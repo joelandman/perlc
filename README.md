@@ -19,7 +19,7 @@ make clean
 ## Usage
 
 ```bash
-./perlc program.pl -o output        # compile and link
+./perlc program.pl -o output            # compile and link
 ./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
 ```
 
@@ -47,6 +47,7 @@ make clean
 
 - Arithmetic: `+`, `-`, `*`, `/`, `%`
 - String: `.` (concat), `x` (repeat)
+- Range: `..` (e.g. `1..10`)
 - Comparison (numeric): `==`, `!=`, `<`, `>`, `<=`, `>=`
 - Comparison (string): `eq`, `ne`, `lt`, `gt`, `le`, `ge`
 - Logical: `&&`, `||`, `!`, `and`, `or`, `not`
@@ -61,11 +62,13 @@ make clean
 if ($x) { ... } elsif ($y) { ... } else { ... }
 unless ($x) { ... }
 while ($cond) { ... }
+while (my $line = <$fh>) { ... }   # my-in-condition idiom
 until ($cond) { ... }
 do { ... } while ($cond);
 do { ... } until ($cond);
 for (my $i = 0; $i < 10; $i++) { ... }
 foreach my $v (@arr) { ... }
+foreach my $i (1..10) { ... }
 last;   # break
 next;   # continue
 ```
@@ -98,14 +101,40 @@ my $result = name(1, 2);
 ```perl
 print "text";
 print "a", "b", "c";
-say "text";        # adds newline
+say "text";          # print with newline
 say $var;
+printf "%s=%d\n", $key, $val;
+sprintf "%05.2f", $n;
+print STDERR "error\n";
+```
+
+### File I/O
+
+```perl
+open(my $fh, '>', "file.txt") or die "Cannot open: $!";
+open(my $fh, '<', "file.txt") or die;
+open(my $fh, '>>', "file.txt");    # append
+open(my $fh, "<file.txt");         # 2-arg form
+
+print $fh "text\n";
+say   $fh "text";
+printf $fh "%d\n", 42;
+
+my $line  = <$fh>;                 # readline (scalar)
+my @lines = <$fh>;                 # slurp all lines (array)
+
+close($fh);
+eof($fh);                          # true after last read
+
+die "error message\n";             # print to STDERR and exit
+unlink "file.txt";                 # delete file
 ```
 
 ### String Builtins
 
 ```perl
 chomp($s);                    # remove trailing newline in-place
+chomp(@arr);                  # chomp every element
 length($s)                    # string length
 substr($s, $offset)           # substring from offset
 substr($s, $offset, $len)     # substring with length
@@ -117,12 +146,12 @@ $s x $n                       # repetition
 
 ```perl
 push @arr, $v;
-push @arr, $v if $cond;       # with modifier
 pop @arr
 shift @arr
 unshift @arr, $v;
 scalar @arr                   # length
 join(", ", @arr)
+join("-", 1..5)                # range in join
 split(/sep/, $str)
 sort @arr                     # lexicographic sort
 ```
@@ -200,24 +229,8 @@ All Perl values are heap-allocated `PerlValue` structs (tagged union):
 
 ```c
 typedef struct PerlValue {
-    PerlTag tag;        // UNDEF, INT, FLOAT, STRING, REF_SCALAR, REF_ARRAY, REF_HASH
+    PerlTag tag;        // UNDEF, INT, FLOAT, STRING, REF_SCALAR, REF_ARRAY, REF_HASH, FILEHANDLE
     union { long long ival; double fval; char *sval; void *pval; };
     long long matchpos; // /g iterator position
 } PerlValue;
-```
-
-Every variable's stack slot holds a stable `PerlValue*` for its lifetime. Assignment calls `perl_assign(dst, src)` to mutate in place — this is required for references to remain valid after assignment.
-
-## Tests
-
-```
-tests/hello.pl     — strings, print/say, interpolation
-tests/arith.pl     — arithmetic, compound assignment, string ops
-tests/fib.pl       — recursive subroutines, @_ unpacking
-tests/hash.pl      — hashes, keys/values/exists/delete, sort
-tests/builtins.pl  — string and array builtins
-tests/refs.pl      — all reference types and dereference forms
-tests/regex.pl     — match, captures, substitution, split
-tests/regex_g.pl   — /g iterator loops, list context /g
-tests/modifiers.pl — statement modifiers (if/unless/while/until/for/foreach)
 ```

@@ -8,10 +8,10 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 9 test programs
+make test         # runs all 11 test programs
 make clean
 
-./perlc foo.pl -o output          # compile and link
+./perlc foo.pl -o output            # compile and link
 ./perlc foo.pl --emit-ir -o out.ll  # dump LLVM IR for debugging
 ```
 
@@ -29,17 +29,18 @@ make clean
 ## Architecture
 
 - **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; }; long long matchpos; }`
-- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6`
+- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7`
 - **PerlArray**: `{ PerlValue **elems; long long len, cap; }`
 - **PerlHash**: 64-bucket chained hash table
 - **matchpos**: per-PerlValue `/g` iterator offset; reset to 0 on `perl_clone`/`perl_assign`
 - **Scope model**: three parallel scope stacks — `scopes_` (scalars), `arrayScopes_`, `hashScopes_`
 - **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime; assignment mutates in-place. Required for references to work correctly.
 - **Codegen pattern**: every op is `callRT("perl_xyz", {args...})` → C runtime does the work
+- **File handles**: `PERL_FILEHANDLE` tag; `FILE*` stored in `pval` field; stable PerlValue* for the fh lifetime; `perl_open_fh` closes the old FILE* before opening a new one on the same PerlValue*
 
 ## Implemented Features
 
-### All passing tests (9/9)
+### All passing tests (11/11)
 
 | Test | What it covers |
 |------|----------------|
@@ -52,16 +53,18 @@ make clean
 | `regex.pl` | match, `!~`, case-insensitive, captures `$1`–`$9`, substitution, split |
 | `regex_g.pl` | `/g` iterator in `while`, captures in `/g`, list context `/g`, foreach `/g` |
 | `modifiers.pl` | postfix if/unless/while/until/for/foreach, last/next with modifier |
+| `range.pl` | `..` range operator in for, array assignment, join, scalar context |
+| `sprintf.pl` | `sprintf`/`printf` with `%s %d %f %x %o %b %e %g %c %%`, width/precision |
 
 ### Language features
 
 **Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--`, compound assignment
 
-**Arrays**: `@arr`, push/pop/shift/unshift, `$arr[i]`, `scalar @arr`, join, split, sort
+**Arrays**: `@arr`, push/pop/shift/unshift, `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`
 
 **Hashes**: `%hash`, `$h{key}`, keys/values/exists/delete, hash-from-list init
 
-**Control flow**: if/elsif/else, unless, while, until, do-while, do-until, C-style for, foreach, last, next, return
+**Control flow**: if/elsif/else, unless, while (including `while (my $var = expr)`), until, do-while, do-until, C-style for, foreach, last, next, return
 
 **Statement modifiers**: `STMT if COND`, `STMT unless COND`, `STMT while COND`, `STMT until COND`, `STMT for LIST`, `STMT foreach LIST`
 
@@ -71,7 +74,13 @@ make clean
 
 **Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`
 
-**Builtins**: chomp, length, substr, join, split, push, pop, shift, unshift, sort, keys, values, exists, delete, scalar, defined, ref, print, say
+**Range**: `1..N` in for/foreach, list context (`my @r = (1..10)`), join context
+
+**sprintf/printf**: full format string — `%s %d %i %u %f %e %E %g %G %x %X %o %b %c %%`, width/precision literals and `*` from args
+
+**File I/O**: `open(my $fh, mode, file)`, `open(my $fh, "modeFile")` (2-arg), `close($fh)`, `<$fh>` (scalar readline), `my @lines = <$fh>` (array readline), `print $fh`, `say $fh`, `printf $fh`, `eof($fh)`, `die`, `print STDERR`, `unlink`
+
+**Builtins**: chomp, length, substr, join, split, push, pop, shift, unshift, sort, keys, values, exists, delete, scalar, defined, ref, print, say, printf, sprintf, unlink
 
 **String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`
 
@@ -82,9 +91,12 @@ make clean
 - `emitArrayPtr` returns `PerlArray*` (av) for array-producing expressions; `emitExpr` returns `PerlValue*` (pv).
 - `FatArrow =>` is treated identically to `,` everywhere.
 - `foreach` loop uses a `stepBB` for the index increment so that `next` jumps through the increment before re-checking the condition (not directly to condBB, which would cause an infinite loop).
+- `while (my $var = expr)` condition: the variable alloca and initial `PerlValue*` are allocated in the pre-loop block (once); each `while.cond` iteration only calls `perl_assign` + truth test — no stack growth or leaking.
 - `%` context: after INT/FLOAT/STRING/IDENT/RPAREN/RBRACKET/`++`/`--` → PERCENT (modulo); otherwise → hash sigil.
 - `/` context: same heuristic → SLASH (division) vs REGEX literal.
 - `parseModifier(stmt, line)`: called at end of every statement path; consumes the `;` itself. Modifier keywords (if/unless/while/until/for/foreach) are detected with `isModifier()` to prevent arg-list parsing from over-consuming.
+- Filehandle detection in print/say/printf: `$var` is treated as a filehandle only when followed by an expression-start token (scalar, string, int, float, ident, `(`, `[`, `{`) — not an operator. Prevents `say $a + $b` from treating `$a` as a filehandle.
+- `die` in expression context (e.g. `open(...) or die "..."`) uses the dead-block pattern: after `CreateUnreachable()`, insert point moves to a fresh dead basic block so surrounding phi nodes remain well-formed.
 
 ## Passing Test Expected Outputs
 
@@ -242,13 +254,36 @@ c
 4
 ```
 
+### range.pl
+```
+1
+2
+3
+4
+5
+10
+55
+1-2-3-4
+4
+```
+
+### sprintf.pl
+```
+hello 42
+   10
+3.14
+ff
+377
+11111111
+1.23e+00
+done
+```
+
 ## Known Limitations / Not Implemented
 
-- Range operator `..` (workaround: write out list elements explicitly)
-- String `sprintf` / `printf`
 - `wantarray`, `caller`, `local`
 - Object-oriented features (`bless`, `->method()`)
-- File I/O (`open`, `close`, `<FH>`)
 - `use` statements (parsed but ignored, except `use strict`/`use warnings`)
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
 - Named captures `(?<name>...)`
+- `$array[idx]` element access when array was populated from `<$fh>` in list context (in-progress)

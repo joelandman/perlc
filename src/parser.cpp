@@ -103,6 +103,20 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_SAY))    { return parseModifier(parsePrint(true),  line); }
     if (check(TK::KW_PRINTF)) {
         advance();
+        /* filehandle detection (same heuristic as parsePrint) */
+        std::string fhname;
+        if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
+            fhname = cur().text; advance();
+        } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
+            TK t2 = peek(2).kind;
+            /* only treat $var as filehandle when the next token starts a new
+             * expression — not when it's an operator or list separator */
+            bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
+                            t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
+                            t2 == TK::IDENT  || t2 == TK::LPAREN ||
+                            t2 == TK::LBRACKET || t2 == TK::LBRACE);
+            if (isFhCtx) { pos_++; fhname = advance().text; }
+        }
         bool hasParen = check(TK::LPAREN);
         if (hasParen) advance();
         NodePtr fmt = parseExpr();
@@ -115,7 +129,7 @@ NodePtr Parser::parseStmt() {
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
-        n->left = std::move(fmt); n->args = std::move(args);
+        n->name = fhname; n->left = std::move(fmt); n->args = std::move(args);
         return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_PUSH))   { return parseModifier(parsePush(),        line); }
@@ -132,6 +146,15 @@ NodePtr Parser::parseStmt() {
         return parseModifier(std::move(n), line);
     }
     if (check(TK::LBRACE))    return parseBlock();
+    if (check(TK::KW_DIE)) {
+        advance();
+        NodePtr msg;
+        if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK))
+            msg = parseExpr();
+        auto n = std::make_unique<Node>(); n->kind = NK::DieStmt; n->line = line;
+        n->left = std::move(msg);
+        return parseModifier(std::move(n), line);
+    }
 
     /* expression statement */
     auto expr = parseExpr();
@@ -403,12 +426,25 @@ NodePtr Parser::parsePrint(bool isSay) {
     int line = cur().line;
     advance(); /* consume print/say */
 
-    /* optional filehandle (bare STDOUT, STDERR) */
-    if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR"))
-        advance();
+    /* filehandle detection:
+       - bare STDOUT/STDERR ident
+       - $fh without a following comma → it's a filehandle, not a value */
+    std::string fhname;
+    if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
+        fhname = cur().text; advance();
+    } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
+        TK t2 = peek(2).kind;
+        bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
+                        t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
+                        t2 == TK::IDENT  || t2 == TK::LPAREN ||
+                        t2 == TK::LBRACKET || t2 == TK::LBRACE);
+        if (isFhCtx) {
+            pos_++;  /* skip $ */
+            fhname = advance().text;  /* variable name */
+        }
+    }
 
     NodeList args;
-    /* parenthesised or not */
     bool hasParen = match(TK::LPAREN);
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
@@ -419,6 +455,7 @@ NodePtr Parser::parsePrint(bool isSay) {
 
     auto n = std::make_unique<Node>();
     n->kind = isSay ? NK::SayStmt : NK::PrintStmt;
+    n->name = fhname;
     n->args = std::move(args); n->line = line;
     return n;
 }
@@ -1135,6 +1172,94 @@ NodePtr Parser::parsePrimary() {
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::JoinFunc;
         n->left = std::move(sep); n->args = std::move(rest); n->line = line;
+        return n;
+    }
+
+    /* readline: <$fh>, <STDIN>, <> */
+    if (check(TK::READLINE)) {
+        std::string fhname = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Readline; n->sval = fhname; n->line = line;
+        return n;
+    }
+
+    /* open([my] $fh, mode, filename) or open([my] $fh, "mode_file") */
+    if (check(TK::KW_OPEN)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        bool isMy = match(TK::KW_MY);
+        consume(TK::SCALAR, "$");
+        std::string fhname = consume(TK::IDENT, "filehandle name").text;
+        match(TK::COMMA);
+        NodeList args;
+        while (true) {
+            if (hasParen && check(TK::RPAREN)) break;
+            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::OpenFunc; n->line = line;
+        n->name = fhname; n->sval = isMy ? "my" : ""; n->args = std::move(args);
+        return n;
+    }
+
+    /* close($fh) */
+    if (check(TK::KW_CLOSE)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        auto fh = parseExpr();
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::CloseFunc; n->line = line;
+        n->left = std::move(fh);
+        return n;
+    }
+
+    /* eof($fh) */
+    if (check(TK::KW_EOF)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        NodePtr fh;
+        if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK))
+            fh = parseExpr();
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::EofFunc; n->line = line;
+        n->left = std::move(fh);
+        return n;
+    }
+
+    /* unlink LIST */
+    if (check(TK::KW_UNLINK)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        auto n = std::make_unique<Node>(); n->kind = NK::UnlinkFunc; n->line = line;
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK) &&
+               !(hasParen && check(TK::RPAREN))) {
+            n->args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* die [EXPR] — also usable in expression context, e.g. open(...) or die "..." */
+    if (check(TK::KW_DIE)) {
+        advance();
+        NodePtr msg;
+        if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK) && !check(TK::RPAREN))
+            msg = parseExpr();
+        auto n = std::make_unique<Node>(); n->kind = NK::DieStmt; n->line = line;
+        n->left = std::move(msg);
+        return n;
+    }
+
+    /* 'my $var [= expr]' in expression context (e.g. while (my $line = <$fh>)) */
+    if (check(TK::KW_MY) && peek(1).kind == TK::SCALAR) {
+        advance();  /* my */
+        pos_++;     /* $ */
+        std::string vname = advance().text;
+        auto n = std::make_unique<Node>(); n->kind = NK::My; n->line = line;
+        n->name = "$" + vname;
+        if (check(TK::ASSIGN)) { advance(); n->right = parseAssign(); }
         return n;
     }
 

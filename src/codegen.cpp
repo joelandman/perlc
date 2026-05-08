@@ -96,7 +96,8 @@ void CodeGen::declareRuntime() {
     RT("perl_array_shift",      pv,  av);
     RT("perl_array_unshift",    voidTy, av, pv);
     /* string builtins */
-    RT("perl_chomp",    i64,  pv);
+    RT("perl_chomp",       i64,  pv);
+    RT("perl_chomp_array", i64,  av);
     RT("perl_length",   pv,   pv);
     RT("perl_substr2",  pv,   pv, pv);
     RT("perl_substr3",  pv,   pv, pv, pv);
@@ -110,6 +111,23 @@ void CodeGen::declareRuntime() {
     RT("perl_deref_array",  av, pv);
     RT("perl_deref_hash",   av, pv);  /* returns PerlHash* as opaque av */
     RT("perl_ref_type",     pv, pv);
+    /* file I/O */
+    RT("perl_open_fh",          pv,     pv, pv, pv);
+    RT("perl_open2_fh",         pv,     pv, pv);
+    RT("perl_close_fh",         voidTy, pv);
+    RT("perl_readline",         pv,     pv);
+    RT("perl_readline_all",     av,     pv);
+    RT("perl_readline_stdin",   pv);
+    RT("perl_readline_all_stdin", av);
+    RT("perl_print_fh",         voidTy, pv, pv);
+    RT("perl_say_fh",           voidTy, pv, pv);
+    RT("perl_printf_fh",        voidTy, pv, pv, av);
+    RT("perl_eof_fh",           pv,     pv);
+    RT("perl_die",              voidTy, pv);
+    RT("perl_unlink_files",     pv,     av);
+    RT("perl_get_stderr",       pv);
+    RT("perl_get_stdout",       pv);
+    RT("perl_get_stdin",        pv);
     /* sprintf / printf */
     RT("perl_sprintf",      pv, pv, av);
     RT("perl_printf",       voidTy, pv, av);
@@ -237,6 +255,15 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         for (auto &elem : n.args)
             callRT("perl_array_push", {av, emitExpr(*elem)});
         return av;
+    }
+    if (n.kind == NK::Readline) {
+        if (n.sval == "STDIN" || n.sval.empty())
+            return callRT("perl_readline_all_stdin", {});
+        if (auto *slot = lookupVar(n.sval)) {
+            Value *fh = builder_.CreateLoad(perlPtrTy_, slot);
+            return callRT("perl_readline_all", {fh});
+        }
+        return callRT("perl_array_new", {});
     }
     if (n.kind == NK::Range) {
         Value *lo = emitExpr(*n.left);
@@ -397,6 +424,9 @@ void CodeGen::emitStmt(const Node &n) {
             }
             declareArray(nm, av);
         } else {
+            /* n.name may carry a '$' prefix when parsed in expression context */
+            std::string nm = n.name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
             auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
             /* allocate a stable PerlValue* that lives for this variable's lifetime */
             Value *pv = perlUndef();
@@ -405,7 +435,7 @@ void CodeGen::emitStmt(const Node &n) {
                 Value *init = emitExpr(*n.right);
                 callRT("perl_assign", {pv, init});
             }
-            declareVar(n.name, alloca);
+            declareVar(nm, alloca);
         }
         break;
     }
@@ -417,23 +447,43 @@ void CodeGen::emitStmt(const Node &n) {
     case NK::PrintStmt:
     case NK::SayStmt: {
         bool isSay = (n.kind == NK::SayStmt);
-        if (n.args.empty()) {
-            /* print $_ */
-            if (auto *slot = lookupVar("_")) {
-                Value *v = builder_.CreateLoad(perlPtrTy_, slot);
-                callRT(isSay ? "perl_say" : "perl_print", {v});
+        /* resolve filehandle (n.name: "", "STDOUT", "STDERR", or scalar varname) */
+        Value *fh = nullptr;
+        if (n.name == "STDERR")       fh = callRT("perl_get_stderr", {});
+        else if (n.name == "STDOUT")  fh = callRT("perl_get_stdout", {});
+        else if (!n.name.empty()) {
+            if (auto *slot = lookupVar(n.name))
+                fh = builder_.CreateLoad(perlPtrTy_, slot);
+        }
+        if (fh) {
+            /* print/say to filehandle */
+            if (n.args.empty()) {
+                if (auto *slot = lookupVar("_")) {
+                    Value *v = builder_.CreateLoad(perlPtrTy_, slot);
+                    callRT(isSay ? "perl_say_fh" : "perl_print_fh", {fh, v});
+                }
+            } else {
+                for (size_t i = 0; i < n.args.size(); i++)
+                    callRT(isSay && i + 1 == n.args.size() ? "perl_say_fh" : "perl_print_fh",
+                           {fh, emitExpr(*n.args[i])});
             }
-        } else if (n.args.size() == 1) {
-            Value *v = emitExpr(*n.args[0]);
-            callRT(isSay ? "perl_say" : "perl_print", {v});
         } else {
-            for (size_t i = 0; i < n.args.size(); i++) {
-                Value *v = emitExpr(*n.args[i]);
-                callRT("perl_print", {v});
-            }
-            if (isSay) {
-                auto *nl = builder_.CreateGlobalString("\n", ".nl");
-                callRT("perl_print_string", {nl});
+            /* print/say to stdout */
+            if (n.args.empty()) {
+                if (auto *slot = lookupVar("_")) {
+                    Value *v = builder_.CreateLoad(perlPtrTy_, slot);
+                    callRT(isSay ? "perl_say" : "perl_print", {v});
+                }
+            } else if (n.args.size() == 1) {
+                Value *v = emitExpr(*n.args[0]);
+                callRT(isSay ? "perl_say" : "perl_print", {v});
+            } else {
+                for (size_t i = 0; i < n.args.size(); i++)
+                    callRT("perl_print", {emitExpr(*n.args[i])});
+                if (isSay) {
+                    auto *nl = builder_.CreateGlobalString("\n", ".nl");
+                    callRT("perl_print_string", {nl});
+                }
             }
         }
         break;
@@ -443,7 +493,16 @@ void CodeGen::emitStmt(const Node &n) {
         Value *fmt = emitExpr(*n.left);
         Value *av  = callRT("perl_array_new", {});
         for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
-        callRT("perl_printf", {fmt, av});
+        if (n.name == "STDERR") {
+            callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
+        } else if (!n.name.empty() && n.name != "STDOUT") {
+            Value *fh = nullptr;
+            if (auto *slot = lookupVar(n.name)) fh = builder_.CreateLoad(perlPtrTy_, slot);
+            if (fh) callRT("perl_printf_fh", {fh, fmt, av});
+            else    callRT("perl_printf",    {fmt, av});
+        } else {
+            callRT("perl_printf", {fmt, av});
+        }
         break;
     }
 
@@ -493,9 +552,33 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.push_back(exit);
         loopContinues_.push_back(cond);
 
+        /* If condition is 'my $var = rhs', hoist the variable allocation before
+         * the loop so the alloca and stable PerlValue* are created exactly once.
+         * In while.cond we only do the assignment + truth-test each iteration. */
+        Value *myCondPv   = nullptr;
+        Node  *myCondRhs  = nullptr;
+        if (n.cond && n.cond->kind == NK::My &&
+            !n.cond->name.empty() && n.cond->name[0] == '$') {
+            std::string nm = n.cond->name.substr(1);
+            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.cond->name);
+            myCondPv = perlUndef();
+            builder_.CreateStore(myCondPv, alloca);
+            declareVar(nm, alloca);
+            myCondRhs = n.cond->right.get();
+        }
+
         builder_.CreateBr(cond);
         builder_.SetInsertPoint(cond);
-        Value *cv = emitExpr(*n.cond);
+
+        Value *cv;
+        if (myCondPv) {
+            Value *rhs = myCondRhs ? emitExpr(*myCondRhs) : perlUndef();
+            callRT("perl_assign", {myCondPv, rhs});
+            cv = myCondPv;
+        } else {
+            cv = emitExpr(*n.cond);
+        }
+
         Value *bv = callRT("perl_is_true", {cv});
         Value *b  = builder_.CreateICmpNE(bv,
                         ConstantInt::get(Type::getInt32Ty(ctx_), 0));
@@ -743,6 +826,73 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_array_len", {av});
     }
 
+    case NK::Readline: {
+        if (n.sval == "STDIN" || n.sval.empty())
+            return callRT("perl_readline_stdin", {});
+        if (auto *slot = lookupVar(n.sval)) {
+            Value *fh = builder_.CreateLoad(perlPtrTy_, slot);
+            return callRT("perl_readline", {fh});
+        }
+        return perlUndef();
+    }
+
+    case NK::OpenFunc: {
+        Value *slot = nullptr;
+        if (n.sval == "my") {
+            slot = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+            Value *pv = perlUndef();
+            builder_.CreateStore(pv, slot);
+            declareVar(n.name, slot);
+        } else {
+            slot = lookupVar(n.name);
+            if (!slot) return perlUndef();
+        }
+        Value *fh_pv = builder_.CreateLoad(perlPtrTy_, slot);
+        if (n.args.size() >= 2)
+            return callRT("perl_open_fh",  {fh_pv, emitExpr(*n.args[0]), emitExpr(*n.args[1])});
+        if (n.args.size() == 1)
+            return callRT("perl_open2_fh", {fh_pv, emitExpr(*n.args[0])});
+        return perlUndef();
+    }
+
+    case NK::CloseFunc: {
+        Value *fh = n.left ? emitExpr(*n.left) : perlUndef();
+        callRT("perl_close_fh", {fh});
+        return perlInt(1);
+    }
+
+    case NK::EofFunc: {
+        Value *fh = n.left ? emitExpr(*n.left) : callRT("perl_get_stdin", {});
+        return callRT("perl_eof_fh", {fh});
+    }
+
+    case NK::DieStmt: {
+        Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
+        callRT("perl_die", {msg});
+        builder_.CreateUnreachable();
+        /* move to a dead block so surrounding codegen stays well-formed */
+        auto *fn     = builder_.GetInsertBlock()->getParent();
+        auto *deadBB = BasicBlock::Create(ctx_, "die.dead", fn);
+        builder_.SetInsertPoint(deadBB);
+        return perlUndef();
+    }
+
+    case NK::UnlinkFunc: {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_unlink_files", {av});
+    }
+
+    case NK::My: {
+        /* 'my $var = expr' in expression context */
+        emitStmt(n);
+        if (!n.name.empty() && n.name[0] == '$') {
+            if (auto *slot = lookupVar(n.name.substr(1)))
+                return builder_.CreateLoad(perlPtrTy_, slot);
+        }
+        return perlUndef();
+    }
+
     case NK::BinOp:     return emitBinOp(n);
 
     case NK::UnaryOp: {
@@ -905,7 +1055,12 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ChompFunc: {
-        /* chomp modifies the variable in-place; we need the PerlValue* pointer */
+        /* chomp on array: chomp every element */
+        if (n.left->kind == NK::ArrayVar) {
+            Value *av = lookupArray(n.left->name);
+            if (av) { callRT("perl_chomp_array", {av}); return perlInt(0); }
+        }
+        /* chomp on scalar */
         Value *v = emitExpr(*n.left);
         callRT("perl_chomp", {v});
         return v;

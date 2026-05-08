@@ -27,6 +27,13 @@ enum class NK {
     Foreach,
     Last, Next, Return,
     PrintStmt, SayStmt, PrintfStmt, SprintfFunc,
+    /* file I/O */
+    Readline,   /* <$fh>  – sval = var name ("" or "STDIN"/"STDERR") */
+    OpenFunc,   /* open   – name=fhvar, sval="my"/"", args=[mode,file] or [modeFile] */
+    CloseFunc,  /* close  – left = fh expr */
+    EofFunc,    /* eof    – left = fh expr */
+    DieStmt,    /* die    – left = msg expr */
+    UnlinkFunc, /* unlink – args = filenames */
     SubDef,
     UseStmt,
     /* builtins that look like functions */

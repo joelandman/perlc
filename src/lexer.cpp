@@ -15,6 +15,8 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"strict",   TK::KW_STRICT},{"warnings", TK::KW_WARNINGS},
     {"print",    TK::KW_PRINT},  {"say",      TK::KW_SAY},
     {"printf",   TK::KW_PRINTF}, {"sprintf",  TK::KW_SPRINTF},
+    {"open",     TK::KW_OPEN},   {"close",    TK::KW_CLOSE},
+    {"eof",      TK::KW_EOF},    {"die",      TK::KW_DIE},   {"unlink",   TK::KW_UNLINK},
     {"push",     TK::KW_PUSH},  {"pop",      TK::KW_POP},
     {"shift",    TK::KW_SHIFT}, {"unshift",  TK::KW_UNSHIFT},
     {"scalar",   TK::KW_SCALAR},{"defined",  TK::KW_DEFINED},
@@ -304,10 +306,30 @@ std::vector<Token> Lexer::tokenize() {
                 else if (peek() == '~') { pos_++; toks.push_back({TK::NBIND, "!~", line_}); }
                 else toks.push_back({TK::NOT, "!", line_});
                 break;
-            case '<':
-                if (peek() == '=') { pos_++; toks.push_back({TK::LE, "<=", line_}); }
-                else toks.push_back({TK::LT, "<", line_});
+            case '<': {
+                if (peek() == '=') { pos_++; toks.push_back({TK::LE, "<=", line_}); break; }
+                /* readline: <$ident>, <STDIN>, <STDERR>, <STDOUT>, <> */
+                {
+                    size_t save = pos_;
+                    bool hasSigil = false;
+                    std::string rl;
+                    if (pos_ < src_.size() && src_[pos_] == '$') { hasSigil = true; pos_++; }
+                    while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+                        rl += src_[pos_++];
+                    if (pos_ < src_.size() && src_[pos_] == '>') {
+                        bool ok = hasSigil || rl.empty()
+                               || rl == "STDIN" || rl == "STDOUT" || rl == "STDERR";
+                        if (ok) {
+                            pos_++;  /* consume '>' */
+                            toks.push_back({TK::READLINE, rl, line_});
+                            break;
+                        }
+                    }
+                    pos_ = save;
+                }
+                toks.push_back({TK::LT, "<", line_});
                 break;
+            }
             case '>':
                 if (peek() == '=') { pos_++; toks.push_back({TK::GE, ">=", line_}); }
                 else toks.push_back({TK::GT, ">", line_});

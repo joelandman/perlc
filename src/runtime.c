@@ -7,6 +7,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <unistd.h>
 
 /* ── allocation ──────────────────────────────────────────────────────────── */
 
@@ -97,6 +98,9 @@ char *perl_to_string(const PerlValue *v) {
         case PERL_REF_HASH:
             snprintf(buf, sizeof buf, "HASH(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
+        case PERL_FILEHANDLE:
+            snprintf(buf, sizeof buf, "GLOB(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            return strdup(buf);
         default:
             return strdup("");
     }
@@ -114,6 +118,8 @@ int perl_is_true(const PerlValue *v) {
         case PERL_REF_ARRAY:
         case PERL_REF_HASH:
             return 1;
+        case PERL_FILEHANDLE:
+            return v->pval != NULL;
         default: return 0;
     }
 }
@@ -385,6 +391,14 @@ void perl_array_unshift(PerlArray *a, PerlValue *v) {
 }
 
 /* ── string builtins ─────────────────────────────────────────────────────── */
+
+long long perl_chomp_array(PerlArray *a) {
+    if (!a) return 0;
+    long long removed = 0;
+    for (long long i = 0; i < a->len; i++)
+        removed += perl_chomp(a->elems[i]);
+    return removed;
+}
 
 long long perl_chomp(PerlValue *v) {
     if (!v) return 0;
@@ -706,6 +720,159 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_REF_HASH:   return perl_alloc_string("HASH");
         default:              return perl_alloc_string("");
     }
+}
+
+/* ── file I/O ────────────────────────────────────────────────────────────── */
+
+static PerlValue s_stdin_pv  = { PERL_UNDEF, {0}, 0 };
+static PerlValue s_stdout_pv = { PERL_UNDEF, {0}, 0 };
+static PerlValue s_stderr_pv = { PERL_UNDEF, {0}, 0 };
+
+PerlValue *perl_get_stdin(void) {
+    if (s_stdin_pv.tag != PERL_FILEHANDLE) { s_stdin_pv.tag = PERL_FILEHANDLE; s_stdin_pv.pval = stdin; }
+    return &s_stdin_pv;
+}
+PerlValue *perl_get_stdout(void) {
+    if (s_stdout_pv.tag != PERL_FILEHANDLE) { s_stdout_pv.tag = PERL_FILEHANDLE; s_stdout_pv.pval = stdout; }
+    return &s_stdout_pv;
+}
+PerlValue *perl_get_stderr(void) {
+    if (s_stderr_pv.tag != PERL_FILEHANDLE) { s_stderr_pv.tag = PERL_FILEHANDLE; s_stderr_pv.pval = stderr; }
+    return &s_stderr_pv;
+}
+
+static const char *mode_to_cmode(const char *m) {
+    if (strcmp(m, "<")  == 0) return "r";
+    if (strcmp(m, ">")  == 0) return "w";
+    if (strcmp(m, ">>") == 0) return "a";
+    if (strcmp(m, "+<") == 0) return "r+";
+    if (strcmp(m, "+>") == 0) return "w+";
+    return "r";
+}
+
+PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filename_pv) {
+    char *ms = perl_to_string(mode_pv);
+    char *fs = perl_to_string(filename_pv);
+    if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
+    FILE *fp = fopen(fs, mode_to_cmode(ms));
+    free(ms); free(fs);
+    if (fp) { target->tag = PERL_FILEHANDLE; target->pval = fp; }
+    else    { target->tag = PERL_UNDEF;      target->pval = NULL; }
+    target->matchpos = 0;
+    return target;
+}
+
+PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
+    char *s = perl_to_string(mode_file_pv);
+    const char *filename = s;
+    char mode[4] = "<";
+    if      (s[0]=='>' && s[1]=='>') { strcpy(mode,">>"); filename=s+2; }
+    else if (s[0]=='>')              { strcpy(mode,">");  filename=s+1; }
+    else if (s[0]=='<')              { strcpy(mode,"<");  filename=s+1; }
+    else if (s[0]=='+' && s[1]=='<') { strcpy(mode,"+<"); filename=s+2; }
+    else if (s[0]=='+' && s[1]=='>')  { strcpy(mode,"+>"); filename=s+2; }
+    while (*filename==' '||*filename=='\t') filename++;
+    if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
+    FILE *fp = fopen(filename, mode_to_cmode(mode));
+    free(s);
+    if (fp) { target->tag = PERL_FILEHANDLE; target->pval = fp; }
+    else    { target->tag = PERL_UNDEF;      target->pval = NULL; }
+    target->matchpos = 0;
+    return target;
+}
+
+void perl_close_fh(PerlValue *fh) {
+    if (fh && fh->tag == PERL_FILEHANDLE && fh->pval) {
+        fclose((FILE*)fh->pval);
+        fh->pval = NULL;
+        fh->tag  = PERL_UNDEF;
+    }
+}
+
+PerlValue *perl_readline(PerlValue *fh) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval)
+        return perl_alloc_undef();
+    FILE *fp = (FILE*)fh->pval;
+    size_t cap = 256, len = 0;
+    char *buf = malloc(cap);
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (len + 2 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+        buf[len++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (len == 0) { free(buf); return perl_alloc_undef(); }
+    buf[len] = '\0';
+    PerlValue *pv = perl_alloc_string(buf);
+    free(buf);
+    return pv;
+}
+
+PerlArray *perl_readline_all(PerlValue *fh) {
+    PerlArray *a = perl_array_new();
+    for (;;) {
+        PerlValue *line = perl_readline(fh);
+        if (line->tag == PERL_UNDEF) { perl_free(line); break; }
+        perl_array_push(a, line);
+    }
+    return a;
+}
+
+PerlValue *perl_readline_stdin(void) {
+    PerlValue tmp = { PERL_FILEHANDLE, {.pval = NULL}, 0 };
+    tmp.pval = stdin;
+    return perl_readline(&tmp);
+}
+
+PerlArray *perl_readline_all_stdin(void) {
+    PerlValue tmp = { PERL_FILEHANDLE, {.pval = NULL}, 0 };
+    tmp.pval = stdin;
+    return perl_readline_all(&tmp);
+}
+
+void perl_print_fh(PerlValue *fh, PerlValue *v) {
+    FILE *fp = (fh && fh->tag == PERL_FILEHANDLE && fh->pval) ? (FILE*)fh->pval : stdout;
+    char *s = perl_to_string(v);
+    fputs(s, fp);
+    free(s);
+}
+
+void perl_say_fh(PerlValue *fh, PerlValue *v) {
+    FILE *fp = (fh && fh->tag == PERL_FILEHANDLE && fh->pval) ? (FILE*)fh->pval : stdout;
+    char *s = perl_to_string(v);
+    fputs(s, fp);
+    fputc('\n', fp);
+    free(s);
+}
+
+void perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
+    PerlValue *s = perl_sprintf(fmt, args);
+    perl_print_fh(fh, s);
+    perl_free(s);
+}
+
+PerlValue *perl_eof_fh(PerlValue *fh) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return perl_alloc_int(1);
+    return perl_alloc_int(feof((FILE*)fh->pval) ? 1 : 0);
+}
+
+void perl_die(PerlValue *msg) {
+    char *s = msg ? perl_to_string(msg) : strdup("Died");
+    fputs(s, stderr);
+    size_t n = strlen(s);
+    if (n == 0 || s[n-1] != '\n') fputc('\n', stderr);
+    free(s);
+    exit(1);
+}
+
+PerlValue *perl_unlink_files(PerlArray *files) {
+    long long removed = 0;
+    for (long long i = 0; i < files->len; i++) {
+        char *name = perl_to_string(files->elems[i]);
+        if (unlink(name) == 0) removed++;
+        free(name);
+    }
+    return perl_alloc_int(removed);
 }
 
 /* ── sprintf / printf ────────────────────────────────────────────────────── */
