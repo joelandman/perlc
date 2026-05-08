@@ -146,12 +146,13 @@ NodePtr Parser::parseStmt() {
         return parseModifier(std::move(n), line);
     }
     if (check(TK::LBRACE))    return parseBlock();
-    if (check(TK::KW_DIE)) {
-        advance();
+    if (check(TK::KW_DIE) || check(TK::KW_WARN)) {
+        bool isDie = check(TK::KW_DIE); advance();
         NodePtr msg;
         if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK))
             msg = parseExpr();
-        auto n = std::make_unique<Node>(); n->kind = NK::DieStmt; n->line = line;
+        auto n = std::make_unique<Node>();
+        n->kind = isDie ? NK::DieStmt : NK::WarnStmt; n->line = line;
         n->left = std::move(msg);
         return parseModifier(std::move(n), line);
     }
@@ -878,6 +879,41 @@ NodePtr Parser::parsePrimary() {
         return makeStr(raw, line);
     }
 
+    /* qw(word list) — returns ArrayLit of string literals */
+    if (check(TK::QWORDS)) {
+        std::string text = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::ArrayLit; n->line = line;
+        std::istringstream iss(text);
+        std::string word;
+        while (iss >> word) n->args.push_back(makeStr(word, line));
+        return n;
+    }
+
+    /* backtick command `cmd` */
+    if (check(TK::BACKTICK)) {
+        std::string raw = cur().text; advance();
+        bool isDQ = !raw.empty() && raw[0] == '\x01';
+        NodePtr cmdExpr;
+        if (isDQ) { raw = raw.substr(1); cmdExpr = parseStringInterp(raw, line); }
+        else       cmdExpr = makeStr(raw, line);
+        auto n = std::make_unique<Node>(); n->kind = NK::BacktickExpr;
+        n->left = std::move(cmdExpr); n->line = line;
+        return n;
+    }
+
+    /* file test: -e $file, -f $file, etc. */
+    if (check(TK::FILETEST)) {
+        std::string flag = cur().text; advance();
+        bool hp = match(TK::LPAREN);
+        NodePtr path;
+        if (!check(TK::SEMI) && !check(TK::EOF_TOK))
+            path = hp ? parseExpr() : parsePostfix(); /* postfix-level: grabs $var, "str", $arr[i] */
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::FileTestOp;
+        n->sval = flag; n->left = std::move(path); n->line = line;
+        return n;
+    }
+
     /* backslash: reference-taking  \$x  \@arr  \%h */
     if (check(TK::BACKSLASH)) {
         advance();
@@ -1006,6 +1042,28 @@ NodePtr Parser::parsePrimary() {
             return n;
         }
         std::string nm = cur().text; advance();
+        /* @arr[0,1,2] — array slice */
+        if (check(TK::LBRACKET)) {
+            advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice; n->name = nm; n->line = line;
+            while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
+                n->args.push_back(parseExpr());
+                if (!match(TK::COMMA)) break;
+            }
+            consume(TK::RBRACKET, "]");
+            return n;
+        }
+        /* @hash{'a','b'} — hash slice */
+        if (check(TK::LBRACE)) {
+            advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::HashSlice; n->name = nm; n->line = line;
+            while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
+                n->args.push_back(parseExpr());
+                if (!match(TK::COMMA)) break;
+            }
+            consume(TK::RBRACE, "}");
+            return n;
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::ArrayVar;
         n->name = nm; n->line = line;
         return n;
@@ -1443,6 +1501,47 @@ NodePtr Parser::parsePrimary() {
         std::string txt = cur().text; advance();
         size_t sep = txt.find('\x01');
         return makeStr(txt.substr(0, sep), line);
+    }
+
+    /* splice(@arr, off[, len[, repl...]]) */
+    if (check(TK::KW_SPLICE)) {
+        advance();
+        bool hp = match(TK::LPAREN);
+        consume(TK::ARRAY, "@");
+        std::string nm = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::SpliceFunc; n->name = nm; n->line = line;
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+            if (!match(TK::COMMA)) break;
+            if ((hp && check(TK::RPAREN)) || check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            n->args.push_back(parseExpr());
+        }
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* system("cmd") */
+    if (check(TK::KW_SYSTEM)) {
+        advance();
+        bool hp = match(TK::LPAREN);
+        auto cmd = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::SystemFunc;
+        n->left = std::move(cmd); n->line = line;
+        return n;
+    }
+
+    /* die / warn in expression context (e.g. open(...) or die "msg") */
+    if (check(TK::KW_DIE) || check(TK::KW_WARN)) {
+        bool isDie = check(TK::KW_DIE); advance();
+        bool hp = match(TK::LPAREN);
+        NodePtr msg;
+        if (!check(TK::SEMI) && !check(TK::EOF_TOK) && !(hp && check(TK::RPAREN)))
+            msg = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>();
+        n->kind = isDie ? NK::DieStmt : NK::WarnStmt; n->line = line;
+        n->left = std::move(msg);
+        return n;
     }
 
     /* unshift as expression (returns new count) */

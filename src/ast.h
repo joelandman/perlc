@@ -53,6 +53,15 @@ enum class NK {
     ChrFunc, OrdFunc, HexFunc, OctFunc,
     /* list builtins */
     ReverseFunc, MapFunc, GrepFunc,
+    SpliceFunc,   /* splice(@arr, off[, len[, repl...]]) – name=arr, args=[off,len,repl...] */
+    /* slices */
+    ArraySlice,   /* @arr[0,1,2]    – name=arr,  args=indices */
+    HashSlice,    /* @hash{'a','b'} – name=hash, args=keys */
+    /* I/O / system */
+    WarnStmt,     /* warn EXPR      – left=msg */
+    SystemFunc,   /* system(cmd)    – left=cmd */
+    BacktickExpr, /* `cmd`          – left=cmd-expr */
+    FileTestOp,   /* -e/-f/etc.     – sval=flag-char, left=path */
     /* references */
     RefScalar,    /* \$x        – left = ScalarVar          */
     RefArray,     /* \@arr      – name = array name         */

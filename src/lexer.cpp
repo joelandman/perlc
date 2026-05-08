@@ -39,6 +39,7 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"chr",      TK::KW_CHR},   {"ord",      TK::KW_ORD},
     {"hex",      TK::KW_HEX},   {"oct",      TK::KW_OCT},
     {"map",      TK::KW_MAP},   {"grep",     TK::KW_GREP},
+    {"warn",     TK::KW_WARN},  {"system",   TK::KW_SYSTEM},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}
@@ -198,8 +199,37 @@ std::vector<Token> Lexer::tokenize() {
         }
         if (c == '\'') { toks.push_back(readString('\'')); continue; }
 
+        /* backtick command `cmd` */
+        if (c == '`') {
+            advance();
+            std::string cmd;
+            while (pos_ < src_.size() && src_[pos_] != '`') {
+                if (src_[pos_] == '\n') line_++;
+                cmd += src_[pos_++];
+            }
+            if (pos_ < src_.size()) pos_++; /* consume closing backtick */
+            /* prefix \x01 so parser treats content like a dq string (interpolation) */
+            toks.push_back({TK::BACKTICK, "\x01" + cmd, line_}); continue;
+        }
+
+        /* qw(...) – quote-word list */
+        if (c == 'q' && peek(1) == 'w' && !isalnum(peek(2)) && peek(2) != '_') {
+            pos_ += 2; /* skip 'qw' */
+            char open = peek();
+            char close = (open == '(') ? ')' : (open == '[') ? ']' :
+                         (open == '{') ? '}' : (open == '<') ? '>' : open;
+            pos_++; /* skip opening delimiter */
+            std::string words;
+            while (pos_ < src_.size() && src_[pos_] != close) {
+                if (src_[pos_] == '\n') line_++;
+                words += src_[pos_++];
+            }
+            if (pos_ < src_.size()) pos_++; /* skip closing delimiter */
+            toks.push_back({TK::QWORDS, words, line_}); continue;
+        }
+
         /* q{} qq{} */
-        if (c == 'q' && (peek(1) == '{' || peek(1) == 'w' || peek(1) == 'q')) {
+        if (c == 'q' && (peek(1) == '{' || peek(1) == 'q')) {
             bool dq = (peek(1) == 'q');
             pos_ += 2;
             if (peek() == '{') { pos_++; }
@@ -287,7 +317,26 @@ std::vector<Token> Lexer::tokenize() {
                 if (peek() == '-') { pos_++; toks.push_back({TK::MINUS_MINUS, "--", line_}); }
                 else if (peek() == '=') { pos_++; toks.push_back({TK::MINUS_ASSIGN, "-=", line_}); }
                 else if (peek() == '>') { pos_++; toks.push_back({TK::ARROW, "->", line_}); }
-                else toks.push_back({TK::MINUS, "-", line_});
+                else {
+                    /* file test: -e/-f/-d/-r/-w/-x/-z/-s/-l/-p only at expression start */
+                    static const std::string ftOps = "efdrzswxolpSTMABC";
+                    bool afterVal = !toks.empty() && [&]{
+                        switch (toks.back().kind) {
+                            case TK::INT: case TK::FLOAT: case TK::STRING:
+                            case TK::IDENT: case TK::RPAREN: case TK::RBRACKET:
+                            case TK::PLUS_PLUS: case TK::MINUS_MINUS: return true;
+                            default: return false;
+                        }
+                    }();
+                    char nxt = peek();
+                    if (!afterVal && isalpha(nxt) && ftOps.find(nxt) != std::string::npos
+                            && (pos_ + 1 >= src_.size() || (!isalnum(src_[pos_+1]) && src_[pos_+1] != '_'))) {
+                        pos_++;
+                        toks.push_back({TK::FILETEST, std::string(1, nxt), line_});
+                    } else {
+                        toks.push_back({TK::MINUS, "-", line_});
+                    }
+                }
                 break;
             case '*':
                 if (peek() == '=') { pos_++; toks.push_back({TK::STAR_ASSIGN, "*=", line_}); }

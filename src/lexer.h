@@ -24,7 +24,11 @@ enum class TK {
     KW_ABS, KW_INT, KW_SQRT,
     KW_CHR, KW_ORD, KW_HEX, KW_OCT,
     KW_MAP, KW_GREP,
+    KW_WARN, KW_SYSTEM,
     SPACESHIP,    /* <=> */
+    FILETEST,  /* -e/-f/-d/-r/-w/-x/-z/-s/-l/-p – text = flag char */
+    QWORDS,    /* qw(...) – text = space-separated words */
+    BACKTICK,  /* `cmd`  – text = command string */
     READLINE,  /* <$fh>, <STDIN>, <> */
     /* regex binding */
     BIND,   /* =~ */

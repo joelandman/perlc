@@ -8,6 +8,8 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 
 /* ── allocation ──────────────────────────────────────────────────────────── */
 
@@ -417,6 +419,23 @@ long long perl_chomp(PerlValue *v) {
     if (len > 0 && s[len - 1] == '\n') { s[len - 1] = '\0'; removed = 1; }
     if (v->tag == PERL_STRING) free(v->sval);
     v->tag = PERL_STRING;
+    v->sval = s;
+    return removed;
+}
+
+PerlValue *perl_chop(PerlValue *v) {
+    char *s = perl_to_string(v);   /* newly heap-allocated */
+    size_t len = strlen(s);
+    PerlValue *removed;
+    if (len > 0) {
+        char buf[2] = { s[len - 1], '\0' };
+        s[len - 1] = '\0';
+        removed = perl_alloc_string(buf);
+    } else {
+        removed = perl_alloc_string("");
+    }
+    if (v->tag == PERL_STRING && v->sval) free(v->sval);
+    v->tag  = PERL_STRING;
     v->sval = s;
     return removed;
 }
@@ -1427,4 +1446,127 @@ PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char 
 
     free(s); pcre2_match_data_free(md); pcre2_code_free(re);
     return arr;
+}
+
+/* ── splice ──────────────────────────────────────────────────────────────── */
+
+PerlArray *perl_splice(PerlArray *arr, PerlValue *off_pv, PerlValue *len_pv, PerlArray *repl) {
+    if (!arr) return perl_array_new();
+
+    long long off = (off_pv && off_pv->tag != PERL_UNDEF) ? perl_to_int(off_pv) : 0;
+    if (off < 0) off = arr->len + off;
+    if (off < 0) off = 0;
+    if (off > arr->len) off = arr->len;
+
+    long long len;
+    if (!len_pv || len_pv->tag == PERL_UNDEF) {
+        len = arr->len - off;
+    } else {
+        len = perl_to_int(len_pv);
+        if (len < 0) { len = arr->len - off + len; if (len < 0) len = 0; }
+    }
+    if (off + len > arr->len) len = arr->len - off;
+
+    /* collect removed elements */
+    PerlArray *removed = perl_array_new();
+    for (long long i = 0; i < len; i++)
+        perl_array_push(removed, arr->elems[off + i]);
+
+    long long repl_len = repl ? repl->len : 0;
+    long long new_len  = arr->len - len + repl_len;
+
+    /* grow if needed */
+    while (arr->cap < new_len) {
+        arr->cap = arr->cap ? arr->cap * 2 : 8;
+        arr->elems = realloc(arr->elems, (size_t)arr->cap * sizeof(PerlValue *));
+    }
+    /* shift tail */
+    if (repl_len != len)
+        memmove(arr->elems + off + repl_len,
+                arr->elems + off + len,
+                (size_t)(arr->len - off - len) * sizeof(PerlValue *));
+    /* insert replacement clones */
+    for (long long i = 0; i < repl_len; i++)
+        arr->elems[off + i] = perl_clone(repl->elems[i]);
+
+    arr->len = new_len;
+    return removed;
+}
+
+/* ── environment ─────────────────────────────────────────────────────────── */
+
+PerlValue *perl_env_get(PerlValue *key) {
+    char *k = perl_to_string(key);
+    const char *val = getenv(k);
+    free(k);
+    return val ? perl_alloc_string(val) : perl_alloc_undef();
+}
+
+void perl_env_set(PerlValue *key, PerlValue *val) {
+    char *k = perl_to_string(key);
+    char *v = perl_to_string(val);
+    setenv(k, v, 1);
+    free(k); free(v);
+}
+
+void perl_warn(PerlValue *msg) {
+    char *s = perl_to_string(msg);
+    size_t len = strlen(s);
+    fputs(s, stderr);
+    if (len == 0 || s[len - 1] != '\n') fputc('\n', stderr);
+    free(s);
+}
+
+PerlValue *perl_system(PerlValue *cmd) {
+    char *s = perl_to_string(cmd);
+    int ret = system(s);
+    free(s);
+    if (ret == -1) return perl_alloc_int(-1);
+    return perl_alloc_int(WIFEXITED(ret) ? WEXITSTATUS(ret) : -1);
+}
+
+PerlValue *perl_backtick(PerlValue *cmd) {
+    char *s = perl_to_string(cmd);
+    FILE *fp = popen(s, "r");
+    free(s);
+    if (!fp) return perl_alloc_undef();
+    char *out = NULL; size_t cap = 0, len = 0;
+    char buf[4096];
+    while (fgets(buf, (int)sizeof(buf), fp)) {
+        size_t n = strlen(buf);
+        if (len + n + 1 > cap) {
+            cap = cap ? cap * 2 : 4096;
+            out = realloc(out, cap);
+        }
+        memcpy(out + len, buf, n); len += n;
+    }
+    pclose(fp);
+    if (!out) { PerlValue *r = perl_alloc_string(""); return r; }
+    out[len] = '\0';
+    PerlValue *r = perl_alloc_string(out);
+    free(out);
+    return r;
+}
+
+/* ── file test operators ─────────────────────────────────────────────────── */
+
+PerlValue *perl_filetest(int op, PerlValue *path_pv) {
+    char *path = perl_to_string(path_pv);
+    struct stat st;
+    PerlValue *result;
+    switch (op) {
+        case 'e': result = perl_alloc_int(access(path, F_OK) == 0); break;
+        case 'f': result = perl_alloc_int(stat(path, &st) == 0 && S_ISREG(st.st_mode)); break;
+        case 'd': result = perl_alloc_int(stat(path, &st) == 0 && S_ISDIR(st.st_mode)); break;
+        case 'r': result = perl_alloc_int(access(path, R_OK) == 0); break;
+        case 'w': result = perl_alloc_int(access(path, W_OK) == 0); break;
+        case 'x': result = perl_alloc_int(access(path, X_OK) == 0); break;
+        case 'z': result = perl_alloc_int(stat(path, &st) == 0 && st.st_size == 0); break;
+        case 's': result = (stat(path, &st) == 0) ? perl_alloc_int(st.st_size) : perl_alloc_undef(); break;
+        case 'l': result = perl_alloc_int(lstat(path, &st) == 0 && S_ISLNK(st.st_mode)); break;
+        case 'p': result = perl_alloc_int(stat(path, &st) == 0 && S_ISFIFO(st.st_mode)); break;
+        default:  result = perl_alloc_int(0); break;
+    }
+    free(path);
+    return result;
 }

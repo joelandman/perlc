@@ -106,6 +106,7 @@ void       perl_array_unshift(PerlArray *a, PerlValue *v);
 /* ── string builtins ─────────────────────────────────────────────────────── */
 long long  perl_chomp(PerlValue *v);       /* remove trailing \n in-place, returns removed count */
 long long  perl_chomp_array(PerlArray *a); /* chomp every element; returns total removed count */
+PerlValue *perl_chop(PerlValue *v);        /* remove and return last character */
 PerlValue *perl_length(PerlValue *v);
 PerlValue *perl_substr2(PerlValue *str, PerlValue *off);
 PerlValue *perl_substr3(PerlValue *str, PerlValue *off, PerlValue *len);
@@ -144,6 +145,20 @@ PerlValue *perl_hash_size(PerlHash *h);    /* returns int count of key-value pai
 /* initialise hash from flat list (k1,v1,k2,v2,...) */
 void       perl_hash_from_list(PerlHash *h, PerlArray *list);
 void       perl_array_extend_hash(PerlArray *dst, PerlHash *h); /* append k,v pairs */
+
+/* ── array manipulation ──────────────────────────────────────────────────── */
+/* splice(@arr, off, len, repl) — removes/inserts elements, returns removed */
+PerlArray *perl_splice(PerlArray *arr, PerlValue *off_pv, PerlValue *len_pv, PerlArray *repl);
+
+/* ── environment / system ───────────────────────────────────────────────── */
+PerlValue *perl_env_get(PerlValue *key);
+void       perl_env_set(PerlValue *key, PerlValue *val);
+void       perl_warn(PerlValue *msg);
+PerlValue *perl_system(PerlValue *cmd);
+PerlValue *perl_backtick(PerlValue *cmd);
+
+/* ── file test operators ─────────────────────────────────────────────────── */
+PerlValue *perl_filetest(int op, PerlValue *path);
 
 /* ── file I/O ────────────────────────────────────────────────────────────── */
 /* open($fh, mode, filename) or open($fh, "mode_and_filename") */
