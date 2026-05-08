@@ -8,6 +8,15 @@
 
 using namespace llvm;
 
+/* mangle Foo::bar → perlsub_Foo__bar for valid LLVM identifiers */
+static std::string subLLVMName(const std::string &name) {
+    std::string result = name;
+    size_t pos;
+    while ((pos = result.find("::")) != std::string::npos)
+        result.replace(pos, 2, "__");
+    return "perlsub_" + result;
+}
+
 /* ── construction ────────────────────────────────────────────────────────── */
 
 CodeGen::CodeGen()
@@ -192,6 +201,10 @@ void CodeGen::declareRuntime() {
     RT("perl_regex_subst",     i64, pv, i8p, i8p, i8p);
     RT("perl_capture",         pv,  i64);
     RT("perl_split_regex",     av,  i8p, i8p, pv);
+    /* OOP */
+    RT("perl_bless",             pv,     pv, pv);
+    RT("perl_register_method",   voidTy, i8p, i8p);
+    RT("perl_dispatch_method",   pv,     pv, i8p, av);
 #undef RT
 }
 
@@ -513,7 +526,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
                         {PointerType::getUnqual(ctx_),  /* PerlArray* args */},
                         false);
         Function::Create(ft, Function::ExternalLinkage,
-                         "perlsub_" + s->name, mod_.get());
+                         subLLVMName(s->name), mod_.get());
     }
 
     /* emit main(int argc, char **argv) */
@@ -529,6 +542,15 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
 
     currentFn_ = mainFn;
     pushScope();
+
+    /* register all subs in the method dispatch table (before user code runs) */
+    for (auto *s : subs) {
+        if (s->name.find("::") != std::string::npos) {
+            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+            auto *fn = mod_->getFunction(subLLVMName(s->name));
+            callRT("perl_register_method", {keyStr, fn});
+        }
+    }
 
     /* set up @ARGV and $0 from command-line arguments */
     {
@@ -560,7 +582,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
 /* ── sub definition ──────────────────────────────────────────────────────── */
 
 void CodeGen::emitSub(const Node &n) {
-    auto *fn = mod_->getFunction("perlsub_" + n.name);
+    auto *fn = mod_->getFunction(subLLVMName(n.name));
     if (!fn) return;
 
     auto *entry = BasicBlock::Create(ctx_, "entry", fn);
@@ -1725,7 +1747,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto *subFT = FunctionType::get(perlPtrTy_,
                           {PointerType::getUnqual(ctx_)}, false);
         auto *subFn = Function::Create(subFT, Function::InternalLinkage,
-                                       "perlsub_" + n.name, mod_.get());
+                                       subLLVMName(n.name), mod_.get());
         /* save state */
         auto *savedFn    = currentFn_;
         auto *savedBB    = builder_.GetInsertBlock();
@@ -1757,7 +1779,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RefSub: {
-        auto *subFn = mod_->getFunction("perlsub_" + n.name);
+        auto *subFn = mod_->getFunction(subLLVMName(n.name));
         if (!subFn) return perlUndef();
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
         return callRT("perl_make_code_ref", {fnPtr});
@@ -1772,6 +1794,30 @@ Value *CodeGen::emitExpr(const Node &n) {
             else     callRT("perl_array_push",   {av, emitExpr(*arg)});
         }
         return callRT("perl_call_code_ref", {ref, av});
+    }
+
+    case NK::PackageStmt:
+        return perlUndef();
+
+    case NK::BlessFunc: {
+        Value *ref = emitExpr(*n.left);
+        Value *cls = emitExpr(*n.right);
+        return callRT("perl_bless", {ref, cls});
+    }
+
+    case NK::MethodCall: {
+        Value *obj = emitExpr(*n.left);
+        Value *argsArr = callRT("perl_array_new", {});
+        for (auto &arg : n.args) {
+            if (arg->kind == NK::ArrayVar) {
+                Value *av = lookupArray(arg->name);
+                if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
+            }
+            Value *v = emitExpr(*arg);
+            callRT("perl_array_push", {argsArr, v});
+        }
+        Value *methodStr = builder_.CreateGlobalStringPtr(n.sval);
+        return callRT("perl_dispatch_method", {obj, methodStr, argsArr});
     }
 
     default:
@@ -1896,7 +1942,7 @@ Value *CodeGen::emitBinOp(const Node &n) {
 }
 
 Value *CodeGen::emitCall(const Node &n) {
-    if (auto *fn = mod_->getFunction("perlsub_" + n.name)) {
+    if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
         Value *argsArr = callRT("perl_array_new", {});
         for (auto &arg : n.args) {
             /* @arr and %hash are splatted into @_ (flattened) */

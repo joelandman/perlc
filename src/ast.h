@@ -87,6 +87,10 @@ enum class NK {
     DollarAt,     /* $@                – the eval error variable                      */
     /* tr/y */
     TrOp,         /* $s =~ tr/a/b/flags – left=str, sval=search\x01replace\x01flags  */
+    /* OOP */
+    PackageStmt,  /* package Foo;      – sval=package_name (parser sets currentPackage_) */
+    BlessFunc,    /* bless $ref, $cls  – left=ref, right=class_expr                   */
+    MethodCall,   /* $obj->method(args)– left=obj, sval=method, args=extra_args       */
 };
 
 struct Node;

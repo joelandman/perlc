@@ -11,6 +11,7 @@ public:
 private:
     std::vector<Token> toks_;
     size_t             pos_ = 0;
+    std::string        currentPackage_ = "main";
 
     Token &cur();
     Token &peek(int offset = 1);

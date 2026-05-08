@@ -37,6 +37,8 @@ PerlValue *perl_alloc_undef(void) {
     PerlValue *v = malloc(sizeof *v);
     v->tag = PERL_UNDEF;
     v->ival = 0;
+    v->matchpos = 0;
+    v->blessed_class = NULL;
     return v;
 }
 
@@ -44,6 +46,8 @@ PerlValue *perl_alloc_int(long long n) {
     PerlValue *v = malloc(sizeof *v);
     v->tag = PERL_INT;
     v->ival = n;
+    v->matchpos = 0;
+    v->blessed_class = NULL;
     return v;
 }
 
@@ -51,6 +55,8 @@ PerlValue *perl_alloc_float(double f) {
     PerlValue *v = malloc(sizeof *v);
     v->tag = PERL_FLOAT;
     v->fval = f;
+    v->matchpos = 0;
+    v->blessed_class = NULL;
     return v;
 }
 
@@ -58,21 +64,29 @@ PerlValue *perl_alloc_string(const char *s) {
     PerlValue *v = malloc(sizeof *v);
     v->tag = PERL_STRING;
     v->sval = strdup(s ? s : "");
+    v->matchpos = 0;
+    v->blessed_class = NULL;
     return v;
 }
 
 PerlValue *perl_clone(const PerlValue *src) {
     if (!src) return perl_alloc_undef();
-    if (src->tag == PERL_STRING) return perl_alloc_string(src->sval);
+    if (src->tag == PERL_STRING) {
+        PerlValue *v = perl_alloc_string(src->sval);
+        v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
+        return v;
+    }
     PerlValue *v = malloc(sizeof *v);
     *v = *src;
-    v->matchpos = 0;   /* fresh clone starts at beginning */
+    v->matchpos = 0;
+    v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     return v;
 }
 
 void perl_free(PerlValue *v) {
     if (!v) return;
     if (v->tag == PERL_STRING) free(v->sval);
+    if (v->blessed_class) free(v->blessed_class);
     free(v);
 }
 
@@ -112,13 +126,22 @@ char *perl_to_string(const PerlValue *v) {
         case PERL_STRING:
             return strdup(v->sval);
         case PERL_REF_SCALAR:
-            snprintf(buf, sizeof buf, "SCALAR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=SCALAR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "SCALAR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
         case PERL_REF_ARRAY:
-            snprintf(buf, sizeof buf, "ARRAY(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "ARRAY(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
         case PERL_REF_HASH:
-            snprintf(buf, sizeof buf, "HASH(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=HASH(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "HASH(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
         case PERL_FILEHANDLE:
             snprintf(buf, sizeof buf, "GLOB(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
@@ -149,10 +172,12 @@ int perl_is_true(const PerlValue *v) {
 void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!dst) return;
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
+    if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
     if (src->tag == PERL_STRING) dst->sval = strdup(src->sval);
-    dst->matchpos = 0;   /* assignment resets /g position */
+    dst->matchpos = 0;
+    dst->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -796,6 +821,7 @@ PerlHash *perl_deref_hash(PerlValue *ref) {
 
 PerlValue *perl_ref_type(PerlValue *ref) {
     if (!ref) return perl_alloc_string("");
+    if (ref->blessed_class) return perl_alloc_string(ref->blessed_class);
     switch (ref->tag) {
         case PERL_REF_SCALAR: return perl_alloc_string("SCALAR");
         case PERL_REF_ARRAY:  return perl_alloc_string("ARRAY");
@@ -820,6 +846,65 @@ PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
         return perl_alloc_undef();
     PerlSubFn fn = (PerlSubFn)ref->pval;
     return fn(args);
+}
+
+/* ── OOP / bless / method dispatch ──────────────────────────────────────── */
+
+PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv) {
+    if (!ref) return perl_alloc_undef();
+    char *cls = perl_to_string(class_pv);
+    if (ref->blessed_class) free(ref->blessed_class);
+    ref->blessed_class = cls;
+    return ref;
+}
+
+typedef struct { char *key; PerlSubFn fn; } MethodEntry;
+#define METHOD_TABLE_MAX 1024
+static MethodEntry s_method_table[METHOD_TABLE_MAX];
+static int s_method_count = 0;
+
+void perl_register_method(const char *key, PerlSubFn fn) {
+    if (s_method_count < METHOD_TABLE_MAX) {
+        s_method_table[s_method_count].key = strdup(key);
+        s_method_table[s_method_count].fn  = fn;
+        s_method_count++;
+    }
+}
+
+static PerlSubFn perl_find_method(const char *class_name, const char *method) {
+    char key[512];
+    snprintf(key, sizeof key, "%s::%s", class_name, method);
+    for (int i = 0; i < s_method_count; i++)
+        if (strcmp(s_method_table[i].key, key) == 0)
+            return s_method_table[i].fn;
+    return NULL;
+}
+
+PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
+    const char *class_name = NULL;
+    if (obj && obj->tag == PERL_STRING && obj->sval)
+        class_name = obj->sval;
+    else if (obj && obj->blessed_class)
+        class_name = obj->blessed_class;
+
+    if (!class_name) {
+        fprintf(stderr, "Can't call method \"%s\" on unblessed reference\n", method);
+        exit(1);
+    }
+    PerlSubFn fn = perl_find_method(class_name, method);
+    if (!fn) {
+        fprintf(stderr, "Can't locate object method \"%s\" via package \"%s\"\n",
+                method, class_name);
+        exit(1);
+    }
+    /* build full @_: prepend $self/$class then rest of args */
+    PerlArray *full_args = perl_array_new();
+    perl_array_push(full_args, obj);
+    if (args) {
+        for (long long i = 0; i < args->len; i++)
+            perl_array_push(full_args, args->elems[i]);
+    }
+    return fn(full_args);
 }
 
 /* ── file I/O ────────────────────────────────────────────────────────────── */

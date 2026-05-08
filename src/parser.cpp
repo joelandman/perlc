@@ -53,6 +53,16 @@ NodePtr Parser::parseBlock() {
 NodePtr Parser::parseStmt() {
     int line = cur().line;
 
+    /* package Foo; — changes current package context for sub naming */
+    if (check(TK::KW_PACKAGE)) {
+        advance();
+        currentPackage_ = cur().text; advance();
+        match(TK::SEMI);
+        auto n = std::make_unique<Node>(); n->kind = NK::PackageStmt;
+        n->sval = currentPackage_; n->line = line;
+        return n;
+    }
+
     if (check(TK::KW_MY) || check(TK::KW_OUR)) return parseMy();
     if (check(TK::KW_IF))      return parseIf();
     if (check(TK::KW_UNLESS)) {
@@ -293,6 +303,9 @@ NodePtr Parser::parseSub() {
     int line = cur().line;
     consume(TK::KW_SUB);
     std::string name = cur().text; advance();
+    /* qualify with current package when not already qualified and not in main */
+    if (name.find("::") == std::string::npos && currentPackage_ != "main")
+        name = currentPackage_ + "::" + name;
     consume(TK::LBRACE, "{");
 
     /* collect params from @_ via 'my ($a,$b) = @_;' — we auto-generate later */
@@ -826,7 +839,23 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                 base = std::move(n);
                 continue;
             }
-            /* -> not followed by [ or { or (: don't consume (restore? no — just stop) */
+            /* ->method(args) or ->method  — method call */
+            if (check(TK::IDENT)) {
+                std::string method = cur().text; advance();
+                auto n = std::make_unique<Node>(); n->kind = NK::MethodCall;
+                n->sval = method; n->left = std::move(base); n->line = line;
+                if (check(TK::LPAREN)) {
+                    advance();
+                    while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                        n->args.push_back(parseExpr());
+                        if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+                    }
+                    consume(TK::RPAREN, ")");
+                }
+                base = std::move(n);
+                continue;
+            }
+            /* -> not followed by [ or { or ( or IDENT: stop */
             break;
         }
         /* adjacent subscripts after a ref-subscript */
@@ -1148,6 +1177,20 @@ NodePtr Parser::parsePrimary() {
         std::string nm = cur().text; advance();
         auto n = std::make_unique<Node>(); n->kind = NK::HashVar;
         n->name = nm; n->line = line;
+        return n;
+    }
+
+    /* bless($ref [, $class])  or  bless $ref, $class */
+    if (check(TK::KW_BLESS)) {
+        advance();
+        bool hp = match(TK::LPAREN);
+        NodePtr ref = parseExpr();
+        NodePtr cls;
+        if (match(TK::COMMA)) cls = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        if (!cls) cls = makeStr(currentPackage_, line);
+        auto n = std::make_unique<Node>(); n->kind = NK::BlessFunc; n->line = line;
+        n->left = std::move(ref); n->right = std::move(cls);
         return n;
     }
 

@@ -26,7 +26,8 @@ typedef struct PerlValue {
         char     *sval;   /* heap-allocated, NUL-terminated */
         void     *pval;   /* for reference types */
     };
-    long long matchpos;   /* current /g match offset; 0 = start of string */
+    long long matchpos;      /* current /g match offset; 0 = start of string */
+    char     *blessed_class; /* NULL unless bless'd */
 } PerlValue;
 
 /* allocation */
@@ -241,6 +242,11 @@ PerlValue *perl_ref_type(PerlValue *ref);       /* "SCALAR"/"ARRAY"/"HASH"/""   
 typedef PerlValue *(*PerlSubFn)(PerlArray *);
 PerlValue *perl_make_code_ref(PerlSubFn fp);
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args);
+
+/* ── OOP / bless / method dispatch ──────────────────────────────────────── */
+PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
+void       perl_register_method(const char *key, PerlSubFn fn);
+PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args);
 
 /* ── tr/// character translation ────────────────────────────────────────── */
 /* returns count of characters translated (like Perl's tr return value) */

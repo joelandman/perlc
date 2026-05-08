@@ -39,7 +39,8 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"chr",      TK::KW_CHR},   {"ord",      TK::KW_ORD},
     {"hex",      TK::KW_HEX},   {"oct",      TK::KW_OCT},
     {"map",      TK::KW_MAP},   {"grep",     TK::KW_GREP},
-    {"warn",     TK::KW_WARN},  {"system",   TK::KW_SYSTEM}, {"eval", TK::KW_EVAL},
+    {"warn",     TK::KW_WARN},  {"system",   TK::KW_SYSTEM}, {"eval",    TK::KW_EVAL},
+    {"bless",    TK::KW_BLESS}, {"package",  TK::KW_PACKAGE},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}

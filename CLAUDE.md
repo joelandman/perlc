@@ -8,7 +8,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 15 test programs
+make test         # runs all 16 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -28,7 +28,7 @@ make clean
 
 ## Architecture
 
-- **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; }; long long matchpos; }`
+- **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; }; long long matchpos; char *blessed_class; }`
 - **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7, CODE_REF=8`
 - **PerlArray**: `{ PerlValue **elems; long long len, cap; }`
 - **PerlHash**: 64-bucket chained hash table
@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (15/15)
+### All passing tests (16/16)
 
 | Test | What it covers |
 |------|----------------|
@@ -59,6 +59,7 @@ make clean
 | `builtins2.pl` | abs/int/sqrt, uc/lc/ucfirst/lcfirst, index/rindex, chr/ord/hex/oct, reverse, map, grep, sort comparators, <=>, cmp |
 | `features.pl` | chop, warn, qw(), splice, array/hash slices, \$ENV{}, file tests (-e/-f/-d/-r/-w/-x/-z/-s/-l), system, backtick |
 | `advanced.pl` | array flattening (push/unshift/my with @arr), string `++`, @ARGV/$0, anon subs, \&sub, eval/\$@, tr/// |
+| `oop.pl` | `package`, `bless`, `->method()`, class/instance methods, `ref()` returning class name |
 
 ### Language features
 
@@ -73,6 +74,8 @@ make clean
 **Statement modifiers**: `STMT if COND`, `STMT unless COND`, `STMT while COND`, `STMT until COND`, `STMT for LIST`, `STMT foreach LIST`
 
 **Subroutines**: `sub name { }`, `@_`, list unpacking, recursion, `sub { }` (anonymous subs), `\&name` (code refs), `$f->(args)` (code ref calls), `ref($f)` → `"CODE"`
+
+**OOP**: `package Foo;` (sets current package), `bless($ref, $class)` / `bless $ref` (uses current package), `$obj->method(args)`, `Foo->method(args)` (class method), `ref($obj)` → class name; `blessed_class` stored in `PerlValue`; method dispatch via `perl_register_method`/`perl_dispatch_method`
 
 **References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
@@ -417,10 +420,27 @@ got: boom
 done
 ```
 
+### oop.pl
+```
+Rex says woof
+Whiskers says meow
+Animal
+Animal
+Rex
+I am Rex and I say woof
+3
+Counter
+```
+
+- `package Foo;` changes `currentPackage_` in parser at parse time; sub names are qualified (`Foo::bar`) if not already containing `::` and package is not "main".
+- LLVM function names mangle `::` → `__` via `subLLVMName()`: `Foo::bar` → `perlsub_Foo__bar`.
+- Method registration: only subs with `::` in name are registered via `perl_register_method("Foo::bar", fn_ptr)` at start of generated `main`.
+- `perl_dispatch_method`: if obj is a string → class method; if obj has `blessed_class` → instance method. Prepends obj to `@_` before dispatch.
+- `blessed_class`: `char*` field added to `PerlValue`; all `perl_alloc_*`, `perl_clone`, `perl_assign`, `perl_free` updated to manage it.
+
 ## Known Limitations / Not Implemented
 
 - `wantarray`, `caller`, `local`
-- Object-oriented features (`bless`, `->method()`)
 - `use` statements (parsed but ignored, except `use strict`/`use warnings`)
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
 - Named captures `(?<name>...)`
