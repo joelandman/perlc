@@ -9,6 +9,100 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/types.h>
+#include <set>
+
+static std::string readFile(const std::string &path) {
+    std::ifstream f(path);
+    if (!f) return "";
+    std::ostringstream buf; buf << f.rdbuf();
+    return buf.str();
+}
+
+static std::string dirOf(const std::string &path) {
+    auto p = path.rfind('/');
+    return p == std::string::npos ? "." : path.substr(0, p);
+}
+
+/* Inline `use Module` by prepending module tokens.
+   Pragmas (strict/warnings/feature/parent/base/constant/Exporter/Carp/POSIX/Scalar::Util)
+   are left as-is for the parser to handle or skip.
+   Returns combined token list: [module tokens...] [main tokens...] */
+static std::vector<Token> inlineModules(
+        const std::vector<Token> &tokens,
+        const std::string &baseDir,
+        std::set<std::string> &loaded)
+{
+    /* pragmas that are not files to load */
+    static const std::set<std::string> PRAGMAS = {
+        "strict","warnings","feature","parent","base",
+        "constant","Exporter","Carp","POSIX","Scalar::Util",
+        "List::Util","Data::Dumper","Storable","overload",
+    };
+
+    std::vector<Token> modTokens;  /* tokens from all inlined modules */
+
+    for (size_t i = 0; i < tokens.size(); ) {
+        if (tokens[i].kind != TK::KW_USE ||
+            i + 1 >= tokens.size() ||
+            tokens[i+1].kind != TK::IDENT) {
+            i++;
+            continue;
+        }
+
+        std::string modName = tokens[i+1].text;
+
+        /* skip to semicolon */
+        size_t j = i + 2;
+        while (j < tokens.size() && tokens[j].kind != TK::SEMI) j++;
+        i = j < tokens.size() ? j + 1 : j;  /* advance past semicolon */
+
+        if (PRAGMAS.count(modName) || loaded.count(modName)) continue;
+
+        /* convert Foo::Bar → Foo/Bar.pm */
+        std::string modPath = modName;
+        for (char &c : modPath) if (c == ':') c = '/';
+        while (modPath.find("//") != std::string::npos)
+            modPath.replace(modPath.find("//"), 2, "/");
+        modPath += ".pm";
+
+        std::vector<std::string> searchDirs = {
+            baseDir,
+            baseDir + "/lib",
+            "lib",
+            "."
+        };
+
+        for (auto &dir : searchDirs) {
+            std::string fullPath = dir + "/" + modPath;
+            if (access(fullPath.c_str(), R_OK) != 0) continue;
+
+            loaded.insert(modName);
+            std::string src = readFile(fullPath);
+            Lexer modLexer(src);
+            auto modToks = modLexer.tokenize();
+            /* strip EOF_TOK so it doesn't terminate the combined stream early */
+            if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK)
+                modToks.pop_back();
+            /* recursively inline modules referenced by this module */
+            auto expanded = inlineModules(modToks, dirOf(fullPath), loaded);
+            /* strip any EOF_TOK from expanded result too */
+            if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK)
+                expanded.pop_back();
+            modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
+            break;
+        }
+    }
+
+    if (modTokens.empty()) return tokens;
+
+    /* combined: [module tokens] + synthetic "package main;" + [main tokens] */
+    std::vector<Token> result = std::move(modTokens);
+    result.push_back({TK::KW_PACKAGE, "package", 0});
+    result.push_back({TK::IDENT,      "main",    0});
+    result.push_back({TK::SEMI,       ";",       0});
+    result.insert(result.end(), tokens.begin(), tokens.end());
+    return result;
+}
 
 static void usage(const char *prog) {
     std::cerr << "Usage: " << prog << " [options] <file.pl>\n"
@@ -56,8 +150,12 @@ int main(int argc, char **argv) {
                 std::cerr << "  " << t.line << "\t" << t.text << "\n";
         }
 
+        /* inline any 'use Module' files before parsing */
+        std::set<std::string> loaded;
+        auto expanded = inlineModules(tokens, dirOf(inputFile), loaded);
+
         /* parse */
-        Parser parser(std::move(tokens));
+        Parser parser(std::move(expanded));
         auto ast = parser.parseProgram();
 
         /* codegen */

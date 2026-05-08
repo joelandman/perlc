@@ -8,6 +8,27 @@
 
 using namespace llvm;
 
+/* collect all ScalarVar names referenced in a node (skip nested AnonSub/SubDef) */
+static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
+    switch (n.kind) {
+    case NK::ScalarVar: names.insert(n.name); return;
+    case NK::AnonSub:   return;  /* don't recurse — nested closure handles its own captures */
+    case NK::SubDef:    return;
+    default: break;
+    }
+    if (n.left)  collectAllScalarNames(*n.left,  names);
+    if (n.right) collectAllScalarNames(*n.right, names);
+    if (n.cond)  collectAllScalarNames(*n.cond,  names);
+    if (n.body)  collectAllScalarNames(*n.body,  names);
+    if (n.init)  collectAllScalarNames(*n.init,  names);
+    if (n.step)  collectAllScalarNames(*n.step,  names);
+    for (auto &b : n.branches) {
+        if (b.cond) collectAllScalarNames(*b.cond, names);
+        if (b.body) collectAllScalarNames(*b.body, names);
+    }
+    for (auto &a : n.args) collectAllScalarNames(*a, names);
+}
+
 /* mangle Foo::bar → perlsub_Foo__bar for valid LLVM identifiers */
 static std::string subLLVMName(const std::string &name) {
     std::string result = name;
@@ -202,9 +223,14 @@ void CodeGen::declareRuntime() {
     RT("perl_capture",         pv,  i64);
     RT("perl_split_regex",     av,  i8p, i8p, pv);
     /* OOP */
-    RT("perl_bless",             pv,     pv, pv);
-    RT("perl_register_method",   voidTy, i8p, i8p);
-    RT("perl_dispatch_method",   pv,     pv, i8p, av);
+    RT("perl_bless",                   pv,     pv, pv);
+    RT("perl_register_method",         voidTy, i8p, i8p);
+    RT("perl_dispatch_method",         pv,     pv, i8p, av);
+    RT("perl_dispatch_method_super",   pv,     pv, i8p, i8p, av);
+    RT("perl_set_isa",                 voidTy, i8p, i8p);
+    /* closures */
+    RT("perl_make_closure",  pv, i8p, av);
+    RT("perl_get_capture",   pv, i64);
 #undef RT
 }
 
@@ -1743,18 +1769,31 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::AnonSub: {
-        /* emit the anonymous sub as a new LLVM function, return a code ref */
+        /* Phase 1: collect captures from outer scopes */
+        std::set<std::string> usedNames;
+        collectAllScalarNames(*n.body, usedNames);
+        std::vector<std::string> captureNames;
+        std::vector<Value*>      captureVals;   /* PerlValue* loaded from outer alloca */
+        for (auto &nm : usedNames) {
+            if (nm == "_") continue;
+            if (auto *slot = lookupVar(nm)) {
+                captureNames.push_back(nm);
+                captureVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
+            }
+        }
+
+        /* Phase 2: emit the closure as an internal LLVM function */
         auto *subFT = FunctionType::get(perlPtrTy_,
                           {PointerType::getUnqual(ctx_)}, false);
         auto *subFn = Function::Create(subFT, Function::InternalLinkage,
                                        subLLVMName(n.name), mod_.get());
-        /* save state */
-        auto *savedFn    = currentFn_;
-        auto *savedBB    = builder_.GetInsertBlock();
-        auto  savedScopes = scopes_;
+        /* save codegen state */
+        auto *savedFn        = currentFn_;
+        auto *savedBB        = builder_.GetInsertBlock();
+        auto  savedScopes    = scopes_;
         auto  savedArrScopes = arrayScopes_;
-        auto  savedHashScopes = hashScopes_;
-        /* emit sub body */
+        auto  savedHashScopes= hashScopes_;
+        /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
         currentFn_ = subFn;
@@ -1763,6 +1802,15 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *argsArr = subFn->getArg(0);
         argsArr->setName("args");
         declareArray("_", argsArr);
+        /* Phase 3: initialise captured variables as local allocas */
+        auto i64Ty = Type::getInt64Ty(ctx_);
+        for (size_t i = 0; i < captureNames.size(); i++) {
+            Value *pv = callRT("perl_get_capture",
+                               {ConstantInt::get(i64Ty, (long long)i)});
+            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, captureNames[i]);
+            builder_.CreateStore(pv, alloca);
+            declareVar(captureNames[i], alloca);
+        }
         emitBlock(*n.body);
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateRet(perlUndef());
@@ -1772,10 +1820,16 @@ Value *CodeGen::emitExpr(const Node &n) {
         builder_.SetInsertPoint(savedBB);
         scopes_ = std::move(savedScopes);
         arrayScopes_ = std::move(savedArrScopes);
-        hashScopes_ = std::move(savedHashScopes);
-        /* return a code ref holding the function pointer */
+        hashScopes_  = std::move(savedHashScopes);
+
+        /* Phase 4: build captures array and return closure (or plain code ref) */
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
-        return callRT("perl_make_code_ref", {fnPtr});
+        if (captureNames.empty())
+            return callRT("perl_make_code_ref", {fnPtr});
+        Value *capsAv = callRT("perl_array_new", {});
+        for (auto *pv : captureVals)
+            callRT("perl_array_push", {capsAv, pv});
+        return callRT("perl_make_closure", {fnPtr, capsAv});
     }
 
     case NK::RefSub: {
@@ -1805,6 +1859,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_bless", {ref, cls});
     }
 
+    case NK::SetIsa: {
+        Value *child  = builder_.CreateGlobalStringPtr(n.name);
+        Value *parent = builder_.CreateGlobalStringPtr(n.sval);
+        callRT("perl_set_isa", {child, parent});
+        return perlUndef();
+    }
+
     case NK::MethodCall: {
         Value *obj = emitExpr(*n.left);
         Value *argsArr = callRT("perl_array_new", {});
@@ -1815,6 +1876,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
             Value *v = emitExpr(*arg);
             callRT("perl_array_push", {argsArr, v});
+        }
+        /* SUPER::method — dispatch starting from parent of caller package */
+        if (n.sval.size() > 7 && n.sval.substr(0, 7) == "SUPER::") {
+            std::string realMethod = n.sval.substr(7);
+            Value *callerPkg  = builder_.CreateGlobalStringPtr(n.name);
+            Value *methodStr  = builder_.CreateGlobalStringPtr(realMethod);
+            return callRT("perl_dispatch_method_super", {obj, callerPkg, methodStr, argsArr});
         }
         Value *methodStr = builder_.CreateGlobalStringPtr(n.sval);
         return callRT("perl_dispatch_method", {obj, methodStr, argsArr});

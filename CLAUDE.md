@@ -8,7 +8,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 16 test programs
+make test         # runs all 19 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (16/16)
+### All passing tests (19/19)
 
 | Test | What it covers |
 |------|----------------|
@@ -60,6 +60,9 @@ make clean
 | `features.pl` | chop, warn, qw(), splice, array/hash slices, \$ENV{}, file tests (-e/-f/-d/-r/-w/-x/-z/-s/-l), system, backtick |
 | `advanced.pl` | array flattening (push/unshift/my with @arr), string `++`, @ARGV/$0, anon subs, \&sub, eval/\$@, tr/// |
 | `oop.pl` | `package`, `bless`, `->method()`, class/instance methods, `ref()` returning class name |
+| `closures.pl` | lexical closures: anonymous subs capturing outer `my` scalars, multiple captures, independent instances |
+| `usemod.pl` | `use Module` loading `.pm` files from `lib/`, method dispatch across module boundary |
+| `inherit.pl` | `use parent`, inherited method lookup, method override, `SUPER::` dispatch |
 
 ### Language features
 
@@ -75,7 +78,13 @@ make clean
 
 **Subroutines**: `sub name { }`, `@_`, list unpacking, recursion, `sub { }` (anonymous subs), `\&name` (code refs), `$f->(args)` (code ref calls), `ref($f)` → `"CODE"`
 
+**Closures**: anonymous subs capture outer lexical `my` scalar variables by stable pointer (same `PerlValue*`); multiple captures; independent closure instances; nested closures; `PerlClosure` struct `{fn, captures[], ncaptures}` stored in `CODE_REF.pval`; `perl_get_capture(i)` retrieves captured value at closure entry; `s_current_captures`/`s_ncaptures` set before call and restored after
+
 **OOP**: `package Foo;` (sets current package), `bless($ref, $class)` / `bless $ref` (uses current package), `$obj->method(args)`, `Foo->method(args)` (class method), `ref($obj)` → class name; `blessed_class` stored in `PerlValue`; method dispatch via `perl_register_method`/`perl_dispatch_method`
+
+**Inheritance**: `use parent 'Base'` / `use base 'Base'` — emits `SetIsa` AST node → `perl_set_isa(child, parent)` at runtime; `perl_find_method` walks ISA chain; `$self->SUPER::method(args)` dispatches via `perl_dispatch_method_super(obj, caller_pkg, method, args)`
+
+**Module loading**: `use Module` scans `{scriptDir, scriptDir/lib, lib, .}` for `Module.pm`; lexes and recursively inlines; inserts synthetic `package main;` before main tokens; `EOF_TOK` stripped from each module to avoid premature termination; pragma names (`strict`, `warnings`, etc.) skipped; implemented in `inlineModules()` in `main.cpp`
 
 **References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
@@ -137,7 +146,11 @@ make clean
 - String `++` on magical strings (`/^[a-zA-Z][a-zA-Z0-9]*$/`): per-character rolling increment in `perl_inc`; non-magical strings become int 1.
 - `@ARGV`/`$0`: generated `main` is `main(int argc, char**argv)`; calls `perl_init_argv` which returns a `PerlArray*` (declared as "ARGV") and sets a stable global `$0` PerlValue*.
 - `$0` in parser: after `$` sigil, if INT token value == 0, returns `makeScalar("0", line)` rather than `CaptureVar`.
-- Anonymous subs (`sub { }`): emit an internal LLVM function, save/restore codegen state, return `perl_make_code_ref(fp)`. Closures (capturing outer lexicals) are NOT supported.
+- Anonymous subs (`sub { }`): emit an internal LLVM function, save/restore codegen state. When captures exist, `collectAllScalarNames` walks the body AST (stopping at nested `AnonSub`), loads each captured `PerlValue*` into a `PerlArray`, calls `perl_make_closure(fp, captures_array)`; otherwise calls `perl_make_code_ref(fp)`.
+- Closures: `perl_call_code_ref` saves/restores `s_current_captures`/`s_ncaptures` around the call; `perl_get_capture(i)` returns `s_current_captures[i]`; at closure entry, codegen calls `perl_get_capture(i)` for each captured name and stores the result in a new alloca — same `PerlValue*` as outer scope, so mutations are shared.
+- Inheritance: ISA table (`s_isa_table[64]`) set at program start via `perl_set_isa`; `perl_find_method` walks the ISA chain; `perl_dispatch_method_super` starts from the parent class of the caller package.
+- `use parent`/`use base`: parsed at `parseProgram` level (before general `use`-skip); emits `SetIsa` node with `name=child_pkg, sval=parent_pkg`.
+- Module inlining (`inlineModules`): strips `EOF_TOK` from module token streams before concatenating; injects `package main;` tokens between module and main tokens.
 - `eval { }` uses `jmp_buf` allocated as `[256 x i8]` alloca in the calling frame; `setjmp` is declared directly with `returns_twice` attribute; `perl_eval_push(jb*)` registers the buffer; `perl_die` does `longjmp` when eval depth > 0 and sets `$@`.
 
 ## Passing Test Expected Outputs
@@ -432,6 +445,45 @@ I am Rex and I say woof
 Counter
 ```
 
+### closures.pl
+```
+1
+2
+3
+1
+4
+12
+14
+5
+10
+2
+4
+6
+```
+
+### usemod.pl
+```
+7
+42
+120
+1
+300
+MathUtils
+```
+
+### inherit.pl
+```
+Rex says woof
+Whiskers says meow
+Dog
+Cat
+I am a dog named Rex
+I am an animal named Whiskers
+sit, shake, roll over
+Fido says bark
+Animal
+```
+
 - `package Foo;` changes `currentPackage_` in parser at parse time; sub names are qualified (`Foo::bar`) if not already containing `::` and package is not "main".
 - LLVM function names mangle `::` → `__` via `subLLVMName()`: `Foo::bar` → `perlsub_Foo__bar`.
 - Method registration: only subs with `::` in name are registered via `perl_register_method("Foo::bar", fn_ptr)` at start of generated `main`.
@@ -441,7 +493,7 @@ Counter
 ## Known Limitations / Not Implemented
 
 - `wantarray`, `caller`, `local`
-- `use` statements (parsed but ignored, except `use strict`/`use warnings`)
+- `use` statements for non-file pragmas are silently ignored; only file-backed modules in search paths are loaded
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
 - Named captures `(?<name>...)`
-- Lexical closures (anonymous subs can access `@_` but not outer lexical `my` variables)
+- `push @{EXPR}, val` — fixed (now supported); `unshift @{EXPR}, val` — not yet

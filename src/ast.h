@@ -90,7 +90,9 @@ enum class NK {
     /* OOP */
     PackageStmt,  /* package Foo;      – sval=package_name (parser sets currentPackage_) */
     BlessFunc,    /* bless $ref, $cls  – left=ref, right=class_expr                   */
-    MethodCall,   /* $obj->method(args)– left=obj, sval=method, args=extra_args       */
+    MethodCall,   /* $obj->method(args)– left=obj, sval=method, args=extra_args;
+                     name=callerPkg when sval starts with "SUPER::"                  */
+    SetIsa,       /* use parent 'Base' – name=child_pkg, sval=parent_pkg              */
 };
 
 struct Node;

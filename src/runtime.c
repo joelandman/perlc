@@ -86,6 +86,11 @@ PerlValue *perl_clone(const PerlValue *src) {
 void perl_free(PerlValue *v) {
     if (!v) return;
     if (v->tag == PERL_STRING) free(v->sval);
+    if (v->tag == PERL_CODE_REF && v->pval) {
+        PerlClosure *cl = (PerlClosure*)v->pval;
+        if (cl->captures) free(cl->captures);
+        free(cl);
+    }
     if (v->blessed_class) free(v->blessed_class);
     free(v);
 }
@@ -831,21 +836,54 @@ PerlValue *perl_ref_type(PerlValue *ref) {
     }
 }
 
-/* ── code references ─────────────────────────────────────────────────────── */
+/* ── code references & closures ──────────────────────────────────────────── */
 
-PerlValue *perl_make_code_ref(PerlSubFn fp) {
+/* active capture context — saved/restored on each code-ref call */
+static PerlValue **s_current_captures = NULL;
+static int        s_ncaptures         = 0;
+
+static PerlValue *make_code_ref_impl(PerlSubFn fp, PerlValue **caps, int ncaps) {
+    PerlClosure *cl = malloc(sizeof *cl);
+    cl->fn = fp;
+    cl->ncaptures = ncaps;
+    cl->captures  = ncaps > 0 ? malloc(ncaps * sizeof(PerlValue*)) : NULL;
+    for (int i = 0; i < ncaps; i++) cl->captures[i] = caps[i];
     PerlValue *v = malloc(sizeof *v);
     v->tag = PERL_CODE_REF;
-    v->pval = (void *)fp;
+    v->pval = cl;
     v->matchpos = 0;
+    v->blessed_class = NULL;
     return v;
+}
+
+PerlValue *perl_make_code_ref(PerlSubFn fp) {
+    return make_code_ref_impl(fp, NULL, 0);
+}
+
+PerlValue *perl_make_closure(PerlSubFn fp, PerlArray *captures) {
+    int n = captures ? (int)captures->len : 0;
+    PerlValue **caps = n > 0 ? captures->elems : NULL;
+    return make_code_ref_impl(fp, caps, n);
 }
 
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
     if (!ref || ref->tag != PERL_CODE_REF || !ref->pval)
         return perl_alloc_undef();
-    PerlSubFn fn = (PerlSubFn)ref->pval;
-    return fn(args);
+    PerlClosure *cl = (PerlClosure*)ref->pval;
+    PerlValue **saved_caps = s_current_captures;
+    int         saved_n    = s_ncaptures;
+    s_current_captures = cl->captures;
+    s_ncaptures        = cl->ncaptures;
+    PerlValue *result = cl->fn(args);
+    s_current_captures = saved_caps;
+    s_ncaptures        = saved_n;
+    return result;
+}
+
+PerlValue *perl_get_capture(long long idx) {
+    if (!s_current_captures || idx < 0 || idx >= s_ncaptures)
+        return NULL;
+    return s_current_captures[idx];
 }
 
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
@@ -857,6 +895,38 @@ PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv) {
     ref->blessed_class = cls;
     return ref;
 }
+
+/* ── inheritance (@ISA) ──────────────────────────────────────────────────── */
+
+typedef struct { char *child; char *parent; } IsaEntry;
+#define ISA_TABLE_MAX 64
+static IsaEntry s_isa_table[ISA_TABLE_MAX];
+static int      s_isa_count = 0;
+
+void perl_set_isa(const char *child, const char *parent) {
+    /* update if already registered */
+    for (int i = 0; i < s_isa_count; i++) {
+        if (strcmp(s_isa_table[i].child, child) == 0) {
+            free(s_isa_table[i].parent);
+            s_isa_table[i].parent = strdup(parent);
+            return;
+        }
+    }
+    if (s_isa_count < ISA_TABLE_MAX) {
+        s_isa_table[s_isa_count].child  = strdup(child);
+        s_isa_table[s_isa_count].parent = strdup(parent);
+        s_isa_count++;
+    }
+}
+
+static const char *perl_get_parent(const char *class_name) {
+    for (int i = 0; i < s_isa_count; i++)
+        if (strcmp(s_isa_table[i].child, class_name) == 0)
+            return s_isa_table[i].parent;
+    return NULL;
+}
+
+/* ── method dispatch table ───────────────────────────────────────────────── */
 
 typedef struct { char *key; PerlSubFn fn; } MethodEntry;
 #define METHOD_TABLE_MAX 1024
@@ -871,13 +941,27 @@ void perl_register_method(const char *key, PerlSubFn fn) {
     }
 }
 
+/* walk class and its @ISA chain; returns NULL if not found */
 static PerlSubFn perl_find_method(const char *class_name, const char *method) {
-    char key[512];
-    snprintf(key, sizeof key, "%s::%s", class_name, method);
-    for (int i = 0; i < s_method_count; i++)
-        if (strcmp(s_method_table[i].key, key) == 0)
-            return s_method_table[i].fn;
+    const char *cls = class_name;
+    while (cls) {
+        char key[512];
+        snprintf(key, sizeof key, "%s::%s", cls, method);
+        for (int i = 0; i < s_method_count; i++)
+            if (strcmp(s_method_table[i].key, key) == 0)
+                return s_method_table[i].fn;
+        cls = perl_get_parent(cls);
+    }
     return NULL;
+}
+
+static PerlArray *build_dispatch_args(PerlValue *obj, PerlArray *args) {
+    PerlArray *full = perl_array_new();
+    perl_array_push(full, obj);
+    if (args)
+        for (long long i = 0; i < args->len; i++)
+            perl_array_push(full, args->elems[i]);
+    return full;
 }
 
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
@@ -897,14 +981,24 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
                 method, class_name);
         exit(1);
     }
-    /* build full @_: prepend $self/$class then rest of args */
-    PerlArray *full_args = perl_array_new();
-    perl_array_push(full_args, obj);
-    if (args) {
-        for (long long i = 0; i < args->len; i++)
-            perl_array_push(full_args, args->elems[i]);
+    return fn(build_dispatch_args(obj, args));
+}
+
+PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
+                                      const char *method, PerlArray *args) {
+    const char *parent = perl_get_parent(caller_pkg);
+    if (!parent) {
+        fprintf(stderr, "Can't call SUPER::%s — no parent for package \"%s\"\n",
+                method, caller_pkg);
+        exit(1);
     }
-    return fn(full_args);
+    PerlSubFn fn = perl_find_method(parent, method);
+    if (!fn) {
+        fprintf(stderr, "Can't locate SUPER method \"%s\" starting from \"%s\"\n",
+                method, parent);
+        exit(1);
+    }
+    return fn(build_dispatch_args(obj, args));
 }
 
 /* ── file I/O ────────────────────────────────────────────────────────────── */

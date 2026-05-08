@@ -28,8 +28,33 @@ Token Parser::consume(TK k, const char *msg) {
 NodePtr Parser::parseProgram() {
     NodeList stmts;
     while (!check(TK::EOF_TOK)) {
-        /* skip bare 'use strict/warnings' */
         if (check(TK::KW_USE)) {
+            int line = cur().line;
+            advance(); /* consume 'use' */
+            /* use parent 'Base'  or  use base 'Base'  or  use parent qw(...) */
+            if (check(TK::IDENT) &&
+                (cur().text == "parent" || cur().text == "base")) {
+                advance();
+                std::vector<std::string> parents;
+                if (check(TK::QWORDS)) {
+                    std::istringstream iss(cur().text); advance();
+                    std::string w;
+                    while (iss >> w) parents.push_back(w);
+                } else if (check(TK::STRING)) {
+                    parents.push_back(cur().text); advance();
+                }
+                match(TK::SEMI);
+                for (auto &p : parents) {
+                    auto n = std::make_unique<Node>();
+                    n->kind = NK::SetIsa;
+                    n->name = currentPackage_; /* child */
+                    n->sval = p;               /* parent */
+                    n->line = line;
+                    stmts.push_back(std::move(n));
+                }
+                continue;
+            }
+            /* skip all other use statements */
             while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
             match(TK::SEMI); continue;
         }
@@ -482,8 +507,12 @@ NodePtr Parser::parsePush() {
     NodeList vals;
     NodePtr refExpr;
     std::string arrName;
-    /* push @$ref, val  or  push @arr, val */
-    if (check(TK::SCALAR)) {
+    /* push @{EXPR}, val  or  push @$ref, val  or  push @arr, val */
+    if (check(TK::LBRACE)) {
+        advance(); /* skip { */
+        refExpr = parseExpr();
+        consume(TK::RBRACE, "}");
+    } else if (check(TK::SCALAR)) {
         advance(); /* skip $ */
         std::string nm = cur().text; advance();
         refExpr = makeScalar(nm, line);
@@ -499,7 +528,7 @@ NodePtr Parser::parsePush() {
     if (hasParen) match(TK::RPAREN);
     auto n = std::make_unique<Node>(); n->kind = NK::PushStmt;
     n->name = arrName; n->args = std::move(vals); n->line = line;
-    if (refExpr) n->left = std::move(refExpr); /* @$ref form */
+    if (refExpr) n->left = std::move(refExpr); /* @$ref or @{EXPR} form */
     return n;
 }
 
@@ -839,11 +868,14 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                 base = std::move(n);
                 continue;
             }
-            /* ->method(args) or ->method  — method call */
+            /* ->method(args), ->SUPER::method(args) — method call */
             if (check(TK::IDENT)) {
                 std::string method = cur().text; advance();
                 auto n = std::make_unique<Node>(); n->kind = NK::MethodCall;
                 n->sval = method; n->left = std::move(base); n->line = line;
+                /* store caller package for SUPER dispatch */
+                if (method.substr(0, 7) == "SUPER::")
+                    n->name = currentPackage_;
                 if (check(TK::LPAREN)) {
                     advance();
                     while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
@@ -1128,6 +1160,15 @@ NodePtr Parser::parsePrimary() {
 
     if (check(TK::ARRAY)) {
         advance(); /* skip @ */
+        /* @{EXPR} — block deref */
+        if (check(TK::LBRACE)) {
+            advance();
+            auto inner = parseExpr();
+            consume(TK::RBRACE, "}");
+            auto n = std::make_unique<Node>(); n->kind = NK::DerefArray;
+            n->left = std::move(inner); n->line = line;
+            return n;
+        }
         /* @$ref — array deref */
         if (check(TK::SCALAR)) {
             advance();

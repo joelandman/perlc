@@ -52,3 +52,6 @@ test: $(TARGET)
 	@echo "=== features.pl  ===" && ./$(TARGET) tests/features.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null
 	@echo "=== advanced.pl  ===" && ./$(TARGET) tests/advanced.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test hello world
 	@echo "=== oop.pl       ===" && ./$(TARGET) tests/oop.pl       -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== closures.pl  ===" && ./$(TARGET) tests/closures.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== usemod.pl    ===" && ./$(TARGET) tests/usemod.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== inherit.pl   ===" && ./$(TARGET) tests/inherit.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test

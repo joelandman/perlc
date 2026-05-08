@@ -240,13 +240,28 @@ PerlValue *perl_ref_type(PerlValue *ref);       /* "SCALAR"/"ARRAY"/"HASH"/""   
 
 /* ── code references ─────────────────────────────────────────────────────── */
 typedef PerlValue *(*PerlSubFn)(PerlArray *);
-PerlValue *perl_make_code_ref(PerlSubFn fp);
+
+/* PerlClosure is the heap object stored in PERL_CODE_REF pval */
+typedef struct PerlClosure {
+    PerlSubFn   fn;
+    PerlValue **captures;  /* borrowed PerlValue* — not owned */
+    int         ncaptures;
+} PerlClosure;
+
+PerlValue *perl_make_code_ref(PerlSubFn fp);                     /* no captures */
+PerlValue *perl_make_closure(PerlSubFn fp, PerlArray *captures); /* with captures */
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args);
+PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a closure call */
 
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
 void       perl_register_method(const char *key, PerlSubFn fn);
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args);
+PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
+                                      const char *method, PerlArray *args);
+
+/* ── inheritance ─────────────────────────────────────────────────────────── */
+void       perl_set_isa(const char *child, const char *parent);
 
 /* ── tr/// character translation ────────────────────────────────────────── */
 /* returns count of characters translated (like Perl's tr return value) */
