@@ -40,6 +40,8 @@ private:
     /* loop control blocks */
     std::vector<llvm::BasicBlock *> loopExits_;
     std::vector<llvm::BasicBlock *> loopContinues_;
+    /* local() save depth at function entry (alloca holding i32) */
+    llvm::Value *localDepthAlloca_ = nullptr;
 
     /* runtime function declarations */
     std::unordered_map<std::string, llvm::Function *> rtFuncs_;

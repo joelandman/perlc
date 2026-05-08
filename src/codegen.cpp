@@ -231,6 +231,10 @@ void CodeGen::declareRuntime() {
     /* closures */
     RT("perl_make_closure",  pv, i8p, av);
     RT("perl_get_capture",   pv, i64);
+    /* local() */
+    RT("perl_local_save_depth", Type::getInt32Ty(ctx_));
+    RT("perl_local_save",       voidTy, pv);
+    RT("perl_local_restore_to", voidTy, Type::getInt32Ty(ctx_));
 #undef RT
 }
 
@@ -589,11 +593,26 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
         builder_.CreateStore(dollar0, slot0);
         declareVar("0", slot0);
+
+        Value *underscoreVal = callRT("perl_alloc_undef", {});
+        auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        builder_.CreateStore(underscoreVal, slotUs);
+        declareVar("_", slotUs);
     }
+
+    /* capture local() save depth at function entry */
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
     emitBlock(program);
     popScope();
 
+    /* restore any local()s before returning */
+    {
+        Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+        callRT("perl_local_restore_to", {depth});
+    }
     builder_.CreateRet(ConstantInt::get(Type::getInt32Ty(ctx_), 0));
 
     /* emit sub bodies */
@@ -623,11 +642,29 @@ void CodeGen::emitSub(const Node &n) {
     argsArr->setName("args");
     declareArray("_", argsArr);
 
+    /* pre-declare $_ so it's available for default-arg builtins and while(<FH>) */
+    {
+        Value *udv  = callRT("perl_alloc_undef", {});
+        auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        builder_.CreateStore(udv, slotUs);
+        declareVar("_", slotUs);
+    }
+
+    /* capture local() save depth at function entry */
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+    auto *savedLocalDepth = localDepthAlloca_;
+    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
     emitBlock(*n.body);
 
-    /* implicit return undef */
-    if (!builder_.GetInsertBlock()->getTerminator())
+    /* implicit return undef — restore locals first */
+    if (!builder_.GetInsertBlock()->getTerminator()) {
+        Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+        callRT("perl_local_restore_to", {depth});
         builder_.CreateRet(perlUndef());
+    }
+    localDepthAlloca_ = savedLocalDepth;
 
     popScope();
     currentFn_ = savedFn;
@@ -1027,7 +1064,35 @@ void CodeGen::emitStmt(const Node &n) {
 
     case NK::Return: {
         Value *v = n.left ? emitExpr(*n.left) : perlUndef();
+        /* restore any local()s before returning; clone retval first so
+           restore doesn't clobber the in-place PerlValue we're returning */
+        if (localDepthAlloca_) {
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+            Value *cloned = callRT("perl_clone", {v});
+            callRT("perl_local_restore_to", {depth});
+            v = cloned;
+        }
         builder_.CreateRet(v);
+        break;
+    }
+
+    case NK::LocalStmt: {
+        /* save current value, optionally assign new one */
+        Value *slot = lookupVar(n.name);
+        if (!slot) {
+            /* first use — declare it */
+            Value *uv = callRT("perl_alloc_undef", {});
+            slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
+            builder_.CreateStore(uv, slot);
+            declareVar(n.name, slot);
+        }
+        Value *pv = builder_.CreateLoad(perlPtrTy_, slot);
+        callRT("perl_local_save", {pv});
+        if (n.left) {
+            Value *rhs = emitExpr(*n.left);
+            callRT("perl_assign", {pv, rhs});
+        }
         break;
     }
 
@@ -1788,11 +1853,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto *subFn = Function::Create(subFT, Function::InternalLinkage,
                                        subLLVMName(n.name), mod_.get());
         /* save codegen state */
-        auto *savedFn        = currentFn_;
-        auto *savedBB        = builder_.GetInsertBlock();
-        auto  savedScopes    = scopes_;
-        auto  savedArrScopes = arrayScopes_;
-        auto  savedHashScopes= hashScopes_;
+        auto *savedFn         = currentFn_;
+        auto *savedBB         = builder_.GetInsertBlock();
+        auto  savedScopes     = scopes_;
+        auto  savedArrScopes  = arrayScopes_;
+        auto  savedHashScopes = hashScopes_;
+        auto *savedLocalDepth = localDepthAlloca_;
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
@@ -1802,6 +1868,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *argsArr = subFn->getArg(0);
         argsArr->setName("args");
         declareArray("_", argsArr);
+        /* fresh local() depth for this closure */
+        {
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+            builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+        }
         /* Phase 3: initialise captured variables as local allocas */
         auto i64Ty = Type::getInt64Ty(ctx_);
         for (size_t i = 0; i < captureNames.size(); i++) {
@@ -1812,15 +1884,20 @@ Value *CodeGen::emitExpr(const Node &n) {
             declareVar(captureNames[i], alloca);
         }
         emitBlock(*n.body);
-        if (!builder_.GetInsertBlock()->getTerminator())
+        if (!builder_.GetInsertBlock()->getTerminator()) {
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+            callRT("perl_local_restore_to", {depth});
             builder_.CreateRet(perlUndef());
+        }
         popScope();
         /* restore state */
-        currentFn_ = savedFn;
+        currentFn_        = savedFn;
         builder_.SetInsertPoint(savedBB);
-        scopes_ = std::move(savedScopes);
-        arrayScopes_ = std::move(savedArrScopes);
-        hashScopes_  = std::move(savedHashScopes);
+        scopes_           = std::move(savedScopes);
+        arrayScopes_      = std::move(savedArrScopes);
+        hashScopes_       = std::move(savedHashScopes);
+        localDepthAlloca_ = savedLocalDepth;
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));

@@ -146,6 +146,51 @@ Token Lexer::readRegex() {
     return {TK::REGEX, pattern + "\x01" + flags, line_};
 }
 
+Token Lexer::readHeredoc() {
+    /* pos_ is just past the second '<'. Handle <<IDENT, <<"IDENT", <<'IDENT' */
+    bool interp = true;
+    char quote  = 0;
+    if (pos_ < src_.size() && (src_[pos_] == '"' || src_[pos_] == '\'')) {
+        quote  = src_[pos_++];
+        interp = (quote == '"');
+    }
+    /* read delimiter name */
+    std::string delim;
+    while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+        delim += src_[pos_++];
+    if (delim.empty())
+        return {TK::EOF_TOK, "", line_}; /* not a heredoc — caller handles */
+    if (quote && pos_ < src_.size() && src_[pos_] == quote)
+        pos_++; /* consume closing quote */
+
+    /* locate end of current line */
+    size_t lineEnd = pos_;
+    while (lineEnd < src_.size() && src_[lineEnd] != '\n') lineEnd++;
+
+    /* collect heredoc body from subsequent lines */
+    size_t p = (lineEnd < src_.size()) ? lineEnd + 1 : lineEnd;
+    std::string body;
+    int extraLines = 0;
+    while (p < src_.size()) {
+        size_t ls = p;
+        while (p < src_.size() && src_[p] != '\n') p++;
+        std::string ln = src_.substr(ls, p - ls);
+        if (p < src_.size()) p++; /* skip \n */
+        extraLines++;
+        if (ln == delim) break; /* terminator line */
+        body += ln + "\n";
+    }
+
+    /* after the current line's \n is consumed, jump past the heredoc body */
+    pendingHeredocPos_   = p;
+    pendingHeredocLines_ = extraLines;
+
+    if (interp)
+        return {TK::STRING, "\x01" + body, line_};
+    else
+        return {TK::STRING, body, line_};
+}
+
 Token Lexer::readSubst() {
     /* pos_ is just past 's/' — read pattern / replacement / flags */
     auto readSection = [&](char delim) {
@@ -173,8 +218,16 @@ std::vector<Token> Lexer::tokenize() {
         char c = peek();
 
         /* whitespace */
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            advance(); continue;
+        if (c == ' ' || c == '\t' || c == '\r') { advance(); continue; }
+        if (c == '\n') {
+            advance();
+            if (pendingHeredocPos_) {
+                pos_   = pendingHeredocPos_;
+                line_ += pendingHeredocLines_;
+                pendingHeredocPos_   = 0;
+                pendingHeredocLines_ = 0;
+            }
+            continue;
         }
 
         /* shebang line */
@@ -385,6 +438,13 @@ std::vector<Token> Lexer::tokenize() {
                 else toks.push_back({TK::NOT, "!", line_});
                 break;
             case '<': {
+                if (peek() == '<') {
+                    pos_++; /* consume second < */
+                    Token t = readHeredoc();
+                    if (t.kind != TK::EOF_TOK) { toks.push_back(t); break; }
+                    /* fallthrough: treat as unknown (no bare << operator in Perl we need) */
+                    break;
+                }
                 if (peek() == '=' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '>') {
                     pos_ += 2; toks.push_back({TK::SPACESHIP, "<=>", line_}); break;
                 }

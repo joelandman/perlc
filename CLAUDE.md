@@ -8,7 +8,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 19 test programs
+make test         # runs all 20 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (19/19)
+### All passing tests (20/20)
 
 | Test | What it covers |
 |------|----------------|
@@ -63,6 +63,7 @@ make clean
 | `closures.pl` | lexical closures: anonymous subs capturing outer `my` scalars, multiple captures, independent instances |
 | `usemod.pl` | `use Module` loading `.pm` files from `lib/`, method dispatch across module boundary |
 | `inherit.pl` | `use parent`, inherited method lookup, method override, `SUPER::` dispatch |
+| `defaults.pl` | heredocs (`<<END`, `<<'END'`, `<<"END"`), `$_` as default (foreach/chomp/s///), `local` |
 
 ### Language features
 
@@ -77,6 +78,12 @@ make clean
 **Statement modifiers**: `STMT if COND`, `STMT unless COND`, `STMT while COND`, `STMT until COND`, `STMT for LIST`, `STMT foreach LIST`
 
 **Subroutines**: `sub name { }`, `@_`, list unpacking, recursion, `sub { }` (anonymous subs), `\&name` (code refs), `$f->(args)` (code ref calls), `ref($f)` → `"CODE"`
+
+**Heredocs**: `<<IDENT`, `<<"IDENT"` (interpolating), `<<'IDENT'` (literal); body collected from subsequent lines until terminator line; `EOF_TOK`-jump mechanism in lexer preserves rest-of-line tokens; interpolating heredocs get `\x01` prefix same as double-quoted strings
+
+**`$_` as default variable**: `foreach (@arr) { }` (no explicit var) loops over `$_`; `while (<FH>)` bare readline auto-assigns to `$_`; `chomp`/`chop` without args operate on `$_`; bare `/regex/`, `s///`, `tr///` bind to `$_`; `$_` pre-declared (as undef) in every function scope (main and subs)
+
+**`local`**: `local $x` / `local $x = val` — dynamic save/restore; `perl_local_save_depth()` + `perl_local_save(pv)` + `perl_local_restore_to(depth)` runtime API; `s_local_stack[256]` with deep-copy of string/blessed_class; depth captured at each function entry; restored before every explicit `return` (with cloned retval) and at implicit-return; `AnonSub` codegen saves/restores `localDepthAlloca_` to prevent cross-function reference errors
 
 **Closures**: anonymous subs capture outer lexical `my` scalar variables by stable pointer (same `PerlValue*`); multiple captures; independent closure instances; nested closures; `PerlClosure` struct `{fn, captures[], ncaptures}` stored in `CODE_REF.pval`; `perl_get_capture(i)` retrieves captured value at closure entry; `s_current_captures`/`s_ncaptures` set before call and restored after
 
@@ -151,6 +158,10 @@ make clean
 - Inheritance: ISA table (`s_isa_table[64]`) set at program start via `perl_set_isa`; `perl_find_method` walks the ISA chain; `perl_dispatch_method_super` starts from the parent class of the caller package.
 - `use parent`/`use base`: parsed at `parseProgram` level (before general `use`-skip); emits `SetIsa` node with `name=child_pkg, sval=parent_pkg`.
 - Module inlining (`inlineModules`): strips `EOF_TOK` from module token streams before concatenating; injects `package main;` tokens between module and main tokens.
+- Heredocs: `pendingHeredocPos_`/`pendingHeredocLines_` fields on Lexer; set in `readHeredoc()`, consumed on the next `\n` in the tokenize loop; body lines collected between heredoc declaration line and terminator line.
+- `$_` pre-declaration: both main-function codegen and `emitSub()` pre-declare `$_` as undef before emitting the body, ensuring it's accessible for implicit-arg builtins.
+- `local` restore ordering: before explicit `return`, the return value is first cloned via `perl_clone` so the subsequent `perl_local_restore_to` (which overwrites the in-place PerlValue) doesn't corrupt the returned value.
+- `AnonSub` codegen saves/restores `localDepthAlloca_` alongside other function state to prevent cross-function IR dominance violations.
 - `eval { }` uses `jmp_buf` allocated as `[256 x i8]` alloca in the calling frame; `setjmp` is declared directly with `returns_twice` attribute; `perl_eval_push(jb*)` registers the buffer; `perl_die` does `longjmp` when eval depth > 0 and sets `$@`.
 
 ## Passing Test Expected Outputs
@@ -490,9 +501,28 @@ Animal
 - `perl_dispatch_method`: if obj is a string → class method; if obj has `blessed_class` → instance method. Prepends obj to `@_` before dispatch.
 - `blessed_class`: `char*` field added to `PerlValue`; all `perl_alloc_*`, `perl_clone`, `perl_assign`, `perl_free` updated to manage it.
 
+### defaults.pl
+```
+Hello, World!
+Line two
+No $name interpolation here
+Hello, Alice!
+1
+2
+3
+4
+5
+hello
+Hello Perl
+matched
+99
+10
+```
+
 ## Known Limitations / Not Implemented
 
-- `wantarray`, `caller`, `local`
+- `wantarray`, `caller`
+- `local` only restores scalars; does not restore arrays, hashes, or special variables (`$/`, `$,`, `$\`)
 - `use` statements for non-file pragmas are silently ignored; only file-backed modules in search paths are loaded
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
 - Named captures `(?<name>...)`

@@ -93,6 +93,7 @@ enum class NK {
     MethodCall,   /* $obj->method(args)– left=obj, sval=method, args=extra_args;
                      name=callerPkg when sval starts with "SUPER::"                  */
     SetIsa,       /* use parent 'Base' – name=child_pkg, sval=parent_pkg              */
+    LocalStmt,    /* local $x [= expr] – name=var_name, left=init(opt)               */
 };
 
 struct Node;

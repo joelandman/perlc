@@ -12,6 +12,38 @@
 #include <sys/wait.h>
 #include <setjmp.h>
 
+/* ── local() save/restore stack ─────────────────────────────────────────── */
+
+#define LOCAL_STACK_MAX 256
+typedef struct { PerlValue *ptr; PerlValue saved; } LocalEntry;
+static LocalEntry s_local_stack[LOCAL_STACK_MAX];
+static int        s_local_depth = 0;
+
+int perl_local_save_depth(void) { return s_local_depth; }
+
+void perl_local_save(PerlValue *pv) {
+    if (s_local_depth >= LOCAL_STACK_MAX) return;
+    s_local_stack[s_local_depth].ptr   = pv;
+    s_local_stack[s_local_depth].saved = *pv;
+    /* deep-copy string/blessed_class so the saved value is independent */
+    if (pv->tag == PERL_STRING && pv->sval)
+        s_local_stack[s_local_depth].saved.sval = strdup(pv->sval);
+    if (pv->blessed_class)
+        s_local_stack[s_local_depth].saved.blessed_class = strdup(pv->blessed_class);
+    s_local_depth++;
+}
+
+void perl_local_restore_to(int depth) {
+    while (s_local_depth > depth) {
+        s_local_depth--;
+        LocalEntry *e = &s_local_stack[s_local_depth];
+        /* free any existing string/blessed_class in the target */
+        if ((e->ptr->tag == PERL_STRING) && e->ptr->sval) free(e->ptr->sval);
+        if (e->ptr->blessed_class) free(e->ptr->blessed_class);
+        *e->ptr = e->saved;  /* restore saved value */
+    }
+}
+
 /* ── eval / $@ support ───────────────────────────────────────────────────── */
 
 /* jmp_buf pointers are pushed by callers (codegen allocates jmp_buf on stack) */

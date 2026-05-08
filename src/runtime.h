@@ -267,6 +267,11 @@ void       perl_set_isa(const char *child, const char *parent);
 /* returns count of characters translated (like Perl's tr return value) */
 long long  perl_tr(PerlValue *str, const char *search, const char *replace, const char *flags);
 
+/* ── local() dynamic save/restore ───────────────────────────────────────── */
+int  perl_local_save_depth(void);              /* current save-stack depth */
+void perl_local_save(PerlValue *pv);           /* save current state of *pv */
+void perl_local_restore_to(int depth);         /* restore all saved since depth */
+
 /* ── eval / exception handling ───────────────────────────────────────────── */
 /* codegen allocates jmp_buf on stack and calls setjmp directly;
    perl_eval_push/pop manage the eval stack of jmp_buf pointers */

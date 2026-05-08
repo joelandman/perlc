@@ -71,6 +71,8 @@ private:
     std::string src_;
     size_t      pos_  = 0;
     int         line_ = 1;
+    size_t      pendingHeredocPos_   = 0; /* if set, jump here after consuming the next \n */
+    int         pendingHeredocLines_ = 0; /* extra line count for the heredoc body */
 
     char peek(int offset = 0) const;
     char advance();

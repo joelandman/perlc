@@ -89,6 +89,16 @@ NodePtr Parser::parseStmt() {
     }
 
     if (check(TK::KW_MY) || check(TK::KW_OUR)) return parseMy();
+    if (check(TK::KW_LOCAL)) {
+        advance(); /* consume 'local' */
+        consume(TK::SCALAR, "$");
+        std::string varName = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::LocalStmt;
+        n->name = varName; n->line = line;
+        if (match(TK::ASSIGN))
+            n->left = parseExpr();
+        return parseModifier(std::move(n), line);
+    }
     if (check(TK::KW_IF))      return parseIf();
     if (check(TK::KW_UNLESS)) {
         /* desugar: unless(C) B  →  if(!C) B */
@@ -230,6 +240,14 @@ NodePtr Parser::parseWhile() {
     consume(TK::KW_WHILE);
     consume(TK::LPAREN, "(");
     auto cond = parseExpr();
+    /* while (<FH>) without explicit assignment → while ($_ = <FH>) */
+    if (cond->kind == NK::Readline) {
+        auto assign = std::make_unique<Node>(); assign->kind = NK::Assign;
+        assign->left  = makeScalar("_", line);
+        assign->right = std::move(cond);
+        assign->line  = line;
+        cond = std::move(assign);
+    }
     consume(TK::RPAREN, ")");
     auto body = parseBlock();
     auto n = std::make_unique<Node>(); n->kind = NK::While; n->line = line;
@@ -1361,8 +1379,15 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_CHOMP) || check(TK::KW_CHOP)) {
         bool isChomp = check(TK::KW_CHOMP); advance();
         bool hasParen = match(TK::LPAREN);
-        auto inner = parseExpr();
-        if (hasParen) consume(TK::RPAREN, ")");
+        NodePtr inner;
+        if (hasParen) {
+            inner = parseExpr();
+            consume(TK::RPAREN, ")");
+        } else if (check(TK::SEMI) || check(TK::RBRACE) || check(TK::EOF_TOK) || isModifier()) {
+            inner = makeScalar("_", line); /* default to $_ */
+        } else {
+            inner = parseExpr();
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::ChompFunc;
         n->left = std::move(inner); n->sval = isChomp ? "chomp" : "chop";
         n->line = line; return n;
@@ -1646,11 +1671,34 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* REGEX literal used outside split/binding — treat as string (pattern only) */
+    /* Bare /regex/ outside split/binding — match against $_ */
     if (check(TK::REGEX)) {
         std::string txt = cur().text; advance();
         size_t sep = txt.find('\x01');
-        return makeStr(txt.substr(0, sep), line);
+        auto n = std::make_unique<Node>(); n->kind = NK::RegexMatch; n->line = line;
+        n->left = makeScalar("_", line);
+        n->sval = txt.substr(0, sep);
+        n->name = (sep != std::string::npos) ? txt.substr(sep + 1) : "";
+        n->ival = 0;
+        return n;
+    }
+    /* Bare s/// — substitute on $_ */
+    if (check(TK::SUBST)) {
+        std::string txt = cur().text; advance();
+        size_t s1 = txt.find('\x01'), s2 = txt.find('\x01', s1 + 1);
+        auto n = std::make_unique<Node>(); n->kind = NK::RegexSubst; n->line = line;
+        n->left = makeScalar("_", line);
+        n->sval = txt.substr(0, s1);
+        n->name = txt.substr(s1 + 1, s2 - s1 - 1) + "\x01" + txt.substr(s2 + 1);
+        return n;
+    }
+    /* Bare tr/// — translate on $_ */
+    if (check(TK::TR)) {
+        std::string txt = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::TrOp; n->line = line;
+        n->left = makeScalar("_", line);
+        n->sval = txt;
+        return n;
     }
 
     /* splice(@arr, off[, len[, repl...]]) */
