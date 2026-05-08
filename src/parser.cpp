@@ -111,10 +111,10 @@ NodePtr Parser::parseStmt() {
             TK t2 = peek(2).kind;
             /* only treat $var as filehandle when the next token starts a new
              * expression — not when it's an operator or list separator */
+            /* LBRACKET/LBRACE excluded: $arr[i] and $hash{k} are subscripts, not fh */
             bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
                             t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                            t2 == TK::IDENT  || t2 == TK::LPAREN ||
-                            t2 == TK::LBRACKET || t2 == TK::LBRACE);
+                            t2 == TK::IDENT  || t2 == TK::LPAREN);
             if (isFhCtx) { pos_++; fhname = advance().text; }
         }
         bool hasParen = check(TK::LPAREN);
@@ -434,10 +434,10 @@ NodePtr Parser::parsePrint(bool isSay) {
         fhname = cur().text; advance();
     } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
         TK t2 = peek(2).kind;
+        /* LBRACKET/LBRACE excluded: $arr[i] and $hash{k} are subscripts, not fh */
         bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
                         t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                        t2 == TK::IDENT  || t2 == TK::LPAREN ||
-                        t2 == TK::LBRACKET || t2 == TK::LBRACE);
+                        t2 == TK::IDENT  || t2 == TK::LPAREN);
         if (isFhCtx) {
             pos_++;  /* skip $ */
             fhname = advance().text;  /* variable name */

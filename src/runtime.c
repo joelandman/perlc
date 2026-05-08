@@ -831,15 +831,16 @@ PerlArray *perl_readline_all_stdin(void) {
 }
 
 void perl_print_fh(PerlValue *fh, PerlValue *v) {
-    FILE *fp = (fh && fh->tag == PERL_FILEHANDLE && fh->pval) ? (FILE*)fh->pval : stdout;
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     char *s = perl_to_string(v);
-    fputs(s, fp);
+    fputs(s, (FILE*)fh->pval);
     free(s);
 }
 
 void perl_say_fh(PerlValue *fh, PerlValue *v) {
-    FILE *fp = (fh && fh->tag == PERL_FILEHANDLE && fh->pval) ? (FILE*)fh->pval : stdout;
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     char *s = perl_to_string(v);
+    FILE *fp = (FILE*)fh->pval;
     fputs(s, fp);
     fputc('\n', fp);
     free(s);

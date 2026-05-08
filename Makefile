@@ -47,3 +47,4 @@ test: $(TARGET)
 	@echo "=== modifiers.pl ===" && ./$(TARGET) tests/modifiers.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== range.pl     ===" && ./$(TARGET) tests/range.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== sprintf.pl   ===" && ./$(TARGET) tests/sprintf.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== fileio.pl    ===" && ./$(TARGET) tests/fileio.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null

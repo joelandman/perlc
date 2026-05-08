@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (11/11)
+### All passing tests (12/12)
 
 | Test | What it covers |
 |------|----------------|
@@ -55,6 +55,7 @@ make clean
 | `modifiers.pl` | postfix if/unless/while/until/for/foreach, last/next with modifier |
 | `range.pl` | `..` range operator in for, array assignment, join, scalar context |
 | `sprintf.pl` | `sprintf`/`printf` with `%s %d %f %x %o %b %e %g %c %%`, width/precision |
+| `fileio.pl` | open/close (2-arg/3-arg), readline scalar+array, print/say/printf to fh, eof, die, unlink |
 
 ### Language features
 
@@ -286,4 +287,3 @@ done
 - `use` statements (parsed but ignored, except `use strict`/`use warnings`)
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
 - Named captures `(?<name>...)`
-- `$array[idx]` element access when array was populated from `<$fh>` in list context (in-progress)
