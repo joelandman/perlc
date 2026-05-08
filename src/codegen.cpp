@@ -494,6 +494,34 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
+    case NK::DoWhile: {
+        auto *fn   = builder_.GetInsertBlock()->getParent();
+        auto *body = BasicBlock::Create(ctx_, "dowhile.body", fn);
+        auto *cond = BasicBlock::Create(ctx_, "dowhile.cond", fn);
+        auto *exit = BasicBlock::Create(ctx_, "dowhile.end",  fn);
+
+        loopExits_.push_back(exit);
+        loopContinues_.push_back(cond);
+
+        builder_.CreateBr(body);
+        builder_.SetInsertPoint(body);
+        emitBlock(*n.body);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(cond);
+
+        builder_.SetInsertPoint(cond);
+        Value *cv = emitExpr(*n.cond);
+        Value *bv = callRT("perl_is_true", {cv});
+        Value *b  = builder_.CreateICmpNE(bv,
+                        ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+        builder_.CreateCondBr(b, body, exit);
+
+        loopExits_.pop_back();
+        loopContinues_.pop_back();
+        builder_.SetInsertPoint(exit);
+        break;
+    }
+
     case NK::For: {
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *condBB = BasicBlock::Create(ctx_, "for.cond", fn);

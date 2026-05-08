@@ -22,6 +22,7 @@ enum class NK {
     My, Our,
     If,             /* if/elsif/else */
     While,
+    DoWhile,        /* do { body } while/until (cond) – body runs first */
     For,            /* C-style for */
     Foreach,
     Last, Next, Return,

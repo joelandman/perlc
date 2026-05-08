@@ -82,6 +82,19 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_DO)) {
         advance();
         auto blk = parseBlock();
+        /* do { } while/until (cond) — post-condition loop */
+        if (check(TK::KW_WHILE) || check(TK::KW_UNTIL)) {
+            bool negate = check(TK::KW_UNTIL);
+            advance();
+            consume(TK::LPAREN, "(");
+            auto cond = parseExpr();
+            consume(TK::RPAREN, ")");
+            match(TK::SEMI);
+            if (negate) cond = makeUnary("!", std::move(cond), line);
+            auto n = std::make_unique<Node>(); n->kind = NK::DoWhile; n->line = line;
+            n->body = std::move(blk); n->cond = std::move(cond);
+            return n;
+        }
         match(TK::SEMI);
         return blk;
     }
