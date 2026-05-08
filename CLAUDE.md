@@ -8,7 +8,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 13 test programs
+make test         # runs all 14 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (13/13)
+### All passing tests (14/14)
 
 | Test | What it covers |
 |------|----------------|
@@ -57,6 +57,7 @@ make clean
 | `sprintf.pl` | `sprintf`/`printf` with `%s %d %f %x %o %b %e %g %c %%`, width/precision |
 | `fileio.pl` | open/close (2-arg/3-arg), readline scalar+array, print/say/printf to fh, eof, die, unlink |
 | `builtins2.pl` | abs/int/sqrt, uc/lc/ucfirst/lcfirst, index/rindex, chr/ord/hex/oct, reverse, map, grep, sort comparators, <=>, cmp |
+| `features.pl` | chop, warn, qw(), splice, array/hash slices, \$ENV{}, file tests (-e/-f/-d/-r/-w/-x/-z/-s/-l), system, backtick |
 
 ### Language features
 
@@ -90,7 +91,13 @@ make clean
 
 **String builtins**: `uc`, `lc`, `ucfirst`, `lcfirst`, `index($str, $sub[, $pos])`, `rindex($str, $sub[, $pos])`, `chr`, `ord`, `hex`, `oct`
 
-**Builtins**: chomp, length, substr, join, split, push, pop, shift, unshift, sort, keys, values, exists, delete, scalar, defined, ref, print, say, printf, sprintf, unlink
+**Slices**: `@arr[0,1,2]` (array slice), `@hash{'a','b'}` (hash slice); qw() and list args auto-flattened
+
+**System/env**: `system("cmd")` (exit code), `` `cmd` `` (output capture, interpolated), `$ENV{KEY}` / `$ENV{KEY}=val`
+
+**File tests**: `-e` (exists), `-f` (file), `-d` (dir), `-r` (readable), `-w` (writable), `-x` (executable), `-z` (empty), `-s` (size), `-l` (symlink), `-p` (pipe)
+
+**Builtins**: chomp, chop, length, substr, join, split, push, pop, shift, unshift, splice, sort, keys, values, exists, delete, scalar, defined, ref, warn, print, say, printf, sprintf, unlink
 
 **String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`
 
@@ -112,6 +119,10 @@ make clean
 - `reverse` in scalar context (`scalar reverse $str`) calls `perl_reverse_str`; in array context calls `perl_reverse_array`.
 - `scalar EXPR` (beyond `@arr`/`keys`/`values`): parser now falls through to `parsePrimary()` and sets `sval = "scalar_ctx"` on the inner node.
 - `index`/`rindex` pass `perlUndef()` for missing pos arg; runtime checks `pos_pv->tag != PERL_UNDEF` to distinguish "no pos given" from "pos=0".
+- File test `-e $var ? x : y` parses at postfix precedence (path is parsePrimary/parsePostfix, not full parseExpr), so the ternary binds outside the file test.
+- `qw(a b c)` → `ArrayLit` of `StringLit`; hash slice `@h{qw(a c)}` gets a single `ArrayLit` arg which codegen auto-flattens.
+- `splice` in array context (emitArrayPtr) returns removed elements as `PerlArray*`; scalar context returns element count.
+- `$ENV{key}` and `$ENV{key}=val` are special-cased in HashElem/Assign codegen (name=="ENV") to call `perl_env_get`/`perl_env_set` rather than normal hash lookup.
 
 ## Passing Test Expected Outputs
 
