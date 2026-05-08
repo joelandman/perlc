@@ -42,6 +42,7 @@ void       perl_free(PerlValue *v);
 long long  perl_to_int(const PerlValue *v);
 double     perl_to_float(const PerlValue *v);
 char      *perl_to_string(const PerlValue *v);   /* caller must free */
+int        perl_defined(const PerlValue *v);
 int        perl_is_true(const PerlValue *v);
 
 /* assignment: dst = src  (manages dst's old string if any) */
@@ -271,6 +272,13 @@ long long  perl_tr(PerlValue *str, const char *search, const char *replace, cons
 int  perl_local_save_depth(void);              /* current save-stack depth */
 void perl_local_save(PerlValue *pv);           /* save current state of *pv */
 void perl_local_restore_to(int depth);         /* restore all saved since depth */
+
+/* ── special global variables ────────────────────────────────────────────── */
+PerlValue *perl_get_input_sep(void);           /* $/ — input record separator (stable ptr) */
+PerlValue *perl_get_dollar_bang(void);         /* $! — errno string */
+void       perl_set_wantarray(int v);          /* set call context (0=scalar, 1=list) */
+PerlValue *perl_wantarray(void);               /* wantarray() builtin */
+PerlArray *perl_caller(void);                  /* caller() — returns (pkg,file,line) */
 
 /* ── eval / exception handling ───────────────────────────────────────────── */
 /* codegen allocates jmp_buf on stack and calls setjmp directly;

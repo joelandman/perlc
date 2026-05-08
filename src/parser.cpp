@@ -88,11 +88,38 @@ NodePtr Parser::parseStmt() {
         return n;
     }
 
+    if (check(TK::KW_BEGIN)) {
+        advance(); /* consume 'BEGIN' */
+        auto body = parseBlock();
+        auto n = std::make_unique<Node>(); n->kind = NK::BeginBlock; n->line = line;
+        n->body = std::move(body);
+        return n;
+    }
+    if (check(TK::KW_END)) {
+        advance(); /* consume 'END' */
+        auto body = parseBlock();
+        auto n = std::make_unique<Node>(); n->kind = NK::EndBlock; n->line = line;
+        n->body = std::move(body);
+        return n;
+    }
     if (check(TK::KW_MY) || check(TK::KW_OUR)) return parseMy();
+    if (check(TK::KW_STATE)) {
+        advance(); /* consume 'state' */
+        consume(TK::SCALAR, "$");
+        std::string varName = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::StateDecl;
+        n->name = varName; n->line = line;
+        if (match(TK::ASSIGN))
+            n->left = parseExpr();
+        return parseModifier(std::move(n), line);
+    }
     if (check(TK::KW_LOCAL)) {
         advance(); /* consume 'local' */
         consume(TK::SCALAR, "$");
-        std::string varName = cur().text; advance();
+        std::string varName;
+        if (check(TK::SLASH)) { advance(); varName = "/"; }    /* local $/ */
+        else if (check(TK::NOT)) { advance(); varName = "!"; } /* local $! */
+        else { varName = cur().text; advance(); }
         auto n = std::make_unique<Node>(); n->kind = NK::LocalStmt;
         n->name = varName; n->line = line;
         if (match(TK::ASSIGN))
@@ -957,6 +984,19 @@ NodePtr Parser::parsePrimary() {
     /* undef */
     if (check(TK::KW_UNDEF)) { advance(); auto n = std::make_unique<Node>(); n->kind = NK::UndefLit; n->line = line; return n; }
 
+    if (check(TK::KW_WANTARRAY)) {
+        advance();
+        if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::WantarrayFunc; n->line = line;
+        return n;
+    }
+    if (check(TK::KW_CALLER)) {
+        advance();
+        if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::CallerFunc; n->line = line;
+        return n;
+    }
+
     /* integer literal */
     if (check(TK::INT)) {
         long long v = std::stoll(cur().text, nullptr, 0);
@@ -1102,6 +1142,16 @@ NodePtr Parser::parsePrimary() {
             advance();
             auto n = std::make_unique<Node>(); n->kind = NK::DollarAt; n->line = line;
             return n;
+        }
+        /* $! — errno string */
+        if (check(TK::NOT)) {
+            advance();
+            return makeScalar("!", line);
+        }
+        /* $/ — input record separator */
+        if (check(TK::SLASH)) {
+            advance();
+            return makeScalar("/", line);
         }
         /* $1, $2, ... capture variables; $0 = program name */
         if (check(TK::INT)) {

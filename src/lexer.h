@@ -26,6 +26,8 @@ enum class TK {
     KW_MAP, KW_GREP,
     KW_WARN, KW_SYSTEM, KW_EVAL,
     KW_BLESS, KW_PACKAGE,
+    KW_WANTARRAY, KW_CALLER, KW_STATE,
+    KW_BEGIN, KW_END,
     SPACESHIP,    /* <=> */
     FILETEST,  /* -e/-f/-d/-r/-w/-x/-z/-s/-l/-p – text = flag char */
     QWORDS,    /* qw(...) – text = space-separated words */

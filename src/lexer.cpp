@@ -41,6 +41,9 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"map",      TK::KW_MAP},   {"grep",     TK::KW_GREP},
     {"warn",     TK::KW_WARN},  {"system",   TK::KW_SYSTEM}, {"eval",    TK::KW_EVAL},
     {"bless",    TK::KW_BLESS}, {"package",  TK::KW_PACKAGE},
+    {"wantarray",TK::KW_WANTARRAY}, {"caller", TK::KW_CALLER},
+    {"state",    TK::KW_STATE},
+    {"BEGIN",    TK::KW_BEGIN},     {"END",    TK::KW_END},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}
@@ -326,6 +329,11 @@ std::vector<Token> Lexer::tokenize() {
             TK k = (c == '$') ? TK::SCALAR : TK::ARRAY;
             pos_++;
             toks.push_back({k, std::string(1, c), line_});
+            /* $/ — force SLASH (not regex) immediately after $ sigil */
+            if (c == '$' && pos_ < src_.size() && src_[pos_] == '/') {
+                pos_++;
+                toks.push_back({TK::SLASH, "/", line_});
+            }
             continue;
         }
         if (c == '%') {

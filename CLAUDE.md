@@ -8,7 +8,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 20 test programs
+make test         # runs all 21 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (20/20)
+### All passing tests (21/21)
 
 | Test | What it covers |
 |------|----------------|
@@ -64,6 +64,7 @@ make clean
 | `usemod.pl` | `use Module` loading `.pm` files from `lib/`, method dispatch across module boundary |
 | `inherit.pl` | `use parent`, inherited method lookup, method override, `SUPER::` dispatch |
 | `defaults.pl` | heredocs (`<<END`, `<<'END'`, `<<"END"`), `$_` as default (foreach/chomp/s///), `local` |
+| `newfeatures.pl` | `state` variables, `wantarray`, `caller`, `$!` (errno), `$/` with `local $/`, `BEGIN`/`END` blocks, `defined()` |
 
 ### Language features
 
@@ -163,6 +164,14 @@ make clean
 - `local` restore ordering: before explicit `return`, the return value is first cloned via `perl_clone` so the subsequent `perl_local_restore_to` (which overwrites the in-place PerlValue) doesn't corrupt the returned value.
 - `AnonSub` codegen saves/restores `localDepthAlloca_` alongside other function state to prevent cross-function IR dominance violations.
 - `eval { }` uses `jmp_buf` allocated as `[256 x i8]` alloca in the calling frame; `setjmp` is declared directly with `returns_twice` attribute; `perl_eval_push(jb*)` registers the buffer; `perl_die` does `longjmp` when eval depth > 0 and sets `$@`.
+- `emitBlock`/`emitBlockLast` save `perl_local_save_depth()` into a per-block i32 alloca and call `perl_local_restore_to(depth)` on normal exit; early exits (return) are handled by the return handler's own restore (which is a no-op if depth is already lower).
+- `state` variables: each `state $x` emits a module-level `ptr` global (starts null) and an `i8` flag global; on first call the flag is 0 → allocates/initializes the PerlValue* and stores in the global; subsequent calls load the existing pointer; mutations via the local alloca (which holds the same pointer) are reflected in the global.
+- `defined()` calls `perl_defined(v)` which returns `v && v->tag != PERL_UNDEF`; was previously a stub returning 1 always.
+- `$!` returns `&s_dollar_bang` (static PerlValue in runtime); refreshes `strerror(errno)` on each call.
+- `$/` returns `&s_input_sep` (static PerlValue); `ensure_input_sep()` lazy-inits to `"\n"` on first access; `local $/` saves/restores via the normal local stack since the pointer is stable.
+- `$/` lexer: after `$` sigil, if the next character is `/`, force-emit `TK::SLASH` immediately to prevent the `/` from being lexed as a regex start.
+- `BEGIN { }` is emitted inline as code in the position it appears; `END { }` compiles the block as an internal function and registers it with `atexit()`.
+- `caller()` in list context uses `emitArrayPtr(NK::CallerFunc)` which returns the full `PerlArray*` from `perl_caller()`; in scalar context `emitExpr` returns the first element.
 
 ## Passing Test Expected Outputs
 
@@ -519,11 +528,48 @@ matched
 10
 ```
 
+### newfeatures.pl
+```
+1
+2
+3
+12
+14
+scalar
+sep defined
+inner undef
+sep restored
+errno ok
+init=1
+caller ok
+done
+end ok
+```
+
+**`state` variables**: `state $x [= expr]` — per-sub static variable; backed by a module-level `PerlValue*` global + i8 init flag; initialized once (lazily on first call); mutations persist across calls
+
+**`wantarray`**: stub always returns false (scalar context); call `wantarray()` compiles and runs; proper context tracking not yet implemented
+
+**`caller`**: stub returns `("main", "unknown", 0)` in list context; `my ($pkg) = caller()` works
+
+**`$!` (errno)**: `$!` → `perl_get_dollar_bang()` — refreshes `strerror(errno)` on each access; usable in error messages after failed I/O
+
+**`$/ (input record separator)**: `$/` reads the global sep; `$/ = undef` sets slurp mode; `local $/ = undef` temporarily enables slurp mode (properly restored at block exit); `perl_readline` respects `$/`
+
+**`BEGIN`/`END` blocks**: `BEGIN { }` runs inline at point of declaration in main; `END { }` compiles as a function registered via `atexit()`, runs at program exit
+
+**`defined()` builtin**: properly checks `v->tag != PERL_UNDEF` (was previously a stub always returning true); works with `$!`, `$/`, and any variable
+
+**Block-scoped `local` restore**: `emitBlock`/`emitBlockLast` now save/restore the local save-stack depth at every block boundary, so `local` variables in bare blocks (`{ local $x = 5; ... }`) restore correctly at block exit
+
 ## Known Limitations / Not Implemented
 
-- `wantarray`, `caller`
-- `local` only restores scalars; does not restore arrays, hashes, or special variables (`$/`, `$,`, `$\`)
+- `wantarray` stub always returns false; proper context tracking not implemented
+- `caller` stub always returns `("main", "unknown", 0)`; real call stack not tracked
+- `local` for arrays and hashes not implemented (scalars and special vars only)
 - `use` statements for non-file pragmas are silently ignored; only file-backed modules in search paths are loaded
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
 - Named captures `(?<name>...)`
-- `push @{EXPR}, val` — fixed (now supported); `unshift @{EXPR}, val` — not yet
+- `require`/`do FILE` at runtime — module loading only at compile time via `inlineModules()`
+- `AUTOLOAD`, `DESTROY` not implemented
+- `unshift @{EXPR}, val` — not yet supported (push @{EXPR} is supported)

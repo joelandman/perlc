@@ -235,6 +235,12 @@ void CodeGen::declareRuntime() {
     RT("perl_local_save_depth", Type::getInt32Ty(ctx_));
     RT("perl_local_save",       voidTy, pv);
     RT("perl_local_restore_to", voidTy, Type::getInt32Ty(ctx_));
+    /* special globals */
+    RT("perl_get_input_sep",    pv);
+    RT("perl_get_dollar_bang",  pv);
+    RT("perl_wantarray",        pv);
+    RT("perl_caller",           av);
+    RT("perl_defined",          Type::getInt32Ty(ctx_), pv);
 #undef RT
 }
 
@@ -531,6 +537,9 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         }
         return res;
     }
+    if (n.kind == NK::CallerFunc) {
+        return callRT("perl_caller", {});
+    }
     return nullptr;
 }
 
@@ -676,17 +685,25 @@ void CodeGen::emitSub(const Node &n) {
 /* ── statement emission ──────────────────────────────────────────────────── */
 
 Value *CodeGen::emitBlock(const Node &n) {
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+    auto *bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
+    builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     pushScope();
     for (auto &stmt : n.args) {
         emitStmt(*stmt);
         if (builder_.GetInsertBlock()->getTerminator()) break;
     }
     popScope();
+    if (!builder_.GetInsertBlock()->getTerminator())
+        callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     return nullptr;
 }
 
 /* Emit a block and return the PerlValue* of its last expression statement. */
 Value *CodeGen::emitBlockLast(const Node &n) {
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+    auto *bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
+    builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     pushScope();
     Value *result = perlUndef();
     for (size_t i = 0; i < n.args.size(); i++) {
@@ -700,6 +717,8 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         if (builder_.GetInsertBlock()->getTerminator()) { result = perlUndef(); break; }
     }
     popScope();
+    if (!builder_.GetInsertBlock()->getTerminator())
+        callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     return result;
 }
 
@@ -1079,20 +1098,85 @@ void CodeGen::emitStmt(const Node &n) {
 
     case NK::LocalStmt: {
         /* save current value, optionally assign new one */
-        Value *slot = lookupVar(n.name);
-        if (!slot) {
-            /* first use — declare it */
-            Value *uv = callRT("perl_alloc_undef", {});
-            slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
-            builder_.CreateStore(uv, slot);
-            declareVar(n.name, slot);
+        Value *pv;
+        if (n.name == "/") {
+            pv = callRT("perl_get_input_sep", {});
+        } else if (n.name == "!") {
+            pv = callRT("perl_get_dollar_bang", {});
+        } else {
+            Value *slot = lookupVar(n.name);
+            if (!slot) {
+                Value *uv = callRT("perl_alloc_undef", {});
+                slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
+                builder_.CreateStore(uv, slot);
+                declareVar(n.name, slot);
+            }
+            pv = builder_.CreateLoad(perlPtrTy_, slot);
         }
-        Value *pv = builder_.CreateLoad(perlPtrTy_, slot);
         callRT("perl_local_save", {pv});
         if (n.left) {
             Value *rhs = emitExpr(*n.left);
             callRT("perl_assign", {pv, rhs});
         }
+        break;
+    }
+
+    case NK::StateDecl: {
+        auto *fn  = builder_.GetInsertBlock()->getParent();
+        auto *ptrTy = perlPtrTy_;
+        auto *i8Ty  = Type::getInt8Ty(ctx_);
+        /* module-level globals: the PerlValue* and an init flag */
+        static int stateSeq = 0;
+        std::string gname = "state.ptr." + std::to_string(stateSeq);
+        std::string gflag = "state.init." + std::to_string(stateSeq++);
+        auto *gptr = new GlobalVariable(*mod_, ptrTy, false,
+            GlobalValue::InternalLinkage, ConstantPointerNull::get(ptrTy), gname);
+        auto *ginit = new GlobalVariable(*mod_, i8Ty, false,
+            GlobalValue::InternalLinkage, ConstantInt::get(i8Ty, 0), gflag);
+        /* local alloca holds the same PerlValue* as the global */
+        auto *slot = builder_.CreateAlloca(ptrTy, nullptr, ("$" + n.name).c_str());
+        declareVar(n.name, slot);
+        auto *initBB = BasicBlock::Create(ctx_, "state.init", fn);
+        auto *doneBB = BasicBlock::Create(ctx_, "state.done", fn);
+        Value *flag = builder_.CreateLoad(i8Ty, ginit);
+        Value *isInited = builder_.CreateICmpNE(flag, ConstantInt::get(i8Ty, 0));
+        builder_.CreateCondBr(isInited, doneBB, initBB);
+        builder_.SetInsertPoint(initBB);
+        Value *initVal = n.left ? emitExpr(*n.left) : callRT("perl_alloc_undef", {});
+        builder_.CreateStore(initVal, gptr);
+        builder_.CreateStore(ConstantInt::get(i8Ty, 1), ginit);
+        builder_.CreateBr(doneBB);
+        builder_.SetInsertPoint(doneBB);
+        Value *finalPtr = builder_.CreateLoad(ptrTy, gptr);
+        builder_.CreateStore(finalPtr, slot);
+        break;
+    }
+
+    case NK::BeginBlock: {
+        /* emit as inline code called immediately (at start of main) */
+        emitBlock(*n.body);
+        break;
+    }
+
+    case NK::EndBlock: {
+        /* compile END body as a function and register via atexit */
+        auto *fn = builder_.GetInsertBlock()->getParent();
+        auto *savedBB = builder_.GetInsertBlock();
+        static int endSeq = 0;
+        std::string endName = "perl_end_" + std::to_string(endSeq++);
+        auto *endFnTy = FunctionType::get(Type::getVoidTy(ctx_), false);
+        auto *endFn = Function::Create(endFnTy, Function::InternalLinkage, endName, mod_.get());
+        auto *entryBB = BasicBlock::Create(ctx_, "entry", endFn);
+        builder_.SetInsertPoint(entryBB);
+        emitBlock(*n.body);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateRetVoid();
+        builder_.SetInsertPoint(savedBB);
+        /* call atexit with the END function */
+        auto *atexitFnTy = FunctionType::get(Type::getInt32Ty(ctx_),
+            {PointerType::get(endFnTy, 0)}, false);
+        auto *atexitFn = mod_->getOrInsertFunction("atexit", atexitFnTy).getCallee();
+        builder_.CreateCall(cast<Function>(atexitFn), {endFn});
         break;
     }
 
@@ -1167,6 +1251,8 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::StringLit: return perlStr(n.sval);
 
     case NK::ScalarVar: {
+        if (n.name == "!")  return callRT("perl_get_dollar_bang", {});
+        if (n.name == "/")  return callRT("perl_get_input_sep",   {});
         auto *slot = lookupVar(n.name);
         if (!slot) return perlUndef();
         return builder_.CreateLoad(perlPtrTy_, slot, n.name);
@@ -1369,6 +1455,15 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_array_set", {av, idx, rhs});
             return rhs;
         }
+        /* special globals: $/ and $! assigned through stable pointer */
+        if (n.left->kind == NK::ScalarVar &&
+            (n.left->name == "/" || n.left->name == "!")) {
+            Value *rhs = emitExpr(*n.right);
+            Value *pv  = (n.left->name == "/") ? callRT("perl_get_input_sep",  {})
+                                                : callRT("perl_get_dollar_bang", {});
+            callRT("perl_assign", {pv, rhs});
+            return rhs;
+        }
         Value *rhs = emitExpr(*n.right);
         Value *lhs = emitLValue(*n.left);
         if (lhs) {
@@ -1404,12 +1499,11 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::DefinedFunc: {
-        /* return 1 if not undef — simplified */
-        Value *v  = emitExpr(*n.left);
-        Value *ti = callRT("perl_to_int", {v});
-        /* Actually check tag == UNDEF. For now: is_true gives false for undef */
-        /* We'll just return 1 (defined) for anything non-null */
-        return perlInt(1);
+        Value *v    = emitExpr(*n.left);
+        Value *i32  = callRT("perl_defined", {v});
+        Value *bit  = builder_.CreateICmpNE(i32, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+        Value *i64  = builder_.CreateZExt(bit, Type::getInt64Ty(ctx_));
+        return callRT("perl_alloc_int", {i64});
     }
 
     case NK::PopExpr: {
@@ -1787,6 +1881,14 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::DollarAt:
         return callRT("perl_get_dollar_at", {});
+
+    case NK::WantarrayFunc:
+        return callRT("perl_wantarray", {});
+
+    case NK::CallerFunc: {
+        Value *av = callRT("perl_caller", {});
+        return callRT("perl_array_get", {av, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+    }
 
     case NK::TrOp: {
         Value *str = emitExpr(*n.left);

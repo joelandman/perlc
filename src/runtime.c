@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <setjmp.h>
@@ -51,6 +52,52 @@ void perl_local_restore_to(int depth) {
 static jmp_buf *s_eval_stack[EVAL_STACK_MAX];
 static int      s_eval_depth = 0;
 static PerlValue s_dollar_at = { PERL_STRING, {0}, 0 }; /* $@ */
+
+/* $/ — input record separator (default "\n", undef = slurp mode) */
+static PerlValue s_input_sep = { PERL_STRING, {0}, 0 };
+static int       s_input_sep_inited = 0;
+
+static void ensure_input_sep(void) {
+    if (!s_input_sep_inited) {
+        s_input_sep.tag  = PERL_STRING;
+        s_input_sep.sval = strdup("\n");
+        s_input_sep_inited = 1;
+    }
+}
+
+/* $/ getter — returns stable pointer so local $/ works */
+PerlValue *perl_get_input_sep(void) {
+    ensure_input_sep();
+    return &s_input_sep;
+}
+
+/* $! — errno as a string */
+static PerlValue s_dollar_bang = { PERL_UNDEF, {0}, 0 };
+PerlValue *perl_get_dollar_bang(void) {
+    if (s_dollar_bang.tag == PERL_STRING && s_dollar_bang.sval) free(s_dollar_bang.sval);
+    if (errno) {
+        s_dollar_bang.tag  = PERL_STRING;
+        s_dollar_bang.sval = strdup(strerror(errno));
+    } else {
+        s_dollar_bang.tag  = PERL_STRING;
+        s_dollar_bang.sval = strdup("");
+    }
+    return &s_dollar_bang;
+}
+
+/* wantarray — returns 1 in list context, 0 in scalar; stub always 0 */
+static int s_wantarray = 0;
+void       perl_set_wantarray(int v) { s_wantarray = v; }
+PerlValue *perl_wantarray(void) { return perl_alloc_int(s_wantarray); }
+
+/* caller — stub returning (package, file, line) */
+PerlArray *perl_caller(void) {
+    PerlArray *a = perl_array_new();
+    perl_array_push(a, perl_alloc_string("main"));
+    perl_array_push(a, perl_alloc_string("unknown"));
+    perl_array_push(a, perl_alloc_int(0));
+    return a;
+}
 
 void perl_eval_push(jmp_buf *jb) {
     if (s_eval_depth < EVAL_STACK_MAX)
@@ -186,6 +233,10 @@ char *perl_to_string(const PerlValue *v) {
         default:
             return strdup("");
     }
+}
+
+int perl_defined(const PerlValue *v) {
+    return v && v->tag != PERL_UNDEF;
 }
 
 int perl_is_true(const PerlValue *v) {
@@ -1104,13 +1155,35 @@ PerlValue *perl_readline(PerlValue *fh) {
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval)
         return perl_alloc_undef();
     FILE *fp = (FILE*)fh->pval;
+    ensure_input_sep();
+    /* slurp mode: $/ is undef */
+    if (s_input_sep.tag == PERL_UNDEF) {
+        size_t cap = 4096, len = 0;
+        char *buf = malloc(cap);
+        int c;
+        while ((c = fgetc(fp)) != EOF) {
+            if (len + 2 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+            buf[len++] = (char)c;
+        }
+        if (len == 0) { free(buf); return perl_alloc_undef(); }
+        buf[len] = '\0';
+        PerlValue *pv = perl_alloc_string(buf);
+        free(buf);
+        return pv;
+    }
+    /* normal mode: read until $/ (default "\n") */
+    const char *sep    = (s_input_sep.tag == PERL_STRING && s_input_sep.sval)
+                         ? s_input_sep.sval : "\n";
+    size_t       seplen = strlen(sep);
     size_t cap = 256, len = 0;
     char *buf = malloc(cap);
     int c;
     while ((c = fgetc(fp)) != EOF) {
         if (len + 2 >= cap) { cap *= 2; buf = realloc(buf, cap); }
         buf[len++] = (char)c;
-        if (c == '\n') break;
+        if (seplen == 1 && (char)c == sep[0]) break;
+        if (seplen > 1 && len >= seplen &&
+            memcmp(buf + len - seplen, sep, seplen) == 0) break;
     }
     if (len == 0) { free(buf); return perl_alloc_undef(); }
     buf[len] = '\0';
@@ -1169,14 +1242,18 @@ PerlValue *perl_eof_fh(PerlValue *fh) {
 }
 
 void perl_die(PerlValue *msg) {
-    char *s = msg ? perl_to_string(msg) : strdup("Died");
     if (s_eval_depth > 0) {
-        /* inside eval: set $@ and longjmp back to setjmp in calling frame */
-        if (s_dollar_at.sval) free(s_dollar_at.sval);
-        s_dollar_at.tag  = PERL_STRING;
-        s_dollar_at.sval = s;
+        /* preserve the original value in $@ (refs stay as refs) */
+        if (msg) {
+            perl_assign(&s_dollar_at, msg);
+        } else {
+            if (s_dollar_at.tag == PERL_STRING && s_dollar_at.sval) free(s_dollar_at.sval);
+            s_dollar_at.tag  = PERL_STRING;
+            s_dollar_at.sval = strdup("Died");
+        }
         longjmp(*s_eval_stack[s_eval_depth - 1], 1);
     }
+    char *s = msg ? perl_to_string(msg) : strdup("Died");
     fputs(s, stderr);
     size_t n = strlen(s);
     if (n == 0 || s[n-1] != '\n') fputc('\n', stderr);
