@@ -133,6 +133,33 @@ void CodeGen::declareRuntime() {
     RT("perl_printf",       voidTy, pv, av);
     /* range */
     RT("perl_range",        av, pv, pv);
+    /* math builtins */
+    RT("perl_abs_val",      pv, pv);
+    RT("perl_int_trunc",    pv, pv);
+    RT("perl_sqrt_val",     pv, pv);
+    /* string case */
+    RT("perl_uc_str",       pv, pv);
+    RT("perl_lc_str",       pv, pv);
+    RT("perl_ucfirst_str",  pv, pv);
+    RT("perl_lcfirst_str",  pv, pv);
+    /* string search */
+    RT("perl_index_str",    pv, pv, pv, pv);
+    RT("perl_rindex_str",   pv, pv, pv, pv);
+    /* character conversion */
+    RT("perl_chr_val",      pv, pv);
+    RT("perl_ord_val",      pv, pv);
+    RT("perl_hex_val",      pv, pv);
+    RT("perl_oct_val",      pv, pv);
+    /* list ops */
+    RT("perl_reverse_array",  av, av);
+    RT("perl_reverse_str",    pv, pv);
+    RT("perl_sort_num_asc",   av, av);
+    RT("perl_sort_num_desc",  av, av);
+    RT("perl_sort_str_asc",   av, av);
+    RT("perl_sort_str_desc",  av, av);
+    /* spaceship / cmp */
+    RT("perl_spaceship",      pv, pv, pv);
+    RT("perl_str_spaceship",  pv, pv, pv);
     /* regex */
     RT("perl_regex_match",     pv,  pv, i8p, i8p);
     RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
@@ -240,11 +267,23 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return callRT("perl_split", {sep, str});
     }
     if (n.kind == NK::SortFunc) {
+        /* collect input array */
         Value *av = nullptr;
         if (n.left) av = emitArrayPtr(*n.left);
+        if (!av && !n.args.empty()) {
+            av = callRT("perl_array_new", {});
+            for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        }
         if (!av) av = callRT("perl_array_new", {});
-        callRT("perl_array_sort_str", {av});
-        return av;
+        /* dispatch on sort mode */
+        const std::string &mode = n.sval;
+        if      (mode == "num_asc")  return callRT("perl_sort_num_asc",  {av});
+        else if (mode == "num_desc") return callRT("perl_sort_num_desc", {av});
+        else if (mode == "str_asc")  return callRT("perl_sort_str_asc",  {av});
+        else if (mode == "str_desc") return callRT("perl_sort_str_desc", {av});
+        else { /* default: sort a copy lexicographically */
+            Value *copy = callRT("perl_sort_str_asc", {av}); return copy;
+        }
     }
     if (n.kind == NK::DerefArray) {
         Value *ref = emitExpr(*n.left);
@@ -269,6 +308,104 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *lo = emitExpr(*n.left);
         Value *hi = emitExpr(*n.right);
         return callRT("perl_range", {lo, hi});
+    }
+    if (n.kind == NK::ReverseFunc) {
+        /* reverse @arr or reverse LIST — return new reversed array */
+        Value *av = nullptr;
+        if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
+        if (!av) {
+            av = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            }
+        }
+        return callRT("perl_reverse_array", {av});
+    }
+    if (n.kind == NK::MapFunc || n.kind == NK::GrepFunc) {
+        bool isMap = (n.kind == NK::MapFunc);
+        auto *fn   = builder_.GetInsertBlock()->getParent();
+        auto *i64  = Type::getInt64Ty(ctx_);
+        auto *i32  = Type::getInt32Ty(ctx_);
+
+        /* build input array from args */
+        Value *inputArr = nullptr;
+        if (n.args.size() == 1) {
+            inputArr = emitArrayPtr(*n.args[0]);
+            if (!inputArr) {
+                inputArr = callRT("perl_array_new", {});
+                callRT("perl_array_push", {inputArr, emitExpr(*n.args[0])});
+            }
+        } else {
+            inputArr = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {inputArr, sub});
+                else     callRT("perl_array_push",   {inputArr, emitExpr(*a)});
+            }
+        }
+
+        Value *resultArr = callRT("perl_array_new", {});
+        Value *lenPv = callRT("perl_array_len", {inputArr});
+        Value *len   = callRT("perl_to_int", {lenPv});
+
+        /* $_ alloca (hoisted before loop) */
+        auto *udAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        Value *udPv    = perlUndef();
+        builder_.CreateStore(udPv, udAlloca);
+
+        auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "mg.i");
+        builder_.CreateStore(ConstantInt::get(i64, 0), iAlloca);
+
+        auto *condBB = BasicBlock::Create(ctx_, isMap ? "map.cond" : "grep.cond", fn);
+        auto *bodyBB = BasicBlock::Create(ctx_, isMap ? "map.body" : "grep.body", fn);
+        auto *exitBB = BasicBlock::Create(ctx_, isMap ? "map.end"  : "grep.end",  fn);
+
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        Value *i     = builder_.CreateLoad(i64, iAlloca);
+        Value *done  = builder_.CreateICmpSGE(i, len);
+        builder_.CreateCondBr(done, exitBB, bodyBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        Value *elem = callRT("perl_array_get", {inputArr, i});
+        callRT("perl_assign", {udPv, elem});
+
+        /* emit block / expr with $_ in scope */
+        pushScope();
+        declareVar("_", udAlloca);
+        Value *blockResult;
+        if (n.body)       blockResult = emitBlockLast(*n.body);
+        else if (n.left)  blockResult = emitExpr(*n.left);
+        else              blockResult = perlUndef();
+        popScope();
+
+        if (isMap) {
+            callRT("perl_array_push", {resultArr, blockResult});
+            Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+            builder_.CreateStore(i2, iAlloca);
+            builder_.CreateBr(condBB);
+        } else {
+            /* grep: push element if block result is true */
+            Value *tv    = callRT("perl_is_true", {blockResult});
+            Value *cond  = builder_.CreateICmpNE(tv, ConstantInt::get(i32, 0));
+            auto *pushBB = BasicBlock::Create(ctx_, "grep.push", fn);
+            auto *nextBB = BasicBlock::Create(ctx_, "grep.next", fn);
+            builder_.CreateCondBr(cond, pushBB, nextBB);
+
+            builder_.SetInsertPoint(pushBB);
+            callRT("perl_array_push", {resultArr, elem});
+            builder_.CreateBr(nextBB);
+
+            builder_.SetInsertPoint(nextBB);
+            Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+            builder_.CreateStore(i2, iAlloca);
+            builder_.CreateBr(condBB);
+        }
+
+        builder_.SetInsertPoint(exitBB);
+        return resultArr;
     }
     if (n.kind == NK::RegexMatch && n.name.find('g') != std::string::npos) {
         Value *str = emitExpr(*n.left);
@@ -362,13 +499,30 @@ void CodeGen::emitSub(const Node &n) {
 
 Value *CodeGen::emitBlock(const Node &n) {
     pushScope();
-    Value *last = nullptr;
     for (auto &stmt : n.args) {
         emitStmt(*stmt);
         if (builder_.GetInsertBlock()->getTerminator()) break;
     }
     popScope();
-    return last;
+    return nullptr;
+}
+
+/* Emit a block and return the PerlValue* of its last expression statement. */
+Value *CodeGen::emitBlockLast(const Node &n) {
+    pushScope();
+    Value *result = perlUndef();
+    for (size_t i = 0; i < n.args.size(); i++) {
+        const Node &stmt = *n.args[i];
+        bool isLast = (i + 1 == n.args.size());
+        if (isLast && stmt.kind == NK::ExprStmt && stmt.left) {
+            result = emitExpr(*stmt.left);
+        } else {
+            emitStmt(stmt);
+        }
+        if (builder_.GetInsertBlock()->getTerminator()) { result = perlUndef(); break; }
+    }
+    popScope();
+    return result;
 }
 
 void CodeGen::emitStmt(const Node &n) {
@@ -1157,9 +1311,58 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_hash_delete_sv", {hv, key});
     }
 
-    case NK::SortFunc: {
-        return perlInt(0);
+    case NK::SortFunc:
+    case NK::MapFunc:
+    case NK::GrepFunc:
+        /* array-producing: scalar context returns element count */
+        {
+            Value *av = emitArrayPtr(n);
+            if (!av) return perlUndef();
+            return callRT("perl_array_len", {av});
+        }
+    case NK::ReverseFunc: {
+        /* scalar EXPR or single scalar arg → reverse string */
+        bool hasScalarCtx = (n.sval == "scalar_ctx");
+        bool hasArrayArg = false;
+        for (auto &a : n.args)
+            if (a->kind == NK::ArrayVar || a->kind == NK::DerefArray) { hasArrayArg = true; break; }
+        if (hasScalarCtx || (!hasArrayArg && n.args.size() == 1)) {
+            return callRT("perl_reverse_str", {emitExpr(*n.args[0])});
+        }
+        Value *av = emitArrayPtr(n);
+        if (!av) return perlUndef();
+        return callRT("perl_array_len", {av});
     }
+
+    /* ── math builtins ───────────────────────────────────────────────────── */
+    case NK::AbsFunc:  return callRT("perl_abs_val",  {emitExpr(*n.left)});
+    case NK::IntFunc:  return callRT("perl_int_trunc",{emitExpr(*n.left)});
+    case NK::SqrtFunc: return callRT("perl_sqrt_val", {emitExpr(*n.left)});
+
+    /* ── string case ─────────────────────────────────────────────────────── */
+    case NK::UcFunc:      return callRT("perl_uc_str",      {emitExpr(*n.left)});
+    case NK::LcFunc:      return callRT("perl_lc_str",      {emitExpr(*n.left)});
+    case NK::UcfirstFunc: return callRT("perl_ucfirst_str", {emitExpr(*n.left)});
+    case NK::LcfirstFunc: return callRT("perl_lcfirst_str", {emitExpr(*n.left)});
+
+    /* ── chr / ord / hex / oct ───────────────────────────────────────────── */
+    case NK::ChrFunc: return callRT("perl_chr_val", {emitExpr(*n.left)});
+    case NK::OrdFunc: return callRT("perl_ord_val", {emitExpr(*n.left)});
+    case NK::HexFunc: return callRT("perl_hex_val", {emitExpr(*n.left)});
+    case NK::OctFunc: return callRT("perl_oct_val", {emitExpr(*n.left)});
+
+    /* ── index / rindex ──────────────────────────────────────────────────── */
+    case NK::IndexFunc:
+    case NK::RindexFunc: {
+        bool isR = (n.kind == NK::RindexFunc);
+        Value *str = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *sub = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *pos = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+        return callRT(isR ? "perl_rindex_str" : "perl_index_str", {str, sub, pos});
+    }
+
+    /* ── reverse in scalar context = reverse string ──────────────────────── */
+    /* (array context is handled in emitArrayPtr) */
 
     /* ── references ─────────────────────────────────────────────────────── */
 
@@ -1366,6 +1569,7 @@ Value *CodeGen::emitBinOp(const Node &n) {
         {"lt", "perl_str_lt"}, {"gt", "perl_str_gt"},
         {"le", "perl_str_le"}, {"ge", "perl_str_ge"},
         {"x",  "perl_repeat_str"},
+        {"<=>","perl_spaceship"}, {"cmp","perl_str_spaceship"},
         {nullptr, nullptr}
     };
     for (auto *p = OPS; p->op; p++)

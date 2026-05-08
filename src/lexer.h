@@ -21,6 +21,10 @@ enum class TK {
     KW_CHOMP, KW_CHOP, KW_LENGTH, KW_SUBSTR, KW_JOIN, KW_SPLIT,
     KW_INDEX, KW_RINDEX, KW_UC, KW_LC, KW_UCFIRST, KW_LCFIRST,
     KW_REVERSE, KW_SPLICE, KW_REF,
+    KW_ABS, KW_INT, KW_SQRT,
+    KW_CHR, KW_ORD, KW_HEX, KW_OCT,
+    KW_MAP, KW_GREP,
+    SPACESHIP,    /* <=> */
     READLINE,  /* <$fh>, <STDIN>, <> */
     /* regex binding */
     BIND,   /* =~ */

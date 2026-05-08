@@ -994,6 +994,176 @@ void perl_printf(PerlValue *fmt, PerlArray *args) {
 
 /* ── range ───────────────────────────────────────────────────────────────── */
 
+/* ── math builtins ───────────────────────────────────────────────────────── */
+PerlValue *perl_abs_val(PerlValue *v) {
+    if (!v) return perl_alloc_int(0);
+    if (v->tag == PERL_FLOAT) return perl_alloc_float(v->fval < 0 ? -v->fval : v->fval);
+    long long i = perl_to_int(v);
+    return perl_alloc_int(i < 0 ? -i : i);
+}
+
+PerlValue *perl_int_trunc(PerlValue *v) {
+    if (!v) return perl_alloc_int(0);
+    if (v->tag == PERL_INT) return perl_alloc_int(v->ival);
+    double d = perl_to_float(v);
+    return perl_alloc_int((long long)d);   /* truncates toward zero */
+}
+
+PerlValue *perl_sqrt_val(PerlValue *v) {
+    double d = v ? perl_to_float(v) : 0.0;
+    return perl_alloc_float(sqrt(d));
+}
+
+/* ── string case ─────────────────────────────────────────────────────────── */
+PerlValue *perl_uc_str(PerlValue *v) {
+    char *s = perl_to_string(v);
+    for (char *p = s; *p; p++) *p = (char)toupper((unsigned char)*p);
+    PerlValue *r = perl_alloc_string(s); free(s); return r;
+}
+
+PerlValue *perl_lc_str(PerlValue *v) {
+    char *s = perl_to_string(v);
+    for (char *p = s; *p; p++) *p = (char)tolower((unsigned char)*p);
+    PerlValue *r = perl_alloc_string(s); free(s); return r;
+}
+
+PerlValue *perl_ucfirst_str(PerlValue *v) {
+    char *s = perl_to_string(v);
+    if (s[0]) s[0] = (char)toupper((unsigned char)s[0]);
+    PerlValue *r = perl_alloc_string(s); free(s); return r;
+}
+
+PerlValue *perl_lcfirst_str(PerlValue *v) {
+    char *s = perl_to_string(v);
+    if (s[0]) s[0] = (char)tolower((unsigned char)s[0]);
+    PerlValue *r = perl_alloc_string(s); free(s); return r;
+}
+
+/* ── index / rindex ──────────────────────────────────────────────────────── */
+PerlValue *perl_index_str(PerlValue *str_pv, PerlValue *sub_pv, PerlValue *pos_pv) {
+    char *s = perl_to_string(str_pv);
+    char *sub = perl_to_string(sub_pv);
+    long long pos = (pos_pv && pos_pv->tag != PERL_UNDEF) ? perl_to_int(pos_pv) : 0;
+    long long slen = (long long)strlen(s);
+    if (pos < 0) pos = 0;
+    long long result = -1;
+    if (pos <= slen) {
+        char *found = strstr(s + pos, sub);
+        if (found) result = (long long)(found - s);
+    }
+    free(s); free(sub);
+    return perl_alloc_int(result);
+}
+
+PerlValue *perl_rindex_str(PerlValue *str_pv, PerlValue *sub_pv, PerlValue *pos_pv) {
+    char *s = perl_to_string(str_pv);
+    char *sub = perl_to_string(sub_pv);
+    long long slen = (long long)strlen(s);
+    long long sublen = (long long)strlen(sub);
+    long long pos = (pos_pv && pos_pv->tag != PERL_UNDEF) ? perl_to_int(pos_pv) : slen;
+    if (pos > slen - sublen) pos = slen - sublen;
+    long long result = -1;
+    for (long long i = pos; i >= 0; i--) {
+        if (strncmp(s + i, sub, (size_t)sublen) == 0) { result = i; break; }
+    }
+    free(s); free(sub);
+    return perl_alloc_int(result);
+}
+
+/* ── chr / ord / hex / oct ───────────────────────────────────────────────── */
+PerlValue *perl_chr_val(PerlValue *v) {
+    long long n = perl_to_int(v);
+    char buf[2] = { (char)(n & 0xFF), '\0' };
+    return perl_alloc_string(buf);
+}
+
+PerlValue *perl_ord_val(PerlValue *v) {
+    char *s = perl_to_string(v);
+    long long r = s[0] ? (long long)(unsigned char)s[0] : 0;
+    free(s);
+    return perl_alloc_int(r);
+}
+
+PerlValue *perl_hex_val(PerlValue *v) {
+    char *s = perl_to_string(v);
+    char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+    long long r = (long long)strtoll(p, NULL, 16);
+    free(s);
+    return perl_alloc_int(r);
+}
+
+PerlValue *perl_oct_val(PerlValue *v) {
+    char *s = perl_to_string(v);
+    char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    long long r;
+    if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) r = (long long)strtoll(p + 2, NULL, 2);
+    else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) r = (long long)strtoll(p + 2, NULL, 16);
+    else r = (long long)strtoll(p, NULL, 8);
+    free(s);
+    return perl_alloc_int(r);
+}
+
+/* ── reverse ─────────────────────────────────────────────────────────────── */
+PerlArray *perl_reverse_array(PerlArray *a) {
+    PerlArray *r = perl_array_new();
+    for (long long i = a->len - 1; i >= 0; i--)
+        perl_array_push(r, perl_clone(a->elems[i]));
+    return r;
+}
+
+PerlValue *perl_reverse_str(PerlValue *v) {
+    char *s = perl_to_string(v);
+    long long len = (long long)strlen(s);
+    char *r = malloc((size_t)len + 1);
+    for (long long i = 0; i < len; i++) r[i] = s[len - 1 - i];
+    r[len] = '\0';
+    PerlValue *res = perl_alloc_string(r);
+    free(s); free(r);
+    return res;
+}
+
+/* ── sort with comparator ────────────────────────────────────────────────── */
+static int cmp_num_asc(const void *a, const void *b) {
+    double da = perl_to_float(*(PerlValue**)a);
+    double db = perl_to_float(*(PerlValue**)b);
+    return (da > db) - (da < db);
+}
+static int cmp_num_desc(const void *a, const void *b) { return cmp_num_asc(b, a); }
+static int cmp_str_asc(const void *a, const void *b) {
+    char *sa = perl_to_string(*(PerlValue**)a);
+    char *sb = perl_to_string(*(PerlValue**)b);
+    int r = strcmp(sa, sb); free(sa); free(sb); return r;
+}
+static int cmp_str_desc(const void *a, const void *b) { return cmp_str_asc(b, a); }
+
+static PerlArray *sort_copy_with(PerlArray *a, int(*cmp)(const void*, const void*)) {
+    PerlArray *r = perl_array_new();
+    for (long long i = 0; i < a->len; i++) perl_array_push(r, perl_clone(a->elems[i]));
+    qsort(r->elems, (size_t)r->len, sizeof(PerlValue*), cmp);
+    return r;
+}
+
+PerlArray *perl_sort_num_asc(PerlArray *a)  { return sort_copy_with(a, cmp_num_asc);  }
+PerlArray *perl_sort_num_desc(PerlArray *a) { return sort_copy_with(a, cmp_num_desc); }
+PerlArray *perl_sort_str_asc(PerlArray *a)  { return sort_copy_with(a, cmp_str_asc);  }
+PerlArray *perl_sort_str_desc(PerlArray *a) { return sort_copy_with(a, cmp_str_desc); }
+
+/* ── spaceship and cmp ───────────────────────────────────────────────────── */
+PerlValue *perl_spaceship(PerlValue *a, PerlValue *b) {
+    double da = perl_to_float(a), db = perl_to_float(b);
+    return perl_alloc_int((da > db) - (da < db));
+}
+
+PerlValue *perl_str_spaceship(PerlValue *a, PerlValue *b) {
+    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    int r = strcmp(sa, sb);
+    free(sa); free(sb);
+    return perl_alloc_int(r < 0 ? -1 : r > 0 ? 1 : 0);
+}
+
 PerlArray *perl_range(PerlValue *from, PerlValue *to) {
     PerlArray *a = perl_array_new();
     long long lo = perl_to_int(from);

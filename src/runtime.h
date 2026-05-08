@@ -168,6 +168,35 @@ PerlValue *perl_get_stdout(void);   /* returns stable STDOUT PerlValue* */
 PerlValue *perl_sprintf(PerlValue *fmt, PerlArray *args);
 void       perl_printf(PerlValue *fmt, PerlArray *args);
 
+/* ── math builtins ───────────────────────────────────────────────────────── */
+PerlValue *perl_abs_val(PerlValue *v);
+PerlValue *perl_int_trunc(PerlValue *v);
+PerlValue *perl_sqrt_val(PerlValue *v);
+
+/* ── string case/conversion builtins ────────────────────────────────────── */
+PerlValue *perl_uc_str(PerlValue *v);
+PerlValue *perl_lc_str(PerlValue *v);
+PerlValue *perl_ucfirst_str(PerlValue *v);
+PerlValue *perl_lcfirst_str(PerlValue *v);
+PerlValue *perl_index_str(PerlValue *str, PerlValue *sub, PerlValue *pos);
+PerlValue *perl_rindex_str(PerlValue *str, PerlValue *sub, PerlValue *pos);
+PerlValue *perl_chr_val(PerlValue *n);
+PerlValue *perl_ord_val(PerlValue *s);
+PerlValue *perl_hex_val(PerlValue *s);
+PerlValue *perl_oct_val(PerlValue *s);
+
+/* ── list ops ────────────────────────────────────────────────────────────── */
+PerlArray *perl_reverse_array(PerlArray *a);    /* new array, reversed */
+PerlValue *perl_reverse_str(PerlValue *s);      /* new string, reversed */
+PerlArray *perl_sort_num_asc(PerlArray *a);     /* numeric ascending */
+PerlArray *perl_sort_num_desc(PerlArray *a);    /* numeric descending */
+PerlArray *perl_sort_str_asc(PerlArray *a);     /* string ascending (same as sort_str) */
+PerlArray *perl_sort_str_desc(PerlArray *a);    /* string descending */
+
+/* ── comparison returning -1/0/1 ─────────────────────────────────────────── */
+PerlValue *perl_spaceship(PerlValue *a, PerlValue *b);  /* <=> */
+PerlValue *perl_str_spaceship(PerlValue *a, PerlValue *b); /* cmp */
+
 /* ── range ───────────────────────────────────────────────────────────────── */
 PerlArray *perl_range(PerlValue *from, PerlValue *to);
 

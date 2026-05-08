@@ -34,6 +34,11 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"ucfirst",  TK::KW_UCFIRST},{"lcfirst",  TK::KW_LCFIRST},
     {"reverse",  TK::KW_REVERSE},{"splice",   TK::KW_SPLICE},
     {"ref",      TK::KW_REF},
+    {"abs",      TK::KW_ABS},   {"int",      TK::KW_INT},
+    {"sqrt",     TK::KW_SQRT},
+    {"chr",      TK::KW_CHR},   {"ord",      TK::KW_ORD},
+    {"hex",      TK::KW_HEX},   {"oct",      TK::KW_OCT},
+    {"map",      TK::KW_MAP},   {"grep",     TK::KW_GREP},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}
@@ -307,6 +312,9 @@ std::vector<Token> Lexer::tokenize() {
                 else toks.push_back({TK::NOT, "!", line_});
                 break;
             case '<': {
+                if (peek() == '=' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '>') {
+                    pos_ += 2; toks.push_back({TK::SPACESHIP, "<=>", line_}); break;
+                }
                 if (peek() == '=') { pos_++; toks.push_back({TK::LE, "<=", line_}); break; }
                 /* readline: <$ident>, <STDIN>, <STDERR>, <STDOUT>, <> */
                 {

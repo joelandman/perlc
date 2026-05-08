@@ -61,6 +61,7 @@ private:
     void   emitStmt(const Node &n);
     llvm::Value *emitExpr(const Node &n);
     llvm::Value *emitBlock(const Node &n);
+    llvm::Value *emitBlockLast(const Node &n); /* emits block, returns last expr value */
     llvm::Value *emitBinOp(const Node &n);
     llvm::Value *emitCall(const Node &n);
     llvm::Value *emitLValue(const Node &n); /* returns alloca */

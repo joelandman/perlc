@@ -711,10 +711,12 @@ NodePtr Parser::parseCmp() {
     auto isCmpOp = [&]() {
         switch (k) {
             case TK::EQ: case TK::NE: case TK::LT: case TK::GT: case TK::LE: case TK::GE:
+            case TK::SPACESHIP:
                 return true;
             case TK::IDENT:
                 return ident == "eq" || ident == "ne" || ident == "lt" ||
-                       ident == "gt" || ident == "le" || ident == "ge";
+                       ident == "gt" || ident == "le" || ident == "ge" ||
+                       ident == "cmp";
             default: return false;
         }
     };
@@ -724,9 +726,10 @@ NodePtr Parser::parseCmp() {
         if (k == TK::IDENT) op = ident;
         else {
             switch (k) {
-                case TK::EQ: op = "=="; break; case TK::NE: op = "!="; break;
-                case TK::LT: op = "<";  break; case TK::GT: op = ">";  break;
-                case TK::LE: op = "<="; break; case TK::GE: op = ">="; break;
+                case TK::EQ:       op = "==";  break; case TK::NE:  op = "!="; break;
+                case TK::LT:       op = "<";   break; case TK::GT:  op = ">";  break;
+                case TK::LE:       op = "<=";  break; case TK::GE:  op = ">="; break;
+                case TK::SPACESHIP:op = "<=>";  break;
                 default: break;
             }
         }
@@ -961,7 +964,7 @@ NodePtr Parser::parsePrimary() {
         return sv;
     }
 
-    /* scalar(@arr) / scalar keys %h / scalar values %h */
+    /* scalar(@arr) / scalar keys %h / scalar values %h / scalar EXPR */
     if (check(TK::KW_SCALAR)) {
         advance();
         /* scalar keys %h  or  scalar values %h — no parens required */
@@ -976,13 +979,20 @@ NodePtr Parser::parsePrimary() {
             n->name = nm; n->sval = "scalar"; n->line = line;
             return n;
         }
-        bool hasParen = match(TK::LPAREN);
-        consume(TK::ARRAY, "@");
-        std::string nm = cur().text; advance();
-        if (hasParen) consume(TK::RPAREN, ")");
-        auto n = std::make_unique<Node>(); n->kind = NK::ScalarFunc;
-        n->name = nm; n->line = line;
-        return n;
+        /* scalar @arr or scalar(@arr) */
+        if (check(TK::ARRAY) || (check(TK::LPAREN) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::ARRAY)) {
+            bool hasParen = match(TK::LPAREN);
+            consume(TK::ARRAY, "@");
+            std::string nm = cur().text; advance();
+            if (hasParen) consume(TK::RPAREN, ")");
+            auto n = std::make_unique<Node>(); n->kind = NK::ScalarFunc;
+            n->name = nm; n->line = line;
+            return n;
+        }
+        /* scalar EXPR — evaluate EXPR in scalar context; just parse it */
+        auto inner = parsePrimary();
+        if (inner) inner->sval = "scalar_ctx";
+        return inner;
     }
 
     if (check(TK::ARRAY)) {
@@ -1078,23 +1088,39 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* sort LIST  or  sort keys %h  or  sort @arr */
+    /* sort LIST  or  sort { CMP } LIST  or  sort keys %h  or  sort @arr */
     if (check(TK::KW_SORT)) {
         advance();
+        /* detect sort { $a <=> $b } or { $b <=> $a } etc. */
+        std::string sortMode;
+        if (check(TK::LBRACE)) {
+            size_t save = pos_;
+            advance(); // {
+            std::string first, op, second;
+            if (check(TK::SCALAR)) { advance(); first = cur().text; advance(); }
+            if (check(TK::SPACESHIP))                { op = "num"; advance(); }
+            else if (check(TK::IDENT) && cur().text == "cmp") { op = "str"; advance(); }
+            if (check(TK::SCALAR)) { advance(); second = cur().text; advance(); }
+            if (!op.empty() && check(TK::RBRACE) && !first.empty() && !second.empty()) {
+                advance(); // }
+                if      (first == "a" && second == "b") sortMode = op + "_asc";
+                else if (first == "b" && second == "a") sortMode = op + "_desc";
+            }
+            if (sortMode.empty()) pos_ = save; // restore: unrecognized block
+        }
         NodeList elems;
         /* sort (list) or sort list-expr */
         if (check(TK::KW_KEYS) || check(TK::KW_VALUES)) {
-            /* sort keys %h → KeysFunc wrapped in SortFunc */
             auto inner = parsePrimary();
-            inner->sval = "sort"; /* mark as needing sort */
+            inner->sval = "sort";
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
-            n->left = std::move(inner); n->line = line;
+            n->left = std::move(inner); n->sval = sortMode; n->line = line;
             return n;
         }
         if (check(TK::ARRAY)) {
             auto inner = parsePrimary();
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
-            n->left = std::move(inner); n->line = line;
+            n->left = std::move(inner); n->sval = sortMode; n->line = line;
             return n;
         }
         if (check(TK::LPAREN)) {
@@ -1106,7 +1132,7 @@ NodePtr Parser::parsePrimary() {
             consume(TK::RPAREN, ")");
         }
         auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
-        n->args = std::move(elems); n->line = line;
+        n->args = std::move(elems); n->sval = sortMode; n->line = line;
         return n;
     }
 
@@ -1307,6 +1333,108 @@ NodePtr Parser::parsePrimary() {
         auto n = std::make_unique<Node>(); n->kind = NK::SplitFunc;
         n->left = std::move(sep); n->right = std::move(str); n->line = line;
         if (regexSplit) { n->ival = 1; n->sval = splitPat; n->name = splitFlags; }
+        return n;
+    }
+
+    /* ── math builtins: abs, int, sqrt ─────────────────────────────────────── */
+    {
+        NK kind = NK::IntLit; /* placeholder */
+        if      (check(TK::KW_ABS))  { kind = NK::AbsFunc;  }
+        else if (check(TK::KW_INT))  { kind = NK::IntFunc;   }
+        else if (check(TK::KW_SQRT)) { kind = NK::SqrtFunc;  }
+        if (kind != NK::IntLit) {
+            advance();
+            bool hp = match(TK::LPAREN);
+            auto inner = parseExpr();
+            if (hp) consume(TK::RPAREN, ")");
+            auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+            n->left = std::move(inner); return n;
+        }
+    }
+
+    /* ── string case: uc, lc, ucfirst, lcfirst ──────────────────────────── */
+    {
+        NK kind = NK::IntLit;
+        if      (check(TK::KW_UC))      { kind = NK::UcFunc;      }
+        else if (check(TK::KW_LC))      { kind = NK::LcFunc;      }
+        else if (check(TK::KW_UCFIRST)) { kind = NK::UcfirstFunc; }
+        else if (check(TK::KW_LCFIRST)) { kind = NK::LcfirstFunc; }
+        if (kind != NK::IntLit) {
+            advance();
+            bool hp = match(TK::LPAREN);
+            auto inner = parseExpr();
+            if (hp) consume(TK::RPAREN, ")");
+            auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+            n->left = std::move(inner); return n;
+        }
+    }
+
+    /* ── chr, ord, hex, oct ──────────────────────────────────────────────── */
+    {
+        NK kind = NK::IntLit;
+        if      (check(TK::KW_CHR)) { kind = NK::ChrFunc; }
+        else if (check(TK::KW_ORD)) { kind = NK::OrdFunc; }
+        else if (check(TK::KW_HEX)) { kind = NK::HexFunc; }
+        else if (check(TK::KW_OCT)) { kind = NK::OctFunc; }
+        if (kind != NK::IntLit) {
+            advance();
+            bool hp = match(TK::LPAREN);
+            auto inner = parseExpr();
+            if (hp) consume(TK::RPAREN, ")");
+            auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+            n->left = std::move(inner); return n;
+        }
+    }
+
+    /* ── index, rindex ───────────────────────────────────────────────────── */
+    if (check(TK::KW_INDEX) || check(TK::KW_RINDEX)) {
+        bool isR = check(TK::KW_RINDEX); advance();
+        bool hp = match(TK::LPAREN);
+        NodeList args;
+        while (args.size() < 3 && !check(TK::RPAREN) && !check(TK::EOF_TOK) && !check(TK::SEMI)) {
+            args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>();
+        n->kind = isR ? NK::RindexFunc : NK::IndexFunc;
+        n->args = std::move(args); n->line = line; return n;
+    }
+
+    /* ── reverse ─────────────────────────────────────────────────────────── */
+    if (check(TK::KW_REVERSE)) {
+        advance();
+        bool hp = match(TK::LPAREN);
+        auto n = std::make_unique<Node>(); n->kind = NK::ReverseFunc; n->line = line;
+        /* collect all args (array var, list, or scalar) */
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+            if (hp && check(TK::RPAREN)) break;
+            n->args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* ── map { BLOCK } LIST  or  map EXPR, LIST ─────────────────────────── */
+    if (check(TK::KW_MAP) || check(TK::KW_GREP)) {
+        bool isMap = check(TK::KW_MAP); advance();
+        auto n = std::make_unique<Node>();
+        n->kind = isMap ? NK::MapFunc : NK::GrepFunc; n->line = line;
+        bool hp = match(TK::LPAREN);
+        if (check(TK::LBRACE)) {
+            n->body = parseBlock(); /* block form: map { BLOCK } LIST */
+        } else {
+            n->left = parseExpr(); /* expr form: map EXPR, LIST */
+        }
+        match(TK::COMMA);
+        /* parse the input list (array, range, or explicit list) */
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+            if (hp && check(TK::RPAREN)) break;
+            n->args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hp) consume(TK::RPAREN, ")");
         return n;
     }
 

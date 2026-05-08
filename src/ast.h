@@ -45,6 +45,14 @@ enum class NK {
     /* string/array builtins */
     ChompFunc, LengthFunc, SubstrFunc, JoinFunc, SplitFunc,
     UnshiftStmt2,  /* unshift @arr, val,... */
+    /* math builtins */
+    AbsFunc, IntFunc, SqrtFunc,
+    /* string case / search / conversion builtins */
+    UcFunc, LcFunc, UcfirstFunc, LcfirstFunc,
+    IndexFunc, RindexFunc,
+    ChrFunc, OrdFunc, HexFunc, OctFunc,
+    /* list builtins */
+    ReverseFunc, MapFunc, GrepFunc,
     /* references */
     RefScalar,    /* \$x        – left = ScalarVar          */
     RefArray,     /* \@arr      – name = array name         */
