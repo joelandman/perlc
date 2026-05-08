@@ -1,0 +1,6 @@
+perlc
+a.out
+src/*.o
+*.ll
+*.bc
+/tmp/

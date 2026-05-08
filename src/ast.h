@@ -1,0 +1,106 @@
+#pragma once
+#include <memory>
+#include <string>
+#include <vector>
+
+/* ── node kinds ─────────────────────────────────────────────────────────── */
+enum class NK {
+    /* literals */
+    IntLit, FloatLit, StringLit, UndefLit,
+    /* variables */
+    ScalarVar, ArrayVar, HashVar,
+    /* array/hash element access */
+    ArrayElem,   /* $arr[idx] */
+    HashElem,    /* $hash{key} */
+    /* expressions */
+    BinOp, UnaryOp, Assign, CompoundAssign,
+    Call,           /* func(args) */
+    InterpolatedStr,/* "hello $name" */
+    ArrayLit,       /* (1,2,3) in list context */
+    /* statements */
+    ExprStmt, Block, FlatBlock,  /* FlatBlock emits without pushing a scope */
+    My, Our,
+    If,             /* if/elsif/else */
+    While,
+    For,            /* C-style for */
+    Foreach,
+    Last, Next, Return,
+    PrintStmt, SayStmt,
+    SubDef,
+    UseStmt,
+    /* builtins that look like functions */
+    PushStmt, PopExpr, ShiftExpr, UnshiftStmt,
+    ScalarFunc, DefinedFunc,
+    /* hash builtins */
+    KeysFunc, ValuesFunc, ExistsFunc, DeleteFunc,
+    SortFunc,
+    /* string/array builtins */
+    ChompFunc, LengthFunc, SubstrFunc, JoinFunc, SplitFunc,
+    UnshiftStmt2,  /* unshift @arr, val,... */
+    /* references */
+    RefScalar,    /* \$x        – left = ScalarVar          */
+    RefArray,     /* \@arr      – name = array name         */
+    RefHash,      /* \%h        – name = hash name          */
+    AnonArray,    /* [list]     – args = elements           */
+    AnonHash,     /* {k=>v,...} – args = flat k,v list      */
+    DerefScalar,  /* $$ref      – left = ref expr           */
+    DerefArray,   /* @$ref      – left = ref expr           */
+    DerefHash,    /* %$ref      – left = ref expr           */
+    ArrowDeref,   /* $r->[i] or $r->{k} – left=base, right=subscript, sval="array"/"hash" */
+    RefFunc,      /* ref($x)    – left = expr               */
+};
+
+struct Node;
+using NodePtr  = std::unique_ptr<Node>;
+using NodeList = std::vector<NodePtr>;
+
+struct IfBranch {
+    NodePtr cond;   /* nullptr = else branch */
+    NodePtr body;
+};
+
+struct Node {
+    NK   kind;
+    int  line = 0;
+
+    /* literal values */
+    long long   ival = 0;
+    double      fval = 0.0;
+    std::string sval;
+
+    /* variable / function name */
+    std::string name;
+
+    /* children */
+    NodePtr            left, right, cond, body, init, step;
+    NodeList           args;      /* call args, print args, array elements */
+    std::vector<IfBranch> branches; /* if/elsif/else */
+
+    /* sub definition */
+    std::vector<std::string> params;
+};
+
+/* ── helpers ────────────────────────────────────────────────────────────── */
+inline NodePtr makeInt(long long v, int line = 0) {
+    auto n = std::make_unique<Node>(); n->kind = NK::IntLit; n->ival = v; n->line = line; return n;
+}
+inline NodePtr makeFloat(double v, int line = 0) {
+    auto n = std::make_unique<Node>(); n->kind = NK::FloatLit; n->fval = v; n->line = line; return n;
+}
+inline NodePtr makeStr(std::string s, int line = 0) {
+    auto n = std::make_unique<Node>(); n->kind = NK::StringLit; n->sval = std::move(s); n->line = line; return n;
+}
+inline NodePtr makeBin(std::string op, NodePtr l, NodePtr r, int line = 0) {
+    auto n = std::make_unique<Node>(); n->kind = NK::BinOp; n->sval = std::move(op);
+    n->left = std::move(l); n->right = std::move(r); n->line = line; return n;
+}
+inline NodePtr makeUnary(std::string op, NodePtr operand, int line = 0) {
+    auto n = std::make_unique<Node>(); n->kind = NK::UnaryOp; n->sval = std::move(op);
+    n->left = std::move(operand); n->line = line; return n;
+}
+inline NodePtr makeScalar(std::string name, int line = 0) {
+    auto n = std::make_unique<Node>(); n->kind = NK::ScalarVar; n->name = std::move(name); n->line = line; return n;
+}
+inline NodePtr makeBlock(NodeList stmts, int line = 0) {
+    auto n = std::make_unique<Node>(); n->kind = NK::Block; n->args = std::move(stmts); n->line = line; return n;
+}

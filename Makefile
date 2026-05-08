@@ -1,0 +1,44 @@
+CXX      := clang++
+LLVM_CFG := llvm-config-18
+LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
+# strip -fno-exceptions so we can use C++ exceptions in our code
+CXXFLAGS := $(filter-out -fno-exceptions,$(LLVM_CXXFLAGS)) -std=c++17 -g -Wall -Wno-unused-function -fexceptions
+LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core orcjit native) -lpthread -ldl
+
+CC       := clang
+CFLAGS   := -g -O2
+
+SRCDIR   := src
+OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o
+RT_OBJ   := $(SRCDIR)/runtime.o
+
+TARGET   := perlc
+
+.PHONY: all clean test
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS) $(RT_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(SRCDIR)/%.o: $(SRCDIR)/%.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+$(SRCDIR)/main.o: $(SRCDIR)/main.cpp $(SRCDIR)/lexer.h $(SRCDIR)/ast.h $(SRCDIR)/parser.h $(SRCDIR)/codegen.h
+$(SRCDIR)/lexer.o: $(SRCDIR)/lexer.cpp $(SRCDIR)/lexer.h
+$(SRCDIR)/parser.o: $(SRCDIR)/parser.cpp $(SRCDIR)/parser.h $(SRCDIR)/ast.h $(SRCDIR)/lexer.h
+$(SRCDIR)/codegen.o: $(SRCDIR)/codegen.cpp $(SRCDIR)/codegen.h $(SRCDIR)/ast.h $(SRCDIR)/runtime.h
+
+clean:
+	rm -f $(SRCDIR)/*.o $(TARGET)
+
+test: $(TARGET)
+	@echo "=== hello.pl    ===" && ./$(TARGET) tests/hello.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== arith.pl    ===" && ./$(TARGET) tests/arith.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== fib.pl      ===" && ./$(TARGET) tests/fib.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== hash.pl     ===" && ./$(TARGET) tests/hash.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== builtins.pl ===" && ./$(TARGET) tests/builtins.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== refs.pl     ===" && ./$(TARGET) tests/refs.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
