@@ -696,8 +696,15 @@ NodePtr Parser::parseBinding() {
             n->name = (sep != std::string::npos) ? txt.substr(sep + 1) : "";
             n->ival = negated ? 1 : 0;
             lhs = std::move(n);
+        } else if (check(TK::TR)) {
+            if (negated) throw std::runtime_error("!~ tr/// doesn't make sense");
+            std::string txt = cur().text; advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::TrOp; n->line = line;
+            n->left = std::move(lhs);
+            n->sval = txt; /* search\x01replace\x01flags */
+            lhs = std::move(n);
         } else {
-            throw std::runtime_error("Expected /regex/ or s/// after =~");
+            throw std::runtime_error("Expected /regex/ or s/// or tr/// after =~");
         }
     }
     return lhs;
@@ -806,7 +813,20 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                 base = std::move(n);
                 continue;
             }
-            /* -> not followed by [ or {: don't consume (restore? no — just stop) */
+            if (check(TK::LPAREN)) {
+                /* $code_ref->(args) */
+                advance();
+                auto n = std::make_unique<Node>(); n->kind = NK::CallCodeRef;
+                n->left = std::move(base); n->line = line;
+                while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                    n->args.push_back(parseExpr());
+                    if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+                }
+                consume(TK::RPAREN, ")");
+                base = std::move(n);
+                continue;
+            }
+            /* -> not followed by [ or { or (: don't consume (restore? no — just stop) */
             break;
         }
         /* adjacent subscripts after a ref-subscript */
@@ -914,7 +934,7 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* backslash: reference-taking  \$x  \@arr  \%h */
+    /* backslash: reference-taking  \$x  \@arr  \%h  \&sub */
     if (check(TK::BACKSLASH)) {
         advance();
         if (check(TK::SCALAR)) {
@@ -938,10 +958,46 @@ NodePtr Parser::parsePrimary() {
             n->name = nm; n->line = line;
             return n;
         }
+        if (check(TK::AND)) {
+            advance();
+            std::string nm = cur().text; advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::RefSub;
+            n->name = nm; n->line = line;
+            return n;
+        }
         /* \(expr) — ref to expr value, treat as RefScalar of expr */
         auto inner = parsePrimary();
         auto n = std::make_unique<Node>(); n->kind = NK::RefScalar;
         n->left = std::move(inner); n->line = line;
+        return n;
+    }
+
+    /* eval { BLOCK } */
+    if (check(TK::KW_EVAL)) {
+        advance();
+        consume(TK::LBRACE, "{");
+        NodeList stmts;
+        while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
+            stmts.push_back(parseStmt());
+        consume(TK::RBRACE, "}");
+        auto n = std::make_unique<Node>(); n->kind = NK::EvalBlock; n->line = line;
+        n->body = makeBlock(std::move(stmts), line);
+        return n;
+    }
+
+    /* anonymous sub: sub { BLOCK } */
+    if (check(TK::KW_SUB) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
+        advance(); /* consume 'sub' */
+        consume(TK::LBRACE, "{");
+        NodeList stmts;
+        while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
+            stmts.push_back(parseStmt());
+        consume(TK::RBRACE, "}");
+        auto n = std::make_unique<Node>(); n->kind = NK::AnonSub; n->line = line;
+        /* generate unique name for this anonymous sub */
+        static int anonCount = 0;
+        n->name = "__anon_" + std::to_string(++anonCount);
+        n->body = makeBlock(std::move(stmts), line);
         return n;
     }
 
@@ -962,9 +1018,19 @@ NodePtr Parser::parsePrimary() {
     /* scalar variable: $name  or  $$ref (scalar deref) */
     if (check(TK::SCALAR)) {
         advance(); /* skip $ */
-        /* $1, $2, ... capture variables */
+        /* $@ — eval error variable */
+        if (check(TK::ARRAY) && cur().text == "@") {
+            advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::DollarAt; n->line = line;
+            return n;
+        }
+        /* $1, $2, ... capture variables; $0 = program name */
         if (check(TK::INT)) {
             long long n = std::stoll(cur().text); advance();
+            if (n == 0) {
+                /* $0 = program name: treat as scalar variable "0" */
+                return makeScalar("0", line);
+            }
             auto node = std::make_unique<Node>(); node->kind = NK::CaptureVar;
             node->ival = n; node->line = line;
             return node;
@@ -1627,24 +1693,98 @@ NodePtr Parser::parseCall(std::string name, int line) {
 /* ── string interpolation ────────────────────────────────────────────────── */
 
 NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
-    /* scan raw for $varname and split into string + scalar fragments */
-    /* e.g. "Hello $name!\n"  → concat("Hello ", $name, "!\n") */
+    /* scan raw for $var / ${var} / $1-$9 / $@ / $0 / $arr[i] / $hash{k}
+       and @arr and split into string + expression fragments */
     std::vector<NodePtr> parts;
     std::string cur_s;
 
+    auto flush = [&]{ if (!cur_s.empty()) { parts.push_back(makeStr(cur_s, line)); cur_s.clear(); } };
+
     size_t i = 0;
     while (i < raw.size()) {
+        /* $@ — eval error */
+        if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '@') {
+            flush();
+            auto n = std::make_unique<Node>(); n->kind = NK::DollarAt; n->line = line;
+            parts.push_back(std::move(n));
+            i += 2; continue;
+        }
+        /* $0 — program name */
+        if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '0') {
+            flush();
+            parts.push_back(makeScalar("0", line));
+            i += 2; continue;
+        }
+        /* $1-$9 — capture vars */
+        if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] >= '1' && raw[i+1] <= '9') {
+            flush();
+            long long n = raw[i+1] - '0'; i += 2;
+            auto cv = std::make_unique<Node>(); cv->kind = NK::CaptureVar;
+            cv->ival = n; cv->line = line;
+            parts.push_back(std::move(cv));
+            continue;
+        }
+        /* ${varname} */
+        if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '{') {
+            flush(); i += 2;
+            std::string vname;
+            while (i < raw.size() && raw[i] != '}') vname += raw[i++];
+            if (i < raw.size()) i++; /* skip } */
+            parts.push_back(makeScalar(vname, line));
+            continue;
+        }
+        /* $varname possibly followed by [idx] or {key} */
         if (raw[i] == '$' && i + 1 < raw.size() && (isalpha(raw[i+1]) || raw[i+1] == '_')) {
-            if (!cur_s.empty()) { parts.push_back(makeStr(cur_s, line)); cur_s.clear(); }
-            i++; /* skip $ */
+            flush(); i++;
             std::string vname;
             while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
-            parts.push_back(makeScalar(vname, line));
-        } else {
-            cur_s += raw[i++];
+            /* $arr[idx] */
+            if (i < raw.size() && raw[i] == '[') {
+                i++;
+                std::string idx_s;
+                while (i < raw.size() && raw[i] != ']') idx_s += raw[i++];
+                if (i < raw.size()) i++;
+                auto n = std::make_unique<Node>(); n->kind = NK::ArrayElem;
+                n->name = vname;
+                long long idx = idx_s.empty() ? 0 : std::stoll(idx_s);
+                n->left = makeInt(idx, line);
+                n->line = line;
+                parts.push_back(std::move(n));
+            /* $hash{key} */
+            } else if (i < raw.size() && raw[i] == '{') {
+                i++;
+                std::string key_s;
+                while (i < raw.size() && raw[i] != '}') key_s += raw[i++];
+                if (i < raw.size()) i++;
+                auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
+                n->name = vname;
+                n->left = makeStr(key_s, line);
+                n->line = line;
+                parts.push_back(std::move(n));
+            } else {
+                parts.push_back(makeScalar(vname, line));
+            }
+            continue;
         }
+        /* @arr — interpolate entire array joined by $" (default space) */
+        if (raw[i] == '@' && i + 1 < raw.size() && (isalpha(raw[i+1]) || raw[i+1] == '_')) {
+            flush(); i++;
+            std::string vname;
+            while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
+            /* join array with space */
+            auto arrNode = std::make_unique<Node>(); arrNode->kind = NK::ArrayVar;
+            arrNode->name = vname; arrNode->line = line;
+            auto sepNode  = makeStr(" ", line);
+            auto joinNode = std::make_unique<Node>(); joinNode->kind = NK::JoinFunc;
+            joinNode->left = std::move(sepNode);
+            joinNode->args.push_back(std::move(arrNode));
+            joinNode->line = line;
+            parts.push_back(std::move(joinNode));
+            continue;
+        }
+        cur_s += raw[i++];
     }
-    if (!cur_s.empty()) parts.push_back(makeStr(cur_s, line));
+    flush();
 
     if (parts.empty()) return makeStr("", line);
     if (parts.size() == 1) return std::move(parts[0]);

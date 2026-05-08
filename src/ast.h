@@ -78,6 +78,15 @@ enum class NK {
     RegexMatch,   /* $s =~ /pat/flags  – left=str, sval=pat, name=flags, ival=1 if !~ */
     RegexSubst,   /* $s =~ s/p/r/flags – left=lval, sval=pat, name=repl\x01flags      */
     CaptureVar,   /* $1..$9            – ival=n                                        */
+    /* code references */
+    AnonSub,      /* sub { BLOCK }     – body=block, name=generated-fn-name           */
+    CallCodeRef,  /* $f->(args)        – left=code-ref expr, args=arg list            */
+    RefSub,       /* \&name or &name   – name=subname                                 */
+    /* eval */
+    EvalBlock,    /* eval { BLOCK }    – body=block                                   */
+    DollarAt,     /* $@                – the eval error variable                      */
+    /* tr/y */
+    TrOp,         /* $s =~ tr/a/b/flags – left=str, sval=search\x01replace\x01flags  */
 };
 
 struct Node;

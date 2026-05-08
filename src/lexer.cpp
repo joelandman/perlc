@@ -39,7 +39,7 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"chr",      TK::KW_CHR},   {"ord",      TK::KW_ORD},
     {"hex",      TK::KW_HEX},   {"oct",      TK::KW_OCT},
     {"map",      TK::KW_MAP},   {"grep",     TK::KW_GREP},
-    {"warn",     TK::KW_WARN},  {"system",   TK::KW_SYSTEM},
+    {"warn",     TK::KW_WARN},  {"system",   TK::KW_SYSTEM}, {"eval", TK::KW_EVAL},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}
@@ -240,6 +240,29 @@ std::vector<Token> Lexer::tokenize() {
 
         /* s/pattern/replacement/flags — substitution operator */
         if (c == 's' && peek(1) == '/') { pos_ += 2; toks.push_back(readSubst()); continue; }
+
+        /* tr/search/replace/flags  or  y/search/replace/flags */
+        if ((c == 't' && peek(1) == 'r' && peek(2) == '/') ||
+            (c == 'y' && peek(1) == '/')) {
+            size_t skip = (c == 't') ? 3 : 2;
+            pos_ += skip;
+            auto readSec = [&](char delim) {
+                std::string s;
+                while (pos_ < src_.size()) {
+                    char ch = src_[pos_];
+                    if (ch == delim) { pos_++; break; }
+                    if (ch == '\\' && pos_ + 1 < src_.size()) { s += ch; s += src_[++pos_]; pos_++; continue; }
+                    s += ch; pos_++;
+                }
+                return s;
+            };
+            std::string search = readSec('/');
+            std::string repl   = readSec('/');
+            std::string flags;
+            while (pos_ < src_.size() && isalpha(src_[pos_])) flags += src_[pos_++];
+            toks.push_back({TK::TR, search + "\x01" + repl + "\x01" + flags, line_});
+            continue;
+        }
 
         /* identifiers and keywords */
         if (isalpha(c) || c == '_') { toks.push_back(readIdent()); continue; }

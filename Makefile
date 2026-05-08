@@ -50,3 +50,4 @@ test: $(TARGET)
 	@echo "=== fileio.pl    ===" && ./$(TARGET) tests/fileio.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null
 	@echo "=== builtins2.pl ===" && ./$(TARGET) tests/builtins2.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== features.pl  ===" && ./$(TARGET) tests/features.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null
+	@echo "=== advanced.pl  ===" && ./$(TARGET) tests/advanced.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test hello world

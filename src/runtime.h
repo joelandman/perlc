@@ -15,6 +15,7 @@ typedef enum {
     PERL_REF_ARRAY  = 5,
     PERL_REF_HASH   = 6,
     PERL_FILEHANDLE = 7,
+    PERL_CODE_REF   = 8,
 } PerlTag;
 
 typedef struct PerlValue {
@@ -157,6 +158,10 @@ void       perl_warn(PerlValue *msg);
 PerlValue *perl_system(PerlValue *cmd);
 PerlValue *perl_backtick(PerlValue *cmd);
 
+/* ── command-line arguments ─────────────────────────────────────────────── */
+PerlArray *perl_init_argv(int argc, char **argv); /* call at program start; sets $0, returns @ARGV */
+PerlValue *perl_get_dollar0(void);               /* returns stable $0 PerlValue* */
+
 /* ── file test operators ─────────────────────────────────────────────────── */
 PerlValue *perl_filetest(int op, PerlValue *path);
 
@@ -231,6 +236,23 @@ PerlValue *perl_deref_scalar(PerlValue *ref);   /* returns (PerlValue*)ref->pval
 PerlArray *perl_deref_array(PerlValue *ref);    /* returns (PerlArray*)ref->pval */
 PerlHash  *perl_deref_hash(PerlValue *ref);     /* returns (PerlHash*)ref->pval */
 PerlValue *perl_ref_type(PerlValue *ref);       /* "SCALAR"/"ARRAY"/"HASH"/""   */
+
+/* ── code references ─────────────────────────────────────────────────────── */
+typedef PerlValue *(*PerlSubFn)(PerlArray *);
+PerlValue *perl_make_code_ref(PerlSubFn fp);
+PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args);
+
+/* ── tr/// character translation ────────────────────────────────────────── */
+/* returns count of characters translated (like Perl's tr return value) */
+long long  perl_tr(PerlValue *str, const char *search, const char *replace, const char *flags);
+
+/* ── eval / exception handling ───────────────────────────────────────────── */
+/* codegen allocates jmp_buf on stack and calls setjmp directly;
+   perl_eval_push/pop manage the eval stack of jmp_buf pointers */
+#include <setjmp.h>
+void       perl_eval_push(jmp_buf *jb); /* push caller's jmp_buf onto eval stack */
+void       perl_eval_pop(void);          /* pop after eval completes */
+PerlValue *perl_get_dollar_at(void);   /* returns stable $@ PerlValue* */
 
 #ifdef __cplusplus
 }

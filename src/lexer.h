@@ -24,7 +24,7 @@ enum class TK {
     KW_ABS, KW_INT, KW_SQRT,
     KW_CHR, KW_ORD, KW_HEX, KW_OCT,
     KW_MAP, KW_GREP,
-    KW_WARN, KW_SYSTEM,
+    KW_WARN, KW_SYSTEM, KW_EVAL,
     SPACESHIP,    /* <=> */
     FILETEST,  /* -e/-f/-d/-r/-w/-x/-z/-s/-l/-p – text = flag char */
     QWORDS,    /* qw(...) – text = space-separated words */
@@ -34,6 +34,7 @@ enum class TK {
     BIND,   /* =~ */
     NBIND,  /* !~ */
     SUBST,  /* s/pat/repl/flags */
+    TR,     /* tr/search/replace/flags  or  y/search/replace/flags */
     /* sigils */
     SCALAR,   /* $ */
     ARRAY,    /* @ */

@@ -169,6 +169,22 @@ void CodeGen::declareRuntime() {
     RT("perl_env_set",    voidTy, pv, pv);
     RT("perl_system",     pv, pv);
     RT("perl_backtick",   pv, pv);
+    RT("perl_init_argv",   av, Type::getInt32Ty(ctx_), i8p);
+    RT("perl_get_dollar0", pv);
+    RT("perl_make_code_ref",  pv, i8p);
+    RT("perl_call_code_ref",  pv, pv, av);
+    RT("perl_eval_pop",        voidTy);
+    RT("perl_get_dollar_at",   pv);
+    RT("perl_eval_push",       voidTy, i8p);
+    RT("perl_tr",              i64, pv, i8p, i8p, i8p);
+    /* setjmp called directly from generated code — must be returns_twice */
+    {
+        auto *ft = makeRT(ctx_, Type::getInt32Ty(ctx_), {i8p});
+        auto *fn = Function::Create(ft, Function::ExternalLinkage,
+                                    "setjmp", mod_.get());
+        fn->addFnAttr(Attribute::ReturnsTwice);
+        rtFuncs_["setjmp"] = fn;
+    }
     /* regex */
     RT("perl_regex_match",     pv,  pv, i8p, i8p);
     RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
@@ -463,6 +479,15 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         for (auto &keyNode : n.args) pushHashKey(*keyNode);
         return res;
     }
+    if (n.kind == NK::ArrayLit) {
+        Value *res = callRT("perl_array_new", {});
+        for (auto &elem : n.args) {
+            Value *sub = emitArrayPtr(*elem);
+            if (sub) callRT("perl_array_extend", {res, sub});
+            else     callRT("perl_array_push",   {res, emitExpr(*elem)});
+        }
+        return res;
+    }
     return nullptr;
 }
 
@@ -491,15 +516,33 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
                          "perlsub_" + s->name, mod_.get());
     }
 
-    /* emit main */
-    auto *mainFT = FunctionType::get(Type::getInt32Ty(ctx_), {}, false);
+    /* emit main(int argc, char **argv) */
+    auto *i32  = Type::getInt32Ty(ctx_);
+    auto *i8p  = PointerType::getUnqual(ctx_);
+    auto *mainFT = FunctionType::get(i32, {i32, i8p}, false);
     auto *mainFn = Function::Create(mainFT, Function::ExternalLinkage,
                                     "main", mod_.get());
+    mainFn->getArg(0)->setName("argc");
+    mainFn->getArg(1)->setName("argv");
     auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
     builder_.SetInsertPoint(entry);
 
     currentFn_ = mainFn;
     pushScope();
+
+    /* set up @ARGV and $0 from command-line arguments */
+    {
+        Value *argc_v = mainFn->getArg(0);
+        Value *argv_v = mainFn->getArg(1);
+        Value *argvArr = callRT("perl_init_argv", {argc_v, argv_v});
+        declareArray("ARGV", argvArr);
+
+        Value *dollar0 = callRT("perl_get_dollar0", {});
+        auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
+        builder_.CreateStore(dollar0, slot0);
+        declareVar("0", slot0);
+    }
+
     emitBlock(program);
     popScope();
 
@@ -602,30 +645,18 @@ void CodeGen::emitStmt(const Node &n) {
             Value *hv = callRT("perl_hash_new", {});
             declareHash(nm, hv);
             if (n.right) {
-                Value *listArr = nullptr;
-                auto &rhs = *n.right;
-                if (rhs.kind == NK::ArrayVar) {
-                    listArr = lookupArray(rhs.name);
-                    if (!listArr) listArr = callRT("perl_array_new", {});
-                } else if (rhs.kind == NK::ArrayLit) {
+                Value *listArr = emitArrayPtr(*n.right);
+                if (!listArr) {
                     listArr = callRT("perl_array_new", {});
-                    for (auto &elem : rhs.args)
-                        callRT("perl_array_push", {listArr, emitExpr(*elem)});
+                    callRT("perl_array_push", {listArr, emitExpr(*n.right)});
                 }
-                if (listArr) callRT("perl_hash_from_list", {hv, listArr});
+                callRT("perl_hash_from_list", {hv, listArr});
             }
         } else if (isArr) {
             std::string nm = n.name.substr(1);
-            /* try to get a PerlArray* directly from the rhs expression */
             Value *av = nullptr;
             if (n.right) av = emitArrayPtr(*n.right);
-            if (!av) {
-                av = callRT("perl_array_new", {});
-                if (n.right && n.right->kind == NK::ArrayLit) {
-                    for (auto &elem : n.right->args)
-                        callRT("perl_array_push", {av, emitExpr(*elem)});
-                }
-            }
+            if (!av) av = callRT("perl_array_new", {});
             declareArray(nm, av);
         } else {
             /* n.name may carry a '$' prefix when parsed in expression context */
@@ -961,7 +992,11 @@ void CodeGen::emitStmt(const Node &n) {
             av = lookupArray(n.name);
             if (!av) { av = callRT("perl_array_new", {}); declareArray(n.name, av); }
         }
-        for (auto &arg : n.args) callRT("perl_array_push", {av, emitExpr(*arg)});
+        for (auto &arg : n.args) {
+            Value *src = emitArrayPtr(*arg);
+            if (src) callRT("perl_array_extend", {av, src});
+            else     callRT("perl_array_push",   {av, emitExpr(*arg)});
+        }
         break;
     }
 
@@ -974,8 +1009,33 @@ void CodeGen::emitStmt(const Node &n) {
             av = lookupArray(n.name);
             if (!av) { av = callRT("perl_array_new", {}); declareArray(n.name, av); }
         }
-        for (int i = (int)n.args.size() - 1; i >= 0; i--)
-            callRT("perl_array_unshift", {av, emitExpr(*n.args[i])});
+        /* build a temp array in order then extend from front */
+        Value *tmp = callRT("perl_array_new", {});
+        for (auto &arg : n.args) {
+            Value *src = emitArrayPtr(*arg);
+            if (src) callRT("perl_array_extend", {tmp, src});
+            else     callRT("perl_array_push",   {tmp, emitExpr(*arg)});
+        }
+        /* unshift tmp elements into av in reverse order */
+        Value *tmpLen = callRT("perl_to_int", {callRT("perl_array_len", {tmp})});
+        /* emit a simple C-style loop: for (i = len-1; i >= 0; i--) */
+        auto *fn    = builder_.GetInsertBlock()->getParent();
+        auto *i64   = Type::getInt64Ty(ctx_);
+        auto *iA    = builder_.CreateAlloca(i64, nullptr, "us.i");
+        builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(i64, 1)), iA);
+        auto *condBB = BasicBlock::Create(ctx_, "us.cond", fn);
+        auto *bodyBB = BasicBlock::Create(ctx_, "us.body", fn);
+        auto *exitBB = BasicBlock::Create(ctx_, "us.exit", fn);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        Value *i = builder_.CreateLoad(i64, iA);
+        builder_.CreateCondBr(builder_.CreateICmpSGE(i, ConstantInt::get(i64, 0)), bodyBB, exitBB);
+        builder_.SetInsertPoint(bodyBB);
+        Value *elem = callRT("perl_array_get", {tmp, i});
+        callRT("perl_array_unshift", {av, elem});
+        builder_.CreateStore(builder_.CreateSub(i, ConstantInt::get(i64, 1)), iA);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(exitBB);
         break;
     }
 
@@ -1259,8 +1319,30 @@ Value *CodeGen::emitExpr(const Node &n) {
             av = lookupArray(n.name);
             if (!av) { av = callRT("perl_array_new", {}); declareArray(n.name, av); }
         }
-        for (int i = (int)n.args.size() - 1; i >= 0; i--)
-            callRT("perl_array_unshift", {av, emitExpr(*n.args[i])});
+        Value *tmp = callRT("perl_array_new", {});
+        for (auto &arg : n.args) {
+            Value *src = emitArrayPtr(*arg);
+            if (src) callRT("perl_array_extend", {tmp, src});
+            else     callRT("perl_array_push",   {tmp, emitExpr(*arg)});
+        }
+        Value *tmpLen = callRT("perl_to_int", {callRT("perl_array_len", {tmp})});
+        auto *fn    = builder_.GetInsertBlock()->getParent();
+        auto *i64   = Type::getInt64Ty(ctx_);
+        auto *iA    = builder_.CreateAlloca(i64, nullptr, "us2.i");
+        builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(i64, 1)), iA);
+        auto *condBB = BasicBlock::Create(ctx_, "us2.cond", fn);
+        auto *bodyBB = BasicBlock::Create(ctx_, "us2.body", fn);
+        auto *exitBB = BasicBlock::Create(ctx_, "us2.exit", fn);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(condBB);
+        Value *i = builder_.CreateLoad(i64, iA);
+        builder_.CreateCondBr(builder_.CreateICmpSGE(i, ConstantInt::get(i64, 0)), bodyBB, exitBB);
+        builder_.SetInsertPoint(bodyBB);
+        Value *elem = callRT("perl_array_get", {tmp, i});
+        callRT("perl_array_unshift", {av, elem});
+        builder_.CreateStore(builder_.CreateSub(i, ConstantInt::get(i64, 1)), iA);
+        builder_.CreateBr(condBB);
+        builder_.SetInsertPoint(exitBB);
         return callRT("perl_array_len", {av});
     }
 
@@ -1588,6 +1670,108 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *av = emitArrayPtr(n);
         if (!av) return perlUndef();
         return callRT("perl_array_len", {av});
+    }
+
+    case NK::DollarAt:
+        return callRT("perl_get_dollar_at", {});
+
+    case NK::TrOp: {
+        Value *str = emitExpr(*n.left);
+        size_t s1 = n.sval.find('\x01'), s2 = n.sval.find('\x01', s1 + 1);
+        std::string search = n.sval.substr(0, s1);
+        std::string repl   = n.sval.substr(s1 + 1, s2 - s1 - 1);
+        std::string flags  = n.sval.substr(s2 + 1);
+        Value *sv = builder_.CreateGlobalStringPtr(search, "tr_s");
+        Value *rv = builder_.CreateGlobalStringPtr(repl,   "tr_r");
+        Value *fv = builder_.CreateGlobalStringPtr(flags,  "tr_f");
+        Value *cnt = callRT("perl_tr", {str, sv, rv, fv});
+        return callRT("perl_alloc_int", {cnt});
+    }
+
+    case NK::EvalBlock: {
+        /* $@ = "" before eval */
+        Value *emptyAt = perlStr("");
+        callRT("perl_assign", {callRT("perl_get_dollar_at", {}), emptyAt});
+
+        /* allocate jmp_buf on stack (256 bytes, enough for any platform) */
+        auto *i8Arr  = ArrayType::get(Type::getInt8Ty(ctx_), 256);
+        auto *jbAlloca = builder_.CreateAlloca(i8Arr, nullptr, "jmp_buf");
+        /* cast to ptr for setjmp/perl_eval_push */
+        Value *jbPtr = builder_.CreateBitCast(jbAlloca, PointerType::getUnqual(ctx_));
+        /* perl_eval_push(jbPtr) — register this jmp_buf */
+        callRT("perl_eval_push", {jbPtr});
+
+        /* int caught = setjmp(jbPtr) */
+        auto *i32     = Type::getInt32Ty(ctx_);
+        Value *caught = callRT("setjmp", {jbPtr});
+        auto *fn      = builder_.GetInsertBlock()->getParent();
+        Value *isCaught = builder_.CreateICmpNE(caught, ConstantInt::get(i32, 0));
+        auto *bodyBB  = BasicBlock::Create(ctx_, "eval.body", fn);
+        auto *endBB   = BasicBlock::Create(ctx_, "eval.end",  fn);
+        builder_.CreateCondBr(isCaught, endBB, bodyBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        if (n.body) emitBlock(*n.body);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        callRT("perl_eval_pop", {});
+        return perlUndef();
+    }
+
+    case NK::AnonSub: {
+        /* emit the anonymous sub as a new LLVM function, return a code ref */
+        auto *subFT = FunctionType::get(perlPtrTy_,
+                          {PointerType::getUnqual(ctx_)}, false);
+        auto *subFn = Function::Create(subFT, Function::InternalLinkage,
+                                       "perlsub_" + n.name, mod_.get());
+        /* save state */
+        auto *savedFn    = currentFn_;
+        auto *savedBB    = builder_.GetInsertBlock();
+        auto  savedScopes = scopes_;
+        auto  savedArrScopes = arrayScopes_;
+        auto  savedHashScopes = hashScopes_;
+        /* emit sub body */
+        auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
+        builder_.SetInsertPoint(subEntry);
+        currentFn_ = subFn;
+        scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {};
+        pushScope();
+        Value *argsArr = subFn->getArg(0);
+        argsArr->setName("args");
+        declareArray("_", argsArr);
+        emitBlock(*n.body);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateRet(perlUndef());
+        popScope();
+        /* restore state */
+        currentFn_ = savedFn;
+        builder_.SetInsertPoint(savedBB);
+        scopes_ = std::move(savedScopes);
+        arrayScopes_ = std::move(savedArrScopes);
+        hashScopes_ = std::move(savedHashScopes);
+        /* return a code ref holding the function pointer */
+        Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
+        return callRT("perl_make_code_ref", {fnPtr});
+    }
+
+    case NK::RefSub: {
+        auto *subFn = mod_->getFunction("perlsub_" + n.name);
+        if (!subFn) return perlUndef();
+        Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
+        return callRT("perl_make_code_ref", {fnPtr});
+    }
+
+    case NK::CallCodeRef: {
+        Value *ref = emitExpr(*n.left);
+        Value *av  = callRT("perl_array_new", {});
+        for (auto &arg : n.args) {
+            Value *src = emitArrayPtr(*arg);
+            if (src) callRT("perl_array_extend", {av, src});
+            else     callRT("perl_array_push",   {av, emitExpr(*arg)});
+        }
+        return callRT("perl_call_code_ref", {ref, av});
     }
 
     default:

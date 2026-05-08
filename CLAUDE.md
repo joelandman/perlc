@@ -8,7 +8,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 14 test programs
+make test         # runs all 15 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -29,7 +29,7 @@ make clean
 ## Architecture
 
 - **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; }; long long matchpos; }`
-- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7`
+- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7, CODE_REF=8`
 - **PerlArray**: `{ PerlValue **elems; long long len, cap; }`
 - **PerlHash**: 64-bucket chained hash table
 - **matchpos**: per-PerlValue `/g` iterator offset; reset to 0 on `perl_clone`/`perl_assign`
@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (14/14)
+### All passing tests (15/15)
 
 | Test | What it covers |
 |------|----------------|
@@ -58,12 +58,13 @@ make clean
 | `fileio.pl` | open/close (2-arg/3-arg), readline scalar+array, print/say/printf to fh, eof, die, unlink |
 | `builtins2.pl` | abs/int/sqrt, uc/lc/ucfirst/lcfirst, index/rindex, chr/ord/hex/oct, reverse, map, grep, sort comparators, <=>, cmp |
 | `features.pl` | chop, warn, qw(), splice, array/hash slices, \$ENV{}, file tests (-e/-f/-d/-r/-w/-x/-z/-s/-l), system, backtick |
+| `advanced.pl` | array flattening (push/unshift/my with @arr), string `++`, @ARGV/$0, anon subs, \&sub, eval/\$@, tr/// |
 
 ### Language features
 
-**Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--`, compound assignment
+**Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--` (including magical string increment), compound assignment
 
-**Arrays**: `@arr`, push/pop/shift/unshift, `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`
+**Arrays**: `@arr`, push/pop/shift/unshift (all flatten array args), `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`; `my @a = (@b, @c)` properly flattens
 
 **Hashes**: `%hash`, `$h{key}`, keys/values/exists/delete, hash-from-list init
 
@@ -71,11 +72,13 @@ make clean
 
 **Statement modifiers**: `STMT if COND`, `STMT unless COND`, `STMT while COND`, `STMT until COND`, `STMT for LIST`, `STMT foreach LIST`
 
-**Subroutines**: `sub name { }`, `@_`, list unpacking, recursion
+**Subroutines**: `sub name { }`, `@_`, list unpacking, recursion, `sub { }` (anonymous subs), `\&name` (code refs), `$f->(args)` (code ref calls), `ref($f)` → `"CODE"`
 
-**References**: `\$x`, `\@arr`, `\%h`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
+**References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
 **Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`
+
+**tr///**: `$s =~ tr/SEARCH/REPLACE/flags` — character translation; flags: `d` (delete), `s` (squeeze), `c` (complement); ranges `a-z`; returns count
 
 **Range**: `1..N` in for/foreach, list context (`my @r = (1..10)`), join context
 
@@ -99,7 +102,11 @@ make clean
 
 **Builtins**: chomp, chop, length, substr, join, split, push, pop, shift, unshift, splice, sort, keys, values, exists, delete, scalar, defined, ref, warn, print, say, printf, sprintf, unlink
 
-**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`
+**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space)
+
+**Command-line**: `@ARGV` (arguments), `$0` (program name); generated `main` accepts `int argc, char **argv`
+
+**eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime
 
 ## Key Invariants
 
@@ -123,6 +130,12 @@ make clean
 - `qw(a b c)` → `ArrayLit` of `StringLit`; hash slice `@h{qw(a c)}` gets a single `ArrayLit` arg which codegen auto-flattens.
 - `splice` in array context (emitArrayPtr) returns removed elements as `PerlArray*`; scalar context returns element count.
 - `$ENV{key}` and `$ENV{key}=val` are special-cased in HashElem/Assign codegen (name=="ENV") to call `perl_env_get`/`perl_env_set` rather than normal hash lookup.
+- `emitArrayPtr` handles `ArrayLit` by flattening elements (ArrayVar children use `perl_array_extend`). Enables `my @a = (@b, @c)`, `push @a, @b` to flatten correctly.
+- String `++` on magical strings (`/^[a-zA-Z][a-zA-Z0-9]*$/`): per-character rolling increment in `perl_inc`; non-magical strings become int 1.
+- `@ARGV`/`$0`: generated `main` is `main(int argc, char**argv)`; calls `perl_init_argv` which returns a `PerlArray*` (declared as "ARGV") and sets a stable global `$0` PerlValue*.
+- `$0` in parser: after `$` sigil, if INT token value == 0, returns `makeScalar("0", line)` rather than `CaptureVar`.
+- Anonymous subs (`sub { }`): emit an internal LLVM function, save/restore codegen state, return `perl_make_code_ref(fp)`. Closures (capturing outer lexicals) are NOT supported.
+- `eval { }` uses `jmp_buf` allocated as `[256 x i8]` alloca in the calling frame; `setjmp` is declared directly with `returns_twice` attribute; `perl_eval_push(jb*)` registers the buffer; `perl_die` does `longjmp` when eval depth > 0 and sets `$@`.
 
 ## Passing Test Expected Outputs
 
@@ -282,15 +295,20 @@ c
 
 ### range.pl
 ```
+1 2 3 4 5 
 1
 2
 3
-4
 5
-10
-55
+1
+5
+10, 11, 12, 13, 14, 15
+5
+3
+7
+0
 1-2-3-4
-4
+55
 ```
 
 ### sprintf.pl
@@ -373,6 +391,32 @@ cherry,banana,apple
 done
 ```
 
+### advanced.pl (run with args `hello world`)
+```
+6
+1,2,3,4,5,6
+5
+1,2,3,7,8
+1,2,3,4,5,6
+ab
+ba
+aaa
+Ba
+AAa0
+2
+hello
+world
+7
+CODE
+10
+caught error
+
+ok
+got: boom
+
+done
+```
+
 ## Known Limitations / Not Implemented
 
 - `wantarray`, `caller`, `local`
@@ -380,3 +424,4 @@ done
 - `use` statements (parsed but ignored, except `use strict`/`use warnings`)
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
 - Named captures `(?<name>...)`
+- Lexical closures (anonymous subs can access `@_` but not outer lexical `my` variables)

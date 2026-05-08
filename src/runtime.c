@@ -10,6 +10,26 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <setjmp.h>
+
+/* ── eval / $@ support ───────────────────────────────────────────────────── */
+
+/* jmp_buf pointers are pushed by callers (codegen allocates jmp_buf on stack) */
+#define EVAL_STACK_MAX 64
+static jmp_buf *s_eval_stack[EVAL_STACK_MAX];
+static int      s_eval_depth = 0;
+static PerlValue s_dollar_at = { PERL_STRING, {0}, 0 }; /* $@ */
+
+void perl_eval_push(jmp_buf *jb) {
+    if (s_eval_depth < EVAL_STACK_MAX)
+        s_eval_stack[s_eval_depth++] = jb;
+}
+
+void perl_eval_pop(void) {
+    if (s_eval_depth > 0) s_eval_depth--;
+}
+
+PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
 
 /* ── allocation ──────────────────────────────────────────────────────────── */
 
@@ -290,8 +310,51 @@ void perl_print_string(const char *s) {
 /* ── inc/dec ─────────────────────────────────────────────────────────────── */
 
 PerlValue *perl_inc(PerlValue *v) {
-    if (v->tag == PERL_FLOAT) { v->fval += 1.0; }
-    else { if (v->tag != PERL_INT) { v->tag = PERL_INT; v->ival = 0; } v->ival++; }
+    if (v->tag == PERL_FLOAT) { v->fval += 1.0; return v; }
+    if (v->tag == PERL_INT)   { v->ival++; return v; }
+    if (v->tag == PERL_STRING && v->sval) {
+        /* magical string increment: only for /^[a-zA-Z][a-zA-Z0-9]*$/ */
+        const char *s = v->sval;
+        size_t len = strlen(s);
+        int magic = (len > 0);
+        for (size_t i = 0; i < len && magic; i++) {
+            char c = s[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (i > 0 && c >= '0' && c <= '9')))
+                magic = 0;
+        }
+        if (magic) {
+            char *buf = malloc(len + 2);
+            memcpy(buf, s, len + 1);
+            int carry = 1;
+            for (long long i = (long long)len - 1; i >= 0 && carry; i--) {
+                char c = buf[i];
+                if (c >= 'a' && c <= 'z') {
+                    if (c < 'z') { buf[i]++; carry = 0; }
+                    else { buf[i] = 'a'; }
+                } else if (c >= 'A' && c <= 'Z') {
+                    if (c < 'Z') { buf[i]++; carry = 0; }
+                    else { buf[i] = 'A'; }
+                } else if (c >= '0' && c <= '9') {
+                    if (c < '9') { buf[i]++; carry = 0; }
+                    else { buf[i] = '0'; }
+                }
+            }
+            if (carry) {
+                char first = buf[0];
+                char prefix = (first >= 'a' && first <= 'z') ? 'a'
+                            : (first >= 'A' && first <= 'Z') ? 'A' : '1';
+                memmove(buf + 1, buf, len + 1);
+                buf[0] = prefix;
+            }
+            free(v->sval);
+            v->sval = buf;
+            return v;
+        }
+    }
+    /* non-magic: convert to int 0 and increment */
+    if (v->tag == PERL_STRING) { free(v->sval); v->sval = NULL; }
+    v->tag = PERL_INT; v->ival = 1;
     return v;
 }
 
@@ -737,8 +800,26 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_REF_SCALAR: return perl_alloc_string("SCALAR");
         case PERL_REF_ARRAY:  return perl_alloc_string("ARRAY");
         case PERL_REF_HASH:   return perl_alloc_string("HASH");
+        case PERL_CODE_REF:   return perl_alloc_string("CODE");
         default:              return perl_alloc_string("");
     }
+}
+
+/* ── code references ─────────────────────────────────────────────────────── */
+
+PerlValue *perl_make_code_ref(PerlSubFn fp) {
+    PerlValue *v = malloc(sizeof *v);
+    v->tag = PERL_CODE_REF;
+    v->pval = (void *)fp;
+    v->matchpos = 0;
+    return v;
+}
+
+PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
+    if (!ref || ref->tag != PERL_CODE_REF || !ref->pval)
+        return perl_alloc_undef();
+    PerlSubFn fn = (PerlSubFn)ref->pval;
+    return fn(args);
 }
 
 /* ── file I/O ────────────────────────────────────────────────────────────── */
@@ -878,6 +959,13 @@ PerlValue *perl_eof_fh(PerlValue *fh) {
 
 void perl_die(PerlValue *msg) {
     char *s = msg ? perl_to_string(msg) : strdup("Died");
+    if (s_eval_depth > 0) {
+        /* inside eval: set $@ and longjmp back to setjmp in calling frame */
+        if (s_dollar_at.sval) free(s_dollar_at.sval);
+        s_dollar_at.tag  = PERL_STRING;
+        s_dollar_at.sval = s;
+        longjmp(*s_eval_stack[s_eval_depth - 1], 1);
+    }
     fputs(s, stderr);
     size_t n = strlen(s);
     if (n == 0 || s[n-1] != '\n') fputc('\n', stderr);
@@ -1546,6 +1634,138 @@ PerlValue *perl_backtick(PerlValue *cmd) {
     PerlValue *r = perl_alloc_string(out);
     free(out);
     return r;
+}
+
+/* ── tr/// character translation ────────────────────────────────────────── */
+
+/* Expand tr ranges like a-z into individual characters */
+static char *tr_expand(const char *s, size_t *outlen) {
+    size_t len = strlen(s);
+    /* worst case: all ranges a-z = 24 chars each → allocate generously */
+    char *buf = malloc(len * 256 + 1);
+    size_t out = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (i + 2 < len && s[i+1] == '-' && s[i+2] >= s[i]) {
+            for (unsigned char c = (unsigned char)s[i]; c <= (unsigned char)s[i+2]; c++)
+                buf[out++] = (char)c;
+            i += 2;
+        } else if (s[i] == '\\' && i + 1 < len) {
+            i++;
+            switch (s[i]) {
+                case 'n': buf[out++] = '\n'; break;
+                case 't': buf[out++] = '\t'; break;
+                case 'r': buf[out++] = '\r'; break;
+                default:  buf[out++] = s[i]; break;
+            }
+        } else {
+            buf[out++] = s[i];
+        }
+    }
+    buf[out] = '\0';
+    *outlen = out;
+    return buf;
+}
+
+long long perl_tr(PerlValue *str, const char *search, const char *replace, const char *flags) {
+    if (!str) return 0;
+    int do_delete  = strchr(flags, 'd') != NULL;
+    int do_squeeze = strchr(flags, 's') != NULL;
+    int do_compl   = strchr(flags, 'c') != NULL;
+
+    size_t slen, rlen;
+    char *sch = tr_expand(search, &slen);
+    char *rch = tr_expand(replace, &rlen);
+
+    /* build 256-entry translation table */
+    int table[256];
+    for (int i = 0; i < 256; i++) table[i] = -1; /* -1 = no translation */
+
+    if (!do_compl) {
+        for (size_t i = 0; i < slen; i++) {
+            unsigned char sc = (unsigned char)sch[i];
+            if (table[sc] == -1) { /* first occurrence wins */
+                if (i < rlen)          table[sc] = (unsigned char)rch[i];
+                else if (rlen == 0) {
+                    if (do_delete)     table[sc] = -2; /* delete */
+                    else               table[sc] = sc;  /* replicate = identity */
+                } else                 table[sc] = (unsigned char)rch[rlen - 1];
+            }
+        }
+    } else {
+        /* complement: translate chars NOT in search list */
+        char in_search[256] = {0};
+        for (size_t i = 0; i < slen; i++) in_search[(unsigned char)sch[i]] = 1;
+        size_t ri = 0;
+        for (int c = 0; c < 256; c++) {
+            if (!in_search[c]) {
+                if (ri < rlen)         table[c] = (unsigned char)rch[ri++];
+                else if (rlen == 0) {
+                    if (do_delete)     table[c] = -2;
+                    else               table[c] = c;
+                } else                 table[c] = (unsigned char)rch[rlen - 1];
+            }
+        }
+    }
+    free(sch); free(rch);
+
+    char *s = perl_to_string(str);
+    size_t in_len = strlen(s);
+    char *out = malloc(in_len + 1);
+    size_t out_len = 0;
+    long long count = 0;
+    char last_out = 0;
+    int has_last = 0;
+
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        int mapped = table[c];
+        if (mapped == -1) {
+            /* no translation — pass through */
+            if (!do_squeeze || !has_last || (char)c != last_out) {
+                out[out_len++] = (char)c;
+                last_out = (char)c; has_last = 1;
+            }
+        } else if (mapped == -2) {
+            /* explicit delete marker */
+            count++;
+        } else {
+            count++;
+            char mc = (char)mapped;
+            if (do_squeeze && has_last && mc == last_out) continue;
+            out[out_len++] = mc;
+            last_out = mc; has_last = 1;
+        }
+    }
+    out[out_len] = '\0';
+
+    /* update str in-place */
+    if (str->tag == PERL_STRING && str->sval) free(str->sval);
+    str->tag  = PERL_STRING;
+    str->sval = out;
+    free(s);
+    return count;
+}
+
+/* ── command-line arguments ─────────────────────────────────────────────── */
+
+static PerlArray *perl_argv_arr = NULL;
+static PerlValue  perl_dollar0_val = { PERL_STRING, {0}, 0 };
+
+PerlArray *perl_init_argv(int argc, char **argv) {
+    perl_argv_arr = perl_array_new();
+    /* $0 = script name (argv[0]) */
+    perl_dollar0_val.sval = strdup(argc > 0 ? argv[0] : "");
+    /* @ARGV = argv[1..] */
+    for (int i = 1; i < argc; i++) {
+        PerlValue *v = perl_alloc_string(argv[i]);
+        perl_array_push(perl_argv_arr, v);
+        perl_free(v);
+    }
+    return perl_argv_arr;
+}
+
+PerlValue *perl_get_dollar0(void) {
+    return &perl_dollar0_val;
 }
 
 /* ── file test operators ─────────────────────────────────────────────────── */
