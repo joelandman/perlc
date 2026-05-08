@@ -8,7 +8,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 11 test programs
+make test         # runs all 13 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -40,7 +40,7 @@ make clean
 
 ## Implemented Features
 
-### All passing tests (12/12)
+### All passing tests (13/13)
 
 | Test | What it covers |
 |------|----------------|
@@ -56,6 +56,7 @@ make clean
 | `range.pl` | `..` range operator in for, array assignment, join, scalar context |
 | `sprintf.pl` | `sprintf`/`printf` with `%s %d %f %x %o %b %e %g %c %%`, width/precision |
 | `fileio.pl` | open/close (2-arg/3-arg), readline scalar+array, print/say/printf to fh, eof, die, unlink |
+| `builtins2.pl` | abs/int/sqrt, uc/lc/ucfirst/lcfirst, index/rindex, chr/ord/hex/oct, reverse, map, grep, sort comparators, <=>, cmp |
 
 ### Language features
 
@@ -81,6 +82,14 @@ make clean
 
 **File I/O**: `open(my $fh, mode, file)`, `open(my $fh, "modeFile")` (2-arg), `close($fh)`, `<$fh>` (scalar readline), `my @lines = <$fh>` (array readline), `print $fh`, `say $fh`, `printf $fh`, `eof($fh)`, `die`, `print STDERR`, `unlink`
 
+**Operators**: `<=>` (spaceship numeric), `cmp` (spaceship string)
+
+**List ops**: `map { BLOCK } LIST`, `grep { BLOCK } LIST`, `sort { CMP } LIST` (with `$a`/`$b` comparator patterns), `reverse @arr` (array), `scalar reverse $str` (string)
+
+**Math builtins**: `abs`, `int` (truncate), `sqrt`
+
+**String builtins**: `uc`, `lc`, `ucfirst`, `lcfirst`, `index($str, $sub[, $pos])`, `rindex($str, $sub[, $pos])`, `chr`, `ord`, `hex`, `oct`
+
 **Builtins**: chomp, length, substr, join, split, push, pop, shift, unshift, sort, keys, values, exists, delete, scalar, defined, ref, print, say, printf, sprintf, unlink
 
 **String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`
@@ -98,6 +107,11 @@ make clean
 - `parseModifier(stmt, line)`: called at end of every statement path; consumes the `;` itself. Modifier keywords (if/unless/while/until/for/foreach) are detected with `isModifier()` to prevent arg-list parsing from over-consuming.
 - Filehandle detection in print/say/printf: `$var` is treated as a filehandle only when followed by an expression-start token (scalar, string, int, float, ident, `(`, `[`, `{`) — not an operator. Prevents `say $a + $b` from treating `$a` as a filehandle.
 - `die` in expression context (e.g. `open(...) or die "..."`) uses the dead-block pattern: after `CreateUnreachable()`, insert point moves to a fresh dead basic block so surrounding phi nodes remain well-formed.
+- `map`/`grep` blocks compile as inline LLVM loops; `$_` alloca is hoisted before the loop; `emitBlockLast` returns the last expression from the block.
+- `sort { CMP }` block: parser detects 4 patterns (`$a <=> $b`, `$b <=> $a`, `$a cmp $b`, `$b cmp $a`) and stores the mode in `Node::sval`; codegen dispatches to specialized C sort functions.
+- `reverse` in scalar context (`scalar reverse $str`) calls `perl_reverse_str`; in array context calls `perl_reverse_array`.
+- `scalar EXPR` (beyond `@arr`/`keys`/`values`): parser now falls through to `parsePrimary()` and sets `sval = "scalar_ctx"` on the inner node.
+- `index`/`rindex` pass `perlUndef()` for missing pos arg; runtime checks `pos_pv->tag != PERL_UNDEF` to distinguish "no pos given" from "pos=0".
 
 ## Passing Test Expected Outputs
 
@@ -270,13 +284,81 @@ c
 
 ### sprintf.pl
 ```
-hello 42
-   10
-3.14
+Hello, Alice! You are 30 years old.
+Pi is approximately 3.1416
+1.234568e+04
+0.000123
+[     right]
+[left      ]
+[00042]
+(foo, 99)
 ff
-377
-11111111
-1.23e+00
+FF
+10
+item 01: value
+item 02: value
+item 03: value
+      42
+3.142
+100%
+Result: 3 + 4 = 7
+```
+
+### fileio.pl
+```
+line one
+line two
+line three
+3
+line one
+line three
+4
+eof
+line one
+answer=42
+done
+```
+
+### builtins2.pl
+```
+5
+3.7
+3
+-3
+4.0
+HELLO
+world
+Foo
+bAR
+6
+-1
+4
+9
+3
+A
+65
+97
+255
+255
+63
+10
+5,4,3,2,1
+olleh
+2,4,6,8,10
+n1
+n5
+2,4
+4,5
+1,2,3,4,5
+5,4,3,2,1
+apple,banana,cherry
+cherry,banana,apple
+-1
+0
+1
+-1
+0
+1
 done
 ```
 
