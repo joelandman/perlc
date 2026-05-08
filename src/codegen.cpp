@@ -110,6 +110,8 @@ void CodeGen::declareRuntime() {
     RT("perl_deref_array",  av, pv);
     RT("perl_deref_hash",   av, pv);  /* returns PerlHash* as opaque av */
     RT("perl_ref_type",     pv, pv);
+    /* range */
+    RT("perl_range",        av, pv, pv);
     /* regex */
     RT("perl_regex_match",     pv,  pv, i8p, i8p);
     RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
@@ -232,6 +234,11 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         for (auto &elem : n.args)
             callRT("perl_array_push", {av, emitExpr(*elem)});
         return av;
+    }
+    if (n.kind == NK::Range) {
+        Value *lo = emitExpr(*n.left);
+        Value *hi = emitExpr(*n.right);
+        return callRT("perl_range", {lo, hi});
     }
     if (n.kind == NK::RegexMatch && n.name.find('g') != std::string::npos) {
         Value *str = emitExpr(*n.left);
@@ -719,6 +726,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         return av;
     }
 
+    case NK::Range: {
+        /* in scalar context, return the element count */
+        Value *av = callRT("perl_range", {emitExpr(*n.left), emitExpr(*n.right)});
+        return callRT("perl_array_len", {av});
+    }
+
     case NK::BinOp:     return emitBinOp(n);
 
     case NK::UnaryOp: {
@@ -905,18 +918,15 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *sep = emitExpr(*n.left);
         /* build a temp array from the rest of the args */
         Value *av = nullptr;
-        if (n.args.size() == 1 && n.args[0]->kind == NK::ArrayVar) {
-            av = lookupArray(n.args[0]->name);
-            if (!av) av = callRT("perl_array_new", {});
-        } else {
+        if (n.args.size() == 1) {
+            av = emitArrayPtr(*n.args[0]);
+        }
+        if (!av) {
             av = callRT("perl_array_new", {});
             for (auto &a : n.args) {
-                if (a->kind == NK::ArrayVar) {
-                    Value *src = lookupArray(a->name);
-                    if (src) callRT("perl_array_extend", {av, src});
-                } else {
-                    callRT("perl_array_push", {av, emitExpr(*a)});
-                }
+                Value *src = emitArrayPtr(*a);
+                if (src) callRT("perl_array_extend", {av, src});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
             }
         }
         return callRT("perl_join", {sep, av});

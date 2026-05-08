@@ -143,6 +143,9 @@ PerlValue *perl_hash_size(PerlHash *h);    /* returns int count of key-value pai
 void       perl_hash_from_list(PerlHash *h, PerlArray *list);
 void       perl_array_extend_hash(PerlArray *dst, PerlHash *h); /* append k,v pairs */
 
+/* ── range ───────────────────────────────────────────────────────────────── */
+PerlArray *perl_range(PerlValue *from, PerlValue *to);
+
 /* ── regex (PCRE2) ───────────────────────────────────────────────────────── */
 PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags);
 PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags);

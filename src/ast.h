@@ -50,6 +50,7 @@ enum class NK {
     ArrowDeref,   /* $r->[i] or $r->{k} – left=base, right=subscript, sval="array"/"hash" */
     RefFunc,      /* ref($x)    – left = expr               */
     /* regex */
+    Range,        /* lo..hi             – left=lo, right=hi                           */
     RegexMatch,   /* $s =~ /pat/flags  – left=str, sval=pat, name=flags, ival=1 if !~ */
     RegexSubst,   /* $s =~ s/p/r/flags – left=lval, sval=pat, name=repl\x01flags      */
     CaptureVar,   /* $1..$9            – ival=n                                        */

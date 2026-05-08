@@ -564,8 +564,20 @@ NodePtr Parser::parseAssign() {
     return lhs;
 }
 
+NodePtr Parser::parseRange() {
+    auto lhs = parseOr();
+    if (!check(TK::DOTDOT)) return lhs;
+    int line = cur().line;
+    advance();
+    auto rhs = parseOr();
+    auto n = std::make_unique<Node>();
+    n->kind = NK::Range; n->line = line;
+    n->left = std::move(lhs); n->right = std::move(rhs);
+    return n;
+}
+
 NodePtr Parser::parseTernary() {
-    auto cond = parseOr();
+    auto cond = parseRange();
     if (!match(TK::QUESTION)) return cond;
     int line = cur().line;
     auto then = parseExpr();

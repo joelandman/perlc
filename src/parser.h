@@ -40,6 +40,7 @@ private:
     NodePtr parseExpr();
     NodePtr parseAssign();
     NodePtr parseTernary();
+    NodePtr parseRange();
     NodePtr parseOr();
     NodePtr parseAnd();
     NodePtr parseNot();

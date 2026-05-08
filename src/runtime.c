@@ -708,6 +708,17 @@ PerlValue *perl_ref_type(PerlValue *ref) {
     }
 }
 
+/* ── range ───────────────────────────────────────────────────────────────── */
+
+PerlArray *perl_range(PerlValue *from, PerlValue *to) {
+    PerlArray *a = perl_array_new();
+    long long lo = perl_to_int(from);
+    long long hi = perl_to_int(to);
+    for (long long i = lo; i <= hi; i++)
+        perl_array_push(a, perl_alloc_int(i));
+    return a;
+}
+
 /* ── regex (PCRE2) ───────────────────────────────────────────────────────── */
 
 #define PERL_MAX_CAPTURES 10
