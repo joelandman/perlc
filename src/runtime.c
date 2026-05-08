@@ -708,6 +708,122 @@ PerlValue *perl_ref_type(PerlValue *ref) {
     }
 }
 
+/* ── sprintf / printf ────────────────────────────────────────────────────── */
+
+PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
+    char *fmt = perl_to_string(fmt_pv);
+
+    /* dynamic output buffer */
+    size_t cap = 256, pos = 0;
+    char *out = malloc(cap);
+
+#define OUT_ENSURE(n) do { while (pos+(n)+1 > cap) { cap*=2; out=realloc(out,cap); } } while(0)
+#define OUT_PUTS(s,l) do { size_t _l=(l); OUT_ENSURE(_l); memcpy(out+pos,(s),_l); pos+=_l; } while(0)
+
+    long long argidx = 0;
+
+    for (const char *p = fmt; *p; ) {
+        if (*p != '%') { OUT_PUTS(p, 1); p++; continue; }
+        p++;
+        if (*p == '%') { OUT_PUTS("%", 1); p++; continue; }
+
+        /* collect specifier: [flags][width][.prec]type */
+        char spec[128]; int si = 1; spec[0] = '%';
+        while (*p && strchr("-+ 0#", *p)) spec[si++] = *p++;
+        /* width — digits or * (from next arg) */
+        if (*p == '*') {
+            PerlValue *wa = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+            long long w = perl_to_int(wa);
+            si += snprintf(spec+si, sizeof(spec)-si-2, "%lld", w);
+            p++;
+        } else { while (*p && isdigit(*p)) spec[si++] = *p++; }
+        /* precision */
+        if (*p == '.') {
+            spec[si++] = *p++;
+            if (*p == '*') {
+                PerlValue *pa = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+                long long pr = perl_to_int(pa);
+                si += snprintf(spec+si, sizeof(spec)-si-2, "%lld", pr);
+                p++;
+            } else { while (*p && isdigit(*p)) spec[si++] = *p++; }
+        }
+        char conv = *p ? *p++ : 's';
+
+        PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+
+        char tmp[512];
+        switch (conv) {
+        case 's': {
+            char *s = perl_to_string(arg);
+            size_t needed = strlen(s) + (size_t)(si + 16);
+            char *tbuf = needed <= sizeof(tmp) ? tmp : malloc(needed);
+            spec[si++] = 's'; spec[si] = '\0';
+            snprintf(tbuf, needed, spec, s);
+            OUT_PUTS(tbuf, strlen(tbuf));
+            if (tbuf != tmp) free(tbuf);
+            free(s);
+            continue;
+        }
+        case 'd': case 'i': {
+            char ls[138]; memcpy(ls, spec, si);
+            ls[si]=ls[si+1]='l'; ls[si+2]=conv; ls[si+3]='\0';
+            snprintf(tmp, sizeof(tmp), ls, perl_to_int(arg));
+            break;
+        }
+        case 'u': {
+            char ls[138]; memcpy(ls, spec, si);
+            ls[si]=ls[si+1]='l'; ls[si+2]='u'; ls[si+3]='\0';
+            snprintf(tmp, sizeof(tmp), ls, (unsigned long long)perl_to_int(arg));
+            break;
+        }
+        case 'f': case 'e': case 'E': case 'g': case 'G': {
+            spec[si++] = conv; spec[si] = '\0';
+            snprintf(tmp, sizeof(tmp), spec, perl_to_float(arg));
+            break;
+        }
+        case 'x': case 'X': case 'o': {
+            char ls[138]; memcpy(ls, spec, si);
+            ls[si]='l'; ls[si+1]='l'; ls[si+2]=conv; ls[si+3]='\0';
+            unsigned long long uv = (unsigned long long)perl_to_int(arg);
+            snprintf(tmp, sizeof(tmp), ls, uv);
+            break;
+        }
+        case 'b': case 'B': {
+            unsigned long long uv = (unsigned long long)perl_to_int(arg);
+            char binbuf[65]; int bi = 0;
+            if (uv == 0) { binbuf[bi++] = '0'; }
+            else { for (int bit = 63; bit >= 0; bit--) if ((uv>>bit)&1 || bi) binbuf[bi++] = ((uv>>bit)&1)?'1':'0'; }
+            binbuf[bi] = '\0';
+            snprintf(tmp, sizeof(tmp), "%s", binbuf);
+            break;
+        }
+        case 'c': {
+            tmp[0] = (char)perl_to_int(arg); tmp[1] = '\0';
+            break;
+        }
+        default:
+            spec[si++] = conv; spec[si] = '\0';
+            snprintf(tmp, sizeof(tmp), spec, perl_to_int(arg));
+            break;
+        }
+        OUT_PUTS(tmp, strlen(tmp));
+    }
+    out[pos] = '\0';
+#undef OUT_ENSURE
+#undef OUT_PUTS
+
+    free(fmt);
+    PerlValue *result = perl_alloc_string(out);
+    free(out);
+    return result;
+}
+
+void perl_printf(PerlValue *fmt, PerlArray *args) {
+    PerlValue *s = perl_sprintf(fmt, args);
+    perl_print(s);
+    perl_free(s);
+}
+
 /* ── range ───────────────────────────────────────────────────────────────── */
 
 PerlArray *perl_range(PerlValue *from, PerlValue *to) {

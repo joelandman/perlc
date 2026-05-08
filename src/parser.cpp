@@ -101,6 +101,23 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_SUB))    return parseSub();
     if (check(TK::KW_PRINT))  { return parseModifier(parsePrint(false), line); }
     if (check(TK::KW_SAY))    { return parseModifier(parsePrint(true),  line); }
+    if (check(TK::KW_PRINTF)) {
+        advance();
+        bool hasParen = check(TK::LPAREN);
+        if (hasParen) advance();
+        NodePtr fmt = parseExpr();
+        NodeList args;
+        while (match(TK::COMMA)) {
+            if (!hasParen && isModifier()) break;
+            if (hasParen && check(TK::RPAREN)) break;
+            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            args.push_back(parseExpr());
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
+        n->left = std::move(fmt); n->args = std::move(args);
+        return parseModifier(std::move(n), line);
+    }
     if (check(TK::KW_PUSH))   { return parseModifier(parsePush(),        line); }
     if (check(TK::KW_UNSHIFT)){ return parseModifier(parseUnshift(),     line); }
     if (check(TK::KW_RETURN)) { return parseModifier(parseReturn(),      line); }
@@ -1118,6 +1135,24 @@ NodePtr Parser::parsePrimary() {
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::JoinFunc;
         n->left = std::move(sep); n->args = std::move(rest); n->line = line;
+        return n;
+    }
+
+    /* sprintf($fmt, args...) */
+    if (check(TK::KW_SPRINTF)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        NodePtr fmt = parseExpr();
+        NodeList args;
+        while (match(TK::COMMA)) {
+            if (!hasParen && isModifier()) break;
+            if (hasParen && check(TK::RPAREN)) break;
+            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            args.push_back(parseExpr());
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::SprintfFunc; n->line = line;
+        n->left = std::move(fmt); n->args = std::move(args);
         return n;
     }
 

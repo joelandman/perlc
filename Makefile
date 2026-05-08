@@ -46,3 +46,4 @@ test: $(TARGET)
 	@echo "=== regex_g.pl  ===" && ./$(TARGET) tests/regex_g.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== modifiers.pl ===" && ./$(TARGET) tests/modifiers.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== range.pl     ===" && ./$(TARGET) tests/range.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== sprintf.pl   ===" && ./$(TARGET) tests/sprintf.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test

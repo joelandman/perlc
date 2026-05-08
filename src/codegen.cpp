@@ -110,6 +110,9 @@ void CodeGen::declareRuntime() {
     RT("perl_deref_array",  av, pv);
     RT("perl_deref_hash",   av, pv);  /* returns PerlHash* as opaque av */
     RT("perl_ref_type",     pv, pv);
+    /* sprintf / printf */
+    RT("perl_sprintf",      pv, pv, av);
+    RT("perl_printf",       voidTy, pv, av);
     /* range */
     RT("perl_range",        av, pv, pv);
     /* regex */
@@ -433,6 +436,14 @@ void CodeGen::emitStmt(const Node &n) {
                 callRT("perl_print_string", {nl});
             }
         }
+        break;
+    }
+
+    case NK::PrintfStmt: {
+        Value *fmt = emitExpr(*n.left);
+        Value *av  = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        callRT("perl_printf", {fmt, av});
         break;
     }
 
@@ -912,6 +923,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             return callRT("perl_substr3", {str, off, len});
         }
         return callRT("perl_substr2", {str, off});
+    }
+
+    case NK::SprintfFunc: {
+        Value *fmt = emitExpr(*n.left);
+        Value *av  = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_sprintf", {fmt, av});
     }
 
     case NK::JoinFunc: {

@@ -26,7 +26,7 @@ enum class NK {
     For,            /* C-style for */
     Foreach,
     Last, Next, Return,
-    PrintStmt, SayStmt,
+    PrintStmt, SayStmt, PrintfStmt, SprintfFunc,
     SubDef,
     UseStmt,
     /* builtins that look like functions */

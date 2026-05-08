@@ -143,6 +143,10 @@ PerlValue *perl_hash_size(PerlHash *h);    /* returns int count of key-value pai
 void       perl_hash_from_list(PerlHash *h, PerlArray *list);
 void       perl_array_extend_hash(PerlArray *dst, PerlHash *h); /* append k,v pairs */
 
+/* ── sprintf / printf ────────────────────────────────────────────────────── */
+PerlValue *perl_sprintf(PerlValue *fmt, PerlArray *args);
+void       perl_printf(PerlValue *fmt, PerlArray *args);
+
 /* ── range ───────────────────────────────────────────────────────────────── */
 PerlArray *perl_range(PerlValue *from, PerlValue *to);
 
