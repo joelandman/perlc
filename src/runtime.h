@@ -24,6 +24,7 @@ typedef struct PerlValue {
         char     *sval;   /* heap-allocated, NUL-terminated */
         void     *pval;   /* for reference types */
     };
+    long long matchpos;   /* current /g match offset; 0 = start of string */
 } PerlValue;
 
 /* allocation */
@@ -144,6 +145,8 @@ void       perl_array_extend_hash(PerlArray *dst, PerlHash *h); /* append k,v pa
 
 /* ── regex (PCRE2) ───────────────────────────────────────────────────────── */
 PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags);
+PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags);
+PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char *flags);
 long long  perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags);
 PerlValue *perl_capture(long long n);
 PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str);

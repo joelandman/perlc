@@ -111,10 +111,12 @@ void CodeGen::declareRuntime() {
     RT("perl_deref_hash",   av, pv);  /* returns PerlHash* as opaque av */
     RT("perl_ref_type",     pv, pv);
     /* regex */
-    RT("perl_regex_match",  pv,      pv, i8p, i8p);
-    RT("perl_regex_subst",  i64,     pv, i8p, i8p, i8p);
-    RT("perl_capture",      pv,      i64);
-    RT("perl_split_regex",  av,      i8p, i8p, pv);
+    RT("perl_regex_match",     pv,  pv, i8p, i8p);
+    RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
+    RT("perl_regex_match_all", av,  pv, i8p, i8p);
+    RT("perl_regex_subst",     i64, pv, i8p, i8p, i8p);
+    RT("perl_capture",         pv,  i64);
+    RT("perl_split_regex",     av,  i8p, i8p, pv);
 #undef RT
 }
 
@@ -230,6 +232,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         for (auto &elem : n.args)
             callRT("perl_array_push", {av, emitExpr(*elem)});
         return av;
+    }
+    if (n.kind == NK::RegexMatch && n.name.find('g') != std::string::npos) {
+        Value *str = emitExpr(*n.left);
+        Value *pat = builder_.CreateGlobalStringPtr(n.sval, "ra_pat");
+        Value *flg = builder_.CreateGlobalStringPtr(n.name, "ra_flg");
+        return callRT("perl_regex_match_all", {str, pat, flg});
     }
     return nullptr;
 }
@@ -1012,7 +1020,8 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *str = emitExpr(*n.left);
         Value *pat = builder_.CreateGlobalStringPtr(n.sval, "re_pat");
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
-        Value *res = callRT("perl_regex_match", {str, pat, flg});
+        bool isG   = n.name.find('g') != std::string::npos;
+        Value *res = callRT(isG ? "perl_regex_match_g" : "perl_regex_match", {str, pat, flg});
         return n.ival ? callRT("perl_not", {res}) : res;
     }
 

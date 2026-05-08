@@ -43,3 +43,4 @@ test: $(TARGET)
 	@echo "=== builtins.pl ===" && ./$(TARGET) tests/builtins.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== refs.pl     ===" && ./$(TARGET) tests/refs.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== regex.pl    ===" && ./$(TARGET) tests/regex.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== regex_g.pl  ===" && ./$(TARGET) tests/regex_g.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
