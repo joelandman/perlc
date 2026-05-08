@@ -130,9 +130,30 @@ Token Lexer::readRegex() {
         pattern += c;
         pos_++;
     }
-    /* skip trailing flags: gimsxy */
-    while (pos_ < src_.size() && isalpha(src_[pos_])) pos_++;
-    return {TK::REGEX, pattern, line_};
+    /* capture trailing flags */
+    std::string flags;
+    while (pos_ < src_.size() && isalpha(src_[pos_])) flags += src_[pos_++];
+    return {TK::REGEX, pattern + "\x01" + flags, line_};
+}
+
+Token Lexer::readSubst() {
+    /* pos_ is just past 's/' — read pattern / replacement / flags */
+    auto readSection = [&](char delim) {
+        std::string s;
+        while (pos_ < src_.size()) {
+            char c = src_[pos_];
+            if (c == delim) { pos_++; break; }
+            if (c == '\\' && pos_ + 1 < src_.size()) { s += c; s += src_[++pos_]; pos_++; continue; }
+            if (c == '\n') line_++;
+            s += c; pos_++;
+        }
+        return s;
+    };
+    std::string pattern = readSection('/');
+    std::string repl    = readSection('/');
+    std::string flags;
+    while (pos_ < src_.size() && isalpha(src_[pos_])) flags += src_[pos_++];
+    return {TK::SUBST, pattern + "\x01" + repl + "\x01" + flags, line_};
 }
 
 std::vector<Token> Lexer::tokenize() {
@@ -178,6 +199,9 @@ std::vector<Token> Lexer::tokenize() {
             if (dq) t.text = "\x01" + t.text;
             toks.push_back(t); continue;
         }
+
+        /* s/pattern/replacement/flags — substitution operator */
+        if (c == 's' && peek(1) == '/') { pos_ += 2; toks.push_back(readSubst()); continue; }
 
         /* identifiers and keywords */
         if (isalpha(c) || c == '_') { toks.push_back(readIdent()); continue; }
@@ -271,10 +295,12 @@ std::vector<Token> Lexer::tokenize() {
             case '=':
                 if (peek() == '=') { pos_++; toks.push_back({TK::EQ, "==", line_}); }
                 else if (peek() == '>') { pos_++; toks.push_back({TK::FATARROW, "=>", line_}); }
+                else if (peek() == '~') { pos_++; toks.push_back({TK::BIND, "=~", line_}); }
                 else toks.push_back({TK::ASSIGN, "=", line_});
                 break;
             case '!':
                 if (peek() == '=') { pos_++; toks.push_back({TK::NE, "!=", line_}); }
+                else if (peek() == '~') { pos_++; toks.push_back({TK::NBIND, "!~", line_}); }
                 else toks.push_back({TK::NOT, "!", line_});
                 break;
             case '<':

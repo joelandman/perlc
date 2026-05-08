@@ -1,3 +1,5 @@
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -465,12 +467,14 @@ PerlValue *perl_join(PerlValue *sep, PerlArray *arr) {
     }
     if (arr->len > 1) total += seplen * (size_t)(arr->len - 1);
     char *buf = malloc(total + 1);
-    buf[0] = '\0';
+    size_t cur = 0;
     for (long long i = 0; i < arr->len; i++) {
-        if (i > 0) { memcpy(buf + strlen(buf), ssep, seplen); buf[strlen(buf) + seplen] = '\0'; }
-        strcat(buf, parts[i]);
+        if (i > 0) { memcpy(buf + cur, ssep, seplen); cur += seplen; }
+        size_t plen = strlen(parts[i]);
+        memcpy(buf + cur, parts[i], plen); cur += plen;
         free(parts[i]);
     }
+    buf[cur] = '\0';
     PerlValue *r = perl_alloc_string(buf);
     free(ssep); free(parts); free(buf);
     return r;
@@ -700,4 +704,178 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_REF_HASH:   return perl_alloc_string("HASH");
         default:              return perl_alloc_string("");
     }
+}
+
+/* ── regex (PCRE2) ───────────────────────────────────────────────────────── */
+
+#define PERL_MAX_CAPTURES 10
+static PerlValue *perl_captures_[PERL_MAX_CAPTURES + 1];  /* $1..$10 */
+
+static int pcre_flags(const char *flags) {
+    int opts = 0;
+    for (; *flags; flags++) {
+        switch (*flags) {
+            case 'i': opts |= PCRE2_CASELESS;  break;
+            case 's': opts |= PCRE2_DOTALL;    break;
+            case 'm': opts |= PCRE2_MULTILINE; break;
+            case 'x': opts |= PCRE2_EXTENDED;  break;
+        }
+    }
+    return opts;
+}
+
+PerlValue *perl_capture(long long n) {
+    if (n < 1 || n > PERL_MAX_CAPTURES) return perl_alloc_undef();
+    return perl_captures_[n] ? perl_clone(perl_captures_[n]) : perl_alloc_undef();
+}
+
+PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags) {
+    int errcode; PCRE2_SIZE erroffset;
+    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                                   pcre_flags(flags), &errcode, &erroffset, NULL);
+    if (!re) return perl_alloc_int(0);
+
+    char *s = perl_to_string(str);
+    size_t slen = strlen(s);
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, 0, 0, md, NULL);
+
+    if (rc > 0) {
+        PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+        for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
+            if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
+        }
+        for (int i = 1; i < rc && i <= PERL_MAX_CAPTURES; i++) {
+            size_t cstart = ov[2*i], cend = ov[2*i+1];
+            char *cap = malloc(cend - cstart + 1);
+            memcpy(cap, s + cstart, cend - cstart);
+            cap[cend - cstart] = '\0';
+            perl_captures_[i] = perl_alloc_string(cap);
+            free(cap);
+        }
+    }
+
+    free(s);
+    pcre2_match_data_free(md);
+    pcre2_code_free(re);
+    return perl_alloc_int(rc > 0 ? 1 : 0);
+}
+
+long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags) {
+    /* separate /g from PCRE options */
+    int global = 0;
+    char clean[64]; int ci = 0;
+    for (const char *fp = flags; *fp; fp++) {
+        if (*fp == 'g') global = 1;
+        else if (ci < 63) clean[ci++] = *fp;
+    }
+    clean[ci] = '\0';
+
+    int errcode; PCRE2_SIZE erroffset;
+    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                                   pcre_flags(clean), &errcode, &erroffset, NULL);
+    if (!re) return 0;
+
+    char *s = perl_to_string(str);
+    size_t slen = strlen(s);
+
+#define ENSURE(need) do { \
+    while (out_len + (need) + 1 > out_cap) { out_cap *= 2; out = realloc(out, out_cap); } \
+} while(0)
+
+    size_t out_cap = slen * 2 + 64;
+    char *out = malloc(out_cap);
+    size_t out_len = 0;
+    long long count = 0;
+    size_t pos = 0;
+
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    while (pos <= slen) {
+        int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
+        if (rc <= 0) {
+            size_t rem = slen - pos;
+            ENSURE(rem); memcpy(out + out_len, s + pos, rem); out_len += rem; break;
+        }
+        PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+        size_t mstart = ov[0], mend = ov[1];
+
+        /* text before match */
+        size_t pre = mstart - pos;
+        ENSURE(pre); memcpy(out + out_len, s + pos, pre); out_len += pre;
+
+        /* expand replacement: handle $0 (whole match), $1..$9 */
+        for (const char *rp = repl; *rp; ) {
+            if (*rp == '$' && isdigit((unsigned char)rp[1])) {
+                int n = rp[1] - '0'; rp += 2;
+                size_t cstart = (n == 0) ? mstart : (n < rc ? ov[2*n]   : 0);
+                size_t cend   = (n == 0) ? mend   : (n < rc ? ov[2*n+1] : 0);
+                size_t caplen = (cstart < cend) ? cend - cstart : 0;
+                ENSURE(caplen); memcpy(out + out_len, s + cstart, caplen); out_len += caplen;
+            } else {
+                ENSURE(1); out[out_len++] = *rp++;
+            }
+        }
+        count++;
+
+        if (mend == mstart) {
+            /* zero-length match: copy current char to prevent infinite loop */
+            if (pos < slen) { ENSURE(1); out[out_len++] = s[pos]; }
+            pos = mstart + 1;
+        } else {
+            pos = mend;
+        }
+
+        if (!global) {
+            size_t rem = slen - pos;
+            ENSURE(rem); memcpy(out + out_len, s + pos, rem); out_len += rem; break;
+        }
+    }
+    out[out_len] = '\0';
+#undef ENSURE
+
+    /* update PerlValue in-place */
+    if (str->tag == PERL_STRING && str->sval) free(str->sval);
+    str->tag  = PERL_STRING;
+    str->sval = out;
+
+    free(s);
+    pcre2_match_data_free(md);
+    pcre2_code_free(re);
+    return count;
+}
+
+PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str) {
+    int errcode; PCRE2_SIZE erroffset;
+    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                                   pcre_flags(flags), &errcode, &erroffset, NULL);
+    PerlArray *arr = perl_array_new();
+    if (!re) return arr;
+
+    char *s = perl_to_string(str);
+    size_t slen = strlen(s);
+    size_t pos = 0;
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+
+    while (pos <= slen) {
+        int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
+        if (rc <= 0) {
+            PerlValue *v = perl_alloc_string(s + pos);
+            perl_array_push(arr, v); perl_free(v); break;
+        }
+        PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+        size_t mstart = ov[0], mend = ov[1];
+
+        size_t pre = mstart - pos;
+        char *elem = malloc(pre + 1);
+        memcpy(elem, s + pos, pre); elem[pre] = '\0';
+        PerlValue *v = perl_alloc_string(elem); free(elem);
+        perl_array_push(arr, v); perl_free(v);
+
+        pos = (mend > mstart) ? mend : mend + 1;
+    }
+
+    free(s);
+    pcre2_match_data_free(md);
+    pcre2_code_free(re);
+    return arr;
 }

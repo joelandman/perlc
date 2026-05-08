@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
 
         std::string cmd =
             "clang-18 -O1 " + tmpIR + " " + rtSrc +
-            " -o " + outputFile + " -lm 2>&1";
+            " -o " + outputFile + " -lm -lpcre2-8 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
         int rc = system(cmd.c_str());

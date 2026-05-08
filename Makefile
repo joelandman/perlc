@@ -3,7 +3,7 @@ LLVM_CFG := llvm-config-18
 LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 # strip -fno-exceptions so we can use C++ exceptions in our code
 CXXFLAGS := $(filter-out -fno-exceptions,$(LLVM_CXXFLAGS)) -std=c++17 -g -Wall -Wno-unused-function -fexceptions
-LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core orcjit native) -lpthread -ldl
+LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core orcjit native) -lpthread -ldl -lpcre2-8
 
 CC       := clang
 CFLAGS   := -g -O2
@@ -42,3 +42,4 @@ test: $(TARGET)
 	@echo "=== hash.pl     ===" && ./$(TARGET) tests/hash.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== builtins.pl ===" && ./$(TARGET) tests/builtins.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== refs.pl     ===" && ./$(TARGET) tests/refs.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== regex.pl    ===" && ./$(TARGET) tests/regex.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test

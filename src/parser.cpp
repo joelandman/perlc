@@ -532,8 +532,39 @@ NodePtr Parser::parseNot() {
     return parseCmp();
 }
 
-NodePtr Parser::parseCmp() {
+NodePtr Parser::parseBinding() {
     auto lhs = parseAdd();
+    while (check(TK::BIND) || check(TK::NBIND)) {
+        bool negated = check(TK::NBIND);
+        int line = cur().line; advance();
+        if (check(TK::SUBST)) {
+            if (negated) throw std::runtime_error("!~ s/// doesn't make sense");
+            std::string txt = cur().text; advance();
+            size_t s1 = txt.find('\x01'), s2 = txt.find('\x01', s1 + 1);
+            auto n = std::make_unique<Node>(); n->kind = NK::RegexSubst; n->line = line;
+            n->left  = std::move(lhs);
+            n->sval  = txt.substr(0, s1);                       /* pattern */
+            n->name  = txt.substr(s1 + 1, s2 - s1 - 1)         /* replacement */
+                     + "\x01" + txt.substr(s2 + 1);             /* flags */
+            lhs = std::move(n);
+        } else if (check(TK::REGEX)) {
+            std::string txt = cur().text; advance();
+            size_t sep = txt.find('\x01');
+            auto n = std::make_unique<Node>(); n->kind = NK::RegexMatch; n->line = line;
+            n->left = std::move(lhs);
+            n->sval = txt.substr(0, sep);
+            n->name = (sep != std::string::npos) ? txt.substr(sep + 1) : "";
+            n->ival = negated ? 1 : 0;
+            lhs = std::move(n);
+        } else {
+            throw std::runtime_error("Expected /regex/ or s/// after =~");
+        }
+    }
+    return lhs;
+}
+
+NodePtr Parser::parseCmp() {
+    auto lhs = parseBinding();
     int line = cur().line;
     TK k = cur().kind;
     std::string ident = (k == TK::IDENT) ? cur().text : "";
@@ -753,6 +784,13 @@ NodePtr Parser::parsePrimary() {
     /* scalar variable: $name  or  $$ref (scalar deref) */
     if (check(TK::SCALAR)) {
         advance(); /* skip $ */
+        /* $1, $2, ... capture variables */
+        if (check(TK::INT)) {
+            long long n = std::stoll(cur().text); advance();
+            auto node = std::make_unique<Node>(); node->kind = NK::CaptureVar;
+            node->ival = n; node->line = line;
+            return node;
+        }
         /* $$ref — deref */
         if (check(TK::SCALAR)) {
             advance();
@@ -1004,8 +1042,15 @@ NodePtr Parser::parsePrimary() {
         bool hasParen = match(TK::LPAREN);
         NodePtr sep;
         /* first arg: regex literal or string */
+        bool regexSplit = false;
+        std::string splitPat, splitFlags;
         if (check(TK::REGEX)) {
-            sep = makeStr(cur().text, line); advance();
+            std::string txt = cur().text; advance();
+            size_t sp = txt.find('\x01');
+            splitPat   = txt.substr(0, sp);
+            splitFlags = (sp != std::string::npos) ? txt.substr(sp + 1) : "";
+            regexSplit = true;
+            sep = makeStr(splitPat, line); /* placeholder, not used for regex split */
         } else {
             sep = parseExpr();
         }
@@ -1016,13 +1061,15 @@ NodePtr Parser::parsePrimary() {
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::SplitFunc;
         n->left = std::move(sep); n->right = std::move(str); n->line = line;
+        if (regexSplit) { n->ival = 1; n->sval = splitPat; n->name = splitFlags; }
         return n;
     }
 
-    /* REGEX literal used outside split (e.g. just /pattern/) — treat as string */
+    /* REGEX literal used outside split/binding — treat as string (pattern only) */
     if (check(TK::REGEX)) {
-        std::string pat = cur().text; advance();
-        return makeStr(pat, line);
+        std::string txt = cur().text; advance();
+        size_t sep = txt.find('\x01');
+        return makeStr(txt.substr(0, sep), line);
     }
 
     /* unshift as expression (returns new count) */

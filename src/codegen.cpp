@@ -110,6 +110,11 @@ void CodeGen::declareRuntime() {
     RT("perl_deref_array",  av, pv);
     RT("perl_deref_hash",   av, pv);  /* returns PerlHash* as opaque av */
     RT("perl_ref_type",     pv, pv);
+    /* regex */
+    RT("perl_regex_match",  pv,      pv, i8p, i8p);
+    RT("perl_regex_subst",  i64,     pv, i8p, i8p, i8p);
+    RT("perl_capture",      pv,      i64);
+    RT("perl_split_regex",  av,      i8p, i8p, pv);
 #undef RT
 }
 
@@ -200,8 +205,13 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return h ? callRT("perl_hash_values", {h}) : callRT("perl_array_new", {});
     }
     if (n.kind == NK::SplitFunc) {
-        Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
         Value *str = n.right ? emitExpr(*n.right) : perlUndef();
+        if (n.ival) {
+            Value *pat = builder_.CreateGlobalStringPtr(n.sval, "sp_pat");
+            Value *flg = builder_.CreateGlobalStringPtr(n.name, "sp_flg");
+            return callRT("perl_split_regex", {pat, flg, str});
+        }
+        Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
         return callRT("perl_split", {sep, str});
     }
     if (n.kind == NK::SortFunc) {
@@ -874,9 +884,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::SplitFunc: {
-        Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
         Value *str = n.right ? emitExpr(*n.right) : perlUndef();
-        return callRT("perl_split", {sep, str});  /* returns PerlArray* as opaque */
+        if (n.ival) {  /* regex split */
+            Value *pat = builder_.CreateGlobalStringPtr(n.sval, "sp_pat");
+            Value *flg = builder_.CreateGlobalStringPtr(n.name, "sp_flg");
+            return callRT("perl_split_regex", {pat, flg, str});
+        }
+        Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
+        return callRT("perl_split", {sep, str});
     }
 
     case NK::HashVar: {
@@ -991,6 +1006,30 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::RefFunc: {
         Value *v = emitExpr(*n.left);
         return callRT("perl_ref_type", {v});
+    }
+
+    case NK::RegexMatch: {
+        Value *str = emitExpr(*n.left);
+        Value *pat = builder_.CreateGlobalStringPtr(n.sval, "re_pat");
+        Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
+        Value *res = callRT("perl_regex_match", {str, pat, flg});
+        return n.ival ? callRT("perl_not", {res}) : res;
+    }
+
+    case NK::RegexSubst: {
+        Value *str = emitExpr(*n.left);
+        size_t sep = n.name.find('\x01');
+        std::string repl  = n.name.substr(0, sep);
+        std::string flags = n.name.substr(sep + 1);
+        Value *pat  = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
+        Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
+        Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");
+        Value *cnt  = callRT("perl_regex_subst", {str, pat, rep, flg});
+        return callRT("perl_alloc_int", {cnt});
+    }
+
+    case NK::CaptureVar: {
+        return callRT("perl_capture", {builder_.getInt64(n.ival)});
     }
 
     default:

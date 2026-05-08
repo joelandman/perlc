@@ -19,6 +19,10 @@ enum class TK {
     KW_CHOMP, KW_CHOP, KW_LENGTH, KW_SUBSTR, KW_JOIN, KW_SPLIT,
     KW_INDEX, KW_RINDEX, KW_UC, KW_LC, KW_UCFIRST, KW_LCFIRST,
     KW_REVERSE, KW_SPLICE, KW_REF,
+    /* regex binding */
+    BIND,   /* =~ */
+    NBIND,  /* !~ */
+    SUBST,  /* s/pat/repl/flags */
     /* sigils */
     SCALAR,   /* $ */
     ARRAY,    /* @ */
@@ -64,4 +68,5 @@ private:
     Token readHeredoc();
     Token readIdent();
     Token readRegex();
+    Token readSubst();
 };

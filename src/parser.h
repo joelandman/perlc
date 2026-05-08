@@ -41,6 +41,7 @@ private:
     NodePtr parseAnd();
     NodePtr parseNot();
     NodePtr parseCmp();
+    NodePtr parseBinding();
     NodePtr parseAdd();
     NodePtr parseMul();
     NodePtr parseUnary();
