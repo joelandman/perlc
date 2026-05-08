@@ -2,25 +2,24 @@
 
 ## Overview
 
-A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`). Currently implements a substantial subset of Perl including scalars, arrays, hashes, subroutines, control flow, string/array builtins, and (in-progress) references.
+A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
 ## Build & Test
 
 ```bash
-make          # builds ./perlc
-make test     # runs hello/arith/fib tests
-# manual tests:
-./perlc tests/hash.pl     -o /tmp/t && /tmp/t
-./perlc tests/builtins.pl -o /tmp/t && /tmp/t
-./perlc tests/refs.pl     -o /tmp/t && /tmp/t   # WIP — see bug below
-./perlc foo.pl --emit-ir -o foo.ll   # dump LLVM IR for debugging
+make              # builds ./perlc
+make test         # runs all 9 test programs
+make clean
+
+./perlc foo.pl -o output          # compile and link
+./perlc foo.pl --emit-ir -o out.ll  # dump LLVM IR for debugging
 ```
 
 ## Source Files
 
 | File | Role |
 |------|------|
-| `src/lexer.h/cpp` | Tokenizer with context-aware `%` (modulo vs hash sigil) and `/` (slash vs regex) |
+| `src/lexer.h/cpp` | Tokenizer; context-aware `%` (modulo vs hash sigil) and `/` (division vs regex) |
 | `src/ast.h` | `NK` enum of node kinds + `Node` struct |
 | `src/parser.h/cpp` | Recursive-descent parser → AST |
 | `src/codegen.h/cpp` | AST → LLVM IR via IRBuilder |
@@ -29,104 +28,65 @@ make test     # runs hello/arith/fib tests
 
 ## Architecture
 
-- **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; } }`
+- **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; }; long long matchpos; }`
 - **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6`
 - **PerlArray**: `{ PerlValue **elems; long long len, cap; }`
 - **PerlHash**: 64-bucket chained hash table
+- **matchpos**: per-PerlValue `/g` iterator offset; reset to 0 on `perl_clone`/`perl_assign`
 - **Scope model**: three parallel scope stacks — `scopes_` (scalars), `arrayScopes_`, `hashScopes_`
-- **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime; assignment mutates in-place. This is required for references to work correctly.
+- **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime; assignment mutates in-place. Required for references to work correctly.
 - **Codegen pattern**: every op is `callRT("perl_xyz", {args...})` → C runtime does the work
 
-## Implemented Features (all passing tests)
+## Implemented Features
 
-- `hello.pl` — strings, print/say, interpolation
-- `arith.pl` — arithmetic, compound assign, string ops
-- `fib.pl` — recursive subs, `@_`, `my ($n) = @_`
-- `hash.pl` — `%hash`, `$h{k}`, keys/values/exists/delete, sort keys, hash args to subs
-- `builtins.pl` — shift/unshift/chomp/length/substr/join/split (incl. regex literal split)
+### All passing tests (9/9)
 
-## References (`tests/refs.pl`) — Complete
+| Test | What it covers |
+|------|----------------|
+| `hello.pl` | strings, print/say, double-quoted interpolation |
+| `arith.pl` | arithmetic, compound assign (`+=` etc.), string concat/repeat |
+| `fib.pl` | recursive subs, `@_`, `my ($n) = @_` list assignment |
+| `hash.pl` | `%hash`, `$h{k}`, keys/values/exists/delete, sort keys, hash args |
+| `builtins.pl` | shift/unshift/chomp/length/substr/join/split (including regex split) |
+| `refs.pl` | all reference types, anonymous array/hash, arrow subscript, `ref()` |
+| `regex.pl` | match, `!~`, case-insensitive, captures `$1`–`$9`, substitution, split |
+| `regex_g.pl` | `/g` iterator in `while`, captures in `/g`, list context `/g`, foreach `/g` |
+| `modifiers.pl` | postfix if/unless/while/until/for/foreach, last/next with modifier |
 
-All reference plumbing is implemented and passing.
+### Language features
 
-### What is done
+**Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--`, compound assignment
 
-**runtime.h/c** — complete:
-- `PERL_REF_SCALAR=4`, `PERL_REF_ARRAY=5`, `PERL_REF_HASH=6` added to `PerlTag`
-- `void *pval` added to `PerlValue` union
-- `perl_ref_scalar/array/hash`, `perl_deref_scalar/array/hash`, `perl_ref_type` implemented
-- `perl_to_string` updated (prints `ARRAY(0x...)` etc.)
-- `perl_is_true` updated (refs are truthy)
+**Arrays**: `@arr`, push/pop/shift/unshift, `$arr[i]`, `scalar @arr`, join, split, sort
 
-**lexer** — complete:
-- `KW_REF` added; `"ref"` maps to it
+**Hashes**: `%hash`, `$h{key}`, keys/values/exists/delete, hash-from-list init
 
-**ast.h** — complete:
-- `RefScalar, RefArray, RefHash` — `\$x`, `\@arr`, `\%h`
-- `AnonArray, AnonHash` — `[list]`, `{k=>v,...}`
-- `DerefScalar, DerefArray, DerefHash` — `$$ref`, `@$ref`, `%$ref`
-- `ArrowDeref` — `$ref->[i]` or `$ref->{k}` (sval="array"/"hash")
-- `RefFunc` — `ref($x)`
+**Control flow**: if/elsif/else, unless, while, until, do-while, do-until, C-style for, foreach, last, next, return
 
-**parser.cpp** — complete except for the bug below:
-- `parsePrimary`: handles `\`, `[...]` (AnonArray), `{...}` (AnonHash), `$$ref`, `@$ref`, `%$ref`, `KW_REF`
-- `parseSubscript(NodePtr base, int line)`: chains `->[]` and `->{}`
-- `parsePostfix`: calls `parseSubscript` when `->` is seen — **BUG HERE**
-- `parsePush`/`parseUnshift`: handle `@$ref` form (n.left = ref expr when name is empty)
+**Statement modifiers**: `STMT if COND`, `STMT unless COND`, `STMT while COND`, `STMT until COND`, `STMT for LIST`, `STMT foreach LIST`
 
-**codegen.cpp** — complete:
-- All new NK nodes handled in `emitExpr`
-- `emitArrayPtr` extended for `DerefArray`, `AnonArray`
-- `NK::My` scalar path uses `perl_assign` model (stable PerlValue*)
-- `NK::Assign` handles `DerefScalar`, `ArrowDeref`, `ArrayElem` lvalues
-- `NK::CompoundAssign` uses `perl_assign`
-- `NK::Foreach` loop variable uses `perl_assign` (stable `loopPv`)
-- `NK::PushStmt`/`NK::UnshiftStmt2` handle `n.left` = ref expr
+**Subroutines**: `sub name { }`, `@_`, list unpacking, recursion
 
-### Bug Fix Applied
+**References**: `\$x`, `\@arr`, `\%h`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
-**Root cause**: Use-after-move UB in `parsePostfix()` — `std::move(expr)` and `expr->line` were evaluated in the same function call with unspecified argument evaluation order.
+**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`
 
-**Fix** (`src/parser.cpp:667`):
-```cpp
-if (check(TK::ARROW)) {
-    int ln = expr->line;
-    expr = parseSubscript(std::move(expr), ln);
-}
-```
+**Builtins**: chomp, length, substr, join, split, push, pop, shift, unshift, sort, keys, values, exists, delete, scalar, defined, ref, print, say
 
-### Test file (`tests/refs.pl`) — expected output
+**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`
 
-```
-42       # $$ref
-99       # $x after $$ref = 99
-1        # $aref->[0]
-3        # $aref->[2]
-20       # $arr[1] after $aref->[1]=20
-10       # $anon->[0]
-30       # $anon->[2]
-40       # $anon->[3] after push @$anon,40
-1        # $href->{a}
-3        # $h{c} after $href->{c}=3
-10       # $ah->{x}
-20       # $ah->{y}
-ARRAY    # ref($aref)
-HASH     # ref($href)
-SCALAR   # ref(\$x)
-2        # $nested->{a}->[1]
-42       # $nested->{b}->{c}
-```
+## Key Invariants
 
-## Key Decisions & Invariants
-
-- `perl_assign` model: every `my $x` alloca holds a single `PerlValue*` for the variable's lifetime. Assignment calls `perl_assign(load(alloca), new_val)` to mutate in-place. This is what makes `\$x` work — the captured pointer is always current.
-- In codegen, `pv` = `PointerType::getUnqual(ctx_)` = opaque ptr used for `PerlValue*`; `av` = same type used for `PerlArray*`/`PerlHash*`. All are opaque in LLVM 18.
+- `perl_assign` model: stable `PerlValue*` per alloca for the variable's lifetime. Captures via `\$x` work because the pointer never moves.
+- In codegen: `pv` = opaque ptr = `PerlValue*`; `av` = opaque ptr = `PerlArray*` or `PerlHash*`. All opaque in LLVM 18.
 - `emitArrayPtr` returns `PerlArray*` (av) for array-producing expressions; `emitExpr` returns `PerlValue*` (pv).
-- FatArrow `=>` is treated identically to `,` everywhere in list/call contexts.
-- `%` context: after INT/FLOAT/STRING/IDENT/RPAREN/RBRACKET/++/-- → PERCENT; else → HASH sigil.
-- `/` context: same heuristic → SLASH vs REGEX literal.
+- `FatArrow =>` is treated identically to `,` everywhere.
+- `foreach` loop uses a `stepBB` for the index increment so that `next` jumps through the increment before re-checking the condition (not directly to condBB, which would cause an infinite loop).
+- `%` context: after INT/FLOAT/STRING/IDENT/RPAREN/RBRACKET/`++`/`--` → PERCENT (modulo); otherwise → hash sigil.
+- `/` context: same heuristic → SLASH (division) vs REGEX literal.
+- `parseModifier(stmt, line)`: called at end of every statement path; consumes the `;` itself. Modifier keywords (if/unless/while/until/for/foreach) are detected with `isModifier()` to prevent arg-list parsing from over-consuming.
 
-## Passing Test Expected Outputs (for regression checking)
+## Passing Test Expected Outputs
 
 ### hello.pl
 ```
@@ -167,7 +127,7 @@ yellow
 3
 12
 ```
-(exact key order in hash iterating may vary for `keys`/`values`)
+(key iteration order may vary — tests use `sort keys`)
 
 ### builtins.pl
 ```
@@ -200,3 +160,95 @@ foo
 bar
 baz
 ```
+
+### refs.pl
+```
+42
+99
+1
+3
+20
+10
+30
+40
+1
+3
+10
+20
+ARRAY
+HASH
+SCALAR
+2
+42
+```
+
+### regex.pl
+```
+match
+no xyz
+icase
+2024
+03
+15
+baz bar foo
+aaxxcc
+[hello] [world]
+one
+two
+three
+digits only
+```
+
+### regex_g.pl
+```
+match
+match
+match
+x
+1
+y
+2
+z
+3
+aa
+bb
+cc
+hello
+world
+foo
+3
+one
+two
+three
+```
+
+### modifiers.pl
+```
+positive
+ok
+3
+0
+1
+2
+3
+a
+b
+c
+5
+0
+7
+1
+2
+4
+```
+
+## Known Limitations / Not Implemented
+
+- Range operator `..` (workaround: write out list elements explicitly)
+- String `sprintf` / `printf`
+- `wantarray`, `caller`, `local`
+- Object-oriented features (`bless`, `->method()`)
+- File I/O (`open`, `close`, `<FH>`)
+- `use` statements (parsed but ignored, except `use strict`/`use warnings`)
+- Regular expression modifiers `x` (extended) and `e` (eval replacement)
+- Named captures `(?<name>...)`
