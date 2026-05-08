@@ -99,20 +99,27 @@ NodePtr Parser::parseStmt() {
         return blk;
     }
     if (check(TK::KW_SUB))    return parseSub();
-    if (check(TK::KW_PRINT))  return parsePrint(false);
-    if (check(TK::KW_SAY))    return parsePrint(true);
-    if (check(TK::KW_PUSH))    return parsePush();
-    if (check(TK::KW_UNSHIFT)) return parseUnshift();
-    if (check(TK::KW_RETURN))  return parseReturn();
-    if (check(TK::KW_LAST))   { advance(); match(TK::SEMI); auto n = std::make_unique<Node>(); n->kind = NK::Last; n->line = line; return n; }
-    if (check(TK::KW_NEXT))   { advance(); match(TK::SEMI); auto n = std::make_unique<Node>(); n->kind = NK::Next; n->line = line; return n; }
+    if (check(TK::KW_PRINT))  { return parseModifier(parsePrint(false), line); }
+    if (check(TK::KW_SAY))    { return parseModifier(parsePrint(true),  line); }
+    if (check(TK::KW_PUSH))   { return parseModifier(parsePush(),        line); }
+    if (check(TK::KW_UNSHIFT)){ return parseModifier(parseUnshift(),     line); }
+    if (check(TK::KW_RETURN)) { return parseModifier(parseReturn(),      line); }
+    if (check(TK::KW_LAST)) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Last; n->line = line;
+        return parseModifier(std::move(n), line);
+    }
+    if (check(TK::KW_NEXT)) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Next; n->line = line;
+        return parseModifier(std::move(n), line);
+    }
     if (check(TK::LBRACE))    return parseBlock();
 
     /* expression statement */
     auto expr = parseExpr();
-    match(TK::SEMI);
     auto n = std::make_unique<Node>(); n->kind = NK::ExprStmt; n->left = std::move(expr); n->line = line;
-    return n;
+    return parseModifier(std::move(n), line);
 }
 
 NodePtr Parser::parseIf() {
@@ -386,13 +393,12 @@ NodePtr Parser::parsePrint(bool isSay) {
     NodeList args;
     /* parenthesised or not */
     bool hasParen = match(TK::LPAREN);
-    while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+    while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
         args.push_back(parseExpr());
         if (!match(TK::COMMA)) break;
     }
     if (hasParen) match(TK::RPAREN);
-    match(TK::SEMI);
 
     auto n = std::make_unique<Node>();
     n->kind = isSay ? NK::SayStmt : NK::PrintStmt;
@@ -417,13 +423,12 @@ NodePtr Parser::parsePush() {
         arrName = cur().text; advance();
     }
     match(TK::COMMA);
-    while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+    while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
         vals.push_back(parseExpr());
         if (!match(TK::COMMA)) break;
     }
     if (hasParen) match(TK::RPAREN);
-    match(TK::SEMI);
     auto n = std::make_unique<Node>(); n->kind = NK::PushStmt;
     n->name = arrName; n->args = std::move(vals); n->line = line;
     if (refExpr) n->left = std::move(refExpr); /* @$ref form */
@@ -446,13 +451,12 @@ NodePtr Parser::parseUnshift() {
     }
     match(TK::COMMA);
     NodeList vals;
-    while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+    while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
         vals.push_back(parseExpr());
         if (!match(TK::COMMA)) break;
     }
     if (hasParen) match(TK::RPAREN);
-    match(TK::SEMI);
     auto n = std::make_unique<Node>(); n->kind = NK::UnshiftStmt2;
     n->name = arrName; n->args = std::move(vals); n->line = line;
     if (refExpr) n->left = std::move(refExpr);
@@ -463,11 +467,67 @@ NodePtr Parser::parseReturn() {
     int line = cur().line;
     consume(TK::KW_RETURN);
     NodePtr val;
-    if (!check(TK::SEMI)) val = parseExpr();
-    match(TK::SEMI);
+    if (!check(TK::SEMI) && !isModifier()) val = parseExpr();
     auto n = std::make_unique<Node>(); n->kind = NK::Return; n->line = line;
     n->left = std::move(val);
     return n;
+}
+
+/* ── statement modifiers ─────────────────────────────────────────────────── */
+
+bool Parser::isModifier() const {
+    TK k = toks_[pos_].kind;
+    return k == TK::KW_IF || k == TK::KW_UNLESS ||
+           k == TK::KW_WHILE || k == TK::KW_UNTIL ||
+           k == TK::KW_FOR   || k == TK::KW_FOREACH;
+}
+
+/* Wrap stmt in an if/while/foreach node if a modifier keyword follows.
+   Always consumes the trailing semicolon. */
+NodePtr Parser::parseModifier(NodePtr stmt, int line) {
+    if (check(TK::KW_IF) || check(TK::KW_UNLESS)) {
+        bool neg = check(TK::KW_UNLESS); advance();
+        bool hasParen = match(TK::LPAREN);
+        auto cond = parseExpr();
+        if (hasParen) consume(TK::RPAREN, ")");
+        if (neg) cond = makeUnary("!", std::move(cond), line);
+        NodeList body; body.push_back(std::move(stmt));
+        auto n = std::make_unique<Node>(); n->kind = NK::If; n->line = line;
+        n->branches.push_back({std::move(cond), makeBlock(std::move(body), line)});
+        match(TK::SEMI);
+        return n;
+    }
+    if (check(TK::KW_WHILE) || check(TK::KW_UNTIL)) {
+        bool neg = check(TK::KW_UNTIL); advance();
+        bool hasParen = match(TK::LPAREN);
+        auto cond = parseExpr();
+        if (hasParen) consume(TK::RPAREN, ")");
+        if (neg) cond = makeUnary("!", std::move(cond), line);
+        NodeList body; body.push_back(std::move(stmt));
+        auto n = std::make_unique<Node>(); n->kind = NK::While; n->line = line;
+        n->cond = std::move(cond); n->body = makeBlock(std::move(body), line);
+        match(TK::SEMI);
+        return n;
+    }
+    if (check(TK::KW_FOR) || check(TK::KW_FOREACH)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        NodeList elems;
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+            if (hasParen && check(TK::RPAREN)) break;
+            elems.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hasParen) match(TK::RPAREN);
+        NodeList body; body.push_back(std::move(stmt));
+        auto n = std::make_unique<Node>(); n->kind = NK::Foreach; n->line = line;
+        n->name = "_"; n->args = std::move(elems);
+        n->body = makeBlock(std::move(body), line);
+        match(TK::SEMI);
+        return n;
+    }
+    match(TK::SEMI);
+    return stmt;
 }
 
 /* ── expressions ─────────────────────────────────────────────────────────── */

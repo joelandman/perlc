@@ -34,6 +34,9 @@ private:
     NodePtr parseUnshift();
     NodePtr parseReturn();
 
+    bool    isModifier() const;
+    NodePtr parseModifier(NodePtr stmt, int line);
+
     NodePtr parseExpr();
     NodePtr parseAssign();
     NodePtr parseTernary();

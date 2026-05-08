@@ -593,9 +593,10 @@ void CodeGen::emitStmt(const Node &n) {
 
         auto *condBB = BasicBlock::Create(ctx_, "foreach.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "foreach.body", fn);
+        auto *stepBB = BasicBlock::Create(ctx_, "foreach.step", fn);
 
         loopExits_.push_back(exit);
-        loopContinues_.push_back(condBB);
+        loopContinues_.push_back(stepBB);
 
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
@@ -613,15 +614,17 @@ void CodeGen::emitStmt(const Node &n) {
         callRT("perl_assign", {loopPv, elem});
 
         emitBlock(*n.body);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(stepBB);
 
+        popScope();
+
+        builder_.SetInsertPoint(stepBB);
         Value *idx2 = builder_.CreateLoad(Type::getInt64Ty(ctx_), idxAlloca);
         Value *idx3 = builder_.CreateAdd(idx2,
                         ConstantInt::get(Type::getInt64Ty(ctx_), 1));
         builder_.CreateStore(idx3, idxAlloca);
-        if (!builder_.GetInsertBlock()->getTerminator())
-            builder_.CreateBr(condBB);
-
-        popScope();
+        builder_.CreateBr(condBB);
         loopExits_.pop_back();
         loopContinues_.pop_back();
         builder_.SetInsertPoint(exit);
