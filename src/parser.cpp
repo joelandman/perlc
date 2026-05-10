@@ -5,6 +5,12 @@
 
 Parser::Parser(std::vector<Token> tokens) : toks_(std::move(tokens)) {}
 
+NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens) {
+    tokens.push_back({TK::EOF_TOK, "", 0});
+    Parser p(std::move(tokens));
+    return p.parseExpr();
+}
+
 Token &Parser::cur()                { return toks_[pos_]; }
 Token &Parser::peek(int off)        { size_t p = pos_ + off; return p < toks_.size() ? toks_[p] : toks_.back(); }
 bool   Parser::check(TK k)  const  { return toks_[pos_].kind == k; }
@@ -376,6 +382,9 @@ NodePtr Parser::parseSub() {
     /* qualify with current package when not already qualified and not in main */
     if (name.find("::") == std::string::npos && currentPackage_ != "main")
         name = currentPackage_ + "::" + name;
+    /* forward declaration: sub name; or sub name(PROTOTYPE); */
+    if (check(TK::SEMI)) { advance(); match(TK::RBRACE); auto n = std::make_unique<Node>(); n->kind = NK::SubDef; n->name = name; n->line = line; return n; }
+    if (check(TK::LPAREN)) { advance(); while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) advance(); consume(TK::RPAREN, ")"); if (check(TK::SEMI)) { advance(); match(TK::RBRACE); auto n = std::make_unique<Node>(); n->kind = NK::SubDef; n->name = name; n->line = line; return n; } }
     consume(TK::LBRACE, "{");
 
     ++subDepth_;
@@ -413,40 +422,42 @@ NodePtr Parser::parseMy() {
             return decl;
         }
 
-        /* my (@arr) = rhs */
+        /* my (@a, @b, ..., $x, ...) — mixed arrays/hashes/scalars */
+        /* collect all variable declarations with their sigil types */
+        struct VarDecl {
+            std::string sigil;  /* "@", "%", "$" */
+            std::string name;
+        };
+        std::vector<VarDecl> allVars;
+
         if (check(TK::ARRAY)) {
             advance();
-            std::string nm = cur().text; advance();
-            consume(TK::RPAREN, ")");
-            NodePtr rhs;
-            if (match(TK::ASSIGN)) rhs = parseExpr();
-            match(TK::SEMI);
-            auto decl = std::make_unique<Node>(); decl->kind = NK::My;
-            decl->name = "@" + nm; decl->line = line;
-            if (rhs) decl->right = std::move(rhs);
-            return decl;
+            allVars.push_back({"@", cur().text}); advance();
         }
-
-        NodeList vars;
         while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
-            consume(TK::SCALAR, "$");
-            std::string nm = cur().text; advance();
-            vars.push_back(makeScalar(nm, line));
+            if (check(TK::ARRAY)) { advance(); allVars.push_back({"@", cur().text}); advance(); }
+            else if (check(TK::HASH)) { advance(); allVars.push_back({"%", cur().text}); advance(); }
+            else if (check(TK::SCALAR)) { advance(); allVars.push_back({"$", cur().text}); advance(); }
+            else { advance(); continue; }
             if (!match(TK::COMMA)) break;
         }
         consume(TK::RPAREN, ")");
         NodePtr rhs;
         if (match(TK::ASSIGN)) rhs = parseExpr();
         match(TK::SEMI);
+        /* emit as FlatBlock with multiple decls */
         NodeList stmts;
-        for (auto &v : vars) {
+        for (auto &vd : allVars) {
             auto decl = std::make_unique<Node>(); decl->kind = NK::My;
-            decl->name = v->name; decl->line = line;
+            decl->name = vd.sigil + vd.name; decl->line = line;
             stmts.push_back(std::move(decl));
         }
         if (rhs) {
             NodeList lhsList;
-            for (auto &v : vars) lhsList.push_back(makeScalar(v->name, line));
+            for (auto &vd : allVars) {
+                /* strip sigil for LHS — same as old code using makeScalar */
+                lhsList.push_back(makeScalar(vd.name, line));
+            }
             auto lhsArr = std::make_unique<Node>(); lhsArr->kind = NK::ArrayLit;
             lhsArr->args = std::move(lhsList); lhsArr->line = line;
             auto asgn = std::make_unique<Node>(); asgn->kind = NK::Assign;
@@ -1091,16 +1102,23 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* eval { BLOCK } */
+    /* eval { BLOCK } or eval EXPR (string eval) */
     if (check(TK::KW_EVAL)) {
         advance();
-        consume(TK::LBRACE, "{");
-        NodeList stmts;
-        while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
-            stmts.push_back(parseStmt());
-        consume(TK::RBRACE, "}");
-        auto n = std::make_unique<Node>(); n->kind = NK::EvalBlock; n->line = line;
-        n->body = makeBlock(std::move(stmts), line);
+        if (check(TK::LBRACE)) {
+            consume(TK::LBRACE, "{");
+            NodeList stmts;
+            while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
+                stmts.push_back(parseStmt());
+            consume(TK::RBRACE, "}");
+            auto n = std::make_unique<Node>(); n->kind = NK::EvalBlock; n->line = line;
+            n->body = makeBlock(std::move(stmts), line);
+            return n;
+        }
+        /* eval EXPR — string eval (runtime compilation) */
+        NodePtr expr = parseExpr();
+        auto n = std::make_unique<Node>(); n->kind = NK::Call;
+        n->name = "eval"; n->args.push_back(std::move(expr)); n->line = line;
         return n;
     }
 
@@ -1946,10 +1964,7 @@ NodePtr Parser::parsePrimary() {
         {
             auto cit = constMap_.find(nm);
             if (cit != constMap_.end()) {
-                const Token &t = cit->second;
-                if (t.kind == TK::INT)   return makeInt(std::stoll(t.text), line);
-                if (t.kind == TK::FLOAT) return makeFloat(std::stod(t.text), line);
-                return makeStr(t.text, line);
+                return cit->second->clone();  /* pre-parsed AST node (cloned for reuse) */
             }
         }
         /* bareword string */

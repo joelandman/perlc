@@ -701,6 +701,18 @@ void CodeGen::emitSub(const Node &n) {
     localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
     builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
+    /* forward declaration: emit empty body that returns undef */
+    if (!n.body) {
+        callRT("perl_pop_wantarray", {});
+        Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+        callRT("perl_local_restore_to", {depth});
+        builder_.CreateRet(perlUndef());
+        localDepthAlloca_ = savedLocalDepth;
+        popScope();
+        currentFn_ = savedFn;
+        return;
+    }
+
     emitBlock(*n.body);
 
     /* implicit return undef — restore locals first */
@@ -2301,6 +2313,28 @@ Value *CodeGen::emitBinOp(const Node &n) {
 }
 
 Value *CodeGen::emitCall(const Node &n) {
+    /* eval EXPR — string eval stub: returns undef */
+    if (n.name == "eval") {
+        /* allocate jmp_buf on stack (256 bytes) */
+        auto *i8Arr  = ArrayType::get(Type::getInt8Ty(ctx_), 256);
+        auto *jbAlloca = builder_.CreateAlloca(i8Arr, nullptr, "jmp_buf");
+        Value *jbPtr = builder_.CreateBitCast(jbAlloca, PointerType::getUnqual(ctx_));
+        callRT("perl_eval_push", {jbPtr});
+        auto *i32 = Type::getInt32Ty(ctx_);
+        Value *caught = callRT("setjmp", {jbPtr});
+        Value *isCaught = builder_.CreateICmpNE(caught, ConstantInt::get(i32, 0));
+        auto *fn = builder_.GetInsertBlock()->getParent();
+        auto *bodyBB = BasicBlock::Create(ctx_, "eval.body", fn);
+        auto *endBB = BasicBlock::Create(ctx_, "eval.end", fn);
+        builder_.CreateCondBr(isCaught, endBB, bodyBB);
+        builder_.SetInsertPoint(bodyBB);
+        for (auto &arg : n.args) emitExpr(*arg);  /* evaluate string arg */
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        callRT("perl_eval_pop", {});
+        return perlUndef();
+    }
     if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
         Value *argsArr = callRT("perl_array_new", {});
         for (auto &arg : n.args) {

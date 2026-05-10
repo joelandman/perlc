@@ -10,7 +10,8 @@ public:
     explicit Parser(std::vector<Token> tokens);
     /* importMap: short_name → qualified Module::name for re-exported symbols */
     void setImportMap(std::map<std::string, std::string> m) { importMap_ = std::move(m); }
-    void setConstMap(std::map<std::string, Token> m)       { constMap_  = std::move(m); }
+    void setConstMap(std::map<std::string, NodePtr> m)      { constMap_  = std::move(m); }
+    static NodePtr parseExprFromTokens(std::vector<Token> tokens);  /* pre-parse const value expr */
     NodePtr parseProgram();   /* returns a Block */
 
 private:
@@ -19,7 +20,7 @@ private:
     std::string                     currentPackage_ = "main";
     int                             subDepth_        = 0;
     std::map<std::string,std::string> importMap_;  /* short → qualified call names */
-    std::map<std::string,Token>       constMap_;   /* constant name → literal token */
+    std::map<std::string,NodePtr>     constMap_;   /* constant name → parsed AST */
 
     Token &cur();
     Token &peek(int offset = 1);

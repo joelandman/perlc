@@ -167,11 +167,12 @@ scanExports(const std::vector<Token> &toks)
    Pragmas (strict/warnings/feature/parent/base/Exporter/Carp/POSIX/Scalar::Util etc)
    are handled or skipped.  Returns combined token list. */
 static std::vector<Token> inlineModules(
-        const std::vector<Token> &tokens,
-        const std::string &baseDir,
-        std::set<std::string> &loaded,
-        std::map<std::string,std::string> &importMap,
-        std::map<std::string,Token> *constMap = nullptr)
+         const std::vector<Token> &tokens,
+         const std::string &baseDir,
+         std::set<std::string> &loaded,
+         std::map<std::string,std::string> &importMap,
+         std::map<std::string,NodePtr> *constMap = nullptr,
+         Parser *parser = nullptr)
 {
     /* pragmas that are not files to load */
     static const std::set<std::string> PRAGMAS = {
@@ -217,17 +218,46 @@ static std::vector<Token> inlineModules(
             size_t defStart = ui + 2;
             size_t defEnd   = useEnd; /* exclusive */
 
-            auto emitConstSub = [&](const std::string &cname, const Token &valTok) {
+            auto emitConstSub = [&](const std::string &cname, const std::vector<Token> &valTokens) {
                 /* inject: sub CNAME { return VALUE; } */
                 constToks.push_back({TK::KW_SUB,    "sub",    0});
                 constToks.push_back({TK::IDENT,     cname,    0});
                 constToks.push_back({TK::LBRACE,    "{",      0});
                 constToks.push_back({TK::KW_RETURN, "return", 0});
-                constToks.push_back(valTok);
+                for (const auto &vt : valTokens) constToks.push_back(vt);
                 constToks.push_back({TK::SEMI,      ";",      0});
                 constToks.push_back({TK::RBRACE,    "}",      0});
                 /* also record in constMap so bare NAME (without parens) resolves */
-                if (constMap) (*constMap)[cname] = valTok;
+                if (constMap && !valTokens.empty() && parser) {
+                    /* pre-parse the value expression to store an AST node */
+                    auto parsed = Parser::parseExprFromTokens(valTokens);
+                    if (parsed) (*constMap)[cname] = std::move(parsed);
+                }
+            };
+
+            auto extractValueTokens = [&](size_t start, size_t end) -> std::vector<Token> {
+                if (start >= end) return {};
+                /* if value starts with '(', scan forward to find the statement-ending ';'
+                   then use paren-matching to capture the full expression */
+                if (tokens[start].kind == TK::LPAREN) {
+                    /* find the ';' that ends this use statement */
+                    size_t semiEnd = end;
+                    for (size_t s = start; s < end; s++) {
+                        if (tokens[s].kind == TK::SEMI) { semiEnd = s; break; }
+                    }
+                    int depth = 1;
+                    size_t p = start + 1;
+                    while (p < semiEnd && depth > 0) {
+                        if (tokens[p].kind == TK::LPAREN) depth++;
+                        else if (tokens[p].kind == TK::RPAREN) depth--;
+                        p++;
+                    }
+                    /* p now points past the matching ')' */
+                    std::vector<Token> result(tokens.begin() + start, tokens.begin() + p);
+                    return result;
+                }
+                /* simple value: single token */
+                return {tokens[start]};
             };
 
             if (defStart < defEnd && tokens[defStart].kind == TK::LBRACE) {
@@ -238,7 +268,13 @@ static std::vector<Token> inlineModules(
                         (tokens[p+1].kind == TK::FATARROW || tokens[p+1].kind == TK::COMMA)) {
                         std::string cname = tokens[p].text;
                         p += 2;
-                        if (p < defEnd) { emitConstSub(cname, tokens[p]); p++; }
+                        if (p < defEnd) {
+                            auto vtoks = extractValueTokens(p, defEnd);
+                            emitConstSub(cname, vtoks);
+                            p += vtoks.size();
+                            /* skip past ')' if we captured one */
+                            if (vtoks.size() > 0 && vtoks.back().kind == TK::RPAREN) p++;
+                        }
                     } else p++;
                     if (p < defEnd && tokens[p].kind == TK::COMMA) p++;
                 }
@@ -248,7 +284,10 @@ static std::vector<Token> inlineModules(
                 size_t valIdx = defStart + 1;
                 if (valIdx < defEnd && (tokens[valIdx].kind == TK::FATARROW ||
                                         tokens[valIdx].kind == TK::COMMA)) valIdx++;
-                if (valIdx < defEnd) emitConstSub(cname, tokens[valIdx]);
+                if (valIdx < defEnd) {
+                    auto vtoks = extractValueTokens(valIdx, defEnd);
+                    emitConstSub(cname, vtoks);
+                }
             }
             continue;
         }
@@ -306,7 +345,7 @@ static std::vector<Token> inlineModules(
             if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK)
                 modToks.pop_back();
             /* recursively inline modules referenced by this module */
-            auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap);
+            auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser);
             /* strip any EOF_TOK from expanded result too */
             if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK)
                 expanded.pop_back();
@@ -408,11 +447,14 @@ int main(int argc, char **argv) {
         /* inline any 'use Module' files before parsing; build import map */
         std::set<std::string> loaded;
         std::map<std::string,std::string> importMap;
-        std::map<std::string,Token> constMap;
-        auto expanded = inlineModules(tokens, dirOf(inputFile), loaded, importMap, &constMap);
+        std::map<std::string,NodePtr> constMap;
+        /* create a dummy parser first (will be rebuilt after inlining) */
+        std::vector<Token> dummyTokens;
+        Parser parser(std::move(dummyTokens));
+        auto expanded = inlineModules(tokens, dirOf(inputFile), loaded, importMap, &constMap, &parser);
 
         /* parse */
-        Parser parser(std::move(expanded));
+        parser = Parser(std::move(expanded));
         parser.setImportMap(std::move(importMap));
         parser.setConstMap(std::move(constMap));
         auto ast = parser.parseProgram();

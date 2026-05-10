@@ -4,7 +4,7 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~95% implemented with 21/21 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, and advanced builtins.
+**Current Status**: Core language features are ~97% implemented with 21/21 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, and advanced builtins.
 
 ## Build & Test
 
