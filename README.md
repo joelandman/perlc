@@ -78,7 +78,9 @@ make clean
 
 **Command-line**: `@ARGV` (arguments), `$0` (program name); generated `main` accepts `int argc, char **argv`
 
-**Module installation**: `-pm` flag automatically detects missing `use Module` dependencies (excluding pragmas), installs them via `cpanm --local-lib lib`, and adds `lib/lib/perl5` to search paths. Note: complex CPAN modules may exceed current parser capabilities.
+**Module installation**: `-pm` flag automatically detects missing `use Module` dependencies (excluding pragmas), installs them via `cpanm --local-lib lib` into `lib/lib/perl5/`, and updates search paths.
+
+**Note**: Many simple CPAN modules work, but complex modules with advanced OO patterns, `our` variables, or POD documentation may cause parser errors due to incomplete Perl 5 language coverage.
 
 **eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime
 

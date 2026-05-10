@@ -327,7 +327,16 @@ std::vector<Token> Lexer::tokenize() {
         }
 
         /* identifiers and keywords */
-        if (isalpha(c) || c == '_') { toks.push_back(readIdent()); continue; }
+        if (isalpha(c) || c == '_') {
+            Token t = readIdent();
+            /* handle __END__ - stop parsing at __END__ (POD follows) */
+            if (t.text == "__END__") {
+                toks.push_back({TK::EOF_TOK, "", line_});
+                return toks;
+            }
+            toks.push_back(t);
+            continue;
+        }
 
         /* sigils — but % after an expression-ending token is modulo */
         if (c == '$' || c == '@') {
@@ -385,6 +394,12 @@ std::vector<Token> Lexer::tokenize() {
                 else toks.push_back({TK::SLASH, "/", line_});
             } else {
                 toks.push_back(readRegex());
+            }
+            /* ||= defined-or assignment operator */
+            if (peek() == '|' && peek(1) == '|' && peek(2) == '=') {
+                pos_ += 3;
+                toks.push_back({TK::OR_ASSIGN, "||=", line_});
+                continue;
             }
             continue;
         }

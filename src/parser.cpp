@@ -1957,7 +1957,7 @@ NodePtr Parser::parsePrimary() {
     }
 
     throw std::runtime_error("Parse error line " + std::to_string(line) +
-        ": unexpected token '" + cur().text + "'");
+        ": unexpected token '" + cur().text + "' (this may be due to advanced Perl syntax in an imported module)");
 }
 
 NodePtr Parser::parseCall(std::string name, int line) {
