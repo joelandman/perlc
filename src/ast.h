@@ -99,6 +99,16 @@ enum class NK {
     CallerFunc,   /* caller()          – no children                                  */
     BeginBlock,   /* BEGIN { BLOCK }   – body=block                                   */
     EndBlock,     /* END   { BLOCK }   – body=block                                   */
+    /* filesystem */
+    ChdirFunc,    /* chdir(path)       – left=path                                    */
+    MkdirFunc,    /* mkdir(path[,mode])– left=path, right=mode(opt)                   */
+    RmdirFunc,    /* rmdir(path)       – left=path                                    */
+    RenameFunc,   /* rename(old,new)   – left=old, right=new                          */
+    ChmodFunc,    /* chmod(mode,@files)– left=mode, args=files                        */
+    /* directory I/O */
+    OpendirFunc,  /* opendir(DH,path)  – name=dh_var, left=path                      */
+    ReaddirFunc,  /* readdir(DH)       – name=dh_var                                  */
+    ClosedirFunc, /* closedir(DH)      – name=dh_var                                  */
 };
 
 struct Node;

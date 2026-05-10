@@ -1174,6 +1174,17 @@ NodePtr Parser::parsePrimary() {
         }
         std::string nm = cur().text; advance();
         auto sv = makeScalar(nm, line);
+        if (nm == "+" && check(TK::LBRACE)) {
+          advance();
+          auto key = parseExpr();
+          consume(TK::RBRACE, "}");
+          auto n = std::make_unique<Node>();
+          n->kind = NK::HashElem;
+          n->name = "+";
+          n->left = std::move(key);
+          n->line = line;
+          return std::move(n);
+        }
         /* $arr[idx] */
         if (check(TK::LBRACKET)) {
             advance();
@@ -1792,6 +1803,81 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
+    /* ── filesystem ops ─────────────────────────────────────────────────── */
+    if (check(TK::KW_CHDIR)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto path = parseExpr(); if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::ChdirFunc; n->line = line;
+        n->left = std::move(path); return n;
+    }
+    if (check(TK::KW_MKDIR)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto path = parseExpr();
+        NodePtr mode;
+        if (match(TK::COMMA) && !check(TK::RPAREN)) mode = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::MkdirFunc; n->line = line;
+        n->left = std::move(path); n->right = std::move(mode); return n;
+    }
+    if (check(TK::KW_RMDIR)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto path = parseExpr(); if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::RmdirFunc; n->line = line;
+        n->left = std::move(path); return n;
+    }
+    if (check(TK::KW_RENAME)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto oldp = parseExpr(); match(TK::COMMA); auto newp = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::RenameFunc; n->line = line;
+        n->left = std::move(oldp); n->right = std::move(newp); return n;
+    }
+    if (check(TK::KW_CHMOD)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto mode = parseExpr();
+        auto n = std::make_unique<Node>(); n->kind = NK::ChmodFunc; n->line = line;
+        n->left = std::move(mode);
+        while (match(TK::COMMA)) {
+            if (hp && check(TK::RPAREN)) break;
+            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            n->args.push_back(parseExpr());
+        }
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* ── directory I/O ───────────────────────────────────────────────────── */
+    if (check(TK::KW_OPENDIR)) {
+        advance(); bool hp = match(TK::LPAREN);
+        /* opendir(my $dh, path) or opendir(DH, path) */
+        std::string dhVar;
+        if (check(TK::KW_MY)) { advance(); consume(TK::SCALAR, "$"); dhVar = cur().text; advance(); }
+        else if (check(TK::SCALAR)) { advance(); dhVar = cur().text; advance(); }
+        else { dhVar = cur().text; advance(); } /* bare DH ident */
+        match(TK::COMMA);
+        auto path = parseExpr(); if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::OpendirFunc; n->line = line;
+        n->name = dhVar; n->left = std::move(path); return n;
+    }
+    if (check(TK::KW_READDIR)) {
+        advance(); bool hp = match(TK::LPAREN);
+        std::string dhVar;
+        if (check(TK::SCALAR)) { advance(); dhVar = cur().text; advance(); }
+        else { dhVar = cur().text; advance(); }
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::ReaddirFunc; n->line = line;
+        n->name = dhVar; return n;
+    }
+    if (check(TK::KW_CLOSEDIR)) {
+        advance(); bool hp = match(TK::LPAREN);
+        std::string dhVar;
+        if (check(TK::SCALAR)) { advance(); dhVar = cur().text; advance(); }
+        else { dhVar = cur().text; advance(); }
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::ClosedirFunc; n->line = line;
+        n->name = dhVar; return n;
+    }
+
     /* unshift as expression (returns new count) */
     if (check(TK::KW_UNSHIFT)) {
         advance();
@@ -1851,6 +1937,16 @@ NodePtr Parser::parsePrimary() {
         if (check(TK::LPAREN)) return parseCall(nm, line);
         /* bareword — if followed by FATARROW it's an auto-quoted string */
         if (check(TK::FATARROW)) return makeStr(nm, line);
+        /* check constant map so bare NAME resolves without parens */
+        {
+            auto cit = constMap_.find(nm);
+            if (cit != constMap_.end()) {
+                const Token &t = cit->second;
+                if (t.kind == TK::INT)   return makeInt(std::stoll(t.text), line);
+                if (t.kind == TK::FLOAT) return makeFloat(std::stod(t.text), line);
+                return makeStr(t.text, line);
+            }
+        }
         /* bareword string */
         return makeStr(nm, line);
     }
@@ -1860,6 +1956,9 @@ NodePtr Parser::parsePrimary() {
 }
 
 NodePtr Parser::parseCall(std::string name, int line) {
+    /* remap imported short names to their qualified Module::name */
+    auto it = importMap_.find(name);
+    if (it != importMap_.end()) name = it->second;
     consume(TK::LPAREN, "(");
     NodeList args;
     while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {

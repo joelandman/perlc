@@ -2,16 +2,23 @@
 #include "lexer.h"
 #include "ast.h"
 #include <vector>
+#include <map>
+#include <string>
 
 class Parser {
 public:
     explicit Parser(std::vector<Token> tokens);
+    /* importMap: short_name → qualified Module::name for re-exported symbols */
+    void setImportMap(std::map<std::string, std::string> m) { importMap_ = std::move(m); }
+    void setConstMap(std::map<std::string, Token> m)       { constMap_  = std::move(m); }
     NodePtr parseProgram();   /* returns a Block */
 
 private:
-    std::vector<Token> toks_;
-    size_t             pos_ = 0;
-    std::string        currentPackage_ = "main";
+    std::vector<Token>              toks_;
+    size_t                          pos_ = 0;
+    std::string                     currentPackage_ = "main";
+    std::map<std::string,std::string> importMap_;  /* short → qualified call names */
+    std::map<std::string,Token>       constMap_;   /* constant name → literal token */
 
     Token &cur();
     Token &peek(int offset = 1);

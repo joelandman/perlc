@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <setjmp.h>
 
 /* ── local() save/restore stack ─────────────────────────────────────────── */
@@ -86,9 +87,20 @@ PerlValue *perl_get_dollar_bang(void) {
 }
 
 /* wantarray — returns 1 in list context, 0 in scalar; stub always 0 */
-static int s_wantarray = 0;
-void       perl_set_wantarray(int v) { s_wantarray = v; }
-PerlValue *perl_wantarray(void) { return perl_alloc_int(s_wantarray); }
+static int s_wantarray_stack[64];
+static int s_wantarray_depth = 0;
+
+int perl_push_wantarray(int ctx) {
+  if (s_wantarray_depth < 64) s_wantarray_stack[s_wantarray_depth++] = ctx;
+  return ctx;
+}
+int perl_pop_wantarray(void) {
+  if (s_wantarray_depth > 0) s_wantarray_depth--;
+  return s_wantarray_depth ? s_wantarray_stack[s_wantarray_depth] : 0;
+}
+PerlValue *perl_wantarray(void) {
+  return perl_alloc_int(s_wantarray_stack[s_wantarray_depth - 1]);
+}
 
 /* caller — stub returning (package, file, line) */
 PerlArray *perl_caller(void) {
@@ -957,7 +969,8 @@ PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
     int         saved_n    = s_ncaptures;
     s_current_captures = cl->captures;
     s_ncaptures        = cl->ncaptures;
-    PerlValue *result = cl->fn(args);
+    PerlValue *result = ((PerlSubFnCtx)cl->fn)(args, perl_push_wantarray(0));
+    perl_pop_wantarray();
     s_current_captures = saved_caps;
     s_ncaptures        = saved_n;
     return result;
@@ -1271,6 +1284,83 @@ PerlValue *perl_unlink_files(PerlArray *files) {
     return perl_alloc_int(removed);
 }
 
+/* ── filesystem ops ──────────────────────────────────────────────────────── */
+
+PerlValue *perl_chdir(PerlValue *path) {
+    char *p = perl_to_string(path);
+    int r = chdir(p); free(p);
+    return perl_alloc_int(r == 0 ? 1 : 0);
+}
+
+PerlValue *perl_mkdir_op(PerlValue *path, PerlValue *mode) {
+    char *p = perl_to_string(path);
+    mode_t m = (mode && mode->tag != PERL_UNDEF) ? (mode_t)perl_to_int(mode) : 0777;
+    int r = mkdir(p, m); free(p);
+    return perl_alloc_int(r == 0 ? 1 : 0);
+}
+
+PerlValue *perl_rmdir_op(PerlValue *path) {
+    char *p = perl_to_string(path);
+    int r = rmdir(p); free(p);
+    return perl_alloc_int(r == 0 ? 1 : 0);
+}
+
+PerlValue *perl_rename_op(PerlValue *oldp, PerlValue *newp) {
+    char *o = perl_to_string(oldp);
+    char *n = perl_to_string(newp);
+    int r = rename(o, n); free(o); free(n);
+    return perl_alloc_int(r == 0 ? 1 : 0);
+}
+
+PerlValue *perl_chmod_op(PerlValue *mode, PerlArray *files) {
+    mode_t m = (mode_t)perl_to_int(mode);
+    long long changed = 0;
+    for (long long i = 0; i < files->len; i++) {
+        char *p = perl_to_string(files->elems[i]);
+        if (chmod(p, m) == 0) changed++;
+        free(p);
+    }
+    return perl_alloc_int(changed);
+}
+
+/* ── directory I/O ───────────────────────────────────────────────────────── */
+
+PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path) {
+    char *p = perl_to_string(path);
+    DIR *d = opendir(p); free(p);
+    if (!d) return perl_alloc_int(0);
+    if (target->tag == PERL_DIRHANDLE && target->pval) closedir((DIR*)target->pval);
+    if (target->tag == PERL_STRING && target->sval) free(target->sval);
+    if (target->blessed_class) { free(target->blessed_class); target->blessed_class = NULL; }
+    target->tag  = PERL_DIRHANDLE;
+    target->pval = d;
+    return perl_alloc_int(1);
+}
+
+PerlValue *perl_readdir(PerlValue *dh) {
+    if (!dh || dh->tag != PERL_DIRHANDLE || !dh->pval) return perl_alloc_undef();
+    struct dirent *e = readdir((DIR*)dh->pval);
+    if (!e) return perl_alloc_undef();
+    return perl_alloc_string(e->d_name);
+}
+
+PerlArray *perl_readdir_all(PerlValue *dh) {
+    PerlArray *a = perl_array_new();
+    if (!dh || dh->tag != PERL_DIRHANDLE || !dh->pval) return a;
+    struct dirent *e;
+    while ((e = readdir((DIR*)dh->pval)) != NULL)
+        perl_array_push(a, perl_alloc_string(e->d_name));
+    return a;
+}
+
+void perl_closedir_fh(PerlValue *dh) {
+    if (dh && dh->tag == PERL_DIRHANDLE && dh->pval) {
+        closedir((DIR*)dh->pval);
+        dh->pval = NULL;
+        dh->tag  = PERL_UNDEF;
+    }
+}
+
 /* ── sprintf / printf ────────────────────────────────────────────────────── */
 
 PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
@@ -1572,6 +1662,7 @@ PerlArray *perl_range(PerlValue *from, PerlValue *to) {
 
 #define PERL_MAX_CAPTURES 10
 static PerlValue *perl_captures_[PERL_MAX_CAPTURES + 1];  /* $1..$10 */
+static PerlHash *perl_plus_hash = NULL;
 
 static int pcre_flags(const char *flags) {
     int opts = 0;
@@ -1591,6 +1682,43 @@ PerlValue *perl_capture(long long n) {
     return perl_captures_[n] ? perl_clone(perl_captures_[n]) : perl_alloc_undef();
 }
 
+static void populate_named_captures(pcre2_match_data *md, const char *s, pcre2_code *re) {
+  if (perl_plus_hash) perl_hash_free(perl_plus_hash);
+  perl_plus_hash = perl_hash_new();
+
+  uint32_t namecount;
+  pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT, &namecount);
+  if (namecount == 0) return;
+
+  PCRE2_SIZE name_table_entry_size;
+  uint32_t name_entry_size;
+  uint32_t name_count;
+  pcre2_pattern_info(re, PCRE2_INFO_NAMETABLE, &name_table_entry_size);
+  pcre2_pattern_info(re, PCRE2_INFO_NAMEENTRYSIZE, &name_entry_size);
+  pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT, &name_count);
+
+  PCRE2_SPTR name_table;
+  pcre2_pattern_info(re, PCRE2_INFO_NAMETABLE, &name_table);
+  PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+
+  for (uint32_t i = 0; i < name_count; i++) {
+    PCRE2_SPTR name = name_table + name_entry_size * i;
+    uint32_t group_num = *(uint32_t *)(name_table + name_entry_size * i + name_table_entry_size);
+    size_t cstart = ov[2 * group_num], cend = ov[2 * group_num + 1];
+    if (cstart < cend) {
+      char *cap = malloc(cend - cstart + 1);
+      memcpy(cap, s + cstart, cend - cstart);
+      cap[cend - cstart] = '\0';
+      PerlValue *key = perl_alloc_string((char*)name);
+      PerlValue *val = perl_alloc_string(cap);
+      perl_hash_set_sv(perl_plus_hash, key, val);
+      perl_free(key);
+      perl_free(val);
+      free(cap);
+    }
+  }
+}
+
 PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags) {
     int errcode; PCRE2_SIZE erroffset;
     pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
@@ -1601,9 +1729,11 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
     size_t slen = strlen(s);
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
     int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, 0, 0, md, NULL);
+    if (rc > 0) populate_named_captures(md, s, re);
 
     if (rc > 0) {
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+        populate_named_captures(md, s, re);
         for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
             if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
         }
@@ -1654,6 +1784,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
     while (pos <= slen) {
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
+        if (rc > 0) populate_named_captures(md, s, re);
         if (rc <= 0) {
             size_t rem = slen - pos;
             ENSURE(rem); memcpy(out + out_len, s + pos, rem); out_len += rem; break;
@@ -1720,6 +1851,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
 
     while (pos <= slen) {
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
+        if (rc > 0) populate_named_captures(md, s, re);
         if (rc <= 0) {
             PerlValue *v = perl_alloc_string(s + pos);
             perl_array_push(arr, v); perl_free(v); break;
@@ -1742,6 +1874,17 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     return arr;
 }
 
+PerlValue *perl_get_plus_hash(void) {
+  return perl_plus_hash ? perl_ref_hash(perl_plus_hash) : perl_alloc_undef();
+}
+
+void perl_clear_named_captures(void) {
+  if (perl_plus_hash) {
+    perl_hash_free(perl_plus_hash);
+    perl_plus_hash = NULL;
+  }
+}
+
 PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags) {
     int errcode; PCRE2_SIZE erroffset;
     pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
@@ -1755,6 +1898,8 @@ PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *f
 
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
     int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, startpos, 0, md, NULL);
+    if (rc > 0) populate_named_captures(md, s, re);
+    if (rc > 0) populate_named_captures(md, s, re);
 
     if (rc > 0) {
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
@@ -1795,6 +1940,7 @@ PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char 
 
     while (pos <= slen) {
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
+        if (rc > 0) populate_named_captures(md, s, re);
         if (rc <= 0) break;
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
         size_t mstart = ov[0], mend = ov[1];

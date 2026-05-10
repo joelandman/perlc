@@ -569,7 +569,7 @@ end ok
 - `local` for arrays and hashes not implemented (scalars and special vars only)
 - `use` statements for non-file pragmas are silently ignored; only file-backed modules in search paths are loaded
 - Regular expression modifiers `x` (extended) and `e` (eval replacement)
-- Named captures `(?<name>...)`
+
 - `require`/`do FILE` at runtime — module loading only at compile time via `inlineModules()`
 - `AUTOLOAD`, `DESTROY` not implemented
 - `unshift @{EXPR}, val` — not yet supported (push @{EXPR} is supported)

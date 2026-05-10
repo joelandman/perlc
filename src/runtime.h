@@ -16,6 +16,7 @@ typedef enum {
     PERL_REF_HASH   = 6,
     PERL_FILEHANDLE = 7,
     PERL_CODE_REF   = 8,
+    PERL_DIRHANDLE  = 9,
 } PerlTag;
 
 typedef struct PerlValue {
@@ -240,23 +241,23 @@ PerlHash  *perl_deref_hash(PerlValue *ref);     /* returns (PerlHash*)ref->pval 
 PerlValue *perl_ref_type(PerlValue *ref);       /* "SCALAR"/"ARRAY"/"HASH"/""   */
 
 /* ── code references ─────────────────────────────────────────────────────── */
-typedef PerlValue *(*PerlSubFn)(PerlArray *);
+typedef PerlValue *(*PerlSubFnCtx)(PerlArray *, int ctx);
 
 /* PerlClosure is the heap object stored in PERL_CODE_REF pval */
 typedef struct PerlClosure {
-    PerlSubFn   fn;
+    PerlSubFnCtx   fn;
     PerlValue **captures;  /* borrowed PerlValue* — not owned */
     int         ncaptures;
 } PerlClosure;
 
-PerlValue *perl_make_code_ref(PerlSubFn fp);                     /* no captures */
-PerlValue *perl_make_closure(PerlSubFn fp, PerlArray *captures); /* with captures */
+PerlValue *perl_make_code_ref(PerlSubFnCtx fp);                     /* no captures */
+PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures); /* with captures */
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args);
 PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a closure call */
 
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
-void       perl_register_method(const char *key, PerlSubFn fn);
+void       perl_register_method(const char *key, PerlSubFnCtx fn);
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args);
 PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                                       const char *method, PerlArray *args);
@@ -273,12 +274,30 @@ int  perl_local_save_depth(void);              /* current save-stack depth */
 void perl_local_save(PerlValue *pv);           /* save current state of *pv */
 void perl_local_restore_to(int depth);         /* restore all saved since depth */
 
+/* ── directory I/O ───────────────────────────────────────────────────────── */
+PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path);
+PerlValue *perl_readdir(PerlValue *dh);      /* scalar: one entry or undef */
+PerlArray *perl_readdir_all(PerlValue *dh);  /* list: all remaining entries */
+void       perl_closedir_fh(PerlValue *dh);
+
+/* ── filesystem ops ──────────────────────────────────────────────────────── */
+PerlValue *perl_chdir(PerlValue *path);
+PerlValue *perl_mkdir_op(PerlValue *path, PerlValue *mode);  /* mode may be undef → 0777 */
+PerlValue *perl_rmdir_op(PerlValue *path);
+PerlValue *perl_rename_op(PerlValue *oldp, PerlValue *newp);
+PerlValue *perl_chmod_op(PerlValue *mode, PerlArray *files);
+
 /* ── special global variables ────────────────────────────────────────────── */
 PerlValue *perl_get_input_sep(void);           /* $/ — input record separator (stable ptr) */
 PerlValue *perl_get_dollar_bang(void);         /* $! — errno string */
-void       perl_set_wantarray(int v);          /* set call context (0=scalar, 1=list) */
-PerlValue *perl_wantarray(void);               /* wantarray() builtin */
+typedef PerlValue *(*PerlSubFnCtx)(PerlArray *, int); /* fn(args, ctx) */
+
+int perl_push_wantarray(int ctx);
+int perl_pop_wantarray(void);
+PerlValue *perl_wantarray(void);
 PerlArray *perl_caller(void);                  /* caller() — returns (pkg,file,line) */
+PerlHash *perl_get_plus_hash(void);
+void perl_clear_named_captures(void);
 
 /* ── eval / exception handling ───────────────────────────────────────────── */
 /* codegen allocates jmp_buf on stack and calls setjmp directly;

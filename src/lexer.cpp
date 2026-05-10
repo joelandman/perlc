@@ -44,6 +44,11 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"wantarray",TK::KW_WANTARRAY}, {"caller", TK::KW_CALLER},
     {"state",    TK::KW_STATE},
     {"BEGIN",    TK::KW_BEGIN},     {"END",    TK::KW_END},
+    {"chdir",    TK::KW_CHDIR},     {"mkdir",  TK::KW_MKDIR},
+    {"rmdir",    TK::KW_RMDIR},     {"rename", TK::KW_RENAME},
+    {"chmod",    TK::KW_CHMOD},
+    {"opendir",  TK::KW_OPENDIR},   {"readdir",TK::KW_READDIR},
+    {"closedir", TK::KW_CLOSEDIR},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}
@@ -329,6 +334,11 @@ std::vector<Token> Lexer::tokenize() {
             TK k = (c == '$') ? TK::SCALAR : TK::ARRAY;
             pos_++;
             toks.push_back({k, std::string(1, c), line_});
+    if (c == '$' && pos_ < src_.size() && src_[pos_] == '+') {
+      pos_++;
+      toks.back().text = "+";
+      continue;
+    }
             /* $/ — force SLASH (not regex) immediately after $ sigil */
             if (c == '$' && pos_ < src_.size() && src_[pos_] == '/') {
                 pos_++;

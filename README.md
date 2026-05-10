@@ -204,7 +204,7 @@ foreach my $m ($s =~ /(\w+)/g) { say $m; }
 my @parts = split(/,+/, $csv);
 ```
 
-Supported flags: `i` (case-insensitive), `g` (global/all matches), `s` (dot matches newline), `m` (multiline).
+Supported flags: `i` (case-insensitive), `g` (global/all matches), `s` (dot matches newline), `m` (multiline). Named captures `(?<name>...)` supported, accessible via `$+{name}` or `%+`.
 
 ## Architecture
 

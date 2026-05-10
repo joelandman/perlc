@@ -58,6 +58,7 @@ static FunctionType *makeRT(LLVMContext &ctx, Type *ret,
 void CodeGen::declareRuntime() {
     auto  voidTy = Type::getVoidTy(ctx_);
     auto  i64    = Type::getInt64Ty(ctx_);
+    auto  i32    = Type::getInt32Ty(ctx_);
     auto  i8p    = PointerType::getUnqual(ctx_);
     auto  pv     = perlPtrTy_;   /* PerlValue* */
     auto  av     = arrayPtrTy_;  /* PerlArray* */
@@ -238,9 +239,24 @@ void CodeGen::declareRuntime() {
     /* special globals */
     RT("perl_get_input_sep",    pv);
     RT("perl_get_dollar_bang",  pv);
-    RT("perl_wantarray",        pv);
+    RT("perl_push_wantarray", i32, i32);
+RT("perl_pop_wantarray",  i32);
+RT("perl_wantarray",      pv);
     RT("perl_caller",           av);
+RT("perl_get_plus_hash",     av);
+RT("perl_clear_named_captures", voidTy);
     RT("perl_defined",          Type::getInt32Ty(ctx_), pv);
+    /* filesystem */
+    RT("perl_chdir",            pv, pv);
+    RT("perl_mkdir_op",         pv, pv, pv);
+    RT("perl_rmdir_op",         pv, pv);
+    RT("perl_rename_op",        pv, pv, pv);
+    RT("perl_chmod_op",         pv, pv, av);
+    /* directory I/O */
+    RT("perl_opendir_fh",       pv, pv, pv);
+    RT("perl_readdir",          pv, pv);
+    RT("perl_readdir_all",      av, pv);
+    RT("perl_closedir_fh",      voidTy, pv);
 #undef RT
 }
 
@@ -345,8 +361,17 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *av = nullptr;
         if (n.left) av = emitArrayPtr(*n.left);
         if (!av && !n.args.empty()) {
-            av = callRT("perl_array_new", {});
-            for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+            if (n.args.size() == 1) {
+                av = emitArrayPtr(*n.args[0]);
+            }
+            if (!av) {
+                av = callRT("perl_array_new", {});
+                for (auto &a : n.args) {
+                    Value *sub = emitArrayPtr(*a);
+                    if (sub) callRT("perl_array_extend", {av, sub});
+                    else     callRT("perl_array_push",   {av, emitExpr(*a)});
+                }
+            }
         }
         if (!av) av = callRT("perl_array_new", {});
         /* dispatch on sort mode */
@@ -540,6 +565,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::CallerFunc) {
         return callRT("perl_caller", {});
     }
+    if (n.kind == NK::ReaddirFunc) {
+        Value *slot = lookupVar(n.name);
+        if (!slot) return callRT("perl_array_new", {});
+        Value *dh = builder_.CreateLoad(perlPtrTy_, slot);
+        return callRT("perl_readdir_all", {dh});
+    }
     return nullptr;
 }
 
@@ -617,6 +648,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     emitBlock(program);
     popScope();
 
+    callRT("perl_pop_wantarray", {});
     /* restore any local()s before returning */
     {
         Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
@@ -649,6 +681,8 @@ void CodeGen::emitSub(const Node &n) {
     /* @_ is the first argument (PerlArray*) */
     Value *argsArr = fn->getArg(0);
     argsArr->setName("args");
+    Value *ctxArg = fn->getArg(1);
+    callRT("perl_push_wantarray", {ctxArg});
     declareArray("_", argsArr);
 
     /* pre-declare $_ so it's available for default-arg builtins and while(<FH>) */
@@ -667,6 +701,8 @@ void CodeGen::emitSub(const Node &n) {
 
     emitBlock(*n.body);
 
+    perl_pop_wantarray();
+    callRT("perl_pop_wantarray", {});
     /* implicit return undef — restore locals first */
     if (!builder_.GetInsertBlock()->getTerminator()) {
         Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
@@ -1089,7 +1125,8 @@ void CodeGen::emitStmt(const Node &n) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             Value *cloned = callRT("perl_clone", {v});
-            callRT("perl_local_restore_to", {depth});
+            perl_pop_wantarray();
+    callRT("perl_local_restore_to", {depth});
             v = cloned;
         }
         builder_.CreateRet(v);
@@ -1454,6 +1491,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *idx = callRT("perl_to_int", {emitExpr(*n.left->left)});
             callRT("perl_array_set", {av, idx, rhs});
             return rhs;
+        }
+        /* opendir assignment: opendir(my $dh, path) stores DIRHANDLE into $dh */
+        if (n.left->kind == NK::ScalarVar && n.right &&
+            n.right->kind == NK::OpendirFunc) {
+            /* The OpendirFunc node stores result into the named var */
+            emitStmt(*n.right);   /* side-effect: fills the dh slot */
+            return perlUndef();
         }
         /* special globals: $/ and $! assigned through stable pointer */
         if (n.left->kind == NK::ScalarVar &&
@@ -1890,6 +1934,60 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_array_get", {av, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
     }
 
+    case NK::ChdirFunc:
+        return callRT("perl_chdir", {n.left ? emitExpr(*n.left) : perlStr(".")});
+
+    case NK::MkdirFunc: {
+        Value *path = n.left ? emitExpr(*n.left) : perlStr(".");
+        Value *mode = n.right ? emitExpr(*n.right) : perlUndef();
+        return callRT("perl_mkdir_op", {path, mode});
+    }
+
+    case NK::RmdirFunc:
+        return callRT("perl_rmdir_op", {n.left ? emitExpr(*n.left) : perlStr(".")});
+
+    case NK::RenameFunc: {
+        Value *oldp = n.left  ? emitExpr(*n.left)  : perlUndef();
+        Value *newp = n.right ? emitExpr(*n.right) : perlUndef();
+        return callRT("perl_rename_op", {oldp, newp});
+    }
+
+    case NK::ChmodFunc: {
+        Value *mode = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *av   = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_chmod_op", {mode, av});
+    }
+
+    case NK::OpendirFunc: {
+        /* opendir(my $dh, path) — declare/find $dh, call opendir_fh */
+        Value *slot = lookupVar(n.name);
+        if (!slot) {
+            Value *uv = callRT("perl_alloc_undef", {});
+            slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
+            builder_.CreateStore(uv, slot);
+            declareVar(n.name, slot);
+        }
+        Value *dh   = builder_.CreateLoad(perlPtrTy_, slot);
+        Value *path = n.left ? emitExpr(*n.left) : perlStr(".");
+        return callRT("perl_opendir_fh", {dh, path});
+    }
+
+    case NK::ReaddirFunc: {
+        Value *slot = lookupVar(n.name);
+        if (!slot) return perlUndef();
+        Value *dh = builder_.CreateLoad(perlPtrTy_, slot);
+        return callRT("perl_readdir", {dh});
+    }
+
+    case NK::ClosedirFunc: {
+        Value *slot = lookupVar(n.name);
+        if (!slot) return perlUndef();
+        Value *dh = builder_.CreateLoad(perlPtrTy_, slot);
+        callRT("perl_closedir_fh", {dh});
+        return perlUndef();
+    }
+
     case NK::TrOp: {
         Value *str = emitExpr(*n.left);
         size_t s1 = n.sval.find('\x01'), s2 = n.sval.find('\x01', s1 + 1);
@@ -1967,9 +2065,11 @@ Value *CodeGen::emitExpr(const Node &n) {
         currentFn_ = subFn;
         scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {};
         pushScope();
-        Value *argsArr = subFn->getArg(0);
-        argsArr->setName("args");
-        declareArray("_", argsArr);
+    Value *argsArr = subFn->getArg(0);
+    argsArr->setName("args");
+    Value *ctxArg = subFn->getArg(1);
+    callRT("perl_push_wantarray", {ctxArg});
+    declareArray("_", argsArr);
         /* fresh local() depth for this closure */
         {
             auto *i32Ty = Type::getInt32Ty(ctx_);
@@ -1989,7 +2089,8 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (!builder_.GetInsertBlock()->getTerminator()) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-            callRT("perl_local_restore_to", {depth});
+            perl_pop_wantarray();
+    callRT("perl_local_restore_to", {depth});
             builder_.CreateRet(perlUndef());
         }
         popScope();
@@ -2204,7 +2305,10 @@ Value *CodeGen::emitCall(const Node &n) {
             Value *v = emitExpr(*arg);
             callRT("perl_array_push", {argsArr, v});
         }
-        return builder_.CreateCall(fn, {argsArr});
+        Value *one = ConstantInt::get(i32Ty, 1);
+    Value *zero = ConstantInt::get(i32Ty, 0);
+    Value *zero = ConstantInt::get(i32Ty, 0);
+    return builder_.CreateCall(fn, {argsArr, zero});
     }
     return perlUndef();
 }
