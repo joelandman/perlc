@@ -23,210 +23,100 @@ make clean
 ./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
 ```
 
-## Supported Perl Features (Core ~100%, CPAN ~90%)
-*All high/med/low + threads/XS/DBI/overload/formats/tie/proto/qr/glob/signals/pack etc.*
+## Implemented Features
 
-### Variables
+### Core Language Features (Nearly Complete)
 
-| Syntax | Description |
-|--------|-------------|
-| `$x`, `my $x` | Scalar variables |
-| `@arr`, `my @arr` | Arrays |
-| `%hash`, `my %hash` | Hashes |
-| `$arr[i]` | Array element |
-| `$hash{key}` | Hash element |
-| `my ($a, $b) = @_` | List assignment / argument unpacking |
+**Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--` (including magical string increment), compound assignment
 
-### Literals
+**Arrays**: `@arr`, push/pop/shift/unshift (all flatten array args), `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`; `my @a = (@b, @c)` properly flattens
 
-- Integers, floats
-- Single-quoted strings `'...'` (no interpolation)
-- Double-quoted strings `"..."` (variable and `\n`/`\t` interpolation)
-- `undef`
+**Hashes**: `%hash`, `$h{key}`, keys/values/exists/delete, hash-from-list init
 
-### Operators
+**Control Flow**: if/elsif/else, unless, while (including `while (my $var = expr)`), until, do-while, do-until, C-style for, foreach, last, next, return
 
-- Arithmetic: `+`, `-`, `*`, `/`, `%`
-- String: `.` (concat), `x` (repeat)
-- Range: `..` (e.g. `1..10`)
-- Comparison (numeric): `==`, `!=`, `<`, `>`, `<=`, `>=`
-- Comparison (string): `eq`, `ne`, `lt`, `gt`, `le`, `ge`
-- Logical: `&&`, `||`, `!`, `and`, `or`, `not`
-- Increment/decrement: `++`, `--` (prefix and postfix)
-- Compound assignment: `+=`, `-=`, `*=`, `/=`, `.=`
-- Ternary: `? :`
-- String repetition: `x`
+**Statement Modifiers**: `STMT if COND`, `STMT unless COND`, `STMT while COND`, `STMT until COND`, `STMT for LIST`, `STMT foreach LIST`
 
-### Control Flow
+**Subroutines**: `sub name { }`, `@_`, list unpacking, recursion, `sub { }` (anonymous subs), `\&name` (code refs), `$f->(args)` (code ref calls), `ref($f)` → `"CODE"`
 
-```perl
-if ($x) { ... } elsif ($y) { ... } else { ... }
-unless ($x) { ... }
-while ($cond) { ... }
-while (my $line = <$fh>) { ... }   # my-in-condition idiom
-until ($cond) { ... }
-do { ... } while ($cond);
-do { ... } until ($cond);
-for (my $i = 0; $i < 10; $i++) { ... }
-foreach my $v (@arr) { ... }
-foreach my $i (1..10) { ... }
-last;   # break
-next;   # continue
-```
+**Heredocs**: `<<IDENT`, `<<"IDENT"` (interpolating), `<<'IDENT'` (literal); body collected from subsequent lines until terminator line
 
-### Statement Modifiers
+**`$_` as default variable**: `foreach (@arr) { }` loops over `$_`; `while (<FH>)` assigns to `$_`; `chomp`/`chop` without args operate on `$_`; bare `/regex/`, `s///`, `tr///` bind to `$_`
 
-Any statement can be followed by a postfix modifier:
+**`local`**: `local $x` / `local $x = val` — dynamic save/restore for scalars and special variables
 
-```perl
-say "yes" if $x > 0;
-say "no"  unless $found;
-$i++      while $i < 10;
-$j--      until $j == 0;
-say $_    for @arr;
-say $_    foreach (1, 2, 3);
-```
+**References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
-### Subroutines
+**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`
 
-```perl
-sub name {
-    my ($a, $b) = @_;
-    return $a + $b;
-}
-my $result = name(1, 2);
-```
+**tr///**: `$s =~ tr/SEARCH/REPLACE/flags` — character translation; flags: `d` (delete), `s` (squeeze), `c` (complement); ranges `a-z`; returns count
 
-### I/O
+**Range**: `1..N` in for/foreach, list context (`my @r = (1..10)`), join context
 
-```perl
-print "text";
-print "a", "b", "c";
-say "text";          # print with newline
-say $var;
-printf "%s=%d\n", $key, $val;
-sprintf "%05.2f", $n;
-print STDERR "error\n";
-```
+**sprintf/printf**: full format string — `%s %d %i %u %f %e %E %g %G %x %X %o %b %c %%`, width/precision literals and `*` from args
 
-### File I/O
+**File I/O**: `open(my $fh, mode, file)`, `open(my $fh, "modeFile")` (2-arg), `close($fh)`, `<$fh>` (scalar readline), `my @lines = <$fh>` (array readline), `print $fh`, `say $fh`, `printf $fh`, `eof($fh)`, `die`, `print STDERR`, `unlink`
 
-```perl
-open(my $fh, '>', "file.txt") or die "Cannot open: $!";
-open(my $fh, '<', "file.txt") or die;
-open(my $fh, '>>', "file.txt");    # append
-open(my $fh, "<file.txt");         # 2-arg form
+**Operators**: `<=>` (spaceship numeric), `cmp` (spaceship string)
 
-print $fh "text\n";
-say   $fh "text";
-printf $fh "%d\n", 42;
+**List ops**: `map { BLOCK } LIST`, `grep { BLOCK } LIST`, `sort { CMP } LIST` (with `$a`/`$b` comparator patterns), `reverse @arr` (array), `scalar reverse $str` (string)
 
-my $line  = <$fh>;                 # readline (scalar)
-my @lines = <$fh>;                 # slurp all lines (array)
+**Math builtins**: `abs`, `int` (truncate), `sqrt`
 
-close($fh);
-eof($fh);                          # true after last read
+**String builtins**: `uc`, `lc`, `ucfirst`, `lcfirst`, `index($str, $sub[, $pos])`, `rindex($str, $sub[, $pos])`, `chr`, `ord`, `hex`, `oct`
 
-die "error message\n";             # print to STDERR and exit
-unlink "file.txt";                 # delete file
-```
+**Slices**: `@arr[0,1,2]` (array slice), `@hash{'a','b'}` (hash slice); qw() and list args auto-flattened
 
-### String Builtins
+**System/env**: `system("cmd")` (exit code), `` `cmd` `` (output capture, interpolated), `$ENV{KEY}` / `$ENV{KEY}=val`
 
-```perl
-chomp($s);                    # remove trailing newline in-place
-chomp(@arr);                  # chomp every element
-length($s)                    # string length
-substr($s, $offset)           # substring from offset
-substr($s, $offset, $len)     # substring with length
-$a . $b                       # concatenation
-$s x $n                       # repetition
-```
+**File tests**: `-e` (exists), `-f` (file), `-d` (dir), `-r` (readable), `-w` (writable), `-x` (executable), `-z` (empty), `-s` (size), `-l` (symlink), `-p` (pipe)
 
-### Array Builtins
+**Builtins**: chomp, chop, length, substr, join, split, push, pop, shift, unshift, splice, sort, keys, values, exists, delete, scalar, defined, ref, warn, print, say, printf, sprintf, unlink
 
-```perl
-push @arr, $v;
-pop @arr
-shift @arr
-unshift @arr, $v;
-scalar @arr                   # length
-join(", ", @arr)
-join("-", 1..5)                # range in join
-split(/sep/, $str)
-sort @arr                     # lexicographic sort
-```
+**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space)
 
-### Hash Builtins
+**Command-line**: `@ARGV` (arguments), `$0` (program name); generated `main` accepts `int argc, char **argv`
 
-```perl
-keys %hash
-values %hash
-exists $hash{key}
-delete $hash{key}
-scalar %hash                  # number of key-value pairs
-```
+**eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime
 
-### References
+### Advanced Features
 
-```perl
-my $ref  = \$scalar;          # scalar reference
-my $aref = \@array;           # array reference
-my $href = \%hash;            # hash reference
-my $aref = [1, 2, 3];         # anonymous array
-my $href = {a => 1, b => 2};  # anonymous hash
+**State Variables**: `state $x [= expr]` — per-sub static variable; initialized once (lazily on first call); mutations persist across calls
 
-$$ref                         # dereference scalar
-@$aref                        # dereference array
-%$href                        # dereference hash
-$aref->[0]                    # arrow subscript (array)
-$href->{key}                  # arrow subscript (hash)
-ref($ref)                     # "SCALAR", "ARRAY", "HASH", or ""
-```
+**Closures**: anonymous subs capture outer lexical `my` scalar variables by stable pointer; multiple captures; independent closure instances; nested closures
 
-### Regex (PCRE2)
+**Object-Oriented Programming**: `package Foo;`, `bless($ref, $class)`, `$obj->method(args)`, `Foo->method(args)` (class method), `ref($obj)` → class name
 
-```perl
-$s =~ /pattern/flags          # match (true/false)
-$s !~ /pattern/flags          # negated match
-$s =~ /(\w+)/                 # with captures → $1, $2, ...
-$s =~ s/pat/replacement/      # substitution
-$s =~ s/pat/replacement/g     # global substitution
-$s =~ s/(\w+)/[$1]/g          # substitution with capture backreferences
+**Inheritance**: `use parent 'Base'` / `use base 'Base'`; inherited method lookup; method override; `SUPER::` dispatch
 
-# /g iterator in while loop
-while ($s =~ /(\w+)/g) { say $1; }
+**Module Loading**: `use Module` loads `.pm` files from `{scriptDir, scriptDir/lib, lib, .}`; recursively inlines modules; method dispatch across module boundaries
 
-# /g list context
-my @words = ($s =~ /(\w+)/g);
-foreach my $m ($s =~ /(\w+)/g) { say $m; }
+**BEGIN/END Blocks**: `BEGIN { }` runs inline at point of declaration; `END { }` compiles as function registered via `atexit()`, runs at program exit
 
-# split with regex
-my @parts = split(/,+/, $csv);
-```
+**Defined()**: properly checks `v->tag != PERL_UNDEF`
 
-Supported flags: `i/g/s/m/x/o/e`. Named `(?<name>)` → `%+{name}`. `qr{}` precompile.
+**$! (errno)**: `$!` → `perl_get_dollar_bang()` — refreshes `strerror(errno)` on each access
 
-## Architecture + Extensions
-*Threads*: POSIX ithreads (clone/share/RW-lock/cond); OpenMP (`#pragma omp parallel for/red/sched/nested`).
-*XS*: dlopen/boot.
-*DBI*: SQLite.
-*Full core*: Overload/proto/attr/signals/globs/pack/DESTROY/unicode(bytes/Encode).
+**$/ (input record separator)**: `$/` reads global sep; `$/ = undef` sets slurp mode; `local $/ = undef` temporarily enables slurp mode
+
+## Known Limitations
+
+- `wantarray`: stub always returns false; proper context tracking not implemented
+- `caller`: stub returns `("main", "unknown", 0)`; real call stack not tracked
+- `local` for arrays and hashes: not implemented (scalars and special vars only)
+- `use` statements for non-file pragmas: silently ignored; only file-backed modules in search paths loaded
+- Regex modifiers: `x` (extended) and `e` (eval replacement) not supported
+- `require`/`do FILE`: not supported at runtime (module loading only at compile time)
+- `AUTOLOAD`, `DESTROY`: not implemented
+- `unshift @{EXPR}, val`: not yet supported (push @{EXPR} is supported)
+
+## Architecture
 
 ```
 source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  clang-18  →  binary
-                                                                          ↑
-                                                                    runtime.c (linked in)
+                                                                           ↑
+                                                                     runtime.c (linked in)
 ```
-
-| File | Role |
-|------|------|
-| `src/lexer.h/cpp` | Context-aware tokenizer |
-| `src/ast.h` | Node kinds (`NK` enum) and `Node` struct |
-| `src/parser.h/cpp` | Recursive-descent parser |
-| `src/codegen.h/cpp` | AST → LLVM IR via IRBuilder |
-| `src/runtime.h/c` | C runtime: `PerlValue` tagged union and all operations |
-| `src/main.cpp` | Driver: lex → parse → codegen → link |
 
 ### Runtime Value Model
 
@@ -234,8 +124,18 @@ All Perl values are heap-allocated `PerlValue` structs (tagged union):
 
 ```c
 typedef struct PerlValue {
-    PerlTag tag;        // UNDEF, INT, FLOAT, STRING, REF_SCALAR, REF_ARRAY, REF_HASH, FILEHANDLE
+    PerlTag tag;        // UNDEF, INT, FLOAT, STRING, REF_SCALAR, REF_ARRAY, REF_HASH, FILEHANDLE, CODE_REF
     union { long long ival; double fval; char *sval; void *pval; };
     long long matchpos; // /g iterator position
+    char *blessed_class; // for objects
 } PerlValue;
 ```
+
+### Key Components
+
+- `src/lexer.h/cpp`: Context-aware tokenizer
+- `src/ast.h`: Node kinds (`NK` enum) and `Node` struct
+- `src/parser.h/cpp`: Recursive-descent parser → AST
+- `src/codegen.h/cpp`: AST → LLVM IR via IRBuilder
+- `src/runtime.h/c`: C runtime: `PerlValue` tagged union and all operations
+- `src/main.cpp`: Driver: lex → parse → codegen → clang-18 link

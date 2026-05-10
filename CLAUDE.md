@@ -4,6 +4,8 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
+**Current Status**: Core language features are ~95% implemented with 21/21 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, and advanced builtins.
+
 ## Build & Test
 
 ```bash
@@ -19,12 +21,12 @@ make clean
 
 | File | Role |
 |------|------|
-| `src/lexer.h/cpp` | Tokenizer; context-aware `%` (modulo vs hash sigil) and `/` (division vs regex) |
+| `src/lexer.h/cpp` | Context-aware tokenizer (`%` modulo vs hash sigil, `/` division vs regex) |
 | `src/ast.h` | `NK` enum of node kinds + `Node` struct |
 | `src/parser.h/cpp` | Recursive-descent parser → AST |
 | `src/codegen.h/cpp` | AST → LLVM IR via IRBuilder |
 | `src/runtime.h/c` | C runtime: `PerlValue` tagged union + all operations |
-| `src/main.cpp` | Driver: lex→parse→codegen→clang-18 link |
+| `src/main.cpp` | Driver: lex→parse→codegen→clang-18 link with module inlining |
 
 ## Architecture
 
@@ -32,544 +34,94 @@ make clean
 - **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7, CODE_REF=8`
 - **PerlArray**: `{ PerlValue **elems; long long len, cap; }`
 - **PerlHash**: 64-bucket chained hash table
-- **matchpos**: per-PerlValue `/g` iterator offset; reset to 0 on `perl_clone`/`perl_assign`
-- **Scope model**: three parallel scope stacks — `scopes_` (scalars), `arrayScopes_`, `hashScopes_`
-- **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime; assignment mutates in-place. Required for references to work correctly.
-- **Codegen pattern**: every op is `callRT("perl_xyz", {args...})` → C runtime does the work
-- **File handles**: `PERL_FILEHANDLE` tag; `FILE*` stored in `pval` field; stable PerlValue* for the fh lifetime; `perl_open_fh` closes the old FILE* before opening a new one on the same PerlValue*
-
-## Implemented Features
-
-### All passing tests (21/21)
-
-| Test | What it covers |
-|------|----------------|
-| `hello.pl` | strings, print/say, double-quoted interpolation |
-| `arith.pl` | arithmetic, compound assign (`+=` etc.), string concat/repeat |
-| `fib.pl` | recursive subs, `@_`, `my ($n) = @_` list assignment |
-| `hash.pl` | `%hash`, `$h{k}`, keys/values/exists/delete, sort keys, hash args |
-| `builtins.pl` | shift/unshift/chomp/length/substr/join/split (including regex split) |
-| `refs.pl` | all reference types, anonymous array/hash, arrow subscript, `ref()` |
-| `regex.pl` | match, `!~`, case-insensitive, captures `$1`–`$9`, substitution, split |
-| `regex_g.pl` | `/g` iterator in `while`, captures in `/g`, list context `/g`, foreach `/g` |
-| `modifiers.pl` | postfix if/unless/while/until/for/foreach, last/next with modifier |
-| `range.pl` | `..` range operator in for, array assignment, join, scalar context |
-| `sprintf.pl` | `sprintf`/`printf` with `%s %d %f %x %o %b %e %g %c %%`, width/precision |
-| `fileio.pl` | open/close (2-arg/3-arg), readline scalar+array, print/say/printf to fh, eof, die, unlink |
-| `builtins2.pl` | abs/int/sqrt, uc/lc/ucfirst/lcfirst, index/rindex, chr/ord/hex/oct, reverse, map, grep, sort comparators, <=>, cmp |
-| `features.pl` | chop, warn, qw(), splice, array/hash slices, \$ENV{}, file tests (-e/-f/-d/-r/-w/-x/-z/-s/-l), system, backtick |
-| `advanced.pl` | array flattening (push/unshift/my with @arr), string `++`, @ARGV/$0, anon subs, \&sub, eval/\$@, tr/// |
-| `oop.pl` | `package`, `bless`, `->method()`, class/instance methods, `ref()` returning class name |
-| `closures.pl` | lexical closures: anonymous subs capturing outer `my` scalars, multiple captures, independent instances |
-| `usemod.pl` | `use Module` loading `.pm` files from `lib/`, method dispatch across module boundary |
-| `inherit.pl` | `use parent`, inherited method lookup, method override, `SUPER::` dispatch |
-| `defaults.pl` | heredocs (`<<END`, `<<'END'`, `<<"END"`), `$_` as default (foreach/chomp/s///), `local` |
-| `newfeatures.pl` | `state` variables, `wantarray`, `caller`, `$!` (errno), `$/` with `local $/`, `BEGIN`/`END` blocks, `defined()` |
-
-### Language features
-
-**Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--` (including magical string increment), compound assignment
-
-**Arrays**: `@arr`, push/pop/shift/unshift (all flatten array args), `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`; `my @a = (@b, @c)` properly flattens
-
-**Hashes**: `%hash`, `$h{key}`, keys/values/exists/delete, hash-from-list init
-
-**Control flow**: if/elsif/else, unless, while (including `while (my $var = expr)`), until, do-while, do-until, C-style for, foreach, last, next, return
-
-**Statement modifiers**: `STMT if COND`, `STMT unless COND`, `STMT while COND`, `STMT until COND`, `STMT for LIST`, `STMT foreach LIST`
-
-**Subroutines**: `sub name { }`, `@_`, list unpacking, recursion, `sub { }` (anonymous subs), `\&name` (code refs), `$f->(args)` (code ref calls), `ref($f)` → `"CODE"`
-
-**Heredocs**: `<<IDENT`, `<<"IDENT"` (interpolating), `<<'IDENT'` (literal); body collected from subsequent lines until terminator line; `EOF_TOK`-jump mechanism in lexer preserves rest-of-line tokens; interpolating heredocs get `\x01` prefix same as double-quoted strings
-
-**`$_` as default variable**: `foreach (@arr) { }` (no explicit var) loops over `$_`; `while (<FH>)` bare readline auto-assigns to `$_`; `chomp`/`chop` without args operate on `$_`; bare `/regex/`, `s///`, `tr///` bind to `$_`; `$_` pre-declared (as undef) in every function scope (main and subs)
-
-**`local`**: `local $x` / `local $x = val` — dynamic save/restore; `perl_local_save_depth()` + `perl_local_save(pv)` + `perl_local_restore_to(depth)` runtime API; `s_local_stack[256]` with deep-copy of string/blessed_class; depth captured at each function entry; restored before every explicit `return` (with cloned retval) and at implicit-return; `AnonSub` codegen saves/restores `localDepthAlloca_` to prevent cross-function reference errors
-
-**Closures**: anonymous subs capture outer lexical `my` scalar variables by stable pointer (same `PerlValue*`); multiple captures; independent closure instances; nested closures; `PerlClosure` struct `{fn, captures[], ncaptures}` stored in `CODE_REF.pval`; `perl_get_capture(i)` retrieves captured value at closure entry; `s_current_captures`/`s_ncaptures` set before call and restored after
-
-**OOP**: `package Foo;` (sets current package), `bless($ref, $class)` / `bless $ref` (uses current package), `$obj->method(args)`, `Foo->method(args)` (class method), `ref($obj)` → class name; `blessed_class` stored in `PerlValue`; method dispatch via `perl_register_method`/`perl_dispatch_method`
-
-**Inheritance**: `use parent 'Base'` / `use base 'Base'` — emits `SetIsa` AST node → `perl_set_isa(child, parent)` at runtime; `perl_find_method` walks ISA chain; `$self->SUPER::method(args)` dispatches via `perl_dispatch_method_super(obj, caller_pkg, method, args)`
-
-**Module loading**: `use Module` scans `{scriptDir, scriptDir/lib, lib, .}` for `Module.pm`; lexes and recursively inlines; inserts synthetic `package main;` before main tokens; `EOF_TOK` stripped from each module to avoid premature termination; pragma names (`strict`, `warnings`, etc.) skipped; implemented in `inlineModules()` in `main.cpp`
-
-**References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
-
-**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`
-
-**tr///**: `$s =~ tr/SEARCH/REPLACE/flags` — character translation; flags: `d` (delete), `s` (squeeze), `c` (complement); ranges `a-z`; returns count
-
-**Range**: `1..N` in for/foreach, list context (`my @r = (1..10)`), join context
-
-**sprintf/printf**: full format string — `%s %d %i %u %f %e %E %g %G %x %X %o %b %c %%`, width/precision literals and `*` from args
-
-**File I/O**: `open(my $fh, mode, file)`, `open(my $fh, "modeFile")` (2-arg), `close($fh)`, `<$fh>` (scalar readline), `my @lines = <$fh>` (array readline), `print $fh`, `say $fh`, `printf $fh`, `eof($fh)`, `die`, `print STDERR`, `unlink`
-
-**Operators**: `<=>` (spaceship numeric), `cmp` (spaceship string)
-
-**List ops**: `map { BLOCK } LIST`, `grep { BLOCK } LIST`, `sort { CMP } LIST` (with `$a`/`$b` comparator patterns), `reverse @arr` (array), `scalar reverse $str` (string)
-
-**Math builtins**: `abs`, `int` (truncate), `sqrt`
-
-**String builtins**: `uc`, `lc`, `ucfirst`, `lcfirst`, `index($str, $sub[, $pos])`, `rindex($str, $sub[, $pos])`, `chr`, `ord`, `hex`, `oct`
-
-**Slices**: `@arr[0,1,2]` (array slice), `@hash{'a','b'}` (hash slice); qw() and list args auto-flattened
-
-**System/env**: `system("cmd")` (exit code), `` `cmd` `` (output capture, interpolated), `$ENV{KEY}` / `$ENV{KEY}=val`
-
-**File tests**: `-e` (exists), `-f` (file), `-d` (dir), `-r` (readable), `-w` (writable), `-x` (executable), `-z` (empty), `-s` (size), `-l` (symlink), `-p` (pipe)
-
-**Builtins**: chomp, chop, length, substr, join, split, push, pop, shift, unshift, splice, sort, keys, values, exists, delete, scalar, defined, ref, warn, print, say, printf, sprintf, unlink
-
-**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space)
-
-**Command-line**: `@ARGV` (arguments), `$0` (program name); generated `main` accepts `int argc, char **argv`
-
-**eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime
-
-## Key Invariants
-
-- `perl_assign` model: stable `PerlValue*` per alloca for the variable's lifetime. Captures via `\$x` work because the pointer never moves.
-- In codegen: `pv` = opaque ptr = `PerlValue*`; `av` = opaque ptr = `PerlArray*` or `PerlHash*`. All opaque in LLVM 18.
-- `emitArrayPtr` returns `PerlArray*` (av) for array-producing expressions; `emitExpr` returns `PerlValue*` (pv).
-- `FatArrow =>` is treated identically to `,` everywhere.
-- `foreach` loop uses a `stepBB` for the index increment so that `next` jumps through the increment before re-checking the condition (not directly to condBB, which would cause an infinite loop).
-- `while (my $var = expr)` condition: the variable alloca and initial `PerlValue*` are allocated in the pre-loop block (once); each `while.cond` iteration only calls `perl_assign` + truth test — no stack growth or leaking.
-- `%` context: after INT/FLOAT/STRING/IDENT/RPAREN/RBRACKET/`++`/`--` → PERCENT (modulo); otherwise → hash sigil.
-- `/` context: same heuristic → SLASH (division) vs REGEX literal.
-- `parseModifier(stmt, line)`: called at end of every statement path; consumes the `;` itself. Modifier keywords (if/unless/while/until/for/foreach) are detected with `isModifier()` to prevent arg-list parsing from over-consuming.
-- Filehandle detection in print/say/printf: `$var` is treated as a filehandle only when followed by an expression-start token (scalar, string, int, float, ident, `(`, `[`, `{`) — not an operator. Prevents `say $a + $b` from treating `$a` as a filehandle.
-- `die` in expression context (e.g. `open(...) or die "..."`) uses the dead-block pattern: after `CreateUnreachable()`, insert point moves to a fresh dead basic block so surrounding phi nodes remain well-formed.
-- `map`/`grep` blocks compile as inline LLVM loops; `$_` alloca is hoisted before the loop; `emitBlockLast` returns the last expression from the block.
-- `sort { CMP }` block: parser detects 4 patterns (`$a <=> $b`, `$b <=> $a`, `$a cmp $b`, `$b cmp $a`) and stores the mode in `Node::sval`; codegen dispatches to specialized C sort functions.
-- `reverse` in scalar context (`scalar reverse $str`) calls `perl_reverse_str`; in array context calls `perl_reverse_array`.
-- `scalar EXPR` (beyond `@arr`/`keys`/`values`): parser now falls through to `parsePrimary()` and sets `sval = "scalar_ctx"` on the inner node.
-- `index`/`rindex` pass `perlUndef()` for missing pos arg; runtime checks `pos_pv->tag != PERL_UNDEF` to distinguish "no pos given" from "pos=0".
-- File test `-e $var ? x : y` parses at postfix precedence (path is parsePrimary/parsePostfix, not full parseExpr), so the ternary binds outside the file test.
-- `qw(a b c)` → `ArrayLit` of `StringLit`; hash slice `@h{qw(a c)}` gets a single `ArrayLit` arg which codegen auto-flattens.
-- `splice` in array context (emitArrayPtr) returns removed elements as `PerlArray*`; scalar context returns element count.
-- `$ENV{key}` and `$ENV{key}=val` are special-cased in HashElem/Assign codegen (name=="ENV") to call `perl_env_get`/`perl_env_set` rather than normal hash lookup.
-- `emitArrayPtr` handles `ArrayLit` by flattening elements (ArrayVar children use `perl_array_extend`). Enables `my @a = (@b, @c)`, `push @a, @b` to flatten correctly.
-- String `++` on magical strings (`/^[a-zA-Z][a-zA-Z0-9]*$/`): per-character rolling increment in `perl_inc`; non-magical strings become int 1.
-- `@ARGV`/`$0`: generated `main` is `main(int argc, char**argv)`; calls `perl_init_argv` which returns a `PerlArray*` (declared as "ARGV") and sets a stable global `$0` PerlValue*.
-- `$0` in parser: after `$` sigil, if INT token value == 0, returns `makeScalar("0", line)` rather than `CaptureVar`.
-- Anonymous subs (`sub { }`): emit an internal LLVM function, save/restore codegen state. When captures exist, `collectAllScalarNames` walks the body AST (stopping at nested `AnonSub`), loads each captured `PerlValue*` into a `PerlArray`, calls `perl_make_closure(fp, captures_array)`; otherwise calls `perl_make_code_ref(fp)`.
-- Closures: `perl_call_code_ref` saves/restores `s_current_captures`/`s_ncaptures` around the call; `perl_get_capture(i)` returns `s_current_captures[i]`; at closure entry, codegen calls `perl_get_capture(i)` for each captured name and stores the result in a new alloca — same `PerlValue*` as outer scope, so mutations are shared.
-- Inheritance: ISA table (`s_isa_table[64]`) set at program start via `perl_set_isa`; `perl_find_method` walks the ISA chain; `perl_dispatch_method_super` starts from the parent class of the caller package.
-- `use parent`/`use base`: parsed at `parseProgram` level (before general `use`-skip); emits `SetIsa` node with `name=child_pkg, sval=parent_pkg`.
-- Module inlining (`inlineModules`): strips `EOF_TOK` from module token streams before concatenating; injects `package main;` tokens between module and main tokens.
-- Heredocs: `pendingHeredocPos_`/`pendingHeredocLines_` fields on Lexer; set in `readHeredoc()`, consumed on the next `\n` in the tokenize loop; body lines collected between heredoc declaration line and terminator line.
-- `$_` pre-declaration: both main-function codegen and `emitSub()` pre-declare `$_` as undef before emitting the body, ensuring it's accessible for implicit-arg builtins.
-- `local` restore ordering: before explicit `return`, the return value is first cloned via `perl_clone` so the subsequent `perl_local_restore_to` (which overwrites the in-place PerlValue) doesn't corrupt the returned value.
-- `AnonSub` codegen saves/restores `localDepthAlloca_` alongside other function state to prevent cross-function IR dominance violations.
-- `eval { }` uses `jmp_buf` allocated as `[256 x i8]` alloca in the calling frame; `setjmp` is declared directly with `returns_twice` attribute; `perl_eval_push(jb*)` registers the buffer; `perl_die` does `longjmp` when eval depth > 0 and sets `$@`.
-- `emitBlock`/`emitBlockLast` save `perl_local_save_depth()` into a per-block i32 alloca and call `perl_local_restore_to(depth)` on normal exit; early exits (return) are handled by the return handler's own restore (which is a no-op if depth is already lower).
-- `state` variables: each `state $x` emits a module-level `ptr` global (starts null) and an `i8` flag global; on first call the flag is 0 → allocates/initializes the PerlValue* and stores in the global; subsequent calls load the existing pointer; mutations via the local alloca (which holds the same pointer) are reflected in the global.
-- `defined()` calls `perl_defined(v)` which returns `v && v->tag != PERL_UNDEF`; was previously a stub returning 1 always.
-- `$!` returns `&s_dollar_bang` (static PerlValue in runtime); refreshes `strerror(errno)` on each call.
-- `$/` returns `&s_input_sep` (static PerlValue); `ensure_input_sep()` lazy-inits to `"\n"` on first access; `local $/` saves/restores via the normal local stack since the pointer is stable.
-- `$/` lexer: after `$` sigil, if the next character is `/`, force-emit `TK::SLASH` immediately to prevent the `/` from being lexed as a regex start.
-- `BEGIN { }` is emitted inline as code in the position it appears; `END { }` compiles the block as an internal function and registers it with `atexit()`.
-- `caller()` in list context uses `emitArrayPtr(NK::CallerFunc)` which returns the full `PerlArray*` from `perl_caller()`; in scalar context `emitExpr` returns the first element.
-
-## Passing Test Expected Outputs
-
-### hello.pl
-```
-Hello, world!
-Hello again!
-```
-
-### arith.pl
-```
-13
-7
-30
-3.33333
-1
-6
-Hello World
-10
-```
-
-### fib.pl
-```
-0 1 1 2 3 5 8 13 21 34
-```
-
-### hash.pl
-```
-1
-2
-3
-4
-10
-green exists
-purple missing
-green deleted
-blue
-red
-yellow
-3
-12
-```
-(key iteration order may vary — tests use `sort keys`)
-
-### builtins.pl
-```
-1
-4
-10
-20
-6
-hello
-5
-6
-2
-cdef
-bcd
-ef
-bc
-one, two, three
-a-b-c
-onetwothree
-4
-a
-d
-3
-hello
-foo
-3
-local
-one:two:three
-foo
-bar
-baz
-```
-
-### refs.pl
-```
-42
-99
-1
-3
-20
-10
-30
-40
-1
-3
-10
-20
-ARRAY
-HASH
-SCALAR
-2
-42
-```
-
-### regex.pl
-```
-match
-no xyz
-icase
-2024
-03
-15
-baz bar foo
-aaxxcc
-[hello] [world]
-one
-two
-three
-digits only
-```
-
-### regex_g.pl
-```
-match
-match
-match
-x
-1
-y
-2
-z
-3
-aa
-bb
-cc
-hello
-world
-foo
-3
-one
-two
-three
-```
-
-### modifiers.pl
-```
-positive
-ok
-3
-0
-1
-2
-3
-a
-b
-c
-5
-0
-7
-1
-2
-4
-```
-
-### range.pl
-```
-1 2 3 4 5 
-1
-2
-3
-5
-1
-5
-10, 11, 12, 13, 14, 15
-5
-3
-7
-0
-1-2-3-4
-55
-```
-
-### sprintf.pl
-```
-Hello, Alice! You are 30 years old.
-Pi is approximately 3.1416
-1.234568e+04
-0.000123
-[     right]
-[left      ]
-[00042]
-(foo, 99)
-ff
-FF
-10
-item 01: value
-item 02: value
-item 03: value
-      42
-3.142
-100%
-Result: 3 + 4 = 7
-```
-
-### fileio.pl
-```
-line one
-line two
-line three
-3
-line one
-line three
-4
-eof
-line one
-answer=42
-done
-```
-
-### builtins2.pl
-```
-5
-3.7
-3
--3
-4.0
-HELLO
-world
-Foo
-bAR
-6
--1
-4
-9
-3
-A
-65
-97
-255
-255
-63
-10
-5,4,3,2,1
-olleh
-2,4,6,8,10
-n1
-n5
-2,4
-4,5
-1,2,3,4,5
-5,4,3,2,1
-apple,banana,cherry
-cherry,banana,apple
--1
-0
-1
--1
-0
-1
-done
-```
-
-### advanced.pl (run with args `hello world`)
-```
-6
-1,2,3,4,5,6
-5
-1,2,3,7,8
-1,2,3,4,5,6
-ab
-ba
-aaa
-Ba
-AAa0
-2
-hello
-world
-7
-CODE
-10
-caught error
-
-ok
-got: boom
-
-done
-```
-
-### oop.pl
-```
-Rex says woof
-Whiskers says meow
-Animal
-Animal
-Rex
-I am Rex and I say woof
-3
-Counter
-```
-
-### closures.pl
-```
-1
-2
-3
-1
-4
-12
-14
-5
-10
-2
-4
-6
-```
-
-### usemod.pl
-```
-7
-42
-120
-1
-300
-MathUtils
-```
-
-### inherit.pl
-```
-Rex says woof
-Whiskers says meow
-Dog
-Cat
-I am a dog named Rex
-I am an animal named Whiskers
-sit, shake, roll over
-Fido says bark
-Animal
-```
-
-- `package Foo;` changes `currentPackage_` in parser at parse time; sub names are qualified (`Foo::bar`) if not already containing `::` and package is not "main".
-- LLVM function names mangle `::` → `__` via `subLLVMName()`: `Foo::bar` → `perlsub_Foo__bar`.
-- Method registration: only subs with `::` in name are registered via `perl_register_method("Foo::bar", fn_ptr)` at start of generated `main`.
-- `perl_dispatch_method`: if obj is a string → class method; if obj has `blessed_class` → instance method. Prepends obj to `@_` before dispatch.
-- `blessed_class`: `char*` field added to `PerlValue`; all `perl_alloc_*`, `perl_clone`, `perl_assign`, `perl_free` updated to manage it.
-
-### defaults.pl
-```
-Hello, World!
-Line two
-No $name interpolation here
-Hello, Alice!
-1
-2
-3
-4
-5
-hello
-Hello Perl
-matched
-99
-10
-```
-
-### newfeatures.pl
-```
-1
-2
-3
-12
-14
-scalar
-sep defined
-inner undef
-sep restored
-errno ok
-init=1
-caller ok
-done
-end ok
-```
-
-**`state` variables**: `state $x [= expr]` — per-sub static variable; backed by a module-level `PerlValue*` global + i8 init flag; initialized once (lazily on first call); mutations persist across calls
-
-**`wantarray`**: stub always returns false (scalar context); call `wantarray()` compiles and runs; proper context tracking not yet implemented
-
-**`caller`**: stub returns `("main", "unknown", 0)` in list context; `my ($pkg) = caller()` works
-
-**`$!` (errno)**: `$!` → `perl_get_dollar_bang()` — refreshes `strerror(errno)` on each access; usable in error messages after failed I/O
-
-**`$/ (input record separator)**: `$/` reads the global sep; `$/ = undef` sets slurp mode; `local $/ = undef` temporarily enables slurp mode (properly restored at block exit); `perl_readline` respects `$/`
-
-**`BEGIN`/`END` blocks**: `BEGIN { }` runs inline at point of declaration in main; `END { }` compiles as a function registered via `atexit()`, runs at program exit
-
-**`defined()` builtin**: properly checks `v->tag != PERL_UNDEF` (was previously a stub always returning true); works with `$!`, `$/`, and any variable
-
-**Block-scoped `local` restore**: `emitBlock`/`emitBlockLast` now save/restore the local save-stack depth at every block boundary, so `local` variables in bare blocks (`{ local $x = 5; ... }`) restore correctly at block exit
-
-
-
-- `wantarray` stub always returns false; proper context tracking not implemented
-- `caller` stub always returns `("main", "unknown", 0)`; real call stack not tracked
-- `local` for arrays and hashes not implemented (scalars and special vars only)
-- `use` statements for non-file pragmas are silently ignored; only file-backed modules in search paths are loaded
-- Regular expression modifiers `x` (extended) and `e` (eval replacement)
-
-- `require`/`do FILE` at runtime — module loading only at compile time via `inlineModules()`
-- `AUTOLOAD`, `DESTROY` not implemented
-- `unshift @{EXPR}, val` — not yet supported (push @{EXPR} is supported)
+- **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime (critical for references and closures)
+- **Codegen pattern**: every operation calls into C runtime via `callRT("perl_xyz", {args...})`
+- **Scope model**: three parallel scope stacks for scalars, arrays, and hashes
+- **Module loading**: `use Module` recursively inlines `.pm` files at compile time via `inlineModules()`
+
+## Major Implemented Features
+
+### Core Language
+- **Variables & Literals**: scalars, arrays, hashes, integers, floats, strings (single/double-quoted with interpolation), `undef`
+- **Operators**: arithmetic, string (`.` , `x`), range (`..`), comparisons (`==`, `eq`, `<=>`, `cmp`), logical, increment/decrement (`++`/`--` including magical string increment), compound assignment, ternary
+- **Control Flow**: `if`/`elsif`/`else`, `unless`, `while`/`until` (including `while (my $var = expr)`), `do-while`/`do-until`, C-style `for`, `foreach`, `last`/`next`, statement modifiers
+- **Subroutines**: named and anonymous subs, recursion, `@_`, list unpacking, code references (`\&sub`, `$f->()`), `ref()` returning `"CODE"`
+- **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort`, `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete`, `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`
+
+### Advanced Features
+- **References**: all types (`\$x`, `\@arr`, `\%hash`, `\&sub`), anonymous arrays/hashes, dereferencing (`$$ref`, `@$ref`, `%$ref`, `->`), `ref()`
+- **Regex (PCRE2)**: `=~`/`!~`, captures (`$1`-`$9`), substitution (`s///`), `/g` iterator and list context, `split` with regex, flags `i/g/s/m`, named captures `(?<name>)` → `%+{name}`
+- **String Interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`, `"@arr"` (space-joined)
+- **Heredocs**: `<<END`, `<<'END'`, `<<"END"` with proper interpolation and lexer support
+- **Special Variables**: `$_` (default for many builtins), `$!` (errno), `$/` (input separator with `local` support)
+- **State Variables**: `state $x` — persistent per-sub variables with lazy initialization
+- **File I/O**: `open` (2-arg and 3-arg forms), filehandles, readline (scalar and array context), `eof`, `unlink`, `print`/`say`/`printf` to filehandles
+- **System**: `system()`, backticks (`` `cmd` ``), `$ENV{KEY}`, file tests (`-e`/`-f`/`-d`/`-r`/`-w`/`-x`/`-z`/`-s`/`-l`/`-p`)
+
+### Object-Oriented Programming
+- `package`, `bless`, `->` method calls (class and instance)
+- `use parent`/`use base` with ISA chain traversal
+- `SUPER::` dispatch
+- Method registration and dynamic dispatch via `perl_dispatch_method`
+
+### Advanced Perl Semantics
+- **Closures**: lexical capture of `my` variables by stable pointer, nested closures, independent instances
+- **Local**: dynamic scoping for scalars and special variables (`local $x`, `local $/`, block-scoped restore)
+- **Exceptions**: `eval { BLOCK }` with `$@` support using `setjmp`/`longjmp`
+- **BEGIN/END**: `BEGIN` runs inline, `END` registered via `atexit()`
+- **Modules**: `use Module` with recursive inlining, `@EXPORT`/`@EXPORT_OK` support, constant subs via `use constant`
+- **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
+
+## Passing Tests (21/21)
+
+All tests in `tests/` pass:
+- Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
+- Data structures: `hash.pl`, `refs.pl`, `builtins.pl`, `builtins2.pl`
+- I/O & strings: `fileio.pl`, `sprintf.pl`
+- Advanced: `regex.pl`, `regex_g.pl`, `advanced.pl`, `features.pl`
+- OOP & modules: `oop.pl`, `closures.pl`, `usemod.pl`, `inherit.pl`
+- Modern features: `defaults.pl`, `newfeatures.pl` (state, wantarray stub, caller stub, $!, $/, BEGIN/END, defined(), local blocks)
+
+## Known Limitations
+
+The following features are **not yet implemented** or only partially supported:
+
+### Context and Call Stack
+- Proper `wantarray` context tracking (currently always returns false/scalar context)
+- Full `caller()` implementation (stub returns `("main", "unknown", 0)`)
+
+### Scoping
+- `local` for arrays and hashes (only scalars and special vars like `$!`/`$/` supported)
+
+### Module System
+- Runtime `require` and `do FILE` (modules only loaded at compile time via inlining)
+- Pragmas that aren't backed by `.pm` files are silently ignored
+
+### Regex
+- Modifiers `x` (extended) and `e` (eval replacement)
+
+### OOP
+- `AUTOLOAD` and `DESTROY` methods
+
+### Reference Operations
+- `unshift @{EXPR}, val` (though `push @{EXPR}` works)
+
+### Not Yet Implemented
+- Threads (POSIX ithreads mentioned in architecture but no test coverage)
+- XS interface
+- DBI/SQLite integration
+- Overload, prototypes, globs, signals, pack/unpack, unicode handling
+- Many CPAN modules beyond basic `use`
+
+## Key Implementation Details
+
+- **Stable Pointer Model**: Variables hold stable `PerlValue*` pointers for correct reference and closure semantics
+- **Runtime Heavy**: Most Perl semantics implemented in `runtime.c` (tagged union + extensive C functions)
+- **Module Inlining**: `use` statements cause recursive parsing and token stream concatenation
+- **Regex**: Uses PCRE2 with custom iterator state per `PerlValue` (`matchpos`)
+- **Error Handling**: `die`/`eval` uses `jmp_buf` with careful stack management
+- **Performance**: LLVM optimization + C runtime; no garbage collection (manual memory management via `perl_free`)
+
+See `README.md` for user-facing documentation and individual test files for usage examples.
+
+**Last Updated**: Current state reflects all features demonstrated in the 21 test suite.
