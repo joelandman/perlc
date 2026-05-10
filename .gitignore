@@ -4,3 +4,6 @@ src/*.o
 *.ll
 *.bc
 /tmp/
+lib/
+arith_bin
+test_*.pl

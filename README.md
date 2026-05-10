@@ -21,6 +21,7 @@ make clean
 ```bash
 ./perlc program.pl -o output            # compile and link
 ./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
+./perlc -pm program.pl                  # install missing modules then compile
 ```
 
 ## Implemented Features
@@ -76,6 +77,8 @@ make clean
 **String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space)
 
 **Command-line**: `@ARGV` (arguments), `$0` (program name); generated `main` accepts `int argc, char **argv`
+
+**Module installation**: `-pm` flag automatically detects missing `use Module` dependencies (excluding pragmas), installs them via `cpanm --local-lib lib`, and adds `lib/lib/perl5` to search paths. Note: complex CPAN modules may exceed current parser capabilities.
 
 **eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime
 

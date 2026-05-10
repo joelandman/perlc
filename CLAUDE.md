@@ -69,7 +69,7 @@ make clean
 - **Local**: dynamic scoping for scalars and special variables (`local $x`, `local $/`, block-scoped restore)
 - **Exceptions**: `eval { BLOCK }` with `$@` support using `setjmp`/`longjmp`
 - **BEGIN/END**: `BEGIN` runs inline, `END` registered via `atexit()`
-- **Modules**: `use Module` with recursive inlining, `@EXPORT`/`@EXPORT_OK` support, constant subs via `use constant`
+- **Modules**: `use Module` with recursive inlining, `@EXPORT`/`@EXPORT_OK` support, constant subs via `use constant`. The new `-pm` flag automatically detects missing modules (excluding pragmas), installs them via `cpanm --local-lib lib` into `lib/lib/perl5`, and updates search paths. Complex CPAN modules may not parse fully due to current language coverage.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
 ## Passing Tests (21/21)

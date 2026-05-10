@@ -7,6 +7,7 @@
 #include <sstream>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/types.h>
 #include <set>
@@ -55,6 +56,84 @@ static std::vector<std::string> extractQw(
         pos++;
     }
     return words;
+}
+
+/* Install missing Perl modules using cpanm into a local lib/ directory.
+   Returns true if all modules were successfully installed or were already present. */
+static bool installMissingModules(const std::vector<Token> &tokens,
+                                  const std::string &baseDir)
+{
+    static const std::set<std::string> PRAGMAS = {
+        "strict","warnings","feature","parent","base",
+        "Exporter","Carp","POSIX","Scalar::Util",
+        "List::Util","Data::Dumper","Storable","overload",
+        "constant"
+    };
+
+    std::set<std::string> modulesToInstall;
+    std::vector<std::string> searchDirs = {
+        baseDir, baseDir + "/lib", "lib", "lib/lib/perl5", "."
+    };
+
+    /* Scan for use statements */
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (tokens[i].kind == TK::KW_USE && tokens[i+1].kind == TK::IDENT) {
+            std::string modName = tokens[i+1].text;
+            if (PRAGMAS.count(modName)) continue;
+
+            /* Check if module already exists in search path */
+            bool found = false;
+            std::string modPath = modName;
+            for (char &c : modPath) if (c == ':') c = '/';
+            while (modPath.find("//") != std::string::npos)
+                modPath.replace(modPath.find("//"), 2, "/");
+            modPath += ".pm";
+
+            for (const auto &dir : searchDirs) {
+                std::string fullPath = dir + "/" + modPath;
+                if (access(fullPath.c_str(), R_OK) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                modulesToInstall.insert(modName);
+            }
+        }
+    }
+
+    if (modulesToInstall.empty()) {
+        std::cout << "All Perl modules are already available.\n";
+        return true;
+    }
+
+    std::cout << "Installing " << modulesToInstall.size()
+              << " missing Perl module(s) using cpanm...\n";
+
+    /* Create lib directory if it doesn't exist */
+    std::string libDir = "lib";
+    if (access(libDir.c_str(), F_OK) != 0) {
+        if (system("mkdir -p lib") != 0) {
+            std::cerr << "Failed to create lib/ directory\n";
+            return false;
+        }
+    }
+
+    /* Install each missing module */
+    for (const auto &mod : modulesToInstall) {
+        std::cout << "  Installing " << mod << "...\n";
+        std::string cmd = "cpanm --quiet --notest --local-lib lib " + mod;
+        int rc = system(cmd.c_str());
+        if (rc != 0) {
+            std::cerr << "Failed to install module: " << mod << "\n";
+            std::cerr << "You may need to install cpanm first: sudo apt install cpanminus\n";
+            return false;
+        }
+    }
+
+    std::cout << "All modules installed successfully to lib/\n";
+    return true;
 }
 
 /* Scan module tokens for  our @EXPORT = qw(...)  and  our @EXPORT_OK = qw(...)
@@ -202,6 +281,7 @@ static std::vector<Token> inlineModules(
             baseDir,
             baseDir + "/lib",
             "lib",
+            "lib/lib/perl5",
             "."
         };
 
@@ -272,7 +352,8 @@ static void usage(const char *prog) {
               << "  -o <out>    Output file (default: a.out)\n"
               << "  --emit-ir   Emit LLVM IR (.ll) instead of compiling\n"
               << "  --emit-bc   Emit LLVM bitcode (.bc)\n"
-              << "  -v          Verbose\n";
+              << "  -v          Verbose\n"
+              << "  -pm         Download and install missing Perl modules via cpanm\n";
 }
 
 int main(int argc, char **argv) {
@@ -282,12 +363,13 @@ int main(int argc, char **argv) {
 
     std::string inputFile;
     std::string outputFile = "a.out";
-    bool emitIR = false, emitBC = false, verbose = false;
+    bool emitIR = false, emitBC = false, verbose = false, installPM = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
         else if (!strcmp(argv[i], "-v"))        verbose = true;
+        else if (!strcmp(argv[i], "-pm"))       installPM = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outputFile = argv[++i];
         else if (argv[i][0] != '-')             inputFile = argv[i];
         else { usage(argv[0]); return 1; }
@@ -310,6 +392,17 @@ int main(int argc, char **argv) {
             std::cerr << "[tokens]\n";
             for (auto &t : tokens)
                 std::cerr << "  " << t.line << "\t" << t.text << "\n";
+        }
+
+        /* install missing modules if -pm flag was specified */
+        if (installPM) {
+            if (!installMissingModules(tokens, dirOf(inputFile))) {
+                std::cerr << "Module installation failed. Cannot continue.\n";
+                return 1;
+            }
+            /* re-lex after installing modules (in case new files were added) */
+            Lexer lexer2(src);
+            tokens = lexer2.tokenize();
         }
 
         /* inline any 'use Module' files before parsing; build import map */
