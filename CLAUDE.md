@@ -562,7 +562,7 @@ end ok
 
 **Block-scoped `local` restore**: `emitBlock`/`emitBlockLast` now save/restore the local save-stack depth at every block boundary, so `local` variables in bare blocks (`{ local $x = 5; ... }`) restore correctly at block exit
 
-## Known Limitations / Not Implemented
+
 
 - `wantarray` stub always returns false; proper context tracking not implemented
 - `caller` stub always returns `("main", "unknown", 0)`; real call stack not tracked

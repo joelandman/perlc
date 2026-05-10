@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <setjmp.h>
+#include <pthread.h>
+#include <semaphore.h>
 
 /* ── local() save/restore stack ─────────────────────────────────────────── */
 
@@ -959,6 +961,36 @@ PerlValue *perl_make_closure(PerlSubFn fp, PerlArray *captures) {
     int n = captures ? (int)captures->len : 0;
     PerlValue **caps = n > 0 ? captures->elems : NULL;
     return make_code_ref_impl(fp, caps, n);
+}
+
+pthread_mutex_t perl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void *thread_wrapper(void *arg) {
+  PerlClosure *cl = (PerlClosure*)arg;
+  PerlValue *result = ((PerlSubFnCtx)cl->fn)(NULL, perl_push_wantarray(0));
+  perl_pop_wantarray();
+  return result;  // ignored
+}
+
+PerlValue *perl_threads_create(PerlSubFnCtx fn, PerlArray *args) {
+  PerlClosure *cl = malloc(sizeof(PerlClosure));
+  cl->fn = fn;
+  cl->ncaptures = 0;
+  cl->captures = NULL;
+  pthread_t *thread = malloc(sizeof(pthread_t));
+  pthread_create(thread, NULL, thread_wrapper, cl);
+  PerlValue *tref = malloc(sizeof(PerlValue));
+  tref->tag = PERL_REF_SCALAR;
+  tref->pval = thread;
+  return tref;
+}
+
+void perl_threads_join(PerlValue *thread) {
+  if (thread && thread->tag == PERL_REF_SCALAR && thread->pval) {
+    pthread_t *pth = (pthread_t*)thread->pval;
+    pthread_join(*pth, NULL);
+    free(pth);
+  }
 }
 
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {

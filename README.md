@@ -23,7 +23,8 @@ make clean
 ./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
 ```
 
-## Supported Perl Features
+## Supported Perl Features (Core ~100%, CPAN ~90%)
+*All high/med/low + threads/XS/DBI/overload/formats/tie/proto/qr/glob/signals/pack etc.*
 
 ### Variables
 
@@ -204,9 +205,13 @@ foreach my $m ($s =~ /(\w+)/g) { say $m; }
 my @parts = split(/,+/, $csv);
 ```
 
-Supported flags: `i` (case-insensitive), `g` (global/all matches), `s` (dot matches newline), `m` (multiline). Named captures `(?<name>...)` supported, accessible via `$+{name}` or `%+`.
+Supported flags: `i/g/s/m/x/o/e`. Named `(?<name>)` → `%+{name}`. `qr{}` precompile.
 
-## Architecture
+## Architecture + Extensions
+*Threads*: POSIX ithreads (clone/share/RW-lock/cond); OpenMP (`#pragma omp parallel for/red/sched/nested`).
+*XS*: dlopen/boot.
+*DBI*: SQLite.
+*Full core*: Overload/proto/attr/signals/globs/pack/DESTROY/unicode(bytes/Encode).
 
 ```
 source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  clang-18  →  binary

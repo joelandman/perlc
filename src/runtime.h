@@ -258,6 +258,8 @@ PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a cl
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
 void       perl_register_method(const char *key, PerlSubFnCtx fn);
+PerlValue *perl_threads_create(PerlSubFnCtx fn, PerlArray *args);
+void perl_threads_join(PerlValue *thread);
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args);
 PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                                       const char *method, PerlArray *args);

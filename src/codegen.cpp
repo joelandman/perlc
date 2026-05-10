@@ -242,6 +242,8 @@ void CodeGen::declareRuntime() {
     RT("perl_push_wantarray", i32, i32);
 RT("perl_pop_wantarray",  i32);
 RT("perl_wantarray",      pv);
+RT("perl_threads_create", pv, i8p, av);
+RT("perl_threads_join",   voidTy, pv);
     RT("perl_caller",           av);
 RT("perl_get_plus_hash",     av);
 RT("perl_clear_named_captures", voidTy);
@@ -2165,6 +2167,16 @@ Value *CodeGen::emitExpr(const Node &n) {
             return callRT("perl_dispatch_method_super", {obj, callerPkg, methodStr, argsArr});
         }
         Value *methodStr = builder_.CreateGlobalStringPtr(n.sval);
+    if (n.sval == "threads" && n.name == "create") {
+      // special: threads->create(sub{...})
+      Value *argsArr = callRT("perl_array_new", {});
+      for (auto &arg : n.args) {
+        Value *subArr = emitArrayPtr(*arg);
+        if (subArr) callRT("perl_array_extend", {argsArr, subArr});
+        else callRT("perl_array_push", {argsArr, emitExpr(*arg)});
+      }
+      return callRT("perl_threads_create", {methodStr, argsArr});
+    }
         return callRT("perl_dispatch_method", {obj, methodStr, argsArr});
     }
 
@@ -2308,7 +2320,7 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *one = ConstantInt::get(i32Ty, 1);
     Value *zero = ConstantInt::get(i32Ty, 0);
     Value *zero = ConstantInt::get(i32Ty, 0);
-    return builder_.CreateCall(fn, {argsArr, zero});
+    return builder_.CreateCall(fn, {argsArr, Type::getInt32Ty(ctx_)->getPointerTo()->getPointerTo(), ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
     }
     return perlUndef();
 }
