@@ -378,11 +378,11 @@ NodePtr Parser::parseSub() {
         name = currentPackage_ + "::" + name;
     consume(TK::LBRACE, "{");
 
-    /* collect params from @_ via 'my ($a,$b) = @_;' — we auto-generate later */
-    /* actually parse body, sub will receive args via @_ */
+    ++subDepth_;
     NodeList stmts;
     while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
         stmts.push_back(parseStmt());
+    --subDepth_;
     consume(TK::RBRACE, "}");
 
     auto n = std::make_unique<Node>(); n->kind = NK::SubDef; n->name = name; n->line = line;
@@ -1108,9 +1108,11 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_SUB) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
         advance(); /* consume 'sub' */
         consume(TK::LBRACE, "{");
+        ++subDepth_;
         NodeList stmts;
         while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
             stmts.push_back(parseStmt());
+        --subDepth_;
         consume(TK::RBRACE, "}");
         auto n = std::make_unique<Node>(); n->kind = NK::AnonSub; n->line = line;
         /* generate unique name for this anonymous sub */
@@ -1427,8 +1429,11 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_POP) || check(TK::KW_SHIFT)) {
         bool isPop = check(TK::KW_POP); advance();
         bool hasParen = match(TK::LPAREN);
-        consume(TK::ARRAY, "@");
-        std::string nm = cur().text; advance();
+        std::string nm = subDepth_ > 0 ? "_" : "ARGV"; /* default: @_ in sub, @ARGV at top level */
+        if (check(TK::ARRAY)) {
+            advance();
+            nm = cur().text; advance();
+        }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>();
         n->kind = isPop ? NK::PopExpr : NK::ShiftExpr;

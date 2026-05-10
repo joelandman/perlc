@@ -17,6 +17,7 @@ private:
     std::vector<Token>              toks_;
     size_t                          pos_ = 0;
     std::string                     currentPackage_ = "main";
+    int                             subDepth_        = 0;
     std::map<std::string,std::string> importMap_;  /* short → qualified call names */
     std::map<std::string,Token>       constMap_;   /* constant name → literal token */
 

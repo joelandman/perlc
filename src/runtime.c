@@ -939,7 +939,7 @@ PerlValue *perl_ref_type(PerlValue *ref) {
 static PerlValue **s_current_captures = NULL;
 static int        s_ncaptures         = 0;
 
-static PerlValue *make_code_ref_impl(PerlSubFn fp, PerlValue **caps, int ncaps) {
+static PerlValue *make_code_ref_impl(PerlSubFnCtx fp, PerlValue **caps, int ncaps) {
     PerlClosure *cl = malloc(sizeof *cl);
     cl->fn = fp;
     cl->ncaptures = ncaps;
@@ -953,11 +953,11 @@ static PerlValue *make_code_ref_impl(PerlSubFn fp, PerlValue **caps, int ncaps) 
     return v;
 }
 
-PerlValue *perl_make_code_ref(PerlSubFn fp) {
+PerlValue *perl_make_code_ref(PerlSubFnCtx fp) {
     return make_code_ref_impl(fp, NULL, 0);
 }
 
-PerlValue *perl_make_closure(PerlSubFn fp, PerlArray *captures) {
+PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures) {
     int n = captures ? (int)captures->len : 0;
     PerlValue **caps = n > 0 ? captures->elems : NULL;
     return make_code_ref_impl(fp, caps, n);
@@ -1056,12 +1056,12 @@ static const char *perl_get_parent(const char *class_name) {
 
 /* ── method dispatch table ───────────────────────────────────────────────── */
 
-typedef struct { char *key; PerlSubFn fn; } MethodEntry;
+typedef struct { char *key; PerlSubFnCtx fn; } MethodEntry;
 #define METHOD_TABLE_MAX 1024
 static MethodEntry s_method_table[METHOD_TABLE_MAX];
 static int s_method_count = 0;
 
-void perl_register_method(const char *key, PerlSubFn fn) {
+void perl_register_method(const char *key, PerlSubFnCtx fn) {
     if (s_method_count < METHOD_TABLE_MAX) {
         s_method_table[s_method_count].key = strdup(key);
         s_method_table[s_method_count].fn  = fn;
@@ -1070,7 +1070,7 @@ void perl_register_method(const char *key, PerlSubFn fn) {
 }
 
 /* walk class and its @ISA chain; returns NULL if not found */
-static PerlSubFn perl_find_method(const char *class_name, const char *method) {
+static PerlSubFnCtx perl_find_method(const char *class_name, const char *method) {
     const char *cls = class_name;
     while (cls) {
         char key[512];
@@ -1103,13 +1103,15 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
         fprintf(stderr, "Can't call method \"%s\" on unblessed reference\n", method);
         exit(1);
     }
-    PerlSubFn fn = perl_find_method(class_name, method);
+    PerlSubFnCtx fn = perl_find_method(class_name, method);
     if (!fn) {
         fprintf(stderr, "Can't locate object method \"%s\" via package \"%s\"\n",
                 method, class_name);
         exit(1);
     }
-    return fn(build_dispatch_args(obj, args));
+    PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
+    perl_pop_wantarray();
+    return result;
 }
 
 PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
@@ -1120,13 +1122,15 @@ PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                 method, caller_pkg);
         exit(1);
     }
-    PerlSubFn fn = perl_find_method(parent, method);
+    PerlSubFnCtx fn = perl_find_method(parent, method);
     if (!fn) {
         fprintf(stderr, "Can't locate SUPER method \"%s\" starting from \"%s\"\n",
                 method, parent);
         exit(1);
     }
-    return fn(build_dispatch_args(obj, args));
+    PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
+    perl_pop_wantarray();
+    return result;
 }
 
 /* ── file I/O ────────────────────────────────────────────────────────────── */
@@ -1432,6 +1436,8 @@ PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
                 p++;
             } else { while (*p && isdigit(*p)) spec[si++] = *p++; }
         }
+        /* skip length modifiers (l, ll, h, hh, L, z, t, j) — we normalise internally */
+        while (*p && strchr("lhLztj", *p)) p++;
         char conv = *p ? *p++ : 's';
 
         PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();

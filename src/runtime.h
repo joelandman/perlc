@@ -298,7 +298,7 @@ int perl_push_wantarray(int ctx);
 int perl_pop_wantarray(void);
 PerlValue *perl_wantarray(void);
 PerlArray *perl_caller(void);                  /* caller() — returns (pkg,file,line) */
-PerlHash *perl_get_plus_hash(void);
+PerlValue *perl_get_plus_hash(void);
 void perl_clear_named_captures(void);
 
 /* ── eval / exception handling ───────────────────────────────────────────── */

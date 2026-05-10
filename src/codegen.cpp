@@ -595,7 +595,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     /* pre-declare all subs as Functions */
     for (auto *s : subs) {
         auto *ft = FunctionType::get(perlPtrTy_,
-                        {PointerType::getUnqual(ctx_),  /* PerlArray* args */},
+                        {arrayPtrTy_, Type::getInt32Ty(ctx_)},  /* PerlArray* args, int ctx */
                         false);
         Function::Create(ft, Function::ExternalLinkage,
                          subLLVMName(s->name), mod_.get());
@@ -703,10 +703,9 @@ void CodeGen::emitSub(const Node &n) {
 
     emitBlock(*n.body);
 
-    perl_pop_wantarray();
-    callRT("perl_pop_wantarray", {});
     /* implicit return undef — restore locals first */
     if (!builder_.GetInsertBlock()->getTerminator()) {
+        callRT("perl_pop_wantarray", {});
         Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
         callRT("perl_local_restore_to", {depth});
         builder_.CreateRet(perlUndef());
@@ -1127,8 +1126,8 @@ void CodeGen::emitStmt(const Node &n) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             Value *cloned = callRT("perl_clone", {v});
-            perl_pop_wantarray();
-    callRT("perl_local_restore_to", {depth});
+            callRT("perl_pop_wantarray", {});
+            callRT("perl_local_restore_to", {depth});
             v = cloned;
         }
         builder_.CreateRet(v);
@@ -2051,7 +2050,7 @@ Value *CodeGen::emitExpr(const Node &n) {
 
         /* Phase 2: emit the closure as an internal LLVM function */
         auto *subFT = FunctionType::get(perlPtrTy_,
-                          {PointerType::getUnqual(ctx_)}, false);
+                          {PointerType::getUnqual(ctx_), Type::getInt32Ty(ctx_)}, false);
         auto *subFn = Function::Create(subFT, Function::InternalLinkage,
                                        subLLVMName(n.name), mod_.get());
         /* save codegen state */
@@ -2091,8 +2090,8 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (!builder_.GetInsertBlock()->getTerminator()) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-            perl_pop_wantarray();
-    callRT("perl_local_restore_to", {depth});
+            callRT("perl_pop_wantarray", {});
+            callRT("perl_local_restore_to", {depth});
             builder_.CreateRet(perlUndef());
         }
         popScope();
@@ -2317,10 +2316,9 @@ Value *CodeGen::emitCall(const Node &n) {
             Value *v = emitExpr(*arg);
             callRT("perl_array_push", {argsArr, v});
         }
-        Value *one = ConstantInt::get(i32Ty, 1);
-    Value *zero = ConstantInt::get(i32Ty, 0);
-    Value *zero = ConstantInt::get(i32Ty, 0);
-    return builder_.CreateCall(fn, {argsArr, Type::getInt32Ty(ctx_)->getPointerTo()->getPointerTo(), ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *zero = ConstantInt::get(i32Ty, 0);
+        return builder_.CreateCall(fn, {argsArr, zero});
     }
     return perlUndef();
 }
