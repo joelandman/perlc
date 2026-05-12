@@ -1,6 +1,7 @@
 #include "codegen.h"
 #include "runtime.h"
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <stdexcept>
@@ -40,12 +41,16 @@ static std::string subLLVMName(const std::string &name) {
 
 /* ── construction ────────────────────────────────────────────────────────── */
 
-CodeGen::CodeGen()
-    : mod_(std::make_unique<Module>("perlc", ctx_)),
+CodeGen::CodeGen(bool debug)
+    : debug_(debug),
+      mod_(std::make_unique<Module>("perlc", ctx_)),
       builder_(ctx_) {
     perlPtrTy_  = PointerType::getUnqual(ctx_);
     arrayPtrTy_ = PointerType::getUnqual(ctx_);
     declareRuntime();
+    if (debug_) {
+        dib_ = std::make_unique<DIBuilder>(*mod_);
+    }
 }
 
 /* ── runtime declarations ────────────────────────────────────────────────── */
@@ -85,6 +90,7 @@ void CodeGen::declareRuntime() {
     RT("perl_mul",           pv,  pv, pv);
     RT("perl_div",           pv,  pv, pv);
     RT("perl_mod",           pv,  pv, pv);
+    RT("perl_pow",           pv,  pv, pv);
     RT("perl_negate",        pv,  pv);
     RT("perl_concat",        pv,  pv, pv);
     RT("perl_repeat_str",    pv,  pv, pv);
@@ -279,6 +285,8 @@ Value *CodeGen::lookupVar(const std::string &nm) {
         auto it = scopes_[i].find(nm);
         if (it != scopes_[i].end()) return it->second;
     }
+    auto git = fileScalarGlobals_.find(nm);
+    if (git != fileScalarGlobals_.end()) return git->second;
     return nullptr;
 }
 
@@ -291,6 +299,9 @@ Value *CodeGen::lookupArray(const std::string &nm) {
         auto it = arrayScopes_[i].find(nm);
         if (it != arrayScopes_[i].end()) return it->second;
     }
+    auto git = fileArrayGlobals_.find(nm);
+    if (git != fileArrayGlobals_.end())
+        return builder_.CreateLoad(perlPtrTy_, git->second, nm);
     return nullptr;
 }
 
@@ -303,6 +314,9 @@ Value *CodeGen::lookupHash(const std::string &nm) {
         auto it = hashScopes_[i].find(nm);
         if (it != hashScopes_[i].end()) return it->second;
     }
+    auto git = fileHashGlobals_.find(nm);
+    if (git != fileHashGlobals_.end())
+        return builder_.CreateLoad(perlPtrTy_, git->second, nm);
     return nullptr;
 }
 
@@ -585,6 +599,7 @@ Value *CodeGen::perlStr(const std::string &s) {
 
 void CodeGen::compile(const Node &program, const std::string &modName) {
     mod_->setModuleIdentifier(modName);
+    if (debug_) initializeDebugInfo(modName);
 
     /* collect sub definitions first so forward calls work */
     std::vector<const Node *> subs;
@@ -612,8 +627,16 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
     builder_.SetInsertPoint(entry);
 
+    if (debug_) {
+        mainFn->setSubprogram(currentSP_);
+        builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
+    }
+
     currentFn_ = mainFn;
     pushScope();
+    /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
+    fileScopeDepth_ = (int)scopes_.size() + 1;
+    inMainBody_ = true;
 
     /* register all subs in the method dispatch table (before user code runs) */
     for (auto *s : subs) {
@@ -658,8 +681,13 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     }
     builder_.CreateRet(ConstantInt::get(Type::getInt32Ty(ctx_), 0));
 
+    inMainBody_ = false;
     /* emit sub bodies */
     for (auto *s : subs) emitSub(*s);
+
+    if (debug_) {
+        dib_->finalize();
+    }
 
     std::string err;
     raw_string_ostream es(err);
@@ -675,6 +703,10 @@ void CodeGen::emitSub(const Node &n) {
 
     auto *entry = BasicBlock::Create(ctx_, "entry", fn);
     builder_.SetInsertPoint(entry);
+
+    if (debug_) {
+        builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
+    }
 
     auto *savedFn = currentFn_;
     currentFn_ = fn;
@@ -713,14 +745,14 @@ void CodeGen::emitSub(const Node &n) {
         return;
     }
 
-    emitBlock(*n.body);
+    Value *lastVal = emitBlockLast(*n.body);
 
-    /* implicit return undef — restore locals first */
+    /* implicit return from last expression (Perl: last expr is the return value) */
     if (!builder_.GetInsertBlock()->getTerminator()) {
         callRT("perl_pop_wantarray", {});
         Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
         callRT("perl_local_restore_to", {depth});
-        builder_.CreateRet(perlUndef());
+        builder_.CreateRet(lastVal);
     }
     localDepthAlloca_ = savedLocalDepth;
 
@@ -763,7 +795,7 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         } else {
             emitStmt(stmt);
         }
-        if (builder_.GetInsertBlock()->getTerminator()) { result = perlUndef(); break; }
+        if (builder_.GetInsertBlock()->getTerminator()) { break; }
     }
     popScope();
     if (!builder_.GetInsertBlock()->getTerminator())
@@ -773,6 +805,9 @@ Value *CodeGen::emitBlockLast(const Node &n) {
 
 void CodeGen::emitStmt(const Node &n) {
     if (builder_.GetInsertBlock()->getTerminator()) return;
+    if (debug_ && n.line > 0) {
+        builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
+    }
     switch (n.kind) {
     case NK::Block:
         emitBlock(n); break;
@@ -792,10 +827,18 @@ void CodeGen::emitStmt(const Node &n) {
         if (n.name.empty()) break;
         bool isArr  = n.name[0] == '@';
         bool isHash = n.name[0] == '%';
+        bool atFileScope = inMainBody_ && (int)scopes_.size() == fileScopeDepth_;
 
         if (isHash) {
             std::string nm = n.name.substr(1);
             Value *hv = callRT("perl_hash_new", {});
+            if (atFileScope) {
+                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    GlobalValue::InternalLinkage,
+                    Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
+                builder_.CreateStore(hv, gv);
+                fileHashGlobals_[nm] = gv;
+            }
             declareHash(nm, hv);
             if (n.right) {
                 Value *listArr = emitArrayPtr(*n.right);
@@ -810,20 +853,42 @@ void CodeGen::emitStmt(const Node &n) {
             Value *av = nullptr;
             if (n.right) av = emitArrayPtr(*n.right);
             if (!av) av = callRT("perl_array_new", {});
+            if (atFileScope) {
+                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    GlobalValue::InternalLinkage,
+                    Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
+                builder_.CreateStore(av, gv);
+                fileArrayGlobals_[nm] = gv;
+            }
             declareArray(nm, av);
         } else {
             /* n.name may carry a '$' prefix when parsed in expression context */
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
-            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
-            /* allocate a stable PerlValue* that lives for this variable's lifetime */
-            Value *pv = perlUndef();
-            builder_.CreateStore(pv, alloca);
-            if (n.right) {
-                Value *init = emitExpr(*n.right);
-                callRT("perl_assign", {pv, init});
+            if (atFileScope) {
+                /* use a global variable so subroutines can access this file-scope var */
+                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    GlobalValue::InternalLinkage,
+                    Constant::getNullValue(perlPtrTy_), "g." + nm);
+                Value *pv = perlUndef();
+                builder_.CreateStore(pv, gv);
+                if (n.right) {
+                    Value *init = emitExpr(*n.right);
+                    callRT("perl_assign", {pv, init});
+                }
+                fileScalarGlobals_[nm] = gv;
+                declareVar(nm, gv);
+            } else {
+                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+                /* allocate a stable PerlValue* that lives for this variable's lifetime */
+                Value *pv = perlUndef();
+                builder_.CreateStore(pv, alloca);
+                if (n.right) {
+                    Value *init = emitExpr(*n.right);
+                    callRT("perl_assign", {pv, init});
+                }
+                declareVar(nm, alloca);
             }
-            declareVar(nm, alloca);
         }
         break;
     }
@@ -1294,6 +1359,9 @@ void CodeGen::emitStmt(const Node &n) {
 /* ── expression emission ─────────────────────────────────────────────────── */
 
 Value *CodeGen::emitExpr(const Node &n) {
+    if (debug_ && n.line > 0) {
+        builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
+    }
     switch (n.kind) {
     case NK::UndefLit:  return perlUndef();
     case NK::IntLit:    return perlInt(n.ival);
@@ -1532,17 +1600,63 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::CompoundAssign: {
+        auto applyOp = [&](Value *lv, Value *rv) -> Value * {
+            if      (n.sval == "+") return callRT("perl_add",    {lv, rv});
+            else if (n.sval == "-") return callRT("perl_sub",    {lv, rv});
+            else if (n.sval == "*") return callRT("perl_mul",    {lv, rv});
+            else if (n.sval == "/") return callRT("perl_div",    {lv, rv});
+            else if (n.sval == ".") return callRT("perl_concat", {lv, rv});
+            else return perlUndef();
+        };
+        /* $arr[$i] op= rhs */
+        if (n.left->kind == NK::ArrayElem) {
+            Value *av = lookupArray(n.left->name);
+            if (!av) return perlUndef();
+            Value *idx    = callRT("perl_to_int", {emitExpr(*n.left->left)});
+            Value *lhsVal = callRT("perl_array_get", {av, idx});
+            Value *rhsVal = emitExpr(*n.right);
+            Value *result = applyOp(lhsVal, rhsVal);
+            callRT("perl_array_set", {av, idx, result});
+            return result;
+        }
+        /* $hash{key} op= rhs */
+        if (n.left->kind == NK::HashElem) {
+            Value *hv = lookupHash(n.left->name);
+            if (!hv) return perlUndef();
+            Value *key    = emitExpr(*n.left->left);
+            Value *lhsVal = callRT("perl_hash_get_sv", {hv, key});
+            Value *rhsVal = emitExpr(*n.right);
+            Value *result = applyOp(lhsVal, rhsVal);
+            callRT("perl_hash_set_sv", {hv, key, result});
+            return result;
+        }
+        /* $ref->[$i] op= rhs  or  $ref->{k} op= rhs */
+        if (n.left->kind == NK::ArrowDeref) {
+            Value *base = emitExpr(*n.left->left);
+            Value *lhsVal, *rhsVal, *result;
+            if (n.left->sval == "array") {
+                Value *av  = callRT("perl_deref_array", {base});
+                Value *idx = callRT("perl_to_int", {emitExpr(*n.left->right)});
+                lhsVal = callRT("perl_array_get", {av, idx});
+                rhsVal = emitExpr(*n.right);
+                result = applyOp(lhsVal, rhsVal);
+                callRT("perl_array_set", {av, idx, result});
+            } else {
+                Value *hv  = callRT("perl_deref_hash", {base});
+                Value *key = emitExpr(*n.left->right);
+                lhsVal = callRT("perl_hash_get_sv", {hv, key});
+                rhsVal = emitExpr(*n.right);
+                result = applyOp(lhsVal, rhsVal);
+                callRT("perl_hash_set_sv", {hv, key, result});
+            }
+            return result;
+        }
+        /* scalar: $var op= rhs */
         Value *lhsPtr = emitLValue(*n.left);
         if (!lhsPtr) return perlUndef();
         Value *lhsVal = builder_.CreateLoad(perlPtrTy_, lhsPtr);
         Value *rhsVal = emitExpr(*n.right);
-        Value *result = nullptr;
-        if      (n.sval == "+") result = callRT("perl_add",    {lhsVal, rhsVal});
-        else if (n.sval == "-") result = callRT("perl_sub",    {lhsVal, rhsVal});
-        else if (n.sval == "*") result = callRT("perl_mul",    {lhsVal, rhsVal});
-        else if (n.sval == "/") result = callRT("perl_div",    {lhsVal, rhsVal});
-        else if (n.sval == ".") result = callRT("perl_concat", {lhsVal, rhsVal});
-        else result = perlUndef();
+        Value *result = applyOp(lhsVal, rhsVal);
         callRT("perl_assign", {lhsVal, result});
         return lhsVal;
     }
@@ -2261,6 +2375,28 @@ Value *CodeGen::emitBinOp(const Node &n) {
         phi->addIncoming(rv, rBB);
         return phi;
     }
+    /* defined-or: $a // $b — return $a if defined, else $b */
+    if (n.sval == "//") {
+        auto *fn    = builder_.GetInsertBlock()->getParent();
+        auto *rhsBB = BasicBlock::Create(ctx_, "defor.rhs", fn);
+        auto *endBB = BasicBlock::Create(ctx_, "defor.end", fn);
+        Value *lv   = emitExpr(*n.left);
+        Value *lb   = callRT("perl_defined", {lv});
+        Value *ldef = builder_.CreateICmpNE(lb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+        auto *lBB   = builder_.GetInsertBlock();
+        builder_.CreateCondBr(ldef, endBB, rhsBB);
+
+        builder_.SetInsertPoint(rhsBB);
+        Value *rv = emitExpr(*n.right);
+        auto *rBB = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "defor.result");
+        phi->addIncoming(lv, lBB);
+        phi->addIncoming(rv, rBB);
+        return phi;
+    }
     /* ternary */
     if (n.sval == "?:") {
         auto *fn    = builder_.GetInsertBlock()->getParent();
@@ -2294,7 +2430,8 @@ Value *CodeGen::emitBinOp(const Node &n) {
 
     static const struct { const char *op; const char *rt; } OPS[] = {
         {"+",  "perl_add"   }, {"-",  "perl_sub"   }, {"*",  "perl_mul"   },
-        {"/",  "perl_div"   }, {"%",  "perl_mod"   }, {".",  "perl_concat"},
+        {"/",  "perl_div"   }, {"%",  "perl_mod"   }, {"**", "perl_pow"   },
+        {".",  "perl_concat"},
         {"==", "perl_num_eq"}, {"!=", "perl_num_ne"},
         {"<",  "perl_num_lt"}, {">",  "perl_num_gt"},
         {"<=", "perl_num_le"}, {">=", "perl_num_ge"},
@@ -2375,4 +2512,28 @@ void CodeGen::writeBC(const std::string &path) {
     raw_fd_ostream out(path, ec);
     if (ec) throw std::runtime_error("Cannot write " + path + ": " + ec.message());
     WriteBitcodeToFile(*mod_, out);
+}
+
+void CodeGen::initializeDebugInfo(const std::string &sourceFile) {
+    std::string dir = ".";
+    size_t slash = sourceFile.rfind('/');
+    if (slash != std::string::npos) {
+        dir = sourceFile.substr(0, slash);
+    }
+    std::string filename = (slash != std::string::npos) ? sourceFile.substr(slash + 1) : sourceFile;
+    file_ = dib_->createFile(filename, dir);
+
+    cu_ = dib_->createCompileUnit(
+        llvm::dwarf::DW_LANG_C, file_, "perlc", false, "", 0);
+
+    auto *intTy = dib_->createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+    auto *subTy = dib_->createSubroutineType(dib_->getOrCreateTypeArray(intTy));
+    currentSP_ = dib_->createFunction(
+        cu_, "main", "main", file_, 1, subTy, 1,
+        llvm::DINode::FlagZero, llvm::DISubprogram::SPFlagDefinition);
+}
+
+llvm::DILocation *CodeGen::getDebugLoc(int line, llvm::DIScope *scope) {
+    if (!scope) scope = currentSP_;
+    return llvm::DILocation::get(ctx_, line, 0, scope);
 }

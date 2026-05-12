@@ -21,6 +21,7 @@ make clean
 ```bash
 ./perlc program.pl -o output            # compile and link
 ./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
+./perlc program.pl -g -o output         # compile with debugging symbols (Perl source lines in gdb)
 ./perlc -pm program.pl                  # install missing modules then compile
 ```
 
@@ -106,14 +107,17 @@ make clean
 
 ## Known Limitations
 
-- `wantarray`: stub always returns false; proper context tracking not implemented
-- `caller`: stub returns `("main", "unknown", 0)`; real call stack not tracked
-- `local` for arrays and hashes: not implemented (scalars and special vars only)
-- `use` statements for non-file pragmas: silently ignored; only file-backed modules in search paths loaded
-- Regex modifiers: `x` (extended) and `e` (eval replacement) not supported
-- `require`/`do FILE`: not supported at runtime (module loading only at compile time)
+- `wantarray`: always returns false (scalar context); full context tracking not implemented
+- `caller()`: stub implementation only
+- `local` for arrays and hashes: scalars and special vars (`$!`, `$/`) only
+- `tie` / `untie`: not implemented (use `opendir`/`readdir` for directories)
+- Regex modifiers `x` (extended) and `e` (eval replacement): not supported
+- Runtime `require` / `do FILE`: modules only loaded at compile time via `use` inlining
 - `AUTOLOAD`, `DESTROY`: not implemented
-- `unshift @{EXPR}, val`: not yet supported (push @{EXPR} is supported)
+- `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
+- Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
+
+**Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
 
 ## Architecture
 

@@ -49,9 +49,11 @@ enum class TK {
     SEMI, COMMA, ARROW, FATARROW, COLON,
     /* operators */
     PLUS, MINUS, STAR, SLASH, PERCENT, DOTDOT, DOT,
+    STAR_STAR,                           /* ** exponentiation */
     EQ, NE, LT, GT, LE, GE,             /* numeric cmp */
     STR_EQ, STR_NE, STR_LT, STR_GT, STR_LE, STR_GE,  /* string cmp */
     AND, OR, NOT, AND2, OR2,             /* &&, ||, ! */
+    DEFINED_OR,                          /* // */
     ASSIGN,
     PLUS_ASSIGN, MINUS_ASSIGN, STAR_ASSIGN, SLASH_ASSIGN, DOT_ASSIGN, OR_ASSIGN,
     PLUS_PLUS, MINUS_MINUS,

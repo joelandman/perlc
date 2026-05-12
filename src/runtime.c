@@ -319,6 +319,10 @@ PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_to_int(a) % bv);
 }
 
+PerlValue *perl_pow(const PerlValue *a, const PerlValue *b) {
+    return perl_alloc_float(pow(perl_to_float(a), perl_to_float(b)));
+}
+
 PerlValue *perl_negate(const PerlValue *a) {
     if (a->tag == PERL_INT)   return perl_alloc_int(-a->ival);
     if (a->tag == PERL_FLOAT) return perl_alloc_float(-a->fval);

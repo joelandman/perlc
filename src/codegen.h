@@ -3,6 +3,8 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -13,17 +15,26 @@ using Scope = std::unordered_map<std::string, llvm::Value *>;
 
 class CodeGen {
 public:
-    CodeGen();
+    CodeGen(bool debug = false);
 
     void compile(const Node &program, const std::string &moduleName);
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
 
+    void initializeDebugInfo(const std::string &sourceFile);
+    llvm::DILocation *getDebugLoc(int line, llvm::DIScope *scope = nullptr);
+
 private:
     llvm::LLVMContext              ctx_;
     std::unique_ptr<llvm::Module>  mod_;
     llvm::IRBuilder<>              builder_;
+
+    bool                           debug_ = false;
+    std::unique_ptr<llvm::DIBuilder> dib_;
+    llvm::DICompileUnit           *cu_ = nullptr;
+    llvm::DIFile                  *file_ = nullptr;
+    llvm::DISubprogram            *currentSP_ = nullptr;
 
     /* runtime type: opaque pointer (PerlValue*) */
     llvm::PointerType *perlPtrTy_;
@@ -35,6 +46,14 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> arrayScopes_;
     /* hash variable scope */
     std::vector<std::unordered_map<std::string, llvm::Value *>> hashScopes_;
+
+    /* file-scope (top-level my) globals — accessible from subroutines */
+    std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
+    std::unordered_map<std::string, llvm::GlobalVariable *> fileArrayGlobals_;
+    std::unordered_map<std::string, llvm::GlobalVariable *> fileHashGlobals_;
+    int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */
+    bool inMainBody_ = false;   /* true only while emitting the top-level program body */
+
     /* current function */
     llvm::Function                *currentFn_ = nullptr;
     /* loop control blocks */

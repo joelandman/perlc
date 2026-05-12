@@ -59,6 +59,7 @@ private:
     NodePtr parseAdd();
     NodePtr parseMul();
     NodePtr parseUnary();
+    NodePtr parsePow();
     NodePtr parsePostfix();
     NodePtr parsePrimary();
     NodePtr parseCall(std::string name, int line);

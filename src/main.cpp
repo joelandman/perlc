@@ -392,7 +392,8 @@ static void usage(const char *prog) {
               << "  --emit-ir   Emit LLVM IR (.ll) instead of compiling\n"
               << "  --emit-bc   Emit LLVM bitcode (.bc)\n"
               << "  -v          Verbose\n"
-              << "  -pm         Download and install missing Perl modules via cpanm\n";
+               << "  -pm         Download and install missing Perl modules via cpanm\n"
+               << "  -g          Generate debugging symbols\n";
 }
 
 int main(int argc, char **argv) {
@@ -402,13 +403,14 @@ int main(int argc, char **argv) {
 
     std::string inputFile;
     std::string outputFile = "a.out";
-    bool emitIR = false, emitBC = false, verbose = false, installPM = false;
+    bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
         else if (!strcmp(argv[i], "-v"))        verbose = true;
         else if (!strcmp(argv[i], "-pm"))       installPM = true;
+else if (!strcmp(argv[i], "-g"))        debugSymbols = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outputFile = argv[++i];
         else if (argv[i][0] != '-')             inputFile = argv[i];
         else { usage(argv[0]); return 1; }
@@ -460,7 +462,7 @@ int main(int argc, char **argv) {
         auto ast = parser.parseProgram();
 
         /* codegen */
-        CodeGen cg;
+        CodeGen cg(debugSymbols);
         cg.compile(*ast, inputFile);
 
         if (emitIR) {
@@ -503,9 +505,10 @@ int main(int argc, char **argv) {
         if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
             rtSrc = "src/runtime.c";  /* fallback: CWD */
 
-        std::string cmd =
-            "clang-18 -O1 " + tmpIR + " " + rtSrc +
-            " -o " + outputFile + " -lm -lpcre2-8 2>&1";
+std::string cmd = "clang-18 -O1";
+if (debugSymbols) cmd += " -g";
+cmd += " " + tmpIR + " " + rtSrc +
+    " -o " + outputFile + " -lm -lpcre2-8 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
         int rc = system(cmd.c_str());

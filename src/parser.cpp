@@ -744,10 +744,12 @@ NodePtr Parser::parseTernary() {
 
 NodePtr Parser::parseOr() {
     auto lhs = parseAnd();
-    while (check(TK::OR2) || check(TK::KW_OR)) {
-        int line = cur().line; advance();
+    while (check(TK::OR2) || check(TK::KW_OR) || check(TK::DEFINED_OR)) {
+        int line = cur().line;
+        std::string op = check(TK::DEFINED_OR) ? "//" : "||";
+        advance();
         auto rhs = parseAnd();
-        lhs = makeBin("||", std::move(lhs), std::move(rhs), line);
+        lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
     }
     return lhs;
 }
@@ -874,15 +876,24 @@ NodePtr Parser::parseMul() {
 
 NodePtr Parser::parseUnary() {
     int line = cur().line;
-    if (check(TK::MINUS)) { advance(); return makeUnary("-", parsePostfix(), line); }
-    if (check(TK::NOT))   { advance(); return makeUnary("!", parsePostfix(), line); }
+    if (check(TK::MINUS)) { advance(); return makeUnary("-", parsePow(), line); }
+    if (check(TK::NOT))   { advance(); return makeUnary("!", parsePow(), line); }
     if (check(TK::PLUS_PLUS)) {
         advance(); return makeUnary("pre++", parsePostfix(), line);
     }
     if (check(TK::MINUS_MINUS)) {
         advance(); return makeUnary("pre--", parsePostfix(), line);
     }
-    return parsePostfix();
+    return parsePow();
+}
+
+NodePtr Parser::parsePow() {
+    auto lhs = parsePostfix();
+    if (!check(TK::STAR_STAR)) return lhs;
+    int line = cur().line;
+    advance();
+    auto rhs = parsePow(); /* right-associative */
+    return makeBin("**", std::move(lhs), std::move(rhs), line);
 }
 
 NodePtr Parser::parseSubscript(NodePtr base, int line) {

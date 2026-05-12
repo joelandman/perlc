@@ -97,6 +97,7 @@ The following features are **not yet implemented** or only partially supported:
 ### Module System
 - Runtime `require` and `do FILE` (modules only loaded at compile time via inlining)
 - Pragmas that aren't backed by `.pm` files are silently ignored
+- `tie` / `untie` (use `opendir`/`readdir` instead; see rewritten `testscripts/cputemp.pl`)
 
 ### Regex
 - Modifiers `x` (extended) and `e` (eval replacement)
@@ -107,12 +108,15 @@ The following features are **not yet implemented** or only partially supported:
 ### Reference Operations
 - `unshift @{EXPR}, val` (though `push @{EXPR}` works)
 
+### Command-line / Debugging
+- `-g` flag supported: adds debugging symbols + **Perl source line mapping** via LLVM debug metadata (visible in gdb/lldb)
+
 ### Not Yet Implemented
-- Threads (POSIX ithreads mentioned in architecture but no test coverage)
+- Threads (POSIX ithreads)
 - XS interface
 - DBI/SQLite integration
 - Overload, prototypes, globs, signals, pack/unpack, unicode handling
-- Many CPAN modules beyond basic `use`
+- Many complex CPAN modules (parser may fail on advanced OO/`our`/POD; simplify scripts as needed)
 
 ## Key Implementation Details
 

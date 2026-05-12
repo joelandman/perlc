@@ -55,6 +55,7 @@ PerlValue *perl_sub(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mul(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_div(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b);
+PerlValue *perl_pow(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_negate(const PerlValue *a);
 
 /* string ops */

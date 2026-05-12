@@ -390,7 +390,8 @@ std::vector<Token> Lexer::tokenize() {
             }();
             pos_++; /* consume '/' */
             if (afterValue) {
-                if (peek() == '=') { pos_++; toks.push_back({TK::SLASH_ASSIGN, "/=", line_}); }
+                if (peek() == '/') { pos_++; toks.push_back({TK::DEFINED_OR, "//", line_}); }
+                else if (peek() == '=') { pos_++; toks.push_back({TK::SLASH_ASSIGN, "/=", line_}); }
                 else toks.push_back({TK::SLASH, "/", line_});
             } else {
                 toks.push_back(readRegex());
@@ -449,7 +450,8 @@ std::vector<Token> Lexer::tokenize() {
                 }
                 break;
             case '*':
-                if (peek() == '=') { pos_++; toks.push_back({TK::STAR_ASSIGN, "*=", line_}); }
+                if (peek() == '*') { pos_++; toks.push_back({TK::STAR_STAR, "**", line_}); }
+                else if (peek() == '=') { pos_++; toks.push_back({TK::STAR_ASSIGN, "*=", line_}); }
                 else toks.push_back({TK::STAR, "*", line_});
                 break;
             case '%':
