@@ -2507,6 +2507,10 @@ void CodeGen::runOptimization() {
 
 /* ── output ──────────────────────────────────────────────────────────────── */
 
+std::unique_ptr<Module> CodeGen::releaseModule() {
+    return std::move(mod_);
+}
+
 void CodeGen::dumpIR() {
     mod_->print(outs(), nullptr);
 }

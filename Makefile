@@ -9,7 +9,7 @@ CC       := clang-21
 CFLAGS   := -g -O2
 
 SRCDIR   := src
-OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o
+OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o
 RT_OBJ   := $(SRCDIR)/runtime.o
 
 TARGET   := perlc
@@ -31,6 +31,7 @@ $(SRCDIR)/main.o: $(SRCDIR)/main.cpp $(SRCDIR)/lexer.h $(SRCDIR)/ast.h $(SRCDIR)
 $(SRCDIR)/lexer.o: $(SRCDIR)/lexer.cpp $(SRCDIR)/lexer.h
 $(SRCDIR)/parser.o: $(SRCDIR)/parser.cpp $(SRCDIR)/parser.h $(SRCDIR)/ast.h $(SRCDIR)/lexer.h
 $(SRCDIR)/codegen.o: $(SRCDIR)/codegen.cpp $(SRCDIR)/codegen.h $(SRCDIR)/ast.h $(SRCDIR)/runtime.h
+$(SRCDIR)/jit.o: $(SRCDIR)/jit.cpp $(SRCDIR)/jit.h $(SRCDIR)/runtime.h
 
 clean:
 	rm -f $(SRCDIR)/*.o $(TARGET)

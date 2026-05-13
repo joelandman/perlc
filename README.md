@@ -25,6 +25,7 @@ make clean
 ./perlc -pm program.pl                  # install missing modules then compile
 ./perlc -i                              # interactive REPL mode
 ./perlc -i -p                           # REPL with pause after each statement
+./perlc -i --jit                        # REPL with JIT compilation (experimental)
 ```
 
 ### REPL Mode (`-i` / `--repl`)
@@ -42,10 +43,6 @@ The compiler provides an interactive read-eval-print loop for interactive Perl d
 - Commands: `quit`, `exit`, `q` (exit), `help`, `h`, `?` (help), `clear` (clear subs), `dump` (show subs), `stats` (show stats)
 - Use `perl <code>` to execute raw Perl directly (bypasses perlc)
 
-**Limitations:**
-- Scalars, arrays, and hashes do **not** persist between statements (each statement compiles separately)
-- For variable persistence, use the `perl <code>` command or run system Perl separately
-
 **Pause Mode (`-p` / `--pause`):**
 Pauses after each statement in REPL mode for debugging:
 
@@ -54,6 +51,20 @@ Pauses after each statement in REPL mode for debugging:
 ```
 
 Press ENTER to continue, or 'q' to quit.
+
+### JIT Mode (`--jit`) [Experimental]
+
+Enable JIT compilation in REPL mode for variable persistence:
+
+```bash
+./perlc -i --jit
+```
+
+The JIT compiles code in-memory rather than writing to disk and invoking clang. This enables:
+- Faster REPL iteration (no external compilation)
+- Future variable persistence between statements
+
+Note: JIT mode is experimental. Use the default (external compilation) for production work.
 
 ## Implemented Features
 
@@ -146,7 +157,8 @@ Press ENTER to continue, or 'q' to quit.
 - `AUTOLOAD`, `DESTROY`: not implemented
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
-- REPL: scalar/array/hash variables do not persist between statements; subroutines do persist
+- REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
+- JIT mode: experimental, may have stability issues
 
 **Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
 

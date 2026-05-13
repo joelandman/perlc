@@ -22,6 +22,9 @@ public:
     void writeBC(const std::string &path);
     void dumpIR();
 
+    /* Release the module for use with JIT - transfers ownership to caller */
+    std::unique_ptr<llvm::Module> releaseModule();
+
     void initializeDebugInfo(const std::string &sourceFile);
     llvm::DILocation *getDebugLoc(int line, llvm::DIScope *scope = nullptr);
 
