@@ -23,7 +23,37 @@ make clean
 ./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
 ./perlc program.pl -g -o output         # compile with debugging symbols (Perl source lines in gdb)
 ./perlc -pm program.pl                  # install missing modules then compile
+./perlc -i                              # interactive REPL mode
+./perlc -i -p                           # REPL with pause after each statement
 ```
+
+### REPL Mode (`-i` / `--repl`)
+
+The compiler provides an interactive read-eval-print loop for interactive Perl development:
+
+```bash
+./perlc -i
+```
+
+**Features:**
+- Reads complete Perl statements from stdin (terminated with `;`)
+- Accumulates multi-line statements (continues input until `;` at depth 0)
+- **Subroutines persist** between statements (accumulated in AST and recompiled together)
+- Commands: `quit`, `exit`, `q` (exit), `help`, `h`, `?` (help), `clear` (clear subs), `dump` (show subs), `stats` (show stats)
+- Use `perl <code>` to execute raw Perl directly (bypasses perlc)
+
+**Limitations:**
+- Scalars, arrays, and hashes do **not** persist between statements (each statement compiles separately)
+- For variable persistence, use the `perl <code>` command or run system Perl separately
+
+**Pause Mode (`-p` / `--pause`):**
+Pauses after each statement in REPL mode for debugging:
+
+```bash
+./perlc -i -p
+```
+
+Press ENTER to continue, or 'q' to quit.
 
 ## Implemented Features
 
@@ -116,6 +146,7 @@ make clean
 - `AUTOLOAD`, `DESTROY`: not implemented
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
+- REPL: scalar/array/hash variables do not persist between statements; subroutines do persist
 
 **Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
 

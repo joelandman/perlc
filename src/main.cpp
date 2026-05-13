@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <set>
 #include <map>
 #include <vector>
@@ -385,6 +387,196 @@ static std::vector<Token> inlineModules(
     return result;
 }
 
+/* Check if the token stream represents a complete statement (ends with semicolon at depth 0) */
+static bool isCompleteStatement(const std::vector<Token> &toks) {
+    int depth = 0;
+    for (size_t i = 0; i < toks.size(); i++) {
+        if (toks[i].kind == TK::LPAREN || toks[i].kind == TK::LBRACE || toks[i].kind == TK::LBRACKET)
+            depth++;
+        else if (toks[i].kind == TK::RPAREN || toks[i].kind == TK::RBRACE || toks[i].kind == TK::RBRACKET)
+            depth--;
+        else if (depth == 0 && toks[i].kind == TK::SEMI)
+            return true;
+    }
+    return false;
+}
+
+/* Run REPL: compile each statement with perlc, subroutines persist between statements.
+   Note: scalar/array/hash variables don't persist (each compiles separately).
+   Subroutines DO persist because they're accumulated in the AST. */
+static int runRepl(bool debugSymbols, int optLevel, bool verbose, bool pauseMode) {
+    std::cout << "perlc REPL - type 'quit' or 'exit' to exit, 'help' for commands\n";
+    std::cout << "Enter complete statements (end with ;).\n";
+    std::cout << "Note: Subroutines persist. Scalars/arrays/hashes do not persist between statements.\n\n";
+
+    std::string accum;
+    std::vector<NodePtr> savedSubs;
+    int stmtCount = 0;
+
+    while (true) {
+        std::cout << "perlc> ";
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            std::cout << "\nExiting REPL.\n";
+            break;
+        }
+
+        if (line == "quit" || line == "exit" || line == "q") {
+            std::cout << "Goodbye!\n";
+            break;
+        }
+        if (line == "help" || line == "h" || line == "?") {
+            std::cout << "Commands:\n"
+                      << "  quit/exit/q  - exit the REPL\n"
+                      << "  help/h/?     - show this help\n"
+                      << "  clear        - clear accumulated subroutines\n"
+                      << "  dump         - show accumulated subroutines\n"
+                      << "  stats        - show REPL stats\n"
+                      << "  perl <code>  - execute raw Perl code directly\n"
+                      << "Enter Perl statements - subroutines persist, scalars do not.\n";
+            continue;
+        }
+        if (line == "clear") {
+            accum.clear();
+            savedSubs.clear();
+            stmtCount = 0;
+            std::cout << "State cleared.\n";
+            continue;
+        }
+        if (line == "dump") {
+            std::cout << "=== Accumulated subroutines ===\n";
+            for (auto &sub : savedSubs) {
+                std::cout << "sub " << sub->name << " { ... }\n";
+            }
+            std::cout << "==============================\n";
+            continue;
+        }
+        if (line == "stats") {
+            std::cout << "Statements executed: " << stmtCount << "\n";
+            std::cout << "Subroutines defined: " << savedSubs.size() << "\n";
+            continue;
+        }
+        if (line.substr(0, 5) == "perl ") {
+            std::string code = line.substr(5);
+            std::string cmd = "perl -e '" + code + "' 2>&1";
+            system(cmd.c_str());
+            continue;
+        }
+
+        if (!accum.empty()) accum += "\n";
+        accum += line;
+
+        /* Check for complete statement */
+        int depth = 0;
+        bool complete = false;
+        for (size_t i = 0; i < accum.size(); i++) {
+            if (accum[i] == '(' || accum[i] == '[' || accum[i] == '{') depth++;
+            else if (accum[i] == ')' || accum[i] == ']' || accum[i] == '}') depth--;
+            else if (depth == 0 && accum[i] == ';') { complete = true; break; }
+        }
+
+        if (!complete) {
+            std::cout << "  ... " << std::flush;
+            continue;
+        }
+
+        stmtCount++;
+
+        /* Compile and run with perlc */
+        try {
+            std::set<std::string> loaded;
+            std::map<std::string,std::string> importMap;
+            std::map<std::string,NodePtr> constMap;
+            std::vector<Token> dummyTokens;
+            Parser dummyParser(std::move(dummyTokens));
+            auto expanded = inlineModules(
+                Lexer(accum).tokenize(), ".", loaded, importMap, &constMap, &dummyParser);
+
+            Parser parser(std::move(expanded));
+            parser.setImportMap(std::move(importMap));
+            parser.setConstMap(std::move(constMap));
+            NodePtr ast = parser.parseProgram();
+
+            NodeList mainStmts;
+            for (auto &stmt : ast->args) {
+                if (stmt->kind == NK::SubDef) {
+                    bool found = false;
+                    for (auto &s : savedSubs) {
+                        if (s->name == stmt->name) { found = true; break; }
+                    }
+                    if (!found) savedSubs.push_back(std::move(stmt));
+                } else {
+                    mainStmts.push_back(std::move(stmt));
+                }
+            }
+
+            NodeList allStmts;
+            for (auto &sub : savedSubs) allStmts.push_back(std::move(sub));
+            for (auto &stmt : mainStmts) allStmts.push_back(std::move(stmt));
+
+            NodePtr fullAst = makeBlock(std::move(allStmts), 1);
+
+            CodeGen cg(debugSymbols, optLevel);
+            cg.compile(*fullAst, "repl");
+
+            std::string tmpIR = "/tmp/_perlc_repl_" + std::to_string(getpid()) + ".ll";
+            cg.writeIR(tmpIR);
+
+            std::string rtSrc;
+            {
+                char self[1024] = {};
+                ssize_t len = readlink("/proc/self/exe", self, sizeof(self)-1);
+                if (len > 0) {
+                    std::string dir(self, len);
+                    auto sl = dir.rfind('/');
+                    if (sl != std::string::npos) dir = dir.substr(0, sl);
+                    rtSrc = dir + "/src/runtime.c";
+                }
+            }
+            if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
+                rtSrc = "src/runtime.c";
+
+            std::string outFile = "/tmp/_perlc_repl_out_" + std::to_string(getpid());
+            std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel);
+            if (debugSymbols) cmd += " -g";
+            cmd += " " + tmpIR + " " + rtSrc + " -o " + outFile + " -lm -lpcre2-8 2>&1";
+
+            int rc = system(cmd.c_str());
+            unlink(tmpIR.c_str());
+
+            if (rc == 0) {
+                cmd = outFile + " 2>&1";
+                FILE *fp = popen(cmd.c_str(), "r");
+                if (fp) {
+                    char buf[4096];
+                    while (fgets(buf, sizeof(buf), fp)) std::cout << buf;
+                    pclose(fp);
+                }
+                unlink(outFile.c_str());
+            } else {
+                std::cerr << "Compilation failed.\n";
+            }
+
+            if (pauseMode) {
+                std::cout << "\n--- Press ENTER to continue, 'q' to quit --- ";
+                std::string resp;
+                if (!std::getline(std::cin, resp)) break;
+                if (resp == "q" || resp == "quit" || resp == "exit") {
+                    std::cout << "Goodbye!\n";
+                    break;
+                }
+            }
+
+        } catch (const std::exception &e) {
+            std::cerr << "Error: " << e.what() << "\n";
+        }
+
+        accum.clear();
+    }
+
+    return 0;
+}
+
 static void usage(const char *prog) {
     std::cerr << "Usage: " << prog << " [options] <file.pl>\n"
               << "Options:\n"
@@ -394,7 +586,9 @@ static void usage(const char *prog) {
               << "  -O[level]   Optimization level 0-5 (default: 1)\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
-              << "  -g          Generate debugging symbols\n";
+              << "  -g          Generate debugging symbols\n"
+              << "  -i, --repl  Interactive REPL mode (read-eval-print loop)\n"
+              << "  -p, --pause Pause after each statement in REPL mode\n";
 }
 
 int main(int argc, char **argv) {
@@ -405,6 +599,7 @@ int main(int argc, char **argv) {
     std::string inputFile;
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
+    bool replMode = false, pauseMode = false;
     int optLevel = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -412,7 +607,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
         else if (!strcmp(argv[i], "-v"))        verbose = true;
         else if (!strcmp(argv[i], "-pm"))       installPM = true;
-        else if (!strcmp(argv[i], "-g"))        debugSymbols = true;
+        else if (!strcmp(argv[i], "-g"))         debugSymbols = true;
+        else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--repl")) replMode = true;
+        else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--pause")) pauseMode = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outputFile = argv[++i];
         else if (strncmp(argv[i], "-O", 2) == 0) {
             if (argv[i][2] == '\0') {
@@ -429,7 +626,12 @@ int main(int argc, char **argv) {
         else { usage(argv[0]); return 1; }
     }
 
-    if (inputFile.empty()) { usage(argv[0]); return 1; }
+    if (inputFile.empty() && !replMode) { usage(argv[0]); return 1; }
+
+    /* REPL mode: interactive read-eval-print loop */
+    if (replMode) {
+        return runRepl(debugSymbols, optLevel, verbose, pauseMode);
+    }
 
     /* read source */
     std::ifstream f(inputFile);
