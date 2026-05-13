@@ -15,7 +15,7 @@ using Scope = std::unordered_map<std::string, llvm::Value *>;
 
 class CodeGen {
 public:
-    CodeGen(bool debug = false);
+    CodeGen(bool debug = false, int optLevel = 0);
 
     void compile(const Node &program, const std::string &moduleName);
     void writeIR(const std::string &path);
@@ -31,6 +31,7 @@ private:
     llvm::IRBuilder<>              builder_;
 
     bool                           debug_ = false;
+    int                            optLevel_ = 0;
     std::unique_ptr<llvm::DIBuilder> dib_;
     llvm::DICompileUnit           *cu_ = nullptr;
     llvm::DIFile                  *file_ = nullptr;
@@ -66,6 +67,7 @@ private:
     std::unordered_map<std::string, llvm::Function *> rtFuncs_;
 
     void declareRuntime();
+    void runOptimization();
     llvm::Function *getRTFunc(const std::string &name);
 
     void pushScope();

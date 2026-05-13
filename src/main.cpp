@@ -391,9 +391,10 @@ static void usage(const char *prog) {
               << "  -o <out>    Output file (default: a.out)\n"
               << "  --emit-ir   Emit LLVM IR (.ll) instead of compiling\n"
               << "  --emit-bc   Emit LLVM bitcode (.bc)\n"
+              << "  -O[level]   Optimization level 0-5 (default: 1)\n"
               << "  -v          Verbose\n"
-               << "  -pm         Download and install missing Perl modules via cpanm\n"
-               << "  -g          Generate debugging symbols\n";
+              << "  -pm         Download and install missing Perl modules via cpanm\n"
+              << "  -g          Generate debugging symbols\n";
 }
 
 int main(int argc, char **argv) {
@@ -404,14 +405,26 @@ int main(int argc, char **argv) {
     std::string inputFile;
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
+    int optLevel = 1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
         else if (!strcmp(argv[i], "-v"))        verbose = true;
         else if (!strcmp(argv[i], "-pm"))       installPM = true;
-else if (!strcmp(argv[i], "-g"))        debugSymbols = true;
+        else if (!strcmp(argv[i], "-g"))        debugSymbols = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outputFile = argv[++i];
+        else if (strncmp(argv[i], "-O", 2) == 0) {
+            if (argv[i][2] == '\0') {
+                optLevel = 1;
+            } else {
+                optLevel = atoi(argv[i] + 2);
+                if (optLevel < 0 || optLevel > 5) {
+                    std::cerr << "Invalid optimization level: " << optLevel << " (must be 0-5)\n";
+                    return 1;
+                }
+            }
+        }
         else if (argv[i][0] != '-')             inputFile = argv[i];
         else { usage(argv[0]); return 1; }
     }
@@ -462,7 +475,7 @@ else if (!strcmp(argv[i], "-g"))        debugSymbols = true;
         auto ast = parser.parseProgram();
 
         /* codegen */
-        CodeGen cg(debugSymbols);
+        CodeGen cg(debugSymbols, optLevel);
         cg.compile(*ast, inputFile);
 
         if (emitIR) {
@@ -505,7 +518,7 @@ else if (!strcmp(argv[i], "-g"))        debugSymbols = true;
         if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
             rtSrc = "src/runtime.c";  /* fallback: CWD */
 
-std::string cmd = "clang-18 -O1";
+std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel);
 if (debugSymbols) cmd += " -g";
 cmd += " " + tmpIR + " " + rtSrc +
     " -o " + outputFile + " -lm -lpcre2-8 2>&1";

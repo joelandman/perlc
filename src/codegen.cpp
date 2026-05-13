@@ -41,8 +41,9 @@ static std::string subLLVMName(const std::string &name) {
 
 /* ── construction ────────────────────────────────────────────────────────── */
 
-CodeGen::CodeGen(bool debug)
+CodeGen::CodeGen(bool debug, int optLevel)
     : debug_(debug),
+      optLevel_(optLevel),
       mod_(std::make_unique<Module>("perlc", ctx_)),
       builder_(ctx_) {
     perlPtrTy_  = PointerType::getUnqual(ctx_);
@@ -2494,6 +2495,16 @@ Value *CodeGen::emitCall(const Node &n) {
     return perlUndef();
 }
 
+/* ── optimization ────────────────────────────────────────────────────────── */
+
+void CodeGen::runOptimization() {
+    if (optLevel_ <= 0) return;
+
+    if (verifyModule(*mod_, &errs())) {
+        errs() << "IR verification failed before optimization\n";
+    }
+}
+
 /* ── output ──────────────────────────────────────────────────────────────── */
 
 void CodeGen::dumpIR() {
@@ -2501,6 +2512,7 @@ void CodeGen::dumpIR() {
 }
 
 void CodeGen::writeIR(const std::string &path) {
+    runOptimization();
     std::error_code ec;
     raw_fd_ostream out(path, ec);
     if (ec) throw std::runtime_error("Cannot write " + path + ": " + ec.message());
@@ -2508,6 +2520,7 @@ void CodeGen::writeIR(const std::string &path) {
 }
 
 void CodeGen::writeBC(const std::string &path) {
+    runOptimization();
     std::error_code ec;
     raw_fd_ostream out(path, ec);
     if (ec) throw std::runtime_error("Cannot write " + path + ": " + ec.message());
