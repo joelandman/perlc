@@ -842,7 +842,7 @@ NodePtr Parser::parseCmp() {
             }
         }
         advance();
-        auto rhs = parseAdd();
+        auto rhs = parseBinding();
         lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
         line = cur().line; k = cur().kind;
         ident = (k == TK::IDENT) ? cur().text : "";
@@ -957,8 +957,12 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
             /* -> not followed by [ or { or ( or IDENT: stop */
             break;
         }
-        /* adjacent subscripts after a ref-subscript */
-        if (base->kind == NK::ArrowDeref && check(TK::LBRACKET)) {
+        /* adjacent subscripts after any subscriptable kind — implies implicit -> */
+        auto isSubscriptableK = [](NK k) {
+            return k == NK::ArrowDeref || k == NK::ArrayElem || k == NK::HashElem ||
+                   k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar;
+        };
+        if (isSubscriptableK(base->kind) && check(TK::LBRACKET)) {
             advance();
             auto idx = parseExpr();
             consume(TK::RBRACKET, "]");
@@ -968,7 +972,7 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
             base = std::move(n);
             continue;
         }
-        if (base->kind == NK::ArrowDeref && check(TK::LBRACE)) {
+        if (isSubscriptableK(base->kind) && check(TK::LBRACE)) {
             advance();
             auto key = parseExpr();
             consume(TK::RBRACE, "}");
@@ -985,9 +989,14 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
 
 NodePtr Parser::parsePostfix() {
     auto expr = parsePrimary();
-    /* -> subscript chains */
-    if (check(TK::ARROW)) {
-        int ln = expr->line;
+    int ln = expr->line;
+    /* enter subscript chain for explicit -> or adjacent [ / { after a subscript kind */
+    auto isSubscriptable = [](NK k) {
+        return k == NK::ArrowDeref || k == NK::ArrayElem || k == NK::HashElem ||
+               k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar;
+    };
+    if (check(TK::ARROW) ||
+        (isSubscriptable(expr->kind) && (check(TK::LBRACKET) || check(TK::LBRACE)))) {
         expr = parseSubscript(std::move(expr), ln);
     }
     /* post++ / post-- */

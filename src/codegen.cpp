@@ -405,12 +405,8 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *ref = emitExpr(*n.left);
         return callRT("perl_deref_array", {ref});
     }
-    if (n.kind == NK::AnonArray) {
-        Value *av = callRT("perl_array_new", {});
-        for (auto &elem : n.args)
-            callRT("perl_array_push", {av, emitExpr(*elem)});
-        return av;
-    }
+    /* NK::AnonArray is a scalar (array ref) — do not flatten it as a list.
+       Callers that get nullptr will use emitExpr() which returns perl_ref_array(). */
     if (n.kind == NK::Readline) {
         if (n.sval == "STDIN" || n.sval.empty())
             return callRT("perl_readline_all_stdin", {});
@@ -853,7 +849,12 @@ void CodeGen::emitStmt(const Node &n) {
             std::string nm = n.name.substr(1);
             Value *av = nullptr;
             if (n.right) av = emitArrayPtr(*n.right);
-            if (!av) av = callRT("perl_array_new", {});
+            if (!av) {
+                av = callRT("perl_array_new", {});
+                /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
+                   push the value as a single element */
+                if (n.right) callRT("perl_array_push", {av, emitExpr(*n.right)});
+            }
             if (atFileScope) {
                 auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
                     GlobalValue::InternalLinkage,

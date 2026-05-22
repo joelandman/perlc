@@ -1,11 +1,11 @@
-CXX      := clang++-21
-LLVM_CFG := llvm-config-21
+CXX      := clang++-18
+LLVM_CFG := llvm-config-18
 LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 # strip -fno-exceptions so we can use C++ exceptions in our code
 CXXFLAGS := $(filter-out -fno-exceptions,$(LLVM_CXXFLAGS)) -std=c++17 -g -Wall -Wno-unused-function -fexceptions
 LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core orcjit native) -lpthread -ldl -lpcre2-8
 
-CC       := clang-21
+CC       := clang-18
 CFLAGS   := -g -O2
 
 SRCDIR   := src
