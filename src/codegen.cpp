@@ -122,8 +122,9 @@ void CodeGen::declareRuntime() {
     RT("perl_array_push",    voidTy, av, pv);
     RT("perl_array_pop",     pv,  av);
     RT("perl_array_get",     pv,  av, i64);
-    RT("perl_array_get_ref", pv,  av, i64);
-    RT("perl_array_set",     voidTy, av, i64, pv);
+    RT("perl_array_get_ref",      pv,     av, i64);
+    RT("perl_array_set",          voidTy, av, i64, pv);
+    RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
     RT("perl_array_len",     pv,  av);
     /* hash */
     RT("perl_hash_new",      av);   /* reuse av as opaque ptr */
@@ -2377,6 +2378,27 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *av  = callRT("perl_deref_array", {base});
                 freeIfOwned(base);
                 Value *idx = emitIdx(*n.left->right);
+                /* Fast path: RHS is F64 and op is arithmetic — update in place, zero alloc */
+                if (canEmitF64(*n.right)) {
+                    auto applyF64op = [&](Value *lv, Value *rv) -> Value * {
+                        if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
+                        if (n.sval == "-") return builder_.CreateFSub(lv, rv);
+                        if (n.sval == "*") return builder_.CreateFMul(lv, rv);
+                        if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
+                        return nullptr;
+                    };
+                    Value *borrowPv = callRT("perl_array_get_ref", {av, idx});
+                    Value *lhsF = callRT("perl_to_float", {borrowPv});
+                    Value *rhsF = emitExprF64(*n.right);
+                    if (rhsF) {
+                        Value *newF = applyF64op(lhsF, rhsF);
+                        if (newF) {
+                            callRT("perl_array_update_float", {av, idx, newF});
+                            /* borrowPv now reflects updated value; not owned → no free */
+                            return borrowPv;
+                        }
+                    }
+                }
                 lhsVal = callRT("perl_array_get_ref", {av, idx});
                 rhsVal = emitExpr(*n.right);
                 result = applyOp(lhsVal, rhsVal);

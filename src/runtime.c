@@ -576,6 +576,20 @@ void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
     a->elems[idx] = perl_clone(v);
 }
 
+/* Mutate an existing array element's float value in-place without allocation.
+   Falls back to perl_array_set for out-of-bounds indices. */
+HOTX void perl_array_update_float(PerlArray *a, long long idx, double f) {
+    if (idx < 0) idx += a->len;
+    if (idx >= 0 && idx < a->len) {
+        PerlValue *pv = a->elems[idx];
+        if (pv->tag == PERL_STRING) { free(pv->sval); pv->sval = NULL; }
+        pv->tag = PERL_FLOAT;
+        pv->fval = f;
+        return;
+    }
+    perl_array_set(a, idx, perl_alloc_float(f));
+}
+
 PerlValue *perl_array_len(PerlArray *a) {
     return perl_alloc_int(a->len);
 }
