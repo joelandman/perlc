@@ -16,6 +16,27 @@
 #include <pthread.h>
 #include <semaphore.h>
 
+/* ── PerlValue freelist pool ─────────────────────────────────────────────── *
+ * Avoids malloc/free per temp: freed PVs go onto a singly-linked list (next
+ * pointer stored in pval union field), re-used on the next alloc. The pool
+ * stabilises quickly at the peak concurrent-live count for the hot loop.
+ */
+static PerlValue *pv_freelist_ = NULL;
+
+static inline PerlValue *pv_alloc(void) {
+    if (__builtin_expect(pv_freelist_ != NULL, 1)) {
+        PerlValue *v  = pv_freelist_;
+        pv_freelist_  = (PerlValue *)v->pval;   /* pop head */
+        return v;
+    }
+    return malloc(sizeof(PerlValue));
+}
+
+static inline void pv_pool_push(PerlValue *v) {
+    v->pval      = pv_freelist_;   /* push head */
+    pv_freelist_ = v;
+}
+
 /* ── local() save/restore stack ─────────────────────────────────────────── */
 
 #define LOCAL_STACK_MAX 256
@@ -127,7 +148,7 @@ PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
 /* ── allocation ──────────────────────────────────────────────────────────── */
 
 PerlValue *perl_alloc_undef(void) {
-    PerlValue *v = malloc(sizeof *v);
+    PerlValue *v = pv_alloc();
     v->tag = PERL_UNDEF;
     v->ival = 0;
     v->matchpos = 0;
@@ -136,7 +157,7 @@ PerlValue *perl_alloc_undef(void) {
 }
 
 PerlValue *perl_alloc_int(long long n) {
-    PerlValue *v = malloc(sizeof *v);
+    PerlValue *v = pv_alloc();
     v->tag = PERL_INT;
     v->ival = n;
     v->matchpos = 0;
@@ -145,7 +166,7 @@ PerlValue *perl_alloc_int(long long n) {
 }
 
 PerlValue *perl_alloc_float(double f) {
-    PerlValue *v = malloc(sizeof *v);
+    PerlValue *v = pv_alloc();
     v->tag = PERL_FLOAT;
     v->fval = f;
     v->matchpos = 0;
@@ -154,7 +175,7 @@ PerlValue *perl_alloc_float(double f) {
 }
 
 PerlValue *perl_alloc_string(const char *s) {
-    PerlValue *v = malloc(sizeof *v);
+    PerlValue *v = pv_alloc();
     v->tag = PERL_STRING;
     v->sval = strdup(s ? s : "");
     v->matchpos = 0;
@@ -169,7 +190,7 @@ PerlValue *perl_clone(const PerlValue *src) {
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         return v;
     }
-    PerlValue *v = malloc(sizeof *v);
+    PerlValue *v = pv_alloc();
     *v = *src;
     v->matchpos = 0;
     v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
@@ -183,7 +204,7 @@ void perl_free(PerlValue *v) {
        perl_clone() shallow-copies the pval pointer — freeing it would dangle
        any other references to the same closure. */
     if (v->blessed_class) free(v->blessed_class);
-    free(v);
+    pv_pool_push(v);   /* return struct to freelist instead of free() */
 }
 
 /* ── coercions ───────────────────────────────────────────────────────────── */
@@ -895,23 +916,29 @@ void perl_hash_from_list(PerlHash *h, PerlArray *list) {
 /* ── references ──────────────────────────────────────────────────────────── */
 
 PerlValue *perl_ref_scalar(PerlValue *v) {
-    PerlValue *r = malloc(sizeof *r);
+    PerlValue *r = pv_alloc();
     r->tag = PERL_REF_SCALAR;
     r->pval = v;
+    r->matchpos = 0;
+    r->blessed_class = NULL;
     return r;
 }
 
 PerlValue *perl_ref_array(PerlArray *a) {
-    PerlValue *r = malloc(sizeof *r);
+    PerlValue *r = pv_alloc();
     r->tag = PERL_REF_ARRAY;
     r->pval = a;
+    r->matchpos = 0;
+    r->blessed_class = NULL;
     return r;
 }
 
 PerlValue *perl_ref_hash(PerlHash *h) {
-    PerlValue *r = malloc(sizeof *r);
+    PerlValue *r = pv_alloc();
     r->tag = PERL_REF_HASH;
     r->pval = h;
+    r->matchpos = 0;
+    r->blessed_class = NULL;
     return r;
 }
 
@@ -954,7 +981,7 @@ static PerlValue *make_code_ref_impl(PerlSubFnCtx fp, PerlValue **caps, int ncap
     cl->ncaptures = ncaps;
     cl->captures  = ncaps > 0 ? malloc(ncaps * sizeof(PerlValue*)) : NULL;
     for (int i = 0; i < ncaps; i++) cl->captures[i] = caps[i];
-    PerlValue *v = malloc(sizeof *v);
+    PerlValue *v = pv_alloc();
     v->tag = PERL_CODE_REF;
     v->pval = cl;
     v->matchpos = 0;
@@ -988,9 +1015,11 @@ PerlValue *perl_threads_create(PerlSubFnCtx fn, PerlArray *args) {
   cl->captures = NULL;
   pthread_t *thread = malloc(sizeof(pthread_t));
   pthread_create(thread, NULL, thread_wrapper, cl);
-  PerlValue *tref = malloc(sizeof(PerlValue));
+  PerlValue *tref = pv_alloc();
   tref->tag = PERL_REF_SCALAR;
   tref->pval = thread;
+  tref->matchpos = 0;
+  tref->blessed_class = NULL;
   return tref;
 }
 
