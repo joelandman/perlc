@@ -1,4 +1,7 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
+/* Force-inline helpers: HOT for file-private fns, HOTX for exported fns */
+#define HOT  __attribute__((always_inline)) static inline
+#define HOTX __attribute__((always_inline))
 #include <pcre2.h>
 #include "runtime.h"
 #include <stdio.h>
@@ -147,7 +150,7 @@ PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
 
 /* ── allocation ──────────────────────────────────────────────────────────── */
 
-PerlValue *perl_alloc_undef(void) {
+HOTX PerlValue *perl_alloc_undef(void) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_UNDEF;
     v->ival = 0;
@@ -156,7 +159,7 @@ PerlValue *perl_alloc_undef(void) {
     return v;
 }
 
-PerlValue *perl_alloc_int(long long n) {
+HOTX PerlValue *perl_alloc_int(long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_INT;
     v->ival = n;
@@ -165,7 +168,7 @@ PerlValue *perl_alloc_int(long long n) {
     return v;
 }
 
-PerlValue *perl_alloc_float(double f) {
+HOTX PerlValue *perl_alloc_float(double f) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLOAT;
     v->fval = f;
@@ -197,7 +200,7 @@ PerlValue *perl_clone(const PerlValue *src) {
     return v;
 }
 
-void perl_free(PerlValue *v) {
+HOTX void perl_free(PerlValue *v) {
     if (!v) return;
     if (v->tag == PERL_STRING) free(v->sval);
     /* CODE_REF: pval points to a shared PerlClosure; don't free it here since
@@ -209,7 +212,7 @@ void perl_free(PerlValue *v) {
 
 /* ── coercions ───────────────────────────────────────────────────────────── */
 
-long long perl_to_int(const PerlValue *v) {
+HOTX long long perl_to_int(const PerlValue *v) {
     if (!v) return 0;
     switch (v->tag) {
         case PERL_INT:    return v->ival;
@@ -219,7 +222,7 @@ long long perl_to_int(const PerlValue *v) {
     }
 }
 
-double perl_to_float(const PerlValue *v) {
+HOTX double perl_to_float(const PerlValue *v) {
     if (!v) return 0.0;
     switch (v->tag) {
         case PERL_INT:    return (double)v->ival;
@@ -290,7 +293,7 @@ int perl_is_true(const PerlValue *v) {
     }
 }
 
-void perl_assign(PerlValue *dst, const PerlValue *src) {
+HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!dst) return;
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
@@ -303,28 +306,28 @@ void perl_assign(PerlValue *dst, const PerlValue *src) {
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
-static int both_int(const PerlValue *a, const PerlValue *b) {
+HOT int both_int(const PerlValue *a, const PerlValue *b) {
     return a->tag == PERL_INT && b->tag == PERL_INT;
 }
 
 /* ── arithmetic ──────────────────────────────────────────────────────────── */
 
-PerlValue *perl_add(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_add(const PerlValue *a, const PerlValue *b) {
     if (both_int(a, b)) return perl_alloc_int(a->ival + b->ival);
     return perl_alloc_float(perl_to_float(a) + perl_to_float(b));
 }
 
-PerlValue *perl_sub(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_sub(const PerlValue *a, const PerlValue *b) {
     if (both_int(a, b)) return perl_alloc_int(a->ival - b->ival);
     return perl_alloc_float(perl_to_float(a) - perl_to_float(b));
 }
 
-PerlValue *perl_mul(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_mul(const PerlValue *a, const PerlValue *b) {
     if (both_int(a, b)) return perl_alloc_int(a->ival * b->ival);
     return perl_alloc_float(perl_to_float(a) * perl_to_float(b));
 }
 
-PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
     double bv = perl_to_float(b);
     if (bv == 0.0) { fprintf(stderr, "Illegal division by zero\n"); exit(1); }
     if (both_int(a, b) && a->ival % b->ival == 0)
@@ -376,22 +379,22 @@ PerlValue *perl_repeat_str(const PerlValue *str, const PerlValue *n) {
 
 /* ── numeric comparisons ─────────────────────────────────────────────────── */
 
-PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_to_float(a) == perl_to_float(b));
 }
-PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_to_float(a) != perl_to_float(b));
 }
-PerlValue *perl_num_lt(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_num_lt(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_to_float(a) <  perl_to_float(b));
 }
-PerlValue *perl_num_gt(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_num_gt(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_to_float(a) >  perl_to_float(b));
 }
-PerlValue *perl_num_le(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_num_le(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_to_float(a) <= perl_to_float(b));
 }
-PerlValue *perl_num_ge(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_num_ge(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_to_float(a) >= perl_to_float(b));
 }
 
