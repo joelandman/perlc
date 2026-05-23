@@ -246,6 +246,7 @@ PerlValue *perl_ref_array(PerlArray *a);
 PerlValue *perl_ref_hash(PerlHash *h);
 PerlValue *perl_deref_scalar(PerlValue *ref);   /* returns (PerlValue*)ref->pval */
 PerlArray *perl_deref_array(PerlValue *ref);    /* returns (PerlArray*)ref->pval */
+PerlArray *perl_deref_array_ro(PerlValue *ref); /* fast read-only variant, assumes REF_ARRAY */
 PerlHash  *perl_deref_hash(PerlValue *ref);     /* returns (PerlHash*)ref->pval */
 PerlValue *perl_ref_type(PerlValue *ref);       /* "SCALAR"/"ARRAY"/"HASH"/""   */
 

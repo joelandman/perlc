@@ -161,7 +161,8 @@ void CodeGen::declareRuntime() {
     RT("perl_ref_array",    pv, av);
     RT("perl_ref_hash",     pv, av);  /* PerlHash* treated as opaque av */
     RT("perl_deref_scalar", pv, pv);
-    RT("perl_deref_array",  av, pv);
+    RT("perl_deref_array",    av, pv);
+    RT("perl_deref_array_ro", av, pv);
     RT("perl_deref_hash",   av, pv);  /* returns PerlHash* as opaque av */
     RT("perl_ref_type",     pv, pv);
     /* file I/O */
@@ -282,6 +283,15 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_readdir_all",      av, pv);
     RT("perl_closedir_fh",      voidTy, pv);
 #undef RT
+
+    /* Mark pure read-only functions so GVN/LICM can eliminate redundant calls */
+    for (const char *nm : {"perl_array_get_ref", "perl_to_float", "perl_to_int",
+                            "perl_array_len", "perl_deref_array_ro"}) {
+        auto *F = getRTFunc(nm);
+        F->setMemoryEffects(MemoryEffects::readOnly());
+        F->addFnAttr(Attribute::NoUnwind);
+        F->addFnAttr(Attribute::WillReturn);
+    }
 }
 
 Function *CodeGen::getRTFunc(const std::string &nm) {
@@ -1039,13 +1049,24 @@ Value *CodeGen::emitExprF64(const Node &n) {
     }
     case NK::ArrowDeref: {
         /* $ref->[$i] or $ref->{k} read — unbox the element */
-        Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
-            Value *av  = callRT("perl_deref_array", {base});
-            freeIfOwned(base);
+            /* 2D pattern $arr->[$i][$k]: emit full readonly chain so GVN can CSE */
+            if (n.left->kind == NK::ArrowDeref && n.left->sval == "array") {
+                Value *outerBase = emitExpr(*n.left->left);
+                Value *outerArr  = callRT("perl_deref_array_ro", {outerBase});
+                freeIfOwned(outerBase);
+                Value *innerRef  = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
+                Value *innerArr  = callRT("perl_deref_array_ro", {innerRef});
+                Value *elem      = callRT("perl_array_get_ref", {innerArr, emitIdx(*n.right)});
+                return callRT("perl_to_float", {elem});
+            }
+            Value *base2 = emitExpr(*n.left);
+            Value *av  = callRT("perl_deref_array_ro", {base2});  /* readonly: enables GVN/LICM */
+            freeIfOwned(base2);
             Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
             return callRT("perl_to_float", {elem});
         } else {
+            Value *base = emitExpr(*n.left);
             Value *hv = callRT("perl_deref_hash", {base});
             freeIfOwned(base);
             Value *elem = emitHashGetRef(hv, *n.right);
@@ -2136,19 +2157,29 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *idx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
                 Value *elem = callRT("perl_array_get_ref", {rhsArr, idx});
                 callRT("perl_assign", {pv, elem});
-                /* promote @_ scalar args to float allocas when only used numerically */
+                /* promote @_ scalar args to float/int allocas when only used numerically */
                 if (fromUnderbar && currentSubBody_) {
                     auto *varNode = n.left->args[i].get();
                     if (varNode->kind == NK::ScalarVar) {
                         const std::string &nm = varNode->name;
-                        if (!lookupFloatVar(nm) && !lookupIntVar(nm) &&
-                            needsFloatPrec(*currentSubBody_, nm) &&
-                            floatSafe(*currentSubBody_, nm, false)) {
-                            auto *f64 = Type::getDoubleTy(ctx_);
-                            auto *fa  = builder_.CreateAlloca(f64, nullptr, nm + ".f");
-                            Value *dbl = callRT("perl_to_float", {pv});
-                            builder_.CreateStore(dbl, fa);
-                            declareFloatVar(nm, fa);
+                        if (!lookupFloatVar(nm) && !lookupIntVar(nm)) {
+                            bool safe    = floatSafe(*currentSubBody_, nm, false);
+                            bool needFP  = needsFloatPrec(*currentSubBody_, nm);
+                            if (safe && needFP) {
+                                /* float promotion: var needs fractional precision */
+                                auto *f64 = Type::getDoubleTy(ctx_);
+                                auto *fa  = builder_.CreateAlloca(f64, nullptr, nm + ".f");
+                                Value *dbl = callRT("perl_to_float", {pv});
+                                builder_.CreateStore(dbl, fa);
+                                declareFloatVar(nm, fa);
+                            } else if (safe && !needFP && hasVar(*currentSubBody_, nm)) {
+                                /* int promotion: var only used in integer contexts */
+                                auto *i64 = Type::getInt64Ty(ctx_);
+                                auto *ia  = builder_.CreateAlloca(i64, nullptr, nm + ".i");
+                                Value *ival = callRT("perl_to_int", {pv});
+                                builder_.CreateStore(ival, ia);
+                                declareIntVar(nm, ia);
+                            }
                         }
                     }
                 }
@@ -2372,11 +2403,21 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         /* $ref->[$i] op= rhs  or  $ref->{k} op= rhs */
         if (n.left->kind == NK::ArrowDeref) {
-            Value *base = emitExpr(*n.left->left);
             Value *lhsVal, *rhsVal, *result;
             if (n.left->sval == "array") {
-                Value *av  = callRT("perl_deref_array", {base});
-                freeIfOwned(base);
+                /* 2D pattern $arr->[$i][$k] op= rhs: all-readonly deref chain */
+                Value *av;
+                if (n.left->left->kind == NK::ArrowDeref && n.left->left->sval == "array") {
+                    Value *outerBase = emitExpr(*n.left->left->left);
+                    Value *outerArr  = callRT("perl_deref_array_ro", {outerBase});
+                    freeIfOwned(outerBase);
+                    Value *innerRef  = callRT("perl_array_get_ref",  {outerArr, emitIdx(*n.left->left->right)});
+                    av               = callRT("perl_deref_array_ro", {innerRef});
+                } else {
+                    Value *base = emitExpr(*n.left->left);
+                    av = callRT("perl_deref_array_ro", {base});
+                    freeIfOwned(base);
+                }
                 Value *idx = emitIdx(*n.left->right);
                 /* Fast path: RHS is F64 and op is arithmetic — update in place, zero alloc */
                 if (canEmitF64(*n.right)) {
@@ -2406,8 +2447,9 @@ Value *CodeGen::emitExpr(const Node &n) {
                 freeIfOwned(rhsVal);
                 callRT("perl_array_set", {av, idx, result});
             } else {
-                Value *hv = callRT("perl_deref_hash", {base});
-                freeIfOwned(base);
+                Value *hashBase = emitExpr(*n.left->left);
+                Value *hv = callRT("perl_deref_hash", {hashBase});
+                freeIfOwned(hashBase);
                 lhsVal = emitHashGetRef(hv, *n.left->right);
                 rhsVal = emitExpr(*n.right);
                 result = applyOp(lhsVal, rhsVal);

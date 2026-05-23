@@ -212,7 +212,7 @@ HOTX void perl_free(PerlValue *v) {
 
 /* ── coercions ───────────────────────────────────────────────────────────── */
 
-HOTX long long perl_to_int(const PerlValue *v) {
+__attribute__((pure)) HOTX long long perl_to_int(const PerlValue *v) {
     if (!v) return 0;
     switch (v->tag) {
         case PERL_INT:    return v->ival;
@@ -222,7 +222,7 @@ HOTX long long perl_to_int(const PerlValue *v) {
     }
 }
 
-HOTX double perl_to_float(const PerlValue *v) {
+__attribute__((pure)) HOTX double perl_to_float(const PerlValue *v) {
     if (!v) return 0.0;
     switch (v->tag) {
         case PERL_INT:    return (double)v->ival;
@@ -558,7 +558,7 @@ static PerlValue pv_undef_sentinel_ = { PERL_UNDEF, {0}, 0, NULL };
 
 /* Borrow-read: returns raw pointer into the array (no clone, no alloc).
  * Valid until the array is next modified. Never call perl_free on the result. */
-HOTX PerlValue *perl_array_get_ref(PerlArray *a, long long idx) {
+__attribute__((pure)) HOTX PerlValue *perl_array_get_ref(PerlArray *a, long long idx) {
     if (idx < 0) idx += a->len;
     if (idx < 0 || idx >= a->len) return &pv_undef_sentinel_;
     return a->elems[idx];
@@ -1030,6 +1030,11 @@ PerlValue *perl_deref_scalar(PerlValue *ref) {
 
 PerlArray *perl_deref_array(PerlValue *ref) {
     if (!ref || ref->tag != PERL_REF_ARRAY) return perl_array_new();
+    return (PerlArray *)ref->pval;
+}
+
+/* Fast read-only deref — caller guarantees ref is a valid REF_ARRAY */
+__attribute__((pure)) HOTX PerlArray *perl_deref_array_ro(PerlValue *ref) {
     return (PerlArray *)ref->pval;
 }
 
