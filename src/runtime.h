@@ -102,6 +102,7 @@ void       perl_array_free(PerlArray *a);
 void       perl_array_push(PerlArray *a, PerlValue *v);
 PerlValue *perl_array_pop(PerlArray *a);
 PerlValue *perl_array_get(PerlArray *a, long long idx);
+PerlValue *perl_array_get_ref(PerlArray *a, long long idx); /* borrow: no clone, never free result */
 void       perl_array_set(PerlArray *a, long long idx, PerlValue *v);
 PerlValue *perl_array_len(PerlArray *a);
 void       perl_array_sort_str(PerlArray *a);
@@ -139,6 +140,7 @@ void       perl_hash_free(PerlHash *h);
 
 /* key is a PerlValue* — stringified internally */
 PerlValue *perl_hash_get_sv(PerlHash *h, PerlValue *key);
+PerlValue *perl_hash_get_sv_ref(PerlHash *h, PerlValue *key); /* borrow: no clone, never free result */
 void       perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val);
 int        perl_hash_exists_sv(PerlHash *h, PerlValue *key);
 PerlValue *perl_hash_delete_sv(PerlHash *h, PerlValue *key);

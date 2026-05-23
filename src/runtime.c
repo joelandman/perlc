@@ -552,6 +552,18 @@ PerlValue *perl_array_get(PerlArray *a, long long idx) {
     return perl_clone(a->elems[idx]);
 }
 
+/* Shared read-only sentinel returned by _ref functions on missing key/index.
+ * Callers must never free or mutate this pointer. */
+static PerlValue pv_undef_sentinel_ = { PERL_UNDEF, {0}, 0, NULL };
+
+/* Borrow-read: returns raw pointer into the array (no clone, no alloc).
+ * Valid until the array is next modified. Never call perl_free on the result. */
+HOTX PerlValue *perl_array_get_ref(PerlArray *a, long long idx) {
+    if (idx < 0) idx += a->len;
+    if (idx < 0 || idx >= a->len) return &pv_undef_sentinel_;
+    return a->elems[idx];
+}
+
 void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
     if (idx < 0) idx += a->len;
     /* extend if needed */
@@ -839,6 +851,15 @@ PerlValue *perl_hash_get_sv(PerlHash *h, PerlValue *key) {
     PerlHashEntry *e = hash_find(h, ks);
     free(ks);
     return e ? perl_clone(e->val) : perl_alloc_undef();
+}
+
+/* Borrow-read: returns raw pointer into hash bucket (no clone, no alloc).
+ * Valid until the hash is next modified. Never call perl_free on the result. */
+HOTX PerlValue *perl_hash_get_sv_ref(PerlHash *h, PerlValue *key) {
+    char *ks = perl_to_string(key);
+    PerlHashEntry *e = hash_find(h, ks);
+    free(ks);
+    return e ? e->val : &pv_undef_sentinel_;
 }
 
 void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
