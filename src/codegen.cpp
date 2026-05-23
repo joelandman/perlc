@@ -581,8 +581,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *av  = lookupArray(n.name);
         Value *res = callRT("perl_array_new", {});
         for (auto &idxNode : n.args) {
-            Value *idx  = callRT("perl_to_int", {emitExpr(*idxNode)});
-            Value *elem = av ? callRT("perl_array_get_ref", {av, idx}) : perlUndef();
+            Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(*idxNode)}) : perlUndef();
             callRT("perl_array_push", {res, elem});
         }
         return res;
@@ -826,6 +825,31 @@ Value *CodeGen::tryEmitI1Cond(const Node &n) {
     return builder_.CreateICmp(pred, lv, rv, "icmp");
 }
 
+/* Emit an array index as a bare i64, bypassing PerlValue boxing.
+   - IntLit → ConstantInt (zero allocation)
+   - int var → load from alloca (zero allocation)
+   - float var → FPToSI (zero allocation)
+   - anything else → emitExpr + perl_to_int + freeIfOwned */
+Value *CodeGen::emitIdx(const Node &n) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    if (n.kind == NK::IntLit)
+        return ConstantInt::get(i64, n.ival);
+    if (n.kind == NK::ScalarVar) {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        if (Value *ia = lookupIntVar(nm))
+            return builder_.CreateLoad(i64, ia, nm + ".i");
+        if (Value *fa = lookupFloatVar(nm)) {
+            Value *d = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
+            return builder_.CreateFPToSI(d, i64, nm + ".i");
+        }
+    }
+    Value *pv = emitExpr(n);
+    Value *i  = callRT("perl_to_int", {pv});
+    freeIfOwned(pv);
+    return i;
+}
+
 /* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
    Used to decide whether a @_ scalar arg can be promoted to a float alloca.
    'inNum' = the parent node is a numeric expression (so nm here is safe). */
@@ -1009,23 +1033,16 @@ Value *CodeGen::emitExprF64(const Node &n) {
     case NK::ArrayElem: {
         Value *av = lookupArray(n.name);
         if (!av) return nullptr;
-        /* Use boxed index evaluation */
-        Value *idxPv = emitExpr(*n.left);
-        Value *i = callRT("perl_to_int", {idxPv});
-        freeIfOwned(idxPv);
-        Value *elem = callRT("perl_array_get_ref", {av, i});
+        Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.left)});
         return callRT("perl_to_float", {elem});
     }
     case NK::ArrowDeref: {
         /* $ref->[$i] or $ref->{k} read — unbox the element */
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
-            Value *sub = emitExpr(*n.right);
             Value *av  = callRT("perl_deref_array", {base});
             freeIfOwned(base);
-            Value *idx = callRT("perl_to_int", {sub});
-            freeIfOwned(sub);
-            Value *elem = callRT("perl_array_get_ref", {av, idx});
+            Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
             return callRT("perl_to_float", {elem});
         } else {
             Value *hv = callRT("perl_deref_hash", {base});
@@ -1894,9 +1911,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::ArrayElem: {
         Value *av = lookupArray(n.name);
         if (!av) return perlUndef();
-        Value *idx = emitExpr(*n.left);
-        Value *i   = callRT("perl_to_int", {idx});
-        return callRT("perl_array_get_ref", {av, i});
+        return callRT("perl_array_get_ref", {av, emitIdx(*n.left)});
     }
 
     case NK::ArrayVar: {
@@ -2130,12 +2145,9 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *base = emitExpr(*n.left->left);
             Value *rhs  = emitExpr(*n.right);
             if (n.left->sval == "array") {
-                Value *av      = callRT("perl_deref_array", {base});
+                Value *av = callRT("perl_deref_array", {base});
                 freeIfOwned(base);
-                Value *idxExpr = emitExpr(*n.left->right);
-                Value *idx     = callRT("perl_to_int", {idxExpr});
-                freeIfOwned(idxExpr);
-                callRT("perl_array_set", {av, idx, rhs});
+                callRT("perl_array_set", {av, emitIdx(*n.left->right), rhs});
             } else {
                 Value *hv = callRT("perl_deref_hash", {base});
                 freeIfOwned(base);
@@ -2145,13 +2157,10 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         /* $arr[i] = val */
         if (n.left->kind == NK::ArrayElem) {
-            Value *av  = lookupArray(n.left->name);
+            Value *av = lookupArray(n.left->name);
             if (!av) return perlUndef();
-            Value *rhs     = emitExpr(*n.right);
-            Value *idxExpr = emitExpr(*n.left->left);
-            Value *idx     = callRT("perl_to_int", {idxExpr});
-            freeIfOwned(idxExpr);
-            callRT("perl_array_set", {av, idx, rhs});
+            Value *rhs = emitExpr(*n.right);
+            callRT("perl_array_set", {av, emitIdx(*n.left->left), rhs});
             return rhs;
         }
         /* opendir assignment: opendir(my $dh, path) stores DIRHANDLE into $dh */
@@ -2289,9 +2298,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ArrayElem) {
             Value *av = lookupArray(n.left->name);
             if (!av) return perlUndef();
-            Value *idxExpr = emitExpr(*n.left->left);
-            Value *idx     = callRT("perl_to_int", {idxExpr});
-            freeIfOwned(idxExpr);
+            Value *idx    = emitIdx(*n.left->left);
             Value *lhsVal = callRT("perl_array_get_ref", {av, idx});
             Value *rhsVal = emitExpr(*n.right);
             Value *result = applyOp(lhsVal, rhsVal);
@@ -2317,11 +2324,9 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *base = emitExpr(*n.left->left);
             Value *lhsVal, *rhsVal, *result;
             if (n.left->sval == "array") {
-                Value *av      = callRT("perl_deref_array", {base});
+                Value *av  = callRT("perl_deref_array", {base});
                 freeIfOwned(base);
-                Value *idxExpr = emitExpr(*n.left->right);
-                Value *idx     = callRT("perl_to_int", {idxExpr});
-                freeIfOwned(idxExpr);
+                Value *idx = emitIdx(*n.left->right);
                 lhsVal = callRT("perl_array_get_ref", {av, idx});
                 rhsVal = emitExpr(*n.right);
                 result = applyOp(lhsVal, rhsVal);
@@ -2637,12 +2642,9 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::ArrowDeref: {
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
-            Value *sub = emitExpr(*n.right);
-            Value *av  = callRT("perl_deref_array", {base});
+            Value *av = callRT("perl_deref_array", {base});
             freeIfOwned(base);
-            Value *idx = callRT("perl_to_int", {sub});
-            freeIfOwned(sub);
-            return callRT("perl_array_get_ref", {av, idx});
+            return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
         } else {
             Value *hv = callRT("perl_deref_hash", {base});
             freeIfOwned(base);
@@ -2707,8 +2709,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *av  = lookupArray(n.name);
         Value *res = callRT("perl_array_new", {});
         for (auto &idxNode : n.args) {
-            Value *idx = callRT("perl_to_int", {emitExpr(*idxNode)});
-            Value *elem = av ? callRT("perl_array_get_ref", {av, idx}) : perlUndef();
+            Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(*idxNode)}) : perlUndef();
             callRT("perl_array_push", {res, elem});
         }
         return callRT("perl_ref_array", {res});

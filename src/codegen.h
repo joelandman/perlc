@@ -125,6 +125,7 @@ private:
     llvm::Value *emitExprI64(const Node &n);
     llvm::Value *boxI64(llvm::Value *iv);
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons, else nullptr */
+    llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);
