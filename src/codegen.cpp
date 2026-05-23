@@ -6,6 +6,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <stdexcept>
 #include <sstream>
+#include <unordered_set>
 
 using namespace llvm;
 
@@ -113,6 +114,7 @@ void CodeGen::declareRuntime() {
     RT("perl_inc",           pv,  pv);
     RT("perl_dec",           pv,  pv);
     RT("perl_array_new",     av);
+    RT("perl_array_free",    voidTy, av);
     RT("perl_array_push",    voidTy, av, pv);
     RT("perl_array_pop",     pv,  av);
     RT("perl_array_get",     pv,  av, i64);
@@ -278,8 +280,20 @@ Function *CodeGen::getRTFunc(const std::string &nm) {
 
 /* ── scope management ────────────────────────────────────────────────────── */
 
-void CodeGen::pushScope()  { scopes_.emplace_back(); arrayScopes_.emplace_back(); hashScopes_.emplace_back(); }
-void CodeGen::popScope()   { scopes_.pop_back(); arrayScopes_.pop_back(); hashScopes_.pop_back(); }
+void CodeGen::pushScope()  {
+    scopes_.emplace_back(); arrayScopes_.emplace_back();
+    hashScopes_.emplace_back(); pvScopes_.emplace_back();
+}
+void CodeGen::popScope() {
+    /* free stable PerlValue*s for my-vars going out of scope, unless in dead block */
+    auto *bb = builder_.GetInsertBlock();
+    if (bb && !bb->getTerminator() && !pvScopes_.empty()) {
+        for (Value *pv : pvScopes_.back())
+            callRT("perl_free", {pv});
+    }
+    scopes_.pop_back(); arrayScopes_.pop_back();
+    hashScopes_.pop_back(); pvScopes_.pop_back();
+}
 
 Value *CodeGen::lookupVar(const std::string &nm) {
     for (int i = (int)scopes_.size() - 1; i >= 0; i--) {
@@ -293,6 +307,16 @@ Value *CodeGen::lookupVar(const std::string &nm) {
 
 void CodeGen::declareVar(const std::string &nm, Value *a) {
     scopes_.back()[nm] = a;
+}
+
+void CodeGen::trackPv(Value *pv) {
+    if (!pvScopes_.empty()) pvScopes_.back().push_back(pv);
+}
+
+void CodeGen::emitScopeCleanup() {
+    for (int i = (int)pvScopes_.size() - 1; i >= 0; i--)
+        for (Value *pv : pvScopes_[i])
+            callRT("perl_free", {pv});
 }
 
 Value *CodeGen::lookupArray(const std::string &nm) {
@@ -419,7 +443,10 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::Range) {
         Value *lo = emitExpr(*n.left);
         Value *hi = emitExpr(*n.right);
-        return callRT("perl_range", {lo, hi});
+        Value *arr = callRT("perl_range", {lo, hi});
+        freeIfOwned(lo);
+        freeIfOwned(hi);
+        return arr;
     }
     if (n.kind == NK::ReverseFunc) {
         /* reverse @arr or reverse LIST — return new reversed array */
@@ -592,6 +619,45 @@ Value *CodeGen::perlStr(const std::string &s) {
     return callRT("perl_alloc_string", {gv});
 }
 
+bool CodeGen::isOwnedTemp(llvm::Value *v) {
+    auto *ci = llvm::dyn_cast<llvm::CallInst>(v);
+    if (!ci) return false;
+    auto *fn = ci->getCalledFunction();
+    if (!fn) return false;
+    llvm::StringRef nm = fn->getName();
+    /* user-defined subs always return a freshly cloned PerlValue* */
+    if (nm.starts_with("perlsub_")) return true;
+    static const std::unordered_set<std::string> owned = {
+        "perl_alloc_int", "perl_alloc_float", "perl_alloc_string", "perl_alloc_undef",
+        "perl_add",    "perl_sub",    "perl_mul",    "perl_div",    "perl_mod",
+        "perl_pow",    "perl_negate", "perl_not",    "perl_concat", "perl_repeat_str",
+        "perl_num_eq", "perl_num_ne", "perl_num_lt", "perl_num_gt",
+        "perl_num_le", "perl_num_ge",
+        "perl_str_eq", "perl_str_ne", "perl_str_lt", "perl_str_gt",
+        "perl_str_le", "perl_str_ge",
+        "perl_spaceship", "perl_str_spaceship",
+        "perl_array_get", "perl_hash_get_sv",
+        "perl_ref_type", "perl_ref_array", "perl_ref_scalar",
+        "perl_clone", "perl_sprintf", "perl_array_len",
+        /* single-arg math/string builtins */
+        "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
+        "perl_uc_str", "perl_lc_str", "perl_ucfirst_str", "perl_lcfirst_str",
+        "perl_chr_val", "perl_ord_val",
+        "perl_length", "perl_substr2", "perl_substr3",
+        "perl_chop", "perl_index_str", "perl_rindex_str",
+        "perl_array_pop", "perl_array_shift",
+        "perl_hex_val", "perl_oct_val",
+        "perl_defined", "perl_ref_type",
+        /* hash/array access */
+        "perl_hash_delete_sv",
+    };
+    return owned.count(nm.str()) > 0;
+}
+
+void CodeGen::freeIfOwned(llvm::Value *v) {
+    if (isOwnedTemp(v)) callRT("perl_free", {v});
+}
+
 /* ── top-level compile ───────────────────────────────────────────────────── */
 
 void CodeGen::compile(const Node &program, const std::string &modName) {
@@ -722,6 +788,7 @@ void CodeGen::emitSub(const Node &n) {
         auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
         builder_.CreateStore(udv, slotUs);
         declareVar("_", slotUs);
+        trackPv(udv);  /* ensure $_ stable pv is freed on scope exit */
     }
 
     /* capture local() save depth at function entry */
@@ -735,9 +802,9 @@ void CodeGen::emitSub(const Node &n) {
         callRT("perl_pop_wantarray", {});
         Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
         callRT("perl_local_restore_to", {depth});
+        popScope();  /* free $_ */
         builder_.CreateRet(perlUndef());
         localDepthAlloca_ = savedLocalDepth;
-        popScope();
         currentFn_ = savedFn;
         return;
     }
@@ -749,11 +816,13 @@ void CodeGen::emitSub(const Node &n) {
         callRT("perl_pop_wantarray", {});
         Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
         callRT("perl_local_restore_to", {depth});
+        popScope();  /* free $_ and other function-scope pvs before ret */
         builder_.CreateRet(lastVal);
+    } else {
+        popScope();  /* explicit return: emitScopeCleanup already freed pvs; skip due to terminator */
     }
     localDepthAlloca_ = savedLocalDepth;
 
-    popScope();
     currentFn_ = savedFn;
 
     /* restore insert point to end of main (for any remaining stmts) */
@@ -818,7 +887,7 @@ void CodeGen::emitStmt(const Node &n) {
         break;
 
     case NK::ExprStmt:
-        emitExpr(*n.left); break;
+        freeIfOwned(emitExpr(*n.left)); break;
 
     case NK::My: {
         if (n.name.empty()) break;
@@ -877,6 +946,7 @@ void CodeGen::emitStmt(const Node &n) {
                 if (n.right) {
                     Value *init = emitExpr(*n.right);
                     callRT("perl_assign", {pv, init});
+                    freeIfOwned(init);
                 }
                 fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
@@ -885,9 +955,11 @@ void CodeGen::emitStmt(const Node &n) {
                 /* allocate a stable PerlValue* that lives for this variable's lifetime */
                 Value *pv = perlUndef();
                 builder_.CreateStore(pv, alloca);
+                trackPv(pv);
                 if (n.right) {
                     Value *init = emitExpr(*n.right);
                     callRT("perl_assign", {pv, init});
+                    freeIfOwned(init);
                 }
                 declareVar(nm, alloca);
             }
@@ -976,6 +1048,7 @@ void CodeGen::emitStmt(const Node &n) {
             }
             Value *cond = emitExpr(*br.cond);
             Value *b    = callRT("perl_is_true", {cond});
+            freeIfOwned(cond);
             Value *bv   = builder_.CreateICmpNE(b,
                             ConstantInt::get(Type::getInt32Ty(ctx_), 0));
             auto *thenBB = BasicBlock::Create(ctx_, "if.then", fn);
@@ -1029,12 +1102,14 @@ void CodeGen::emitStmt(const Node &n) {
         if (myCondPv) {
             Value *rhs = myCondRhs ? emitExpr(*myCondRhs) : perlUndef();
             callRT("perl_assign", {myCondPv, rhs});
+            freeIfOwned(rhs);
             cv = myCondPv;
         } else {
             cv = emitExpr(*n.cond);
         }
 
         Value *bv = callRT("perl_is_true", {cv});
+        if (!myCondPv) freeIfOwned(cv);
         Value *b  = builder_.CreateICmpNE(bv,
                         ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         builder_.CreateCondBr(b, body, exit);
@@ -1068,6 +1143,7 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.SetInsertPoint(cond);
         Value *cv = emitExpr(*n.cond);
         Value *bv = callRT("perl_is_true", {cv});
+        freeIfOwned(cv);
         Value *b  = builder_.CreateICmpNE(bv,
                         ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         builder_.CreateCondBr(b, body, exit);
@@ -1096,6 +1172,7 @@ void CodeGen::emitStmt(const Node &n) {
         if (n.cond) {
             Value *cv = emitExpr(*n.cond);
             Value *bv = callRT("perl_is_true", {cv});
+            freeIfOwned(cv);
             Value *b  = builder_.CreateICmpNE(bv,
                             ConstantInt::get(Type::getInt32Ty(ctx_), 0));
             builder_.CreateCondBr(b, bodyBB, exit);
@@ -1109,13 +1186,13 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.CreateBr(stepBB);
 
         builder_.SetInsertPoint(stepBB);
-        if (n.step) emitExpr(*n.step);
+        if (n.step) freeIfOwned(emitExpr(*n.step));
         builder_.CreateBr(condBB);
 
-        popScope();
         loopExits_.pop_back();
         loopContinues_.pop_back();
         builder_.SetInsertPoint(exit);
+        popScope();  /* free for-init pvs (e.g. my $i) at loop exit */
         break;
     }
 
@@ -1125,11 +1202,16 @@ void CodeGen::emitStmt(const Node &n) {
 
         /* build iteration array — try emitArrayPtr first for keys/sort/@arr */
         Value *tmpArr = nullptr;
+        bool ownsTmpArr = false;
         if (n.args.size() == 1) {
             tmpArr = emitArrayPtr(*n.args[0]);
+            /* owned if not a direct reference to an existing named/deref'd array */
+            NK k = n.args[0]->kind;
+            ownsTmpArr = tmpArr && (k != NK::ArrayVar && k != NK::DerefArray);
         }
         if (!tmpArr) {
             tmpArr = callRT("perl_array_new", {});
+            ownsTmpArr = true;
             for (auto &elem : n.args) {
                 Value *v = emitExpr(*elem);
                 callRT("perl_array_push", {tmpArr, v});
@@ -1160,6 +1242,7 @@ void CodeGen::emitStmt(const Node &n) {
         Value *idx  = builder_.CreateLoad(Type::getInt64Ty(ctx_), idxAlloca);
         Value *lenV = callRT("perl_array_len", {tmpArr});
         Value *len  = callRT("perl_to_int", {lenV});
+        callRT("perl_free", {lenV});
         Value *cmp  = builder_.CreateICmpSLT(idx, len);
         builder_.CreateCondBr(cmp, bodyBB, exit);
 
@@ -1168,12 +1251,12 @@ void CodeGen::emitStmt(const Node &n) {
         declareVar(n.name, loopVar);
         Value *elem = callRT("perl_array_get", {tmpArr, idx});
         callRT("perl_assign", {loopPv, elem});
+        callRT("perl_free", {elem});
 
         emitBlock(*n.body);
+        popScope();  /* free loop-body pvs before branch */
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(stepBB);
-
-        popScope();
 
         builder_.SetInsertPoint(stepBB);
         Value *idx2 = builder_.CreateLoad(Type::getInt64Ty(ctx_), idxAlloca);
@@ -1184,6 +1267,8 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.pop_back();
         loopContinues_.pop_back();
         builder_.SetInsertPoint(exit);
+        callRT("perl_free", {loopPv});
+        if (ownsTmpArr) callRT("perl_array_free", {tmpArr});
         break;
     }
 
@@ -1205,10 +1290,12 @@ void CodeGen::emitStmt(const Node &n) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             Value *cloned = callRT("perl_clone", {v});
+            freeIfOwned(v);
             callRT("perl_pop_wantarray", {});
             callRT("perl_local_restore_to", {depth});
             v = cloned;
         }
+        emitScopeCleanup();  /* free tracked my-var pvs in all active scopes */
         builder_.CreateRet(v);
         break;
     }
@@ -1405,8 +1492,12 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::Range: {
         /* in scalar context, return the element count */
-        Value *av = callRT("perl_range", {emitExpr(*n.left), emitExpr(*n.right)});
-        return callRT("perl_array_len", {av});
+        Value *lo = emitExpr(*n.left), *hi = emitExpr(*n.right);
+        Value *av  = callRT("perl_range", {lo, hi});
+        freeIfOwned(lo); freeIfOwned(hi);
+        Value *len = callRT("perl_array_len", {av});
+        callRT("perl_array_free", {av});
+        return len;
     }
 
     case NK::Readline: {
@@ -1479,8 +1570,18 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::BinOp:     return emitBinOp(n);
 
     case NK::UnaryOp: {
-        if (n.sval == "-")     return callRT("perl_negate", {emitExpr(*n.left)});
-        if (n.sval == "!")     return callRT("perl_not",    {emitExpr(*n.left)});
+        if (n.sval == "-") {
+            Value *operand = emitExpr(*n.left);
+            Value *result  = callRT("perl_negate", {operand});
+            freeIfOwned(operand);
+            return result;
+        }
+        if (n.sval == "!") {
+            Value *operand = emitExpr(*n.left);
+            Value *result  = callRT("perl_not", {operand});
+            freeIfOwned(operand);
+            return result;
+        }
         if (n.sval == "pre++") {
             Value *v = emitExpr(*n.left); callRT("perl_inc", {v}); return v;
         }
@@ -1510,9 +1611,11 @@ Value *CodeGen::emitExpr(const Node &n) {
             for (size_t i = 0; i < n.left->args.size(); i++) {
                 auto *slot = emitLValue(*n.left->args[i]);
                 if (!slot) continue;
+                Value *pv  = builder_.CreateLoad(perlPtrTy_, slot);
                 Value *idx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
                 Value *elem = callRT("perl_array_get", {rhsArr, idx});
-                builder_.CreateStore(elem, slot);
+                callRT("perl_assign", {pv, elem});
+                freeIfOwned(elem);
             }
             return perlUndef();
         }
@@ -1522,6 +1625,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *key = emitExpr(*n.left->left);
                 Value *val = emitExpr(*n.right);
                 callRT("perl_env_set", {key, val});
+                freeIfOwned(key);
                 return val;
             }
             Value *hv = lookupHash(n.left->name);
@@ -1529,6 +1633,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *key = emitExpr(*n.left->left);
             Value *val = emitExpr(*n.right);
             callRT("perl_hash_set_sv", {hv, key, val});
+            freeIfOwned(key);
             return val;
         }
         /* %h = (list) */
@@ -1556,13 +1661,18 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *base = emitExpr(*n.left->left);
             Value *rhs  = emitExpr(*n.right);
             if (n.left->sval == "array") {
-                Value *av  = callRT("perl_deref_array", {base});
-                Value *idx = callRT("perl_to_int", {emitExpr(*n.left->right)});
+                Value *av      = callRT("perl_deref_array", {base});
+                freeIfOwned(base);
+                Value *idxExpr = emitExpr(*n.left->right);
+                Value *idx     = callRT("perl_to_int", {idxExpr});
+                freeIfOwned(idxExpr);
                 callRT("perl_array_set", {av, idx, rhs});
             } else {
                 Value *hv  = callRT("perl_deref_hash",  {base});
+                freeIfOwned(base);
                 Value *key = emitExpr(*n.left->right);
                 callRT("perl_hash_set_sv", {hv, key, rhs});
+                freeIfOwned(key);
             }
             return rhs;
         }
@@ -1570,8 +1680,10 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ArrayElem) {
             Value *av  = lookupArray(n.left->name);
             if (!av) return perlUndef();
-            Value *rhs = emitExpr(*n.right);
-            Value *idx = callRT("perl_to_int", {emitExpr(*n.left->left)});
+            Value *rhs     = emitExpr(*n.right);
+            Value *idxExpr = emitExpr(*n.left->left);
+            Value *idx     = callRT("perl_to_int", {idxExpr});
+            freeIfOwned(idxExpr);
             callRT("perl_array_set", {av, idx, rhs});
             return rhs;
         }
@@ -1614,10 +1726,14 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ArrayElem) {
             Value *av = lookupArray(n.left->name);
             if (!av) return perlUndef();
-            Value *idx    = callRT("perl_to_int", {emitExpr(*n.left->left)});
+            Value *idxExpr = emitExpr(*n.left->left);
+            Value *idx     = callRT("perl_to_int", {idxExpr});
+            freeIfOwned(idxExpr);
             Value *lhsVal = callRT("perl_array_get", {av, idx});
             Value *rhsVal = emitExpr(*n.right);
             Value *result = applyOp(lhsVal, rhsVal);
+            freeIfOwned(lhsVal);
+            freeIfOwned(rhsVal);
             callRT("perl_array_set", {av, idx, result});
             return result;
         }
@@ -1629,7 +1745,10 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *lhsVal = callRT("perl_hash_get_sv", {hv, key});
             Value *rhsVal = emitExpr(*n.right);
             Value *result = applyOp(lhsVal, rhsVal);
+            freeIfOwned(lhsVal);
+            freeIfOwned(rhsVal);
             callRT("perl_hash_set_sv", {hv, key, result});
+            freeIfOwned(key);
             return result;
         }
         /* $ref->[$i] op= rhs  or  $ref->{k} op= rhs */
@@ -1637,19 +1756,28 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *base = emitExpr(*n.left->left);
             Value *lhsVal, *rhsVal, *result;
             if (n.left->sval == "array") {
-                Value *av  = callRT("perl_deref_array", {base});
-                Value *idx = callRT("perl_to_int", {emitExpr(*n.left->right)});
+                Value *av      = callRT("perl_deref_array", {base});
+                freeIfOwned(base);
+                Value *idxExpr = emitExpr(*n.left->right);
+                Value *idx     = callRT("perl_to_int", {idxExpr});
+                freeIfOwned(idxExpr);
                 lhsVal = callRT("perl_array_get", {av, idx});
                 rhsVal = emitExpr(*n.right);
                 result = applyOp(lhsVal, rhsVal);
+                freeIfOwned(lhsVal);
+                freeIfOwned(rhsVal);
                 callRT("perl_array_set", {av, idx, result});
             } else {
                 Value *hv  = callRT("perl_deref_hash", {base});
+                freeIfOwned(base);
                 Value *key = emitExpr(*n.left->right);
                 lhsVal = callRT("perl_hash_get_sv", {hv, key});
                 rhsVal = emitExpr(*n.right);
                 result = applyOp(lhsVal, rhsVal);
+                freeIfOwned(lhsVal);
+                freeIfOwned(rhsVal);
                 callRT("perl_hash_set_sv", {hv, key, result});
+                freeIfOwned(key);
             }
             return result;
         }
@@ -1659,7 +1787,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *lhsVal = builder_.CreateLoad(perlPtrTy_, lhsPtr);
         Value *rhsVal = emitExpr(*n.right);
         Value *result = applyOp(lhsVal, rhsVal);
+        freeIfOwned(rhsVal);
         callRT("perl_assign", {lhsVal, result});
+        freeIfOwned(result);
         return lhsVal;
     }
 
@@ -1868,21 +1998,21 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     /* ── math builtins ───────────────────────────────────────────────────── */
-    case NK::AbsFunc:  return callRT("perl_abs_val",  {emitExpr(*n.left)});
-    case NK::IntFunc:  return callRT("perl_int_trunc",{emitExpr(*n.left)});
-    case NK::SqrtFunc: return callRT("perl_sqrt_val", {emitExpr(*n.left)});
+    case NK::AbsFunc:  { Value *a=emitExpr(*n.left); Value *r=callRT("perl_abs_val",  {a}); freeIfOwned(a); return r; }
+    case NK::IntFunc:  { Value *a=emitExpr(*n.left); Value *r=callRT("perl_int_trunc",{a}); freeIfOwned(a); return r; }
+    case NK::SqrtFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_sqrt_val", {a}); freeIfOwned(a); return r; }
 
     /* ── string case ─────────────────────────────────────────────────────── */
-    case NK::UcFunc:      return callRT("perl_uc_str",      {emitExpr(*n.left)});
-    case NK::LcFunc:      return callRT("perl_lc_str",      {emitExpr(*n.left)});
-    case NK::UcfirstFunc: return callRT("perl_ucfirst_str", {emitExpr(*n.left)});
-    case NK::LcfirstFunc: return callRT("perl_lcfirst_str", {emitExpr(*n.left)});
+    case NK::UcFunc:      { Value *a=emitExpr(*n.left); Value *r=callRT("perl_uc_str",      {a}); freeIfOwned(a); return r; }
+    case NK::LcFunc:      { Value *a=emitExpr(*n.left); Value *r=callRT("perl_lc_str",      {a}); freeIfOwned(a); return r; }
+    case NK::UcfirstFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_ucfirst_str", {a}); freeIfOwned(a); return r; }
+    case NK::LcfirstFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_lcfirst_str", {a}); freeIfOwned(a); return r; }
 
     /* ── chr / ord / hex / oct ───────────────────────────────────────────── */
-    case NK::ChrFunc: return callRT("perl_chr_val", {emitExpr(*n.left)});
-    case NK::OrdFunc: return callRT("perl_ord_val", {emitExpr(*n.left)});
-    case NK::HexFunc: return callRT("perl_hex_val", {emitExpr(*n.left)});
-    case NK::OctFunc: return callRT("perl_oct_val", {emitExpr(*n.left)});
+    case NK::ChrFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_chr_val", {a}); freeIfOwned(a); return r; }
+    case NK::OrdFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_ord_val", {a}); freeIfOwned(a); return r; }
+    case NK::HexFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_hex_val", {a}); freeIfOwned(a); return r; }
+    case NK::OctFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_oct_val", {a}); freeIfOwned(a); return r; }
 
     /* ── index / rindex ──────────────────────────────────────────────────── */
     case NK::IndexFunc:
@@ -1953,11 +2083,16 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *sub  = emitExpr(*n.right);
         if (n.sval == "array") {
             Value *av  = callRT("perl_deref_array", {base});
+            freeIfOwned(base);
             Value *idx = callRT("perl_to_int", {sub});
+            freeIfOwned(sub);
             return callRT("perl_array_get", {av, idx});
         } else {
             Value *hv = callRT("perl_deref_hash", {base});
-            return callRT("perl_hash_get_sv", {hv, sub});
+            freeIfOwned(base);
+            Value *result = callRT("perl_hash_get_sv", {hv, sub});
+            freeIfOwned(sub);
+            return result;
         }
     }
 
@@ -2182,17 +2317,18 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto *subFn = Function::Create(subFT, Function::InternalLinkage,
                                        subLLVMName(n.name), mod_.get());
         /* save codegen state */
-        auto *savedFn         = currentFn_;
-        auto *savedBB         = builder_.GetInsertBlock();
-        auto  savedScopes     = scopes_;
-        auto  savedArrScopes  = arrayScopes_;
-        auto  savedHashScopes = hashScopes_;
-        auto *savedLocalDepth = localDepthAlloca_;
+        auto *savedFn          = currentFn_;
+        auto *savedBB          = builder_.GetInsertBlock();
+        auto  savedScopes      = scopes_;
+        auto  savedArrScopes   = arrayScopes_;
+        auto  savedHashScopes  = hashScopes_;
+        auto  savedPvScopes    = pvScopes_;
+        auto *savedLocalDepth  = localDepthAlloca_;
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
         currentFn_ = subFn;
-        scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {};
+        scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
         pushScope();
     Value *argsArr = subFn->getArg(0);
     argsArr->setName("args");
@@ -2229,6 +2365,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         scopes_           = std::move(savedScopes);
         arrayScopes_      = std::move(savedArrScopes);
         hashScopes_       = std::move(savedHashScopes);
+        pvScopes_         = std::move(savedPvScopes);
         localDepthAlloca_ = savedLocalDepth;
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
@@ -2444,9 +2581,14 @@ Value *CodeGen::emitBinOp(const Node &n) {
         {"<=>","perl_spaceship"}, {"cmp","perl_str_spaceship"},
         {nullptr, nullptr}
     };
-    for (auto *p = OPS; p->op; p++)
-        if (n.sval == p->op)
-            return callRT(p->rt, {lv, rv});
+    for (auto *p = OPS; p->op; p++) {
+        if (n.sval == p->op) {
+            Value *result = callRT(p->rt, {lv, rv});
+            freeIfOwned(lv);
+            freeIfOwned(rv);
+            return result;
+        }
+    }
 
     return perlUndef();
 }
@@ -2488,10 +2630,13 @@ Value *CodeGen::emitCall(const Node &n) {
             }
             Value *v = emitExpr(*arg);
             callRT("perl_array_push", {argsArr, v});
+            freeIfOwned(v);
         }
         auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *zero = ConstantInt::get(i32Ty, 0);
-        return builder_.CreateCall(fn, {argsArr, zero});
+        Value *retVal = builder_.CreateCall(fn, {argsArr, zero});
+        callRT("perl_array_free", {argsArr});
+        return retVal;
     }
     return perlUndef();
 }

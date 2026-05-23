@@ -50,6 +50,8 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> arrayScopes_;
     /* hash variable scope */
     std::vector<std::unordered_map<std::string, llvm::Value *>> hashScopes_;
+    /* stable PerlValue* for each my-variable, freed on scope exit */
+    std::vector<std::vector<llvm::Value *>> pvScopes_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
@@ -81,6 +83,8 @@ private:
     void declareArray(const std::string &name, llvm::Value *ptr);
     llvm::Value *lookupHash(const std::string &name);
     void declareHash(const std::string &name, llvm::Value *ptr);
+    void trackPv(llvm::Value *pv);
+    void emitScopeCleanup();  /* free all tracked pvs in all active scopes */
     /* returns a PerlArray* Value for things that produce arrays */
     llvm::Value *emitArrayPtr(const Node &n);
 
@@ -99,4 +103,7 @@ private:
     llvm::Value *perlInt(long long v);
     llvm::Value *perlFloat(double v);
     llvm::Value *perlStr(const std::string &s);
+
+    bool isOwnedTemp(llvm::Value *v);
+    void freeIfOwned(llvm::Value *v);
 };

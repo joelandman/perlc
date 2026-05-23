@@ -98,6 +98,7 @@ typedef struct PerlArray {
 } PerlArray;
 
 PerlArray *perl_array_new(void);
+void       perl_array_free(PerlArray *a);
 void       perl_array_push(PerlArray *a, PerlValue *v);
 PerlValue *perl_array_pop(PerlArray *a);
 PerlValue *perl_array_get(PerlArray *a, long long idx);

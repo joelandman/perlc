@@ -179,11 +179,9 @@ PerlValue *perl_clone(const PerlValue *src) {
 void perl_free(PerlValue *v) {
     if (!v) return;
     if (v->tag == PERL_STRING) free(v->sval);
-    if (v->tag == PERL_CODE_REF && v->pval) {
-        PerlClosure *cl = (PerlClosure*)v->pval;
-        if (cl->captures) free(cl->captures);
-        free(cl);
-    }
+    /* CODE_REF: pval points to a shared PerlClosure; don't free it here since
+       perl_clone() shallow-copies the pval pointer — freeing it would dangle
+       any other references to the same closure. */
     if (v->blessed_class) free(v->blessed_class);
     free(v);
 }
@@ -502,6 +500,13 @@ PerlArray *perl_array_new(void) {
     a->len = 0; a->cap = 8;
     a->elems = malloc(a->cap * sizeof(PerlValue *));
     return a;
+}
+
+void perl_array_free(PerlArray *a) {
+    if (!a) return;
+    for (long long i = 0; i < a->len; i++) perl_free(a->elems[i]);
+    free(a->elems);
+    free(a);
 }
 
 void perl_array_push(PerlArray *a, PerlValue *v) {
@@ -1695,8 +1700,11 @@ PerlArray *perl_range(PerlValue *from, PerlValue *to) {
     PerlArray *a = perl_array_new();
     long long lo = perl_to_int(from);
     long long hi = perl_to_int(to);
-    for (long long i = lo; i <= hi; i++)
-        perl_array_push(a, perl_alloc_int(i));
+    for (long long i = lo; i <= hi; i++) {
+        PerlValue *pv = perl_alloc_int(i);
+        perl_array_push(a, pv);
+        perl_free(pv);
+    }
     return a;
 }
 
