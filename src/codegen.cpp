@@ -826,6 +826,104 @@ Value *CodeGen::tryEmitI1Cond(const Node &n) {
     return builder_.CreateICmp(pred, lv, rv, "icmp");
 }
 
+/* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
+   Used to decide whether a @_ scalar arg can be promoted to a float alloca.
+   'inNum' = the parent node is a numeric expression (so nm here is safe). */
+static bool floatSafe(const Node &n, const std::string &nm, bool inNum) {
+    if (n.kind == NK::ScalarVar && n.name == nm)
+        return inNum;
+
+    switch (n.kind) {
+    case NK::BinOp: {
+        bool isNum = (n.sval=="+"||n.sval=="-"||n.sval=="*"||n.sval=="/"||
+                      n.sval=="**"||n.sval=="%"||n.sval=="<"||n.sval=="<="||
+                      n.sval==">"||n.sval==">="||n.sval=="=="||n.sval=="!=");
+        bool ok = true;
+        if (n.left)  ok = ok && floatSafe(*n.left,  nm, isNum);
+        if (n.right) ok = ok && floatSafe(*n.right, nm, isNum);
+        return ok;
+    }
+    case NK::UnaryOp: {
+        bool isNum = (n.sval=="-"||n.sval=="pre++"||n.sval=="post++"||
+                      n.sval=="pre--"||n.sval=="post--");
+        return !n.left || floatSafe(*n.left, nm, isNum);
+    }
+    case NK::SqrtFunc:
+        return !n.left || floatSafe(*n.left, nm, true);
+    case NK::CompoundAssign: {
+        bool isNum = (n.sval=="+="||n.sval=="-="||n.sval=="*="||n.sval=="/="||
+                      n.sval=="**="||n.sval=="%=");
+        bool ok = true;
+        if (n.left) {
+            /* if nm is directly the LHS target, that's a numeric update — fine */
+            if (!(n.left->kind == NK::ScalarVar && n.left->name == nm))
+                ok = floatSafe(*n.left, nm, false);
+        }
+        if (n.right) ok = ok && floatSafe(*n.right, nm, isNum);
+        return ok;
+    }
+    case NK::Assign:
+        if (n.left && n.left->kind == NK::ArrayLit) {
+            /* LHS elements are write targets — skip them; check RHS only */
+            return !n.right || floatSafe(*n.right, nm, false);
+        }
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm) {
+            return !n.right || floatSafe(*n.right, nm, false);
+        }
+        {
+            bool ok = true;
+            if (n.left)  ok = ok && floatSafe(*n.left,  nm, false);
+            if (n.right) ok = ok && floatSafe(*n.right, nm, false);
+            return ok;
+        }
+    default: {
+        bool ok = true;
+        if (n.left)  ok = ok && floatSafe(*n.left,  nm, false);
+        if (n.right) ok = ok && floatSafe(*n.right, nm, false);
+        for (auto &a : n.args) ok = ok && floatSafe(*a, nm, false);
+        if (n.body)  ok = ok && floatSafe(*n.body,  nm, false);
+        if (n.init)  ok = ok && floatSafe(*n.init,  nm, false);
+        if (n.cond)  ok = ok && floatSafe(*n.cond,  nm, false);
+        if (n.step)  ok = ok && floatSafe(*n.step,  nm, false);
+        return ok;
+    }
+    }
+}
+
+/* Returns true if 'nm' appears anywhere as a ScalarVar in 'n'. */
+static bool hasVar(const Node &n, const std::string &nm) {
+    if (n.kind == NK::ScalarVar && n.name == nm) return true;
+    bool r = false;
+    if (n.left)  r = r || hasVar(*n.left,  nm);
+    if (n.right) r = r || hasVar(*n.right, nm);
+    for (auto &a : n.args) r = r || hasVar(*a, nm);
+    if (n.body)  r = r || hasVar(*n.body,  nm);
+    if (n.init)  r = r || hasVar(*n.init,  nm);
+    if (n.cond)  r = r || hasVar(*n.cond,  nm);
+    if (n.step)  r = r || hasVar(*n.step,  nm);
+    return r;
+}
+
+/* Returns true if 'nm' is ever used in a float-precision context (/, **, sqrt).
+   Ensures we only promote vars that actually need floating-point, not integer
+   counters that happen to appear in arithmetic. */
+static bool needsFloatPrec(const Node &n, const std::string &nm) {
+    if (n.kind == NK::BinOp && (n.sval == "/" || n.sval == "**")) {
+        if ((n.left  && hasVar(*n.left,  nm)) ||
+            (n.right && hasVar(*n.right, nm))) return true;
+    }
+    if (n.kind == NK::SqrtFunc && n.left && hasVar(*n.left, nm)) return true;
+    bool r = false;
+    if (n.left)  r = r || needsFloatPrec(*n.left,  nm);
+    if (n.right) r = r || needsFloatPrec(*n.right, nm);
+    for (auto &a : n.args) r = r || needsFloatPrec(*a, nm);
+    if (n.body)  r = r || needsFloatPrec(*n.body,  nm);
+    if (n.init)  r = r || needsFloatPrec(*n.init,  nm);
+    if (n.cond)  r = r || needsFloatPrec(*n.cond,  nm);
+    if (n.step)  r = r || needsFloatPrec(*n.step,  nm);
+    return r;
+}
+
 /* Pure predicate — can this expression be computed as a bare LLVM double?
    Never emits any IR. Returns true iff emitExprF64 will succeed. */
 bool CodeGen::canEmitF64(const Node &n) {
@@ -1098,7 +1196,10 @@ void CodeGen::emitSub(const Node &n) {
         return;
     }
 
+    auto *savedSubBody = currentSubBody_;
+    currentSubBody_ = n.body.get();
     Value *lastVal = emitBlockLast(*n.body);
+    currentSubBody_ = savedSubBody;
 
     /* implicit return from last expression (Perl: last expr is the return value) */
     if (!builder_.GetInsertBlock()->getTerminator()) {
@@ -1961,6 +2062,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ArrayLit) {
             Value *rhsArr = emitArrayPtr(*n.right);
             if (!rhsArr) rhsArr = emitExpr(*n.right);
+            bool fromUnderbar = (n.right->kind == NK::ArrayVar && n.right->name == "_");
             for (size_t i = 0; i < n.left->args.size(); i++) {
                 auto *slot = emitLValue(*n.left->args[i]);
                 if (!slot) continue;
@@ -1968,6 +2070,22 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *idx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
                 Value *elem = callRT("perl_array_get_ref", {rhsArr, idx});
                 callRT("perl_assign", {pv, elem});
+                /* promote @_ scalar args to float allocas when only used numerically */
+                if (fromUnderbar && currentSubBody_) {
+                    auto *varNode = n.left->args[i].get();
+                    if (varNode->kind == NK::ScalarVar) {
+                        const std::string &nm = varNode->name;
+                        if (!lookupFloatVar(nm) && !lookupIntVar(nm) &&
+                            needsFloatPrec(*currentSubBody_, nm) &&
+                            floatSafe(*currentSubBody_, nm, false)) {
+                            auto *f64 = Type::getDoubleTy(ctx_);
+                            auto *fa  = builder_.CreateAlloca(f64, nullptr, nm + ".f");
+                            Value *dbl = callRT("perl_to_float", {pv});
+                            builder_.CreateStore(dbl, fa);
+                            declareFloatVar(nm, fa);
+                        }
+                    }
+                }
                 freeIfOwned(elem);
             }
             return perlUndef();
@@ -2760,6 +2878,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto  savedFloatScopes = floatScopes_;
         auto  savedIntScopes   = intScopes_;
         auto *savedLocalDepth  = localDepthAlloca_;
+        auto *savedSubBody     = currentSubBody_;
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
@@ -2786,7 +2905,9 @@ Value *CodeGen::emitExpr(const Node &n) {
             builder_.CreateStore(pv, alloca);
             declareVar(captureNames[i], alloca);
         }
+        currentSubBody_ = n.body.get();
         emitBlock(*n.body);
+        currentSubBody_ = savedSubBody;
         if (!builder_.GetInsertBlock()->getTerminator()) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
@@ -2805,6 +2926,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         floatScopes_      = std::move(savedFloatScopes);
         intScopes_        = std::move(savedIntScopes);
         localDepthAlloca_ = savedLocalDepth;
+        currentSubBody_   = savedSubBody;
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));

@@ -66,6 +66,8 @@ private:
 
     /* current function */
     llvm::Function                *currentFn_ = nullptr;
+    /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
+    const Node                    *currentSubBody_ = nullptr;
     /* loop control blocks */
     std::vector<llvm::BasicBlock *> loopExits_;
     std::vector<llvm::BasicBlock *> loopContinues_;
