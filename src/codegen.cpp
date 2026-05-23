@@ -307,6 +307,7 @@ void CodeGen::pushScope()  {
     scopes_.emplace_back(); arrayScopes_.emplace_back();
     hashScopes_.emplace_back(); pvScopes_.emplace_back();
     floatScopes_.emplace_back(); intScopes_.emplace_back();
+    derefAVScopes_.emplace_back();
 }
 void CodeGen::popScope() {
     /* free stable PerlValue*s for my-vars going out of scope, unless in dead block */
@@ -318,6 +319,7 @@ void CodeGen::popScope() {
     scopes_.pop_back(); arrayScopes_.pop_back();
     hashScopes_.pop_back(); pvScopes_.pop_back();
     floatScopes_.pop_back(); intScopes_.pop_back();
+    derefAVScopes_.pop_back();
 }
 
 Value *CodeGen::lookupVar(const std::string &nm) {
@@ -758,6 +760,20 @@ void CodeGen::declareIntVar(const std::string &name, Value *alloca) {
     if (!intScopes_.empty()) intScopes_.back()[name] = alloca;
 }
 
+/* ── cached PerlArray* for array-ref @_ args (Stage 15) ─────────────────── */
+
+Value *CodeGen::lookupDerefAV(const std::string &name) {
+    for (int i = (int)derefAVScopes_.size() - 1; i >= 0; i--) {
+        auto it = derefAVScopes_[i].find(name);
+        if (it != derefAVScopes_[i].end()) return it->second;
+    }
+    return nullptr;
+}
+
+void CodeGen::declareDerefAV(const std::string &name, Value *alloca) {
+    if (!derefAVScopes_.empty()) derefAVScopes_.back()[name] = alloca;
+}
+
 Value *CodeGen::boxI64(Value *iv) {
     return callRT("perl_alloc_int", {iv});
 }
@@ -864,6 +880,51 @@ Value *CodeGen::emitIdx(const Node &n) {
 /* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
    Used to decide whether a @_ scalar arg can be promoted to a float alloca.
    'inNum' = the parent node is a numeric expression (so nm here is safe). */
+/* Returns true if every occurrence of ScalarVar(nm) in the AST is the direct
+   left-child of an ArrowDeref with sval=="array" (i.e. used only as $nm->[$i]).
+   Used to decide whether to cache perl_deref_array_ro at function entry. */
+static bool isOnlyArrayRefDeref(const Node &n, const std::string &nm) {
+    if (n.kind == NK::ScalarVar && n.name == nm)
+        return false; /* bare use — not safe */
+
+    if (n.kind == NK::ArrowDeref && n.sval == "array") {
+        bool leftOk;
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            leftOk = true; /* nm is the direct array-ref base here — safe position */
+        else
+            leftOk = isOnlyArrayRefDeref(*n.left, nm);
+        bool rightOk = !n.right || isOnlyArrayRefDeref(*n.right, nm);
+        return leftOk && rightOk;
+    }
+
+    /* my ($x, $bodies, ...) = @_ — LHS elements are write targets, skip them */
+    if (n.kind == NK::Assign && n.left && n.left->kind == NK::ArrayLit)
+        return !n.right || isOnlyArrayRefDeref(*n.right, nm);
+
+    /* $bodies = expr — reassignment means cached deref would go stale */
+    if (n.kind == NK::Assign && n.left &&
+        n.left->kind == NK::ScalarVar && n.left->name == nm)
+        return false;
+
+    /* my $bodies = expr or state $bodies — redeclaration */
+    if ((n.kind == NK::My || n.kind == NK::StateDecl) && n.name == nm)
+        return false;
+
+    bool ok = true;
+    if (n.left)  ok = ok && isOnlyArrayRefDeref(*n.left,  nm);
+    if (n.right) ok = ok && isOnlyArrayRefDeref(*n.right, nm);
+    for (auto &a : n.args) ok = ok && isOnlyArrayRefDeref(*a, nm);
+    if (n.body)  ok = ok && isOnlyArrayRefDeref(*n.body,  nm);
+    if (n.init)  ok = ok && isOnlyArrayRefDeref(*n.init,  nm);
+    if (n.cond)  ok = ok && isOnlyArrayRefDeref(*n.cond,  nm);
+    if (n.step)  ok = ok && isOnlyArrayRefDeref(*n.step,  nm);
+    for (auto &b : n.branches) {
+        if (b.cond) ok = ok && isOnlyArrayRefDeref(*b.cond, nm);
+        if (b.body) ok = ok && isOnlyArrayRefDeref(*b.body, nm);
+    }
+    return ok;
+}
+
 static bool floatSafe(const Node &n, const std::string &nm, bool inNum) {
     if (n.kind == NK::ScalarVar && n.name == nm)
         return inNum;
@@ -1052,17 +1113,41 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (n.sval == "array") {
             /* 2D pattern $arr->[$i][$k]: emit full readonly chain so GVN can CSE */
             if (n.left->kind == NK::ArrowDeref && n.left->sval == "array") {
-                Value *outerBase = emitExpr(*n.left->left);
-                Value *outerArr  = callRT("perl_deref_array_ro", {outerBase});
-                freeIfOwned(outerBase);
+                /* Outer deref: use cached PerlArray* if available (Stage 15) */
+                Value *outerArr;
+                if (n.left->left->kind == NK::ScalarVar) {
+                    if (Value *pa = lookupDerefAV(n.left->left->name)) {
+                        outerArr = builder_.CreateLoad(perlPtrTy_, pa, n.left->left->name + ".av");
+                    } else {
+                        Value *base = emitExpr(*n.left->left);
+                        outerArr = callRT("perl_deref_array_ro", {base});
+                        freeIfOwned(base);
+                    }
+                } else {
+                    Value *base = emitExpr(*n.left->left);
+                    outerArr = callRT("perl_deref_array_ro", {base});
+                    freeIfOwned(base);
+                }
                 Value *innerRef  = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
                 Value *innerArr  = callRT("perl_deref_array_ro", {innerRef});
                 Value *elem      = callRT("perl_array_get_ref", {innerArr, emitIdx(*n.right)});
                 return callRT("perl_to_float", {elem});
             }
-            Value *base2 = emitExpr(*n.left);
-            Value *av  = callRT("perl_deref_array_ro", {base2});  /* readonly: enables GVN/LICM */
-            freeIfOwned(base2);
+            /* 1D: $arr->[$i] — use cached PerlArray* if available */
+            Value *av;
+            if (n.left->kind == NK::ScalarVar) {
+                if (Value *pa = lookupDerefAV(n.left->name)) {
+                    av = builder_.CreateLoad(perlPtrTy_, pa, n.left->name + ".av");
+                } else {
+                    Value *base = emitExpr(*n.left);
+                    av = callRT("perl_deref_array_ro", {base});
+                    freeIfOwned(base);
+                }
+            } else {
+                Value *base2 = emitExpr(*n.left);
+                av = callRT("perl_deref_array_ro", {base2});
+                freeIfOwned(base2);
+            }
             Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
             return callRT("perl_to_float", {elem});
         } else {
@@ -2162,7 +2247,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     auto *varNode = n.left->args[i].get();
                     if (varNode->kind == NK::ScalarVar) {
                         const std::string &nm = varNode->name;
-                        if (!lookupFloatVar(nm) && !lookupIntVar(nm)) {
+                        if (!lookupFloatVar(nm) && !lookupIntVar(nm) && !lookupDerefAV(nm)) {
                             bool safe    = floatSafe(*currentSubBody_, nm, false);
                             bool needFP  = needsFloatPrec(*currentSubBody_, nm);
                             if (safe && needFP) {
@@ -2179,6 +2264,13 @@ Value *CodeGen::emitExpr(const Node &n) {
                                 Value *ival = callRT("perl_to_int", {pv});
                                 builder_.CreateStore(ival, ia);
                                 declareIntVar(nm, ia);
+                            } else if (!safe && isOnlyArrayRefDeref(*currentSubBody_, nm)) {
+                                /* array-ref arg: cache PerlArray* once at entry — eliminates
+                                   repeated perl_deref_array_ro calls in hot loops (Stage 15) */
+                                auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
+                                Value *av = callRT("perl_deref_array_ro", {pv});
+                                builder_.CreateStore(av, pa);
+                                declareDerefAV(nm, pa);
                             }
                         }
                     }
@@ -2408,9 +2500,22 @@ Value *CodeGen::emitExpr(const Node &n) {
                 /* 2D pattern $arr->[$i][$k] op= rhs: all-readonly deref chain */
                 Value *av;
                 if (n.left->left->kind == NK::ArrowDeref && n.left->left->sval == "array") {
-                    Value *outerBase = emitExpr(*n.left->left->left);
-                    Value *outerArr  = callRT("perl_deref_array_ro", {outerBase});
-                    freeIfOwned(outerBase);
+                    /* Outer deref: use cached PerlArray* if available (Stage 15) */
+                    Value *outerArr;
+                    if (n.left->left->left->kind == NK::ScalarVar) {
+                        if (Value *pa = lookupDerefAV(n.left->left->left->name)) {
+                            outerArr = builder_.CreateLoad(perlPtrTy_, pa,
+                                                           n.left->left->left->name + ".av");
+                        } else {
+                            Value *base = emitExpr(*n.left->left->left);
+                            outerArr = callRT("perl_deref_array_ro", {base});
+                            freeIfOwned(base);
+                        }
+                    } else {
+                        Value *outerBase = emitExpr(*n.left->left->left);
+                        outerArr = callRT("perl_deref_array_ro", {outerBase});
+                        freeIfOwned(outerBase);
+                    }
                     Value *innerRef  = callRT("perl_array_get_ref",  {outerArr, emitIdx(*n.left->left->right)});
                     av               = callRT("perl_deref_array_ro", {innerRef});
                 } else {

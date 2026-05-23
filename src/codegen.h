@@ -56,6 +56,8 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> floatScopes_;
     /* unboxed integer variables: name → i64 alloca */
     std::vector<std::unordered_map<std::string, llvm::Value *>> intScopes_;
+    /* cached PerlArray* for @_ array-ref args: name → ptr alloca (PerlArray*) */
+    std::vector<std::unordered_map<std::string, llvm::Value *>> derefAVScopes_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
@@ -121,6 +123,8 @@ private:
 
     llvm::Value *lookupIntVar(const std::string &name);
     void         declareIntVar(const std::string &name, llvm::Value *alloca);
+    llvm::Value *lookupDerefAV(const std::string &name);   /* cached PerlArray* for array-ref @_ args */
+    void         declareDerefAV(const std::string &name, llvm::Value *alloca);
     bool         canEmitI64(const Node &n);
     llvm::Value *emitExprI64(const Node &n);
     llvm::Value *boxI64(llvm::Value *iv);
