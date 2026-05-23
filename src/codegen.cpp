@@ -1193,8 +1193,19 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     Value *innerRef = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
                     innerArr = callRT("perl_deref_array_ro", {innerRef});
                 }
-                Value *elem      = callRT("perl_array_get_ref", {innerArr, emitIdx(*n.right)});
-                return callRT("perl_to_float", {elem});
+                /* Stage 17: when innerArr came from a rowAV cache, emit inline
+                   GEP+loads (bypassing bounds/tag checks) so GVN can CSE repeated
+                   reads across perl_array_update_float writes. Safe here because:
+                   - rowAV arrays are pre-initialized with float elements
+                   - literal indices in emitIdx(*n.right) stay within bounds */
+                Value *idx17 = emitIdx(*n.right);
+                auto *i8Ty17  = Type::getInt8Ty(ctx_);
+                auto *f64Ty17 = Type::getDoubleTy(ctx_);
+                Value *elems17 = builder_.CreateLoad(perlPtrTy_, innerArr, "av.elems");
+                Value *pvPtr17 = builder_.CreateGEP(perlPtrTy_, elems17, idx17, "pv.ptr");
+                Value *pv17    = builder_.CreateLoad(perlPtrTy_, pvPtr17, "pv");
+                Value *fvPtr17 = builder_.CreateConstInBoundsGEP1_64(i8Ty17, pv17, 8, "fv.ptr");
+                return builder_.CreateLoad(f64Ty17, fvPtr17, "fv");
             }
             /* 1D: $arr->[$i] — use cached PerlArray* if available */
             Value *av;
@@ -1408,17 +1419,39 @@ void CodeGen::emitSub(const Node &n) {
 
 /* ── statement emission ──────────────────────────────────────────────────── */
 
+/* Stage 17: skip local save/restore for blocks that contain no local() */
+static bool hasLocalStmt(const Node &n) {
+    if (n.kind == NK::LocalStmt) return true;
+    bool r = false;
+    if (n.left)  r = r || hasLocalStmt(*n.left);
+    if (n.right) r = r || hasLocalStmt(*n.right);
+    for (auto &a : n.args) { if (!r) r = hasLocalStmt(*a); }
+    if (n.body)  r = r || hasLocalStmt(*n.body);
+    if (n.init)  r = r || hasLocalStmt(*n.init);
+    if (n.cond)  r = r || hasLocalStmt(*n.cond);
+    if (n.step)  r = r || hasLocalStmt(*n.step);
+    for (auto &b : n.branches) {
+        if (!r && b.cond) r = hasLocalStmt(*b.cond);
+        if (!r && b.body) r = hasLocalStmt(*b.body);
+    }
+    return r;
+}
+
 Value *CodeGen::emitBlock(const Node &n) {
     auto *i32Ty = Type::getInt32Ty(ctx_);
-    auto *bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
-    builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
+    bool needLocal = hasLocalStmt(n);
+    llvm::Value *bdAlloca = nullptr;
+    if (needLocal) {
+        bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
+        builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
+    }
     pushScope();
     for (auto &stmt : n.args) {
         emitStmt(*stmt);
         if (builder_.GetInsertBlock()->getTerminator()) break;
     }
     popScope();
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     return nullptr;
 }
@@ -1426,8 +1459,12 @@ Value *CodeGen::emitBlock(const Node &n) {
 /* Emit a block and return the PerlValue* of its last expression statement. */
 Value *CodeGen::emitBlockLast(const Node &n) {
     auto *i32Ty = Type::getInt32Ty(ctx_);
-    auto *bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
-    builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
+    bool needLocal = hasLocalStmt(n);
+    llvm::Value *bdAlloca = nullptr;
+    if (needLocal) {
+        bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
+        builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
+    }
     pushScope();
     Value *result = perlUndef();
     for (size_t i = 0; i < n.args.size(); i++) {
@@ -1441,7 +1478,7 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         if (builder_.GetInsertBlock()->getTerminator()) { break; }
     }
     popScope();
-    if (!builder_.GetInsertBlock()->getTerminator())
+    if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     return result;
 }
@@ -1855,6 +1892,7 @@ void CodeGen::emitStmt(const Node &n) {
                     collectRowAVPairs(*n.body, avNames, pairs);
                     auto *i64 = Type::getInt64Ty(ctx_);
                     for (auto &[outerNm, idxNm] : pairs) {
+                        if (lookupRowAV(outerNm, idxNm)) continue; /* already in outer scope */
                         Value *outerPA = lookupDerefAV(outerNm);
                         Value *idxIA   = lookupIntVar(idxNm);
                         if (!outerPA || !idxIA) continue;
