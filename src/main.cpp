@@ -632,7 +632,7 @@ int main(int argc, char **argv) {
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
     bool replMode = false, pauseMode = false, jitMode = false;
-    int optLevel = 1;
+    int optLevel = 2;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;

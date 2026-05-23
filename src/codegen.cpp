@@ -4,6 +4,9 @@
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm/Analysis/CGSCCPassManager.h>
 #include <stdexcept>
 #include <sstream>
 #include <unordered_set>
@@ -2648,7 +2651,27 @@ void CodeGen::runOptimization() {
 
     if (verifyModule(*mod_, &errs())) {
         errs() << "IR verification failed before optimization\n";
+        return;
     }
+
+    PassBuilder PB;
+    LoopAnalysisManager LAM;
+    FunctionAnalysisManager FAM;
+    CGSCCAnalysisManager CGAM;
+    ModuleAnalysisManager MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    OptimizationLevel level = OptimizationLevel::O1;
+    if (optLevel_ >= 2) level = OptimizationLevel::O2;
+    if (optLevel_ >= 3) level = OptimizationLevel::O3;
+
+    ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(level);
+    MPM.run(*mod_, MAM);
 }
 
 /* ── output ──────────────────────────────────────────────────────────────── */
