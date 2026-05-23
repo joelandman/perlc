@@ -86,6 +86,7 @@ void CodeGen::declareRuntime() {
     RT("perl_free",          voidTy, pv);
     RT("perl_assign",        voidTy, pv, pv);
     RT("perl_to_int",        i64, pv);
+    RT("perl_to_float",      Type::getDoubleTy(ctx_), pv);
     RT("perl_is_true",       Type::getInt32Ty(ctx_), pv);
     RT("perl_print",         voidTy, pv);
     RT("perl_say",           voidTy, pv);
@@ -294,6 +295,7 @@ Function *CodeGen::getRTFunc(const std::string &nm) {
 void CodeGen::pushScope()  {
     scopes_.emplace_back(); arrayScopes_.emplace_back();
     hashScopes_.emplace_back(); pvScopes_.emplace_back();
+    floatScopes_.emplace_back();
 }
 void CodeGen::popScope() {
     /* free stable PerlValue*s for my-vars going out of scope, unless in dead block */
@@ -304,6 +306,7 @@ void CodeGen::popScope() {
     }
     scopes_.pop_back(); arrayScopes_.pop_back();
     hashScopes_.pop_back(); pvScopes_.pop_back();
+    floatScopes_.pop_back();
 }
 
 Value *CodeGen::lookupVar(const std::string &nm) {
@@ -713,6 +716,145 @@ void CodeGen::freeIfOwned(llvm::Value *v) {
     if (isOwnedTemp(v)) callRT("perl_free", {v});
 }
 
+/* ── unboxed float helpers ───────────────────────────────────────────────── */
+
+Value *CodeGen::lookupFloatVar(const std::string &name) {
+    for (int i = (int)floatScopes_.size() - 1; i >= 0; i--) {
+        auto it = floatScopes_[i].find(name);
+        if (it != floatScopes_[i].end()) return it->second;
+    }
+    return nullptr;
+}
+
+void CodeGen::declareFloatVar(const std::string &name, Value *alloca) {
+    if (!floatScopes_.empty()) floatScopes_.back()[name] = alloca;
+}
+
+Value *CodeGen::boxF64(Value *dbl) {
+    return callRT("perl_alloc_float", {dbl});
+}
+
+/* Pure predicate — can this expression be computed as a bare LLVM double?
+   Never emits any IR. Returns true iff emitExprF64 will succeed. */
+bool CodeGen::canEmitF64(const Node &n) {
+    switch (n.kind) {
+    case NK::FloatLit:
+    case NK::IntLit:
+        return true;
+    case NK::ScalarVar: {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        return lookupFloatVar(nm) != nullptr;
+    }
+    case NK::BinOp: {
+        static const char *arithOps[] = {"+", "-", "*", "/", nullptr};
+        for (auto *p = arithOps; *p; p++) if (n.sval == *p) {
+            return n.left && n.right && canEmitF64(*n.left) && canEmitF64(*n.right);
+        }
+        return false;
+    }
+    case NK::UnaryOp:
+        return n.sval == "-" && n.left && canEmitF64(*n.left);
+    case NK::SqrtFunc:
+        return n.left && canEmitF64(*n.left);
+    /* Array/hash element lookups can always be converted to double via perl_to_float,
+       but they require emitting emitExpr calls internally — always allowed. */
+    case NK::ArrayElem:
+        return lookupArray(n.name) != nullptr;
+    case NK::ArrowDeref:
+        /* $ref->[$i] or $ref->{key}: always convertible to float */
+        return true;
+    case NK::HashElem:
+        return lookupHash(n.name) != nullptr;
+    default:
+        return false;
+    }
+}
+
+Value *CodeGen::emitExprF64(const Node &n) {
+    auto *f64 = Type::getDoubleTy(ctx_);
+    switch (n.kind) {
+    case NK::FloatLit:
+        return ConstantFP::get(f64, n.fval);
+    case NK::IntLit:
+        return ConstantFP::get(f64, (double)n.ival);
+    case NK::ScalarVar: {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        if (Value *fa = lookupFloatVar(nm))
+            return builder_.CreateLoad(f64, fa, nm + ".f");
+        return nullptr;
+    }
+    case NK::BinOp: {
+        static const char *arithOps[] = {"+", "-", "*", "/", nullptr};
+        bool isArith = false;
+        for (auto *p = arithOps; *p; p++) if (n.sval == *p) { isArith = true; break; }
+        if (!isArith) return nullptr;
+        /* Check both children before emitting any IR to avoid double-emission */
+        if (!canEmitF64(*n.left) || !canEmitF64(*n.right)) return nullptr;
+        Value *lv = emitExprF64(*n.left);
+        Value *rv = emitExprF64(*n.right);
+        if (!lv || !rv) return nullptr;
+        if (n.sval == "+") return builder_.CreateFAdd(lv, rv, "fadd");
+        if (n.sval == "-") return builder_.CreateFSub(lv, rv, "fsub");
+        if (n.sval == "*") return builder_.CreateFMul(lv, rv, "fmul");
+        /* "/" — no div-by-zero check for unboxed (same as C) */
+        return builder_.CreateFDiv(lv, rv, "fdiv");
+    }
+    case NK::UnaryOp:
+        if (n.sval == "-") {
+            if (!canEmitF64(*n.left)) return nullptr;
+            Value *v = emitExprF64(*n.left);
+            return v ? builder_.CreateFNeg(v, "fneg") : nullptr;
+        }
+        return nullptr;
+    case NK::SqrtFunc: {
+        if (!canEmitF64(*n.left)) return nullptr;
+        Value *v = emitExprF64(*n.left);
+        if (!v) return nullptr;
+        auto *sqrtFn = llvm::Intrinsic::getDeclaration(mod_.get(),
+            llvm::Intrinsic::sqrt, {f64});
+        return builder_.CreateCall(sqrtFn, {v}, "sqrt");
+    }
+    case NK::ArrayElem: {
+        Value *av = lookupArray(n.name);
+        if (!av) return nullptr;
+        /* Use boxed index evaluation */
+        Value *idxPv = emitExpr(*n.left);
+        Value *i = callRT("perl_to_int", {idxPv});
+        freeIfOwned(idxPv);
+        Value *elem = callRT("perl_array_get_ref", {av, i});
+        return callRT("perl_to_float", {elem});
+    }
+    case NK::ArrowDeref: {
+        /* $ref->[$i] or $ref->{k} read — unbox the element */
+        Value *base = emitExpr(*n.left);
+        if (n.sval == "array") {
+            Value *sub = emitExpr(*n.right);
+            Value *av  = callRT("perl_deref_array", {base});
+            freeIfOwned(base);
+            Value *idx = callRT("perl_to_int", {sub});
+            freeIfOwned(sub);
+            Value *elem = callRT("perl_array_get_ref", {av, idx});
+            return callRT("perl_to_float", {elem});
+        } else {
+            Value *hv = callRT("perl_deref_hash", {base});
+            freeIfOwned(base);
+            Value *elem = emitHashGetRef(hv, *n.right);
+            return callRT("perl_to_float", {elem});
+        }
+    }
+    case NK::HashElem: {
+        Value *hv = lookupHash(n.name);
+        if (!hv) return nullptr;
+        Value *elem = emitHashGetRef(hv, *n.left);
+        return callRT("perl_to_float", {elem});
+    }
+    default:
+        return nullptr;
+    }
+}
+
 /* ── top-level compile ───────────────────────────────────────────────────── */
 
 void CodeGen::compile(const Node &program, const std::string &modName) {
@@ -1006,6 +1148,15 @@ void CodeGen::emitStmt(const Node &n) {
                 fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
             } else {
+                /* Unbox numeric scalars: skip PerlValue* alloca entirely */
+                if (n.right && !atFileScope) {
+                    if (Value *fval = emitExprF64(*n.right)) {
+                        auto *falloca = builder_.CreateAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
+                        builder_.CreateStore(fval, falloca);
+                        declareFloatVar(nm, falloca);
+                        break;  /* done — no PerlValue* alloca needed */
+                    }
+                }
                 auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
                 /* allocate a stable PerlValue* that lives for this variable's lifetime */
                 Value *pv = perlUndef();
@@ -1515,6 +1666,15 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::ScalarVar: {
         if (n.name == "!")  return callRT("perl_get_dollar_bang", {});
         if (n.name == "/")  return callRT("perl_get_input_sep",   {});
+        {
+            std::string nm = n.name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            /* float var: box on demand */
+            if (Value *fa = lookupFloatVar(nm)) {
+                Value *dbl = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
+                return boxF64(dbl);
+            }
+        }
         auto *slot = lookupVar(n.name);
         if (!slot) return perlUndef();
         return builder_.CreateLoad(perlPtrTy_, slot, n.name);
@@ -1616,7 +1776,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* 'my $var = expr' in expression context */
         emitStmt(n);
         if (!n.name.empty() && n.name[0] == '$') {
-            if (auto *slot = lookupVar(n.name.substr(1)))
+            std::string nm = n.name.substr(1);
+            if (Value *fa = lookupFloatVar(nm)) {
+                Value *dbl = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
+                return boxF64(dbl);
+            }
+            if (auto *slot = lookupVar(nm))
                 return builder_.CreateLoad(perlPtrTy_, slot);
         }
         return perlUndef();
@@ -1754,6 +1919,25 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_assign", {pv, rhs});
             return rhs;
         }
+        /* float var assignment */
+        if (n.left->kind == NK::ScalarVar) {
+            std::string nm = n.left->name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (Value *fa = lookupFloatVar(nm)) {
+                Value *rhs = emitExprF64(*n.right);
+                if (rhs) {
+                    builder_.CreateStore(rhs, fa);
+                    return boxF64(rhs);  /* return a temporary boxed value */
+                }
+                /* RHS not purely numeric — box and store */
+                Value *rv = emitExpr(*n.right);
+                Value *dbl = callRT("perl_to_float", {rv});
+                builder_.CreateStore(dbl, fa);
+                freeIfOwned(rv);
+                return rv;  /* caller gets the temp */
+            }
+        }
+        {
         Value *rhs = emitExpr(*n.right);
         Value *lhs = emitLValue(*n.left);
         if (lhs) {
@@ -1762,6 +1946,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_assign", {lhsVal, rhs});
         }
         return rhs;
+        }
     }
 
     case NK::CompoundAssign: {
@@ -1773,6 +1958,30 @@ Value *CodeGen::emitExpr(const Node &n) {
             else if (n.sval == ".") return callRT("perl_concat", {lv, rv});
             else return perlUndef();
         };
+        /* float var: $x op= rhs */
+        if (n.left->kind == NK::ScalarVar) {
+            std::string nm = n.left->name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (Value *fa = lookupFloatVar(nm)) {
+                auto applyF64 = [&](Value *lv, Value *rv) -> Value * {
+                    if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
+                    if (n.sval == "-") return builder_.CreateFSub(lv, rv);
+                    if (n.sval == "*") return builder_.CreateFMul(lv, rv);
+                    if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
+                    return nullptr;
+                };
+                Value *lv = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
+                Value *rv = emitExprF64(*n.right);
+                if (rv) {
+                    Value *res = applyF64(lv, rv);
+                    if (res) {
+                        builder_.CreateStore(res, fa);
+                        return boxF64(res);
+                    }
+                }
+                /* fallback: use boxed path */
+            }
+        }
         /* $arr[$i] op= rhs */
         if (n.left->kind == NK::ArrayElem) {
             Value *av = lookupArray(n.left->name);
@@ -2363,12 +2572,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto  savedArrScopes   = arrayScopes_;
         auto  savedHashScopes  = hashScopes_;
         auto  savedPvScopes    = pvScopes_;
+        auto  savedFloatScopes = floatScopes_;
         auto *savedLocalDepth  = localDepthAlloca_;
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
         currentFn_ = subFn;
-        scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+        scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {}; floatScopes_ = {};
         pushScope();
     Value *argsArr = subFn->getArg(0);
     argsArr->setName("args");
@@ -2406,6 +2616,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         arrayScopes_      = std::move(savedArrScopes);
         hashScopes_       = std::move(savedHashScopes);
         pvScopes_         = std::move(savedPvScopes);
+        floatScopes_      = std::move(savedFloatScopes);
         localDepthAlloca_ = savedLocalDepth;
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
@@ -2511,6 +2722,11 @@ Value *CodeGen::emitLValue(const Node &n) {
 }
 
 Value *CodeGen::emitBinOp(const Node &n) {
+    /* Fast path: if both operands can be expressed as doubles, stay unboxed */
+    if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") {
+        if (Value *fv = emitExprF64(n))
+            return boxF64(fv);
+    }
     /* short-circuit ops */
     if (n.sval == "&&") {
         auto *fn   = builder_.GetInsertBlock()->getParent();

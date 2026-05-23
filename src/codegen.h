@@ -52,6 +52,8 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> hashScopes_;
     /* stable PerlValue* for each my-variable, freed on scope exit */
     std::vector<std::vector<llvm::Value *>> pvScopes_;
+    /* unboxed numeric variables: name → double alloca */
+    std::vector<std::unordered_map<std::string, llvm::Value *>> floatScopes_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
@@ -106,6 +108,12 @@ private:
 
     bool isOwnedTemp(llvm::Value *v);
     void freeIfOwned(llvm::Value *v);
+
+    llvm::Value *lookupFloatVar(const std::string &name);
+    void         declareFloatVar(const std::string &name, llvm::Value *alloca);
+    bool         canEmitF64(const Node &n);     /* pure predicate — no IR emitted */
+    llvm::Value *emitExprF64(const Node &n);    /* emits; caller must ensure canEmitF64 */
+    llvm::Value *boxF64(llvm::Value *dbl);      /* perl_alloc_float(dbl) */
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);
