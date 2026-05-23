@@ -1628,13 +1628,68 @@ void CodeGen::emitStmt(const Node &n) {
     case NK::Foreach: {
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *exit  = BasicBlock::Create(ctx_, "foreach.end",  fn);
+        auto *bodyBB = BasicBlock::Create(ctx_, "foreach.body", fn);
+        auto *stepBB = BasicBlock::Create(ctx_, "foreach.step", fn);
+        auto *i64   = Type::getInt64Ty(ctx_);
 
-        /* build iteration array — try emitArrayPtr first for keys/sort/@arr */
+        /* Fast path: integer-range foreach — for my $VAR (LO .. HI)
+           Emits a counted i64 loop with the loop var as an int alloca.
+           Eliminates perl_range alloc, per-iter perl_array_get/perl_assign,
+           and all perl_to_int($VAR) calls in the body via emitIdx. */
+        bool isIntRange = (n.args.size() == 1 &&
+                           n.args[0]->kind == NK::Range);
+        if (isIntRange) {
+            /* Compute lo and hi as bare i64 — use I64 path if possible,
+               fall back to emitExpr + perl_to_int otherwise. */
+            auto emitBound = [&](const Node &bound) -> Value * {
+                if (Value *iv = emitExprI64(bound)) return iv;
+                Value *pv = emitExpr(bound);
+                Value *i  = callRT("perl_to_int", {pv});
+                freeIfOwned(pv);
+                return i;
+            };
+            Value *lo = emitBound(*n.args[0]->left);
+            Value *hi = emitBound(*n.args[0]->right);
+
+            std::string loopNm = n.name;
+            if (!loopNm.empty() && loopNm[0] == '$') loopNm = loopNm.substr(1);
+            auto *iterAlloca = builder_.CreateAlloca(i64, nullptr, loopNm + ".i");
+            builder_.CreateStore(lo, iterAlloca);
+
+            auto *condBB2 = BasicBlock::Create(ctx_, "foreach.cond", fn);
+            loopExits_.push_back(exit);
+            loopContinues_.push_back(stepBB);
+
+            builder_.CreateBr(condBB2);
+            builder_.SetInsertPoint(condBB2);
+            Value *cur = builder_.CreateLoad(i64, iterAlloca);
+            builder_.CreateCondBr(builder_.CreateICmpSLE(cur, hi), bodyBB, exit);
+
+            builder_.SetInsertPoint(bodyBB);
+            pushScope();
+            declareIntVar(loopNm, iterAlloca);
+            emitBlock(*n.body);
+            popScope();
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(stepBB);
+
+            builder_.SetInsertPoint(stepBB);
+            Value *cur2 = builder_.CreateLoad(i64, iterAlloca);
+            builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1)),
+                                 iterAlloca);
+            builder_.CreateBr(condBB2);
+
+            loopExits_.pop_back();
+            loopContinues_.pop_back();
+            builder_.SetInsertPoint(exit);
+            break;
+        }
+
+        /* General foreach: build iteration array */
         Value *tmpArr = nullptr;
         bool ownsTmpArr = false;
         if (n.args.size() == 1) {
             tmpArr = emitArrayPtr(*n.args[0]);
-            /* owned if not a direct reference to an existing named/deref'd array */
             NK k = n.args[0]->kind;
             ownsTmpArr = tmpArr && (k != NK::ArrayVar && k != NK::DerefArray);
         }
@@ -1653,14 +1708,10 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.CreateStore(loopPv, loopVar);
 
         /* index counter */
-        auto *idxAlloca = builder_.CreateAlloca(
-                            Type::getInt64Ty(ctx_), nullptr, "foreach.idx");
-        builder_.CreateStore(
-            ConstantInt::get(Type::getInt64Ty(ctx_), 0), idxAlloca);
+        auto *idxAlloca = builder_.CreateAlloca(i64, nullptr, "foreach.idx");
+        builder_.CreateStore(ConstantInt::get(i64, 0), idxAlloca);
 
         auto *condBB = BasicBlock::Create(ctx_, "foreach.cond", fn);
-        auto *bodyBB = BasicBlock::Create(ctx_, "foreach.body", fn);
-        auto *stepBB = BasicBlock::Create(ctx_, "foreach.step", fn);
 
         loopExits_.push_back(exit);
         loopContinues_.push_back(stepBB);
@@ -1668,7 +1719,7 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
 
-        Value *idx  = builder_.CreateLoad(Type::getInt64Ty(ctx_), idxAlloca);
+        Value *idx  = builder_.CreateLoad(i64, idxAlloca);
         Value *lenV = callRT("perl_array_len", {tmpArr});
         Value *len  = callRT("perl_to_int", {lenV});
         callRT("perl_free", {lenV});
@@ -1683,15 +1734,14 @@ void CodeGen::emitStmt(const Node &n) {
         callRT("perl_free", {elem});
 
         emitBlock(*n.body);
-        popScope();  /* free loop-body pvs before branch */
+        popScope();
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(stepBB);
 
         builder_.SetInsertPoint(stepBB);
-        Value *idx2 = builder_.CreateLoad(Type::getInt64Ty(ctx_), idxAlloca);
-        Value *idx3 = builder_.CreateAdd(idx2,
-                        ConstantInt::get(Type::getInt64Ty(ctx_), 1));
-        builder_.CreateStore(idx3, idxAlloca);
+        Value *idx2 = builder_.CreateLoad(i64, idxAlloca);
+        builder_.CreateStore(
+            builder_.CreateAdd(idx2, ConstantInt::get(i64, 1)), idxAlloca);
         builder_.CreateBr(condBB);
         loopExits_.pop_back();
         loopContinues_.pop_back();
