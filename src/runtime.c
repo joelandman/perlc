@@ -862,6 +862,12 @@ HOTX PerlValue *perl_hash_get_sv_ref(PerlHash *h, PerlValue *key) {
     return e ? e->val : &pv_undef_sentinel_;
 }
 
+/* Constant-key variants: key is a C string literal — no strdup/free needed. */
+HOTX PerlValue *perl_hash_get_str_ref(PerlHash *h, const char *key) {
+    PerlHashEntry *e = hash_find(h, key);
+    return e ? e->val : &pv_undef_sentinel_;
+}
+
 void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
     char *ks = perl_to_string(key);
     unsigned int b = hash_str(ks);
@@ -880,11 +886,48 @@ void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
     }
 }
 
+HOTX void perl_hash_set_str(PerlHash *h, const char *key, PerlValue *val) {
+    unsigned int b = hash_str(key);
+    PerlHashEntry *e = hash_find(h, key);
+    if (e) {
+        perl_free(e->val);
+        e->val = perl_clone(val);
+    } else {
+        PerlHashEntry *ne = malloc(sizeof *ne);
+        ne->key  = strdup(key);
+        ne->val  = perl_clone(val);
+        ne->next = h->buckets[b];
+        h->buckets[b] = ne;
+        h->size++;
+    }
+}
+
 int perl_hash_exists_sv(PerlHash *h, PerlValue *key) {
     char *ks = perl_to_string(key);
     int r = hash_find(h, ks) != NULL;
     free(ks);
     return r;
+}
+
+HOTX int perl_hash_exists_str(PerlHash *h, const char *key) {
+    return hash_find(h, key) != NULL;
+}
+
+PerlValue *perl_hash_delete_str(PerlHash *h, const char *key) {
+    unsigned int b = hash_str(key);
+    PerlHashEntry **pp = &h->buckets[b];
+    while (*pp) {
+        PerlHashEntry *e = *pp;
+        if (strcmp(e->key, key) == 0) {
+            *pp = e->next;
+            PerlValue *v = e->val;
+            free(e->key); free(e);
+            h->size--;
+            return v;
+        }
+        pp = &e->next;
+    }
+    return perl_alloc_undef();
 }
 
 PerlValue *perl_hash_delete_sv(PerlHash *h, PerlValue *key) {

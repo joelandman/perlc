@@ -126,11 +126,17 @@ void CodeGen::declareRuntime() {
     RT("perl_array_len",     pv,  av);
     /* hash */
     RT("perl_hash_new",      av);   /* reuse av as opaque ptr */
-    RT("perl_hash_get_sv",     pv,  av, pv);
-    RT("perl_hash_get_sv_ref", pv,  av, pv);
-    RT("perl_hash_set_sv",   voidTy, av, pv, pv);
-    RT("perl_hash_exists_sv",Type::getInt32Ty(ctx_), av, pv);
-    RT("perl_hash_delete_sv",pv,  av, pv);
+    RT("perl_hash_get_sv",       pv,  av, pv);
+    RT("perl_hash_get_sv_ref",   pv,  av, pv);
+    RT("perl_hash_set_sv",       voidTy, av, pv, pv);
+    RT("perl_hash_exists_sv",    Type::getInt32Ty(ctx_), av, pv);
+    RT("perl_hash_delete_sv",    pv,  av, pv);
+    /* constant C-string key variants — no strdup overhead */
+    auto *strPtrTy = PointerType::get(Type::getInt8Ty(ctx_), 0);
+    RT("perl_hash_get_str_ref",  pv,  av, strPtrTy);
+    RT("perl_hash_set_str",      voidTy, av, strPtrTy, pv);
+    RT("perl_hash_exists_str",   Type::getInt32Ty(ctx_), av, strPtrTy);
+    RT("perl_hash_delete_str",   pv,  av, strPtrTy);
     RT("perl_hash_keys",     av,  av);
     RT("perl_hash_values",   av,  av);
     RT("perl_hash_size",     pv,  av);
@@ -585,13 +591,11 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         auto pushHashKey = [&](const Node &keyNode) {
             if (keyNode.kind == NK::ArrayLit) {
                 for (auto &k : keyNode.args) {
-                    Value *key  = emitExpr(*k);
-                    Value *elem = hv ? callRT("perl_hash_get_sv_ref", {hv, key}) : perlUndef();
+                    Value *elem = hv ? emitHashGetRef(hv, *k) : perlUndef();
                     callRT("perl_array_push", {res, elem});
                 }
             } else {
-                Value *key  = emitExpr(keyNode);
-                Value *elem = hv ? callRT("perl_hash_get_sv_ref", {hv, key}) : perlUndef();
+                Value *elem = hv ? emitHashGetRef(hv, keyNode) : perlUndef();
                 callRT("perl_array_push", {res, elem});
             }
         };
@@ -622,6 +626,52 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
 Value *CodeGen::perlStr(const std::string &s) {
     auto *gv = builder_.CreateGlobalString(s, ".str");
     return callRT("perl_alloc_string", {gv});
+}
+
+/* Returns an i8* global string constant if n is a compile-time string literal,
+ * otherwise nullptr. Used to bypass PerlValue key creation for hash ops. */
+static llvm::Value *constKeyPtr(const Node &n, llvm::IRBuilder<> &builder) {
+    if (n.kind == NK::StringLit || n.kind == NK::IntLit)
+        return builder.CreateGlobalStringPtr(
+            n.kind == NK::IntLit ? std::to_string(n.ival) : n.sval, ".hk");
+    return nullptr;
+}
+
+Value *CodeGen::emitHashGetRef(Value *hv, const Node &keyNode) {
+    if (Value *kp = constKeyPtr(keyNode, builder_))
+        return callRT("perl_hash_get_str_ref", {hv, kp});
+    Value *key = emitExpr(keyNode);
+    Value *r   = callRT("perl_hash_get_sv_ref", {hv, key});
+    freeIfOwned(key);
+    return r;
+}
+
+void CodeGen::emitHashSet(Value *hv, const Node &keyNode, Value *val) {
+    if (Value *kp = constKeyPtr(keyNode, builder_)) {
+        callRT("perl_hash_set_str", {hv, kp, val});
+        return;
+    }
+    Value *key = emitExpr(keyNode);
+    callRT("perl_hash_set_sv", {hv, key, val});
+    freeIfOwned(key);
+}
+
+Value *CodeGen::emitHashExists(Value *hv, const Node &keyNode) {
+    if (Value *kp = constKeyPtr(keyNode, builder_))
+        return callRT("perl_hash_exists_str", {hv, kp});
+    Value *key = emitExpr(keyNode);
+    Value *r   = callRT("perl_hash_exists_sv", {hv, key});
+    freeIfOwned(key);
+    return r;
+}
+
+Value *CodeGen::emitHashDelete(Value *hv, const Node &keyNode) {
+    if (Value *kp = constKeyPtr(keyNode, builder_))
+        return callRT("perl_hash_delete_str", {hv, kp});
+    Value *key = emitExpr(keyNode);
+    Value *r   = callRT("perl_hash_delete_sv", {hv, key});
+    freeIfOwned(key);
+    return r;
 }
 
 bool CodeGen::isOwnedTemp(llvm::Value *v) {
@@ -1635,10 +1685,8 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
             Value *hv = lookupHash(n.left->name);
             if (!hv) return perlUndef();
-            Value *key = emitExpr(*n.left->left);
             Value *val = emitExpr(*n.right);
-            callRT("perl_hash_set_sv", {hv, key, val});
-            freeIfOwned(key);
+            emitHashSet(hv, *n.left->left, val);
             return val;
         }
         /* %h = (list) */
@@ -1673,11 +1721,9 @@ Value *CodeGen::emitExpr(const Node &n) {
                 freeIfOwned(idxExpr);
                 callRT("perl_array_set", {av, idx, rhs});
             } else {
-                Value *hv  = callRT("perl_deref_hash",  {base});
+                Value *hv = callRT("perl_deref_hash", {base});
                 freeIfOwned(base);
-                Value *key = emitExpr(*n.left->right);
-                callRT("perl_hash_set_sv", {hv, key, rhs});
-                freeIfOwned(key);
+                emitHashSet(hv, *n.left->right, rhs);
             }
             return rhs;
         }
@@ -1746,14 +1792,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::HashElem) {
             Value *hv = lookupHash(n.left->name);
             if (!hv) return perlUndef();
-            Value *key    = emitExpr(*n.left->left);
-            Value *lhsVal = callRT("perl_hash_get_sv_ref", {hv, key});
+            Value *lhsVal = emitHashGetRef(hv, *n.left->left);
             Value *rhsVal = emitExpr(*n.right);
             Value *result = applyOp(lhsVal, rhsVal);
             freeIfOwned(lhsVal);
             freeIfOwned(rhsVal);
-            callRT("perl_hash_set_sv", {hv, key, result});
-            freeIfOwned(key);
+            emitHashSet(hv, *n.left->left, result);
             return result;
         }
         /* $ref->[$i] op= rhs  or  $ref->{k} op= rhs */
@@ -1773,16 +1817,14 @@ Value *CodeGen::emitExpr(const Node &n) {
                 freeIfOwned(rhsVal);
                 callRT("perl_array_set", {av, idx, result});
             } else {
-                Value *hv  = callRT("perl_deref_hash", {base});
+                Value *hv = callRT("perl_deref_hash", {base});
                 freeIfOwned(base);
-                Value *key = emitExpr(*n.left->right);
-                lhsVal = callRT("perl_hash_get_sv_ref", {hv, key});
+                lhsVal = emitHashGetRef(hv, *n.left->right);
                 rhsVal = emitExpr(*n.right);
                 result = applyOp(lhsVal, rhsVal);
                 freeIfOwned(lhsVal);
                 freeIfOwned(rhsVal);
-                callRT("perl_hash_set_sv", {hv, key, result});
-                freeIfOwned(key);
+                emitHashSet(hv, *n.left->right, result);
             }
             return result;
         }
@@ -1947,8 +1989,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
-        Value *key = emitExpr(*n.left);
-        return callRT("perl_hash_get_sv_ref", {hv, key});
+        return emitHashGetRef(hv, *n.left);
     }
 
     case NK::KeysFunc: {
@@ -1966,8 +2007,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::ExistsFunc: {
         Value *hv = lookupHash(n.name);
         if (!hv) return perlInt(0);
-        Value *key = emitExpr(*n.left);
-        Value *r   = callRT("perl_hash_exists_sv", {hv, key});
+        Value *r = emitHashExists(hv, *n.left);
         return callRT("perl_alloc_int",
             {builder_.CreateSExt(r, Type::getInt64Ty(ctx_))});
     }
@@ -1975,8 +2015,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::DeleteFunc: {
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
-        Value *key = emitExpr(*n.left);
-        return callRT("perl_hash_delete_sv", {hv, key});
+        return emitHashDelete(hv, *n.left);
     }
 
     case NK::SortFunc:
@@ -2085,8 +2124,8 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::ArrowDeref: {
         Value *base = emitExpr(*n.left);
-        Value *sub  = emitExpr(*n.right);
         if (n.sval == "array") {
+            Value *sub = emitExpr(*n.right);
             Value *av  = callRT("perl_deref_array", {base});
             freeIfOwned(base);
             Value *idx = callRT("perl_to_int", {sub});
@@ -2095,9 +2134,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         } else {
             Value *hv = callRT("perl_deref_hash", {base});
             freeIfOwned(base);
-            Value *result = callRT("perl_hash_get_sv_ref", {hv, sub});
-            freeIfOwned(sub);
-            return result;
+            return emitHashGetRef(hv, *n.right);
         }
     }
 
@@ -2171,13 +2208,11 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto pushHashKey2 = [&](const Node &keyNode) {
             if (keyNode.kind == NK::ArrayLit) {
                 for (auto &k : keyNode.args) {
-                    Value *key  = emitExpr(*k);
-                    Value *elem = hv ? callRT("perl_hash_get_sv_ref", {hv, key}) : perlUndef();
+                    Value *elem = hv ? emitHashGetRef(hv, *k) : perlUndef();
                     callRT("perl_array_push", {res, elem});
                 }
             } else {
-                Value *key  = emitExpr(keyNode);
-                Value *elem = hv ? callRT("perl_hash_get_sv_ref", {hv, key}) : perlUndef();
+                Value *elem = hv ? emitHashGetRef(hv, keyNode) : perlUndef();
                 callRT("perl_array_push", {res, elem});
             }
         };

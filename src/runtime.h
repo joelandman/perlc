@@ -144,6 +144,11 @@ PerlValue *perl_hash_get_sv_ref(PerlHash *h, PerlValue *key); /* borrow: no clon
 void       perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val);
 int        perl_hash_exists_sv(PerlHash *h, PerlValue *key);
 PerlValue *perl_hash_delete_sv(PerlHash *h, PerlValue *key);
+/* key is a C string literal — no strdup overhead */
+PerlValue *perl_hash_get_str_ref(PerlHash *h, const char *key); /* borrow: no clone, never free result */
+void       perl_hash_set_str(PerlHash *h, const char *key, PerlValue *val);
+int        perl_hash_exists_str(PerlHash *h, const char *key);
+PerlValue *perl_hash_delete_str(PerlHash *h, const char *key);
 
 /* list operations */
 PerlArray *perl_hash_keys(PerlHash *h);    /* returns new PerlArray* of key strings */
