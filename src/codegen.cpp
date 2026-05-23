@@ -295,7 +295,7 @@ Function *CodeGen::getRTFunc(const std::string &nm) {
 void CodeGen::pushScope()  {
     scopes_.emplace_back(); arrayScopes_.emplace_back();
     hashScopes_.emplace_back(); pvScopes_.emplace_back();
-    floatScopes_.emplace_back();
+    floatScopes_.emplace_back(); intScopes_.emplace_back();
 }
 void CodeGen::popScope() {
     /* free stable PerlValue*s for my-vars going out of scope, unless in dead block */
@@ -306,7 +306,7 @@ void CodeGen::popScope() {
     }
     scopes_.pop_back(); arrayScopes_.pop_back();
     hashScopes_.pop_back(); pvScopes_.pop_back();
-    floatScopes_.pop_back();
+    floatScopes_.pop_back(); intScopes_.pop_back();
 }
 
 Value *CodeGen::lookupVar(const std::string &nm) {
@@ -734,6 +734,98 @@ Value *CodeGen::boxF64(Value *dbl) {
     return callRT("perl_alloc_float", {dbl});
 }
 
+/* ── unboxed integer helpers ─────────────────────────────────────────────── */
+
+Value *CodeGen::lookupIntVar(const std::string &name) {
+    for (int i = (int)intScopes_.size() - 1; i >= 0; i--) {
+        auto it = intScopes_[i].find(name);
+        if (it != intScopes_[i].end()) return it->second;
+    }
+    return nullptr;
+}
+
+void CodeGen::declareIntVar(const std::string &name, Value *alloca) {
+    if (!intScopes_.empty()) intScopes_.back()[name] = alloca;
+}
+
+Value *CodeGen::boxI64(Value *iv) {
+    return callRT("perl_alloc_int", {iv});
+}
+
+bool CodeGen::canEmitI64(const Node &n) {
+    switch (n.kind) {
+    case NK::IntLit: return true;
+    case NK::ScalarVar: {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        return lookupIntVar(nm) != nullptr;
+    }
+    case NK::BinOp: {
+        static const char *intOps[] = {"+", "-", "*", "%", nullptr};
+        for (auto *p = intOps; *p; p++) if (n.sval == *p)
+            return n.left && n.right && canEmitI64(*n.left) && canEmitI64(*n.right);
+        return false;
+    }
+    case NK::UnaryOp:
+        return n.sval == "-" && n.left && canEmitI64(*n.left);
+    default: return false;
+    }
+}
+
+Value *CodeGen::emitExprI64(const Node &n) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    switch (n.kind) {
+    case NK::IntLit:
+        return ConstantInt::get(i64, n.ival);
+    case NK::ScalarVar: {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        if (Value *ia = lookupIntVar(nm))
+            return builder_.CreateLoad(i64, ia, nm + ".i");
+        return nullptr;
+    }
+    case NK::BinOp: {
+        static const char *intOps[] = {"+", "-", "*", "%", nullptr};
+        bool isInt = false;
+        for (auto *p = intOps; *p; p++) if (n.sval == *p) { isInt = true; break; }
+        if (!isInt || !canEmitI64(*n.left) || !canEmitI64(*n.right)) return nullptr;
+        Value *lv = emitExprI64(*n.left);
+        Value *rv = emitExprI64(*n.right);
+        if (!lv || !rv) return nullptr;
+        if (n.sval == "+") return builder_.CreateAdd(lv, rv, "iadd");
+        if (n.sval == "-") return builder_.CreateSub(lv, rv, "isub");
+        if (n.sval == "*") return builder_.CreateMul(lv, rv, "imul");
+        return builder_.CreateSRem(lv, rv, "irem");
+    }
+    case NK::UnaryOp:
+        if (n.sval == "-" && n.left && canEmitI64(*n.left)) {
+            Value *v = emitExprI64(*n.left);
+            return v ? builder_.CreateNeg(v, "ineg") : nullptr;
+        }
+        return nullptr;
+    default: return nullptr;
+    }
+}
+
+/* Returns an i1 for integer comparisons, nullptr if not applicable. */
+Value *CodeGen::tryEmitI1Cond(const Node &n) {
+    if (n.kind != NK::BinOp || !n.left || !n.right) return nullptr;
+    if (!canEmitI64(*n.left) || !canEmitI64(*n.right)) return nullptr;
+    using P = llvm::CmpInst::Predicate;
+    P pred;
+    if      (n.sval == "<")  pred = P::ICMP_SLT;
+    else if (n.sval == "<=") pred = P::ICMP_SLE;
+    else if (n.sval == ">")  pred = P::ICMP_SGT;
+    else if (n.sval == ">=") pred = P::ICMP_SGE;
+    else if (n.sval == "==") pred = P::ICMP_EQ;
+    else if (n.sval == "!=") pred = P::ICMP_NE;
+    else return nullptr;
+    Value *lv = emitExprI64(*n.left);
+    Value *rv = emitExprI64(*n.right);
+    if (!lv || !rv) return nullptr;
+    return builder_.CreateICmp(pred, lv, rv, "icmp");
+}
+
 /* Pure predicate — can this expression be computed as a bare LLVM double?
    Never emits any IR. Returns true iff emitExprF64 will succeed. */
 bool CodeGen::canEmitF64(const Node &n) {
@@ -1150,11 +1242,17 @@ void CodeGen::emitStmt(const Node &n) {
             } else {
                 /* Unbox numeric scalars: skip PerlValue* alloca entirely */
                 if (n.right && !atFileScope) {
+                    if (Value *ival = emitExprI64(*n.right)) {
+                        auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
+                        builder_.CreateStore(ival, ialloca);
+                        declareIntVar(nm, ialloca);
+                        break;
+                    }
                     if (Value *fval = emitExprF64(*n.right)) {
                         auto *falloca = builder_.CreateAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
                         builder_.CreateStore(fval, falloca);
                         declareFloatVar(nm, falloca);
-                        break;  /* done — no PerlValue* alloca needed */
+                        break;
                     }
                 }
                 auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
@@ -1304,20 +1402,24 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.CreateBr(cond);
         builder_.SetInsertPoint(cond);
 
-        Value *cv;
-        if (myCondPv) {
-            Value *rhs = myCondRhs ? emitExpr(*myCondRhs) : perlUndef();
-            callRT("perl_assign", {myCondPv, rhs});
-            freeIfOwned(rhs);
-            cv = myCondPv;
-        } else {
-            cv = emitExpr(*n.cond);
+        Value *b = nullptr;
+        /* integer comparison fast path: skip boxing entirely */
+        if (!myCondPv && n.cond) b = tryEmitI1Cond(*n.cond);
+        if (!b) {
+            Value *cv;
+            if (myCondPv) {
+                Value *rhs = myCondRhs ? emitExpr(*myCondRhs) : perlUndef();
+                callRT("perl_assign", {myCondPv, rhs});
+                freeIfOwned(rhs);
+                cv = myCondPv;
+            } else {
+                cv = emitExpr(*n.cond);
+            }
+            Value *bv = callRT("perl_is_true", {cv});
+            if (!myCondPv) freeIfOwned(cv);
+            b = builder_.CreateICmpNE(bv,
+                    ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         }
-
-        Value *bv = callRT("perl_is_true", {cv});
-        if (!myCondPv) freeIfOwned(cv);
-        Value *b  = builder_.CreateICmpNE(bv,
-                        ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         builder_.CreateCondBr(b, body, exit);
 
         builder_.SetInsertPoint(body);
@@ -1376,11 +1478,14 @@ void CodeGen::emitStmt(const Node &n) {
 
         builder_.SetInsertPoint(condBB);
         if (n.cond) {
-            Value *cv = emitExpr(*n.cond);
-            Value *bv = callRT("perl_is_true", {cv});
-            freeIfOwned(cv);
-            Value *b  = builder_.CreateICmpNE(bv,
-                            ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+            Value *b = tryEmitI1Cond(*n.cond);
+            if (!b) {
+                Value *cv = emitExpr(*n.cond);
+                Value *bv = callRT("perl_is_true", {cv});
+                freeIfOwned(cv);
+                b = builder_.CreateICmpNE(bv,
+                        ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+            }
             builder_.CreateCondBr(b, bodyBB, exit);
         } else {
             builder_.CreateBr(bodyBB);
@@ -1669,6 +1774,11 @@ Value *CodeGen::emitExpr(const Node &n) {
         {
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            /* int var: box on demand */
+            if (Value *ia = lookupIntVar(nm)) {
+                Value *iv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia, nm + ".i");
+                return boxI64(iv);
+            }
             /* float var: box on demand */
             if (Value *fa = lookupFloatVar(nm)) {
                 Value *dbl = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
@@ -1777,6 +1887,10 @@ Value *CodeGen::emitExpr(const Node &n) {
         emitStmt(n);
         if (!n.name.empty() && n.name[0] == '$') {
             std::string nm = n.name.substr(1);
+            if (Value *ia = lookupIntVar(nm)) {
+                Value *iv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia, nm + ".i");
+                return boxI64(iv);
+            }
             if (Value *fa = lookupFloatVar(nm)) {
                 Value *dbl = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
                 return boxF64(dbl);
@@ -1801,6 +1915,25 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *result  = callRT("perl_not", {operand});
             freeIfOwned(operand);
             return result;
+        }
+        if (n.sval == "pre++" || n.sval == "pre--" ||
+            n.sval == "post++" || n.sval == "post--") {
+            /* fast path: unboxed integer variable */
+            if (n.left && n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (Value *ia = lookupIntVar(nm)) {
+                    auto *i64 = Type::getInt64Ty(ctx_);
+                    Value *cur = builder_.CreateLoad(i64, ia);
+                    bool isInc = (n.sval == "pre++" || n.sval == "post++");
+                    Value *delta = ConstantInt::get(i64, isInc ? 1 : -1);
+                    Value *next = isInc ? builder_.CreateAdd(cur, delta, "preinc")
+                                       : builder_.CreateSub(cur, delta, "predec");
+                    builder_.CreateStore(next, ia);
+                    bool isPre = (n.sval == "pre++" || n.sval == "pre--");
+                    return boxI64(isPre ? next : cur);
+                }
+            }
         }
         if (n.sval == "pre++") {
             Value *v = emitExpr(*n.left); callRT("perl_inc", {v}); return v;
@@ -1919,22 +2052,35 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_assign", {pv, rhs});
             return rhs;
         }
-        /* float var assignment */
+        /* int/float var assignment */
         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (Value *ia = lookupIntVar(nm)) {
+                Value *rhs = emitExprI64(*n.right);
+                if (rhs) {
+                    builder_.CreateStore(rhs, ia);
+                    return boxI64(rhs);
+                }
+                /* RHS not purely integer — extract int from boxed value */
+                Value *rv = emitExpr(*n.right);
+                Value *iv = callRT("perl_to_int", {rv});
+                builder_.CreateStore(iv, ia);
+                freeIfOwned(rv);
+                return rv;
+            }
             if (Value *fa = lookupFloatVar(nm)) {
                 Value *rhs = emitExprF64(*n.right);
                 if (rhs) {
                     builder_.CreateStore(rhs, fa);
-                    return boxF64(rhs);  /* return a temporary boxed value */
+                    return boxF64(rhs);
                 }
                 /* RHS not purely numeric — box and store */
                 Value *rv = emitExpr(*n.right);
                 Value *dbl = callRT("perl_to_float", {rv});
                 builder_.CreateStore(dbl, fa);
                 freeIfOwned(rv);
-                return rv;  /* caller gets the temp */
+                return rv;
             }
         }
         {
@@ -1958,10 +2104,39 @@ Value *CodeGen::emitExpr(const Node &n) {
             else if (n.sval == ".") return callRT("perl_concat", {lv, rv});
             else return perlUndef();
         };
-        /* float var: $x op= rhs */
+        /* int/float var: $x op= rhs */
         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (Value *ia = lookupIntVar(nm)) {
+                auto applyI64 = [&](Value *lv, Value *rv) -> Value * {
+                    if (n.sval == "+") return builder_.CreateAdd(lv, rv);
+                    if (n.sval == "-") return builder_.CreateSub(lv, rv);
+                    if (n.sval == "*") return builder_.CreateMul(lv, rv);
+                    if (n.sval == "%") return builder_.CreateSRem(lv, rv);
+                    return nullptr;
+                };
+                Value *lv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
+                Value *rv = emitExprI64(*n.right);
+                if (rv) {
+                    Value *res = applyI64(lv, rv);
+                    if (res) {
+                        builder_.CreateStore(res, ia);
+                        return boxI64(res);
+                    }
+                }
+                /* fallback: box current int, compute boxed op, unbox result */
+                {
+                    Value *lhsBox = boxI64(lv);
+                    Value *rhsVal = emitExpr(*n.right);
+                    Value *result = applyOp(lhsBox, rhsVal);
+                    Value *newInt = callRT("perl_to_int", {result});
+                    builder_.CreateStore(newInt, ia);
+                    callRT("perl_free", {lhsBox});
+                    freeIfOwned(rhsVal);
+                    return result;
+                }
+            }
             if (Value *fa = lookupFloatVar(nm)) {
                 auto applyF64 = [&](Value *lv, Value *rv) -> Value * {
                     if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
@@ -1979,7 +2154,17 @@ Value *CodeGen::emitExpr(const Node &n) {
                         return boxF64(res);
                     }
                 }
-                /* fallback: use boxed path */
+                /* fallback: box current float, compute boxed op, unbox result */
+                {
+                    Value *lhsBox = boxF64(lv);
+                    Value *rhsVal = emitExpr(*n.right);
+                    Value *result = applyOp(lhsBox, rhsVal);
+                    Value *newDbl = callRT("perl_to_float", {result});
+                    builder_.CreateStore(newDbl, fa);
+                    callRT("perl_free", {lhsBox});
+                    freeIfOwned(rhsVal);
+                    return result;
+                }
             }
         }
         /* $arr[$i] op= rhs */
@@ -2573,12 +2758,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto  savedHashScopes  = hashScopes_;
         auto  savedPvScopes    = pvScopes_;
         auto  savedFloatScopes = floatScopes_;
+        auto  savedIntScopes   = intScopes_;
         auto *savedLocalDepth  = localDepthAlloca_;
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
         currentFn_ = subFn;
-        scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {}; floatScopes_ = {};
+        scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {}; floatScopes_ = {}; intScopes_ = {};
         pushScope();
     Value *argsArr = subFn->getArg(0);
     argsArr->setName("args");
@@ -2617,6 +2803,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         hashScopes_       = std::move(savedHashScopes);
         pvScopes_         = std::move(savedPvScopes);
         floatScopes_      = std::move(savedFloatScopes);
+        intScopes_        = std::move(savedIntScopes);
         localDepthAlloca_ = savedLocalDepth;
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
@@ -2722,6 +2909,11 @@ Value *CodeGen::emitLValue(const Node &n) {
 }
 
 Value *CodeGen::emitBinOp(const Node &n) {
+    /* Fast path: stay unboxed for integer arithmetic */
+    if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%") {
+        if (Value *iv = emitExprI64(n))
+            return boxI64(iv);
+    }
     /* Fast path: if both operands can be expressed as doubles, stay unboxed */
     if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") {
         if (Value *fv = emitExprF64(n))
