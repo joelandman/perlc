@@ -9,6 +9,7 @@
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <stdexcept>
 #include <sstream>
+#include <set>
 #include <unordered_set>
 
 using namespace llvm;
@@ -307,7 +308,7 @@ void CodeGen::pushScope()  {
     scopes_.emplace_back(); arrayScopes_.emplace_back();
     hashScopes_.emplace_back(); pvScopes_.emplace_back();
     floatScopes_.emplace_back(); intScopes_.emplace_back();
-    derefAVScopes_.emplace_back();
+    derefAVScopes_.emplace_back(); rowAVScopes_.emplace_back();
 }
 void CodeGen::popScope() {
     /* free stable PerlValue*s for my-vars going out of scope, unless in dead block */
@@ -319,7 +320,7 @@ void CodeGen::popScope() {
     scopes_.pop_back(); arrayScopes_.pop_back();
     hashScopes_.pop_back(); pvScopes_.pop_back();
     floatScopes_.pop_back(); intScopes_.pop_back();
-    derefAVScopes_.pop_back();
+    derefAVScopes_.pop_back(); rowAVScopes_.pop_back();
 }
 
 Value *CodeGen::lookupVar(const std::string &nm) {
@@ -774,6 +775,20 @@ void CodeGen::declareDerefAV(const std::string &name, Value *alloca) {
     if (!derefAVScopes_.empty()) derefAVScopes_.back()[name] = alloca;
 }
 
+Value *CodeGen::lookupRowAV(const std::string &outerVar, const std::string &idxVar) {
+    std::string key = outerVar + "\x01" + idxVar;
+    for (int i = (int)rowAVScopes_.size() - 1; i >= 0; i--) {
+        auto it = rowAVScopes_[i].find(key);
+        if (it != rowAVScopes_[i].end()) return it->second;
+    }
+    return nullptr;
+}
+
+void CodeGen::declareRowAV(const std::string &outerVar, const std::string &idxVar, Value *alloca) {
+    if (!rowAVScopes_.empty())
+        rowAVScopes_.back()[outerVar + "\x01" + idxVar] = alloca;
+}
+
 Value *CodeGen::boxI64(Value *iv) {
     return callRT("perl_alloc_int", {iv});
 }
@@ -880,6 +895,39 @@ Value *CodeGen::emitIdx(const Node &n) {
 /* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
    Used to decide whether a @_ scalar arg can be promoted to a float alloca.
    'inNum' = the parent node is a numeric expression (so nm here is safe). */
+/* Collect unique (outerVarName, strippedIndexVarName) pairs from 2D ArrowDeref
+   patterns where outerVarName is in derefAVNames (Stage 15 promoted vars).
+   Used by Foreach emitter to pre-emit row derefs at loop body entry. */
+static void collectRowAVPairs(
+    const Node &n,
+    const std::unordered_set<std::string> &derefAVNames,
+    std::set<std::pair<std::string,std::string>> &out)
+{
+    /* 2D read or write target: $outer->[$idx][k]
+       AST: ArrowDeref(left=ArrowDeref(left=ScalarVar(outer), right=ScalarVar(idx)), right=k) */
+    if (n.kind == NK::ArrowDeref && n.sval == "array" &&
+        n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
+        n.left->left && n.left->left->kind == NK::ScalarVar &&
+        derefAVNames.count(n.left->left->name) &&
+        n.left->right && n.left->right->kind == NK::ScalarVar) {
+        std::string idxNm = n.left->right->name;
+        if (!idxNm.empty() && idxNm[0] == '$') idxNm = idxNm.substr(1);
+        out.insert({n.left->left->name, idxNm});
+    }
+
+    if (n.left)  collectRowAVPairs(*n.left,  derefAVNames, out);
+    if (n.right) collectRowAVPairs(*n.right, derefAVNames, out);
+    for (auto &a : n.args) collectRowAVPairs(*a, derefAVNames, out);
+    if (n.body)  collectRowAVPairs(*n.body,  derefAVNames, out);
+    if (n.init)  collectRowAVPairs(*n.init,  derefAVNames, out);
+    if (n.cond)  collectRowAVPairs(*n.cond,  derefAVNames, out);
+    if (n.step)  collectRowAVPairs(*n.step,  derefAVNames, out);
+    for (auto &b : n.branches) {
+        if (b.cond) collectRowAVPairs(*b.cond, derefAVNames, out);
+        if (b.body) collectRowAVPairs(*b.body, derefAVNames, out);
+    }
+}
+
 /* Returns true if every occurrence of ScalarVar(nm) in the AST is the direct
    left-child of an ArrowDeref with sval=="array" (i.e. used only as $nm->[$i]).
    Used to decide whether to cache perl_deref_array_ro at function entry. */
@@ -1128,8 +1176,23 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     outerArr = callRT("perl_deref_array_ro", {base});
                     freeIfOwned(base);
                 }
-                Value *innerRef  = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
-                Value *innerArr  = callRT("perl_deref_array_ro", {innerRef});
+                /* Inner deref: use row cache if first index is a named var (Stage 16) */
+                Value *innerArr;
+                if (n.left->left->kind == NK::ScalarVar &&
+                    n.left->right->kind == NK::ScalarVar) {
+                    std::string idxNm = n.left->right->name;
+                    if (!idxNm.empty() && idxNm[0] == '$') idxNm = idxNm.substr(1);
+                    if (Value *ra = lookupRowAV(n.left->left->name, idxNm)) {
+                        innerArr = builder_.CreateLoad(perlPtrTy_, ra,
+                                                        n.left->left->name + "." + idxNm + ".ra");
+                    } else {
+                        Value *innerRef = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
+                        innerArr = callRT("perl_deref_array_ro", {innerRef});
+                    }
+                } else {
+                    Value *innerRef = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
+                    innerArr = callRT("perl_deref_array_ro", {innerRef});
+                }
                 Value *elem      = callRT("perl_array_get_ref", {innerArr, emitIdx(*n.right)});
                 return callRT("perl_to_float", {elem});
             }
@@ -1775,6 +1838,38 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.SetInsertPoint(bodyBB);
             pushScope();
             declareIntVar(loopNm, iterAlloca);
+
+            /* Stage 16: pre-emit row derefs for hot 2D patterns.
+               Collect (outerVar, firstIndexVar) pairs — for each we know:
+               (a) outerVar is a cached PerlArray* (derefAVScopes_), and
+               (b) the firstIndex is a loop variable (int alloca).
+               Emitting get_ref+deref_ro once per body entry eliminates
+               repeated recomputation blocked by update_float aliasing. */
+            if (n.body) {
+                std::unordered_set<std::string> avNames;
+                for (auto &scope : derefAVScopes_)
+                    for (auto &[nm, _] : scope) avNames.insert(nm);
+
+                if (!avNames.empty()) {
+                    std::set<std::pair<std::string,std::string>> pairs;
+                    collectRowAVPairs(*n.body, avNames, pairs);
+                    auto *i64 = Type::getInt64Ty(ctx_);
+                    for (auto &[outerNm, idxNm] : pairs) {
+                        Value *outerPA = lookupDerefAV(outerNm);
+                        Value *idxIA   = lookupIntVar(idxNm);
+                        if (!outerPA || !idxIA) continue;
+                        Value *outerArr = builder_.CreateLoad(perlPtrTy_, outerPA, outerNm + ".av");
+                        Value *idx      = builder_.CreateLoad(i64, idxIA, idxNm + ".i");
+                        Value *rowRef   = callRT("perl_array_get_ref", {outerArr, idx});
+                        Value *rowArr   = callRT("perl_deref_array_ro", {rowRef});
+                        auto *ra = builder_.CreateAlloca(perlPtrTy_, nullptr,
+                                                         outerNm + "." + idxNm + ".ra");
+                        builder_.CreateStore(rowArr, ra);
+                        declareRowAV(outerNm, idxNm, ra);
+                    }
+                }
+            }
+
             emitBlock(*n.body);
             popScope();
             if (!builder_.GetInsertBlock()->getTerminator())
@@ -2516,8 +2611,24 @@ Value *CodeGen::emitExpr(const Node &n) {
                         outerArr = callRT("perl_deref_array_ro", {outerBase});
                         freeIfOwned(outerBase);
                     }
-                    Value *innerRef  = callRT("perl_array_get_ref",  {outerArr, emitIdx(*n.left->left->right)});
-                    av               = callRT("perl_deref_array_ro", {innerRef});
+                    /* Inner deref: use row cache if first index is a named var (Stage 16) */
+                    if (n.left->left->left->kind == NK::ScalarVar &&
+                        n.left->left->right->kind == NK::ScalarVar) {
+                        std::string idxNm = n.left->left->right->name;
+                        if (!idxNm.empty() && idxNm[0] == '$') idxNm = idxNm.substr(1);
+                        if (Value *ra = lookupRowAV(n.left->left->left->name, idxNm)) {
+                            av = builder_.CreateLoad(perlPtrTy_, ra,
+                                                     n.left->left->left->name + "." + idxNm + ".ra");
+                        } else {
+                            Value *innerRef = callRT("perl_array_get_ref",
+                                                     {outerArr, emitIdx(*n.left->left->right)});
+                            av = callRT("perl_deref_array_ro", {innerRef});
+                        }
+                    } else {
+                        Value *innerRef = callRT("perl_array_get_ref",
+                                                 {outerArr, emitIdx(*n.left->left->right)});
+                        av = callRT("perl_deref_array_ro", {innerRef});
+                    }
                 } else {
                     Value *base = emitExpr(*n.left->left);
                     av = callRT("perl_deref_array_ro", {base});
