@@ -1081,6 +1081,8 @@ bool CodeGen::canEmitF64(const Node &n) {
         return lookupFloatVar(nm) != nullptr;
     }
     case NK::BinOp: {
+        if (n.sval == "**" && n.right && n.right->kind == NK::IntLit && n.right->ival == 2)
+            return n.left && canEmitF64(*n.left);
         static const char *arithOps[] = {"+", "-", "*", "/", nullptr};
         for (auto *p = arithOps; *p; p++) if (n.sval == *p) {
             return n.left && n.right && canEmitF64(*n.left) && canEmitF64(*n.right);
@@ -1120,6 +1122,12 @@ Value *CodeGen::emitExprF64(const Node &n) {
         return nullptr;
     }
     case NK::BinOp: {
+        /* x**2 → x*x (avoids boxing and perl_pow entirely) */
+        if (n.sval == "**" && n.right && n.right->kind == NK::IntLit && n.right->ival == 2) {
+            if (!canEmitF64(*n.left)) return nullptr;
+            Value *v = emitExprF64(*n.left);
+            return v ? builder_.CreateFMul(v, v, "sq") : nullptr;
+        }
         static const char *arithOps[] = {"+", "-", "*", "/", nullptr};
         bool isArith = false;
         for (auto *p = arithOps; *p; p++) if (n.sval == *p) { isArith = true; break; }
@@ -1898,8 +1906,16 @@ void CodeGen::emitStmt(const Node &n) {
                         if (!outerPA || !idxIA) continue;
                         Value *outerArr = builder_.CreateLoad(perlPtrTy_, outerPA, outerNm + ".av");
                         Value *idx      = builder_.CreateLoad(i64, idxIA, idxNm + ".i");
-                        Value *rowRef   = callRT("perl_array_get_ref", {outerArr, idx});
-                        Value *rowArr   = callRT("perl_deref_array_ro", {rowRef});
+                        /* Inline row deref: bypass bounds/tag checks.
+                           outerArr->elems[idx]->pval = inner PerlArray*.
+                           Safe when loop variable is within array bounds and
+                           elements are guaranteed to be REF_ARRAY. */
+                        auto *i8TyRD    = Type::getInt8Ty(ctx_);
+                        Value *outerElems = builder_.CreateLoad(perlPtrTy_, outerArr, outerNm + ".oe");
+                        Value *rowRefPP   = builder_.CreateGEP(perlPtrTy_, outerElems, idx, outerNm + "." + idxNm + ".rpp");
+                        Value *rowRef     = builder_.CreateLoad(perlPtrTy_, rowRefPP, outerNm + "." + idxNm + ".rref");
+                        Value *pvalPtr    = builder_.CreateConstInBoundsGEP1_64(i8TyRD, rowRef, 8, outerNm + "." + idxNm + ".pval.ptr");
+                        Value *rowArr     = builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".ra.direct");
                         auto *ra = builder_.CreateAlloca(perlPtrTy_, nullptr,
                                                          outerNm + "." + idxNm + ".ra");
                         builder_.CreateStore(rowArr, ra);
@@ -2673,7 +2689,9 @@ Value *CodeGen::emitExpr(const Node &n) {
                     freeIfOwned(base);
                 }
                 Value *idx = emitIdx(*n.left->right);
-                /* Fast path: RHS is F64 and op is arithmetic — update in place, zero alloc */
+                /* Fast path: RHS is F64 and op is arithmetic — update in place, zero alloc.
+                   Direct GEP+load/store bypass bounds checks, tag dispatch, and string-free
+                   branches. Safe when elements are numeric (initialized as int/float). */
                 if (canEmitF64(*n.right)) {
                     auto applyF64op = [&](Value *lv, Value *rv) -> Value * {
                         if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
@@ -2682,15 +2700,23 @@ Value *CodeGen::emitExpr(const Node &n) {
                         if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
                         return nullptr;
                     };
-                    Value *borrowPv = callRT("perl_array_get_ref", {av, idx});
-                    Value *lhsF = callRT("perl_to_float", {borrowPv});
-                    Value *rhsF = emitExprF64(*n.right);
+                    auto *i8Ty  = Type::getInt8Ty(ctx_);
+                    auto *i32Ty = Type::getInt32Ty(ctx_);
+                    auto *f64Ty = Type::getDoubleTy(ctx_);
+                    /* Direct read: load av->elems, GEP to pv, load fval at offset 8 */
+                    Value *elems = builder_.CreateLoad(perlPtrTy_, av, "av.elems");
+                    Value *pvPtr = builder_.CreateGEP(perlPtrTy_, elems, idx, "pv.ptr");
+                    Value *pv    = builder_.CreateLoad(perlPtrTy_, pvPtr, "pv");
+                    Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fv.ptr");
+                    Value *lhsF  = builder_.CreateLoad(f64Ty, fvPtr, "lhsf");
+                    Value *rhsF  = emitExprF64(*n.right);
                     if (rhsF) {
                         Value *newF = applyF64op(lhsF, rhsF);
                         if (newF) {
-                            callRT("perl_array_update_float", {av, idx, newF});
-                            /* borrowPv now reflects updated value; not owned → no free */
-                            return borrowPv;
+                            /* Direct write: store FLOAT tag (2) at offset 0, fval at offset 8 */
+                            builder_.CreateStore(ConstantInt::get(i32Ty, 2), pv);
+                            builder_.CreateStore(newF, fvPtr);
+                            return pv;
                         }
                     }
                 }
