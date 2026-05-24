@@ -1050,7 +1050,26 @@ PerlValue *perl_deref_scalar(PerlValue *ref) {
 }
 
 PerlArray *perl_deref_array(PerlValue *ref) {
-    if (!ref || ref->tag != PERL_REF_ARRAY) return perl_array_new();
+    if (!ref) return perl_array_new();
+    if (ref->tag == PERL_FLAT_ARRAY) {
+        /* Lazy conversion: box flat double[] into a proper PerlArray in-place.
+           Mutates the PV from FLAT_ARRAY to REF_ARRAY so subsequent accesses
+           (including the Stage 22 inline GEP path) see the correct tag. */
+        long long n = ref->matchpos;
+        double *dbl = (double *)ref->pval;
+        PerlArray *av = perl_array_new();
+        for (long long i = 0; i < n; i++) {
+            PerlValue *fv = perl_alloc_float(dbl[i]);
+            perl_array_push(av, fv);
+            perl_free(fv);
+        }
+        free(dbl);
+        ref->tag   = PERL_REF_ARRAY;
+        ref->pval  = av;
+        ref->matchpos = 0;
+        return av;
+    }
+    if (ref->tag != PERL_REF_ARRAY) return perl_array_new();
     return (PerlArray *)ref->pval;
 }
 

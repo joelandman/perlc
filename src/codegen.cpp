@@ -1250,24 +1250,111 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     outerArr = callRT("perl_deref_array_ro", {base});
                     freeIfOwned(base);
                 }
-                /* Inner deref: use row cache (Stage 16) if first index is a named var */
+                /* Inner deref: use flat/row cache if first index is a named var */
                 Value *innerArr;
                 if (n.left->left->kind == NK::ScalarVar &&
                     n.left->right->kind == NK::ScalarVar) {
                     std::string idxNm = n.left->right->name;
                     if (!idxNm.empty() && idxNm[0] == '$') idxNm = idxNm.substr(1);
 
+                    /* Stage 22: flat row cache — direct double[] read via phi dispatch */
+                    if (Value *fra = lookupFlatRow(n.left->left->name, idxNm)) {
+                        Value *idx17    = emitIdx(*n.right);
+                        auto *f64Ty17   = Type::getDoubleTy(ctx_);
+                        Value *flatPtr  = builder_.CreateLoad(perlPtrTy_, fra, "flat.ptr");
+                        Value *isFlat17 = builder_.CreateICmpNE(flatPtr,
+                            ConstantPointerNull::get(perlPtrTy_), "s17.if");
+                        auto *curFn17 = builder_.GetInsertBlock()->getParent();
+                        auto *fBB17   = BasicBlock::Create(ctx_, "s17.f", curFn17);
+                        auto *nBB17   = BasicBlock::Create(ctx_, "s17.n", curFn17);
+                        auto *mBB17   = BasicBlock::Create(ctx_, "s17.m", curFn17);
+                        builder_.CreateCondBr(isFlat17, fBB17, nBB17);
+                        /* flat BB: direct double load */
+                        builder_.SetInsertPoint(fBB17);
+                        Value *ep17  = builder_.CreateGEP(f64Ty17, flatPtr, idx17, "fe");
+                        Value *fvf17 = builder_.CreateLoad(f64Ty17, ep17, "ffv");
+                        setTBAA(fvf17, tbaaFlatDoubleTag_);
+                        builder_.CreateBr(mBB17);
+                        auto *fBB17p = builder_.GetInsertBlock();
+                        /* norm BB: PV* row cache */
+                        builder_.SetInsertPoint(nBB17);
+                        Value *fvn17 = ConstantFP::get(f64Ty17, 0.0);
+                        if (Value *ra17 = lookupRowAV(n.left->left->name, idxNm)) {
+                            Value *ia17   = builder_.CreateLoad(perlPtrTy_, ra17,
+                                              n.left->left->name + "." + idxNm + ".ra");
+                            auto *i8Ty17n = Type::getInt8Ty(ctx_);
+                            Value *el17   = builder_.CreateLoad(perlPtrTy_, ia17, "ae");
+                            setTBAA(el17, tbaaAvElemsTag_);
+                            Value *pp17   = builder_.CreateGEP(perlPtrTy_, el17, idx17, "pp");
+                            Value *pv17   = builder_.CreateLoad(perlPtrTy_, pp17, "pv");
+                            setTBAA(pv17, tbaaAvElemTag_);
+                            Value *fp17   = builder_.CreateConstInBoundsGEP1_64(i8Ty17n, pv17, 8, "fp");
+                            fvn17         = builder_.CreateLoad(f64Ty17, fp17, "nfv");
+                            setTBAA(fvn17, tbaaPvFvalTag_);
+                        }
+                        builder_.CreateBr(mBB17);
+                        auto *nBB17p = builder_.GetInsertBlock();
+                        builder_.SetInsertPoint(mBB17);
+                        auto *phi17 = builder_.CreatePHI(f64Ty17, 2, "fv");
+                        phi17->addIncoming(fvf17, fBB17p);
+                        phi17->addIncoming(fvn17, nBB17p);
+                        return phi17;
+                    }
+
                     /* Stage 16: normal PV* row cache */
                     if (Value *ra = lookupRowAV(n.left->left->name, idxNm)) {
                         innerArr = builder_.CreateLoad(perlPtrTy_, ra,
                                                         n.left->left->name + "." + idxNm + ".ra");
                     } else {
+                        /* Fallback: no row cache — inner row might be FLAT_ARRAY,
+                           use perl_deref_array (handles lazy conversion) not _ro */
                         Value *innerRef = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
-                        innerArr = callRT("perl_deref_array_ro", {innerRef});
+                        innerArr = callRT("perl_deref_array", {innerRef});
                     }
                 } else {
+                    /* Uncached 2D read (non-ScalarVar index): flat/norm dispatch so
+                       FLAT_ARRAY PVs are never lazy-converted by perl_deref_array. */
                     Value *innerRef = callRT("perl_array_get_ref", {outerArr, emitIdx(*n.left->right)});
-                    innerArr = callRT("perl_deref_array_ro", {innerRef});
+                    Value *idx17u   = emitIdx(*n.right);
+                    auto *i8Tu      = Type::getInt8Ty(ctx_);
+                    auto *i32Tu     = Type::getInt32Ty(ctx_);
+                    auto *f64Tu     = Type::getDoubleTy(ctx_);
+                    Value *tagU     = builder_.CreateLoad(i32Tu, innerRef, "tagu");
+                    setTBAA(tagU, tbaaPvTagTag_);
+                    Value *isFlatU  = builder_.CreateICmpEQ(tagU,
+                                         ConstantInt::get(i32Tu, 10), "isflatu");
+                    auto *curFnU    = builder_.GetInsertBlock()->getParent();
+                    auto *fBBU      = BasicBlock::Create(ctx_, "r22u.f", curFnU);
+                    auto *nBBU      = BasicBlock::Create(ctx_, "r22u.n", curFnU);
+                    auto *mBBU      = BasicBlock::Create(ctx_, "r22u.m", curFnU);
+                    builder_.CreateCondBr(isFlatU, fBBU, nBBU);
+                    /* flat: load double directly from pval[] */
+                    builder_.SetInsertPoint(fBBU);
+                    Value *pvalOffU = builder_.CreateConstInBoundsGEP1_64(i8Tu, innerRef, 8, "pvaloffu");
+                    Value *dblPtrU  = builder_.CreateLoad(perlPtrTy_, pvalOffU, "dblpu");
+                    Value *epU      = builder_.CreateGEP(f64Tu, dblPtrU, idx17u, "epu");
+                    Value *fvFlatU  = builder_.CreateLoad(f64Tu, epU, "fvflatu");
+                    if (tbaaFlatDoubleTag_) setTBAA(fvFlatU, tbaaFlatDoubleTag_);
+                    builder_.CreateBr(mBBU);
+                    auto *fBBUp = builder_.GetInsertBlock();
+                    /* norm: PV* chain via perl_deref_array */
+                    builder_.SetInsertPoint(nBBU);
+                    Value *innerArrU = callRT("perl_deref_array", {innerRef});
+                    Value *elemsU    = builder_.CreateLoad(perlPtrTy_, innerArrU, "aeu");
+                    setTBAA(elemsU, tbaaAvElemsTag_);
+                    Value *pvPtrU    = builder_.CreateGEP(perlPtrTy_, elemsU, idx17u, "ppu");
+                    Value *pvU       = builder_.CreateLoad(perlPtrTy_, pvPtrU, "pvu");
+                    setTBAA(pvU, tbaaAvElemTag_);
+                    Value *fvPtrU    = builder_.CreateConstInBoundsGEP1_64(i8Tu, pvU, 8, "fpu");
+                    Value *fvNormU   = builder_.CreateLoad(f64Tu, fvPtrU, "fvnu");
+                    setTBAA(fvNormU, tbaaPvFvalTag_);
+                    builder_.CreateBr(mBBU);
+                    auto *nBBUp = builder_.GetInsertBlock();
+                    builder_.SetInsertPoint(mBBU);
+                    auto *phiU = builder_.CreatePHI(f64Tu, 2, "fvu");
+                    phiU->addIncoming(fvFlatU, fBBUp);
+                    phiU->addIncoming(fvNormU, nBBUp);
+                    return phiU;
                 }
                 /* Stage 17: inline GEP+loads from PV* chain */
                 Value *idx17 = emitIdx(*n.right);
@@ -1975,17 +2062,38 @@ void CodeGen::emitStmt(const Node &n) {
                         Value *outerArr = builder_.CreateLoad(perlPtrTy_, outerPA, outerNm + ".av");
                         Value *idx      = builder_.CreateLoad(i64, idxIA, idxNm + ".i");
                         /* Stage 19: inline row deref — bypass bounds/tag checks.
-                           outerArr->elems[idx]->pval = inner PerlArray* (REF_ARRAY). */
+                           outerArr->elems[idx]->pval = inner PerlArray* (REF_ARRAY)
+                           or double* (FLAT_ARRAY=10). One branch per outer iteration
+                           dispatches to flatRowScopes_ (double*) or rowAVScopes_ (PerlArray*). */
                         auto *i8TyRD    = Type::getInt8Ty(ctx_);
+                        auto *i32TyRD   = Type::getInt32Ty(ctx_);
                         Value *outerElems = builder_.CreateLoad(perlPtrTy_, outerArr, outerNm + ".oe");
                         setTBAA(outerElems, tbaaAvElemsTag_);
                         Value *rowRefPP   = builder_.CreateGEP(perlPtrTy_, outerElems, idx, outerNm + "." + idxNm + ".rpp");
                         Value *rowRef     = builder_.CreateLoad(perlPtrTy_, rowRefPP, outerNm + "." + idxNm + ".rref");
                         setTBAA(rowRef, tbaaAvElemTag_);
                         Value *pvalPtr    = builder_.CreateConstInBoundsGEP1_64(i8TyRD, rowRef, 8, outerNm + "." + idxNm + ".pp");
-                        Value *rowArr     = builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".ra.direct");
-                        auto *ra = builder_.CreateAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".ra");
-                        builder_.CreateStore(rowArr, ra);
+                        Value *rowData    = builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".data");
+                        auto *fra = builder_.CreateAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".fra");
+                        auto *ra  = builder_.CreateAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".ra");
+                        builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), fra);
+                        builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), ra);
+                        Value *pvTag    = builder_.CreateLoad(i32TyRD, rowRef, outerNm + "." + idxNm + ".tag");
+                        static_cast<LoadInst *>(pvTag)->setMetadata(LLVMContext::MD_tbaa, tbaaPvTagTag_);
+                        Value *isFlat   = builder_.CreateICmpEQ(pvTag,
+                            ConstantInt::get(i32TyRD, 10), outerNm + "." + idxNm + ".isflat");
+                        auto *flatBBrd  = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".flat", fn);
+                        auto *normBBrd  = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".norm", fn);
+                        auto *mergeBBrd = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".rmerge", fn);
+                        builder_.CreateCondBr(isFlat, flatBBrd, normBBrd);
+                        builder_.SetInsertPoint(flatBBrd);
+                        builder_.CreateStore(rowData, fra);
+                        builder_.CreateBr(mergeBBrd);
+                        builder_.SetInsertPoint(normBBrd);
+                        builder_.CreateStore(rowData, ra);
+                        builder_.CreateBr(mergeBBrd);
+                        builder_.SetInsertPoint(mergeBBrd);
+                        declareFlatRow(outerNm, idxNm, fra);
                         declareRowAV(outerNm, idxNm, ra);
                     }
                 }
@@ -2533,17 +2641,50 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* $ref->[i] = val  or  $ref->{k} = val */
         if (n.left->kind == NK::ArrowDeref) {
             Value *base = emitExpr(*n.left->left);
-            Value *rhs  = emitExpr(*n.right);
             if (n.left->sval == "array") {
-                Value *av = callRT("perl_deref_array", {base});
+                Value *idx = emitIdx(*n.left->right);
+                Value *rhs = emitExpr(*n.right);
+                /* Stage 22: always dispatch flat/norm to avoid perl_deref_array
+                   lazy-converting FLAT_ARRAY PVs (keeps all bodies flat throughout). */
+                auto *i8T32  = Type::getInt8Ty(ctx_);
+                auto *i32T32 = Type::getInt32Ty(ctx_);
+                auto *f64T32 = Type::getDoubleTy(ctx_);
+                Value *tag32    = builder_.CreateLoad(i32T32, base, "tag32");
+                setTBAA(tag32, tbaaPvTagTag_);
+                Value *isFlat32 = builder_.CreateICmpEQ(tag32,
+                                     ConstantInt::get(i32T32, 10), "isflat32");
+                auto *curFn32   = builder_.GetInsertBlock()->getParent();
+                auto *fBB32     = BasicBlock::Create(ctx_, "w22.f", curFn32);
+                auto *nBB32     = BasicBlock::Create(ctx_, "w22.n", curFn32);
+                auto *mBB32     = BasicBlock::Create(ctx_, "w22.m", curFn32);
+                builder_.CreateCondBr(isFlat32, fBB32, nBB32);
+                /* flat: extract double from rhs, store directly into double[] */
+                builder_.SetInsertPoint(fBB32);
+                Value *rhsF32    = callRT("perl_to_float", {rhs});
+                Value *pvalOff32 = builder_.CreateConstInBoundsGEP1_64(
+                                       i8T32, base, 8, "pvaloff32");
+                Value *dblPtr32  = builder_.CreateLoad(perlPtrTy_, pvalOff32, "dblp32");
+                Value *ep32      = builder_.CreateGEP(f64T32, dblPtr32, idx, "ep32");
+                auto *fst32 = builder_.CreateStore(rhsF32, ep32);
+                if (tbaaFlatDoubleTag_)
+                    fst32->setMetadata(LLVMContext::MD_tbaa, tbaaFlatDoubleTag_);
                 freeIfOwned(base);
-                callRT("perl_array_set", {av, emitIdx(*n.left->right), rhs});
+                builder_.CreateBr(mBB32);
+                /* norm: use perl_deref_array + perl_array_set */
+                builder_.SetInsertPoint(nBB32);
+                Value *av32 = callRT("perl_deref_array", {base});
+                freeIfOwned(base);
+                callRT("perl_array_set", {av32, idx, rhs});
+                builder_.CreateBr(mBB32);
+                builder_.SetInsertPoint(mBB32);
+                return rhs;
             } else {
+                Value *rhs = emitExpr(*n.right);
                 Value *hv = callRT("perl_deref_hash", {base});
                 freeIfOwned(base);
                 emitHashSet(hv, *n.left->right, rhs);
+                return rhs;
             }
-            return rhs;
         }
         /* $arr[i] = val */
         if (n.left->kind == NK::ArrayElem) {
@@ -2732,12 +2873,88 @@ Value *CodeGen::emitExpr(const Node &n) {
                         outerArr = callRT("perl_deref_array_ro", {outerBase});
                         freeIfOwned(outerBase);
                     }
-                    /* Inner deref: use row cache (Stage 16) if first index is a named var */
+                    /* Inner deref: use flat/row cache if first index is a named var */
                     if (n.left->left->left->kind == NK::ScalarVar &&
                         n.left->left->right->kind == NK::ScalarVar) {
                         std::string idxNm = n.left->left->right->name;
                         if (!idxNm.empty() && idxNm[0] == '$') idxNm = idxNm.substr(1);
                         const std::string &outerNm18 = n.left->left->left->name;
+
+                        /* Stage 22: flat row fast path — RHS emitted ONCE before condBr
+                           so LLVM sees a single expression, enabling CSE/hoisting. */
+                        if (canEmitF64(*n.right)) {
+                            if (Value *fra18 = lookupFlatRow(outerNm18, idxNm)) {
+                                auto applyF64 = [&](Value *lv, Value *rv) -> Value * {
+                                    if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
+                                    if (n.sval == "-") return builder_.CreateFSub(lv, rv);
+                                    if (n.sval == "*") return builder_.CreateFMul(lv, rv);
+                                    if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
+                                    return nullptr;
+                                };
+                                auto *f64Ty18 = Type::getDoubleTy(ctx_);
+                                Value *idx18  = emitIdx(*n.left->right);
+                                Value *flatPtr = builder_.CreateLoad(perlPtrTy_, fra18, "flat.ptr");
+                                Value *isFlat18 = builder_.CreateICmpNE(flatPtr,
+                                    ConstantPointerNull::get(perlPtrTy_), "s18.if");
+                                /* Emit RHS once here — before the branch — so both BBs reuse it.
+                                   emitExprF64 may itself emit sub-branches (e.g. for reads of other
+                                   flat rows); isFlat18/flatPtr/idx18 remain available via SSA. */
+                                Value *rhsF = emitExprF64(*n.right);
+                                if (rhsF) {
+                                    auto *curFn18 = builder_.GetInsertBlock()->getParent();
+                                    auto *fBB18   = BasicBlock::Create(ctx_, "s18.f", curFn18);
+                                    auto *nBB18   = BasicBlock::Create(ctx_, "s18.n", curFn18);
+                                    auto *mBB18   = BasicBlock::Create(ctx_, "s18.m", curFn18);
+                                    builder_.CreateCondBr(isFlat18, fBB18, nBB18);
+                                    /* flat BB: load double, apply op, store — no PV overhead */
+                                    builder_.SetInsertPoint(fBB18);
+                                    Value *ep18f  = builder_.CreateGEP(f64Ty18, flatPtr, idx18, "fe");
+                                    Value *lhsF   = builder_.CreateLoad(f64Ty18, ep18f, "lhsf");
+                                    setTBAA(lhsF, tbaaFlatDoubleTag_);
+                                    Value *newF   = applyF64(lhsF, rhsF);
+                                    Value *retFlat = ConstantPointerNull::get(perlPtrTy_);
+                                    if (newF) {
+                                        auto *st = builder_.CreateStore(newF, ep18f);
+                                        st->setMetadata(LLVMContext::MD_tbaa, tbaaFlatDoubleTag_);
+                                    }
+                                    builder_.CreateBr(mBB18);
+                                    auto *fBB18p = builder_.GetInsertBlock();
+                                    /* norm BB: PV* chain — reuse same rhsF */
+                                    builder_.SetInsertPoint(nBB18);
+                                    Value *retNorm = ConstantPointerNull::get(perlPtrTy_);
+                                    if (Value *ra18 = lookupRowAV(outerNm18, idxNm)) {
+                                        auto *i8Ty18  = Type::getInt8Ty(ctx_);
+                                        auto *i32Ty18 = Type::getInt32Ty(ctx_);
+                                        Value *av18   = builder_.CreateLoad(perlPtrTy_, ra18,
+                                                          outerNm18 + "." + idxNm + ".ra");
+                                        Value *elems18 = builder_.CreateLoad(perlPtrTy_, av18, "ae");
+                                        setTBAA(elems18, tbaaAvElemsTag_);
+                                        Value *pvPtr18 = builder_.CreateGEP(perlPtrTy_, elems18, idx18, "pp");
+                                        Value *pv18    = builder_.CreateLoad(perlPtrTy_, pvPtr18, "pv");
+                                        setTBAA(pv18, tbaaAvElemTag_);
+                                        Value *fvPtr18 = builder_.CreateConstInBoundsGEP1_64(i8Ty18, pv18, 8, "fp");
+                                        Value *lhsN    = builder_.CreateLoad(f64Ty18, fvPtr18, "lhsn");
+                                        setTBAA(lhsN, tbaaPvFvalTag_);
+                                        Value *newN    = applyF64(lhsN, rhsF);  /* reuse rhsF */
+                                        if (newN) {
+                                            auto *tst = builder_.CreateStore(
+                                                ConstantInt::get(i32Ty18, 2), pv18);
+                                            tst->setMetadata(LLVMContext::MD_tbaa, tbaaPvTagTag_);
+                                            auto *fst = builder_.CreateStore(newN, fvPtr18);
+                                            fst->setMetadata(LLVMContext::MD_tbaa, tbaaPvFvalTag_);
+                                            retNorm = pv18;
+                                        }
+                                    }
+                                    builder_.CreateBr(mBB18);
+                                    auto *nBB18p = builder_.GetInsertBlock();
+                                    builder_.SetInsertPoint(mBB18);
+                                    auto *phi18 = builder_.CreatePHI(perlPtrTy_, 2, "pv");
+                                    phi18->addIncoming(retFlat, fBB18p);
+                                    phi18->addIncoming(retNorm, nBB18p);
+                                    return phi18;
+                                }
+                            }
+                        }
 
                         /* Stage 16: normal PV* row cache */
                         if (Value *ra = lookupRowAV(outerNm18, idxNm)) {
@@ -2746,12 +2963,12 @@ Value *CodeGen::emitExpr(const Node &n) {
                         } else {
                             Value *innerRef = callRT("perl_array_get_ref",
                                                      {outerArr, emitIdx(*n.left->left->right)});
-                            av = callRT("perl_deref_array_ro", {innerRef});
+                            av = callRT("perl_deref_array", {innerRef});
                         }
                     } else {
                         Value *innerRef = callRT("perl_array_get_ref",
                                                  {outerArr, emitIdx(*n.left->left->right)});
-                        av = callRT("perl_deref_array_ro", {innerRef});
+                        av = callRT("perl_deref_array", {innerRef});
                     }
                 } else {
                     Value *base = emitExpr(*n.left->left);
@@ -3074,6 +3291,30 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::AnonArray: {
+        /* Stage 22: all-numeric elements → flat double[] stored in a PERL_FLAT_ARRAY PV.
+           Eliminates per-element PV boxing and PV** indirection in hot loops.
+           Reads/writes outside foreach loops fall back to perl_deref_array which
+           lazy-converts FLAT_ARRAY → REF_ARRAY in-place on first such access. */
+        if (!n.args.empty()) {
+            bool allFloat = true;
+            for (auto &e : n.args) if (!canEmitF64(*e)) { allFloat = false; break; }
+            if (allFloat) {
+                auto *i8Ty  = Type::getInt8Ty(ctx_);
+                auto *i64Ty = Type::getInt64Ty(ctx_);
+                auto *f64Ty = Type::getDoubleTy(ctx_);
+                Value *nElems  = ConstantInt::get(i64Ty, (long long)n.args.size(), true);
+                Value *flatPV  = callRT("perl_alloc_flat_array", {nElems});
+                Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(
+                    i8Ty, flatPV, 8, "flat.pval.ptr");
+                Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "flat.dbl");
+                for (int i = 0; i < (int)n.args.size(); i++) {
+                    Value *fv = emitExprF64(*n.args[i]);
+                    Value *ep = builder_.CreateConstInBoundsGEP1_64(f64Ty, dblPtr, i, "flat.ep");
+                    builder_.CreateStore(fv, ep);
+                }
+                return flatPV;
+            }
+        }
         Value *av = callRT("perl_array_new", {});
         for (auto &elem : n.args)
             callRT("perl_array_push", {av, emitExpr(*elem)});
