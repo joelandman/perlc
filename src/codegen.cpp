@@ -54,9 +54,41 @@ CodeGen::CodeGen(bool debug, int optLevel)
     perlPtrTy_  = PointerType::getUnqual(ctx_);
     arrayPtrTy_ = PointerType::getUnqual(ctx_);
     declareRuntime();
+
+    /* Build TBAA type hierarchy so LLVM can prove PerlValue tag/fval stores
+       don't alias PerlArray.elems loads — enables CSE of the elems pointer
+       across velocity update stores in the nbody inner loop.
+       createTBAAStructTypeNode requires the access type to appear as a field
+       in the base struct at the specified offset; using scalar nodes as the
+       base would cause the LLVM verifier to reject the metadata. */
+    MDBuilder mdb(ctx_);
+    MDNode *tbaaRoot = mdb.createTBAARoot("PerlTBAA");
+    MDNode *ptrLeaf  = mdb.createTBAAScalarTypeNode("pointer", tbaaRoot);
+    MDNode *i32Leaf  = mdb.createTBAAScalarTypeNode("int32",   tbaaRoot);
+    MDNode *f64Leaf  = mdb.createTBAAScalarTypeNode("float64", tbaaRoot);
+    MDNode *i64Leaf  = mdb.createTBAAScalarTypeNode("int64",   tbaaRoot);
+    /* PerlArray: { PerlValue **elems (ptr,0), long long len (i64,8), cap (i64,16) } */
+    MDNode *avStruct = mdb.createTBAAStructTypeNode("PerlArray",
+        {{ptrLeaf, 0}, {i64Leaf, 8}, {i64Leaf, 16}});
+    /* PerlValue: { PerlTag tag (i32,0), [pad 4], union fval/pval (f64,8), ... }
+       Use f64Leaf for offset 8; pval loads at offset 8 are not tagged (null). */
+    MDNode *pvStruct = mdb.createTBAAStructTypeNode("PerlValue",
+        {{i32Leaf, 0}, {f64Leaf, 8}});
+    tbaaAvElemsTag_ = mdb.createTBAAStructTagNode(avStruct, ptrLeaf, 0);
+    tbaaPvTagTag_   = mdb.createTBAAStructTagNode(pvStruct, i32Leaf, 0);
+    tbaaPvFvalTag_  = mdb.createTBAAStructTagNode(pvStruct, f64Leaf, 8);
+    /* tbaaPvPvalTag_: pval is at offset 8 (union with fval). Registering ptr
+       at offset 8 would conflict with f64Leaf; leave null — pval loads in
+       Stage 19 are outer-loop precomputation and don't need alias disambiguation. */
+
     if (debug_) {
         dib_ = std::make_unique<DIBuilder>(*mod_);
     }
+}
+
+void CodeGen::setTBAA(Value *v, MDNode *tag) {
+    if (auto *inst = dyn_cast<Instruction>(v))
+        inst->setMetadata(LLVMContext::MD_tbaa, tag);
 }
 
 /* ── runtime declarations ────────────────────────────────────────────────── */
@@ -1210,10 +1242,13 @@ Value *CodeGen::emitExprF64(const Node &n) {
                 auto *i8Ty17  = Type::getInt8Ty(ctx_);
                 auto *f64Ty17 = Type::getDoubleTy(ctx_);
                 Value *elems17 = builder_.CreateLoad(perlPtrTy_, innerArr, "av.elems");
+                setTBAA(elems17, tbaaAvElemsTag_);
                 Value *pvPtr17 = builder_.CreateGEP(perlPtrTy_, elems17, idx17, "pv.ptr");
                 Value *pv17    = builder_.CreateLoad(perlPtrTy_, pvPtr17, "pv");
                 Value *fvPtr17 = builder_.CreateConstInBoundsGEP1_64(i8Ty17, pv17, 8, "fv.ptr");
-                return builder_.CreateLoad(f64Ty17, fvPtr17, "fv");
+                Value *fv17    = builder_.CreateLoad(f64Ty17, fvPtr17, "fv");
+                setTBAA(fv17, tbaaPvFvalTag_);
+                return fv17;
             }
             /* 1D: $arr->[$i] — use cached PerlArray* if available */
             Value *av;
@@ -1912,6 +1947,7 @@ void CodeGen::emitStmt(const Node &n) {
                            elements are guaranteed to be REF_ARRAY. */
                         auto *i8TyRD    = Type::getInt8Ty(ctx_);
                         Value *outerElems = builder_.CreateLoad(perlPtrTy_, outerArr, outerNm + ".oe");
+                        setTBAA(outerElems, tbaaAvElemsTag_);
                         Value *rowRefPP   = builder_.CreateGEP(perlPtrTy_, outerElems, idx, outerNm + "." + idxNm + ".rpp");
                         Value *rowRef     = builder_.CreateLoad(perlPtrTy_, rowRefPP, outerNm + "." + idxNm + ".rref");
                         Value *pvalPtr    = builder_.CreateConstInBoundsGEP1_64(i8TyRD, rowRef, 8, outerNm + "." + idxNm + ".pval.ptr");
@@ -2705,17 +2741,21 @@ Value *CodeGen::emitExpr(const Node &n) {
                     auto *f64Ty = Type::getDoubleTy(ctx_);
                     /* Direct read: load av->elems, GEP to pv, load fval at offset 8 */
                     Value *elems = builder_.CreateLoad(perlPtrTy_, av, "av.elems");
+                    setTBAA(elems, tbaaAvElemsTag_);
                     Value *pvPtr = builder_.CreateGEP(perlPtrTy_, elems, idx, "pv.ptr");
                     Value *pv    = builder_.CreateLoad(perlPtrTy_, pvPtr, "pv");
                     Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fv.ptr");
                     Value *lhsF  = builder_.CreateLoad(f64Ty, fvPtr, "lhsf");
+                    setTBAA(lhsF, tbaaPvFvalTag_);
                     Value *rhsF  = emitExprF64(*n.right);
                     if (rhsF) {
                         Value *newF = applyF64op(lhsF, rhsF);
                         if (newF) {
                             /* Direct write: store FLOAT tag (2) at offset 0, fval at offset 8 */
-                            builder_.CreateStore(ConstantInt::get(i32Ty, 2), pv);
-                            builder_.CreateStore(newF, fvPtr);
+                            auto *tagSt = builder_.CreateStore(ConstantInt::get(i32Ty, 2), pv);
+                            tagSt->setMetadata(LLVMContext::MD_tbaa, tbaaPvTagTag_);
+                            auto *fvSt = builder_.CreateStore(newF, fvPtr);
+                            fvSt->setMetadata(LLVMContext::MD_tbaa, tbaaPvFvalTag_);
                             return pv;
                         }
                     }

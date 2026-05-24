@@ -5,6 +5,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/IR/MDBuilder.h>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -43,6 +44,13 @@ private:
     /* runtime type: opaque pointer (PerlValue*) */
     llvm::PointerType *perlPtrTy_;
     llvm::PointerType *arrayPtrTy_;
+
+    /* TBAA access tags — attached to inline GEP+load/store so LLVM can prove
+       PerlValue tag/fval stores don't alias PerlArray.elems loads */
+    llvm::MDNode *tbaaAvElemsTag_ = nullptr;  /* PerlArray.elems  (ptr  @ offset 0) */
+    llvm::MDNode *tbaaPvTagTag_   = nullptr;  /* PerlValue.tag    (i32  @ offset 0) */
+    llvm::MDNode *tbaaPvFvalTag_  = nullptr;  /* PerlValue.fval   (f64  @ offset 8) */
+    void setTBAA(llvm::Value *v, llvm::MDNode *tag);
 
     /* scope stack */
     std::vector<Scope>             scopes_;
