@@ -58,3 +58,4 @@ test: $(TARGET)
 	@echo "=== inherit.pl   ===" && ./$(TARGET) tests/inherit.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== defaults.pl     ===" && ./$(TARGET) tests/defaults.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== newfeatures.pl  ===" && ./$(TARGET) tests/newfeatures.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== fibn.pl         ===" && ./$(TARGET) tests/fibn.pl         -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 10

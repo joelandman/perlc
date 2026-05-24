@@ -2023,8 +2023,13 @@ void CodeGen::emitStmt(const Node &n) {
 
             std::string loopNm = n.name;
             if (!loopNm.empty() && loopNm[0] == '$') loopNm = loopNm.substr(1);
-            auto *iterAlloca = builder_.CreateAlloca(i64, nullptr, loopNm + ".i");
-            builder_.CreateStore(lo, iterAlloca);
+            /* counterAlloca: hidden loop counter — never exposed to user code.
+               iterAlloca: user-visible $VAR — refreshed from counter at each body entry.
+               This mirrors Perl semantics: $i++ inside foreach body does not advance
+               the loop; the loop always advances its own counter by exactly 1. */
+            auto *counterAlloca = builder_.CreateAlloca(i64, nullptr, loopNm + ".counter");
+            auto *iterAlloca    = builder_.CreateAlloca(i64, nullptr, loopNm + ".i");
+            builder_.CreateStore(lo, counterAlloca);
 
             auto *condBB2 = BasicBlock::Create(ctx_, "foreach.cond", fn);
             loopExits_.push_back(exit);
@@ -2032,10 +2037,12 @@ void CodeGen::emitStmt(const Node &n) {
 
             builder_.CreateBr(condBB2);
             builder_.SetInsertPoint(condBB2);
-            Value *cur = builder_.CreateLoad(i64, iterAlloca);
+            Value *cur = builder_.CreateLoad(i64, counterAlloca);
             builder_.CreateCondBr(builder_.CreateICmpSLE(cur, hi), bodyBB, exit);
 
             builder_.SetInsertPoint(bodyBB);
+            /* Refresh user variable from the hidden counter at each body entry. */
+            builder_.CreateStore(cur, iterAlloca);
             pushScope();
             declareIntVar(loopNm, iterAlloca);
 
@@ -2105,9 +2112,9 @@ void CodeGen::emitStmt(const Node &n) {
                 builder_.CreateBr(stepBB);
 
             builder_.SetInsertPoint(stepBB);
-            Value *cur2 = builder_.CreateLoad(i64, iterAlloca);
+            Value *cur2 = builder_.CreateLoad(i64, counterAlloca);
             builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1)),
-                                 iterAlloca);
+                                 counterAlloca);
             builder_.CreateBr(condBB2);
 
             loopExits_.pop_back();
