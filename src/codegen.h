@@ -50,6 +50,7 @@ private:
     llvm::MDNode *tbaaAvElemsTag_ = nullptr;  /* PerlArray.elems  (ptr  @ offset 0) */
     llvm::MDNode *tbaaPvTagTag_   = nullptr;  /* PerlValue.tag    (i32  @ offset 0) */
     llvm::MDNode *tbaaPvFvalTag_  = nullptr;  /* PerlValue.fval   (f64  @ offset 8) */
+    llvm::MDNode *tbaaAvElemTag_  = nullptr;  /* PerlValue* element of elems[] array */
     void setTBAA(llvm::Value *v, llvm::MDNode *tag);
 
     /* scope stack */

@@ -77,9 +77,12 @@ CodeGen::CodeGen(bool debug, int optLevel)
     tbaaAvElemsTag_ = mdb.createTBAAStructTagNode(avStruct, ptrLeaf, 0);
     tbaaPvTagTag_   = mdb.createTBAAStructTagNode(pvStruct, i32Leaf, 0);
     tbaaPvFvalTag_  = mdb.createTBAAStructTagNode(pvStruct, f64Leaf, 8);
-    /* tbaaPvPvalTag_: pval is at offset 8 (union with fval). Registering ptr
-       at offset 8 would conflict with f64Leaf; leave null — pval loads in
-       Stage 19 are outer-loop precomputation and don't need alias disambiguation. */
+    /* Scalar TBAA type for PerlValue* pointers stored in elems[].
+       Sibling of i32/f64 under PerlTBAA root — no aliasing with PerlValue
+       tag/fval stores, so LLVM can keep PV* values (mass, velocity slot) in
+       registers across velocity update stores. */
+    MDNode *pvPtrLeaf = mdb.createTBAAScalarTypeNode("PerlValuePtr", tbaaRoot);
+    tbaaAvElemTag_  = mdb.createTBAAStructTagNode(pvPtrLeaf, pvPtrLeaf, 0);
 
     if (debug_) {
         dib_ = std::make_unique<DIBuilder>(*mod_);
@@ -1245,6 +1248,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
                 setTBAA(elems17, tbaaAvElemsTag_);
                 Value *pvPtr17 = builder_.CreateGEP(perlPtrTy_, elems17, idx17, "pv.ptr");
                 Value *pv17    = builder_.CreateLoad(perlPtrTy_, pvPtr17, "pv");
+                setTBAA(pv17, tbaaAvElemTag_);
                 Value *fvPtr17 = builder_.CreateConstInBoundsGEP1_64(i8Ty17, pv17, 8, "fv.ptr");
                 Value *fv17    = builder_.CreateLoad(f64Ty17, fvPtr17, "fv");
                 setTBAA(fv17, tbaaPvFvalTag_);
@@ -1950,6 +1954,7 @@ void CodeGen::emitStmt(const Node &n) {
                         setTBAA(outerElems, tbaaAvElemsTag_);
                         Value *rowRefPP   = builder_.CreateGEP(perlPtrTy_, outerElems, idx, outerNm + "." + idxNm + ".rpp");
                         Value *rowRef     = builder_.CreateLoad(perlPtrTy_, rowRefPP, outerNm + "." + idxNm + ".rref");
+                        setTBAA(rowRef, tbaaAvElemTag_);
                         Value *pvalPtr    = builder_.CreateConstInBoundsGEP1_64(i8TyRD, rowRef, 8, outerNm + "." + idxNm + ".pval.ptr");
                         Value *rowArr     = builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".ra.direct");
                         auto *ra = builder_.CreateAlloca(perlPtrTy_, nullptr,
@@ -2744,6 +2749,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     setTBAA(elems, tbaaAvElemsTag_);
                     Value *pvPtr = builder_.CreateGEP(perlPtrTy_, elems, idx, "pv.ptr");
                     Value *pv    = builder_.CreateLoad(perlPtrTy_, pvPtr, "pv");
+                    setTBAA(pv, tbaaAvElemTag_);
                     Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fv.ptr");
                     Value *lhsF  = builder_.CreateLoad(f64Ty, fvPtr, "lhsf");
                     setTBAA(lhsF, tbaaPvFvalTag_);
