@@ -17,6 +17,7 @@ typedef enum {
     PERL_FILEHANDLE = 7,
     PERL_CODE_REF   = 8,
     PERL_DIRHANDLE  = 9,
+    PERL_FLAT_ARRAY = 10, /* flat double[] — pval=double*, matchpos=len */
 } PerlTag;
 
 typedef struct PerlValue {
@@ -36,6 +37,7 @@ PerlValue *perl_alloc_undef(void);
 PerlValue *perl_alloc_int(long long v);
 PerlValue *perl_alloc_float(double v);
 PerlValue *perl_alloc_string(const char *s);
+PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);
 

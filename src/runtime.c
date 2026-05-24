@@ -177,6 +177,15 @@ HOTX PerlValue *perl_alloc_float(double f) {
     return v;
 }
 
+PerlValue *perl_alloc_flat_array(long long n) {
+    PerlValue *v = pv_alloc();
+    v->tag = PERL_FLAT_ARRAY;
+    v->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
+    v->matchpos = n;
+    v->blessed_class = NULL;
+    return v;
+}
+
 PerlValue *perl_alloc_string(const char *s) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_STRING;
@@ -193,6 +202,16 @@ PerlValue *perl_clone(const PerlValue *src) {
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         return v;
     }
+    if (src->tag == PERL_FLAT_ARRAY) {
+        long long n = src->matchpos;
+        PerlValue *v = pv_alloc();
+        v->tag = PERL_FLAT_ARRAY;
+        v->matchpos = n;
+        v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
+        v->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
+        if (n > 0) memcpy(v->pval, src->pval, sizeof(double) * (size_t)n);
+        return v;
+    }
     PerlValue *v = pv_alloc();
     *v = *src;
     v->matchpos = 0;
@@ -203,6 +222,7 @@ PerlValue *perl_clone(const PerlValue *src) {
 HOTX void perl_free(PerlValue *v) {
     if (!v) return;
     if (v->tag == PERL_STRING) free(v->sval);
+    if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
     /* CODE_REF: pval points to a shared PerlClosure; don't free it here since
        perl_clone() shallow-copies the pval pointer — freeing it would dangle
        any other references to the same closure. */
@@ -286,6 +306,7 @@ int perl_is_true(const PerlValue *v) {
         case PERL_REF_SCALAR:
         case PERL_REF_ARRAY:
         case PERL_REF_HASH:
+        case PERL_FLAT_ARRAY:
             return 1;
         case PERL_FILEHANDLE:
             return v->pval != NULL;

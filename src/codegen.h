@@ -50,7 +50,8 @@ private:
     llvm::MDNode *tbaaAvElemsTag_ = nullptr;  /* PerlArray.elems  (ptr  @ offset 0) */
     llvm::MDNode *tbaaPvTagTag_   = nullptr;  /* PerlValue.tag    (i32  @ offset 0) */
     llvm::MDNode *tbaaPvFvalTag_  = nullptr;  /* PerlValue.fval   (f64  @ offset 8) */
-    llvm::MDNode *tbaaAvElemTag_  = nullptr;  /* PerlValue* element of elems[] array */
+    llvm::MDNode *tbaaAvElemTag_      = nullptr;  /* PerlValue* element of elems[] array */
+    llvm::MDNode *tbaaFlatDoubleTag_  = nullptr;  /* double element of flat double[] array */
     void setTBAA(llvm::Value *v, llvm::MDNode *tag);
 
     /* scope stack */
@@ -69,6 +70,8 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> derefAVScopes_;
     /* per-loop row cache: "outerVar\x01indexVar" → ptr alloca (inner PerlArray*) */
     std::vector<std::unordered_map<std::string, llvm::Value *>> rowAVScopes_;
+    /* per-loop flat row cache: "outerVar\x01indexVar" → ptr alloca (double*, null if not flat) */
+    std::vector<std::unordered_map<std::string, llvm::Value *>> flatRowScopes_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
@@ -138,6 +141,8 @@ private:
     void         declareDerefAV(const std::string &name, llvm::Value *alloca);
     llvm::Value *lookupRowAV(const std::string &outerVar, const std::string &idxVar);
     void         declareRowAV(const std::string &outerVar, const std::string &idxVar, llvm::Value *alloca);
+    llvm::Value *lookupFlatRow(const std::string &outerVar, const std::string &idxVar);
+    void         declareFlatRow(const std::string &outerVar, const std::string &idxVar, llvm::Value *alloca);
     bool         canEmitI64(const Node &n);
     llvm::Value *emitExprI64(const Node &n);
     llvm::Value *boxI64(llvm::Value *iv);
