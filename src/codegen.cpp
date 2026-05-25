@@ -1087,6 +1087,10 @@ static bool floatSafe(const Node &n, const std::string &nm, bool inNum) {
         if (n.init)  ok = ok && floatSafe(*n.init,  nm, false);
         if (n.cond)  ok = ok && floatSafe(*n.cond,  nm, false);
         if (n.step)  ok = ok && floatSafe(*n.step,  nm, false);
+        for (auto &b : n.branches) {
+            if (b.cond) ok = ok && floatSafe(*b.cond, nm, false);
+            if (b.body) ok = ok && floatSafe(*b.body, nm, false);
+        }
         return ok;
     }
     }
@@ -1103,6 +1107,10 @@ static bool hasVar(const Node &n, const std::string &nm) {
     if (n.init)  r = r || hasVar(*n.init,  nm);
     if (n.cond)  r = r || hasVar(*n.cond,  nm);
     if (n.step)  r = r || hasVar(*n.step,  nm);
+    for (auto &b : n.branches) {
+        if (b.cond) r = r || hasVar(*b.cond, nm);
+        if (b.body) r = r || hasVar(*b.body, nm);
+    }
     return r;
 }
 
@@ -1123,6 +1131,10 @@ static bool needsFloatPrec(const Node &n, const std::string &nm) {
     if (n.init)  r = r || needsFloatPrec(*n.init,  nm);
     if (n.cond)  r = r || needsFloatPrec(*n.cond,  nm);
     if (n.step)  r = r || needsFloatPrec(*n.step,  nm);
+    for (auto &b : n.branches) {
+        if (b.cond) r = r || needsFloatPrec(*b.cond, nm);
+        if (b.body) r = r || needsFloatPrec(*b.body, nm);
+    }
     return r;
 }
 
@@ -1587,8 +1599,43 @@ void CodeGen::emitSub(const Node &n) {
 
     auto *savedSubBody = currentSubBody_;
     currentSubBody_ = n.body.get();
+
+    /* Stage 25: pre-analyze the body to find promotable @_ args.
+       For my ($a, $b) = @_ patterns, skip the PV alloca entirely in NK::My
+       and fill the unboxed alloca directly from the borrowed args element. */
+    auto savedPrePromoted = prePromotedArgs_;
+    prePromotedArgs_.clear();
+    auto tryFindAtAssign = [&](const Node &blk) {
+        for (auto &stmt : blk.args) {
+            const Node *asgn = nullptr;
+            if (stmt->kind == NK::ExprStmt && stmt->left)
+                asgn = stmt->left.get();
+            if (!asgn || asgn->kind != NK::Assign) continue;
+            if (!asgn->left  || asgn->left->kind  != NK::ArrayLit) continue;
+            if (!asgn->right || asgn->right->kind != NK::ArrayVar || asgn->right->name != "_") continue;
+            for (auto &lhsElem : asgn->left->args) {
+                if (lhsElem->kind != NK::ScalarVar) continue;
+                const std::string &nm = lhsElem->name;
+                if (prePromotedArgs_.count(nm)) continue;
+                bool safe   = floatSafe(*n.body, nm, false);
+                bool needFP = needsFloatPrec(*n.body, nm);
+                bool used   = hasVar(*n.body, nm);
+                if (safe && needFP)
+                    prePromotedArgs_[nm] = PPKind::Float;
+                else if (safe && !needFP && used)
+                    prePromotedArgs_[nm] = PPKind::Int;
+                else if (!safe && isOnlyArrayRefDeref(*n.body, nm))
+                    prePromotedArgs_[nm] = PPKind::DerefAV;
+            }
+        }
+    };
+    tryFindAtAssign(*n.body);
+    for (auto &stmt : n.body->args)
+        if (stmt->kind == NK::FlatBlock) tryFindAtAssign(*stmt);
+
     Value *lastVal = emitBlockLast(*n.body);
     currentSubBody_ = savedSubBody;
+    prePromotedArgs_ = std::move(savedPrePromoted);
 
     /* implicit return from last expression (Perl: last expr is the return value) */
     if (!builder_.GetInsertBlock()->getTerminator()) {
@@ -1832,6 +1879,29 @@ void CodeGen::emitStmt(const Node &n) {
                         builder_.CreateStore(fval, falloca);
                         declareFloatVar(nm, falloca);
                         break;
+                    }
+                }
+                /* Stage 25: @_ arg pre-promoted — skip PV alloca entirely.
+                   Only applies when n.right is null (bare my $var; no RHS). */
+                if (!n.right) {
+                    auto ppIt = prePromotedArgs_.find(nm);
+                    if (ppIt != prePromotedArgs_.end()) {
+                        auto *i64Ty = Type::getInt64Ty(ctx_);
+                        auto *f64Ty = Type::getDoubleTy(ctx_);
+                        if (ppIt->second == PPKind::Float) {
+                            auto *fa = builder_.CreateAlloca(f64Ty, nullptr, nm + ".f");
+                            builder_.CreateStore(ConstantFP::get(f64Ty, 0.0), fa);
+                            declareFloatVar(nm, fa);
+                        } else if (ppIt->second == PPKind::Int) {
+                            auto *ia = builder_.CreateAlloca(i64Ty, nullptr, nm + ".i");
+                            builder_.CreateStore(ConstantInt::get(i64Ty, 0), ia);
+                            declareIntVar(nm, ia);
+                        } else { /* DerefAV */
+                            auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
+                            builder_.CreateStore(Constant::getNullValue(perlPtrTy_), pa);
+                            declareDerefAV(nm, pa);
+                        }
+                        break; /* done — no PV alloca, no trackPv */
                     }
                 }
                 auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
@@ -2732,6 +2802,24 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (!rhsArr) rhsArr = emitExpr(*n.right);
             bool fromUnderbar = (n.right->kind == NK::ArrayVar && n.right->name == "_");
             for (size_t i = 0; i < n.left->args.size(); i++) {
+                /* Stage 25: pre-promoted @_ arg — check BEFORE emitLValue to prevent
+                   auto-vivification of a PV for a variable that has only an unboxed alloca. */
+                if (fromUnderbar && n.left->args[i]->kind == NK::ScalarVar) {
+                    const std::string &nm = n.left->args[i]->name;
+                    auto ppIt = prePromotedArgs_.find(nm);
+                    if (ppIt != prePromotedArgs_.end()) {
+                        Value *idx2 = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
+                        Value *elem2 = callRT("perl_array_get_ref", {rhsArr, idx2});
+                        if (ppIt->second == PPKind::Float)
+                            builder_.CreateStore(callRT("perl_to_float", {elem2}), lookupFloatVar(nm));
+                        else if (ppIt->second == PPKind::Int)
+                            builder_.CreateStore(callRT("perl_to_int", {elem2}), lookupIntVar(nm));
+                        else
+                            builder_.CreateStore(callRT("perl_deref_array_ro", {elem2}), lookupDerefAV(nm));
+                        /* elem2 is borrowed (array_get_ref not in owned set) — no free needed */
+                        continue; /* skip emitLValue + assign path */
+                    }
+                }
                 auto *slot = emitLValue(*n.left->args[i]);
                 if (!slot) continue;
                 Value *pv  = builder_.CreateLoad(perlPtrTy_, slot);

@@ -90,6 +90,9 @@ private:
     bool                           currentSubNeedsWantarray_ = true;
     /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
     const Node                    *currentSubBody_ = nullptr;
+    /* Stage 25: promotion kind for @_ args identified before sub body emission */
+    enum class PPKind { Int, Float, DerefAV };
+    std::unordered_map<std::string, PPKind> prePromotedArgs_;
     /* loop control blocks */
     std::vector<llvm::BasicBlock *> loopExits_;
     std::vector<llvm::BasicBlock *> loopContinues_;
