@@ -1506,6 +1506,9 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         throw std::runtime_error("LLVM verify error: " + err);
 }
 
+/* forward declaration — defined in "statement emission" section */
+static bool hasLocalStmt(const Node &n);
+
 /* ── sub definition ──────────────────────────────────────────────────────── */
 
 void CodeGen::emitSub(const Node &n) {
@@ -1539,17 +1542,23 @@ void CodeGen::emitSub(const Node &n) {
         trackPv(udv);  /* ensure $_ stable pv is freed on scope exit */
     }
 
-    /* capture local() save depth at function entry */
+    /* capture local() save depth at function entry.
+       localDepthAlloca_ must always be set and initialised — used by NK::Return
+       for perl_clone + perl_local_restore_to. Only skip the restore at *implicit*
+       return (no explicit return statement) when there are no local() in the body. */
     auto *i32Ty = Type::getInt32Ty(ctx_);
     auto *savedLocalDepth = localDepthAlloca_;
+    bool subNeedsLocal = n.body && hasLocalStmt(*n.body);
     localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
     builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
     /* forward declaration: emit empty body that returns undef */
     if (!n.body) {
         callRT("perl_pop_wantarray", {});
-        Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-        callRT("perl_local_restore_to", {depth});
+        if (subNeedsLocal) {
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+            callRT("perl_local_restore_to", {depth});
+        }
         popScope();  /* free $_ */
         builder_.CreateRet(perlUndef());
         localDepthAlloca_ = savedLocalDepth;
@@ -1565,8 +1574,10 @@ void CodeGen::emitSub(const Node &n) {
     /* implicit return from last expression (Perl: last expr is the return value) */
     if (!builder_.GetInsertBlock()->getTerminator()) {
         callRT("perl_pop_wantarray", {});
-        Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-        callRT("perl_local_restore_to", {depth});
+        if (subNeedsLocal) {
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+            callRT("perl_local_restore_to", {depth});
+        }
         popScope();  /* free $_ and other function-scope pvs before ret */
         builder_.CreateRet(lastVal);
     } else {

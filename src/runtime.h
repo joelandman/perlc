@@ -100,6 +100,7 @@ typedef struct PerlArray {
 } PerlArray;
 
 PerlArray *perl_array_new(void);
+long long perl_array_is_all_flat(PerlArray *av); /* 1 if all elems are FLAT_ARRAY */
 void       perl_array_free(PerlArray *a);
 void       perl_array_push(PerlArray *a, PerlValue *v);
 PerlValue *perl_array_pop(PerlArray *a);

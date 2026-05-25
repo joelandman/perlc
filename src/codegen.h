@@ -79,6 +79,8 @@ private:
     std::unordered_map<std::string, llvm::GlobalVariable *> fileHashGlobals_;
     int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */
     bool inMainBody_ = false;   /* true only while emitting the top-level program body */
+    /* Stage 23: when true, all 2D-array rows are known FLAT_ARRAY — skip flat/norm condBrs */
+    bool inFlatOnly_ = false;
 
     /* current function */
     llvm::Function                *currentFn_ = nullptr;

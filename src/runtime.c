@@ -186,6 +186,17 @@ PerlValue *perl_alloc_flat_array(long long n) {
     return v;
 }
 
+/* Returns 1 if every element of av is a PERL_FLAT_ARRAY PV, 0 otherwise.
+   Used by Stage 23 codegen to guard flat-only loop specializations. */
+long long perl_array_is_all_flat(PerlArray *av) {
+    if (!av) return 0;
+    for (long long i = 0; i < av->len; i++) {
+        PerlValue *pv = av->elems[i];
+        if (!pv || pv->tag != PERL_FLAT_ARRAY) return 0;
+    }
+    return 1;
+}
+
 PerlValue *perl_alloc_string(const char *s) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_STRING;
