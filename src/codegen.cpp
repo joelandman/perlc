@@ -1651,6 +1651,15 @@ void CodeGen::emitSub(const Node &n) {
                 if (lhsElem->kind != NK::ScalarVar) continue;
                 const std::string &nm = lhsElem->name;
                 if (prePromotedArgs_.count(nm)) continue;
+                /* Stage 27c: DerefAV pre-promotion.
+                   If the arg is only used as an array-ref deref base ($x->[$i]),
+                   skip the PV alloca entirely — call perl_deref_array_ro directly on
+                   the borrowed @_ element and cache the PerlArray* in a derefAV alloca.
+                   This eliminates 3 pool ops per call (alloc + assign + free). */
+                if (isOnlyArrayRefDeref(*n.body, nm)) {
+                    prePromotedArgs_[nm] = PPKind::DerefAV;
+                    continue;
+                }
                 bool safe   = floatSafe(*n.body, nm, false);
                 bool needFP = needsFloatPrec(*n.body, nm);
                 bool used   = hasVar(*n.body, nm);
@@ -1658,8 +1667,6 @@ void CodeGen::emitSub(const Node &n) {
                     prePromotedArgs_[nm] = PPKind::Float;
                 else if (safe && !needFP && used)
                     prePromotedArgs_[nm] = PPKind::Int;
-                /* DerefAV NOT pre-promoted: write paths ($x->[$i][$j] = val)
-                   use the PV via perl_deref_array; eliminating the PV breaks writes. */
             }
         }
     };
@@ -1952,9 +1959,9 @@ void CodeGen::emitStmt(const Node &n) {
                         break;
                     }
                 }
-                /* Stage 25: @_ arg pre-promoted to int/float — skip PV alloca entirely.
-                   Only applies when n.right is null (bare my $var; no RHS).
-                   DerefAV args are NOT pre-promoted here: write paths need the PV. */
+                /* Stage 25/27c: @_ arg pre-promoted to int/float/derefAV —
+                   skip PV alloca entirely.
+                   Only applies when n.right is null (bare my $var; no RHS). */
                 if (!n.right) {
                     auto ppIt = prePromotedArgs_.find(nm);
                     if (ppIt != prePromotedArgs_.end()) {
@@ -1964,10 +1971,17 @@ void CodeGen::emitStmt(const Node &n) {
                             auto *fa = builder_.CreateAlloca(f64Ty, nullptr, nm + ".f");
                             builder_.CreateStore(ConstantFP::get(f64Ty, 0.0), fa);
                             declareFloatVar(nm, fa);
-                        } else { /* Int */
+                        } else if (ppIt->second == PPKind::Int) {
                             auto *ia = builder_.CreateAlloca(i64Ty, nullptr, nm + ".i");
                             builder_.CreateStore(ConstantInt::get(i64Ty, 0), ia);
                             declareIntVar(nm, ia);
+                        } else { /* PPKind::DerefAV: Stage 27c — borrow @_ elem into PV slot.
+                                    Create a perlPtrTy_ alloca in scopes_ (NOT trackPv'd) so
+                                    emitExpr(ScalarVar) still finds a valid PerlValue*.
+                                    The derefAV alloca (PerlArray*) is filled in the Assign handler. */
+                            auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm);
+                            builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), pvA);
+                            declareVar(nm, pvA);  /* in scopes_, NOT trackPv */
                         }
                         break; /* done — no PV alloca, no trackPv */
                     }
@@ -2307,6 +2321,10 @@ void CodeGen::emitStmt(const Node &n) {
            and all perl_to_int($VAR) calls in the body via emitIdx. */
         bool isIntRange = (n.args.size() == 1 &&
                            n.args[0]->kind == NK::Range);
+        /* Stage 28: inner loops (nested within another loop) get unroll+vectorize
+           hints on their back-branch so LLVM's SLP vectorizer can combine two
+           independent sqrt computations (e.g. two j-iterations) into sqrtpd. */
+        bool isInnerLoop = !loopExits_.empty();
         if (isIntRange) {
             /* Compute lo and hi as bare i64 — use I64 path if possible,
                fall back to emitExpr + perl_to_int otherwise. */
@@ -2488,7 +2506,26 @@ void CodeGen::emitStmt(const Node &n) {
             Value *cur2 = builder_.CreateLoad(i64, counterAlloca);
             builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1)),
                                  counterAlloca);
-            builder_.CreateBr(condBB2);
+            {
+                auto *backBr = builder_.CreateBr(condBB2);
+                /* Stage 28: attach unroll+vectorize loop metadata to inner loops.
+                   Two unrolled j-iterations expose two independent sqrt chains so
+                   LLVM's SLP vectorizer can fuse them into sqrtpd (2×throughput). */
+                if (isInnerLoop) {
+                    /* Unroll the inner loop 2× so two independent sqrt chains become
+                       adjacent, giving the SLP vectorizer a chance to fuse them into
+                       sqrtpd (or at least overlap them via out-of-order execution). */
+                    auto *unrollMD = MDNode::get(ctx_, {
+                        MDString::get(ctx_, "llvm.loop.unroll.count"),
+                        ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ctx_), 2))
+                    });
+                    /* Loop metadata requires a self-referential distinguished node. */
+                    SmallVector<Metadata*, 2> loopArgs = {nullptr, unrollMD};
+                    auto *loopID = MDNode::getDistinct(ctx_, loopArgs);
+                    loopID->replaceOperandWith(0, loopID);
+                    backBr->setMetadata("llvm.loop", loopID);
+                }
+            }
 
             loopExits_.pop_back();
             loopContinues_.pop_back();
@@ -2950,8 +2987,18 @@ Value *CodeGen::emitExpr(const Node &n) {
                         Value *elem2 = callRT("perl_array_get_ref", {rhsArr, idx2});
                         if (ppIt->second == PPKind::Float)
                             builder_.CreateStore(callRT("perl_to_float", {elem2}), lookupFloatVar(nm));
-                        else /* Int */
+                        else if (ppIt->second == PPKind::Int)
                             builder_.CreateStore(callRT("perl_to_int", {elem2}), lookupIntVar(nm));
+                        else { /* PPKind::DerefAV: Stage 27c — borrow elem into PV slot, cache PerlArray*.
+                                   No alloc_undef, no perl_assign, no perl_free at exit.
+                                   emitExpr(ScalarVar) finds the borrowed elem via scopes_. */
+                            Value *pvSlot = lookupVar(nm);
+                            if (pvSlot) builder_.CreateStore(elem2, pvSlot);
+                            Value *av = callRT("perl_deref_array_ro", {elem2});
+                            auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
+                            builder_.CreateStore(av, pa);
+                            declareDerefAV(nm, pa);
+                        }
                         /* elem2 is borrowed (array_get_ref not in owned set) — no free needed */
                         continue; /* skip emitLValue + assign path */
                     }
