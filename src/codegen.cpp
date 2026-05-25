@@ -1824,7 +1824,11 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     }
     pushScope();
-    Value *result = perlUndef();
+    /* Stage 27b: start with null; allocate only if no expr provides a value.
+       Avoids a dead alloc_undef when the block's return value is unused (e.g.
+       advance() implicit-return undef — caller always frees it, but we delay
+       the alloc to the exit path so the entry path is allocation-free). */
+    Value *result = nullptr;
     for (size_t i = 0; i < n.args.size(); i++) {
         const Node &stmt = *n.args[i];
         bool isLast = (i + 1 == n.args.size());
@@ -1838,6 +1842,16 @@ Value *CodeGen::emitBlockLast(const Node &n) {
     popScope();
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
+    /* if no expression provided a real value (e.g. last stmt is a loop, or
+       last expr was a void list assignment), materialize an undef now.
+       Only insert IR if the block has no terminator; if it does (early return),
+       the caller (emitSub) ignores the result anyway. */
+    if (!result || llvm::isa<llvm::ConstantPointerNull>(result)) {
+        if (!builder_.GetInsertBlock()->getTerminator())
+            result = perlUndef();
+        else
+            result = llvm::ConstantPointerNull::get(perlPtrTy_);
+    }
     return result;
 }
 
@@ -2983,7 +2997,10 @@ Value *CodeGen::emitExpr(const Node &n) {
                 }
                 freeIfOwned(elem);
             }
-            return perlUndef();
+            /* Stage 27b: list assignment is void — return non-owned null so
+               freeIfOwned (in ExprStmt) does nothing; emitBlockLast handles
+               the null-result case when this is the last expression. */
+            return llvm::ConstantPointerNull::get(perlPtrTy_);
         }
         /* $h{key} = val */
         if (n.left->kind == NK::HashElem) {
