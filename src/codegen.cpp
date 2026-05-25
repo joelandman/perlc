@@ -1304,7 +1304,13 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     if (Value *fra = lookupFlatRow(n.left->left->name, idxNm)) {
                         Value *idx17    = emitIdx(*n.right);
                         auto *f64Ty17   = Type::getDoubleTy(ctx_);
-                        Value *flatPtr  = builder_.CreateLoad(perlPtrTy_, fra, "flat.ptr");
+                        auto *flatLoad17 = builder_.CreateLoad(perlPtrTy_, fra, "flat.ptr");
+                        /* Stage 29: when the outer array was pre-checked all-flat, the fra
+                           pointer is guaranteed non-null — mark it so LLVM folds the null-check
+                           and eliminates the dead norm BB from the inner loop. */
+                        if (avAllflatSlots_.count(n.left->left->name))
+                            flatLoad17->setMetadata(LLVMContext::MD_nonnull, MDNode::get(ctx_, {}));
+                        Value *flatPtr  = flatLoad17;
                         Value *isFlat17 = builder_.CreateICmpNE(flatPtr,
                             ConstantPointerNull::get(perlPtrTy_), "s17.if");
                         auto *curFn17 = builder_.GetInsertBlock()->getParent();
@@ -1849,16 +1855,13 @@ Value *CodeGen::emitBlockLast(const Node &n) {
     popScope();
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
-    /* if no expression provided a real value (e.g. last stmt is a loop, or
-       last expr was a void list assignment), materialize an undef now.
-       Only insert IR if the block has no terminator; if it does (early return),
-       the caller (emitSub) ignores the result anyway. */
-    if (!result || llvm::isa<llvm::ConstantPointerNull>(result)) {
-        if (!builder_.GetInsertBlock()->getTerminator())
-            result = perlUndef();
-        else
-            result = llvm::ConstantPointerNull::get(perlPtrTy_);
-    }
+    /* Stage 29: return null (non-owned) when no expression produced a real value
+       (e.g. last stmt was a loop or a void list-assign).
+       perl_free(null) is a noop; perl_assign(dst,null) assigns undef; all other
+       runtime functions already guard against null src — so this is safe and
+       eliminates 50M alloc_undef+free pairs for advance() in nb.pl. */
+    if (!result || llvm::isa<llvm::ConstantPointerNull>(result))
+        result = llvm::ConstantPointerNull::get(perlPtrTy_);
     return result;
 }
 
@@ -2512,15 +2515,19 @@ void CodeGen::emitStmt(const Node &n) {
                    Two unrolled j-iterations expose two independent sqrt chains so
                    LLVM's SLP vectorizer can fuse them into sqrtpd (2×throughput). */
                 if (isInnerLoop) {
-                    /* Unroll the inner loop 2× so two independent sqrt chains become
-                       adjacent, giving the SLP vectorizer a chance to fuse them into
-                       sqrtpd (or at least overlap them via out-of-order execution). */
+                    /* Stage 28: unroll 2× + interleave 2× on inner loops.
+                       Unroll exposes two independent sqrt chains; interleave tells
+                       LLVM to schedule instructions from both in the same window so
+                       the CPU can overlap the two ~20-cycle sqrt latencies. */
                     auto *unrollMD = MDNode::get(ctx_, {
                         MDString::get(ctx_, "llvm.loop.unroll.count"),
                         ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ctx_), 2))
                     });
-                    /* Loop metadata requires a self-referential distinguished node. */
-                    SmallVector<Metadata*, 2> loopArgs = {nullptr, unrollMD};
+                    auto *interleaveMD = MDNode::get(ctx_, {
+                        MDString::get(ctx_, "llvm.loop.interleave.count"),
+                        ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ctx_), 2))
+                    });
+                    SmallVector<Metadata*, 3> loopArgs = {nullptr, unrollMD, interleaveMD};
                     auto *loopID = MDNode::getDistinct(ctx_, loopArgs);
                     loopID->replaceOperandWith(0, loopID);
                     backBr->setMetadata("llvm.loop", loopID);
@@ -3339,7 +3346,12 @@ Value *CodeGen::emitExpr(const Node &n) {
                                 };
                                 auto *f64Ty18 = Type::getDoubleTy(ctx_);
                                 Value *idx18  = emitIdx(*n.left->right);
-                                Value *flatPtr = builder_.CreateLoad(perlPtrTy_, fra18, "flat.ptr");
+                                auto *flatLoad18 = builder_.CreateLoad(perlPtrTy_, fra18, "flat.ptr");
+                                /* Stage 29: mark non-null when outer array is all-flat so LLVM
+                                   folds the null-check and removes the dead norm write path. */
+                                if (avAllflatSlots_.count(outerNm18))
+                                    flatLoad18->setMetadata(LLVMContext::MD_nonnull, MDNode::get(ctx_, {}));
+                                Value *flatPtr = flatLoad18;
                                 Value *isFlat18 = builder_.CreateICmpNE(flatPtr,
                                     ConstantPointerNull::get(perlPtrTy_), "s18.if");
                                 /* Emit RHS once here — before the branch — so both BBs reuse it.
