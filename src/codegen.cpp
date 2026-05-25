@@ -1315,6 +1315,12 @@ Value *CodeGen::emitExprF64(const Node &n) {
 
                     /* Stage 22: flat row cache — direct double[] read via phi dispatch */
                     if (Value *fra = lookupFlatRow(n.left->left->name, idxNm)) {
+                        /* Stage 31: return cached f64 if this exact element was already loaded */
+                        if (n.right->kind == NK::IntLit) {
+                            std::string ckey = n.left->left->name + "\x01" + idxNm + "\x01" + std::to_string(n.right->ival);
+                            auto cit = flatDoubleCache_.find(ckey);
+                            if (cit != flatDoubleCache_.end()) return cit->second;
+                        }
                         Value *idx17    = emitIdx(*n.right);
                         auto *f64Ty17   = Type::getDoubleTy(ctx_);
                         auto *flatLoad17 = builder_.CreateLoad(perlPtrTy_, fra, "flat.ptr");
@@ -1360,6 +1366,11 @@ Value *CodeGen::emitExprF64(const Node &n) {
                         auto *phi17 = builder_.CreatePHI(f64Ty17, 2, "fv");
                         phi17->addIncoming(fvf17, fBB17p);
                         phi17->addIncoming(fvn17, nBB17p);
+                        /* Stage 31: cache the loaded value for repeated reads of same element */
+                        if (n.right->kind == NK::IntLit) {
+                            std::string ckey = n.left->left->name + "\x01" + idxNm + "\x01" + std::to_string(n.right->ival);
+                            flatDoubleCache_[ckey] = phi17;
+                        }
                         return phi17;
                     }
 
@@ -1589,6 +1600,7 @@ void CodeGen::emitSub(const Node &n) {
 
     auto *savedFn = currentFn_;
     currentFn_ = fn;
+    flatDoubleCache_.clear();  /* Stage 31: SSA Values from outer fn are invalid here */
     pushScope();
 
     /* @_ is the first argument (PerlArray*) */
@@ -3424,6 +3436,14 @@ Value *CodeGen::emitExpr(const Node &n) {
                                     auto *phi18 = builder_.CreatePHI(perlPtrTy_, 2, "pv");
                                     phi18->addIncoming(retFlat, fBB18p);
                                     phi18->addIncoming(retNorm, nBB18p);
+                                    /* Stage 31: invalidate flat-double cache for written element */
+                                    if (n.left->right->kind == NK::IntLit) {
+                                        flatDoubleCache_.erase(outerNm18 + "\x01" + idxNm + "\x01" + std::to_string(n.left->right->ival));
+                                    } else {
+                                        std::string pfx = outerNm18 + "\x01" + idxNm + "\x01";
+                                        for (auto it = flatDoubleCache_.begin(); it != flatDoubleCache_.end(); )
+                                            it = (it->first.substr(0, pfx.size()) == pfx) ? flatDoubleCache_.erase(it) : std::next(it);
+                                    }
                                     return phi18;
                                 }
                             }

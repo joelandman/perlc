@@ -78,6 +78,10 @@ private:
        v*v can be replaced by x and v*v*v can be replaced by x*v (1 fewer fmul on critical path) */
     llvm::Value *lastSqrtInput_ = nullptr;
     std::unordered_map<std::string, llvm::Value *> floatSqrtOf_;
+    /* Stage 31: flat-double read cache: (outerNm\x01idxNm\x01elemIdx) → f64 Value*.
+       Eliminates redundant loads like body[j][6] appearing 3× in the velocity-update
+       block; invalidated only when the exact (outerNm, idxNm, elemIdx) is written. */
+    std::unordered_map<std::string, llvm::Value *> flatDoubleCache_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
