@@ -1507,8 +1507,10 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         throw std::runtime_error("LLVM verify error: " + err);
 }
 
-/* forward declaration — defined in "statement emission" section */
+/* forward declarations — defined in "statement emission" section */
 static bool hasLocalStmt(const Node &n);
+static bool hasWantarrayOrUserCall(const Node &n);
+static bool hasReturnStmt(const Node &n);
 
 /* ── sub definition ──────────────────────────────────────────────────────── */
 
@@ -1531,7 +1533,16 @@ void CodeGen::emitSub(const Node &n) {
     Value *argsArr = fn->getArg(0);
     argsArr->setName("args");
     Value *ctxArg = fn->getArg(1);
-    callRT("perl_push_wantarray", {ctxArg});
+
+    /* Stage 24a: skip push/pop wantarray for functions with no wantarray expression
+       and no user sub calls (called functions read the CALLER's push, so omitting
+       our push would corrupt their context if any of them use wantarray). */
+    bool subNeedsWantarray = !n.body || hasWantarrayOrUserCall(*n.body);
+    bool savedNeedsWantarray = currentSubNeedsWantarray_;
+    currentSubNeedsWantarray_ = subNeedsWantarray;
+    if (subNeedsWantarray)
+        callRT("perl_push_wantarray", {ctxArg});
+
     declareArray("_", argsArr);
 
     /* pre-declare $_ so it's available for default-arg builtins and while(<FH>) */
@@ -1544,18 +1555,24 @@ void CodeGen::emitSub(const Node &n) {
     }
 
     /* capture local() save depth at function entry.
-       localDepthAlloca_ must always be set and initialised — used by NK::Return
-       for perl_clone + perl_local_restore_to. Only skip the restore at *implicit*
-       return (no explicit return statement) when there are no local() in the body. */
+       Stage 24b: skip the alloca + perl_local_save_depth entirely when the
+       function has no local() AND no explicit return — in that case
+       localDepthAlloca_ is never read (implicit return skips restore, and
+       NK::Return is never emitted), so nullptr is safe. */
     auto *i32Ty = Type::getInt32Ty(ctx_);
     auto *savedLocalDepth = localDepthAlloca_;
     bool subNeedsLocal = n.body && hasLocalStmt(*n.body);
-    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
-    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+    bool subNeedsReturn = n.body && hasReturnStmt(*n.body);
+    if (subNeedsLocal || subNeedsReturn) {
+        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+        builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+    } else {
+        localDepthAlloca_ = nullptr;
+    }
 
     /* forward declaration: emit empty body that returns undef */
     if (!n.body) {
-        callRT("perl_pop_wantarray", {});
+        if (subNeedsWantarray) callRT("perl_pop_wantarray", {});
         if (subNeedsLocal) {
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_local_restore_to", {depth});
@@ -1563,6 +1580,7 @@ void CodeGen::emitSub(const Node &n) {
         popScope();  /* free $_ */
         builder_.CreateRet(perlUndef());
         localDepthAlloca_ = savedLocalDepth;
+        currentSubNeedsWantarray_ = savedNeedsWantarray;
         currentFn_ = savedFn;
         return;
     }
@@ -1574,7 +1592,7 @@ void CodeGen::emitSub(const Node &n) {
 
     /* implicit return from last expression (Perl: last expr is the return value) */
     if (!builder_.GetInsertBlock()->getTerminator()) {
-        callRT("perl_pop_wantarray", {});
+        if (subNeedsWantarray) callRT("perl_pop_wantarray", {});
         if (subNeedsLocal) {
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_local_restore_to", {depth});
@@ -1585,7 +1603,7 @@ void CodeGen::emitSub(const Node &n) {
         popScope();  /* explicit return: emitScopeCleanup already freed pvs; skip due to terminator */
     }
     localDepthAlloca_ = savedLocalDepth;
-
+    currentSubNeedsWantarray_ = savedNeedsWantarray;
     currentFn_ = savedFn;
 
     /* restore insert point to end of main (for any remaining stmts) */
@@ -1593,6 +1611,48 @@ void CodeGen::emitSub(const Node &n) {
 }
 
 /* ── statement emission ──────────────────────────────────────────────────── */
+
+/* Stage 24a: skip push/pop wantarray for functions with no wantarray expr and
+   no user sub calls (NK::Call) — called functions read from the caller's push,
+   so skipping is unsafe if any nested user sub might call wantarray. */
+static bool hasWantarrayOrUserCall(const Node &n) {
+    if (n.kind == NK::WantarrayFunc) return true;
+    if (n.kind == NK::Call)         return true;  /* any user-defined sub call */
+    bool r = false;
+    if (n.left)  r = r || hasWantarrayOrUserCall(*n.left);
+    if (n.right) r = r || hasWantarrayOrUserCall(*n.right);
+    for (auto &a : n.args) { if (!r) r = hasWantarrayOrUserCall(*a); }
+    if (n.body)  r = r || hasWantarrayOrUserCall(*n.body);
+    if (n.init)  r = r || hasWantarrayOrUserCall(*n.init);
+    if (n.cond)  r = r || hasWantarrayOrUserCall(*n.cond);
+    if (n.step)  r = r || hasWantarrayOrUserCall(*n.step);
+    for (auto &b : n.branches) {
+        if (!r && b.cond) r = hasWantarrayOrUserCall(*b.cond);
+        if (!r && b.body) r = hasWantarrayOrUserCall(*b.body);
+    }
+    return r;
+}
+
+/* Stage 24b: skip local-depth alloca + perl_local_save_depth for functions
+   with no local() AND no explicit return — in that case localDepthAlloca_
+   is never read (implicit return skips restore when !subNeedsLocal, and
+   NK::Return is never emitted). */
+static bool hasReturnStmt(const Node &n) {
+    if (n.kind == NK::Return) return true;
+    bool r = false;
+    if (n.left)  r = r || hasReturnStmt(*n.left);
+    if (n.right) r = r || hasReturnStmt(*n.right);
+    for (auto &a : n.args) { if (!r) r = hasReturnStmt(*a); }
+    if (n.body)  r = r || hasReturnStmt(*n.body);
+    if (n.init)  r = r || hasReturnStmt(*n.init);
+    if (n.cond)  r = r || hasReturnStmt(*n.cond);
+    if (n.step)  r = r || hasReturnStmt(*n.step);
+    for (auto &b : n.branches) {
+        if (!r && b.cond) r = hasReturnStmt(*b.cond);
+        if (!r && b.body) r = hasReturnStmt(*b.body);
+    }
+    return r;
+}
 
 /* Stage 23: only emit allflat pre-check for loops whose body contains a nested
    foreach — simple single-level loops don't benefit enough to pay the call cost. */
@@ -2313,7 +2373,7 @@ void CodeGen::emitStmt(const Node &n) {
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             Value *cloned = callRT("perl_clone", {v});
             freeIfOwned(v);
-            callRT("perl_pop_wantarray", {});
+            if (currentSubNeedsWantarray_) callRT("perl_pop_wantarray", {});
             callRT("perl_local_restore_to", {depth});
             v = cloned;
         }

@@ -86,6 +86,8 @@ private:
 
     /* current function */
     llvm::Function                *currentFn_ = nullptr;
+    /* Stage 24a: true when current sub emitted perl_push_wantarray at entry */
+    bool                           currentSubNeedsWantarray_ = true;
     /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
     const Node                    *currentSubBody_ = nullptr;
     /* loop control blocks */
