@@ -1241,6 +1241,18 @@ Value *CodeGen::emitExprF64(const Node &n) {
         bool isArith = false;
         for (auto *p = arithOps; *p; p++) if (n.sval == *p) { isArith = true; break; }
         if (!isArith) return nullptr;
+        /* Stage 30: $sqrt_var * $sqrt_var → dsq (exact, avoids fmul on the sqrt critical path).
+           This fires when both sides are the SAME float variable that was assigned sqrt(x),
+           giving dist*dist = x.  Together with the multiply-chain rule, dist*dist*dist = x*dist,
+           shortening the critical path by one fmul (5 cycles × 10 pairs per advance() call). */
+        if (n.sval == "*" && n.left->kind == NK::ScalarVar && n.right->kind == NK::ScalarVar) {
+            auto lnm = n.left->name;  if (!lnm.empty() && lnm[0]=='$') lnm = lnm.substr(1);
+            auto rnm = n.right->name; if (!rnm.empty() && rnm[0]=='$') rnm = rnm.substr(1);
+            if (lnm == rnm) {
+                auto it = floatSqrtOf_.find(lnm);
+                if (it != floatSqrtOf_.end()) return it->second;  /* dist*dist = dsq */
+            }
+        }
         /* Check both children before emitting any IR to avoid double-emission */
         if (!canEmitF64(*n.left) || !canEmitF64(*n.right)) return nullptr;
         Value *lv = emitExprF64(*n.left);
@@ -1263,6 +1275,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!canEmitF64(*n.left)) return nullptr;
         Value *v = emitExprF64(*n.left);
         if (!v) return nullptr;
+        lastSqrtInput_ = v;  /* Stage 30: remember input so cube opts can use x*sqrt(x) */
         auto *sqrtFn = llvm::Intrinsic::getDeclaration(mod_.get(),
             llvm::Intrinsic::sqrt, {f64});
         return builder_.CreateCall(sqrtFn, {v}, "sqrt");
@@ -1959,6 +1972,9 @@ void CodeGen::emitStmt(const Node &n) {
                         auto *falloca = builder_.CreateAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
                         builder_.CreateStore(fval, falloca);
                         declareFloatVar(nm, falloca);
+                        /* Stage 30: if this var was assigned sqrt(x), remember x.
+                           Enables v*v → x and v*v*v → x*v (shorter sqrt critical path). */
+                        if (lastSqrtInput_) { floatSqrtOf_[nm] = lastSqrtInput_; lastSqrtInput_ = nullptr; }
                         break;
                     }
                 }
@@ -2516,9 +2532,8 @@ void CodeGen::emitStmt(const Node &n) {
                    LLVM's SLP vectorizer can fuse them into sqrtpd (2×throughput). */
                 if (isInnerLoop) {
                     /* Stage 28: unroll 2× + interleave 2× on inner loops.
-                       Unroll exposes two independent sqrt chains; interleave tells
-                       LLVM to schedule instructions from both in the same window so
-                       the CPU can overlap the two ~20-cycle sqrt latencies. */
+                       Two unrolled iterations expose independent sqrt chains; interleave
+                       hints the scheduler to overlap the ~20-cycle sqrt latencies. */
                     auto *unrollMD = MDNode::get(ctx_, {
                         MDString::get(ctx_, "llvm.loop.unroll.count"),
                         ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ctx_), 2))

@@ -74,6 +74,10 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> flatRowScopes_;
     /* Stage 23: per-outer-loop allflat pre-check: outerVar → i1 alloca (1 if all rows flat) */
     std::unordered_map<std::string, llvm::Value *> avAllflatSlots_;
+    /* Stage 30: for float vars assigned via sqrt(x), track x so that
+       v*v can be replaced by x and v*v*v can be replaced by x*v (1 fewer fmul on critical path) */
+    llvm::Value *lastSqrtInput_ = nullptr;
+    std::unordered_map<std::string, llvm::Value *> floatSqrtOf_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
