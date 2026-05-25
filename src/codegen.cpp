@@ -166,6 +166,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
+    RT("perl_array_is_all_flat", i64, av);  /* Stage 23: 1 if every elem is FLAT_ARRAY */
     RT("perl_array_len",     pv,  av);
     /* hash */
     RT("perl_hash_new",      av);   /* reuse av as opaque ptr */
@@ -1593,6 +1594,25 @@ void CodeGen::emitSub(const Node &n) {
 
 /* ── statement emission ──────────────────────────────────────────────────── */
 
+/* Stage 23: only emit allflat pre-check for loops whose body contains a nested
+   foreach — simple single-level loops don't benefit enough to pay the call cost. */
+static bool hasNestedForEach(const Node &n) {
+    if (n.kind == NK::Foreach) return true;
+    bool r = false;
+    if (n.left)  r = r || hasNestedForEach(*n.left);
+    if (n.right) r = r || hasNestedForEach(*n.right);
+    for (auto &a : n.args) { if (!r) r = hasNestedForEach(*a); }
+    if (n.body)  r = r || hasNestedForEach(*n.body);
+    if (n.init)  r = r || hasNestedForEach(*n.init);
+    if (n.cond)  r = r || hasNestedForEach(*n.cond);
+    if (n.step)  r = r || hasNestedForEach(*n.step);
+    for (auto &b : n.branches) {
+        if (!r && b.cond) r = hasNestedForEach(*b.cond);
+        if (!r && b.body) r = hasNestedForEach(*b.body);
+    }
+    return r;
+}
+
 /* Stage 17: skip local save/restore for blocks that contain no local() */
 static bool hasLocalStmt(const Node &n) {
     if (n.kind == NK::LocalStmt) return true;
@@ -2046,6 +2066,44 @@ void CodeGen::emitStmt(const Node &n) {
             loopExits_.push_back(exit);
             loopContinues_.push_back(stepBB);
 
+            /* Stage 23: call perl_array_is_all_flat ONCE before the loop for each
+               derefAV that will be row-dereffed in the body. The result is stored
+               in a loop-invariant i1 alloca. At body entry, the row-deref branches
+               on this flag instead of pvTag; LLVM's loop-unswitch then specializes
+               the loop into a flat-only version where GVN+InstSimplify can prove
+               every `fra` load is !nonnull, eliminating the per-access null-check.
+               Guard: only pay the allflat call when the body has a nested foreach
+               (simple single-level loops don't benefit enough to cover the call cost). */
+            std::vector<std::string> newAllflatNames;
+            if (n.body && hasNestedForEach(*n.body)) {
+                std::unordered_set<std::string> avNamesS23;
+                for (auto &scope : derefAVScopes_)
+                    for (auto &[nm, _] : scope) avNamesS23.insert(nm);
+                if (!avNamesS23.empty()) {
+                    std::set<std::pair<std::string,std::string>> prePairs;
+                    collectRowAVPairs(*n.body, avNamesS23, prePairs);
+                    std::unordered_set<std::string> avChecked;
+                    auto *i1Ty   = Type::getInt1Ty(ctx_);
+                    auto *i64_   = Type::getInt64Ty(ctx_);
+                    for (auto &[outerNm, idxNm] : prePairs) {
+                        if (!avChecked.insert(outerNm).second) continue;
+                        if (avAllflatSlots_.count(outerNm)) continue; /* outer loop handles it */
+                        Value *outerPA = lookupDerefAV(outerNm);
+                        if (!outerPA) continue;
+                        Value *outerArr = builder_.CreateLoad(arrayPtrTy_, outerPA,
+                                                              outerNm + ".avS23");
+                        Value *af_i64 = callRT("perl_array_is_all_flat", {outerArr});
+                        Value *af_i1  = builder_.CreateICmpNE(af_i64,
+                                            ConstantInt::get(i64_, 0), outerNm + ".af");
+                        auto *af_slot = builder_.CreateAlloca(i1Ty, nullptr,
+                                                              outerNm + ".af.slot");
+                        builder_.CreateStore(af_i1, af_slot);
+                        avAllflatSlots_[outerNm] = af_slot;
+                        newAllflatNames.push_back(outerNm);
+                    }
+                }
+            }
+
             builder_.CreateBr(condBB2);
             builder_.SetInsertPoint(condBB2);
             Value *cur = builder_.CreateLoad(i64, counterAlloca);
@@ -2057,12 +2115,16 @@ void CodeGen::emitStmt(const Node &n) {
             pushScope();
             declareIntVar(loopNm, iterAlloca);
 
-            /* Stage 16: pre-emit row derefs for hot 2D patterns.
+            /* Stage 16/19: pre-emit row derefs for hot 2D patterns.
                Collect (outerVar, firstIndexVar) pairs — for each we know:
                (a) outerVar is a cached PerlArray* (derefAVScopes_), and
                (b) the firstIndex is a loop variable (int alloca).
-               Emitting get_ref+deref_ro once per body entry eliminates
-               repeated recomputation blocked by update_float aliasing. */
+               Emitting the deref once per body entry eliminates repeated
+               recomputation blocked by update_float aliasing.
+               Stage 23: when avAllflatSlots_[outerNm] is set, branch on the
+               loop-invariant allflat flag instead of pvTag. The flat path marks
+               pval as !nonnull so GVN+InstSimplify can fold the per-access
+               null-check away after LLVM loop-unswitches on the allflat flag. */
             if (n.body) {
                 std::unordered_set<std::string> avNames;
                 for (auto &scope : derefAVScopes_)
@@ -2071,18 +2133,14 @@ void CodeGen::emitStmt(const Node &n) {
                 if (!avNames.empty()) {
                     std::set<std::pair<std::string,std::string>> pairs;
                     collectRowAVPairs(*n.body, avNames, pairs);
-                    auto *i64 = Type::getInt64Ty(ctx_);
+                    auto *i64_ = Type::getInt64Ty(ctx_);
                     for (auto &[outerNm, idxNm] : pairs) {
                         if (lookupRowAV(outerNm, idxNm)) continue; /* already in outer scope */
                         Value *outerPA = lookupDerefAV(outerNm);
                         Value *idxIA   = lookupIntVar(idxNm);
                         if (!outerPA || !idxIA) continue;
                         Value *outerArr = builder_.CreateLoad(perlPtrTy_, outerPA, outerNm + ".av");
-                        Value *idx      = builder_.CreateLoad(i64, idxIA, idxNm + ".i");
-                        /* Stage 19: inline row deref — bypass bounds/tag checks.
-                           outerArr->elems[idx]->pval = inner PerlArray* (REF_ARRAY)
-                           or double* (FLAT_ARRAY=10). One branch per outer iteration
-                           dispatches to flatRowScopes_ (double*) or rowAVScopes_ (PerlArray*). */
+                        Value *idx      = builder_.CreateLoad(i64_, idxIA, idxNm + ".i");
                         auto *i8TyRD    = Type::getInt8Ty(ctx_);
                         auto *i32TyRD   = Type::getInt32Ty(ctx_);
                         Value *outerElems = builder_.CreateLoad(perlPtrTy_, outerArr, outerNm + ".oe");
@@ -2091,25 +2149,59 @@ void CodeGen::emitStmt(const Node &n) {
                         Value *rowRef     = builder_.CreateLoad(perlPtrTy_, rowRefPP, outerNm + "." + idxNm + ".rref");
                         setTBAA(rowRef, tbaaAvElemTag_);
                         Value *pvalPtr    = builder_.CreateConstInBoundsGEP1_64(i8TyRD, rowRef, 8, outerNm + "." + idxNm + ".pp");
-                        Value *rowData    = builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".data");
                         auto *fra = builder_.CreateAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".fra");
                         auto *ra  = builder_.CreateAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".ra");
                         builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), fra);
                         builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), ra);
-                        Value *pvTag    = builder_.CreateLoad(i32TyRD, rowRef, outerNm + "." + idxNm + ".tag");
-                        static_cast<LoadInst *>(pvTag)->setMetadata(LLVMContext::MD_tbaa, tbaaPvTagTag_);
-                        Value *isFlat   = builder_.CreateICmpEQ(pvTag,
-                            ConstantInt::get(i32TyRD, 10), outerNm + "." + idxNm + ".isflat");
                         auto *flatBBrd  = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".flat", fn);
                         auto *normBBrd  = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".norm", fn);
                         auto *mergeBBrd = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".rmerge", fn);
-                        builder_.CreateCondBr(isFlat, flatBBrd, normBBrd);
-                        builder_.SetInsertPoint(flatBBrd);
-                        builder_.CreateStore(rowData, fra);
-                        builder_.CreateBr(mergeBBrd);
-                        builder_.SetInsertPoint(normBBrd);
-                        builder_.CreateStore(rowData, ra);
-                        builder_.CreateBr(mergeBBrd);
+                        auto afIt = avAllflatSlots_.find(outerNm);
+                        if (afIt != avAllflatSlots_.end()) {
+                            /* Stage 23 fast path: branch on loop-invariant allflat flag.
+                               LICM hoists the load; loop-unswitch specialises the loop. */
+                            Value *afVal = builder_.CreateLoad(Type::getInt1Ty(ctx_),
+                                              afIt->second, outerNm + ".af.v");
+                            builder_.CreateCondBr(afVal, flatBBrd, normBBrd);
+                            /* flat BB: we know pval is a real double* — mark !nonnull so
+                               GVN+InstSimplify can fold the per-access null-check away. */
+                            builder_.SetInsertPoint(flatBBrd);
+                            auto *flatLoad = static_cast<LoadInst *>(
+                                builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".data"));
+                            flatLoad->setMetadata(LLVMContext::MD_nonnull, MDNode::get(ctx_, {}));
+                            builder_.CreateStore(flatLoad, fra);
+                            builder_.CreateBr(mergeBBrd);
+                            /* norm BB: not all flat — check each row's pvTag individually */
+                            builder_.SetInsertPoint(normBBrd);
+                            Value *rowDataN = builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".dataN");
+                            Value *pvTagN   = builder_.CreateLoad(i32TyRD, rowRef, outerNm + "." + idxNm + ".tag");
+                            static_cast<LoadInst *>(pvTagN)->setMetadata(LLVMContext::MD_tbaa, tbaaPvTagTag_);
+                            Value *isFlatN  = builder_.CreateICmpEQ(pvTagN,
+                                ConstantInt::get(i32TyRD, 10), outerNm + "." + idxNm + ".isflat");
+                            auto *nFlatBB = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".nflat", fn);
+                            auto *nNormBB = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".nnorm", fn);
+                            builder_.CreateCondBr(isFlatN, nFlatBB, nNormBB);
+                            builder_.SetInsertPoint(nFlatBB);
+                            builder_.CreateStore(rowDataN, fra);
+                            builder_.CreateBr(mergeBBrd);
+                            builder_.SetInsertPoint(nNormBB);
+                            builder_.CreateStore(rowDataN, ra);
+                            builder_.CreateBr(mergeBBrd);
+                        } else {
+                            /* Original Stage 19 path: dispatch on pvTag directly. */
+                            Value *rowData = builder_.CreateLoad(perlPtrTy_, pvalPtr, outerNm + "." + idxNm + ".data");
+                            Value *pvTag   = builder_.CreateLoad(i32TyRD, rowRef, outerNm + "." + idxNm + ".tag");
+                            static_cast<LoadInst *>(pvTag)->setMetadata(LLVMContext::MD_tbaa, tbaaPvTagTag_);
+                            Value *isFlat  = builder_.CreateICmpEQ(pvTag,
+                                ConstantInt::get(i32TyRD, 10), outerNm + "." + idxNm + ".isflat");
+                            builder_.CreateCondBr(isFlat, flatBBrd, normBBrd);
+                            builder_.SetInsertPoint(flatBBrd);
+                            builder_.CreateStore(rowData, fra);
+                            builder_.CreateBr(mergeBBrd);
+                            builder_.SetInsertPoint(normBBrd);
+                            builder_.CreateStore(rowData, ra);
+                            builder_.CreateBr(mergeBBrd);
+                        }
                         builder_.SetInsertPoint(mergeBBrd);
                         declareFlatRow(outerNm, idxNm, fra);
                         declareRowAV(outerNm, idxNm, ra);
@@ -2119,6 +2211,8 @@ void CodeGen::emitStmt(const Node &n) {
 
             emitBlock(*n.body);
             popScope();
+            /* Clean up allflat slots added by this loop level. */
+            for (auto &nm : newAllflatNames) avAllflatSlots_.erase(nm);
             if (!builder_.GetInsertBlock()->getTerminator())
                 builder_.CreateBr(stepBB);
 

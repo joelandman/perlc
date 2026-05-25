@@ -72,6 +72,8 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> rowAVScopes_;
     /* per-loop flat row cache: "outerVar\x01indexVar" → ptr alloca (double*, null if not flat) */
     std::vector<std::unordered_map<std::string, llvm::Value *>> flatRowScopes_;
+    /* Stage 23: per-outer-loop allflat pre-check: outerVar → i1 alloca (1 if all rows flat) */
+    std::unordered_map<std::string, llvm::Value *> avAllflatSlots_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
