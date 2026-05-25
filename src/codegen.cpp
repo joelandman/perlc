@@ -1624,8 +1624,8 @@ void CodeGen::emitSub(const Node &n) {
                     prePromotedArgs_[nm] = PPKind::Float;
                 else if (safe && !needFP && used)
                     prePromotedArgs_[nm] = PPKind::Int;
-                else if (!safe && isOnlyArrayRefDeref(*n.body, nm))
-                    prePromotedArgs_[nm] = PPKind::DerefAV;
+                /* DerefAV NOT pre-promoted: write paths ($x->[$i][$j] = val)
+                   use the PV via perl_deref_array; eliminating the PV breaks writes. */
             }
         }
     };
@@ -1881,8 +1881,9 @@ void CodeGen::emitStmt(const Node &n) {
                         break;
                     }
                 }
-                /* Stage 25: @_ arg pre-promoted — skip PV alloca entirely.
-                   Only applies when n.right is null (bare my $var; no RHS). */
+                /* Stage 25: @_ arg pre-promoted to int/float — skip PV alloca entirely.
+                   Only applies when n.right is null (bare my $var; no RHS).
+                   DerefAV args are NOT pre-promoted here: write paths need the PV. */
                 if (!n.right) {
                     auto ppIt = prePromotedArgs_.find(nm);
                     if (ppIt != prePromotedArgs_.end()) {
@@ -1892,14 +1893,10 @@ void CodeGen::emitStmt(const Node &n) {
                             auto *fa = builder_.CreateAlloca(f64Ty, nullptr, nm + ".f");
                             builder_.CreateStore(ConstantFP::get(f64Ty, 0.0), fa);
                             declareFloatVar(nm, fa);
-                        } else if (ppIt->second == PPKind::Int) {
+                        } else { /* Int */
                             auto *ia = builder_.CreateAlloca(i64Ty, nullptr, nm + ".i");
                             builder_.CreateStore(ConstantInt::get(i64Ty, 0), ia);
                             declareIntVar(nm, ia);
-                        } else { /* DerefAV */
-                            auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
-                            builder_.CreateStore(Constant::getNullValue(perlPtrTy_), pa);
-                            declareDerefAV(nm, pa);
                         }
                         break; /* done — no PV alloca, no trackPv */
                     }
@@ -2812,10 +2809,8 @@ Value *CodeGen::emitExpr(const Node &n) {
                         Value *elem2 = callRT("perl_array_get_ref", {rhsArr, idx2});
                         if (ppIt->second == PPKind::Float)
                             builder_.CreateStore(callRT("perl_to_float", {elem2}), lookupFloatVar(nm));
-                        else if (ppIt->second == PPKind::Int)
+                        else /* Int */
                             builder_.CreateStore(callRT("perl_to_int", {elem2}), lookupIntVar(nm));
-                        else
-                            builder_.CreateStore(callRT("perl_deref_array_ro", {elem2}), lookupDerefAV(nm));
                         /* elem2 is borrowed (array_get_ref not in owned set) — no free needed */
                         continue; /* skip emitLValue + assign path */
                     }
