@@ -909,7 +909,6 @@ Value *CodeGen::emitExprI64(const Node &n) {
 /* Returns an i1 for integer comparisons, nullptr if not applicable. */
 Value *CodeGen::tryEmitI1Cond(const Node &n) {
     if (n.kind != NK::BinOp || !n.left || !n.right) return nullptr;
-    if (!canEmitI64(*n.left) || !canEmitI64(*n.right)) return nullptr;
     using P = llvm::CmpInst::Predicate;
     P pred;
     if      (n.sval == "<")  pred = P::ICMP_SLT;
@@ -919,10 +918,41 @@ Value *CodeGen::tryEmitI1Cond(const Node &n) {
     else if (n.sval == "==") pred = P::ICMP_EQ;
     else if (n.sval == "!=") pred = P::ICMP_NE;
     else return nullptr;
-    Value *lv = emitExprI64(*n.left);
-    Value *rv = emitExprI64(*n.right);
-    if (!lv || !rv) return nullptr;
-    return builder_.CreateICmp(pred, lv, rv, "icmp");
+
+    /* Standard path: both operands expressible as bare i64. */
+    if (canEmitI64(*n.left) && canEmitI64(*n.right)) {
+        Value *lv = emitExprI64(*n.left);
+        Value *rv = emitExprI64(*n.right);
+        if (lv && rv) return builder_.CreateICmp(pred, lv, rv, "icmp");
+    }
+
+    /* Stage 26a: intVar CMP fileGlobal (or vice-versa).
+       File-scope globals can't be assumed to be int in general (they may be
+       floats like $pi). We only trust them here, in a comparison context where
+       the value is always used as an index/bound (e.g., $i <= $n). */
+    auto tryFileGlobalI64 = [&](const Node &nd) -> Value* {
+        if (nd.kind != NK::ScalarVar) return nullptr;
+        std::string nm = nd.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        auto git = fileScalarGlobals_.find(nm);
+        if (git == fileScalarGlobals_.end()) return nullptr;
+        Value *pv = builder_.CreateLoad(perlPtrTy_, git->second, nm);
+        return callRT("perl_to_int", {pv});
+    };
+
+    if (canEmitI64(*n.left)) {
+        if (Value *rv = tryFileGlobalI64(*n.right)) {
+            Value *lv = emitExprI64(*n.left);
+            if (lv) return builder_.CreateICmp(pred, lv, rv, "icmp");
+        }
+    }
+    if (canEmitI64(*n.right)) {
+        if (Value *lv = tryFileGlobalI64(*n.left)) {
+            Value *rv = emitExprI64(*n.right);
+            if (rv) return builder_.CreateICmp(pred, lv, rv, "icmp");
+        }
+    }
+    return nullptr;
 }
 
 /* Emit an array index as a bare i64, bypassing PerlValue boxing.
@@ -2120,6 +2150,44 @@ void CodeGen::emitStmt(const Node &n) {
 
         pushScope();
         if (n.init) emitStmt(*n.init);
+
+        /* Stage 26c: if the loop body is a single call to a named sub with
+           all loop-invariant args (literals + array refs), build the args
+           array once before the loop and reuse it every iteration.
+           Saves: array_new + N*(alloc+push+free) + array_free per iteration. */
+        auto isInvariantArg = [](const Node &a) {
+            return a.kind == NK::IntLit || a.kind == NK::FloatLit ||
+                   a.kind == NK::StringLit || a.kind == NK::RefArray;
+        };
+        const Node *hoistCallNode = nullptr;
+        llvm::Function *hoistFn   = nullptr;
+        if (n.body && n.body->args.size() == 1) {
+            const Node *stmt = n.body->args[0].get();
+            /* body may be wrapped in ExprStmt */
+            const Node *call = nullptr;
+            if (stmt->kind == NK::ExprStmt && stmt->left)
+                call = stmt->left.get();
+            else if (stmt->kind == NK::Call)
+                call = stmt;
+            if (call && call->kind == NK::Call && !call->name.empty()) {
+                if (auto *lf = mod_->getFunction(subLLVMName(call->name))) {
+                    bool allInv = true;
+                    for (auto &a : call->args)
+                        if (!isInvariantArg(*a)) { allInv = false; break; }
+                    if (allInv) { hoistCallNode = call; hoistFn = lf; }
+                }
+            }
+        }
+        Value *hoistedArgs = nullptr;
+        if (hoistCallNode) {
+            hoistedArgs = callRT("perl_array_new", {});
+            for (auto &arg : hoistCallNode->args) {
+                Value *v = emitExpr(*arg);
+                callRT("perl_array_push", {hoistedArgs, v});
+                freeIfOwned(v);
+            }
+        }
+
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(condBB);
@@ -2138,17 +2206,49 @@ void CodeGen::emitStmt(const Node &n) {
         }
 
         builder_.SetInsertPoint(bodyBB);
-        emitBlock(*n.body);
+        if (hoistFn && hoistedArgs) {
+            /* Emit the call with pre-built args; free only the return value */
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *ret = builder_.CreateCall(hoistFn,
+                {hoistedArgs, ConstantInt::get(i32Ty, 0)});
+            freeIfOwned(ret);
+        } else {
+            emitBlock(*n.body);
+        }
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(stepBB);
 
         builder_.SetInsertPoint(stepBB);
-        if (n.step) freeIfOwned(emitExpr(*n.step));
+        if (n.step) {
+            /* Stage 26b: post/pre ++/-- on an unboxed int var — increment
+               directly, skipping the dead alloc_int(old_val)+free round-trip. */
+            bool handledStep = false;
+            if (n.step->kind == NK::UnaryOp && n.step->left &&
+                n.step->left->kind == NK::ScalarVar) {
+                const std::string &sv = n.step->sval;
+                if (sv == "post++" || sv == "post--" ||
+                    sv == "pre++"  || sv == "pre--") {
+                    std::string nm = n.step->left->name;
+                    if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                    if (Value *ia = lookupIntVar(nm)) {
+                        auto *i64Ty = Type::getInt64Ty(ctx_);
+                        Value *cur = builder_.CreateLoad(i64Ty, ia, nm + ".cur");
+                        bool isInc = (sv == "post++" || sv == "pre++");
+                        Value *next = builder_.CreateAdd(cur,
+                            ConstantInt::get(i64Ty, isInc ? 1LL : -1LL), nm + ".step");
+                        builder_.CreateStore(next, ia);
+                        handledStep = true;
+                    }
+                }
+            }
+            if (!handledStep) freeIfOwned(emitExpr(*n.step));
+        }
         builder_.CreateBr(condBB);
 
         loopExits_.pop_back();
         loopContinues_.pop_back();
         builder_.SetInsertPoint(exit);
+        if (hoistedArgs) callRT("perl_array_free", {hoistedArgs});
         popScope();  /* free for-init pvs (e.g. my $i) at loop exit */
         break;
     }
