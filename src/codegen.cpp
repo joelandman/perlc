@@ -1553,6 +1553,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
 static bool hasLocalStmt(const Node &n);
 static bool hasWantarrayOrUserCall(const Node &n);
 static bool hasReturnStmt(const Node &n);
+static bool hasDefaultVarUse(const Node &n);
 
 /* ── sub definition ──────────────────────────────────────────────────────── */
 
@@ -1587,8 +1588,11 @@ void CodeGen::emitSub(const Node &n) {
 
     declareArray("_", argsArr);
 
-    /* pre-declare $_ so it's available for default-arg builtins and while(<FH>) */
-    {
+    /* Stage 27a: only pre-declare $_ when the sub body actually uses it.
+       Skipping this eliminates 1 alloc_undef + 1 free per call for pure
+       numeric subs like advance() that never touch $_. */
+    bool subUsesDefaultVar = !n.body || hasDefaultVarUse(*n.body);
+    if (subUsesDefaultVar) {
         Value *udv  = callRT("perl_alloc_undef", {});
         auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
         builder_.CreateStore(udv, slotUs);
@@ -1746,6 +1750,29 @@ static bool hasNestedForEach(const Node &n) {
     for (auto &b : n.branches) {
         if (!r && b.cond) r = hasNestedForEach(*b.cond);
         if (!r && b.body) r = hasNestedForEach(*b.body);
+    }
+    return r;
+}
+
+/* Stage 27a: returns true if the body references $_ (explicitly or implicitly).
+   Conservative: also fires for foreach without explicit loop var, and for
+   common builtins that default to $_ when given no arguments. */
+static bool hasDefaultVarUse(const Node &n) {
+    /* Explicit $_ reference */
+    if (n.kind == NK::ScalarVar && (n.name == "_" || n.name == "$_")) return true;
+    /* foreach/for without explicit var name — loop var defaults to $_ */
+    if (n.kind == NK::Foreach && n.name.empty()) return true;
+    bool r = false;
+    if (n.left)  r = r || hasDefaultVarUse(*n.left);
+    if (n.right) r = r || hasDefaultVarUse(*n.right);
+    for (auto &a : n.args) { if (!r) r = hasDefaultVarUse(*a); }
+    if (n.body)  r = r || hasDefaultVarUse(*n.body);
+    if (n.init)  r = r || hasDefaultVarUse(*n.init);
+    if (n.cond)  r = r || hasDefaultVarUse(*n.cond);
+    if (n.step)  r = r || hasDefaultVarUse(*n.step);
+    for (auto &b : n.branches) {
+        if (!r && b.cond) r = hasDefaultVarUse(*b.cond);
+        if (!r && b.body) r = hasDefaultVarUse(*b.body);
     }
     return r;
 }
