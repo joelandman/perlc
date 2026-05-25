@@ -97,9 +97,11 @@ typedef struct PerlArray {
     PerlValue **elems;
     long long   len;
     long long   cap;
+    int         refcount; /* 0 = scope-managed (named @arr), >0 = anonymous refcounted ([]) */
 } PerlArray;
 
 PerlArray *perl_array_new(void);
+PerlArray *perl_anon_array_new(void); /* like perl_array_new but refcount=1 (anonymous) */
 long long perl_array_is_all_flat(PerlArray *av); /* 1 if all elems are FLAT_ARRAY */
 void       perl_array_free(PerlArray *a);
 void       perl_array_push(PerlArray *a, PerlValue *v);
@@ -136,9 +138,11 @@ typedef struct PerlHashEntry {
 typedef struct PerlHash {
     PerlHashEntry  *buckets[PERL_HASH_BUCKETS];
     long long       size;
+    int             refcount; /* 0 = scope-managed (named %hash), >0 = anonymous refcounted ({}) */
 } PerlHash;
 
 PerlHash *perl_hash_new(void);
+PerlHash *perl_anon_hash_new(void); /* like perl_hash_new but refcount=1 (anonymous) */
 void       perl_hash_free(PerlHash *h);
 
 /* key is a PerlValue* — stringified internally */

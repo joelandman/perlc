@@ -158,7 +158,8 @@ void CodeGen::declareRuntime() {
     RT("perl_or",            pv,  pv, pv);
     RT("perl_inc",           pv,  pv);
     RT("perl_dec",           pv,  pv);
-    RT("perl_array_new",     av);
+    RT("perl_array_new",      av);
+    RT("perl_anon_array_new", av);
     RT("perl_array_free",    voidTy, av);
     RT("perl_array_push",    voidTy, av, pv);
     RT("perl_array_pop",     pv,  av);
@@ -170,6 +171,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_len",     pv,  av);
     /* hash */
     RT("perl_hash_new",      av);   /* reuse av as opaque ptr */
+    RT("perl_anon_hash_new", av);
     RT("perl_hash_get_sv",       pv,  av, pv);
     RT("perl_hash_get_sv_ref",   pv,  av, pv);
     RT("perl_hash_set_sv",       voidTy, av, pv, pv);
@@ -1148,7 +1150,11 @@ static bool hasVar(const Node &n, const std::string &nm) {
    Ensures we only promote vars that actually need floating-point, not integer
    counters that happen to appear in arithmetic. */
 static bool needsFloatPrec(const Node &n, const std::string &nm) {
-    if (n.kind == NK::BinOp && (n.sval == "/" || n.sval == "**")) {
+    /* Any arithmetic op (+, -, *, /, **) involving nm may lose precision if nm
+       holds a float value — classify as float rather than int for @_ params. */
+    if (n.kind == NK::BinOp &&
+        (n.sval == "/" || n.sval == "**" ||
+         n.sval == "+" || n.sval == "-"  || n.sval == "*")) {
         if ((n.left  && hasVar(*n.left,  nm)) ||
             (n.right && hasVar(*n.right, nm))) return true;
     }
@@ -1197,10 +1203,14 @@ bool CodeGen::canEmitF64(const Node &n) {
     /* Array/hash element lookups can always be converted to double via perl_to_float,
        but they require emitting emitExpr calls internally — always allowed. */
     case NK::ArrayElem:
-        return lookupArray(n.name) != nullptr;
+        /* Array elements may be refs or mixed types — not safely float-promotable.
+           The emitExprF64/float-var path is wrong when elements hold array refs. */
+        return false;
     case NK::ArrowDeref:
-        /* $ref->[$i] or $ref->{key}: always convertible to float */
-        return true;
+        /* Only 2D subscript $ref->[$i][$j] is safely float-emittable.
+           1D $ref->[$i] may yield an array/hash ref, not a scalar. */
+        return n.sval == "array" && n.left &&
+               n.left->kind == NK::ArrowDeref && n.left->sval == "array";
     case NK::HashElem:
         return lookupHash(n.name) != nullptr;
     default:
@@ -1280,12 +1290,10 @@ Value *CodeGen::emitExprF64(const Node &n) {
             llvm::Intrinsic::sqrt, {f64});
         return builder_.CreateCall(sqrtFn, {v}, "sqrt");
     }
-    case NK::ArrayElem: {
-        Value *av = lookupArray(n.name);
-        if (!av) return nullptr;
-        Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.left)});
-        return callRT("perl_to_float", {elem});
-    }
+    case NK::ArrayElem:
+        /* Array elements may hold refs — cannot safely emit as f64.
+           Callers must go through the PerlValue* path instead. */
+        return nullptr;
     case NK::ArrowDeref: {
         /* $ref->[$i] or $ref->{k} read — unbox the element */
         if (n.sval == "array") {
@@ -1443,23 +1451,9 @@ Value *CodeGen::emitExprF64(const Node &n) {
                 setTBAA(fv17, tbaaPvFvalTag_);
                 return fv17;
             }
-            /* 1D: $arr->[$i] — use cached PerlArray* if available */
-            Value *av;
-            if (n.left->kind == NK::ScalarVar) {
-                if (Value *pa = lookupDerefAV(n.left->name)) {
-                    av = builder_.CreateLoad(perlPtrTy_, pa, n.left->name + ".av");
-                } else {
-                    Value *base = emitExpr(*n.left);
-                    av = callRT("perl_deref_array_ro", {base});
-                    freeIfOwned(base);
-                }
-            } else {
-                Value *base2 = emitExpr(*n.left);
-                av = callRT("perl_deref_array_ro", {base2});
-                freeIfOwned(base2);
-            }
-            Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
-            return callRT("perl_to_float", {elem});
+            /* 1D: $arr->[$i] may return an array/hash ref, not a scalar float.
+               Return nullptr so callers fall through to the PerlValue* path. */
+            return nullptr;
         } else {
             Value *base = emitExpr(*n.left);
             Value *hv = callRT("perl_deref_hash", {base});
@@ -3808,14 +3802,14 @@ Value *CodeGen::emitExpr(const Node &n) {
                 return flatPV;
             }
         }
-        Value *av = callRT("perl_array_new", {});
+        Value *av = callRT("perl_anon_array_new", {});
         for (auto &elem : n.args)
             callRT("perl_array_push", {av, emitExpr(*elem)});
         return callRT("perl_ref_array", {av});
     }
 
     case NK::AnonHash: {
-        Value *hv = callRT("perl_hash_new", {});
+        Value *hv = callRT("perl_anon_hash_new", {});
         Value *listArr = callRT("perl_array_new", {});
         for (auto &elem : n.args)
             callRT("perl_array_push", {listArr, emitExpr(*elem)});

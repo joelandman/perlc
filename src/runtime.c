@@ -227,6 +227,13 @@ PerlValue *perl_clone(const PerlValue *src) {
     *v = *src;
     v->matchpos = 0;
     v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
+    if (src->tag == PERL_REF_ARRAY && src->pval) {
+        PerlArray *av = (PerlArray *)src->pval;
+        if (av->refcount > 0) av->refcount++;
+    } else if (src->tag == PERL_REF_HASH && src->pval) {
+        PerlHash *hv = (PerlHash *)src->pval;
+        if (hv->refcount > 0) hv->refcount++;
+    }
     return v;
 }
 
@@ -234,6 +241,14 @@ HOTX void perl_free(PerlValue *v) {
     if (!v) return;
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
+    if (v->tag == PERL_REF_ARRAY && v->pval) {
+        PerlArray *av = (PerlArray *)v->pval;
+        if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
+    }
+    if (v->tag == PERL_REF_HASH && v->pval) {
+        PerlHash *hv = (PerlHash *)v->pval;
+        if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
+    }
     /* CODE_REF: pval points to a shared PerlClosure; don't free it here since
        perl_clone() shallow-copies the pval pointer — freeing it would dangle
        any other references to the same closure. */
@@ -327,13 +342,32 @@ int perl_is_true(const PerlValue *v) {
 
 HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!dst) return;
+    /* Acquire new reference first (handles self-assignment safely) */
+    if (src && src->tag == PERL_REF_ARRAY && src->pval) {
+        PerlArray *av = (PerlArray *)src->pval;
+        if (av->refcount > 0) av->refcount++;
+    } else if (src && src->tag == PERL_REF_HASH && src->pval) {
+        PerlHash *hv = (PerlHash *)src->pval;
+        if (hv->refcount > 0) hv->refcount++;
+    }
+    /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
+    if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { free(dst->pval); dst->pval = NULL; }
+    if (dst->tag == PERL_REF_ARRAY && dst->pval) {
+        PerlArray *av = (PerlArray *)dst->pval;
+        if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
+    }
+    if (dst->tag == PERL_REF_HASH && dst->pval) {
+        PerlHash *hv = (PerlHash *)dst->pval;
+        if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
+    }
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
     if (src->tag == PERL_STRING) dst->sval = strdup(src->sval);
     dst->matchpos = 0;
     dst->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
+    /* Note: the refcount increment above already accounts for dst's ownership of pval */
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -553,8 +587,14 @@ PerlValue *perl_dec(PerlValue *v) {
 
 PerlArray *perl_array_new(void) {
     PerlArray *a = malloc(sizeof *a);
-    a->len = 0; a->cap = 8;
+    a->len = 0; a->cap = 8; a->refcount = 0;
     a->elems = malloc(a->cap * sizeof(PerlValue *));
+    return a;
+}
+
+PerlArray *perl_anon_array_new(void) {
+    PerlArray *a = perl_array_new();
+    a->refcount = 1;
     return a;
 }
 
@@ -867,6 +907,13 @@ static unsigned int hash_str(const char *s) {
 
 PerlHash *perl_hash_new(void) {
     PerlHash *h = calloc(1, sizeof *h);
+    /* refcount=0: scope-managed (calloc zeros it) */
+    return h;
+}
+
+PerlHash *perl_anon_hash_new(void) {
+    PerlHash *h = perl_hash_new();
+    h->refcount = 1;
     return h;
 }
 
@@ -1068,7 +1115,7 @@ PerlArray *perl_deref_array(PerlValue *ref) {
            (including the Stage 22 inline GEP path) see the correct tag. */
         long long n = ref->matchpos;
         double *dbl = (double *)ref->pval;
-        PerlArray *av = perl_array_new();
+        PerlArray *av = perl_anon_array_new();
         for (long long i = 0; i < n; i++) {
             PerlValue *fv = perl_alloc_float(dbl[i]);
             perl_array_push(av, fv);

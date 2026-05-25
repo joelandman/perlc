@@ -567,7 +567,7 @@ static int runRepl(bool debugSymbols, int optLevel, bool verbose, bool pauseMode
                     rtSrc = "src/runtime.c";
 
                 std::string outFile = "/tmp/_perlc_repl_out_" + std::to_string(getpid());
-                std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel);
+                std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native";
                 if (debugSymbols) cmd += " -g";
                 cmd += " " + tmpIR + " " + rtSrc + " -o " + outFile + " -lm -lpcre2-8 2>&1";
 
@@ -753,7 +753,7 @@ int main(int argc, char **argv) {
         if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
             rtSrc = "src/runtime.c";  /* fallback: CWD */
 
-std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel);
+std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native";
 if (debugSymbols) cmd += " -g";
 cmd += " " + tmpIR + " " + rtSrc +
     " -o " + outputFile + " -lm -lpcre2-8 2>&1";
