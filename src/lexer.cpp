@@ -49,6 +49,12 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"chmod",    TK::KW_CHMOD},
     {"opendir",  TK::KW_OPENDIR},   {"readdir",TK::KW_READDIR},
     {"closedir", TK::KW_CLOSEDIR},
+    {"rand",     TK::KW_RAND},      {"srand",  TK::KW_SRAND},
+    {"time",     TK::KW_TIME},      {"localtime",TK::KW_LOCALTIME}, {"gmtime", TK::KW_GMTIME},
+    {"sleep",    TK::KW_SLEEP},     {"alarm",  TK::KW_ALARM},
+    {"sum",      TK::KW_SUM},       {"min",    TK::KW_MIN},    {"max",    TK::KW_MAX},
+    {"first",    TK::KW_FIRST},     {"any",    TK::KW_ANY},    {"all",    TK::KW_ALL},
+    {"none",     TK::KW_NONE},      {"uniq",   TK::KW_UNIQ},   {"reduce", TK::KW_REDUCE},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}

@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~97% implemented with 22/22 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, and advanced builtins.
+**Current Status**: Core language features are ~98% implemented with 23/23 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, and List::Util.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 22 test programs
+make test         # runs all 23 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -47,7 +47,11 @@ make clean
 - **Operators**: arithmetic, string (`.` , `x`), range (`..`), comparisons (`==`, `eq`, `<=>`, `cmp`), logical, increment/decrement (`++`/`--` including magical string increment), compound assignment, ternary
 - **Control Flow**: `if`/`elsif`/`else`, `unless`, `while`/`until` (including `while (my $var = expr)`), `do-while`/`do-until`, C-style `for`, `foreach`, `last`/`next`, statement modifiers
 - **Subroutines**: named and anonymous subs, recursion, `@_`, list unpacking, code references (`\&sub`, `$f->()`), `ref()` returning `"CODE"`
-- **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort`, `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete`, `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`
+- **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort` (including `sort { BLOCK }`), `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete`, `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`
+- **Time**: `time`, `localtime`, `gmtime` (list context → 9-element list: sec,min,hour,mday,mon,year,wday,yday,isdst)
+- **Randomness**: `rand [MAX]`, `srand [SEED]`
+- **Process**: `sleep SECS`, `alarm SECS`
+- **List::Util** (built-in, no CPAN): `sum`, `min`, `max`, `first { BLOCK } LIST`, `any { BLOCK } LIST`, `all { BLOCK } LIST`, `none { BLOCK } LIST`, `uniq LIST`, `reduce { BLOCK } LIST`
 
 ### Advanced Features
 - **References**: all types (`\$x`, `\@arr`, `\%hash`, `\&sub`), anonymous arrays/hashes, dereferencing (`$$ref`, `@$ref`, `%$ref`, `->`), `ref()`
@@ -74,7 +78,7 @@ make clean
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (22/22)
+## Passing Tests (23/23)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
@@ -84,6 +88,7 @@ All tests in `tests/` pass:
 - OOP & modules: `oop.pl`, `closures.pl`, `usemod.pl`, `inherit.pl`
 - Modern features: `defaults.pl`, `newfeatures.pl` (state, wantarray stub, caller stub, $!, $/, BEGIN/END, defined(), local blocks)
 - Performance benchmarks: `fibn.pl` (Fibonacci), `mbs.pl` (Mandelbrot set 512×512×80 iters)
+- Tier 1 builtins: `tier1.pl` (rand/srand, time/localtime/gmtime, sleep/alarm, sort { BLOCK }, List::Util)
 
 ## Known Limitations
 
@@ -131,4 +136,4 @@ The following features are **not yet implemented** or only partially supported:
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 22-test suite.
+**Last Updated**: Current state reflects all features demonstrated in the 23-test suite.

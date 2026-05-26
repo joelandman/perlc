@@ -2498,3 +2498,146 @@ PerlValue *perl_filetest(int op, PerlValue *path_pv) {
     free(path);
     return result;
 }
+
+/* ── time / randomness / process ────────────────────────────────────────── */
+#include <time.h>
+
+PerlValue *perl_rand_val(PerlValue *max) {
+    double m = max ? perl_to_float(max) : 1.0;
+    return perl_alloc_float(m * ((double)rand() / ((double)RAND_MAX + 1.0)));
+}
+
+void perl_srand_val(PerlValue *seed) {
+    unsigned s = seed ? (unsigned)perl_to_int(seed) : (unsigned)time(NULL);
+    srand(s);
+}
+
+PerlValue *perl_time_val(void) {
+    return perl_alloc_int((long long)time(NULL));
+}
+
+static PerlArray *_broken_time(time_t t) {
+    struct tm *tm = localtime(&t);
+    PerlArray *a = perl_array_new();
+    perl_array_push(a, perl_alloc_int(tm->tm_sec));
+    perl_array_push(a, perl_alloc_int(tm->tm_min));
+    perl_array_push(a, perl_alloc_int(tm->tm_hour));
+    perl_array_push(a, perl_alloc_int(tm->tm_mday));
+    perl_array_push(a, perl_alloc_int(tm->tm_mon));
+    perl_array_push(a, perl_alloc_int(tm->tm_year));
+    perl_array_push(a, perl_alloc_int(tm->tm_wday));
+    perl_array_push(a, perl_alloc_int(tm->tm_yday));
+    perl_array_push(a, perl_alloc_int(tm->tm_isdst));
+    return a;
+}
+
+static PerlArray *_broken_time_gm(time_t t) {
+    struct tm *tm = gmtime(&t);
+    PerlArray *a = perl_array_new();
+    perl_array_push(a, perl_alloc_int(tm->tm_sec));
+    perl_array_push(a, perl_alloc_int(tm->tm_min));
+    perl_array_push(a, perl_alloc_int(tm->tm_hour));
+    perl_array_push(a, perl_alloc_int(tm->tm_mday));
+    perl_array_push(a, perl_alloc_int(tm->tm_mon));
+    perl_array_push(a, perl_alloc_int(tm->tm_year));
+    perl_array_push(a, perl_alloc_int(tm->tm_wday));
+    perl_array_push(a, perl_alloc_int(tm->tm_yday));
+    perl_array_push(a, perl_alloc_int(tm->tm_isdst));
+    return a;
+}
+
+PerlArray *perl_localtime_val(PerlValue *t) {
+    time_t ts = t ? (time_t)perl_to_int(t) : time(NULL);
+    return _broken_time(ts);
+}
+
+PerlArray *perl_gmtime_val(PerlValue *t) {
+    time_t ts = t ? (time_t)perl_to_int(t) : time(NULL);
+    return _broken_time_gm(ts);
+}
+
+PerlValue *perl_sleep_val(PerlValue *secs) {
+    unsigned s = secs ? (unsigned)perl_to_int(secs) : 0;
+    return perl_alloc_int((long long)sleep(s));
+}
+
+PerlValue *perl_alarm_val(PerlValue *secs) {
+    unsigned s = secs ? (unsigned)perl_to_int(secs) : 0;
+    return perl_alloc_int((long long)alarm(s));
+}
+
+/* ── List::Util ───────────────────────────────────────────────────────────── */
+
+PerlValue *perl_sum_list(PerlArray *a) {
+    if (!a || a->len == 0) return perl_alloc_undef();
+    double s = 0.0;
+    int has_float = 0;
+    for (long long i = 0; i < a->len; i++) {
+        PerlValue *v = a->elems[i];
+        if (v && v->tag == PERL_FLOAT) has_float = 1;
+        s += v ? perl_to_float(v) : 0.0;
+    }
+    if (has_float) return perl_alloc_float(s);
+    return perl_alloc_int((long long)s);
+}
+
+PerlValue *perl_min_list(PerlArray *a) {
+    if (!a || a->len == 0) return perl_alloc_undef();
+    double m = perl_to_float(a->elems[0]);
+    for (long long i = 1; i < a->len; i++) {
+        double v = perl_to_float(a->elems[i]);
+        if (v < m) m = v;
+    }
+    return perl_alloc_float(m);
+}
+
+PerlValue *perl_max_list(PerlArray *a) {
+    if (!a || a->len == 0) return perl_alloc_undef();
+    double m = perl_to_float(a->elems[0]);
+    for (long long i = 1; i < a->len; i++) {
+        double v = perl_to_float(a->elems[i]);
+        if (v > m) m = v;
+    }
+    return perl_alloc_float(m);
+}
+
+PerlArray *perl_uniq_list(PerlArray *a) {
+    PerlArray *res = perl_array_new();
+    if (!a) return res;
+    char *prev = NULL;
+    for (long long i = 0; i < a->len; i++) {
+        char *s = perl_to_string(a->elems[i]);
+        if (!prev || strcmp(prev, s) != 0) {
+            perl_array_push(res, perl_clone(a->elems[i]));
+            free(prev);
+            prev = s;
+        } else {
+            free(s);
+        }
+    }
+    free(prev);
+    return res;
+}
+
+/* ── sort with custom comparator ─────────────────────────────────────────── */
+
+static PerlSortCmpFn sort_custom_cmp_ = NULL;
+
+static int sort_qsort_wrap_(const void *pa, const void *pb) {
+    PerlValue *a = *(PerlValue **)pa;
+    PerlValue *b = *(PerlValue **)pb;
+    long long r = sort_custom_cmp_(a, b);
+    return r < 0 ? -1 : r > 0 ? 1 : 0;
+}
+
+PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp) {
+    PerlArray *res = perl_array_new();
+    if (!a) return res;
+    /* copy element pointers (shallow) */
+    for (long long i = 0; i < a->len; i++)
+        perl_array_push(res, perl_clone(a->elems[i]));
+    sort_custom_cmp_ = cmp;
+    qsort(res->elems, (size_t)res->len, sizeof(PerlValue *), sort_qsort_wrap_);
+    sort_custom_cmp_ = NULL;
+    return res;
+}

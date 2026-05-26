@@ -109,6 +109,24 @@ enum class NK {
     OpendirFunc,  /* opendir(DH,path)  – name=dh_var, left=path                      */
     ReaddirFunc,  /* readdir(DH)       – name=dh_var                                  */
     ClosedirFunc, /* closedir(DH)      – name=dh_var                                  */
+    /* time / randomness / sleep */
+    RandFunc,     /* rand [MAX]        – left=max (opt)                               */
+    SrandFunc,    /* srand [SEED]      – left=seed (opt)                              */
+    TimeFunc,     /* time()            – no children                                  */
+    LocaltimeFunc,/* localtime [TIME]  – left=time (opt); sval="scalar" if scalar ctx */
+    GmtimeFunc,   /* gmtime [TIME]     – left=time (opt)                              */
+    SleepFunc,    /* sleep SECS        – left=secs                                    */
+    AlarmFunc,    /* alarm SECS        – left=secs                                    */
+    /* List::Util */
+    SumFunc,      /* sum LIST          – args=list                                    */
+    MinFunc,      /* min LIST          – args=list                                    */
+    MaxFunc,      /* max LIST          – args=list                                    */
+    UniqFunc,     /* uniq LIST         – args=list                                    */
+    FirstFunc,    /* first { BLOCK } LIST – body=block, args=list; uses $_            */
+    AnyFunc,      /* any   { BLOCK } LIST – body=block, args=list; uses $_            */
+    AllFunc,      /* all   { BLOCK } LIST – body=block, args=list; uses $_            */
+    NoneFunc,     /* none  { BLOCK } LIST – body=block, args=list; uses $_            */
+    ReduceFunc,   /* reduce { BLOCK } LIST – body=block, args=list; uses $a/$b        */
 };
 
 struct Node;

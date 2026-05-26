@@ -59,3 +59,4 @@ test: $(TARGET)
 	@echo "=== defaults.pl     ===" && ./$(TARGET) tests/defaults.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== newfeatures.pl  ===" && ./$(TARGET) tests/newfeatures.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== fibn.pl         ===" && ./$(TARGET) tests/fibn.pl         -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 10
+	@echo "=== tier1.pl        ===" && ./$(TARGET) tests/tier1.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test

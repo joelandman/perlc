@@ -327,6 +327,21 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_readdir",          pv, pv);
     RT("perl_readdir_all",      av, pv);
     RT("perl_closedir_fh",      voidTy, pv);
+    /* time / randomness / sleep */
+    RT("perl_rand_val",     pv,     pv);
+    RT("perl_srand_val",    voidTy, pv);
+    RT("perl_time_val",     pv);
+    RT("perl_localtime_val",av,     pv);
+    RT("perl_gmtime_val",   av,     pv);
+    RT("perl_sleep_val",    pv,     pv);
+    RT("perl_alarm_val",    pv,     pv);
+    /* List::Util */
+    RT("perl_sum_list",     pv,  av);
+    RT("perl_min_list",     pv,  av);
+    RT("perl_max_list",     pv,  av);
+    RT("perl_uniq_list",    av,  av);
+    /* sort with custom comparator — fn ptr passed as i8p (opaque pointer) */
+    RT("perl_sort_custom",  av,  av, i8p);
 #undef RT
 
     /* Mark pure read-only functions so GVN/LICM can eliminate redundant calls */
@@ -471,6 +486,29 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
         return callRT("perl_split", {sep, str});
     }
+    /* localtime / gmtime in list context → 9-element array */
+    if (n.kind == NK::LocaltimeFunc) {
+        Value *t = n.left ? emitExpr(*n.left) : perlUndef();
+        return callRT("perl_localtime_val", {t});
+    }
+    if (n.kind == NK::GmtimeFunc) {
+        Value *t = n.left ? emitExpr(*n.left) : perlUndef();
+        return callRT("perl_gmtime_val", {t});
+    }
+    /* uniq in list context */
+    if (n.kind == NK::UniqFunc) {
+        Value *av = nullptr;
+        if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
+        if (!av) {
+            av = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            }
+        }
+        return callRT("perl_uniq_list", {av});
+    }
     if (n.kind == NK::SortFunc) {
         /* collect input array */
         Value *av = nullptr;
@@ -495,6 +533,77 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         else if (mode == "num_desc") return callRT("perl_sort_num_desc", {av});
         else if (mode == "str_asc")  return callRT("perl_sort_str_asc",  {av});
         else if (mode == "str_desc") return callRT("perl_sort_str_desc", {av});
+        else if (mode == "custom" && n.body) {
+            /* Generate a comparison function: long long cmp(PerlValue* a, PerlValue* b) */
+            static int sortCmpCounter = 0;
+            std::string cmpName = "__sort_cmp_" + std::to_string(sortCmpCounter++);
+
+            auto *i64Ty = Type::getInt64Ty(ctx_);
+            auto *cmpFT = FunctionType::get(i64Ty, {perlPtrTy_, perlPtrTy_}, false);
+            auto *cmpFn = Function::Create(cmpFT, Function::InternalLinkage,
+                                           cmpName, mod_.get());
+            /* save codegen state */
+            auto *savedFn      = currentFn_;
+            auto *savedBB      = builder_.GetInsertBlock();
+            auto  savedScopes  = scopes_;
+            auto  savedArr     = arrayScopes_;
+            auto  savedHash    = hashScopes_;
+            auto  savedPv      = pvScopes_;
+            auto  savedFloat   = floatScopes_;
+            auto  savedInt     = intScopes_;
+            auto *savedLDep    = localDepthAlloca_;
+            auto *savedBody    = currentSubBody_;
+
+            auto *cmpEntry = BasicBlock::Create(ctx_, "entry", cmpFn);
+            builder_.SetInsertPoint(cmpEntry);
+            currentFn_ = cmpFn;
+            scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+            floatScopes_ = {}; intScopes_ = {};
+            pushScope();
+
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+            builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+            /* bind $a and $b to the function parameters */
+            Value *argA = cmpFn->getArg(0); argA->setName("a");
+            Value *argB = cmpFn->getArg(1); argB->setName("b");
+            auto *aAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "a");
+            auto *bAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "b");
+            builder_.CreateStore(argA, aAlloca);
+            builder_.CreateStore(argB, bAlloca);
+            declareVar("a", aAlloca);
+            declareVar("b", bAlloca);
+
+            currentSubBody_ = n.body.get();
+            Value *cmpResult = emitBlockLast(*n.body);
+            currentSubBody_ = savedBody;
+
+            if (!builder_.GetInsertBlock()->getTerminator()) {
+                Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+                callRT("perl_local_restore_to", {depth});
+                Value *rv = callRT("perl_to_int", {cmpResult});
+                builder_.CreateRet(rv);
+            }
+            popScope();
+
+            /* restore state */
+            currentFn_        = savedFn;
+            builder_.SetInsertPoint(savedBB);
+            scopes_           = std::move(savedScopes);
+            arrayScopes_      = std::move(savedArr);
+            hashScopes_       = std::move(savedHash);
+            pvScopes_         = std::move(savedPv);
+            floatScopes_      = std::move(savedFloat);
+            intScopes_        = std::move(savedInt);
+            localDepthAlloca_ = savedLDep;
+            currentSubBody_   = savedBody;
+
+            /* call perl_sort_custom(av, cmpFn) */
+            Value *fnPtr = builder_.CreateBitCast(cmpFn,
+                              PointerType::getUnqual(ctx_));
+            return callRT("perl_sort_custom", {av, fnPtr});
+        }
         else { /* default: sort a copy lexicographically */
             Value *copy = callRT("perl_sort_str_asc", {av}); return copy;
         }
@@ -3762,6 +3871,233 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::OrdFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_ord_val", {a}); freeIfOwned(a); return r; }
     case NK::HexFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_hex_val", {a}); freeIfOwned(a); return r; }
     case NK::OctFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_oct_val", {a}); freeIfOwned(a); return r; }
+
+    /* ── rand / srand / time / localtime / gmtime / sleep / alarm ───────── */
+    case NK::RandFunc: {
+        Value *mx = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *r  = callRT("perl_rand_val", {mx});
+        if (n.left) freeIfOwned(mx);
+        return r;
+    }
+    case NK::SrandFunc: {
+        Value *s = n.left ? emitExpr(*n.left) : perlUndef();
+        callRT("perl_srand_val", {s});
+        if (n.left) freeIfOwned(s);
+        return perlUndef();
+    }
+    case NK::TimeFunc:
+        return callRT("perl_time_val", {});
+    case NK::SleepFunc: {
+        Value *s = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *r = callRT("perl_sleep_val", {s});
+        if (n.left) freeIfOwned(s);
+        return r;
+    }
+    case NK::AlarmFunc: {
+        Value *s = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *r = callRT("perl_alarm_val", {s});
+        if (n.left) freeIfOwned(s);
+        return r;
+    }
+    /* localtime / gmtime in scalar context return a string */
+    case NK::LocaltimeFunc:
+    case NK::GmtimeFunc: {
+        /* In scalar context we can't easily tell, so return the epoch for further use.
+           Most common use is in list context via emitArrayPtr; scalar context: return time. */
+        Value *t = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *r = callRT("perl_time_val", {});
+        if (n.left) freeIfOwned(t);
+        return r;
+    }
+
+    /* ── List::Util scalar results ───────────────────────────────────────── */
+    case NK::SumFunc:
+    case NK::MinFunc:
+    case NK::MaxFunc:
+    case NK::UniqFunc: {
+        /* collect input list into an array then call runtime */
+        Value *av = nullptr;
+        if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
+        if (!av) {
+            av = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            }
+        }
+        if (n.kind == NK::SumFunc)  return callRT("perl_sum_list", {av});
+        if (n.kind == NK::MinFunc)  return callRT("perl_min_list", {av});
+        if (n.kind == NK::MaxFunc)  return callRT("perl_max_list", {av});
+        /* UniqFunc: scalar context returns first element of unique list */
+        return callRT("perl_array_get", {callRT("perl_uniq_list", {av}),
+                                         ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+    }
+
+    /* ── first / any / all / none ────────────────────────────────────────── */
+    case NK::FirstFunc:
+    case NK::AnyFunc:
+    case NK::AllFunc:
+    case NK::NoneFunc: {
+        auto *fn   = builder_.GetInsertBlock()->getParent();
+        auto *i64  = Type::getInt64Ty(ctx_);
+        auto *i32  = Type::getInt32Ty(ctx_);
+        bool isFirst = (n.kind == NK::FirstFunc);
+        bool isAll   = (n.kind == NK::AllFunc);
+        bool isNone  = (n.kind == NK::NoneFunc);
+
+        /* build input array */
+        Value *inputArr = nullptr;
+        if (n.args.size() == 1) inputArr = emitArrayPtr(*n.args[0]);
+        if (!inputArr) {
+            inputArr = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {inputArr, sub});
+                else     callRT("perl_array_push",   {inputArr, emitExpr(*a)});
+            }
+        }
+
+        /* result slot — heap PV so perl_assign works */
+        Value *resultPv = isFirst  ? perlUndef()
+                        : (isAll || isNone) ? perlInt(1)
+                        :                     perlInt(0); /* any starts 0 */
+
+        Value *lenPv = callRT("perl_array_len", {inputArr});
+        Value *len   = callRT("perl_to_int", {lenPv});
+        auto *udAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        Value *udPv    = perlUndef();
+        builder_.CreateStore(udPv, udAlloca);
+        auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "fan.i");
+        builder_.CreateStore(ConstantInt::get(i64, 0), iAlloca);
+
+        auto *condBB = BasicBlock::Create(ctx_, "fan.cond", fn);
+        auto *bodyBB = BasicBlock::Create(ctx_, "fan.body", fn);
+        auto *trueBB = BasicBlock::Create(ctx_, "fan.true", fn);  /* block was true */
+        auto *falseBB= BasicBlock::Create(ctx_, "fan.false",fn);  /* block was false */
+        auto *nextBB = BasicBlock::Create(ctx_, "fan.next", fn);  /* continue loop */
+        auto *exitBB = BasicBlock::Create(ctx_, "fan.exit", fn);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(condBB);
+        Value *i     = builder_.CreateLoad(i64, iAlloca);
+        Value *done  = builder_.CreateICmpSGE(i, len);
+        builder_.CreateCondBr(done, exitBB, bodyBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        Value *elem = callRT("perl_array_get_ref", {inputArr, i});
+        callRT("perl_assign", {udPv, elem});
+        pushScope();
+        declareVar("_", udAlloca);
+        Value *blockResult = n.body ? emitBlockLast(*n.body) : perlUndef();
+        popScope();
+        Value *tv   = callRT("perl_is_true", {blockResult});
+        Value *cond = builder_.CreateICmpNE(tv, ConstantInt::get(i32, 0));
+        builder_.CreateCondBr(cond, trueBB, falseBB);
+
+        /* true branch */
+        builder_.SetInsertPoint(trueBB);
+        if (isFirst) {
+            callRT("perl_assign", {resultPv, elem});
+            builder_.CreateBr(exitBB);
+        } else if (isAll) {
+            builder_.CreateBr(nextBB);             /* all: true element → continue */
+        } else if (isNone) {
+            callRT("perl_assign", {resultPv, perlInt(0)});
+            builder_.CreateBr(exitBB);             /* none: one true → fail */
+        } else {
+            callRT("perl_assign", {resultPv, perlInt(1)});
+            builder_.CreateBr(exitBB);             /* any: one true → succeed */
+        }
+
+        /* false branch */
+        builder_.SetInsertPoint(falseBB);
+        if (isAll) {
+            callRT("perl_assign", {resultPv, perlInt(0)});
+            builder_.CreateBr(exitBB);             /* all: one false → fail */
+        } else {
+            builder_.CreateBr(nextBB);             /* first/any/none: false → continue */
+        }
+
+        builder_.SetInsertPoint(nextBB);
+        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+        builder_.CreateStore(i2, iAlloca);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(exitBB);
+        return resultPv;
+    }
+
+    /* ── reduce ──────────────────────────────────────────────────────────── */
+    case NK::ReduceFunc: {
+        auto *fn  = builder_.GetInsertBlock()->getParent();
+        auto *i64 = Type::getInt64Ty(ctx_);
+
+        /* build input array */
+        Value *inputArr = nullptr;
+        if (n.args.size() == 1) inputArr = emitArrayPtr(*n.args[0]);
+        if (!inputArr) {
+            inputArr = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {inputArr, sub});
+                else     callRT("perl_array_push",   {inputArr, emitExpr(*a)});
+            }
+        }
+
+        Value *lenPv = callRT("perl_array_len", {inputArr});
+        Value *len   = callRT("perl_to_int", {lenPv});
+
+        /* $a and $b allocas */
+        auto *aAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$a");
+        auto *bAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$b");
+        Value *aPv    = perlUndef();
+        Value *bPv    = perlUndef();
+        builder_.CreateStore(aPv, aAlloca);
+        builder_.CreateStore(bPv, bAlloca);
+
+        /* accumulator starts as first element */
+        auto *accAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "red.acc");
+        Value *first    = callRT("perl_array_get_ref", {inputArr, ConstantInt::get(i64, 0)});
+        Value *accPv    = perlUndef();
+        callRT("perl_assign", {accPv, first});
+        builder_.CreateStore(accPv, accAlloca);
+
+        auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "red.i");
+        builder_.CreateStore(ConstantInt::get(i64, 1), iAlloca); /* start from index 1 */
+
+        auto *condBB = BasicBlock::Create(ctx_, "red.cond", fn);
+        auto *bodyBB = BasicBlock::Create(ctx_, "red.body", fn);
+        auto *exitBB = BasicBlock::Create(ctx_, "red.exit", fn);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(condBB);
+        Value *i    = builder_.CreateLoad(i64, iAlloca);
+        Value *done = builder_.CreateICmpSGE(i, len);
+        builder_.CreateCondBr(done, exitBB, bodyBB);
+
+        builder_.SetInsertPoint(bodyBB);
+        /* $a = accumulator, $b = current element */
+        callRT("perl_assign", {aPv, builder_.CreateLoad(perlPtrTy_, accAlloca)});
+        Value *cur = callRT("perl_array_get_ref", {inputArr, i});
+        callRT("perl_assign", {bPv, cur});
+
+        pushScope();
+        declareVar("a", aAlloca);
+        declareVar("b", bAlloca);
+        Value *blockResult = n.body ? emitBlockLast(*n.body) : perlUndef();
+        popScope();
+
+        /* update accumulator */
+        callRT("perl_assign", {accPv, blockResult});
+
+        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+        builder_.CreateStore(i2, iAlloca);
+        builder_.CreateBr(condBB);
+
+        builder_.SetInsertPoint(exitBB);
+        return builder_.CreateLoad(perlPtrTy_, accAlloca);
+    }
 
     /* ── index / rindex ──────────────────────────────────────────────────── */
     case NK::IndexFunc:

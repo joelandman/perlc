@@ -293,6 +293,25 @@ int  perl_local_save_depth(void);              /* current save-stack depth */
 void perl_local_save(PerlValue *pv);           /* save current state of *pv */
 void perl_local_restore_to(int depth);         /* restore all saved since depth */
 
+/* ── time / randomness / process ────────────────────────────────────────── */
+PerlValue *perl_rand_val(PerlValue *max);       /* rand [max] — float [0,max) */
+void       perl_srand_val(PerlValue *seed);     /* srand [seed] */
+PerlValue *perl_time_val(void);                 /* time() — epoch seconds */
+PerlArray *perl_localtime_val(PerlValue *t);    /* localtime — 9-element list */
+PerlArray *perl_gmtime_val(PerlValue *t);       /* gmtime — 9-element list */
+PerlValue *perl_sleep_val(PerlValue *secs);     /* sleep — returns actual secs slept */
+PerlValue *perl_alarm_val(PerlValue *secs);     /* alarm — returns prev alarm value */
+
+/* ── List::Util ───────────────────────────────────────────────────────────── */
+PerlValue *perl_sum_list(PerlArray *a);         /* sum LIST — undef if empty */
+PerlValue *perl_min_list(PerlArray *a);         /* min LIST — undef if empty */
+PerlValue *perl_max_list(PerlArray *a);         /* max LIST — undef if empty */
+PerlArray *perl_uniq_list(PerlArray *a);        /* uniq LIST — remove consecutive dups */
+
+/* ── sort with custom comparator ─────────────────────────────────────────── */
+typedef long long (*PerlSortCmpFn)(PerlValue *, PerlValue *);
+PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp); /* sort copy of a */
+
 /* ── directory I/O ───────────────────────────────────────────────────────── */
 PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path);
 PerlValue *perl_readdir(PerlValue *dh);      /* scalar: one entry or undef */

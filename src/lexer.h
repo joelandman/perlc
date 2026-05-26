@@ -30,6 +30,11 @@ enum class TK {
     KW_BEGIN, KW_END,
     KW_CHDIR, KW_MKDIR, KW_RMDIR, KW_RENAME, KW_CHMOD,
     KW_OPENDIR, KW_READDIR, KW_CLOSEDIR,
+    /* time / randomness / process */
+    KW_RAND, KW_SRAND, KW_TIME, KW_LOCALTIME, KW_GMTIME,
+    KW_SLEEP, KW_ALARM,
+    /* List::Util */
+    KW_SUM, KW_MIN, KW_MAX, KW_FIRST, KW_ANY, KW_ALL, KW_NONE, KW_UNIQ, KW_REDUCE,
     SPACESHIP,    /* <=> */
     FILETEST,  /* -e/-f/-d/-r/-w/-x/-z/-s/-l/-p – text = flag char */
     QWORDS,    /* qw(...) – text = space-separated words */

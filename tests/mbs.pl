@@ -74,6 +74,7 @@ sub mbi {
     for ( my $iter = 0 ; $iter < $Niter ; $iter++ ) {
 
         # zzzp .= zzz .* zzz .+ ccc
+        # pragma omp for
         for ( my $j = 0 ; $j < $N ; $j++ ) {
             my $zj  = $zzz->[$j];
             my $ccj = $ccc->[$j];
@@ -85,6 +86,7 @@ sub mbi {
         }
 
         # zzz .= zzzp .* (abs2(zzzp) < 4) .+ (2+0i) * (abs(zzzp) >= 4)
+        # pragma omp for
         for ( my $j = 0 ; $j < $N ; $j++ ) {
             my $zpj = $zzzp[$j];
             my $zj  = $zzz->[$j];

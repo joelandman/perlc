@@ -1418,8 +1418,9 @@ NodePtr Parser::parsePrimary() {
     /* sort LIST  or  sort { CMP } LIST  or  sort keys %h  or  sort @arr */
     if (check(TK::KW_SORT)) {
         advance();
-        /* detect sort { $a <=> $b } or { $b <=> $a } etc. */
+        /* detect sort { $a <=> $b } or { $b <=> $a } or sort { BLOCK } */
         std::string sortMode;
+        NodePtr sortBlock;
         if (check(TK::LBRACE)) {
             size_t save = pos_;
             advance(); // {
@@ -1433,7 +1434,11 @@ NodePtr Parser::parsePrimary() {
                 if      (first == "a" && second == "b") sortMode = op + "_asc";
                 else if (first == "b" && second == "a") sortMode = op + "_desc";
             }
-            if (sortMode.empty()) pos_ = save; // restore: unrecognized block
+            if (sortMode.empty()) {
+                pos_ = save; /* restore — parse as arbitrary block */
+                sortBlock = parseBlock();
+                sortMode = "custom";
+            }
         }
         NodeList elems;
         /* sort (list) or sort list-expr */
@@ -1442,12 +1447,14 @@ NodePtr Parser::parsePrimary() {
             inner->sval = "sort";
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
             n->left = std::move(inner); n->sval = sortMode; n->line = line;
+            n->body = std::move(sortBlock);
             return n;
         }
         if (check(TK::ARRAY)) {
             auto inner = parsePrimary();
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
             n->left = std::move(inner); n->sval = sortMode; n->line = line;
+            n->body = std::move(sortBlock);
             return n;
         }
         if (check(TK::LPAREN)) {
@@ -1460,6 +1467,7 @@ NodePtr Parser::parsePrimary() {
         }
         auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
         n->args = std::move(elems); n->sval = sortMode; n->line = line;
+        n->body = std::move(sortBlock);
         return n;
     }
 
@@ -1721,6 +1729,101 @@ NodePtr Parser::parsePrimary() {
             auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
             n->left = std::move(inner); return n;
         }
+    }
+
+    /* ── rand, srand ─────────────────────────────────────────────────────── */
+    if (check(TK::KW_RAND) || check(TK::KW_SRAND)) {
+        bool isRand = check(TK::KW_RAND); advance();
+        auto n = std::make_unique<Node>();
+        n->kind = isRand ? NK::RandFunc : NK::SrandFunc; n->line = line;
+        bool hp = match(TK::LPAREN);
+        if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier())
+            n->left = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* ── time, localtime, gmtime ─────────────────────────────────────────── */
+    if (check(TK::KW_TIME)) {
+        advance();
+        /* optional empty parens */
+        if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::TimeFunc; n->line = line;
+        return n;
+    }
+    if (check(TK::KW_LOCALTIME) || check(TK::KW_GMTIME)) {
+        bool isGm = check(TK::KW_GMTIME); advance();
+        auto n = std::make_unique<Node>();
+        n->kind = isGm ? NK::GmtimeFunc : NK::LocaltimeFunc; n->line = line;
+        bool hp = match(TK::LPAREN);
+        if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier())
+            n->left = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* ── sleep, alarm ────────────────────────────────────────────────────── */
+    if (check(TK::KW_SLEEP) || check(TK::KW_ALARM)) {
+        bool isSleep = check(TK::KW_SLEEP); advance();
+        auto n = std::make_unique<Node>();
+        n->kind = isSleep ? NK::SleepFunc : NK::AlarmFunc; n->line = line;
+        bool hp = match(TK::LPAREN);
+        if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier())
+            n->left = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* ── List::Util: sum, min, max, uniq ────────────────────────────────── */
+    if (check(TK::KW_SUM) || check(TK::KW_MIN) || check(TK::KW_MAX) || check(TK::KW_UNIQ)) {
+        NK kind = check(TK::KW_SUM) ? NK::SumFunc
+                : check(TK::KW_MIN) ? NK::MinFunc
+                : check(TK::KW_UNIQ)? NK::UniqFunc : NK::MaxFunc;
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+        bool hp = match(TK::LPAREN);
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+            if (hp && check(TK::RPAREN)) break;
+            n->args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* ── List::Util: first, any, all, none — block form ─────────────────── */
+    if (check(TK::KW_FIRST) || check(TK::KW_ANY) || check(TK::KW_ALL) || check(TK::KW_NONE)) {
+        NK kind = check(TK::KW_FIRST) ? NK::FirstFunc
+                : check(TK::KW_ANY)   ? NK::AnyFunc
+                : check(TK::KW_NONE)  ? NK::NoneFunc : NK::AllFunc;
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+        bool hp = match(TK::LPAREN);
+        if (check(TK::LBRACE)) n->body = parseBlock();
+        match(TK::COMMA);
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+            if (hp && check(TK::RPAREN)) break;
+            n->args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
+    }
+
+    /* ── List::Util: reduce ──────────────────────────────────────────────── */
+    if (check(TK::KW_REDUCE)) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::ReduceFunc; n->line = line;
+        bool hp = match(TK::LPAREN);
+        if (check(TK::LBRACE)) n->body = parseBlock();
+        match(TK::COMMA);
+        while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+            if (hp && check(TK::RPAREN)) break;
+            n->args.push_back(parseExpr());
+            if (!match(TK::COMMA)) break;
+        }
+        if (hp) consume(TK::RPAREN, ")");
+        return n;
     }
 
     /* ── index, rindex ───────────────────────────────────────────────────── */
