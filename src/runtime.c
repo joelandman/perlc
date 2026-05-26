@@ -2900,3 +2900,122 @@ PerlValue *perl_can_check(PerlValue *obj, PerlValue *method_pv) {
     if (!fn) return perl_alloc_undef();
     return perl_make_code_ref(fn);
 }
+
+/* ── Tier 3: read / fileno / truncate / each / pos / getpid / $^O ──────── */
+
+PerlValue *perl_read_fh(PerlValue *fh, PerlValue *buf_pv, PerlValue *nbytes, PerlValue *offset) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return perl_alloc_int(0);
+    FILE *fp = (FILE *)fh->pval;
+    long long n = perl_to_int(nbytes);
+    long long off = offset ? perl_to_int(offset) : 0;
+    if (n <= 0) return perl_alloc_int(0);
+    char *tmp = (char *)malloc(n + 1);
+    if (!tmp) return perl_alloc_int(0);
+    size_t got = fread(tmp, 1, (size_t)n, fp);
+    tmp[got] = '\0';
+    /* write into buf_pv (which is a stable PerlValue*) */
+    if (buf_pv) {
+        if (off > 0) {
+            /* append at offset */
+            char *cur = (buf_pv->tag == PERL_STRING && buf_pv->sval) ? buf_pv->sval : (char *)"";
+            long long curlen = (long long)strlen(cur);
+            if (off > curlen) off = curlen;
+            char *newbuf = (char *)malloc(off + got + 1);
+            memcpy(newbuf, cur, (size_t)off);
+            memcpy(newbuf + off, tmp, got);
+            newbuf[off + got] = '\0';
+            if (buf_pv->tag == PERL_STRING && buf_pv->sval) free(buf_pv->sval);
+            buf_pv->tag = PERL_STRING;
+            buf_pv->sval = newbuf;
+        } else {
+            if (buf_pv->tag == PERL_STRING && buf_pv->sval) free(buf_pv->sval);
+            buf_pv->tag = PERL_STRING;
+            buf_pv->sval = tmp;
+            tmp = NULL;
+        }
+    }
+    if (tmp) free(tmp);
+    return perl_alloc_int((long long)got);
+}
+
+PerlValue *perl_fileno_fh(PerlValue *fh) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return perl_alloc_undef();
+    FILE *fp = (FILE *)fh->pval;
+    int fd = fileno(fp);
+    if (fd < 0) return perl_alloc_undef();
+    return perl_alloc_int((long long)fd);
+}
+
+PerlValue *perl_truncate_fh(PerlValue *fh_or_path, PerlValue *len) {
+    long long sz = perl_to_int(len);
+    if (!fh_or_path) return perl_alloc_int(0);
+    int rc = -1;
+    if (fh_or_path->tag == PERL_FILEHANDLE && fh_or_path->pval) {
+        FILE *fp = (FILE *)fh_or_path->pval;
+        rc = ftruncate(fileno(fp), (off_t)sz);
+    } else {
+        char *path = perl_to_string(fh_or_path);
+        rc = truncate(path, (off_t)sz);
+        free(path);
+    }
+    return perl_alloc_int(rc == 0 ? 1 : 0);
+}
+
+PerlArray *perl_each_hash(PerlHash *h) {
+    PerlArray *out = perl_array_new();
+    if (!h) return out;
+    static struct { PerlHash *h; int bucket; int chain; } iters[256];
+    static int niters = 0;
+    int idx = -1;
+    for (int i = 0; i < niters; i++) {
+        if (iters[i].h == h) { idx = i; break; }
+    }
+    if (idx < 0) {
+        if (niters < 256) idx = niters++;
+        else idx = 0;
+        iters[idx].h = h;
+        iters[idx].bucket = 0;
+        iters[idx].chain = 0;
+    }
+    for (int b = iters[idx].bucket; b < PERL_HASH_BUCKETS; b++) {
+        PerlHashEntry *e = h->buckets[b];
+        int skip = (b == iters[idx].bucket) ? iters[idx].chain : 0;
+        int pos = 0;
+        while (e) {
+            if (pos >= skip) {
+                PerlValue *kv = perl_alloc_string(e->key);
+                PerlValue *vv = perl_clone(e->val);
+                perl_array_push(out, kv);
+                perl_array_push(out, vv);
+                if (e->next) {
+                    iters[idx].bucket = b;
+                    iters[idx].chain = pos + 1;
+                } else {
+                    iters[idx].bucket = b + 1;
+                    iters[idx].chain = 0;
+                }
+                return out;
+            }
+            pos++;
+            e = e->next;
+        }
+        if (b == iters[idx].bucket) iters[idx].chain = 0;
+    }
+    iters[idx].bucket = 0;
+    iters[idx].chain = 0;
+    return out;
+}
+
+PerlValue *perl_pos_str(PerlValue *pv) {
+    if (!pv) return perl_alloc_undef();
+    if (pv->matchpos <= 0) return perl_alloc_undef();
+    return perl_alloc_int(pv->matchpos);
+}
+
+PerlValue *perl_getpid(void) {
+    return perl_alloc_int((long long)getpid());
+}
+
+PerlValue *perl_get_os_name(void) {
+    return perl_alloc_string("linux");
+}

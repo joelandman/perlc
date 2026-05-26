@@ -374,6 +374,14 @@ RT("perl_clear_named_captures", voidTy);
     /* UNIVERSAL */
     RT("perl_isa_check",        pv, pv, pv);
     RT("perl_can_check",        pv, pv, pv);
+    /* Tier 3 */
+    RT("perl_read_fh",          pv, pv, pv, pv, pv);
+    RT("perl_fileno_fh",        pv, pv);
+    RT("perl_truncate_fh",      pv, pv, pv);
+    RT("perl_each_hash",        av, av);
+    RT("perl_pos_str",          pv, pv);
+    RT("perl_getpid",           pv);
+    RT("perl_get_os_name",      pv);
 #undef RT
 
     /* Mark pure read-only functions so GVN/LICM can eliminate redundant calls */
@@ -531,6 +539,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::GlobFunc) {
         Value *pat = n.left ? emitExpr(*n.left) : perlUndef();
         return callRT("perl_glob_val", {pat});
+    }
+    /* each %hash in list context → (key, val) pair */
+    if (n.kind == NK::EachFunc) {
+        Value *hv = lookupHash(n.name);
+        if (!hv) return callRT("perl_array_new", {});
+        return callRT("perl_each_hash", {hv});
     }
     /* localtime / gmtime in list context → 9-element array */
     if (n.kind == NK::LocaltimeFunc) {
@@ -3152,6 +3166,63 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *res = callRT("perl_clone", {v});
         callRT("perl_array_free", {av});
         return res;
+    }
+
+    case NK::ReadFunc: {
+        Value *fh  = emitExpr(*n.args[0]);
+        Value *buf = emitExpr(*n.args[1]);
+        Value *nb  = emitExpr(*n.args[2]);
+        Value *off = n.args.size() > 3 ? emitExpr(*n.args[3]) : perlUndef();
+        return callRT("perl_read_fh", {fh, buf, nb, off});
+    }
+
+    case NK::FilenofFunc: {
+        Value *fh = n.left ? emitExpr(*n.left) : perlUndef();
+        return callRT("perl_fileno_fh", {fh});
+    }
+
+    case NK::TruncateFunc: {
+        Value *fh  = n.left  ? emitExpr(*n.left)  : perlUndef();
+        Value *len = n.right ? emitExpr(*n.right) : perlUndef();
+        return callRT("perl_truncate_fh", {fh, len});
+    }
+
+    case NK::EachFunc: {
+        /* scalar context: return undef when exhausted, else just call it */
+        Value *hv = lookupHash(n.name);
+        if (!hv) return perlUndef();
+        Value *av = callRT("perl_each_hash", {hv});
+        Value *len = callRT("perl_array_len", {av});
+        callRT("perl_array_free", {av});
+        return len;
+    }
+
+    case NK::PosFunc: {
+        Value *str;
+        if (n.left) {
+            str = emitExpr(*n.left);
+        } else if (auto *slot = lookupVar("_")) {
+            str = builder_.CreateLoad(perlPtrTy_, slot, "pos_default");
+        } else {
+            str = perlUndef();
+        }
+        return callRT("perl_pos_str", {str});
+    }
+
+    case NK::GetpidFunc: {
+        if (n.sval == "osname") return callRT("perl_get_os_name", {});
+        return callRT("perl_getpid", {});
+    }
+
+    case NK::RequireStmt: {
+        /* treat as no-op at runtime — modules loaded at compile time */
+        return perlInt(1);
+    }
+
+    case NK::Redo: {
+        /* redo restarts the current loop iteration — jump to loop body start */
+        /* For now, implement as a no-op (complex to implement without restructuring) */
+        return perlInt(0);
     }
 
     case NK::DieStmt: {

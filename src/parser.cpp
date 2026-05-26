@@ -227,6 +227,20 @@ NodePtr Parser::parseStmt() {
         auto n = std::make_unique<Node>(); n->kind = NK::Next; n->line = line;
         return parseModifier(std::move(n), line);
     }
+    if (check(TK::KW_REDO)) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line;
+        return parseModifier(std::move(n), line);
+    }
+    if (check(TK::KW_REQUIRE)) {
+        advance();
+        std::string modname;
+        /* require Module::Name  or  require "file.pm" */
+        if (check(TK::IDENT)) { modname = cur().text; advance(); }
+        else if (check(TK::STRING)) { modname = cur().text; advance(); }
+        auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt; n->sval = modname; n->line = line;
+        return parseModifier(std::move(n), line);
+    }
     if (check(TK::LBRACE))    return parseBlock();
     if (check(TK::KW_DIE) || check(TK::KW_WARN)) {
         bool isDie = check(TK::KW_DIE); advance();
@@ -1181,6 +1195,16 @@ NodePtr Parser::parsePrimary() {
 
     /* scalar variable: $name  or  $$ref (scalar deref) */
     if (check(TK::SCALAR)) {
+        /* $^O and similar control variables — text encodes "^X" */
+        if (cur().text.size() == 2 && cur().text[0] == '^') {
+            char ctrl = cur().text[1];
+            advance();
+            if (ctrl == 'O') {
+                auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc;
+                n->sval = "osname"; n->line = line; return n;
+            }
+            return makeScalar(std::string("^") + ctrl, line);
+        }
         advance(); /* skip $ */
         /* $@ — eval error variable */
         if (check(TK::ARRAY) && cur().text == "@") {
@@ -1229,9 +1253,17 @@ NodePtr Parser::parsePrimary() {
             node->ival = n; node->line = line;
             return node;
         }
-        /* $$ref — deref */
+        /* $$ — process ID or $$ref deref */
         if (check(TK::SCALAR)) {
-            advance();
+            advance(); /* skip second $ */
+            /* check if next token is identifier-like (any token whose text is alphanumeric) */
+            const std::string &nxt = cur().text;
+            bool isIdent = !nxt.empty() && (isalpha((unsigned char)nxt[0]) || nxt[0] == '_');
+            if (!isIdent) {
+                /* standalone $$ = process ID */
+                auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc; n->line = line;
+                return n;
+            }
             std::string nm = cur().text; advance();
             auto n = std::make_unique<Node>(); n->kind = NK::DerefScalar;
             n->left = makeScalar(nm, line); n->line = line;
@@ -1657,6 +1689,29 @@ NodePtr Parser::parsePrimary() {
         n->name = "$" + vname;
         if (check(TK::ASSIGN)) { advance(); n->right = parseAssign(); }
         return n;
+    }
+    /* 'my ($a, $b, ...) = expr' in expression context (e.g. while (my ($k,$v) = each %h)) */
+    if (check(TK::KW_MY) && peek(1).kind == TK::LPAREN) {
+        advance();  /* my */
+        advance();  /* ( */
+        NodeList vars;
+        while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+            if (check(TK::SCALAR)) {
+                advance(); /* $ */
+                std::string vn = cur().text; advance();
+                auto vnode = std::make_unique<Node>(); vnode->kind = NK::My;
+                vnode->name = "$" + vn; vnode->line = line;
+                vars.push_back(std::move(vnode));
+            }
+            if (!match(TK::COMMA)) break;
+        }
+        consume(TK::RPAREN, ")");
+        /* build a list assignment node */
+        auto lhs = std::make_unique<Node>(); lhs->kind = NK::ArrayLit; lhs->args = std::move(vars); lhs->line = line;
+        auto asgn = std::make_unique<Node>(); asgn->kind = NK::Assign; asgn->line = line;
+        asgn->left = std::move(lhs);
+        if (check(TK::ASSIGN)) { advance(); asgn->right = parseAssign(); }
+        return asgn;
     }
 
     /* sprintf($fmt, args...) */
@@ -2108,6 +2163,69 @@ NodePtr Parser::parsePrimary() {
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::GlobFunc; n->line = line;
         n->left = std::move(pat); return n;
+    }
+
+    /* read($fh, $buf, $n [, $offset]) */
+    if (check(TK::KW_READ)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto fh = parseExpr(); match(TK::COMMA);
+        auto buf = parseExpr(); match(TK::COMMA);
+        auto nb  = parseExpr();
+        NodePtr off;
+        if (match(TK::COMMA)) off = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::ReadFunc; n->line = line;
+        n->args.push_back(std::move(fh));
+        n->args.push_back(std::move(buf));
+        n->args.push_back(std::move(nb));
+        if (off) n->args.push_back(std::move(off));
+        return n;
+    }
+
+    /* fileno($fh) */
+    if (check(TK::KW_FILENO)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto fh = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::FilenofFunc; n->line = line;
+        n->left = std::move(fh); return n;
+    }
+
+    /* truncate($fh_or_path, $len) */
+    if (check(TK::KW_TRUNCATE)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto fh = parseExpr(); match(TK::COMMA);
+        auto len = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::TruncateFunc; n->line = line;
+        n->left = std::move(fh); n->right = std::move(len); return n;
+    }
+
+    /* each %hash */
+    if (check(TK::KW_EACH)) {
+        advance(); bool hp = match(TK::LPAREN);
+        match(TK::HASH);
+        std::string nm = cur().text; advance();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::EachFunc; n->line = line;
+        n->name = nm; return n;
+    }
+
+    /* pos($str) or pos */
+    if (check(TK::KW_POS)) {
+        advance(); bool hp = match(TK::LPAREN);
+        NodePtr arg;
+        if (!hp || !check(TK::RPAREN)) arg = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::PosFunc; n->line = line;
+        if (arg) n->left = std::move(arg); return n;
+    }
+
+    /* redo */
+    if (check(TK::KW_REDO)) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line;
+        return n;
     }
 
     /* unshift as expression (returns new count) */

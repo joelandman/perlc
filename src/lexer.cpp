@@ -55,6 +55,9 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"seek",     TK::KW_SEEK},      {"tell",   TK::KW_TELL},
     {"binmode",  TK::KW_BINMODE},   {"stat",   TK::KW_STAT},
     {"lstat",    TK::KW_LSTAT},     {"glob",   TK::KW_GLOB},
+    {"read",     TK::KW_READ},      {"fileno", TK::KW_FILENO},
+    {"truncate", TK::KW_TRUNCATE},
+    {"pos",      TK::KW_POS},
     {"sum",      TK::KW_SUM},       {"min",    TK::KW_MIN},    {"max",    TK::KW_MAX},
     {"first",    TK::KW_FIRST},     {"any",    TK::KW_ANY},    {"all",    TK::KW_ALL},
     {"none",     TK::KW_NONE},      {"uniq",   TK::KW_UNIQ},   {"reduce", TK::KW_REDUCE},
@@ -357,6 +360,14 @@ std::vector<Token> Lexer::tokenize() {
       toks.back().text = "+";
       continue;
     }
+            /* $^X control variables: encode as "^X" in the SCALAR token text */
+            if (c == '$' && pos_ < src_.size() && src_[pos_] == '^'
+                    && pos_+1 < src_.size() && isupper((unsigned char)src_[pos_+1])) {
+                char ctrl = src_[pos_+1];
+                pos_ += 2;
+                toks.back().text = std::string("^") + ctrl;
+                continue;
+            }
             /* $/ — force SLASH (not regex) immediately after $ sigil */
             if (c == '$' && pos_ < src_.size() && src_[pos_] == '/') {
                 pos_++;

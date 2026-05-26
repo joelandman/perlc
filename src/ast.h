@@ -116,6 +116,15 @@ enum class NK {
     StatFunc,    /* stat(PATH)       – left=expr; returns 13-element list  */
     LstatFunc,   /* lstat(PATH)      – like stat but via lstat()           */
     GlobFunc,    /* glob(PATTERN)    – left=pattern; returns filename list  */
+    /* Tier 3 file / misc builtins */
+    ReadFunc,    /* read($fh,$buf,$n[,$off]) – args=[fh,bufvar,n,off]       */
+    FilenofFunc, /* fileno($fh)      – left=fh                              */
+    TruncateFunc,/* truncate($fh,$len)– left=fh, right=len                  */
+    EachFunc,    /* each %hash       – name=hash_name; returns (k,v) pair   */
+    PosFunc,     /* pos($str)        – left=str (opt, else $_)              */
+    RequireStmt, /* require Module   – sval=module_name                     */
+    Redo,        /* redo             – no children                          */
+    GetpidFunc,  /* getpid()         – no children; returns $$              */
     /* time / randomness / sleep */
     RandFunc,     /* rand [MAX]        – left=max (opt)                               */
     SrandFunc,    /* srand [SEED]      – left=seed (opt)                              */

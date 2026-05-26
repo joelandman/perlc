@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 24/24 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, and Tier 2 builtins.
+**Current Status**: Core language features are ~99% implemented with 25/25 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 24 test programs
+make test         # runs all 25 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -68,6 +68,7 @@ make clean
 - **Scalar::Util** (built-in): `blessed`, `reftype`, `looks_like_number`
 - **Carp** (built-in): `croak`/`carp`/`confess`/`cluck`
 - **UNIVERSAL**: `->isa(class)`, `->can(method)`, `our @ISA = (...)` inheritance
+- **Tier 3 builtins**: `read($fh,$buf,$n)`, `fileno($fh)`, `truncate($fh,$len)`, `each %hash`, `pos($str)`, `getpid()` / `$$`, `$^O` (OS name)
 
 ### Object-Oriented Programming
 - `package`, `bless`, `->` method calls (class and instance)
@@ -84,7 +85,7 @@ make clean
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (24/24)
+## Passing Tests (25/25)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
@@ -96,6 +97,7 @@ All tests in `tests/` pass:
 - Performance benchmarks: `fibn.pl` (Fibonacci), `mbs.pl` (Mandelbrot set 512×512×80 iters)
 - Tier 1 builtins: `tier1.pl` (rand/srand, time/localtime/gmtime, sleep/alarm, sort { BLOCK }, List::Util)
 - Tier 2 builtins: `tier2.pl` ($/.$,/$\/$&, POSIX::floor/ceil/fmod/strftime, Scalar::Util::blessed/reftype/looks_like_number, seek/tell/binmode, stat/lstat, glob, isa/can, our @ISA)
+- Tier 3 builtins: `tier3.pl` ($$/$^O, fileno, read, truncate, each %hash, pos, getpid)
 
 ## Known Limitations
 
@@ -143,4 +145,4 @@ The following features are **not yet implemented** or only partially supported:
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 24-test suite.
+**Last Updated**: Current state reflects all features demonstrated in the 25-test suite.

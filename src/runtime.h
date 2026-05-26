@@ -328,6 +328,15 @@ PerlArray *perl_stat_path(PerlValue *v);
 PerlArray *perl_lstat_path(PerlValue *v);
 PerlArray *perl_glob_val(PerlValue *pattern);
 
+/* ── Tier 3 file / misc builtins ────────────────────────────────────────── */
+PerlValue *perl_read_fh(PerlValue *fh, PerlValue *buf_pv, PerlValue *nbytes, PerlValue *offset);
+PerlValue *perl_fileno_fh(PerlValue *fh);
+PerlValue *perl_truncate_fh(PerlValue *fh_or_path, PerlValue *len);
+PerlArray *perl_each_hash(PerlHash *h);        /* returns [key,val] or empty [] */
+PerlValue *perl_pos_str(PerlValue *pv);        /* pos($str) — last match pos */
+PerlValue *perl_getpid(void);                  /* getpid() */
+PerlValue *perl_get_os_name(void);             /* $^O — "linux" */
+
 /* ── UNIVERSAL isa / can ──────────────────────────────────────────────────── */
 PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv);
 PerlValue *perl_can_check(PerlValue *obj, PerlValue *method_pv);

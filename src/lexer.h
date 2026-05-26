@@ -35,6 +35,11 @@ enum class TK {
     KW_SLEEP, KW_ALARM,
     /* file / filesystem */
     KW_SEEK, KW_TELL, KW_BINMODE, KW_STAT, KW_LSTAT, KW_GLOB,
+    KW_READ, KW_FILENO, KW_TRUNCATE,
+    /* require */
+    KW_REQUIRE,
+    /* misc builtins */
+    KW_POS,
     /* List::Util */
     KW_SUM, KW_MIN, KW_MAX, KW_FIRST, KW_ANY, KW_ALL, KW_NONE, KW_UNIQ, KW_REDUCE,
     SPACESHIP,    /* <=> */
