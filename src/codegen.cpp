@@ -757,6 +757,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_ref_type", "perl_ref_array", "perl_ref_scalar",
         "perl_clone", "perl_sprintf", "perl_array_len",
         /* single-arg math/string builtins */
+        "perl_alloc_flat_array",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
         "perl_uc_str", "perl_lc_str", "perl_ucfirst_str", "perl_lcfirst_str",
         "perl_chr_val", "perl_ord_val",
@@ -1207,10 +1208,16 @@ bool CodeGen::canEmitF64(const Node &n) {
            The emitExprF64/float-var path is wrong when elements hold array refs. */
         return false;
     case NK::ArrowDeref:
-        /* Only 2D subscript $ref->[$i][$j] is safely float-emittable.
-           1D $ref->[$i] may yield an array/hash ref, not a scalar. */
-        return n.sval == "array" && n.left &&
-               n.left->kind == NK::ArrowDeref && n.left->sval == "array";
+        if (n.sval != "array" || !n.left) return false;
+        /* 2D subscript $ref->[$i][$j]: inner array always holds scalars */
+        if (n.left->kind == NK::ArrowDeref && n.left->sval == "array") return true;
+        /* 1D $ref->[$i] where $ref is a DerefAV-cached param: elements are scalars */
+        if (n.left->kind == NK::ScalarVar) {
+            std::string nm = n.left->name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (lookupDerefAV(nm)) return true;
+        }
+        return false;
     case NK::HashElem:
         return lookupHash(n.name) != nullptr;
     default:
@@ -1451,8 +1458,16 @@ Value *CodeGen::emitExprF64(const Node &n) {
                 setTBAA(fv17, tbaaPvFvalTag_);
                 return fv17;
             }
-            /* 1D: $arr->[$i] may return an array/hash ref, not a scalar float.
-               Return nullptr so callers fall through to the PerlValue* path. */
+            /* 1D with DerefAV cached param: load PerlArray* and coerce element to double */
+            if (n.left && n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (Value *pa = lookupDerefAV(nm)) {
+                    Value *av   = builder_.CreateLoad(arrayPtrTy_, pa, nm + ".av");
+                    Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
+                    return callRT("perl_to_float", {elem});
+                }
+            }
             return nullptr;
         } else {
             Value *base = emitExpr(*n.left);
@@ -1966,8 +1981,12 @@ void CodeGen::emitStmt(const Node &n) {
                 fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
             } else {
-                /* Unbox numeric scalars: skip PerlValue* alloca entirely */
-                if (n.right && !atFileScope) {
+                /* Unbox numeric scalars: skip PerlValue* alloca entirely.
+                   Guard: 1D ArrowDeref may return an array/hash ref, not a scalar. */
+                bool rhsMayBeRef = n.right &&
+                    n.right->kind == NK::ArrowDeref && n.right->sval == "array" &&
+                    n.right->left && n.right->left->kind != NK::ArrowDeref;
+                if (n.right && !atFileScope && !rhsMayBeRef) {
                     if (Value *ival = emitExprI64(*n.right)) {
                         auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
                         builder_.CreateStore(ival, ialloca);
@@ -3022,7 +3041,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                                    emitExpr(ScalarVar) finds the borrowed elem via scopes_. */
                             Value *pvSlot = lookupVar(nm);
                             if (pvSlot) builder_.CreateStore(elem2, pvSlot);
-                            Value *av = callRT("perl_deref_array_ro", {elem2});
+                            Value *av = callRT("perl_deref_array", {elem2});
                             auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
                             builder_.CreateStore(av, pa);
                             declareDerefAV(nm, pa);
@@ -3783,9 +3802,22 @@ Value *CodeGen::emitExpr(const Node &n) {
            Reads/writes outside foreach loops fall back to perl_deref_array which
            lazy-converts FLAT_ARRAY → REF_ARRAY in-place on first such access. */
         if (!n.args.empty()) {
+            /* Predicate: does the subtree contain a 1D ArrowDeref?
+               1D accesses ($ref->[$i] where base isn't another ArrowDeref) may return
+               complex array refs. FLAT_ARRAY is only safe for pure scalar float trees. */
+            std::function<bool(const Node &)> has1DArrow = [&](const Node &x) -> bool {
+                if (x.kind == NK::ArrowDeref && x.sval == "array" &&
+                    x.left && x.left->kind != NK::ArrowDeref) return true;
+                if (x.left  && has1DArrow(*x.left))  return true;
+                if (x.right && has1DArrow(*x.right)) return true;
+                for (auto &a : x.args) if (has1DArrow(*a)) return true;
+                return false;
+            };
             bool allFloat = true;
-            for (auto &e : n.args) if (!canEmitF64(*e)) { allFloat = false; break; }
-            if (allFloat) {
+            for (auto &e : n.args) {
+                if (!canEmitF64(*e) || has1DArrow(*e)) { allFloat = false; break; }
+            }
+            if (allFloat && n.args.size() >= 4) {
                 auto *i8Ty  = Type::getInt8Ty(ctx_);
                 auto *i64Ty = Type::getInt64Ty(ctx_);
                 auto *f64Ty = Type::getDoubleTy(ctx_);
@@ -3803,8 +3835,11 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
         }
         Value *av = callRT("perl_anon_array_new", {});
-        for (auto &elem : n.args)
-            callRT("perl_array_push", {av, emitExpr(*elem)});
+        for (auto &elem : n.args) {
+            Value *pv = emitExpr(*elem);
+            callRT("perl_array_push", {av, pv});
+            freeIfOwned(pv);
+        }
         return callRT("perl_ref_array", {av});
     }
 
@@ -3833,6 +3868,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ArrowDeref: {
+        if (n.sval == "array" && n.left && n.left->kind == NK::ScalarVar) {
+            std::string nm = n.left->name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (Value *pa = lookupDerefAV(nm)) {
+                Value *av = builder_.CreateLoad(arrayPtrTy_, pa, nm + ".av");
+                return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
+            }
+        }
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
             Value *av = callRT("perl_deref_array", {base});

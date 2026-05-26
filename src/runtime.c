@@ -364,8 +364,19 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
-    if (src->tag == PERL_STRING) dst->sval = strdup(src->sval);
-    dst->matchpos = 0;
+    if (src->tag == PERL_STRING) {
+        dst->sval = strdup(src->sval);
+        dst->matchpos = 0;
+    } else if (src->tag == PERL_FLAT_ARRAY && src->pval) {
+        /* Deep-copy the double[] so src and dst each own their own buffer.
+           matchpos is the element count for FLAT_ARRAY — must NOT be zeroed. */
+        long long n = src->matchpos;
+        double *copy = (double *)malloc((size_t)n * sizeof(double));
+        memcpy(copy, (double *)src->pval, (size_t)n * sizeof(double));
+        dst->pval = copy;
+    } else {
+        dst->matchpos = 0;
+    }
     dst->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     /* Note: the refcount increment above already accounts for dst's ownership of pval */
 }
