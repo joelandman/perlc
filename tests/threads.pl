@@ -59,4 +59,44 @@ my $thr9 = threads->create(sub { $local_only = 99; });
 $thr9->join();
 print "isolated_ok=" . ($local_only == 0 ? "yes" : "no") . "\n";  # yes
 
+# Test 10: lock() enables atomic read-modify-write on a shared scalar
+my $counter : shared = 0;
+my @inc_workers;
+for my $i (1..10) {
+    push @inc_workers, threads->create(sub {
+        lock($counter);
+        $counter = $counter + 1;
+    });
+}
+for my $w (@inc_workers) { $w->join(); }
+print "lock_ok=" . ($counter == 10 ? "yes" : "no") . "\n";  # yes
+
+# Test 11: shared array with lock
+my @shared_arr : shared;
+my @arr_workers;
+for my $i (1..5) {
+    push @arr_workers, threads->create(sub {
+        lock(@shared_arr);
+        push @shared_arr, $_[0];
+    }, $i);
+}
+for my $w (@arr_workers) { $w->join(); }
+my @sorted_arr = sort { $a <=> $b } @shared_arr;
+print "shared_arr_ok=" . (scalar(@sorted_arr) == 5 ? "yes" : "no") . "\n";  # yes
+
+# Test 12: cond_wait / cond_signal producer-consumer
+my $ready : shared = 0;
+my $thr12 = threads->create(sub {
+    lock($ready);
+    while (!$ready) { cond_wait($ready); }
+    return "signaled";
+});
+{
+    lock($ready);
+    $ready = 1;
+    cond_signal($ready);
+}
+my $r12 = $thr12->join();
+print "cond_ok=" . ($r12 eq "signaled" ? "yes" : "no") . "\n";  # yes
+
 print "threads_done\n";

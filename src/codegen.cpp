@@ -376,6 +376,14 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_can_check",        pv, pv, pv);
     /* threads::shared */
     RT("perl_make_shared_scalar", pv);
+    RT("perl_lock_shared",        voidTy, pv);
+    RT("perl_lock_array",         voidTy, av);
+    RT("perl_lock_hash",          voidTy, av);
+    RT("perl_array_make_shared",  voidTy, av);
+    RT("perl_hash_make_shared",   voidTy, av);
+    RT("perl_cond_wait",          voidTy, pv);
+    RT("perl_cond_signal",        voidTy, pv);
+    RT("perl_cond_broadcast",     voidTy, pv);
     /* threads */
     RT("perl_threads_create",   pv, pv, av);
     RT("perl_threads_join",     pv, pv);
@@ -2084,8 +2092,16 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
     }
     switch (n.kind) {
-    case NK::Block:
-        emitBlock(n); break;
+    case NK::Block: {
+        /* Save local depth so lock() / local() inside bare { } blocks
+           auto-restore when the block exits (Perl scope semantics). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *savedDepth = callRT("perl_local_save_depth", {});
+        emitBlock(n);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            callRT("perl_local_restore_to", {savedDepth});
+        break;
+    }
 
     case NK::FlatBlock:
         /* emit contents in the current scope, no new scope push */
@@ -2115,6 +2131,7 @@ void CodeGen::emitStmt(const Node &n) {
                 fileHashGlobals_[nm] = gv;
             }
             declareHash(nm, hv);
+            if (n.ival & 1) callRT("perl_hash_make_shared", {hv});
             if (n.right) {
                 Value *listArr = emitArrayPtr(*n.right);
                 if (!listArr) {
@@ -2141,6 +2158,7 @@ void CodeGen::emitStmt(const Node &n) {
                 fileArrayGlobals_[nm] = gv;
             }
             declareArray(nm, av);
+            if (n.ival & 1) callRT("perl_array_make_shared", {av});
             /* our @ISA = ('Parent', ...) — wire up ISA chain */
             if (nm == "ISA" && n.right && !n.sval.empty()) {
                 Value *child = builder_.CreateGlobalStringPtr(n.sval);
@@ -3249,6 +3267,28 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* For now, implement as a no-op (complex to implement without restructuring) */
         return perlInt(0);
     }
+
+    case NK::LockStmt: {
+        if (n.sval == "array") {
+            Value *av = lookupArray(n.name);
+            if (av) callRT("perl_lock_array", {av});
+        } else if (n.sval == "hash") {
+            Value *hv = lookupHash(n.name);
+            if (hv) callRT("perl_lock_hash", {hv});
+        } else {
+            /* scalar — n.name set if bare $var, n.left set for arbitrary expr */
+            Value *pv = n.left ? emitExpr(*n.left)
+                               : (lookupVar(n.name)
+                                      ? builder_.CreateLoad(perlPtrTy_, lookupVar(n.name))
+                                      : perlUndef());
+            callRT("perl_lock_shared", {pv});
+        }
+        return perlUndef();
+    }
+
+    case NK::CondWait:      { callRT("perl_cond_wait",      {emitExpr(*n.left)}); return perlUndef(); }
+    case NK::CondSignal:    { callRT("perl_cond_signal",    {emitExpr(*n.left)}); return perlUndef(); }
+    case NK::CondBcast:     { callRT("perl_cond_broadcast", {emitExpr(*n.left)}); return perlUndef(); }
 
     case NK::DieStmt: {
         Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");

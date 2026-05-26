@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 26/26 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, and basic threads.
+**Current Status**: Core language features are ~99% implemented with 26/26 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, and threads with threads::shared.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 25 test programs
+make test         # runs all 26 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -69,7 +69,8 @@ make clean
 - **Carp** (built-in): `croak`/`carp`/`confess`/`cluck`
 - **UNIVERSAL**: `->isa(class)`, `->can(method)`, `our @ISA = (...)` inheritance
 - **Tier 3 builtins**: `read($fh,$buf,$n)`, `fileno($fh)`, `truncate($fh,$len)`, `each %hash`, `pos($str)`, `getpid()` / `$$`, `$^O` (OS name)
-- **Threads (Phase 1)**: `use threads`; `threads->create(sub{...}, @args)`, `$thr->join()`, `$thr->detach()`, `$thr->tid()`, `threads->self()`, `threads->list()`, `threads->yield()`; thread-local freelist/eval-stack/captures via `__thread`; `PERL_THREAD` tag (11); closure capture works across threads
+- **Threads**: `use threads`; `threads->create(sub{...}, @args)`, `$thr->join()`, `$thr->detach()`, `$thr->tid()`, `threads->self()`, `threads->list()`, `threads->yield()`; thread-local freelist/eval-stack/captures via `__thread`; `PERL_THREAD` tag (11); closure capture deep-copied per thread for isolation (non-shared vars are independent copies)
+- **threads::shared**: `use threads::shared`; `my $x : shared` / `my @arr : shared` / `my %hash : shared`; `lock($x)` / `lock(@arr)` / `lock(%hash)` with auto-unlock at block exit; `cond_wait($x)` / `cond_signal($x)` / `cond_broadcast($x)`; `PerlSharedVar` struct wraps PerlValue with embedded pthread_mutex+cond; shared vars bypass thread isolation (original pointer shared across threads)
 
 ### Object-Oriented Programming
 - `package`, `bless`, `->` method calls (class and instance)
@@ -99,7 +100,7 @@ All tests in `tests/` pass:
 - Tier 1 builtins: `tier1.pl` (rand/srand, time/localtime/gmtime, sleep/alarm, sort { BLOCK }, List::Util)
 - Tier 2 builtins: `tier2.pl` ($/.$,/$\/$&, POSIX::floor/ceil/fmod/strftime, Scalar::Util::blessed/reftype/looks_like_number, seek/tell/binmode, stat/lstat, glob, isa/can, our @ISA)
 - Tier 3 builtins: `tier3.pl` ($$/$^O, fileno, read, truncate, each %hash, pos, getpid)
-- Threads: `threads.pl` (create/join/tid/self/closure-capture, multiple concurrent threads)
+- Threads: `threads.pl` (create/join/tid/self, closure capture, thread isolation, threads::shared scalars/arrays, lock/cond_wait/cond_signal)
 
 ## Known Limitations
 
@@ -130,7 +131,7 @@ The following features are **not yet implemented** or only partially supported:
 - `-g` flag supported: adds debugging symbols + **Perl source line mapping** via LLVM debug metadata (visible in gdb/lldb)
 
 ### Not Yet Implemented
-- `threads::shared` (shared variables across threads — Phase 2)
+- `threads::shared` hash support untested (`my %hash : shared` / `lock(%hash)` should work but not yet exercised)
 - XS interface
 - DBI/SQLite integration
 - Overload, prototypes, globs, signals, pack/unpack, unicode handling

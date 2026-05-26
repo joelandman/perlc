@@ -37,12 +37,13 @@ typedef struct PerlValue {
     char     *blessed_class; /* NULL unless bless'd */
 } PerlValue;
 
-/* PerlSharedVar: a PerlValue with an embedded mutex for threads::shared.
+/* PerlSharedVar: a PerlValue with an embedded mutex+condvar for threads::shared.
    The PerlValue MUST be the first member so that (PerlValue*) == (PerlSharedVar*). */
 #include <pthread.h>
 typedef struct {
-    PerlValue      pv;
+    PerlValue       pv;
     pthread_mutex_t mu;
+    pthread_cond_t  cond;
 } PerlSharedVar;
 
 /* allocation */
@@ -54,6 +55,12 @@ PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] *
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);
 PerlValue *perl_make_shared_scalar(void); /* threads::shared — returns PerlSharedVar->pv */
+
+/* threads::shared — lock/cond */
+void perl_lock_shared(PerlValue *pv);          /* lock scalar shared var + push auto-unlock */
+void perl_cond_wait(PerlValue *pv);            /* cond_wait on shared var's condvar */
+void perl_cond_signal(PerlValue *pv);          /* cond_signal */
+void perl_cond_broadcast(PerlValue *pv);       /* cond_broadcast */
 
 /* coercions */
 long long  perl_to_int(const PerlValue *v);
@@ -108,16 +115,19 @@ PerlValue *perl_dec(PerlValue *v);
 
 /* array support */
 typedef struct PerlArray {
-    PerlValue **elems;
-    long long   len;
-    long long   cap;
-    int         refcount; /* 0 = scope-managed (named @arr), >0 = anonymous refcounted ([]) */
+    PerlValue      **elems;
+    long long        len;
+    long long        cap;
+    int              refcount; /* 0 = scope-managed (named @arr), >0 = anonymous refcounted ([]) */
+    pthread_mutex_t *mu;       /* non-NULL when declared : shared */
 } PerlArray;
 
 PerlArray *perl_array_new(void);
 PerlArray *perl_anon_array_new(void); /* like perl_array_new but refcount=1 (anonymous) */
 long long perl_array_is_all_flat(PerlArray *av); /* 1 if all elems are FLAT_ARRAY */
 void       perl_array_free(PerlArray *a);
+void       perl_array_make_shared(PerlArray *a); /* threads::shared: init mu */
+void       perl_lock_array(PerlArray *a);        /* lock + push auto-unlock */
 void       perl_array_push(PerlArray *a, PerlValue *v);
 void       perl_array_push_capture(PerlArray *a, PerlValue *v);
 PerlValue *perl_array_pop(PerlArray *a);
@@ -151,14 +161,17 @@ typedef struct PerlHashEntry {
 } PerlHashEntry;
 
 typedef struct PerlHash {
-    PerlHashEntry  *buckets[PERL_HASH_BUCKETS];
-    long long       size;
-    int             refcount; /* 0 = scope-managed (named %hash), >0 = anonymous refcounted ({}) */
+    PerlHashEntry   *buckets[PERL_HASH_BUCKETS];
+    long long        size;
+    int              refcount; /* 0 = scope-managed (named %hash), >0 = anonymous refcounted ({}) */
+    pthread_mutex_t *mu;       /* non-NULL when declared : shared */
 } PerlHash;
 
 PerlHash *perl_hash_new(void);
 PerlHash *perl_anon_hash_new(void); /* like perl_hash_new but refcount=1 (anonymous) */
 void       perl_hash_free(PerlHash *h);
+void       perl_hash_make_shared(PerlHash *h); /* threads::shared: init mu */
+void       perl_lock_hash(PerlHash *h);        /* lock + push auto-unlock */
 
 /* key is a PerlValue* — stringified internally */
 PerlValue *perl_hash_get_sv(PerlHash *h, PerlValue *key);

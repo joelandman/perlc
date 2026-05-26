@@ -125,6 +125,10 @@ enum class NK {
     RequireStmt, /* require Module   – sval=module_name                     */
     Redo,        /* redo             – no children                          */
     GetpidFunc,  /* getpid()         – no children; returns $$              */
+    LockStmt,    /* lock(EXPR)       – sval="scalar"/"array"/"hash", name=var */
+    CondWait,    /* cond_wait($v)    – left=shared var expr                 */
+    CondSignal,  /* cond_signal($v)  – left=shared var expr                 */
+    CondBcast,   /* cond_broadcast($v) – left=shared var expr               */
     /* time / randomness / sleep */
     RandFunc,     /* rand [MAX]        – left=max (opt)                               */
     SrandFunc,    /* srand [SEED]      – left=seed (opt)                              */

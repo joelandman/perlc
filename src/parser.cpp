@@ -232,6 +232,29 @@ NodePtr Parser::parseStmt() {
         auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line;
         return parseModifier(std::move(n), line);
     }
+    /* lock(EXPR) — threads::shared scope lock */
+    if (check(TK::KW_LOCK)) {
+        advance();
+        match(TK::LPAREN);
+        auto n = std::make_unique<Node>(); n->kind = NK::LockStmt; n->line = line;
+        if (check(TK::SCALAR))      { advance(); n->sval = "scalar"; n->name = cur().text; advance(); }
+        else if (check(TK::ARRAY))  { advance(); n->sval = "array";  n->name = cur().text; advance(); }
+        else if (check(TK::HASH))   { advance(); n->sval = "hash";   n->name = cur().text; advance(); }
+        else { n->sval = "scalar"; n->left = parseExpr(); }
+        match(TK::RPAREN);
+        match(TK::SEMI);
+        return n;
+    }
+    /* cond_wait / cond_signal / cond_broadcast */
+    if (check(TK::KW_COND_WAIT) || check(TK::KW_COND_SIGNAL) || check(TK::KW_COND_BROADCAST)) {
+        NK kind = check(TK::KW_COND_WAIT) ? NK::CondWait
+                : check(TK::KW_COND_SIGNAL) ? NK::CondSignal : NK::CondBcast;
+        advance(); match(TK::LPAREN);
+        auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+        n->left = parseExpr();
+        match(TK::RPAREN); match(TK::SEMI);
+        return n;
+    }
     if (check(TK::KW_REQUIRE)) {
         advance();
         std::string modname;
@@ -514,6 +537,10 @@ NodePtr Parser::parseMy() {
         auto decl = std::make_unique<Node>(); decl->kind = NK::My;
         decl->name = "@" + nm; decl->line = line;
         if (nm == "ISA") decl->sval = currentPackage_; /* tag for codegen */
+        if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
+                toks_[pos_ + 1].text == "shared") {
+            advance(); advance(); decl->ival = 1; /* shared flag */
+        }
         if (match(TK::ASSIGN)) {
             decl->right = parseExpr();
         }
@@ -527,6 +554,10 @@ NodePtr Parser::parseMy() {
         std::string nm = cur().text; advance();
         auto decl = std::make_unique<Node>(); decl->kind = NK::My;
         decl->name = "%" + nm; decl->line = line;
+        if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
+                toks_[pos_ + 1].text == "shared") {
+            advance(); advance(); decl->ival = 1; /* shared flag */
+        }
         if (match(TK::ASSIGN)) {
             decl->right = parseExpr();
         }

@@ -39,7 +39,7 @@ enum class TK {
     /* require */
     KW_REQUIRE,
     /* misc builtins */
-    KW_POS,
+    KW_POS, KW_LOCK, KW_COND_WAIT, KW_COND_SIGNAL, KW_COND_BROADCAST,
     /* List::Util */
     KW_SUM, KW_MIN, KW_MAX, KW_FIRST, KW_ANY, KW_ALL, KW_NONE, KW_UNIQ, KW_REDUCE,
     SPACESHIP,    /* <=> */

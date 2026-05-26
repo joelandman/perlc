@@ -45,7 +45,11 @@ static inline void pv_pool_push(PerlValue *v) {
 /* ── local() save/restore stack ─────────────────────────────────────────── */
 
 #define LOCAL_STACK_MAX 256
-typedef struct { PerlValue *ptr; PerlValue saved; } LocalEntry;
+#define LOCAL_SCALAR  0   /* save/restore a PerlValue (existing behaviour) */
+#define LOCAL_LOCK_PV 1   /* auto-unlock a PerlSharedVar on scope exit */
+#define LOCAL_LOCK_AV 2   /* auto-unlock a PerlArray->mu on scope exit */
+#define LOCAL_LOCK_HV 3   /* auto-unlock a PerlHash->mu on scope exit */
+typedef struct { int type; PerlValue *ptr; PerlValue saved; } LocalEntry;
 static __thread LocalEntry s_local_stack[LOCAL_STACK_MAX];
 static __thread int        s_local_depth = 0;
 
@@ -53,6 +57,7 @@ int perl_local_save_depth(void) { return s_local_depth; }
 
 void perl_local_save(PerlValue *pv) {
     if (s_local_depth >= LOCAL_STACK_MAX) return;
+    s_local_stack[s_local_depth].type  = LOCAL_SCALAR;
     s_local_stack[s_local_depth].ptr   = pv;
     s_local_stack[s_local_depth].saved = *pv;
     /* deep-copy string/blessed_class so the saved value is independent */
@@ -67,10 +72,18 @@ void perl_local_restore_to(int depth) {
     while (s_local_depth > depth) {
         s_local_depth--;
         LocalEntry *e = &s_local_stack[s_local_depth];
-        /* free any existing string/blessed_class in the target */
-        if ((e->ptr->tag == PERL_STRING) && e->ptr->sval) free(e->ptr->sval);
-        if (e->ptr->blessed_class) free(e->ptr->blessed_class);
-        *e->ptr = e->saved;  /* restore saved value */
+        if (e->type == LOCAL_LOCK_PV) {
+            pthread_mutex_unlock(&((PerlSharedVar *)e->ptr)->mu);
+        } else if (e->type == LOCAL_LOCK_AV) {
+            pthread_mutex_unlock(((PerlArray *)e->ptr)->mu);
+        } else if (e->type == LOCAL_LOCK_HV) {
+            pthread_mutex_unlock(((PerlHash *)e->ptr)->mu);
+        } else { /* LOCAL_SCALAR */
+            /* free any existing string/blessed_class in the target */
+            if ((e->ptr->tag == PERL_STRING) && e->ptr->sval) free(e->ptr->sval);
+            if (e->ptr->blessed_class) free(e->ptr->blessed_class);
+            *e->ptr = e->saved;  /* restore saved value */
+        }
     }
 }
 
@@ -379,7 +392,8 @@ int perl_is_true(const PerlValue *v) {
 HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!dst) return;
     int shared = dst->flags & PV_FLAG_SHARED;
-    if (shared) pthread_mutex_lock(&((PerlSharedVar *)dst)->mu);
+    /* No implicit mutex here — caller must hold lock() for concurrent safety.
+       Locking inside perl_assign would deadlock when lock() is already held. */
     /* Acquire new reference first (handles self-assignment safely) */
     if (src && src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
@@ -400,8 +414,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
     }
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
-    if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0;
-                if (shared) pthread_mutex_unlock(&((PerlSharedVar *)dst)->mu); return; }
+    if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
     dst->flags = (unsigned int)shared;  /* restore shared flag — *dst = *src clobbered it */
     if (src->tag == PERL_STRING) {
@@ -419,7 +432,6 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     }
     dst->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     /* Note: the refcount increment above already accounts for dst's ownership of pval */
-    if (shared) pthread_mutex_unlock(&((PerlSharedVar *)dst)->mu);
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -639,7 +651,7 @@ PerlValue *perl_dec(PerlValue *v) {
 
 PerlArray *perl_array_new(void) {
     PerlArray *a = malloc(sizeof *a);
-    a->len = 0; a->cap = 8; a->refcount = 0;
+    a->len = 0; a->cap = 8; a->refcount = 0; a->mu = NULL;
     a->elems = malloc(a->cap * sizeof(PerlValue *));
     return a;
 }
@@ -654,7 +666,24 @@ void perl_array_free(PerlArray *a) {
     if (!a) return;
     for (long long i = 0; i < a->len; i++) perl_free(a->elems[i]);
     free(a->elems);
+    if (a->mu) { pthread_mutex_destroy(a->mu); free(a->mu); }
     free(a);
+}
+
+void perl_array_make_shared(PerlArray *a) {
+    if (!a || a->mu) return;
+    a->mu = malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init(a->mu, NULL);
+}
+
+void perl_lock_array(PerlArray *a) {
+    if (!a || !a->mu) return;
+    pthread_mutex_lock(a->mu);
+    if (s_local_depth < LOCAL_STACK_MAX) {
+        s_local_stack[s_local_depth].type = LOCAL_LOCK_AV;
+        s_local_stack[s_local_depth].ptr  = (PerlValue *)a;
+        s_local_depth++;
+    }
 }
 
 void perl_array_push(PerlArray *a, PerlValue *v) {
@@ -994,7 +1023,24 @@ void perl_hash_free(PerlHash *h) {
             e = next;
         }
     }
+    if (h->mu) { pthread_mutex_destroy(h->mu); free(h->mu); }
     free(h);
+}
+
+void perl_hash_make_shared(PerlHash *h) {
+    if (!h || h->mu) return;
+    h->mu = malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init(h->mu, NULL);
+}
+
+void perl_lock_hash(PerlHash *h) {
+    if (!h || !h->mu) return;
+    pthread_mutex_lock(h->mu);
+    if (s_local_depth < LOCAL_STACK_MAX) {
+        s_local_stack[s_local_depth].type = LOCAL_LOCK_HV;
+        s_local_stack[s_local_depth].ptr  = (PerlValue *)h;
+        s_local_depth++;
+    }
 }
 
 static PerlHashEntry *hash_find(PerlHash *h, const char *key) {
@@ -1254,8 +1300,36 @@ PerlValue *perl_make_shared_scalar(void) {
     PerlSharedVar *sv = calloc(1, sizeof(PerlSharedVar));
     sv->pv.tag   = PERL_UNDEF;
     sv->pv.flags = PV_FLAG_SHARED;
-    pthread_mutex_init(&sv->mu, NULL);
+    pthread_mutex_init(&sv->mu,   NULL);
+    pthread_cond_init( &sv->cond, NULL);
     return &sv->pv;
+}
+
+void perl_lock_shared(PerlValue *pv) {
+    if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
+    PerlSharedVar *sv = (PerlSharedVar *)pv;
+    pthread_mutex_lock(&sv->mu);
+    if (s_local_depth < LOCAL_STACK_MAX) {
+        s_local_stack[s_local_depth].type = LOCAL_LOCK_PV;
+        s_local_stack[s_local_depth].ptr  = pv;
+        s_local_depth++;
+    }
+}
+
+void perl_cond_wait(PerlValue *pv) {
+    if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
+    PerlSharedVar *sv = (PerlSharedVar *)pv;
+    pthread_cond_wait(&sv->cond, &sv->mu);
+}
+
+void perl_cond_signal(PerlValue *pv) {
+    if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
+    pthread_cond_signal(&((PerlSharedVar *)pv)->cond);
+}
+
+void perl_cond_broadcast(PerlValue *pv) {
+    if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
+    pthread_cond_broadcast(&((PerlSharedVar *)pv)->cond);
 }
 
 /* ── threads ─────────────────────────────────────────────────────────────── */
