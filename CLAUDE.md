@@ -4,7 +4,7 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 25/25 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins.
+**Current Status**: Core language features are ~99% implemented with 26/26 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, and basic threads.
 
 ## Build & Test
 
@@ -69,6 +69,7 @@ make clean
 - **Carp** (built-in): `croak`/`carp`/`confess`/`cluck`
 - **UNIVERSAL**: `->isa(class)`, `->can(method)`, `our @ISA = (...)` inheritance
 - **Tier 3 builtins**: `read($fh,$buf,$n)`, `fileno($fh)`, `truncate($fh,$len)`, `each %hash`, `pos($str)`, `getpid()` / `$$`, `$^O` (OS name)
+- **Threads (Phase 1)**: `use threads`; `threads->create(sub{...}, @args)`, `$thr->join()`, `$thr->detach()`, `$thr->tid()`, `threads->self()`, `threads->list()`, `threads->yield()`; thread-local freelist/eval-stack/captures via `__thread`; `PERL_THREAD` tag (11); closure capture works across threads
 
 ### Object-Oriented Programming
 - `package`, `bless`, `->` method calls (class and instance)
@@ -85,7 +86,7 @@ make clean
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (25/25)
+## Passing Tests (26/26)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
@@ -98,6 +99,7 @@ All tests in `tests/` pass:
 - Tier 1 builtins: `tier1.pl` (rand/srand, time/localtime/gmtime, sleep/alarm, sort { BLOCK }, List::Util)
 - Tier 2 builtins: `tier2.pl` ($/.$,/$\/$&, POSIX::floor/ceil/fmod/strftime, Scalar::Util::blessed/reftype/looks_like_number, seek/tell/binmode, stat/lstat, glob, isa/can, our @ISA)
 - Tier 3 builtins: `tier3.pl` ($$/$^O, fileno, read, truncate, each %hash, pos, getpid)
+- Threads: `threads.pl` (create/join/tid/self/closure-capture, multiple concurrent threads)
 
 ## Known Limitations
 
@@ -128,7 +130,7 @@ The following features are **not yet implemented** or only partially supported:
 - `-g` flag supported: adds debugging symbols + **Perl source line mapping** via LLVM debug metadata (visible in gdb/lldb)
 
 ### Not Yet Implemented
-- Threads (POSIX ithreads)
+- `threads::shared` (shared variables across threads — Phase 2)
 - XS interface
 - DBI/SQLite integration
 - Overload, prototypes, globs, signals, pack/unpack, unicode handling

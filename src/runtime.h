@@ -18,6 +18,7 @@ typedef enum {
     PERL_CODE_REF   = 8,
     PERL_DIRHANDLE  = 9,
     PERL_FLAT_ARRAY = 10, /* flat double[] — pval=double*, matchpos=len */
+    PERL_THREAD     = 11, /* thread object  — pval=PerlThread* */
 } PerlTag;
 
 typedef struct PerlValue {
@@ -275,8 +276,24 @@ PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a cl
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
 void       perl_register_method(const char *key, PerlSubFnCtx fn);
-PerlValue *perl_threads_create(PerlSubFnCtx fn, PerlArray *args);
-void perl_threads_join(PerlValue *thread);
+/* ── threads ─────────────────────────────────────────────────────────────── */
+#include <pthread.h>
+typedef struct PerlThread {
+    pthread_t   pth;
+    long long   tid;
+    PerlValue  *result;    /* return value (set by thread before exit) */
+    int         joined;
+    int         detached;
+} PerlThread;
+
+PerlValue *perl_threads_create(PerlValue *code_pv, PerlArray *args);
+PerlValue *perl_threads_join(PerlValue *thr_pv);    /* returns result PerlValue* */
+void       perl_threads_detach(PerlValue *thr_pv);
+PerlValue *perl_threads_tid(PerlValue *thr_pv);
+PerlValue *perl_threads_self(void);
+PerlArray *perl_threads_list(void);
+void       perl_threads_yield(void);
+
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args);
 PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                                       const char *method, PerlArray *args);

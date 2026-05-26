@@ -62,3 +62,4 @@ test: $(TARGET)
 	@echo "=== tier1.pl        ===" && ./$(TARGET) tests/tier1.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== tier2.pl        ===" && ./$(TARGET) tests/tier2.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== tier3.pl        ===" && ./$(TARGET) tests/tier3.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== threads.pl      ===" && ./$(TARGET) tests/threads.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test

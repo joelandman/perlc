@@ -24,19 +24,20 @@
  * pointer stored in pval union field), re-used on the next alloc. The pool
  * stabilises quickly at the peak concurrent-live count for the hot loop.
  */
-static PerlValue *pv_freelist_ = NULL;
+/* Per-thread freelist: no mutex needed since each thread has its own */
+static __thread PerlValue *pv_freelist_ = NULL;
 
 static inline PerlValue *pv_alloc(void) {
     if (__builtin_expect(pv_freelist_ != NULL, 1)) {
         PerlValue *v  = pv_freelist_;
-        pv_freelist_  = (PerlValue *)v->pval;   /* pop head */
+        pv_freelist_  = (PerlValue *)v->pval;
         return v;
     }
     return malloc(sizeof(PerlValue));
 }
 
 static inline void pv_pool_push(PerlValue *v) {
-    v->pval      = pv_freelist_;   /* push head */
+    v->pval      = pv_freelist_;
     pv_freelist_ = v;
 }
 
@@ -44,8 +45,8 @@ static inline void pv_pool_push(PerlValue *v) {
 
 #define LOCAL_STACK_MAX 256
 typedef struct { PerlValue *ptr; PerlValue saved; } LocalEntry;
-static LocalEntry s_local_stack[LOCAL_STACK_MAX];
-static int        s_local_depth = 0;
+static __thread LocalEntry s_local_stack[LOCAL_STACK_MAX];
+static __thread int        s_local_depth = 0;
 
 int perl_local_save_depth(void) { return s_local_depth; }
 
@@ -76,9 +77,9 @@ void perl_local_restore_to(int depth) {
 
 /* jmp_buf pointers are pushed by callers (codegen allocates jmp_buf on stack) */
 #define EVAL_STACK_MAX 64
-static jmp_buf *s_eval_stack[EVAL_STACK_MAX];
-static int      s_eval_depth = 0;
-static PerlValue s_dollar_at = { PERL_STRING, {0}, 0 }; /* $@ */
+static __thread jmp_buf *s_eval_stack[EVAL_STACK_MAX];
+static __thread int      s_eval_depth = 0;
+static __thread PerlValue s_dollar_at; /* $@ — zero-initialized = UNDEF per thread */
 
 /* $/ — input record separator (default "\n", undef = slurp mode) */
 static PerlValue s_input_sep = { PERL_STRING, {0}, 0 };
@@ -144,8 +145,8 @@ PerlValue *perl_get_dollar_bang(void) {
 }
 
 /* wantarray — returns 1 in list context, 0 in scalar; stub always 0 */
-static int s_wantarray_stack[64];
-static int s_wantarray_depth = 0;
+static __thread int s_wantarray_stack[64];
+static __thread int s_wantarray_depth = 0;
 
 int perl_push_wantarray(int ctx) {
   if (s_wantarray_depth < 64) s_wantarray_stack[s_wantarray_depth++] = ctx;
@@ -1198,8 +1199,8 @@ PerlValue *perl_ref_type(PerlValue *ref) {
 /* ── code references & closures ──────────────────────────────────────────── */
 
 /* active capture context — saved/restored on each code-ref call */
-static PerlValue **s_current_captures = NULL;
-static int        s_ncaptures         = 0;
+static __thread PerlValue **s_current_captures = NULL;
+static __thread int        s_ncaptures         = 0;
 
 static PerlValue *make_code_ref_impl(PerlSubFnCtx fp, PerlValue **caps, int ncaps) {
     PerlClosure *cl = malloc(sizeof *cl);
@@ -1225,36 +1226,118 @@ PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures) {
     return make_code_ref_impl(fp, caps, n);
 }
 
-pthread_mutex_t perl_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* ── threads ─────────────────────────────────────────────────────────────── */
+
+#define THREAD_REGISTRY_MAX 1024
+static PerlValue        *thread_registry[THREAD_REGISTRY_MAX];
+static int               thread_registry_count = 0;
+static long long         next_tid = 1;           /* main thread is tid 0 */
+static pthread_mutex_t   thread_registry_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Each thread's own PerlValue* (PERL_THREAD tag) stored in TLS */
+static __thread PerlValue *current_thread_pv = NULL;
+
+static PerlValue *make_thread_pv(PerlThread *thr) {
+    PerlValue *pv = malloc(sizeof(PerlValue));
+    pv->tag            = PERL_THREAD;
+    pv->pval           = thr;
+    pv->matchpos       = 0;
+    pv->blessed_class  = NULL;
+    return pv;
+}
+
+typedef struct { PerlValue *code_pv; PerlArray *args; PerlThread *thread; PerlValue *thr_pv; } ThreadArgs;
 
 static void *thread_wrapper(void *arg) {
-  PerlClosure *cl = (PerlClosure*)arg;
-  PerlValue *result = ((PerlSubFnCtx)cl->fn)(NULL, perl_push_wantarray(0));
-  perl_pop_wantarray();
-  return result;  // ignored
+    ThreadArgs *ta = arg;
+    current_thread_pv = ta->thr_pv;
+    /* call the closure/code-ref with the supplied args */
+    PerlValue *result = perl_call_code_ref(ta->code_pv, ta->args);
+    ta->thread->result = result ? perl_clone(result) : perl_alloc_undef();
+    perl_array_free(ta->args);
+    free(ta);
+    /* remove from live registry */
+    pthread_mutex_lock(&thread_registry_mu);
+    for (int i = 0; i < thread_registry_count; i++) {
+        PerlThread *t = (PerlThread *)thread_registry[i]->pval;
+        if (t == ta->thread) {
+            thread_registry[i] = thread_registry[--thread_registry_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thread_registry_mu);
+    return NULL;
 }
 
-PerlValue *perl_threads_create(PerlSubFnCtx fn, PerlArray *args) {
-  PerlClosure *cl = malloc(sizeof(PerlClosure));
-  cl->fn = fn;
-  cl->ncaptures = 0;
-  cl->captures = NULL;
-  pthread_t *thread = malloc(sizeof(pthread_t));
-  pthread_create(thread, NULL, thread_wrapper, cl);
-  PerlValue *tref = pv_alloc();
-  tref->tag = PERL_REF_SCALAR;
-  tref->pval = thread;
-  tref->matchpos = 0;
-  tref->blessed_class = NULL;
-  return tref;
+PerlValue *perl_threads_create(PerlValue *code_pv, PerlArray *args) {
+    if (!code_pv || code_pv->tag != PERL_CODE_REF) return perl_alloc_undef();
+
+    PerlThread *thr = calloc(1, sizeof(PerlThread));
+    pthread_mutex_lock(&thread_registry_mu);
+    thr->tid = next_tid++;
+    pthread_mutex_unlock(&thread_registry_mu);
+
+    PerlValue *thr_pv = make_thread_pv(thr);
+
+    /* register before spawn to avoid race in perl_threads_list */
+    pthread_mutex_lock(&thread_registry_mu);
+    if (thread_registry_count < THREAD_REGISTRY_MAX)
+        thread_registry[thread_registry_count++] = thr_pv;
+    pthread_mutex_unlock(&thread_registry_mu);
+
+    ThreadArgs *ta = malloc(sizeof(ThreadArgs));
+    ta->code_pv  = perl_clone(code_pv);
+    ta->args     = args ? args : perl_array_new();
+    ta->thread   = thr;
+    ta->thr_pv   = thr_pv;
+
+    pthread_create(&thr->pth, NULL, thread_wrapper, ta);
+    return thr_pv;
 }
 
-void perl_threads_join(PerlValue *thread) {
-  if (thread && thread->tag == PERL_REF_SCALAR && thread->pval) {
-    pthread_t *pth = (pthread_t*)thread->pval;
-    pthread_join(*pth, NULL);
-    free(pth);
-  }
+PerlValue *perl_threads_join(PerlValue *thr_pv) {
+    if (!thr_pv || thr_pv->tag != PERL_THREAD) return perl_alloc_undef();
+    PerlThread *thr = (PerlThread *)thr_pv->pval;
+    if (!thr || thr->joined || thr->detached) return perl_alloc_undef();
+    pthread_join(thr->pth, NULL);
+    thr->joined = 1;
+    return thr->result ? thr->result : perl_alloc_undef();
+}
+
+void perl_threads_detach(PerlValue *thr_pv) {
+    if (!thr_pv || thr_pv->tag != PERL_THREAD) return;
+    PerlThread *thr = (PerlThread *)thr_pv->pval;
+    if (!thr || thr->joined || thr->detached) return;
+    pthread_detach(thr->pth);
+    thr->detached = 1;
+}
+
+PerlValue *perl_threads_tid(PerlValue *thr_pv) {
+    if (!thr_pv || thr_pv->tag != PERL_THREAD) return perl_alloc_int(0);
+    PerlThread *thr = (PerlThread *)thr_pv->pval;
+    return perl_alloc_int(thr ? thr->tid : 0);
+}
+
+PerlValue *perl_threads_self(void) {
+    if (current_thread_pv) return current_thread_pv;
+    /* main thread: synthesize a tid=0 object on first call */
+    static PerlThread main_thread = {0};
+    static PerlValue *main_thread_pv = NULL;
+    if (!main_thread_pv) main_thread_pv = make_thread_pv(&main_thread);
+    return main_thread_pv;
+}
+
+PerlArray *perl_threads_list(void) {
+    PerlArray *out = perl_array_new();
+    pthread_mutex_lock(&thread_registry_mu);
+    for (int i = 0; i < thread_registry_count; i++)
+        perl_array_push(out, perl_clone(thread_registry[i]));
+    pthread_mutex_unlock(&thread_registry_mu);
+    return out;
+}
+
+void perl_threads_yield(void) {
+    sched_yield();
 }
 
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
@@ -1357,6 +1440,34 @@ static PerlArray *build_dispatch_args(PerlValue *obj, PerlArray *args) {
 }
 
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
+    /* thread instance methods */
+    if (obj && obj->tag == PERL_THREAD) {
+        if (strcmp(method, "join")    == 0) return perl_threads_join(obj);
+        if (strcmp(method, "detach")  == 0) { perl_threads_detach(obj); return perl_alloc_undef(); }
+        if (strcmp(method, "tid")     == 0) return perl_threads_tid(obj);
+        if (strcmp(method, "is_running") == 0) {
+            PerlThread *t = (PerlThread *)obj->pval;
+            return perl_alloc_int(t && !t->joined && !t->detached ? 1 : 0);
+        }
+        fprintf(stderr, "Unknown thread method: %s\n", method);
+        return perl_alloc_undef();
+    }
+    /* threads class methods */
+    if (obj && obj->tag == PERL_STRING && obj->sval && strcmp(obj->sval, "threads") == 0) {
+        if (strcmp(method, "self")  == 0) return perl_threads_self();
+        if (strcmp(method, "yield") == 0) { perl_threads_yield(); return perl_alloc_undef(); }
+        if (strcmp(method, "list")  == 0) return perl_alloc_undef(); /* array context only */
+        if (strcmp(method, "create") == 0) {
+            /* args[0] = code_ref, args[1..] = thread args */
+            if (!args || args->len < 1) return perl_alloc_undef();
+            PerlValue *code_pv = args->elems[0];
+            PerlArray *thread_args = perl_array_new();
+            for (long long i = 1; i < args->len; i++)
+                perl_array_push(thread_args, perl_clone(args->elems[i]));
+            return perl_threads_create(code_pv, thread_args);
+        }
+    }
+
     const char *class_name = NULL;
     if (obj && obj->tag == PERL_STRING && obj->sval)
         class_name = obj->sval;

@@ -954,8 +954,14 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                 base = std::move(n);
                 continue;
             }
-            /* ->method(args), ->SUPER::method(args) — method call */
-            if (check(TK::IDENT)) {
+            /* ->method(args), ->SUPER::method(args) — method call
+               Accept any identifier-like token (keywords can be method names) */
+            if ([&]{ const std::string &t = cur().text;
+                     if (t.empty()) return false;
+                     if (!isalpha((unsigned char)t[0]) && t[0]!='_') return false;
+                     return t.find_first_not_of("abcdefghijklmnopqrstuvwxyz"
+                                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                                "0123456789_:") == std::string::npos; }()) {
                 std::string method = cur().text; advance();
                 auto n = std::make_unique<Node>(); n->kind = NK::MethodCall;
                 n->sval = method; n->left = std::move(base); n->line = line;

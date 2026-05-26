@@ -310,7 +310,6 @@ void CodeGen::declareRuntime() {
     RT("perl_push_wantarray", i32, i32);
 RT("perl_pop_wantarray",  i32);
 RT("perl_wantarray",      pv);
-RT("perl_threads_create", pv, i8p, av);
 RT("perl_threads_join",   voidTy, pv);
     RT("perl_caller",           av);
 RT("perl_get_plus_hash",     av);
@@ -374,6 +373,14 @@ RT("perl_clear_named_captures", voidTy);
     /* UNIVERSAL */
     RT("perl_isa_check",        pv, pv, pv);
     RT("perl_can_check",        pv, pv, pv);
+    /* threads */
+    RT("perl_threads_create",   pv, pv, av);
+    RT("perl_threads_join",     pv, pv);
+    RT("perl_threads_detach",   voidTy, pv);
+    RT("perl_threads_tid",      pv, pv);
+    RT("perl_threads_self",     pv);
+    RT("perl_threads_list",     av);
+    RT("perl_threads_yield",    voidTy);
     /* Tier 3 */
     RT("perl_read_fh",          pv, pv, pv, pv, pv);
     RT("perl_fileno_fh",        pv, pv);
@@ -4762,17 +4769,21 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *methodStr  = builder_.CreateGlobalStringPtr(realMethod);
             return callRT("perl_dispatch_method_super", {obj, callerPkg, methodStr, argsArr});
         }
+        /* threads class methods — intercept before generic dispatch */
+        if (n.left && n.left->kind == NK::StringLit && n.left->sval == "threads") {
+            if (n.sval == "create") {
+                Value *code = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                Value *thArgs = callRT("perl_array_new", {});
+                for (size_t i = 1; i < n.args.size(); i++)
+                    callRT("perl_array_push", {thArgs, emitExpr(*n.args[i])});
+                return callRT("perl_threads_create", {code, thArgs});
+            }
+            if (n.sval == "self")  return callRT("perl_threads_self",  {});
+            if (n.sval == "list")  return callRT("perl_threads_list",  {});
+            if (n.sval == "yield") { callRT("perl_threads_yield", {}); return perlUndef(); }
+        }
+        /* thread instance methods — dispatch handles PERL_THREAD objects */
         Value *methodStr = builder_.CreateGlobalStringPtr(n.sval);
-    if (n.sval == "threads" && n.name == "create") {
-      // special: threads->create(sub{...})
-      Value *argsArr = callRT("perl_array_new", {});
-      for (auto &arg : n.args) {
-        Value *subArr = emitArrayPtr(*arg);
-        if (subArr) callRT("perl_array_extend", {argsArr, subArr});
-        else callRT("perl_array_push", {argsArr, emitExpr(*arg)});
-      }
-      return callRT("perl_threads_create", {methodStr, argsArr});
-    }
         return callRT("perl_dispatch_method", {obj, methodStr, argsArr});
     }
 
