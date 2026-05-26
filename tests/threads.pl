@@ -99,4 +99,41 @@ my $thr12 = threads->create(sub {
 my $r12 = $thr12->join();
 print "cond_ok=" . ($r12 eq "signaled" ? "yes" : "no") . "\n";  # yes
 
+# Test 13: shared hash — multiple threads write distinct keys, all visible after join
+my %shared_hash : shared;
+my @hash_workers;
+for my $i (1..5) {
+    push @hash_workers, threads->create(sub {
+        my $k = "k$_[0]";
+        lock(%shared_hash);
+        $shared_hash{$k} = $_[0] * 10;
+    }, $i);
+}
+for my $w (@hash_workers) { $w->join(); }
+my $hash_ok = 1;
+for my $i (1..5) {
+    $hash_ok = 0 unless exists $shared_hash{"k$i"} && $shared_hash{"k$i"} == $i * 10;
+}
+print "shared_hash_ok=" . ($hash_ok ? "yes" : "no") . "\n";  # yes
+
+# Test 14: cond_broadcast — multiple waiters all wake up
+my $bcast_ready : shared = 0;
+my $bcast_count : shared = 0;
+my @bcast_thrs;
+for my $i (1..3) {
+    push @bcast_thrs, threads->create(sub {
+        lock($bcast_ready);
+        while (!$bcast_ready) { cond_wait($bcast_ready); }
+        lock($bcast_count);
+        $bcast_count = $bcast_count + 1;
+    });
+}
+{
+    lock($bcast_ready);
+    $bcast_ready = 1;
+    cond_broadcast($bcast_ready);
+}
+for my $t (@bcast_thrs) { $t->join(); }
+print "cond_broadcast_ok=" . ($bcast_count == 3 ? "yes" : "no") . "\n";  # yes
+
 print "threads_done\n";

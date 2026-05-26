@@ -100,7 +100,7 @@ All tests in `tests/` pass:
 - Tier 1 builtins: `tier1.pl` (rand/srand, time/localtime/gmtime, sleep/alarm, sort { BLOCK }, List::Util)
 - Tier 2 builtins: `tier2.pl` ($/.$,/$\/$&, POSIX::floor/ceil/fmod/strftime, Scalar::Util::blessed/reftype/looks_like_number, seek/tell/binmode, stat/lstat, glob, isa/can, our @ISA)
 - Tier 3 builtins: `tier3.pl` ($$/$^O, fileno, read, truncate, each %hash, pos, getpid)
-- Threads: `threads.pl` (create/join/tid/self, closure capture, thread isolation, threads::shared scalars/arrays, lock/cond_wait/cond_signal)
+- Threads: `threads.pl` (create/join/tid/self, closure capture, thread isolation, threads::shared scalars/arrays/hashes, lock/cond_wait/cond_signal/cond_broadcast)
 
 ## Known Limitations
 
@@ -131,7 +131,7 @@ The following features are **not yet implemented** or only partially supported:
 - `-g` flag supported: adds debugging symbols + **Perl source line mapping** via LLVM debug metadata (visible in gdb/lldb)
 
 ### Not Yet Implemented
-- `threads::shared` hash support untested (`my %hash : shared` / `lock(%hash)` should work but not yet exercised)
+- `threads::shared` hash support tested and working (`my %hash : shared` / `lock(%hash)` / concurrent key writes from multiple threads)
 - XS interface
 - DBI/SQLite integration
 - Overload, prototypes, globs, signals, pack/unpack, unicode handling
