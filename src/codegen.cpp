@@ -161,7 +161,8 @@ void CodeGen::declareRuntime() {
     RT("perl_array_new",      av);
     RT("perl_anon_array_new", av);
     RT("perl_array_free",    voidTy, av);
-    RT("perl_array_push",    voidTy, av, pv);
+    RT("perl_array_push",         voidTy, av, pv);
+    RT("perl_array_push_capture", voidTy, av, pv);
     RT("perl_array_pop",     pv,  av);
     RT("perl_array_get",     pv,  av, i64);
     RT("perl_array_get_ref",      pv,     av, i64);
@@ -373,6 +374,8 @@ RT("perl_clear_named_captures", voidTy);
     /* UNIVERSAL */
     RT("perl_isa_check",        pv, pv, pv);
     RT("perl_can_check",        pv, pv, pv);
+    /* threads::shared */
+    RT("perl_make_shared_scalar", pv);
     /* threads */
     RT("perl_threads_create",   pv, pv, av);
     RT("perl_threads_join",     pv, pv);
@@ -2157,6 +2160,21 @@ void CodeGen::emitStmt(const Node &n) {
             /* n.name may carry a '$' prefix when parsed in expression context */
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            bool isShared = (n.ival & 1) != 0;
+            if (isShared) {
+                /* threads::shared variable: allocate PerlSharedVar, skip unboxing */
+                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+                Value *pv = callRT("perl_make_shared_scalar", {});
+                builder_.CreateStore(pv, alloca);
+                /* no trackPv — shared vars have program lifetime */
+                if (n.right) {
+                    Value *init = emitExpr(*n.right);
+                    callRT("perl_assign", {pv, init});
+                    freeIfOwned(init);
+                }
+                declareVar(nm, alloca);
+                break;
+            }
             if (atFileScope) {
                 /* use a global variable so subroutines can access this file-scope var */
                 auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
@@ -4704,7 +4722,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             return callRT("perl_make_code_ref", {fnPtr});
         Value *capsAv = callRT("perl_array_new", {});
         for (auto *pv : captureVals)
-            callRT("perl_array_push", {capsAv, pv});
+            callRT("perl_array_push_capture", {capsAv, pv});
         return callRT("perl_make_closure", {fnPtr, capsAv});
     }
 

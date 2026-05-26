@@ -46,4 +46,17 @@ my $r7 = $thr7->join();
 print "thread_saw=$r7\n";              # 99
 print "parent_saw=$isolated\n";        # 10
 
+# Test 8: threads::shared — thread's write to a shared var is visible in parent after join
+use threads::shared;
+my $shared_val : shared = 0;
+my $thr8 = threads->create(sub { $shared_val = 42; });
+$thr8->join();
+print "shared_ok=" . ($shared_val == 42 ? "yes" : "no") . "\n";  # yes
+
+# Test 9: non-shared var still isolated
+my $local_only = 0;
+my $thr9 = threads->create(sub { $local_only = 99; });
+$thr9->join();
+print "isolated_ok=" . ($local_only == 0 ? "yes" : "no") . "\n";  # yes
+
 print "threads_done\n";

@@ -489,12 +489,17 @@ NodePtr Parser::parseMy() {
         return fb;
     }
 
-    /* my $scalar [= expr] */
+    /* my $scalar [: shared] [= expr] */
     if (check(TK::SCALAR)) {
         advance(); /* skip $ */
         std::string nm = cur().text; advance();
         auto decl = std::make_unique<Node>(); decl->kind = NK::My;
         decl->name = nm; decl->line = line;
+        if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
+                toks_[pos_ + 1].text == "shared") {
+            advance(); advance(); /* skip : shared */
+            decl->ival = 1;       /* shared flag */
+        }
         if (match(TK::ASSIGN)) {
             decl->right = parseExpr();
         }

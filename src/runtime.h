@@ -21,8 +21,12 @@ typedef enum {
     PERL_THREAD     = 11, /* thread object  — pval=PerlThread* */
 } PerlTag;
 
+/* PV_FLAG_SHARED: variable is a threads::shared variable (PerlSharedVar). */
+#define PV_FLAG_SHARED 1u
+
 typedef struct PerlValue {
-    PerlTag tag;
+    PerlTag      tag;
+    unsigned int flags;       /* PV_FLAG_SHARED etc.; fits existing padding slot */
     union {
         long long ival;
         double    fval;
@@ -33,6 +37,14 @@ typedef struct PerlValue {
     char     *blessed_class; /* NULL unless bless'd */
 } PerlValue;
 
+/* PerlSharedVar: a PerlValue with an embedded mutex for threads::shared.
+   The PerlValue MUST be the first member so that (PerlValue*) == (PerlSharedVar*). */
+#include <pthread.h>
+typedef struct {
+    PerlValue      pv;
+    pthread_mutex_t mu;
+} PerlSharedVar;
+
 /* allocation */
 PerlValue *perl_alloc_undef(void);
 PerlValue *perl_alloc_int(long long v);
@@ -41,6 +53,7 @@ PerlValue *perl_alloc_string(const char *s);
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);
+PerlValue *perl_make_shared_scalar(void); /* threads::shared — returns PerlSharedVar->pv */
 
 /* coercions */
 long long  perl_to_int(const PerlValue *v);
@@ -106,6 +119,7 @@ PerlArray *perl_anon_array_new(void); /* like perl_array_new but refcount=1 (ano
 long long perl_array_is_all_flat(PerlArray *av); /* 1 if all elems are FLAT_ARRAY */
 void       perl_array_free(PerlArray *a);
 void       perl_array_push(PerlArray *a, PerlValue *v);
+void       perl_array_push_capture(PerlArray *a, PerlValue *v);
 PerlValue *perl_array_pop(PerlArray *a);
 PerlValue *perl_array_get(PerlArray *a, long long idx);
 PerlValue *perl_array_get_ref(PerlArray *a, long long idx); /* borrow: no clone, never free result */

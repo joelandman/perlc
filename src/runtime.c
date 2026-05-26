@@ -33,7 +33,8 @@ static inline PerlValue *pv_alloc(void) {
         pv_freelist_  = (PerlValue *)v->pval;
         return v;
     }
-    return malloc(sizeof(PerlValue));
+    /* calloc zeroes flags (and all other fields) on fresh allocation */
+    return calloc(1, sizeof(PerlValue));
 }
 
 static inline void pv_pool_push(PerlValue *v) {
@@ -82,7 +83,7 @@ static __thread int      s_eval_depth = 0;
 static __thread PerlValue s_dollar_at; /* $@ — zero-initialized = UNDEF per thread */
 
 /* $/ — input record separator (default "\n", undef = slurp mode) */
-static PerlValue s_input_sep = { PERL_STRING, {0}, 0 };
+static PerlValue s_input_sep = { .tag = PERL_STRING };
 static int       s_input_sep_inited = 0;
 
 static void ensure_input_sep(void) {
@@ -100,13 +101,13 @@ PerlValue *perl_get_input_sep(void) {
 }
 
 /* $. — current input line number */
-static PerlValue s_dollar_dot   = { PERL_INT,   {.ival=0}, 0 };
+static PerlValue s_dollar_dot   = { .tag = PERL_INT,   .ival = 0 };
 /* $, — output field separator (undef = no separator) */
-static PerlValue s_dollar_comma = { PERL_UNDEF, {0}, 0 };
+static PerlValue s_dollar_comma = { .tag = PERL_UNDEF };
 /* $\ — output record separator (undef = no separator) */
-static PerlValue s_dollar_bsl   = { PERL_UNDEF, {0}, 0 };
+static PerlValue s_dollar_bsl   = { .tag = PERL_UNDEF };
 /* $& — last successful regex match string */
-static PerlValue s_dollar_amp   = { PERL_UNDEF, {0}, 0 };
+static PerlValue s_dollar_amp   = { .tag = PERL_UNDEF };
 
 PerlValue *perl_get_dollar_dot(void)   { return &s_dollar_dot;   }
 PerlValue *perl_get_dollar_comma(void) { return &s_dollar_comma; }
@@ -131,7 +132,7 @@ void perl_print_ors_fh(PerlValue *fh) {
 }
 
 /* $! — errno as a string */
-static PerlValue s_dollar_bang = { PERL_UNDEF, {0}, 0 };
+static PerlValue s_dollar_bang = { .tag = PERL_UNDEF };
 PerlValue *perl_get_dollar_bang(void) {
     if (s_dollar_bang.tag == PERL_STRING && s_dollar_bang.sval) free(s_dollar_bang.sval);
     if (errno) {
@@ -257,6 +258,7 @@ PerlValue *perl_clone(const PerlValue *src) {
     }
     PerlValue *v = pv_alloc();
     *v = *src;
+    v->flags = 0;      /* clones are never shared — that's a property of the slot, not the value */
     v->matchpos = 0;
     v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     if (src->tag == PERL_REF_ARRAY && src->pval) {
@@ -271,6 +273,8 @@ PerlValue *perl_clone(const PerlValue *src) {
 
 HOTX void perl_free(PerlValue *v) {
     if (!v) return;
+    /* Shared vars are PerlSharedVar (larger than PerlValue) — never pool them. */
+    if (v->flags & PV_FLAG_SHARED) return;
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
     if (v->tag == PERL_REF_ARRAY && v->pval) {
@@ -374,6 +378,8 @@ int perl_is_true(const PerlValue *v) {
 
 HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!dst) return;
+    int shared = dst->flags & PV_FLAG_SHARED;
+    if (shared) pthread_mutex_lock(&((PerlSharedVar *)dst)->mu);
     /* Acquire new reference first (handles self-assignment safely) */
     if (src && src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
@@ -394,8 +400,10 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
     }
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
-    if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
+    if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0;
+                if (shared) pthread_mutex_unlock(&((PerlSharedVar *)dst)->mu); return; }
     *dst = *src;
+    dst->flags = (unsigned int)shared;  /* restore shared flag — *dst = *src clobbered it */
     if (src->tag == PERL_STRING) {
         dst->sval = strdup(src->sval);
         dst->matchpos = 0;
@@ -411,6 +419,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     }
     dst->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     /* Note: the refcount increment above already accounts for dst's ownership of pval */
+    if (shared) pthread_mutex_unlock(&((PerlSharedVar *)dst)->mu);
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -656,6 +665,19 @@ void perl_array_push(PerlArray *a, PerlValue *v) {
     a->elems[a->len++] = perl_clone(v);
 }
 
+/* Like perl_array_push but preserves the original pointer for shared vars
+   (no clone).  Used exclusively for closure capture arrays. */
+void perl_array_push_capture(PerlArray *a, PerlValue *v) {
+    if (a->len == a->cap) {
+        a->cap *= 2;
+        a->elems = realloc(a->elems, a->cap * sizeof(PerlValue *));
+    }
+    if (v && (v->flags & PV_FLAG_SHARED))
+        a->elems[a->len++] = v;        /* shared: store original pointer */
+    else
+        a->elems[a->len++] = perl_clone(v);
+}
+
 PerlValue *perl_array_pop(PerlArray *a) {
     if (a->len == 0) return perl_alloc_undef();
     return a->elems[--a->len];
@@ -669,7 +691,7 @@ PerlValue *perl_array_get(PerlArray *a, long long idx) {
 
 /* Shared read-only sentinel returned by _ref functions on missing key/index.
  * Callers must never free or mutate this pointer. */
-static PerlValue pv_undef_sentinel_ = { PERL_UNDEF, {0}, 0, NULL };
+static PerlValue pv_undef_sentinel_ = { .tag = PERL_UNDEF };
 
 /* Borrow-read: returns raw pointer into the array (no clone, no alloc).
  * Valid until the array is next modified. Never call perl_free on the result. */
@@ -1226,6 +1248,16 @@ PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures) {
     return make_code_ref_impl(fp, caps, n);
 }
 
+/* ── threads::shared ─────────────────────────────────────────────────────── */
+
+PerlValue *perl_make_shared_scalar(void) {
+    PerlSharedVar *sv = calloc(1, sizeof(PerlSharedVar));
+    sv->pv.tag   = PERL_UNDEF;
+    sv->pv.flags = PV_FLAG_SHARED;
+    pthread_mutex_init(&sv->mu, NULL);
+    return &sv->pv;
+}
+
 /* ── threads ─────────────────────────────────────────────────────────────── */
 
 /* Clone a CODE_REF for thread isolation: each captured variable gets a fresh
@@ -1243,8 +1275,15 @@ static PerlValue *clone_code_ref_for_thread(PerlValue *code_pv) {
         ? malloc(old_cl->ncaptures * sizeof(PerlValue *)) : NULL;
     for (int i = 0; i < old_cl->ncaptures; i++) {
         PerlValue *os = old_cl->captures[i];   /* parent's stable slot */
-        PerlValue *ns = malloc(sizeof(PerlValue));  /* thread's stable slot */
-        *ns = *os;                             /* copy all scalar fields */
+        /* threads::shared variables: pass the original slot so both threads
+           see the same PerlValue (writes are mutex-protected in perl_assign). */
+        if (os->flags & PV_FLAG_SHARED) {
+            new_cl->captures[i] = os;
+            continue;
+        }
+        PerlValue *ns = malloc(sizeof(PerlValue));  /* thread's isolated stable slot */
+        *ns = *os;
+        ns->flags = 0;
         ns->matchpos = 0;
         ns->blessed_class = os->blessed_class ? strdup(os->blessed_class) : NULL;
         if (os->tag == PERL_STRING && os->sval) {
@@ -1551,9 +1590,9 @@ PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
 
 /* ── file I/O ────────────────────────────────────────────────────────────── */
 
-static PerlValue s_stdin_pv  = { PERL_UNDEF, {0}, 0 };
-static PerlValue s_stdout_pv = { PERL_UNDEF, {0}, 0 };
-static PerlValue s_stderr_pv = { PERL_UNDEF, {0}, 0 };
+static PerlValue s_stdin_pv  = { .tag = PERL_UNDEF };
+static PerlValue s_stdout_pv = { .tag = PERL_UNDEF };
+static PerlValue s_stderr_pv = { .tag = PERL_UNDEF };
 
 PerlValue *perl_get_stdin(void) {
     if (s_stdin_pv.tag != PERL_FILEHANDLE) { s_stdin_pv.tag = PERL_FILEHANDLE; s_stdin_pv.pval = stdin; }
@@ -1670,14 +1709,12 @@ PerlArray *perl_readline_all(PerlValue *fh) {
 }
 
 PerlValue *perl_readline_stdin(void) {
-    PerlValue tmp = { PERL_FILEHANDLE, {.pval = NULL}, 0 };
-    tmp.pval = stdin;
+    PerlValue tmp = { .tag = PERL_FILEHANDLE, .pval = stdin };
     return perl_readline(&tmp);
 }
 
 PerlArray *perl_readline_all_stdin(void) {
-    PerlValue tmp = { PERL_FILEHANDLE, {.pval = NULL}, 0 };
-    tmp.pval = stdin;
+    PerlValue tmp = { .tag = PERL_FILEHANDLE, .pval = stdin };
     return perl_readline_all(&tmp);
 }
 
@@ -2648,7 +2685,7 @@ long long perl_tr(PerlValue *str, const char *search, const char *replace, const
 /* ── command-line arguments ─────────────────────────────────────────────── */
 
 static PerlArray *perl_argv_arr = NULL;
-static PerlValue  perl_dollar0_val = { PERL_STRING, {0}, 0 };
+static PerlValue  perl_dollar0_val = { .tag = PERL_STRING };
 
 PerlArray *perl_init_argv(int argc, char **argv) {
     perl_argv_arr = perl_array_new();
