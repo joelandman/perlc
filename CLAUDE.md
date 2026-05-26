@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~97% implemented with 21/21 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, and advanced builtins.
+**Current Status**: Core language features are ~97% implemented with 22/22 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, and advanced builtins.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 21 test programs
+make test         # runs all 22 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -31,12 +31,13 @@ make clean
 ## Architecture
 
 - **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; }; long long matchpos; char *blessed_class; }`
-- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7, CODE_REF=8`
-- **PerlArray**: `{ PerlValue **elems; long long len, cap; }`
+- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7, CODE_REF=8, FLAT_ARRAY=10`
+- **PerlArray**: `{ PerlValue **elems; long long len, cap; int refcount; }`
 - **PerlHash**: 64-bucket chained hash table
 - **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime (critical for references and closures)
 - **Codegen pattern**: every operation calls into C runtime via `callRT("perl_xyz", {args...})`
-- **Scope model**: three parallel scope stacks for scalars, arrays, and hashes
+- **Scope model**: parallel scope stacks for scalars, arrays, hashes, float vars, int vars, and DerefAV-cached array-ref params
+- **FLAT_ARRAY**: all-numeric AnonArray literals with ≥4 elements compile to `double[]` inline (tag=10, pval=double*, matchpos=count), eliminating PV boxing in hot loops; `perl_assign` deep-copies the double[] for correct ownership semantics
 - **Module loading**: `use Module` recursively inlines `.pm` files at compile time via `inlineModules()`
 
 ## Major Implemented Features
@@ -73,7 +74,7 @@ make clean
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (21/21)
+## Passing Tests (22/22)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
@@ -82,6 +83,7 @@ All tests in `tests/` pass:
 - Advanced: `regex.pl`, `regex_g.pl`, `advanced.pl`, `features.pl`
 - OOP & modules: `oop.pl`, `closures.pl`, `usemod.pl`, `inherit.pl`
 - Modern features: `defaults.pl`, `newfeatures.pl` (state, wantarray stub, caller stub, $!, $/, BEGIN/END, defined(), local blocks)
+- Performance benchmarks: `fibn.pl` (Fibonacci), `mbs.pl` (Mandelbrot set 512×512×80 iters)
 
 ## Known Limitations
 
@@ -125,8 +127,8 @@ The following features are **not yet implemented** or only partially supported:
 - **Module Inlining**: `use` statements cause recursive parsing and token stream concatenation
 - **Regex**: Uses PCRE2 with custom iterator state per `PerlValue` (`matchpos`)
 - **Error Handling**: `die`/`eval` uses `jmp_buf` with careful stack management
-- **Performance**: LLVM optimization + C runtime; no garbage collection (manual memory management via `perl_free`)
+- **Performance**: LLVM optimization (O2 + LTO) + C runtime with freelist pool allocator; no GC (manual via `perl_free`). Extensive unboxing optimizations: float scalar vars (`floatScopes_`), unboxed arithmetic (`canEmitF64`/`emitExprF64`), FLAT_ARRAY for numeric arrays, DerefAV cache for array-ref @_ params, borrow reads for array/hash elements, TBAA metadata for alias disambiguation. nb.pl n=5M runs in 0.22s vs Perl's ~33s (~150× faster).
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 21 test suite.
+**Last Updated**: Current state reflects all features demonstrated in the 22-test suite.
