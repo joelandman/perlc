@@ -1228,6 +1228,47 @@ PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures) {
 
 /* ── threads ─────────────────────────────────────────────────────────────── */
 
+/* Clone a CODE_REF for thread isolation: each captured variable gets a fresh
+   stable slot initialized from the parent's value, so perl_assign inside the
+   thread only modifies the thread's copy.  Arrays/hashes behind a REF_ARRAY
+   or REF_HASH are still shared (refcount bumped) — full deep-copy deferred
+   until threads::shared. */
+static PerlValue *clone_code_ref_for_thread(PerlValue *code_pv) {
+    if (!code_pv || code_pv->tag != PERL_CODE_REF) return perl_clone(code_pv);
+    PerlClosure *old_cl = (PerlClosure *)code_pv->pval;
+    PerlClosure *new_cl = malloc(sizeof *new_cl);
+    new_cl->fn        = old_cl->fn;
+    new_cl->ncaptures = old_cl->ncaptures;
+    new_cl->captures  = old_cl->ncaptures > 0
+        ? malloc(old_cl->ncaptures * sizeof(PerlValue *)) : NULL;
+    for (int i = 0; i < old_cl->ncaptures; i++) {
+        PerlValue *os = old_cl->captures[i];   /* parent's stable slot */
+        PerlValue *ns = malloc(sizeof(PerlValue));  /* thread's stable slot */
+        *ns = *os;                             /* copy all scalar fields */
+        ns->matchpos = 0;
+        ns->blessed_class = os->blessed_class ? strdup(os->blessed_class) : NULL;
+        if (os->tag == PERL_STRING && os->sval) {
+            ns->sval = strdup(os->sval);
+        } else if (os->tag == PERL_FLAT_ARRAY) {
+            long long n = os->matchpos;
+            ns->matchpos = n;
+            ns->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
+            if (n > 0) memcpy(ns->pval, os->pval, sizeof(double) * (size_t)n);
+        } else if (os->tag == PERL_REF_ARRAY && os->pval) {
+            ((PerlArray *)os->pval)->refcount++;  /* shared array */
+        } else if (os->tag == PERL_REF_HASH && os->pval) {
+            ((PerlHash *)os->pval)->refcount++;   /* shared hash */
+        }
+        new_cl->captures[i] = ns;
+    }
+    PerlValue *pv = pv_alloc();
+    pv->tag          = PERL_CODE_REF;
+    pv->pval         = new_cl;
+    pv->matchpos     = 0;
+    pv->blessed_class = code_pv->blessed_class ? strdup(code_pv->blessed_class) : NULL;
+    return pv;
+}
+
 #define THREAD_REGISTRY_MAX 1024
 static PerlValue        *thread_registry[THREAD_REGISTRY_MAX];
 static int               thread_registry_count = 0;
@@ -1286,7 +1327,7 @@ PerlValue *perl_threads_create(PerlValue *code_pv, PerlArray *args) {
     pthread_mutex_unlock(&thread_registry_mu);
 
     ThreadArgs *ta = malloc(sizeof(ThreadArgs));
-    ta->code_pv  = perl_clone(code_pv);
+    ta->code_pv  = clone_code_ref_for_thread(code_pv);
     ta->args     = args ? args : perl_array_new();
     ta->thread   = thr;
     ta->thr_pv   = thr_pv;

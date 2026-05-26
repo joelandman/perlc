@@ -39,4 +39,11 @@ my $thr6 = threads->create(sub { return $base + $_[0]; }, 7);
 my $r6 = $thr6->join();
 print "closure=$r6\n";
 
+# Test 7: isolation — thread modifying a captured 'my' var doesn't affect parent
+my $isolated = 10;
+my $thr7 = threads->create(sub { $isolated = 99; return $isolated; });
+my $r7 = $thr7->join();
+print "thread_saw=$r7\n";              # 99
+print "parent_saw=$isolated\n";        # 10
+
 print "threads_done\n";
