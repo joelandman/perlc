@@ -293,6 +293,45 @@ int  perl_local_save_depth(void);              /* current save-stack depth */
 void perl_local_save(PerlValue *pv);           /* save current state of *pv */
 void perl_local_restore_to(int depth);         /* restore all saved since depth */
 
+/* ── special global variables (Tier 2) ───────────────────────────────────── */
+PerlValue *perl_get_dollar_dot(void);      /* $.  — current input line number  */
+PerlValue *perl_get_dollar_comma(void);    /* $,  — output field separator     */
+PerlValue *perl_get_dollar_bsl(void);      /* $\  — output record separator    */
+PerlValue *perl_get_dollar_amp(void);      /* $&  — last successful regex match */
+void       perl_print_sep(void);           /* print $, if defined              */
+void       perl_print_sep_fh(PerlValue *fh);
+void       perl_print_ors(void);           /* print $\ if defined              */
+void       perl_print_ors_fh(PerlValue *fh);
+
+/* ── POSIX functions ──────────────────────────────────────────────────────── */
+PerlValue *perl_posix_floor(PerlValue *v);
+PerlValue *perl_posix_ceil(PerlValue *v);
+PerlValue *perl_posix_fmod(PerlValue *a, PerlValue *b);
+PerlValue *perl_posix_strftime(PerlArray *args); /* (fmt, sec,min,hour,mday,mon,year,...) */
+
+/* ── Scalar::Util functions ───────────────────────────────────────────────── */
+PerlValue *perl_su_blessed(PerlValue *v);
+PerlValue *perl_su_reftype(PerlValue *v);
+PerlValue *perl_su_looks_like_number(PerlValue *v);
+
+/* ── Carp functions ───────────────────────────────────────────────────────── */
+void       perl_carp_croak(PerlArray *args);   /* die with caller location    */
+void       perl_carp_carp(PerlArray *args);    /* warn with caller location   */
+
+/* ── file I/O extras ──────────────────────────────────────────────────────── */
+PerlValue *perl_seek_fh(PerlValue *fh, PerlValue *off, PerlValue *whence);
+PerlValue *perl_tell_fh(PerlValue *fh);
+PerlValue *perl_binmode_fh(PerlValue *fh, PerlValue *layer);
+
+/* ── filesystem stat / glob ───────────────────────────────────────────────── */
+PerlArray *perl_stat_path(PerlValue *v);
+PerlArray *perl_lstat_path(PerlValue *v);
+PerlArray *perl_glob_val(PerlValue *pattern);
+
+/* ── UNIVERSAL isa / can ──────────────────────────────────────────────────── */
+PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv);
+PerlValue *perl_can_check(PerlValue *obj, PerlValue *method_pv);
+
 /* ── time / randomness / process ────────────────────────────────────────── */
 PerlValue *perl_rand_val(PerlValue *max);       /* rand [max] — float [0,max) */
 void       perl_srand_val(PerlValue *seed);     /* srand [seed] */

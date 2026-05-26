@@ -109,6 +109,13 @@ enum class NK {
     OpendirFunc,  /* opendir(DH,path)  – name=dh_var, left=path                      */
     ReaddirFunc,  /* readdir(DH)       – name=dh_var                                  */
     ClosedirFunc, /* closedir(DH)      – name=dh_var                                  */
+    /* file / filesystem (Tier 2) */
+    SeekFunc,    /* seek($fh,off,wh) – args=[fh,off,whence]                */
+    TellFunc,    /* tell($fh)        – left=fh                             */
+    BinmodeFunc, /* binmode($fh)     – left=fh, right=disc(opt)            */
+    StatFunc,    /* stat(PATH)       – left=expr; returns 13-element list  */
+    LstatFunc,   /* lstat(PATH)      – like stat but via lstat()           */
+    GlobFunc,    /* glob(PATTERN)    – left=pattern; returns filename list  */
     /* time / randomness / sleep */
     RandFunc,     /* rand [MAX]        – left=max (opt)                               */
     SrandFunc,    /* srand [SEED]      – left=seed (opt)                              */

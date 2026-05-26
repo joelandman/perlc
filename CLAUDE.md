@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~98% implemented with 23/23 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, and List::Util.
+**Current Status**: Core language features are ~99% implemented with 24/24 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, and Tier 2 builtins.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 23 test programs
+make test         # runs all 24 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -60,8 +60,14 @@ make clean
 - **Heredocs**: `<<END`, `<<'END'`, `<<"END"` with proper interpolation and lexer support
 - **Special Variables**: `$_` (default for many builtins), `$!` (errno), `$/` (input separator with `local` support)
 - **State Variables**: `state $x` — persistent per-sub variables with lazy initialization
-- **File I/O**: `open` (2-arg and 3-arg forms), filehandles, readline (scalar and array context), `eof`, `unlink`, `print`/`say`/`printf` to filehandles
+- **File I/O**: `open` (2-arg and 3-arg forms), filehandles, readline (scalar and array context), `eof`, `unlink`, `print`/`say`/`printf` to filehandles; `seek`/`tell`/`binmode`
+- **Filesystem**: `stat`/`lstat` (13-element list), `glob`
 - **System**: `system()`, backticks (`` `cmd` ``), `$ENV{KEY}`, file tests (`-e`/`-f`/`-d`/`-r`/`-w`/`-x`/`-z`/`-s`/`-l`/`-p`)
+- **Special Variables**: `$.` (line number), `$,` (output field sep), `$\` (output record sep), `$&` (last match), `$/` (input sep), `$!` (errno); all support `local`
+- **POSIX module** (built-in): `floor`, `ceil`, `fmod`, `strftime`
+- **Scalar::Util** (built-in): `blessed`, `reftype`, `looks_like_number`
+- **Carp** (built-in): `croak`/`carp`/`confess`/`cluck`
+- **UNIVERSAL**: `->isa(class)`, `->can(method)`, `our @ISA = (...)` inheritance
 
 ### Object-Oriented Programming
 - `package`, `bless`, `->` method calls (class and instance)
@@ -78,7 +84,7 @@ make clean
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (23/23)
+## Passing Tests (24/24)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
@@ -89,6 +95,7 @@ All tests in `tests/` pass:
 - Modern features: `defaults.pl`, `newfeatures.pl` (state, wantarray stub, caller stub, $!, $/, BEGIN/END, defined(), local blocks)
 - Performance benchmarks: `fibn.pl` (Fibonacci), `mbs.pl` (Mandelbrot set 512×512×80 iters)
 - Tier 1 builtins: `tier1.pl` (rand/srand, time/localtime/gmtime, sleep/alarm, sort { BLOCK }, List::Util)
+- Tier 2 builtins: `tier2.pl` ($/.$,/$\/$&, POSIX::floor/ceil/fmod/strftime, Scalar::Util::blessed/reftype/looks_like_number, seek/tell/binmode, stat/lstat, glob, isa/can, our @ISA)
 
 ## Known Limitations
 
@@ -136,4 +143,4 @@ The following features are **not yet implemented** or only partially supported:
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 23-test suite.
+**Last Updated**: Current state reflects all features demonstrated in the 24-test suite.

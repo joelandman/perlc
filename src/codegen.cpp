@@ -342,6 +342,38 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_uniq_list",    av,  av);
     /* sort with custom comparator — fn ptr passed as i8p (opaque pointer) */
     RT("perl_sort_custom",  av,  av, i8p);
+    /* special globals (Tier 2) */
+    RT("perl_get_dollar_dot",   pv);
+    RT("perl_get_dollar_comma", pv);
+    RT("perl_get_dollar_bsl",   pv);
+    RT("perl_get_dollar_amp",   pv);
+    RT("perl_print_sep",        voidTy);
+    RT("perl_print_sep_fh",     voidTy, pv);
+    RT("perl_print_ors",        voidTy);
+    RT("perl_print_ors_fh",     voidTy, pv);
+    /* POSIX */
+    RT("perl_posix_floor",      pv, pv);
+    RT("perl_posix_ceil",       pv, pv);
+    RT("perl_posix_fmod",       pv, pv, pv);
+    RT("perl_posix_strftime",   pv, av);
+    /* Scalar::Util */
+    RT("perl_su_blessed",              pv, pv);
+    RT("perl_su_reftype",              pv, pv);
+    RT("perl_su_looks_like_number",    pv, pv);
+    /* Carp */
+    RT("perl_carp_croak",       voidTy, av);
+    RT("perl_carp_carp",        voidTy, av);
+    /* File I/O (Tier 2) */
+    RT("perl_seek_fh",          pv, pv, pv, pv);
+    RT("perl_tell_fh",          pv, pv);
+    RT("perl_binmode_fh",       pv, pv, pv);
+    /* Filesystem (Tier 2) */
+    RT("perl_stat_path",        av, pv);
+    RT("perl_lstat_path",       av, pv);
+    RT("perl_glob_val",         av, pv);
+    /* UNIVERSAL */
+    RT("perl_isa_check",        pv, pv, pv);
+    RT("perl_can_check",        pv, pv, pv);
 #undef RT
 
     /* Mark pure read-only functions so GVN/LICM can eliminate redundant calls */
@@ -485,6 +517,20 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         }
         Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
         return callRT("perl_split", {sep, str});
+    }
+    /* stat / lstat in list context → 13-element array */
+    if (n.kind == NK::StatFunc) {
+        Value *path = n.left ? emitExpr(*n.left) : perlUndef();
+        return callRT("perl_stat_path", {path});
+    }
+    if (n.kind == NK::LstatFunc) {
+        Value *path = n.left ? emitExpr(*n.left) : perlUndef();
+        return callRT("perl_lstat_path", {path});
+    }
+    /* glob in list context */
+    if (n.kind == NK::GlobFunc) {
+        Value *pat = n.left ? emitExpr(*n.left) : perlUndef();
+        return callRT("perl_glob_val", {pat});
     }
     /* localtime / gmtime in list context → 9-element array */
     if (n.kind == NK::LocaltimeFunc) {
@@ -2071,6 +2117,21 @@ void CodeGen::emitStmt(const Node &n) {
                 fileArrayGlobals_[nm] = gv;
             }
             declareArray(nm, av);
+            /* our @ISA = ('Parent', ...) — wire up ISA chain */
+            if (nm == "ISA" && n.right && !n.sval.empty()) {
+                Value *child = builder_.CreateGlobalStringPtr(n.sval);
+                auto processISAElem = [&](const Node &elem) {
+                    if (elem.kind == NK::StringLit) {
+                        Value *parent = builder_.CreateGlobalStringPtr(elem.sval);
+                        callRT("perl_set_isa", {child, parent});
+                    }
+                };
+                if (n.right->kind == NK::ArrayLit) {
+                    for (auto &elem : n.right->args) processISAElem(*elem);
+                } else if (n.right->kind == NK::StringLit) {
+                    processISAElem(*n.right);
+                }
+            }
         } else {
             /* n.name may carry a '$' prefix when parsed in expression context */
             std::string nm = n.name;
@@ -2178,10 +2239,14 @@ void CodeGen::emitStmt(const Node &n) {
                     callRT(isSay ? "perl_say_fh" : "perl_print_fh", {fh, v});
                 }
             } else {
-                for (size_t i = 0; i < n.args.size(); i++)
-                    callRT(isSay && i + 1 == n.args.size() ? "perl_say_fh" : "perl_print_fh",
+                for (size_t i = 0; i < n.args.size(); i++) {
+                    if (i > 0) callRT("perl_print_sep_fh", {fh});
+                    bool lastArg = (i + 1 == n.args.size());
+                    callRT(isSay && lastArg ? "perl_say_fh" : "perl_print_fh",
                            {fh, emitExpr(*n.args[i])});
+                }
             }
+            if (!isSay) callRT("perl_print_ors_fh", {fh});
         } else {
             /* print/say to stdout */
             if (n.args.empty()) {
@@ -2193,13 +2258,16 @@ void CodeGen::emitStmt(const Node &n) {
                 Value *v = emitExpr(*n.args[0]);
                 callRT(isSay ? "perl_say" : "perl_print", {v});
             } else {
-                for (size_t i = 0; i < n.args.size(); i++)
+                for (size_t i = 0; i < n.args.size(); i++) {
+                    if (i > 0) callRT("perl_print_sep", {});
                     callRT("perl_print", {emitExpr(*n.args[i])});
+                }
                 if (isSay) {
                     auto *nl = builder_.CreateGlobalString("\n", ".nl");
                     callRT("perl_print_string", {nl});
                 }
             }
+            if (!isSay) callRT("perl_print_ors", {});
         }
         break;
     }
@@ -2786,11 +2854,13 @@ void CodeGen::emitStmt(const Node &n) {
     case NK::LocalStmt: {
         /* save current value, optionally assign new one */
         Value *pv;
-        if (n.name == "/") {
-            pv = callRT("perl_get_input_sep", {});
-        } else if (n.name == "!") {
-            pv = callRT("perl_get_dollar_bang", {});
-        } else {
+        if (n.name == "/")   pv = callRT("perl_get_input_sep",    {});
+        else if (n.name == "!") pv = callRT("perl_get_dollar_bang",{});
+        else if (n.name == ".") pv = callRT("perl_get_dollar_dot",  {});
+        else if (n.name == ",") pv = callRT("perl_get_dollar_comma",{});
+        else if (n.name == "\\") pv = callRT("perl_get_dollar_bsl", {});
+        else if (n.name == "&") pv = callRT("perl_get_dollar_amp",  {});
+        else {
             Value *slot = lookupVar(n.name);
             if (!slot) {
                 Value *uv = callRT("perl_alloc_undef", {});
@@ -2941,8 +3011,12 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::StringLit: return perlStr(n.sval);
 
     case NK::ScalarVar: {
-        if (n.name == "!")  return callRT("perl_get_dollar_bang", {});
-        if (n.name == "/")  return callRT("perl_get_input_sep",   {});
+        if (n.name == "!")  return callRT("perl_get_dollar_bang",  {});
+        if (n.name == "/")  return callRT("perl_get_input_sep",    {});
+        if (n.name == ".")  return callRT("perl_get_dollar_dot",   {});
+        if (n.name == ",")  return callRT("perl_get_dollar_comma", {});
+        if (n.name == "\\") return callRT("perl_get_dollar_bsl",   {});
+        if (n.name == "&")  return callRT("perl_get_dollar_amp",   {});
         {
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
@@ -3033,6 +3107,51 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::EofFunc: {
         Value *fh = n.left ? emitExpr(*n.left) : callRT("perl_get_stdin", {});
         return callRT("perl_eof_fh", {fh});
+    }
+
+    case NK::SeekFunc: {
+        Value *fh = emitExpr(*n.args[0]);
+        Value *off = emitExpr(*n.args[1]);
+        Value *wh  = emitExpr(*n.args[2]);
+        return callRT("perl_seek_fh", {fh, off, wh});
+    }
+
+    case NK::TellFunc: {
+        Value *fh = n.left ? emitExpr(*n.left) : perlUndef();
+        return callRT("perl_tell_fh", {fh});
+    }
+
+    case NK::BinmodeFunc: {
+        Value *fh  = n.left  ? emitExpr(*n.left)  : perlUndef();
+        Value *lay = n.right ? emitExpr(*n.right) : perlUndef();
+        return callRT("perl_binmode_fh", {fh, lay});
+    }
+
+    case NK::StatFunc: {
+        /* scalar context: return number of elements (13 or 0) */
+        Value *path = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *av   = callRT("perl_stat_path", {path});
+        Value *len  = callRT("perl_array_len", {av});
+        callRT("perl_array_free", {av});
+        return len;
+    }
+
+    case NK::LstatFunc: {
+        Value *path = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *av   = callRT("perl_lstat_path", {path});
+        Value *len  = callRT("perl_array_len", {av});
+        callRT("perl_array_free", {av});
+        return len;
+    }
+
+    case NK::GlobFunc: {
+        /* scalar context: return first match */
+        Value *pat = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *av  = callRT("perl_glob_val", {pat});
+        Value *v   = callRT("perl_array_get_ref", {av, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+        Value *res = callRT("perl_clone", {v});
+        callRT("perl_array_free", {av});
+        return res;
     }
 
     case NK::DieStmt: {
@@ -4556,6 +4675,15 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *v = emitExpr(*arg);
             callRT("perl_array_push", {argsArr, v});
         }
+        /* isa / can — UNIVERSAL methods */
+        if (n.sval == "isa") {
+            Value *cls = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            return callRT("perl_isa_check", {obj, cls});
+        }
+        if (n.sval == "can") {
+            Value *meth = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            return callRT("perl_can_check", {obj, meth});
+        }
         /* SUPER::method — dispatch starting from parent of caller package */
         if (n.sval.size() > 7 && n.sval.substr(0, 7) == "SUPER::") {
             std::string realMethod = n.sval.substr(7);
@@ -4758,6 +4886,62 @@ Value *CodeGen::emitCall(const Node &n) {
         builder_.SetInsertPoint(endBB);
         callRT("perl_eval_pop", {});
         return perlUndef();
+    }
+    /* ── Qualified / imported function interceptions ──────────────────────── */
+    /* POSIX */
+    auto buildArgArray = [&]() -> Value * {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &arg : n.args) callRT("perl_array_push", {av, emitExpr(*arg)});
+        return av;
+    };
+    if (n.name == "POSIX::floor" || n.name == "floor") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_floor", {v});
+    }
+    if (n.name == "POSIX::ceil" || n.name == "ceil") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_ceil", {v});
+    }
+    if (n.name == "POSIX::fmod") {
+        Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_posix_fmod", {a, b});
+    }
+    if (n.name == "POSIX::strftime" || n.name == "strftime") {
+        return callRT("perl_posix_strftime", {buildArgArray()});
+    }
+    /* Scalar::Util */
+    if (n.name == "Scalar::Util::blessed" || n.name == "blessed") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_su_blessed", {v});
+    }
+    if (n.name == "Scalar::Util::reftype" || n.name == "reftype") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_su_reftype", {v});
+    }
+    if (n.name == "Scalar::Util::looks_like_number" || n.name == "looks_like_number") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_su_looks_like_number", {v});
+    }
+    /* Carp */
+    if (n.name == "Carp::croak" || n.name == "croak" ||
+        n.name == "Carp::confess" || n.name == "confess") {
+        callRT("perl_carp_croak", {buildArgArray()});
+        builder_.CreateUnreachable();
+        auto *dead = BasicBlock::Create(ctx_, "croak.dead", builder_.GetInsertBlock()->getParent());
+        builder_.SetInsertPoint(dead);
+        return perlUndef();
+    }
+    if (n.name == "Carp::carp" || n.name == "carp" ||
+        n.name == "Carp::cluck" || n.name == "cluck") {
+        callRT("perl_carp_carp", {buildArgArray()});
+        return perlUndef();
+    }
+    /* UNIVERSAL */
+    if (n.name == "UNIVERSAL::isa") {
+        Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_isa_check", {a, b});
     }
     if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
         Value *argsArr = callRT("perl_array_new", {});

@@ -123,8 +123,12 @@ NodePtr Parser::parseStmt() {
         advance(); /* consume 'local' */
         consume(TK::SCALAR, "$");
         std::string varName;
-        if (check(TK::SLASH)) { advance(); varName = "/"; }    /* local $/ */
-        else if (check(TK::NOT)) { advance(); varName = "!"; } /* local $! */
+        if (check(TK::SLASH))     { advance(); varName = "/"; }
+        else if (check(TK::NOT))  { advance(); varName = "!"; }
+        else if (check(TK::DOT))  { advance(); varName = "."; }
+        else if (check(TK::COMMA)){ advance(); varName = ","; }
+        else if (check(TK::BACKSLASH)) { advance(); varName = "\\"; }
+        else if (check(TK::AND))  { advance(); varName = "&"; }
         else { varName = cur().text; advance(); }
         auto n = std::make_unique<Node>(); n->kind = NK::LocalStmt;
         n->name = varName; n->line = line;
@@ -484,12 +488,13 @@ NodePtr Parser::parseMy() {
         return decl;
     }
 
-    /* my @arr */
+    /* my @arr / our @arr */
     if (check(TK::ARRAY)) {
         advance(); /* skip @ */
         std::string nm = cur().text; advance();
         auto decl = std::make_unique<Node>(); decl->kind = NK::My;
         decl->name = "@" + nm; decl->line = line;
+        if (nm == "ISA") decl->sval = currentPackage_; /* tag for codegen */
         if (match(TK::ASSIGN)) {
             decl->right = parseExpr();
         }
@@ -1192,6 +1197,26 @@ NodePtr Parser::parsePrimary() {
         if (check(TK::SLASH)) {
             advance();
             return makeScalar("/", line);
+        }
+        /* $. — line number */
+        if (check(TK::DOT)) {
+            advance();
+            return makeScalar(".", line);
+        }
+        /* $, — output field separator */
+        if (check(TK::COMMA)) {
+            advance();
+            return makeScalar(",", line);
+        }
+        /* $\ — output record separator */
+        if (check(TK::BACKSLASH)) {
+            advance();
+            return makeScalar("\\", line);
+        }
+        /* $& — last match string */
+        if (check(TK::AND)) {
+            advance();
+            return makeScalar("&", line);
         }
         /* $1, $2, ... capture variables; $0 = program name */
         if (check(TK::INT)) {
@@ -2024,6 +2049,67 @@ NodePtr Parser::parsePrimary() {
         n->name = dhVar; return n;
     }
 
+    /* seek($fh, offset, whence) */
+    if (check(TK::KW_SEEK)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto fh = parseExpr(); consume(TK::COMMA, ",");
+        auto off = parseExpr(); consume(TK::COMMA, ",");
+        auto wh = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::SeekFunc; n->line = line;
+        n->args.push_back(std::move(fh));
+        n->args.push_back(std::move(off));
+        n->args.push_back(std::move(wh));
+        return n;
+    }
+
+    /* tell($fh) */
+    if (check(TK::KW_TELL)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto fh = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::TellFunc; n->line = line;
+        n->left = std::move(fh); return n;
+    }
+
+    /* binmode($fh[, $layer]) */
+    if (check(TK::KW_BINMODE)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto fh = parseExpr();
+        NodePtr layer;
+        if (match(TK::COMMA)) layer = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::BinmodeFunc; n->line = line;
+        n->left = std::move(fh); n->right = std::move(layer); return n;
+    }
+
+    /* stat(EXPR) */
+    if (check(TK::KW_STAT)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto path = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::StatFunc; n->line = line;
+        n->left = std::move(path); return n;
+    }
+
+    /* lstat(EXPR) */
+    if (check(TK::KW_LSTAT)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto path = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::LstatFunc; n->line = line;
+        n->left = std::move(path); return n;
+    }
+
+    /* glob(PATTERN) or <PATTERN> */
+    if (check(TK::KW_GLOB)) {
+        advance(); bool hp = match(TK::LPAREN);
+        auto pat = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::GlobFunc; n->line = line;
+        n->left = std::move(pat); return n;
+    }
+
     /* unshift as expression (returns new count) */
     if (check(TK::KW_UNSHIFT)) {
         advance();
@@ -2132,6 +2218,21 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             auto n = std::make_unique<Node>(); n->kind = NK::DollarAt; n->line = line;
             parts.push_back(std::move(n));
             i += 2; continue;
+        }
+        /* $. $, $\ $& $! $/ — special single-char vars */
+        if (raw[i] == '$' && i + 1 < raw.size()) {
+            char nc = raw[i+1];
+            if (nc == '.' || nc == ',' || nc == '!' || nc == '/') {
+                flush();
+                std::string vn(1, nc);
+                parts.push_back(makeScalar(vn, line));
+                i += 2; continue;
+            }
+            if (nc == '&') {
+                flush();
+                parts.push_back(makeScalar("&", line));
+                i += 2; continue;
+            }
         }
         /* $0 — program name */
         if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '0') {

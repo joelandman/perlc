@@ -98,6 +98,37 @@ PerlValue *perl_get_input_sep(void) {
     return &s_input_sep;
 }
 
+/* $. — current input line number */
+static PerlValue s_dollar_dot   = { PERL_INT,   {.ival=0}, 0 };
+/* $, — output field separator (undef = no separator) */
+static PerlValue s_dollar_comma = { PERL_UNDEF, {0}, 0 };
+/* $\ — output record separator (undef = no separator) */
+static PerlValue s_dollar_bsl   = { PERL_UNDEF, {0}, 0 };
+/* $& — last successful regex match string */
+static PerlValue s_dollar_amp   = { PERL_UNDEF, {0}, 0 };
+
+PerlValue *perl_get_dollar_dot(void)   { return &s_dollar_dot;   }
+PerlValue *perl_get_dollar_comma(void) { return &s_dollar_comma; }
+PerlValue *perl_get_dollar_bsl(void)   { return &s_dollar_bsl;   }
+PerlValue *perl_get_dollar_amp(void)   { return &s_dollar_amp;   }
+
+void perl_print_sep(void) {
+    if (s_dollar_comma.tag == PERL_UNDEF) return;
+    perl_print(&s_dollar_comma);
+}
+void perl_print_sep_fh(PerlValue *fh) {
+    if (s_dollar_comma.tag == PERL_UNDEF) return;
+    perl_print_fh(fh, &s_dollar_comma);
+}
+void perl_print_ors(void) {
+    if (s_dollar_bsl.tag == PERL_UNDEF) return;
+    perl_print(&s_dollar_bsl);
+}
+void perl_print_ors_fh(PerlValue *fh) {
+    if (s_dollar_bsl.tag == PERL_UNDEF) return;
+    perl_print_fh(fh, &s_dollar_bsl);
+}
+
 /* $! — errno as a string */
 static PerlValue s_dollar_bang = { PERL_UNDEF, {0}, 0 };
 PerlValue *perl_get_dollar_bang(void) {
@@ -1449,6 +1480,7 @@ PerlValue *perl_readline(PerlValue *fh) {
         }
         if (len == 0) { free(buf); return perl_alloc_undef(); }
         buf[len] = '\0';
+        s_dollar_dot.ival++;
         PerlValue *pv = perl_alloc_string(buf);
         free(buf);
         return pv;
@@ -1469,6 +1501,7 @@ PerlValue *perl_readline(PerlValue *fh) {
     }
     if (len == 0) { free(buf); return perl_alloc_undef(); }
     buf[len] = '\0';
+    s_dollar_dot.ival++;
     PerlValue *pv = perl_alloc_string(buf);
     free(buf);
     return pv;
@@ -2008,6 +2041,12 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
     if (rc > 0) {
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
         populate_named_captures(md, s, re);
+        /* store $& — full match (group 0) */
+        if (s_dollar_amp.tag == PERL_STRING && s_dollar_amp.sval) free(s_dollar_amp.sval);
+        { size_t ms = ov[0], me = ov[1];
+          char *ms_str = malloc(me - ms + 1);
+          memcpy(ms_str, s + ms, me - ms); ms_str[me-ms] = '\0';
+          s_dollar_amp.tag = PERL_STRING; s_dollar_amp.sval = ms_str; }
         for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
             if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
         }
@@ -2640,4 +2679,224 @@ PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp) {
     qsort(res->elems, (size_t)res->len, sizeof(PerlValue *), sort_qsort_wrap_);
     sort_custom_cmp_ = NULL;
     return res;
+}
+
+/* ── POSIX ────────────────────────────────────────────────────────────────── */
+#include <math.h>
+
+PerlValue *perl_posix_floor(PerlValue *v) {
+    return perl_alloc_float(floor(perl_to_float(v)));
+}
+PerlValue *perl_posix_ceil(PerlValue *v) {
+    return perl_alloc_float(ceil(perl_to_float(v)));
+}
+PerlValue *perl_posix_fmod(PerlValue *a, PerlValue *b) {
+    return perl_alloc_float(fmod(perl_to_float(a), perl_to_float(b)));
+}
+PerlValue *perl_posix_strftime(PerlArray *args) {
+    if (!args || args->len < 1) return perl_alloc_string("");
+    char *fmt = perl_to_string(args->elems[0]);
+    struct tm tm = {0};
+    if (args->len >= 7) {
+        tm.tm_sec   = args->len > 1 ? (int)perl_to_int(args->elems[1]) : 0;
+        tm.tm_min   = args->len > 2 ? (int)perl_to_int(args->elems[2]) : 0;
+        tm.tm_hour  = args->len > 3 ? (int)perl_to_int(args->elems[3]) : 0;
+        tm.tm_mday  = args->len > 4 ? (int)perl_to_int(args->elems[4]) : 1;
+        tm.tm_mon   = args->len > 5 ? (int)perl_to_int(args->elems[5]) : 0;
+        tm.tm_year  = args->len > 6 ? (int)perl_to_int(args->elems[6]) : 0;
+        tm.tm_wday  = args->len > 7 ? (int)perl_to_int(args->elems[7]) : 0;
+        tm.tm_yday  = args->len > 8 ? (int)perl_to_int(args->elems[8]) : 0;
+        tm.tm_isdst = args->len > 9 ? (int)perl_to_int(args->elems[9]) : -1;
+    } else {
+        time_t now = time(NULL);
+        localtime_r(&now, &tm);
+    }
+    char buf[512];
+    strftime(buf, sizeof(buf), fmt, &tm);
+    free(fmt);
+    return perl_alloc_string(buf);
+}
+
+/* ── Scalar::Util ─────────────────────────────────────────────────────────── */
+
+PerlValue *perl_su_blessed(PerlValue *v) {
+    if (!v) return perl_alloc_undef();
+    if ((v->tag == PERL_REF_ARRAY || v->tag == PERL_REF_HASH ||
+         v->tag == PERL_REF_SCALAR) && v->blessed_class)
+        return perl_alloc_string(v->blessed_class);
+    return perl_alloc_undef();
+}
+
+PerlValue *perl_su_reftype(PerlValue *v) {
+    if (!v) return perl_alloc_undef();
+    switch (v->tag) {
+    case PERL_REF_SCALAR: return perl_alloc_string("SCALAR");
+    case PERL_REF_ARRAY:  return perl_alloc_string("ARRAY");
+    case PERL_REF_HASH:   return perl_alloc_string("HASH");
+    case PERL_CODE_REF:   return perl_alloc_string("CODE");
+    default:              return perl_alloc_undef();
+    }
+}
+
+PerlValue *perl_su_looks_like_number(PerlValue *v) {
+    if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
+    if (v->tag == PERL_INT || v->tag == PERL_FLOAT) return perl_alloc_int(1);
+    if (v->tag != PERL_STRING || !v->sval) return perl_alloc_int(0);
+    const char *s = v->sval;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '+' || *s == '-') s++;
+    if (*s == '\0') return perl_alloc_int(0);
+    int has_digit = 0;
+    while (*s >= '0' && *s <= '9') { has_digit = 1; s++; }
+    if (*s == '.') { s++; while (*s >= '0' && *s <= '9') { has_digit = 1; s++; } }
+    if (!has_digit) return perl_alloc_int(0);
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        if (*s < '0' || *s > '9') return perl_alloc_int(0);
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    while (*s == ' ' || *s == '\t') s++;
+    return perl_alloc_int(*s == '\0' ? 1 : 0);
+}
+
+/* ── Carp ─────────────────────────────────────────────────────────────────── */
+
+void perl_carp_croak(PerlArray *args) {
+    char *msg = (args && args->len > 0) ? perl_to_string(args->elems[0]) : strdup("Died");
+    fprintf(stderr, "%s\n", msg);
+    free(msg);
+    exit(1);
+}
+
+void perl_carp_carp(PerlArray *args) {
+    char *msg = (args && args->len > 0) ? perl_to_string(args->elems[0]) : strdup("Warning: something's wrong");
+    fprintf(stderr, "%s\n", msg);
+    free(msg);
+}
+
+/* ── File I/O ─────────────────────────────────────────────────────────────── */
+
+PerlValue *perl_seek_fh(PerlValue *fh, PerlValue *off, PerlValue *whence) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval)
+        return perl_alloc_int(0);
+    long offset  = (long)perl_to_int(off);
+    int  whencei = (int)perl_to_int(whence);
+    int r = fseek((FILE*)fh->pval, offset, whencei);
+    return perl_alloc_int(r == 0 ? 1 : 0);
+}
+
+PerlValue *perl_tell_fh(PerlValue *fh) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval)
+        return perl_alloc_int(-1);
+    return perl_alloc_int((long long)ftell((FILE*)fh->pval));
+}
+
+PerlValue *perl_binmode_fh(PerlValue *fh, PerlValue *layer) {
+    (void)fh; (void)layer;
+    return perl_alloc_int(1);
+}
+
+/* ── Filesystem ───────────────────────────────────────────────────────────── */
+#include <sys/stat.h>
+
+static PerlArray *_stat_to_array(struct stat *st) {
+    PerlArray *a = perl_array_new();
+    perl_array_push(a, perl_alloc_int((long long)st->st_dev));
+    perl_array_push(a, perl_alloc_int((long long)st->st_ino));
+    perl_array_push(a, perl_alloc_int((long long)st->st_mode));
+    perl_array_push(a, perl_alloc_int((long long)st->st_nlink));
+    perl_array_push(a, perl_alloc_int((long long)st->st_uid));
+    perl_array_push(a, perl_alloc_int((long long)st->st_gid));
+    perl_array_push(a, perl_alloc_int((long long)st->st_rdev));
+    perl_array_push(a, perl_alloc_int((long long)st->st_size));
+    perl_array_push(a, perl_alloc_int((long long)st->st_blksize));
+    perl_array_push(a, perl_alloc_int((long long)st->st_blocks));
+    perl_array_push(a, perl_alloc_int((long long)st->st_atime));
+    perl_array_push(a, perl_alloc_int((long long)st->st_mtime));
+    perl_array_push(a, perl_alloc_int((long long)st->st_ctime));
+    return a;
+}
+
+PerlArray *perl_stat_path(PerlValue *v) {
+    char *path = perl_to_string(v);
+    struct stat st;
+    PerlArray *a;
+    if (stat(path, &st) == 0) {
+        a = _stat_to_array(&st);
+    } else {
+        a = perl_array_new();
+    }
+    free(path);
+    return a;
+}
+
+PerlArray *perl_lstat_path(PerlValue *v) {
+    char *path = perl_to_string(v);
+    struct stat st;
+    PerlArray *a;
+    if (lstat(path, &st) == 0) {
+        a = _stat_to_array(&st);
+    } else {
+        a = perl_array_new();
+    }
+    free(path);
+    return a;
+}
+
+#include <glob.h>
+
+PerlArray *perl_glob_val(PerlValue *pattern) {
+    char *pat = perl_to_string(pattern);
+    PerlArray *res = perl_array_new();
+    glob_t g;
+    if (glob(pat, GLOB_TILDE | GLOB_NOCHECK, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++)
+            perl_array_push(res, perl_alloc_string(g.gl_pathv[i]));
+        globfree(&g);
+    }
+    free(pat);
+    return res;
+}
+
+/* ── UNIVERSAL: isa / can ─────────────────────────────────────────────────── */
+
+PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv) {
+    if (!obj || !class_pv) return perl_alloc_int(0);
+    const char *want = (class_pv->tag == PERL_STRING && class_pv->sval)
+                       ? class_pv->sval : "";
+    const char *got  = obj->blessed_class;
+    if (!got) {
+        /* check tag-based type names */
+        const char *tname = NULL;
+        switch (obj->tag) {
+        case PERL_REF_ARRAY:  tname = "ARRAY"; break;
+        case PERL_REF_HASH:   tname = "HASH"; break;
+        case PERL_REF_SCALAR: tname = "SCALAR"; break;
+        case PERL_CODE_REF:   tname = "CODE"; break;
+        default: break;
+        }
+        if (tname && strcmp(tname, want) == 0) return perl_alloc_int(1);
+        return perl_alloc_int(0);
+    }
+    /* walk ISA chain */
+    const char *cls = got;
+    for (int depth = 0; depth < 32; depth++) {
+        if (strcmp(cls, want) == 0) return perl_alloc_int(1);
+        const char *parent = perl_get_parent(cls);
+        if (!parent) break;
+        cls = parent;
+    }
+    return perl_alloc_int(0);
+}
+
+PerlValue *perl_can_check(PerlValue *obj, PerlValue *method_pv) {
+    if (!obj || !method_pv) return perl_alloc_undef();
+    char *method = perl_to_string(method_pv);
+    const char *cls = obj->blessed_class;
+    if (!cls) { free(method); return perl_alloc_undef(); }
+    PerlSubFnCtx fn = perl_find_method(cls, method);
+    free(method);
+    if (!fn) return perl_alloc_undef();
+    return perl_make_code_ref(fn);
 }
