@@ -187,7 +187,63 @@ static std::vector<Token> inlineModules(
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
     std::vector<Token> constToks;   /* synthetic constant sub definitions */
 
+    std::vector<std::string> searchDirsBase = {
+        baseDir, baseDir + "/lib", "lib", "lib/lib/perl5", "."
+    };
+
     for (size_t i = 0; i < tokens.size(); ) {
+        /* ── require "file.pm" or require Module::Name ── */
+        if (tokens[i].kind == TK::KW_REQUIRE &&
+            i + 1 < tokens.size() &&
+            (tokens[i+1].kind == TK::IDENT || tokens[i+1].kind == TK::STRING)) {
+            std::string rawName = tokens[i+1].text;
+            /* double-quoted STRING tokens have a leading \x01 marker — strip it */
+            if (!rawName.empty() && rawName[0] == '\x01') rawName = rawName.substr(1);
+            /* advance past: require <name> ; */
+            size_t j = i + 2;
+            while (j < tokens.size() && tokens[j].kind != TK::SEMI) j++;
+            i = (j < tokens.size()) ? j + 1 : j;
+
+            /* convert to module name (for loaded tracking) and file path */
+            std::string modName = rawName, modPath = rawName;
+            if (rawName.find('/') != std::string::npos ||
+                (rawName.size() > 3 && rawName.substr(rawName.size()-3) == ".pm")) {
+                /* file path form: "Foo/Bar.pm" */
+                modPath = rawName;
+                /* strip .pm and convert / to :: for the loaded key */
+                if (modPath.size() > 3 && modPath.substr(modPath.size()-3) == ".pm")
+                    modName = modPath.substr(0, modPath.size()-3);
+                for (char &c : modName) if (c == '/') c = ':';
+            } else {
+                /* module name form: Foo::Bar */
+                modPath = rawName;
+                for (char &c : modPath) if (c == ':') c = '/';
+                while (modPath.find("//") != std::string::npos)
+                    modPath.replace(modPath.find("//"), 2, "/");
+                modPath += ".pm";
+            }
+            if (PRAGMAS.count(modName) || loaded.count(modName)) continue;
+            /* helper: load and inline one file into modTokens */
+            auto tryInlineFile = [&](const std::string &fullPath) -> bool {
+                if (access(fullPath.c_str(), R_OK) != 0) return false;
+                loaded.insert(modName);
+                std::string src = readFile(fullPath);
+                Lexer modLexer(src);
+                auto modToks = modLexer.tokenize();
+                if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK) modToks.pop_back();
+                auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser);
+                if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK) expanded.pop_back();
+                modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
+                return true;
+            };
+            /* absolute path: use directly */
+            if (!modPath.empty() && modPath[0] == '/') { tryInlineFile(modPath); continue; }
+            for (auto &dir : searchDirsBase) {
+                if (tryInlineFile(dir + "/" + modPath)) break;
+            }
+            continue;
+        }
+
         if (tokens[i].kind != TK::KW_USE ||
             i + 1 >= tokens.size() ||
             tokens[i+1].kind != TK::IDENT) {

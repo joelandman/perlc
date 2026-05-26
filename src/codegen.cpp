@@ -310,7 +310,9 @@ void CodeGen::declareRuntime() {
     RT("perl_get_dollar_bang",  pv);
     RT("perl_push_wantarray", i32, i32);
 RT("perl_pop_wantarray",  i32);
-RT("perl_wantarray",      pv);
+RT("perl_wantarray",             pv);
+RT("perl_array_to_list_return",  pv, av);
+RT("perl_unwrap_list_return",    av, pv);
 RT("perl_threads_join",   voidTy, pv);
     RT("perl_caller",           av);
 RT("perl_get_plus_hash",     av);
@@ -869,6 +871,30 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *dh = builder_.CreateLoad(perlPtrTy_, slot);
         return callRT("perl_readdir_all", {dh});
     }
+    /* user-defined sub call in list context: call with ctx=1, unwrap result */
+    if (n.kind == NK::Call) {
+        if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+            Value *argsArr = callRT("perl_array_new", {});
+            for (auto &arg : n.args) {
+                if (arg->kind == NK::ArrayVar) {
+                    Value *av = lookupArray(arg->name);
+                    if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
+                }
+                if (arg->kind == NK::HashVar) {
+                    Value *hv = lookupHash(arg->name);
+                    if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
+                }
+                Value *v = emitExpr(*arg);
+                callRT("perl_array_push", {argsArr, v});
+                freeIfOwned(v);
+            }
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *one = ConstantInt::get(i32Ty, 1);
+            Value *pv = builder_.CreateCall(fn, {argsArr, one});
+            callRT("perl_array_free", {argsArr});
+            return callRT("perl_unwrap_list_return", {pv});
+        }
+    }
     return nullptr;
 }
 
@@ -955,8 +981,19 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_defined", "perl_ref_type",
         /* hash/array access */
         "perl_hash_delete_sv",
+        /* method/sub dispatch always returns a freshly cloned PerlValue* */
+        "perl_dispatch_method",
+        /* reference constructors: each returns a freshly allocated PerlValue* */
+        "perl_ref_hash", "perl_ref_array", "perl_ref_scalar",
     };
-    return owned.count(nm.str()) > 0;
+    if (owned.count(nm.str()) > 0) return true;
+    /* perl_bless returns its first argument unchanged.  It is owned (and therefore
+       safe to free after cloning for return) ONLY when the argument is itself an
+       owned temp (e.g. a freshly-allocated perl_ref_hash result).  When bless is
+       applied to a stable PV loaded from an alloca, the argument is a LoadInst, not
+       a CallInst, so the recursive check returns false — preventing a double-free. */
+    if (nm == "perl_bless") return isOwnedTemp(ci->getArgOperand(0));
+    return false;
 }
 
 void CodeGen::freeIfOwned(llvm::Value *v) {
@@ -1933,6 +1970,8 @@ void CodeGen::emitSub(const Node &n) {
 static bool hasWantarrayOrUserCall(const Node &n) {
     if (n.kind == NK::WantarrayFunc) return true;
     if (n.kind == NK::Call)         return true;  /* any user-defined sub call */
+    /* return (LIST) uses perl_array_to_list_return which reads wantarray stack */
+    if (n.kind == NK::Return && n.left && n.left->kind == NK::ArrayLit) return true;
     bool r = false;
     if (n.left)  r = r || hasWantarrayOrUserCall(*n.left);
     if (n.right) r = r || hasWantarrayOrUserCall(*n.right);
@@ -2143,7 +2182,7 @@ void CodeGen::emitStmt(const Node &n) {
         } else if (isArr) {
             std::string nm = n.name.substr(1);
             Value *av = nullptr;
-            if (n.right) av = emitArrayPtr(*n.right);
+            if (n.right) { callCtx_ = 1; av = emitArrayPtr(*n.right); callCtx_ = 0; }
             if (!av) {
                 av = callRT("perl_array_new", {});
                 /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
@@ -2891,7 +2930,14 @@ void CodeGen::emitStmt(const Node &n) {
         break;
 
     case NK::Return: {
-        Value *v = n.left ? emitExpr(*n.left) : perlUndef();
+        Value *v;
+        if (n.left && n.left->kind == NK::ArrayLit) {
+            /* return (LIST) — wrap for list/scalar context at runtime */
+            Value *av = emitExpr(*n.left);  /* returns PerlArray* */
+            v = callRT("perl_array_to_list_return", {av});
+        } else {
+            v = n.left ? emitExpr(*n.left) : perlUndef();
+        }
         /* restore any local()s before returning; clone retval first so
            restore doesn't clobber the in-place PerlValue we're returning */
         if (localDepthAlloca_) {
@@ -3384,8 +3430,10 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::Assign: {
         /* ($a,$b,...) = list */
         if (n.left->kind == NK::ArrayLit) {
+            callCtx_ = 1;
             Value *rhsArr = emitArrayPtr(*n.right);
             if (!rhsArr) rhsArr = emitExpr(*n.right);
+            callCtx_ = 0;
             bool fromUnderbar = (n.right->kind == NK::ArrayVar && n.right->name == "_");
             for (size_t i = 0; i < n.left->args.size(); i++) {
                 /* Stage 25: pre-promoted @_ arg — check BEFORE emitLValue to prevent
@@ -5100,8 +5148,9 @@ Value *CodeGen::emitCall(const Node &n) {
             freeIfOwned(v);
         }
         auto *i32Ty = Type::getInt32Ty(ctx_);
-        Value *zero = ConstantInt::get(i32Ty, 0);
-        Value *retVal = builder_.CreateCall(fn, {argsArr, zero});
+        Value *ctxVal = ConstantInt::get(i32Ty, callCtx_);
+        callCtx_ = 0;
+        Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
         callRT("perl_array_free", {argsArr});
         return retVal;
     }

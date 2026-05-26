@@ -122,6 +122,10 @@ typedef struct PerlArray {
     pthread_mutex_t *mu;       /* non-NULL when declared : shared */
 } PerlArray;
 
+/* list-context return helpers for wantarray */
+PerlValue *perl_array_to_list_return(PerlArray *av); /* wrap for return in list/scalar ctx */
+PerlArray *perl_unwrap_list_return(PerlValue *pv);   /* caller side: extract array from return */
+
 PerlArray *perl_array_new(void);
 PerlArray *perl_anon_array_new(void); /* like perl_array_new but refcount=1 (anonymous) */
 long long perl_array_is_all_flat(PerlArray *av); /* 1 if all elems are FLAT_ARRAY */

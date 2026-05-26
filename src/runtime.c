@@ -174,6 +174,38 @@ PerlValue *perl_wantarray(void) {
   return perl_alloc_int(s_wantarray_stack[s_wantarray_depth - 1]);
 }
 
+/* list-context return: wrap PerlArray* in REF_ARRAY if wantarray, else take last elem */
+PerlValue *perl_array_to_list_return(PerlArray *av) {
+    int ctx = (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
+    if (ctx) {
+        PerlValue *r = pv_alloc();
+        r->tag = PERL_REF_ARRAY;
+        r->flags = 0; r->matchpos = 0; r->blessed_class = NULL;
+        r->pval = av;
+        av->refcount = 1;
+        return r;
+    } else {
+        PerlValue *last = (av->len > 0) ? perl_clone(av->elems[av->len - 1])
+                                        : perl_alloc_undef();
+        perl_array_free(av);
+        return last;
+    }
+}
+
+/* caller-side unwrap: extract PerlArray* from list-context function result */
+PerlArray *perl_unwrap_list_return(PerlValue *pv) {
+    if (!pv) return perl_array_new();
+    if (pv->tag == PERL_REF_ARRAY && pv->pval) {
+        PerlArray *av = (PerlArray *)pv->pval;
+        pv->pval = NULL;
+        perl_free(pv);
+        return av;
+    }
+    PerlArray *av = perl_array_new();
+    perl_array_push(av, pv);
+    return av;
+}
+
 /* caller — stub returning (package, file, line) */
 PerlArray *perl_caller(void) {
     PerlArray *a = perl_array_new();
@@ -284,6 +316,9 @@ PerlValue *perl_clone(const PerlValue *src) {
     return v;
 }
 
+static __thread int s_destroy_depth = 0;
+static PerlSubFnCtx perl_find_method(const char *class_name, const char *method);
+
 HOTX void perl_free(PerlValue *v) {
     if (!v) return;
     /* Shared vars are PerlSharedVar (larger than PerlValue) — never pool them. */
@@ -296,6 +331,22 @@ HOTX void perl_free(PerlValue *v) {
     }
     if (v->tag == PERL_REF_HASH && v->pval) {
         PerlHash *hv = (PerlHash *)v->pval;
+        /* call DESTROY before the hash is freed */
+        if (hv->refcount == 1 && v->blessed_class && s_destroy_depth < 100) {
+            PerlSubFnCtx fn = perl_find_method(v->blessed_class, "DESTROY");
+            if (fn) {
+                s_destroy_depth++;
+                PerlArray *args = perl_array_new();
+                PerlValue *self = perl_clone(v);
+                perl_array_push(args, self);
+                PerlValue *ret = fn(args, perl_push_wantarray(0));
+                perl_pop_wantarray();
+                perl_free(ret);
+                perl_array_free(args);
+                perl_free(self);
+                s_destroy_depth--;
+            }
+        }
         if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
     }
     /* CODE_REF: pval points to a shared PerlClosure; don't free it here since
@@ -411,6 +462,22 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     }
     if (dst->tag == PERL_REF_HASH && dst->pval) {
         PerlHash *hv = (PerlHash *)dst->pval;
+        /* trigger DESTROY when last reference is being released */
+        if (hv->refcount == 1 && dst->blessed_class && s_destroy_depth < 100) {
+            PerlSubFnCtx fn = perl_find_method(dst->blessed_class, "DESTROY");
+            if (fn) {
+                PerlValue *self = perl_clone(dst);
+                s_destroy_depth++;
+                PerlArray *args = perl_array_new();
+                perl_array_push(args, self);
+                PerlValue *ret = fn(args, perl_push_wantarray(0));
+                perl_pop_wantarray();
+                perl_free(ret);
+                perl_array_free(args);
+                perl_free(self);
+                s_destroy_depth--;
+            }
+        }
         if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
     }
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }

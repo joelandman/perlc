@@ -96,6 +96,8 @@ private:
     llvm::Function                *currentFn_ = nullptr;
     /* Stage 24a: true when current sub emitted perl_push_wantarray at entry */
     bool                           currentSubNeedsWantarray_ = true;
+    /* 0=scalar context, 1=list context — set before emitting call, consumed by emitCall */
+    int                            callCtx_ = 0;
     /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
     const Node                    *currentSubBody_ = nullptr;
     /* Stage 25: promotion kind for @_ args identified before sub body emission */

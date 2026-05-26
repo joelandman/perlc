@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 26/26 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, and threads with threads::shared.
+**Current Status**: Core language features are ~99% implemented with 27/27 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, and DESTROY.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 26 test programs
+make test         # runs all 27 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -101,20 +101,22 @@ All tests in `tests/` pass:
 - Tier 2 builtins: `tier2.pl` ($/.$,/$\/$&, POSIX::floor/ceil/fmod/strftime, Scalar::Util::blessed/reftype/looks_like_number, seek/tell/binmode, stat/lstat, glob, isa/can, our @ISA)
 - Tier 3 builtins: `tier3.pl` ($$/$^O, fileno, read, truncate, each %hash, pos, getpid)
 - Threads: `threads.pl` (create/join/tid/self, closure capture, thread isolation, threads::shared scalars/arrays/hashes, lock/cond_wait/cond_signal/cond_broadcast)
+- Object lifecycle: `destroy.pl` (DESTROY on scope exit, undef assignment, overwrite, loop, data access in destructor)
 
 ## Known Limitations
 
 The following features are **not yet implemented** or only partially supported:
 
 ### Context and Call Stack
-- Proper `wantarray` context tracking (currently always returns false/scalar context)
+- `wantarray` context propagation: implemented for list vs. scalar context at call sites (`my @list = func()` correctly calls in list context); `wantarray` builtin returns correct value within a sub
 - Full `caller()` implementation (stub returns `("main", "unknown", 0)`)
 
 ### Scoping
 - `local` for arrays and hashes (only scalars and special vars like `$!`/`$/` supported)
 
 ### Module System
-- Runtime `require` and `do FILE` (modules only loaded at compile time via inlining)
+- `require Module::Name` and `require "file.pm"` are implemented (compile-time inlining, same as `use`); runtime `require` and `do FILE` are not yet supported
+
 - Pragmas that aren't backed by `.pm` files are silently ignored
 - `tie` / `untie` (use `opendir`/`readdir` instead; see rewritten `testscripts/cputemp.pl`)
 
@@ -122,7 +124,8 @@ The following features are **not yet implemented** or only partially supported:
 - Modifiers `x` (extended) and `e` (eval replacement)
 
 ### OOP
-- `AUTOLOAD` and `DESTROY` methods
+- `AUTOLOAD` method
+- `DESTROY` is now implemented (fires on scope exit, undef assignment, and overwrite)
 
 ### Reference Operations
 - `unshift @{EXPR}, val` (though `push @{EXPR}` works)

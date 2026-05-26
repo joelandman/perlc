@@ -11,7 +11,7 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"foreach",  TK::KW_FOREACH},{"do",      TK::KW_DO},
     {"last",     TK::KW_LAST},  {"next",     TK::KW_NEXT},
     {"redo",     TK::KW_REDO},  {"return",   TK::KW_RETURN},
-    {"sub",      TK::KW_SUB},   {"use",      TK::KW_USE},
+    {"sub",      TK::KW_SUB},   {"use",      TK::KW_USE},   {"require",  TK::KW_REQUIRE},
     {"strict",   TK::KW_STRICT},{"warnings", TK::KW_WARNINGS},
     {"print",    TK::KW_PRINT},  {"say",      TK::KW_SAY},
     {"printf",   TK::KW_PRINTF}, {"sprintf",  TK::KW_SPRINTF},
