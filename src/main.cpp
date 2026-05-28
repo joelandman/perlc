@@ -809,10 +809,26 @@ int main(int argc, char **argv) {
         if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
             rtSrc = "src/runtime.c";  /* fallback: CWD */
 
-std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native";
-if (debugSymbols) cmd += " -g";
-cmd += " " + tmpIR + " " + rtSrc +
-    " -o " + outputFile + " -lm -lpcre2-8 2>&1";
+        /* locate libperlc_eval.a (same dir as runtime.c) for string eval */
+        std::string evalLib;
+        if (cg.hasStringEval()) {
+            std::string dir = rtSrc.substr(0, rtSrc.rfind('/'));
+            std::string candidate = dir + "/libperlc_eval.a";
+            if (access(candidate.c_str(), R_OK) == 0)
+                evalLib = candidate;
+            else
+                std::cerr << "Warning: string eval used but libperlc_eval.a not found; "
+                             "eval EXPR will return undef\n";
+        }
+
+        std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native";
+        if (debugSymbols) cmd += " -g";
+        cmd += " " + tmpIR + " " + rtSrc;
+        if (!evalLib.empty())
+            cmd += " -rdynamic"   /* export runtime symbols for JIT dlopen */
+                   " -Wl,--whole-archive " + evalLib + " -Wl,--no-whole-archive"
+                   " -L/usr/lib/llvm-18/lib -lLLVM-18 -lstdc++ -lpthread -ldl";
+        cmd += " -o " + outputFile + " -lm -lpcre2-8 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
         int rc = system(cmd.c_str());

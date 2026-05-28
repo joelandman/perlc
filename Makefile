@@ -11,18 +11,26 @@ CFLAGS   := -g -O2
 SRCDIR   := src
 OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o
 RT_OBJ   := $(SRCDIR)/runtime.o
+EVAL_OBJ := $(SRCDIR)/eval_jit.o
+EVAL_LIB := $(SRCDIR)/libperlc_eval.a
 
 TARGET   := perlc
 
 .PHONY: all clean test
 
-all: $(TARGET)
+all: $(TARGET) $(EVAL_LIB)
 
 $(TARGET): $(OBJS) $(RT_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(SRCDIR)/eval_jit.o: $(SRCDIR)/eval_jit.cpp $(SRCDIR)/eval_jit.h $(SRCDIR)/lexer.h $(SRCDIR)/parser.h $(SRCDIR)/codegen.h $(SRCDIR)/jit.h $(SRCDIR)/runtime.h
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+$(EVAL_LIB): $(EVAL_OBJ) $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o
+	ar rcs $@ $^
 
 $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
@@ -34,7 +42,7 @@ $(SRCDIR)/codegen.o: $(SRCDIR)/codegen.cpp $(SRCDIR)/codegen.h $(SRCDIR)/ast.h $
 $(SRCDIR)/jit.o: $(SRCDIR)/jit.cpp $(SRCDIR)/jit.h $(SRCDIR)/runtime.h
 
 clean:
-	rm -f $(SRCDIR)/*.o $(TARGET)
+	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.a $(TARGET)
 
 test: $(TARGET)
 	@echo "=== hello.pl    ===" && ./$(TARGET) tests/hello.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test

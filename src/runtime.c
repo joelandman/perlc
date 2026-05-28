@@ -226,6 +226,26 @@ void perl_eval_pop(void) {
 
 PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
 
+/* ── string eval ─────────────────────────────────────────────────────────── */
+PerlEvalStringFn perl_eval_string_fn = NULL;
+
+PerlValue *perl_eval_string(PerlValue *code_pv) {
+    /* clear $@ before eval */
+    PerlValue empty = { .tag = PERL_STRING, .sval = "" };
+    perl_assign(&s_dollar_at, &empty);
+
+    if (!perl_eval_string_fn) {
+        PerlValue msg = { .tag = PERL_STRING,
+            .sval = "eval: string eval not available (recompile with eval support)" };
+        perl_assign(&s_dollar_at, &msg);
+        return perl_alloc_undef();
+    }
+
+    char *code = perl_to_string(code_pv);
+    PerlValue *result = perl_eval_string_fn(code);
+    return result ? result : perl_alloc_undef();
+}
+
 /* ── allocation ──────────────────────────────────────────────────────────── */
 
 HOTX PerlValue *perl_alloc_undef(void) {
@@ -2797,11 +2817,9 @@ long long perl_tr(PerlValue *str, const char *search, const char *replace, const
         unsigned char c = (unsigned char)s[i];
         int mapped = table[c];
         if (mapped == -1) {
-            /* no translation — pass through */
-            if (!do_squeeze || !has_last || (char)c != last_out) {
-                out[out_len++] = (char)c;
-                last_out = (char)c; has_last = 1;
-            }
+            /* no translation — always pass through; /s never squeezes untranslated chars */
+            out[out_len++] = (char)c;
+            has_last = 0;  /* break any in-progress squeeze run */
         } else if (mapped == -2) {
             /* explicit delete marker */
             count++;

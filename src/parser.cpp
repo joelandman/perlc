@@ -650,7 +650,11 @@ NodePtr Parser::parseUnshift() {
     consume(TK::ARRAY, "@");
     NodePtr refExpr;
     std::string arrName;
-    if (check(TK::SCALAR)) {
+    if (check(TK::LBRACE)) {           /* @{expr} — deref arbitrary expression */
+        advance();
+        refExpr = parseExpr();
+        consume(TK::RBRACE, "}");
+    } else if (check(TK::SCALAR)) {    /* @$ref — scalar deref */
         advance();
         std::string nm = cur().text; advance();
         refExpr = makeScalar(nm, line);
@@ -1072,6 +1076,12 @@ NodePtr Parser::parsePostfix() {
 
 NodePtr Parser::parsePrimary() {
     int line = cur().line;
+
+    /* do { BLOCK } — block in expression context, returns last value */
+    if (check(TK::KW_DO) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
+        advance(); /* consume 'do' */
+        return parseBlock();
+    }
 
     /* undef */
     if (check(TK::KW_UNDEF)) { advance(); auto n = std::make_unique<Node>(); n->kind = NK::UndefLit; n->line = line; return n; }

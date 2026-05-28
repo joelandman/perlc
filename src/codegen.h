@@ -19,20 +19,29 @@ public:
     CodeGen(bool debug = false, int optLevel = 0);
 
     void compile(const Node &program, const std::string &moduleName);
+    /* Compile a Perl snippet for JIT string eval: emits PerlValue *funcName()
+       with no init calls; caller handles die via perl_eval_push/setjmp. */
+    void compileForEval(const Node &program, const std::string &funcName);
+    bool hasStringEval() const { return hasStringEval_; }
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
 
     /* Release the module for use with JIT - transfers ownership to caller */
     std::unique_ptr<llvm::Module> releaseModule();
+    /* For JIT use: release the LLVMContext so it can be owned by ThreadSafeModule */
+    std::unique_ptr<llvm::LLVMContext> releaseContext();
 
     void initializeDebugInfo(const std::string &sourceFile);
     llvm::DILocation *getDebugLoc(int line, llvm::DIScope *scope = nullptr);
 
 private:
-    llvm::LLVMContext              ctx_;
-    std::unique_ptr<llvm::Module>  mod_;
-    llvm::IRBuilder<>              builder_;
+    /* ctx_ is heap-allocated so it can be released to ThreadSafeModule
+       while all ctx_ references in this class remain valid. */
+    std::unique_ptr<llvm::LLVMContext> ctx_owned_;
+    llvm::LLVMContext                 &ctx_;       /* = *ctx_owned_ */
+    std::unique_ptr<llvm::Module>      mod_;
+    llvm::IRBuilder<>                  builder_;
 
     bool                           debug_ = false;
     int                            optLevel_ = 0;
@@ -91,6 +100,7 @@ private:
     bool inMainBody_ = false;   /* true only while emitting the top-level program body */
     /* Stage 23: when true, all 2D-array rows are known FLAT_ARRAY — skip flat/norm condBrs */
     bool inFlatOnly_ = false;
+    bool hasStringEval_ = false;
 
     /* current function */
     llvm::Function                *currentFn_ = nullptr;
@@ -106,6 +116,7 @@ private:
     /* loop control blocks */
     std::vector<llvm::BasicBlock *> loopExits_;
     std::vector<llvm::BasicBlock *> loopContinues_;
+    std::vector<llvm::BasicBlock *> loopRedos_;  /* redo target = body start */
     /* local() save depth at function entry (alloca holding i32) */
     llvm::Value *localDepthAlloca_ = nullptr;
 

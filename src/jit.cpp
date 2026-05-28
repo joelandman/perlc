@@ -6,6 +6,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <iostream>
 
 using namespace llvm;
@@ -41,25 +42,36 @@ PerlJIT::PerlJIT() {
 
     jit_ = std::move(*jitOrErr);
 
+    /* Expose process symbols (perl_*, pcre2_*, etc.) to JIT-compiled modules */
+    auto gen = DynamicLibrarySearchGenerator::GetForCurrentProcess(
+        jit_->getDataLayout().getGlobalPrefix());
+    if (gen)
+        jit_->getMainJITDylib().addGenerator(std::move(*gen));
+
     std::cerr << "JIT initialized successfully\n";
 }
 
 PerlJIT::~PerlJIT() = default;
 
 void PerlJIT::addModule(std::unique_ptr<Module> mod) {
+    addModuleWithContext(std::move(mod), std::make_unique<LLVMContext>());
+}
+
+void PerlJIT::addModuleWithContext(std::unique_ptr<Module> mod,
+                                   std::unique_ptr<LLVMContext> ctx) {
     if (!jit_) {
         std::cerr << "JIT not initialized\n";
         return;
     }
 
-    /* Verify the module */
+    /* Verify using the module's actual context (must still be alive) */
     if (verifyModule(*mod, &errs())) {
         std::cerr << "Module verification failed\n";
         return;
     }
 
-    /* Wrap module in ThreadSafeModule */
-    ThreadSafeModule tsm(std::move(mod), std::make_unique<LLVMContext>());
+    /* Hand both module and context to ThreadSafeModule */
+    ThreadSafeModule tsm(std::move(mod), std::move(ctx));
 
     auto err = jit_->addIRModule(std::move(tsm));
     if (err) {

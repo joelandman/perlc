@@ -47,7 +47,9 @@ static std::string subLLVMName(const std::string &name) {
 /* ── construction ────────────────────────────────────────────────────────── */
 
 CodeGen::CodeGen(bool debug, int optLevel)
-    : debug_(debug),
+    : ctx_owned_(std::make_unique<LLVMContext>()),
+      ctx_(*ctx_owned_),
+      debug_(debug),
       optLevel_(optLevel),
       mod_(std::make_unique<Module>("perlc", ctx_)),
       builder_(ctx_) {
@@ -275,6 +277,7 @@ void CodeGen::declareRuntime() {
     RT("perl_call_code_ref",  pv, pv, av);
     RT("perl_eval_pop",        voidTy);
     RT("perl_get_dollar_at",   pv);
+    RT("perl_eval_string",     pv,  pv);
     RT("perl_eval_push",       voidTy, i8p);
     RT("perl_tr",              i64, pv, i8p, i8p, i8p);
     /* setjmp called directly from generated code — must be returns_twice */
@@ -2431,6 +2434,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         loopExits_.push_back(exit);
         loopContinues_.push_back(cond);
+        loopRedos_.push_back(body);
 
         /* If condition is 'my $var = rhs', hoist the variable allocation before
          * the loop so the alloca and stable PerlValue* are created exactly once.
@@ -2477,6 +2481,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         loopExits_.pop_back();
         loopContinues_.pop_back();
+        loopRedos_.pop_back();
         builder_.SetInsertPoint(exit);
         break;
     }
@@ -2489,6 +2494,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         loopExits_.push_back(exit);
         loopContinues_.push_back(cond);
+        loopRedos_.push_back(body);
 
         builder_.CreateBr(body);
         builder_.SetInsertPoint(body);
@@ -2506,6 +2512,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         loopExits_.pop_back();
         loopContinues_.pop_back();
+        loopRedos_.pop_back();
         builder_.SetInsertPoint(exit);
         break;
     }
@@ -2519,6 +2526,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         loopExits_.push_back(exit);
         loopContinues_.push_back(stepBB);
+        loopRedos_.push_back(bodyBB);
 
         pushScope();
         if (n.init) emitStmt(*n.init);
@@ -2619,6 +2627,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         loopExits_.pop_back();
         loopContinues_.pop_back();
+        loopRedos_.pop_back();
         builder_.SetInsertPoint(exit);
         if (hoistedArgs) callRT("perl_array_free", {hoistedArgs});
         popScope();  /* free for-init pvs (e.g. my $i) at loop exit */
@@ -2668,6 +2677,7 @@ void CodeGen::emitStmt(const Node &n) {
             auto *condBB2 = BasicBlock::Create(ctx_, "foreach.cond", fn);
             loopExits_.push_back(exit);
             loopContinues_.push_back(stepBB);
+            loopRedos_.push_back(bodyBB);
 
             /* Stage 23: call perl_array_is_all_flat ONCE before the loop for each
                derefAV that will be row-dereffed in the body. The result is stored
@@ -2849,6 +2859,7 @@ void CodeGen::emitStmt(const Node &n) {
 
             loopExits_.pop_back();
             loopContinues_.pop_back();
+            loopRedos_.pop_back();
             builder_.SetInsertPoint(exit);
             break;
         }
@@ -2883,6 +2894,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         loopExits_.push_back(exit);
         loopContinues_.push_back(stepBB);
+        loopRedos_.push_back(bodyBB);
 
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
@@ -2913,6 +2925,7 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.CreateBr(condBB);
         loopExits_.pop_back();
         loopContinues_.pop_back();
+        loopRedos_.pop_back();
         builder_.SetInsertPoint(exit);
         callRT("perl_free", {loopPv});
         if (ownsTmpArr) callRT("perl_array_free", {tmpArr});
@@ -3108,6 +3121,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
     }
     switch (n.kind) {
+    case NK::Block:     return emitBlockLast(n);   /* do { BLOCK } in expr ctx */
     case NK::UndefLit:  return perlUndef();
     case NK::IntLit:    return perlInt(n.ival);
     case NK::FloatLit:  return perlFloat(n.fval);
@@ -3309,9 +3323,13 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Redo: {
-        /* redo restarts the current loop iteration — jump to loop body start */
-        /* For now, implement as a no-op (complex to implement without restructuring) */
-        return perlInt(0);
+        if (!loopRedos_.empty()) {
+            builder_.CreateBr(loopRedos_.back());
+            auto *fn   = builder_.GetInsertBlock()->getParent();
+            auto *dead = BasicBlock::Create(ctx_, "redo.dead", fn);
+            builder_.SetInsertPoint(dead);
+        }
+        return perlUndef();
     }
 
     case NK::LockStmt: {
@@ -5053,27 +5071,11 @@ Value *CodeGen::emitBinOp(const Node &n) {
 }
 
 Value *CodeGen::emitCall(const Node &n) {
-    /* eval EXPR — string eval stub: returns undef */
+    /* eval EXPR — JIT-based string eval */
     if (n.name == "eval") {
-        /* allocate jmp_buf on stack (256 bytes) */
-        auto *i8Arr  = ArrayType::get(Type::getInt8Ty(ctx_), 256);
-        auto *jbAlloca = builder_.CreateAlloca(i8Arr, nullptr, "jmp_buf");
-        Value *jbPtr = builder_.CreateBitCast(jbAlloca, PointerType::getUnqual(ctx_));
-        callRT("perl_eval_push", {jbPtr});
-        auto *i32 = Type::getInt32Ty(ctx_);
-        Value *caught = callRT("setjmp", {jbPtr});
-        Value *isCaught = builder_.CreateICmpNE(caught, ConstantInt::get(i32, 0));
-        auto *fn = builder_.GetInsertBlock()->getParent();
-        auto *bodyBB = BasicBlock::Create(ctx_, "eval.body", fn);
-        auto *endBB = BasicBlock::Create(ctx_, "eval.end", fn);
-        builder_.CreateCondBr(isCaught, endBB, bodyBB);
-        builder_.SetInsertPoint(bodyBB);
-        for (auto &arg : n.args) emitExpr(*arg);  /* evaluate string arg */
-        if (!builder_.GetInsertBlock()->getTerminator())
-            builder_.CreateBr(endBB);
-        builder_.SetInsertPoint(endBB);
-        callRT("perl_eval_pop", {});
-        return perlUndef();
+        hasStringEval_ = true;
+        Value *strVal = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_eval_string", {strVal});
     }
     /* ── Qualified / imported function interceptions ──────────────────────── */
     /* POSIX */
@@ -5187,10 +5189,71 @@ void CodeGen::runOptimization() {
     MPM.run(*mod_, MAM);
 }
 
+/* ── string eval compilation ─────────────────────────────────────────────── */
+
+void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
+    auto *pv    = perlPtrTy_;
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+
+    /* Pre-declare any subs so forward calls work (mirrors compile()) */
+    std::vector<const Node *> subs;
+    for (auto &stmt : program.args)
+        if (stmt->kind == NK::SubDef) subs.push_back(stmt.get());
+    for (auto *s : subs) {
+        auto *ft = FunctionType::get(pv, {arrayPtrTy_, Type::getInt32Ty(ctx_)}, false);
+        Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
+    }
+
+    /* emit: PerlValue *funcName() */
+    auto *evalFT = FunctionType::get(pv, {}, false);
+    auto *evalFn = Function::Create(evalFT, Function::ExternalLinkage,
+                                    funcName, mod_.get());
+    auto *entry = BasicBlock::Create(ctx_, "entry", evalFn);
+    builder_.SetInsertPoint(entry);
+
+    currentFn_ = evalFn;
+    pushScope();
+    fileScopeDepth_ = (int)scopes_.size() + 1;
+    inMainBody_ = true;
+
+    /* $_ available inside eval */
+    Value *underscoreVal = callRT("perl_alloc_undef", {});
+    auto *slotUs = builder_.CreateAlloca(pv, nullptr, "$_");
+    builder_.CreateStore(underscoreVal, slotUs);
+    declareVar("_", slotUs);
+
+    /* local() depth tracking */
+    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+    /* emit body, capture last value */
+    Value *lastVal = emitBlockLast(program);
+    if (!lastVal) lastVal = perlUndef();
+
+    popScope();
+
+    /* restore any local()s */
+    Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+    callRT("perl_local_restore_to", {depth});
+
+    inMainBody_ = false;
+    localDepthAlloca_ = nullptr;
+
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateRet(lastVal);
+
+    /* emit sub bodies (mirrors compile()) */
+    for (auto *s : subs) emitSub(*s);
+}
+
 /* ── output ──────────────────────────────────────────────────────────────── */
 
 std::unique_ptr<Module> CodeGen::releaseModule() {
     return std::move(mod_);
+}
+
+std::unique_ptr<LLVMContext> CodeGen::releaseContext() {
+    return std::move(ctx_owned_);
 }
 
 void CodeGen::dumpIR() {

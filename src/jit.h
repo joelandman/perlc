@@ -9,7 +9,10 @@ public:
     PerlJIT();
     ~PerlJIT();
 
-    /* Add an LLVM module to the JIT */
+    /* Add a module; caller also provides the context it was built in */
+    void addModuleWithContext(std::unique_ptr<llvm::Module> mod,
+                              std::unique_ptr<llvm::LLVMContext> ctx);
+    /* Add a module with a fresh context (for REPL use) */
     void addModule(std::unique_ptr<llvm::Module> mod);
 
     /* Look up a function by name and get its address */

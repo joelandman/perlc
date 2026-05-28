@@ -441,6 +441,13 @@ void       perl_eval_push(jmp_buf *jb); /* push caller's jmp_buf onto eval stack
 void       perl_eval_pop(void);          /* pop after eval completes */
 PerlValue *perl_get_dollar_at(void);   /* returns stable $@ PerlValue* */
 
+/* ── string eval hook ────────────────────────────────────────────────────── */
+/* Set by eval_jit.cpp (linked only when program uses eval EXPR).
+   NULL → perl_eval_string sets $@ and returns undef. */
+typedef PerlValue *(*PerlEvalStringFn)(const char *code);
+extern PerlEvalStringFn perl_eval_string_fn;
+PerlValue *perl_eval_string(PerlValue *code_pv);  /* called from JIT'd code */
+
 #ifdef __cplusplus
 }
 #endif
