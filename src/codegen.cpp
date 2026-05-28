@@ -4493,9 +4493,15 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         Value *av = callRT("perl_anon_array_new", {});
         for (auto &elem : n.args) {
-            Value *pv = emitExpr(*elem);
-            callRT("perl_array_push", {av, pv});
-            freeIfOwned(pv);
+            /* List-producing nodes (qw(), reverse, range, etc.) must be
+               extended into av, not pushed as a single mistyped element. */
+            if (Value *sub = emitArrayPtr(*elem)) {
+                callRT("perl_array_extend", {av, sub});
+            } else {
+                Value *pv = emitExpr(*elem);
+                callRT("perl_array_push", {av, pv});
+                freeIfOwned(pv);
+            }
         }
         return callRT("perl_ref_array", {av});
     }

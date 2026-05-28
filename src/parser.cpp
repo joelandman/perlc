@@ -1,4 +1,5 @@
 #include "parser.h"
+#include "lexer.h"
 #include <stdexcept>
 #include <sstream>
 #include <cstdlib>
@@ -2419,13 +2420,29 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             parts.push_back(std::move(cv));
             continue;
         }
-        /* ${varname} */
+        /* ${varname} or ${\expr} */
         if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '{') {
             flush(); i += 2;
-            std::string vname;
-            while (i < raw.size() && raw[i] != '}') vname += raw[i++];
-            if (i < raw.size()) i++; /* skip } */
-            parts.push_back(makeScalar(vname, line));
+            /* ${\expr} — scalar expression: deref(ref(expr)) = expr stringified */
+            if (i < raw.size() && raw[i] == '\\') {
+                i++;  /* skip \ */
+                std::string inner;
+                int depth = 1;
+                while (i < raw.size() && depth > 0) {
+                    char c = raw[i];
+                    if (c == '{') depth++;
+                    else if (c == '}') { if (--depth == 0) { i++; break; } }
+                    inner += c; i++;
+                }
+                Lexer innerLex(inner);
+                auto innerToks = innerLex.tokenize();
+                parts.push_back(Parser::parseExprFromTokens(std::move(innerToks)));
+            } else {
+                std::string vname;
+                while (i < raw.size() && raw[i] != '}') vname += raw[i++];
+                if (i < raw.size()) i++; /* skip } */
+                parts.push_back(makeScalar(vname, line));
+            }
             continue;
         }
         /* $varname possibly followed by [idx] or {key} */
@@ -2459,6 +2476,41 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             } else {
                 parts.push_back(makeScalar(vname, line));
             }
+            continue;
+        }
+        /* @{expr} — deref expr as array, join elements with space */
+        if (raw[i] == '@' && i + 1 < raw.size() && raw[i+1] == '{') {
+            flush(); i += 2;
+            std::string inner;
+            int depth = 1;
+            while (i < raw.size() && depth > 0) {
+                char c = raw[i];
+                if (c == '{') depth++;
+                else if (c == '}') { if (--depth == 0) { i++; break; } }
+                inner += c; i++;
+            }
+            Lexer innerLex(inner);
+            auto innerToks = innerLex.tokenize();
+            NodePtr exprNode = Parser::parseExprFromTokens(std::move(innerToks));
+            auto derefNode = std::make_unique<Node>();
+            derefNode->kind = NK::DerefArray; derefNode->left = std::move(exprNode); derefNode->line = line;
+            auto joinNode = std::make_unique<Node>();
+            joinNode->kind = NK::JoinFunc; joinNode->left = makeStr(" ", line);
+            joinNode->args.push_back(std::move(derefNode)); joinNode->line = line;
+            parts.push_back(std::move(joinNode));
+            continue;
+        }
+        /* @$ref — deref scalar ref as array, join with space */
+        if (raw[i] == '@' && i + 1 < raw.size() && raw[i+1] == '$') {
+            flush(); i += 2;
+            std::string vname;
+            while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
+            auto derefNode = std::make_unique<Node>();
+            derefNode->kind = NK::DerefArray; derefNode->left = makeScalar(vname, line); derefNode->line = line;
+            auto joinNode = std::make_unique<Node>();
+            joinNode->kind = NK::JoinFunc; joinNode->left = makeStr(" ", line);
+            joinNode->args.push_back(std::move(derefNode)); joinNode->line = line;
+            parts.push_back(std::move(joinNode));
             continue;
         }
         /* @arr — interpolate entire array joined by $" (default space) */
