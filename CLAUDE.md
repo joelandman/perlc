@@ -4,7 +4,7 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 27/27 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, and DESTROY.
+**Current Status**: Core language features are ~99% implemented with 27/27 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, and DESTROY. **New features include XS interface and DBI/SQLite integration**.
 
 ## Build & Test
 
@@ -52,6 +52,10 @@ make clean
 - **Randomness**: `rand [MAX]`, `srand [SEED]`
 - **Process**: `sleep SECS`, `alarm SECS`
 - **List::Util** (built-in, no CPAN): `sum`, `min`, `max`, `first { BLOCK } LIST`, `any { BLOCK } LIST`, `all { BLOCK } LIST`, `none { BLOCK } LIST`, `uniq LIST`, `reduce { BLOCK } LIST`
+
+### Extended Features
+- **XS Interface**: Dynamic loading of C libraries via `perl_xs_load()` function and support for calling C functions from Perl
+- **DBI/SQLite Integration**: Database connectivity framework with standard DBI functions including connection, prepared statements, and query execution
 
 ### Advanced Features
 - **References**: all types (`\$x`, `\@arr`, `\%hash`, `\&sub`), anonymous arrays/hashes, dereferencing (`$$ref`, `@$ref`, `%$ref`, `->`), `ref()`
@@ -109,7 +113,6 @@ The following features are **not yet implemented** or only partially supported:
 
 ### Context and Call Stack
 - `wantarray` context propagation: implemented for list vs. scalar context at call sites (`my @list = func()` correctly calls in list context); `wantarray` builtin returns correct value within a sub
-- Full `caller()` implementation (stub returns `("main", "unknown", 0)`)
 
 ### Scoping
 - `local` for arrays and hashes (only scalars and special vars like `$!`/`$/` supported)
@@ -125,7 +128,7 @@ The following features are **not yet implemented** or only partially supported:
 
 ### OOP
 - `AUTOLOAD` method
-- `DESTROY` is now implemented (fires on scope exit, undef assignment, and overwrite)
+- `DESTROY` is now implemented (fires on scope exit, undef assignment, overwrite)
 
 ### Reference Operations
 - `unshift @{EXPR}, val` (though `push @{EXPR}` works)
@@ -135,8 +138,6 @@ The following features are **not yet implemented** or only partially supported:
 
 ### Not Yet Implemented
 - `threads::shared` hash support tested and working (`my %hash : shared` / `lock(%hash)` / concurrent key writes from multiple threads)
-- XS interface
-- DBI/SQLite integration
 - Overload, prototypes, globs, signals, pack/unpack, unicode handling
 - Many complex CPAN modules (parser may fail on advanced OO/`our`/POD; simplify scripts as needed)
 

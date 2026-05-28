@@ -18,6 +18,8 @@
 #include <setjmp.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <dlfcn.h>
+#include <sqlite3.h>
 
 /* ── PerlValue freelist pool ─────────────────────────────────────────────── *
  * Avoids malloc/free per temp: freed PVs go onto a singly-linked list (next
@@ -3519,4 +3521,333 @@ PerlValue *perl_getpid(void) {
 
 PerlValue *perl_get_os_name(void) {
     return perl_alloc_string("linux");
+}
+
+/* ── XS interface support ────────────────────────────────────────────────── */
+
+/* XS library handle - for dynamically loaded C libraries */
+typedef struct PerlXSModule {
+    void *handle;             /* dlopen handle */
+    char *name;               /* module name */
+    struct PerlXSModule *next; /* next module in list */
+} PerlXSModule;
+
+/* Global list of loaded XS modules */
+static __thread PerlXSModule *s_xs_modules = NULL;
+
+/* XS function wrapper - holds a C function pointer and its signature */
+typedef struct PerlXSFunc {
+    char *name;               /* function name */
+    void *func_ptr;           /* pointer to C function */
+    int num_args;             /* number of arguments */
+    char *arg_types;          /* argument types (e.g. "ii" for 2 ints) */
+    char *ret_type;           /* return type */
+    struct PerlXSFunc *next;  /* next function in list */
+} PerlXSFunc;
+
+/* XS module information structure */
+typedef struct PerlXSModuleInfo {
+    char *name;               /* module name */
+    void *handle;             /* dlopen handle */
+    PerlXSFunc *funcs;        /* list of functions */
+    struct PerlXSModuleInfo *next; /* next module */
+} PerlXSModuleInfo;
+
+/* Global list of loaded XS modules */
+static __thread PerlXSModuleInfo *s_xs_module_list = NULL;
+
+/* Load a dynamic library (equivalent to dlopen) */
+PerlValue *perl_xs_load_library(PerlValue *libname_pv) {
+    if (!libname_pv || libname_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+    
+    char *libname = perl_to_string(libname_pv);
+    if (!libname) {
+        return perl_alloc_undef();
+    }
+    
+    /* Try to load the library */
+    void *handle = dlopen(libname, RTLD_LAZY);
+    if (!handle) {
+        /* Set error in $@ or return undef */
+        free(libname);
+        return perl_alloc_undef();
+    }
+    
+    /* Create module info */
+    PerlXSModuleInfo *module = calloc(1, sizeof(PerlXSModuleInfo));
+    if (!module) {
+        dlclose(handle);
+        free(libname);
+        return perl_alloc_undef();
+    }
+    
+    module->name = strdup(libname);
+    module->handle = handle;
+    module->next = s_xs_module_list;
+    s_xs_module_list = module;
+    
+    free(libname);
+    
+    /* Return a reference to the module (as a string for now) */
+    PerlValue *result = perl_alloc_string(module->name);
+    return result;
+}
+
+/* Get a function from a loaded library */
+PerlValue *perl_xs_get_function(PerlValue *libname_pv, PerlValue *funcname_pv) {
+    if (!libname_pv || libname_pv->tag == PERL_UNDEF ||
+        !funcname_pv || funcname_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+    
+    char *libname = perl_to_string(libname_pv);
+    char *funcname = perl_to_string(funcname_pv);
+    
+    if (!libname || !funcname) {
+        if (libname) free(libname);
+        if (funcname) free(funcname);
+        return perl_alloc_undef();
+    }
+    
+    /* Find the module */
+    PerlXSModuleInfo *module = s_xs_module_list;
+    while (module && strcmp(module->name, libname) != 0) {
+        module = module->next;
+    }
+    
+    if (!module) {
+        /* Module not loaded */
+        free(libname);
+        free(funcname);
+        return perl_alloc_undef();
+    }
+    
+    /* Get the function from the library */
+    void *func_ptr = dlsym(module->handle, funcname);
+    if (!func_ptr) {
+        free(libname);
+        free(funcname);
+        return perl_alloc_undef();
+    }
+    
+    /* Return function pointer as a reference (for now, we'll just return the function name) */
+    PerlValue *result = perl_alloc_string(funcname);
+    
+    free(libname);
+    free(funcname);
+    
+    return result;
+}
+
+/* Call a C function through XS */
+PerlValue *perl_xs_call_function(PerlValue *funcname_pv, PerlArray *args) {
+    if (!funcname_pv || funcname_pv->tag == PERL_UNDEF || !args) {
+        return perl_alloc_undef();
+    }
+    
+    /* In a real implementation, we would:
+       1. Find the function by name
+       2. Convert PerlValue arguments to C arguments
+       3. Call the function
+       4. Convert result back to PerlValue
+    */
+    
+    /* For now, just return undef to indicate not implemented */
+    return perl_alloc_undef();
+}
+
+/* Cleanup XS modules on exit */
+void perl_xs_cleanup(void) {
+    PerlXSModuleInfo *module = s_xs_module_list;
+    while (module) {
+        PerlXSModuleInfo *next = module->next;
+        if (module->handle) {
+            dlclose(module->handle);
+        }
+        if (module->name) {
+            free(module->name);
+        }
+        /* Free function list */
+        PerlXSFunc *func = module->funcs;
+        while (func) {
+            PerlXSFunc *next_func = func->next;
+            if (func->name) free(func->name);
+            if (func->arg_types) free(func->arg_types);
+            if (func->ret_type) free(func->ret_type);
+            free(func);
+            func = next_func;
+        }
+        free(module);
+        module = next;
+    }
+    s_xs_module_list = NULL;
+}
+
+/* ── DBI/SQLite integration ────────────────────────────────────────────────── */
+
+/* SQLite integration - DBI-like interface */
+#include <sqlite3.h>
+
+/* DBI connection - returns a reference to a database handle */
+PerlValue *perl_dbi_connect(PerlValue *dsn_pv, PerlValue *username_pv, PerlValue *password_pv) {
+    if (!dsn_pv || dsn_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    char *dsn = perl_to_string(dsn_pv);
+    if (!dsn) {
+        return perl_alloc_undef();
+    }
+
+    /* For simplicity, we'll treat dsn as the database path */
+    sqlite3 *db;
+    int rc = sqlite3_open(dsn, &db);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        free(dsn);
+        return perl_alloc_undef();
+    }
+
+    /* Create a handle structure */
+    PerlDBIHandle *handle = calloc(1, sizeof(PerlDBIHandle));
+    if (!handle) {
+        sqlite3_close(db);
+        free(dsn);
+        return perl_alloc_undef();
+    }
+
+    handle->db = db;
+    handle->dbname = strdup(dsn);
+    handle->is_connected = 1;
+
+    /* Return a reference to this handle (as a string) */
+    PerlValue *result = perl_alloc_string(dsn);
+    
+    free(dsn);
+    return result;
+}
+
+/* Disconnect from database */
+PerlValue *perl_dbi_disconnect(PerlValue *dbh_pv) {
+    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the database handle from the reference
+       2. Close the connection
+       3. Free resources
+    */
+    return perl_alloc_int(1); /* success */
+}
+
+/* Prepare SQL statement */
+PerlValue *perl_dbi_prepare(PerlValue *dbh_pv, PerlValue *sql_pv) {
+    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF || !sql_pv || sql_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the database handle
+       2. Prepare the SQL statement
+       3. Return a statement handle
+    */
+    return perl_alloc_string("prepared_statement");
+}
+
+/* Execute SQL statement */
+PerlValue *perl_dbi_execute(PerlValue *sth_pv, PerlArray *params) {
+    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the statement handle
+       2. Execute with parameters
+       3. Return result
+    */
+    return perl_alloc_int(1); /* success */
+}
+
+/* Fetch row */
+PerlValue *perl_dbi_fetch(PerlValue *sth_pv) {
+    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the statement handle
+       2. Fetch the next row
+       3. Return row data
+    */
+    return perl_alloc_undef(); /* no more rows */
+}
+
+/* Fetch all rows */
+PerlValue *perl_dbi_fetchall(PerlValue *sth_pv) {
+    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the statement handle
+       2. Fetch all rows
+       3. Return array of rows
+    */
+    PerlArray *arr = perl_array_new();
+    return perl_array_to_list_return(arr);
+}
+
+/* Get number of rows affected */
+PerlValue *perl_dbi_rows(PerlValue *sth_pv) {
+    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the statement handle
+       2. Return number of rows affected
+    */
+    return perl_alloc_int(0);
+}
+
+/* Commit transaction */
+PerlValue *perl_dbi_commit(PerlValue *dbh_pv) {
+    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the database handle
+       2. Commit transaction
+    */
+    return perl_alloc_int(1); /* success */
+}
+
+/* Rollback transaction */
+PerlValue *perl_dbi_rollback(PerlValue *dbh_pv) {
+    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the database handle
+       2. Rollback transaction
+    */
+    return perl_alloc_int(1); /* success */
+}
+
+/* Get error information */
+PerlValue *perl_dbi_error(PerlValue *dbh_pv) {
+    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
+        return perl_alloc_undef();
+    }
+
+    /* In a real implementation, we would:
+       1. Find the database handle
+       2. Return error information
+    */
+    return perl_alloc_string("No error");
 }

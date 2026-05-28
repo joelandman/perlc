@@ -459,6 +459,26 @@ void perl_set_pos_str(PerlValue *pv, PerlValue *pos);
 /* ── runtime require ─────────────────────────────────────────────────────── */
 PerlValue *perl_runtime_require(const char *modname);
 
+/* ── DBI/SQLite integration ──────────────────────────────────────────────── */
+/* SQLite database handle */
+typedef struct PerlDBIHandle {
+    void *db; /* SQLite database handle */
+    char *dbname;
+    int is_connected;
+} PerlDBIHandle;
+
+/* Database connection */
+PerlValue *perl_dbi_connect(PerlValue *dsn, PerlValue *username, PerlValue *password);
+PerlValue *perl_dbi_disconnect(PerlValue *dbh);
+PerlValue *perl_dbi_prepare(PerlValue *dbh, PerlValue *sql);
+PerlValue *perl_dbi_execute(PerlValue *sth, PerlArray *params);
+PerlValue *perl_dbi_fetch(PerlValue *sth);
+PerlValue *perl_dbi_fetchall(PerlValue *sth);
+PerlValue *perl_dbi_rows(PerlValue *sth);
+PerlValue *perl_dbi_commit(PerlValue *dbh);
+PerlValue *perl_dbi_rollback(PerlValue *dbh);
+PerlValue *perl_dbi_error(PerlValue *dbh);
+
 /* ── string eval hook ────────────────────────────────────────────────────── */
 /* Set by eval_jit.cpp (linked only when program uses eval EXPR).
    NULL → perl_eval_string sets $@ and returns undef. */

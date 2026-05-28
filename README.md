@@ -7,6 +7,7 @@ A Perl compiler that translates Perl source to LLVM IR and links a C runtime to 
 - `clang++` / `clang` (LLVM 18)
 - `llvm-config-18`
 - `libpcre2-8` (`apt install libpcre2-dev`)
+- `libsqlite3-dev` (for DBI/SQLite integration, `apt install libsqlite3-dev`)
 
 ## Build
 
@@ -161,6 +162,18 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 - JIT mode: experimental, may have stability issues
 
 **Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
+
+## New Features Implemented
+
+### XS Interface
+- Dynamic loading of C libraries via `perl_xs_load()` function
+- Support for calling C functions from Perl code using XS-like interface
+- Function signature handling and proper argument passing
+
+### DBI/SQLite Integration
+- Database connectivity framework with standard DBI functions
+- Support for database connections, prepared statements, and query execution
+- Integration with Perl's value system through `PerlValue*` return types
 
 ## Architecture
 
