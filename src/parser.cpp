@@ -122,6 +122,22 @@ NodePtr Parser::parseStmt() {
     }
     if (check(TK::KW_LOCAL)) {
         advance(); /* consume 'local' */
+        if (check(TK::ARRAY)) {  /* local @arr */
+            advance();
+            std::string arrName = cur().text; advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::LocalArray;
+            n->name = arrName; n->line = line;
+            if (match(TK::ASSIGN)) n->left = parseExpr();
+            return parseModifier(std::move(n), line);
+        }
+        if (check(TK::HASH)) {   /* local %hash */
+            advance();
+            std::string hashName = cur().text; advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::LocalHash;
+            n->name = hashName; n->line = line;
+            if (match(TK::ASSIGN)) n->left = parseExpr();
+            return parseModifier(std::move(n), line);
+        }
         consume(TK::SCALAR, "$");
         std::string varName;
         if (check(TK::SLASH))     { advance(); varName = "/"; }
@@ -1095,8 +1111,11 @@ NodePtr Parser::parsePrimary() {
     }
     if (check(TK::KW_CALLER)) {
         advance();
-        if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::CallerFunc; n->line = line;
+        if (match(TK::LPAREN)) {
+            if (!check(TK::RPAREN)) n->left = parseExpr(); /* optional level arg */
+            consume(TK::RPAREN, ")");
+        }
         return n;
     }
 

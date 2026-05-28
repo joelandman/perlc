@@ -119,6 +119,9 @@ private:
     std::vector<llvm::BasicBlock *> loopRedos_;  /* redo target = body start */
     /* local() save depth at function entry (alloca holding i32) */
     llvm::Value *localDepthAlloca_ = nullptr;
+    /* caller() support: current package name and source file */
+    std::string currentPackage_ = "main";
+    std::string sourceFile_;
 
     /* runtime function declarations */
     std::unordered_map<std::string, llvm::Function *> rtFuncs_;

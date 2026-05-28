@@ -49,7 +49,15 @@ static inline void pv_pool_push(PerlValue *v) {
 #define LOCAL_LOCK_PV 1   /* auto-unlock a PerlSharedVar on scope exit */
 #define LOCAL_LOCK_AV 2   /* auto-unlock a PerlArray->mu on scope exit */
 #define LOCAL_LOCK_HV 3   /* auto-unlock a PerlHash->mu on scope exit */
-typedef struct { int type; PerlValue *ptr; PerlValue saved; } LocalEntry;
+#define LOCAL_ARRAY   4   /* save/restore a PerlArray* (local @arr) */
+#define LOCAL_HASH    5   /* save/restore a PerlHash*  (local %hash) */
+typedef struct {
+    int type;
+    PerlValue *ptr;   /* LOCAL_SCALAR: target PerlValue* */
+    PerlValue saved;  /* LOCAL_SCALAR: saved content */
+    void *ptr2;       /* LOCAL_ARRAY/HASH: slot (PerlArray** or PerlHash**) */
+    void *saved2;     /* LOCAL_ARRAY/HASH: saved pointer value */
+} LocalEntry;
 static __thread LocalEntry s_local_stack[LOCAL_STACK_MAX];
 static __thread int        s_local_depth = 0;
 
@@ -78,6 +86,16 @@ void perl_local_restore_to(int depth) {
             pthread_mutex_unlock(((PerlArray *)e->ptr)->mu);
         } else if (e->type == LOCAL_LOCK_HV) {
             pthread_mutex_unlock(((PerlHash *)e->ptr)->mu);
+        } else if (e->type == LOCAL_ARRAY) {
+            PerlArray **slot = (PerlArray **)e->ptr2;
+            PerlArray *cur   = *slot;
+            *slot = (PerlArray *)e->saved2;
+            if (cur != e->saved2) perl_array_free(cur);
+        } else if (e->type == LOCAL_HASH) {
+            PerlHash **slot = (PerlHash **)e->ptr2;
+            PerlHash *cur   = *slot;
+            *slot = (PerlHash *)e->saved2;
+            if (cur != e->saved2) perl_hash_free(cur);
         } else { /* LOCAL_SCALAR */
             /* free any existing string/blessed_class in the target */
             if ((e->ptr->tag == PERL_STRING) && e->ptr->sval) free(e->ptr->sval);
@@ -85,6 +103,24 @@ void perl_local_restore_to(int depth) {
             *e->ptr = e->saved;  /* restore saved value */
         }
     }
+}
+
+void perl_local_save_array(PerlArray **slot) {
+    if (s_local_depth >= LOCAL_STACK_MAX) return;
+    s_local_stack[s_local_depth].type   = LOCAL_ARRAY;
+    s_local_stack[s_local_depth].ptr    = NULL;
+    s_local_stack[s_local_depth].ptr2   = slot;
+    s_local_stack[s_local_depth].saved2 = *slot;
+    s_local_depth++;
+}
+
+void perl_local_save_hash(PerlHash **slot) {
+    if (s_local_depth >= LOCAL_STACK_MAX) return;
+    s_local_stack[s_local_depth].type   = LOCAL_HASH;
+    s_local_stack[s_local_depth].ptr    = NULL;
+    s_local_stack[s_local_depth].ptr2   = slot;
+    s_local_stack[s_local_depth].saved2 = *slot;
+    s_local_depth++;
 }
 
 /* ── eval / $@ support ───────────────────────────────────────────────────── */
@@ -206,12 +242,36 @@ PerlArray *perl_unwrap_list_return(PerlValue *pv) {
     return av;
 }
 
-/* caller — stub returning (package, file, line) */
-PerlArray *perl_caller(void) {
+/* ── call stack for caller() ─────────────────────────────────────────────── */
+#define CALL_STACK_MAX 512
+typedef struct { const char *package; const char *file; int line; } CallFrame;
+static __thread CallFrame s_call_stack[CALL_STACK_MAX];
+static __thread int       s_call_depth = 0;
+
+void perl_push_call_frame(const char *pkg, const char *file, int line) {
+    if (s_call_depth < CALL_STACK_MAX) {
+        s_call_stack[s_call_depth].package = pkg;
+        s_call_stack[s_call_depth].file    = file;
+        s_call_stack[s_call_depth].line    = line;
+        s_call_depth++;
+    }
+}
+
+void perl_pop_call_frame(void) {
+    if (s_call_depth > 0) s_call_depth--;
+}
+
+PerlArray *perl_caller(int level) {
+    /* s_call_depth-1 is the frame pushed by the current sub's call site.
+       level 0 = immediate caller, level 1 = caller's caller, etc. */
+    int idx = s_call_depth - 1 - level;
+    if (idx < 0) return perl_array_new(); /* out of range → empty list */
     PerlArray *a = perl_array_new();
-    perl_array_push(a, perl_alloc_string("main"));
-    perl_array_push(a, perl_alloc_string("unknown"));
-    perl_array_push(a, perl_alloc_int(0));
+    perl_array_push(a, perl_alloc_string(s_call_stack[idx].package
+                                          ? s_call_stack[idx].package : "main"));
+    perl_array_push(a, perl_alloc_string(s_call_stack[idx].file
+                                          ? s_call_stack[idx].file : ""));
+    perl_array_push(a, perl_alloc_int(s_call_stack[idx].line));
     return a;
 }
 
@@ -225,6 +285,75 @@ void perl_eval_pop(void) {
 }
 
 PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
+
+/* ── runtime require ─────────────────────────────────────────────────────── */
+PerlValue *perl_runtime_require(const char *modname) {
+    if (!modname || !*modname) return perl_alloc_int(1);
+
+    /* Convert Foo::Bar → Foo/Bar.pm  or use literal string as path */
+    char path[1024];
+    if (strstr(modname, "::")) {
+        size_t n = strlen(modname);
+        if (n >= sizeof(path) - 4) return perl_alloc_undef();
+        size_t j = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (modname[i] == ':' && i + 1 < n && modname[i+1] == ':') {
+                path[j++] = '/'; i++;
+            } else {
+                path[j++] = modname[i];
+            }
+        }
+        /* append .pm if not already present */
+        if (j < 3 || memcmp(path + j - 3, ".pm", 3) != 0) {
+            path[j++] = '.'; path[j++] = 'p'; path[j++] = 'm';
+        }
+        path[j] = '\0';
+    } else {
+        snprintf(path, sizeof(path), "%s", modname);
+    }
+
+    /* Search @INC for the file (simple fallback: current dir + lib/) */
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        char libpath[1024];
+        snprintf(libpath, sizeof(libpath), "lib/%s", path);
+        f = fopen(libpath, "r");
+        if (!f) {
+            /* not found — set $@ and return undef */
+            char errmsg[1200];
+            snprintf(errmsg, sizeof(errmsg), "Can't locate %s in @INC", path);
+            PerlValue msg = { .tag = PERL_STRING, .sval = errmsg };
+            perl_assign(&s_dollar_at, &msg);
+            return perl_alloc_undef();
+        }
+        snprintf(path, sizeof(path), "%s", libpath);
+        fclose(f);
+    } else {
+        fclose(f);
+    }
+
+    /* Read the file */
+    f = fopen(path, "r");
+    if (!f) return perl_alloc_undef();
+    fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+    char *code = malloc(sz + 1);
+    if (!code) { fclose(f); return perl_alloc_undef(); }
+    fread(code, 1, sz, f); code[sz] = '\0'; fclose(f);
+
+    /* Execute via JIT eval if available */
+    PerlValue *result = perl_alloc_int(1);
+    if (perl_eval_string_fn) {
+        PerlValue *r = perl_eval_string_fn(code);
+        if (r) perl_free(r);
+        /* check $@ for errors */
+        if (s_dollar_at.tag != PERL_UNDEF && s_dollar_at.sval && s_dollar_at.sval[0]) {
+            free(code);
+            return perl_alloc_undef();
+        }
+    }
+    free(code);
+    return result;
+}
 
 /* ── string eval ─────────────────────────────────────────────────────────── */
 PerlEvalStringFn perl_eval_string_fn = NULL;
@@ -1680,6 +1809,11 @@ static PerlArray *build_dispatch_args(PerlValue *obj, PerlArray *args) {
     return full;
 }
 
+/* ── $AUTOLOAD global ───────────────────────────────────────────────────── */
+static PerlValue s_autoload_pv = { .tag = PERL_UNDEF };
+
+PerlValue *perl_get_autoload_name(void) { return &s_autoload_pv; }
+
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
     /* thread instance methods */
     if (obj && obj->tag == PERL_THREAD) {
@@ -1721,9 +1855,21 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
     }
     PerlSubFnCtx fn = perl_find_method(class_name, method);
     if (!fn) {
-        fprintf(stderr, "Can't locate object method \"%s\" via package \"%s\"\n",
-                method, class_name);
-        exit(1);
+        /* Try AUTOLOAD in the package's ISA chain */
+        fn = perl_find_method(class_name, "AUTOLOAD");
+        if (fn) {
+            /* Set $AUTOLOAD = "Package::method" */
+            char autoload_name[512];
+            snprintf(autoload_name, sizeof(autoload_name), "%s::%s", class_name, method);
+            if (s_autoload_pv.tag == PERL_STRING && s_autoload_pv.sval)
+                free(s_autoload_pv.sval);
+            s_autoload_pv.tag  = PERL_STRING;
+            s_autoload_pv.sval = strdup(autoload_name);
+        } else {
+            fprintf(stderr, "Can't locate object method \"%s\" via package \"%s\"\n",
+                    method, class_name);
+            exit(1);
+        }
     }
     PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
     perl_pop_wantarray();
@@ -3358,6 +3504,13 @@ PerlValue *perl_pos_str(PerlValue *pv) {
     if (!pv) return perl_alloc_undef();
     if (pv->matchpos <= 0) return perl_alloc_undef();
     return perl_alloc_int(pv->matchpos);
+}
+
+void perl_set_pos_str(PerlValue *pv, PerlValue *pos) {
+    if (!pv) return;
+    if (!pos || pos->tag == PERL_UNDEF) { pv->matchpos = 0; return; }
+    long long n = perl_to_int(pos);
+    pv->matchpos = (n < 0) ? 0 : n;
 }
 
 PerlValue *perl_getpid(void) {

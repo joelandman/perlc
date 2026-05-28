@@ -429,7 +429,7 @@ typedef PerlValue *(*PerlSubFnCtx)(PerlArray *, int); /* fn(args, ctx) */
 int perl_push_wantarray(int ctx);
 int perl_pop_wantarray(void);
 PerlValue *perl_wantarray(void);
-PerlArray *perl_caller(void);                  /* caller() — returns (pkg,file,line) */
+PerlArray *perl_caller(int level);             /* caller(N) — returns (pkg,file,line) at N levels up */
 PerlValue *perl_get_plus_hash(void);
 void perl_clear_named_captures(void);
 
@@ -440,6 +440,24 @@ void perl_clear_named_captures(void);
 void       perl_eval_push(jmp_buf *jb); /* push caller's jmp_buf onto eval stack */
 void       perl_eval_pop(void);          /* pop after eval completes */
 PerlValue *perl_get_dollar_at(void);   /* returns stable $@ PerlValue* */
+
+/* ── caller() call stack ─────────────────────────────────────────────────── */
+void perl_push_call_frame(const char *pkg, const char *file, int line);
+void perl_pop_call_frame(void);
+PerlArray *perl_caller(int level);
+
+/* ── local @arr / local %hash ───────────────────────────────────────────── */
+void perl_local_save_array(PerlArray **slot);
+void perl_local_save_hash(PerlHash  **slot);
+
+/* ── AUTOLOAD ────────────────────────────────────────────────────────────── */
+PerlValue *perl_get_autoload_name(void);   /* returns stable $AUTOLOAD PV* */
+
+/* ── pos() write ─────────────────────────────────────────────────────────── */
+void perl_set_pos_str(PerlValue *pv, PerlValue *pos);
+
+/* ── runtime require ─────────────────────────────────────────────────────── */
+PerlValue *perl_runtime_require(const char *modname);
 
 /* ── string eval hook ────────────────────────────────────────────────────── */
 /* Set by eval_jit.cpp (linked only when program uses eval EXPR).

@@ -94,6 +94,8 @@ enum class NK {
                      name=callerPkg when sval starts with "SUPER::"                  */
     SetIsa,       /* use parent 'Base' – name=child_pkg, sval=parent_pkg              */
     LocalStmt,    /* local $x [= expr] – name=var_name, left=init(opt)               */
+    LocalArray,   /* local @arr [= expr] – name=arr_name, left=init(opt)             */
+    LocalHash,    /* local %h   [= expr] – name=hash_name, left=init(opt)            */
     StateDecl,    /* state $x [= expr] – name=var_name, left=init(opt)               */
     WantarrayFunc,/* wantarray()       – no children                                  */
     CallerFunc,   /* caller()          – no children                                  */

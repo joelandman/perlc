@@ -307,6 +307,11 @@ void CodeGen::declareRuntime() {
     /* local() */
     RT("perl_local_save_depth", Type::getInt32Ty(ctx_));
     RT("perl_local_save",       voidTy, pv);
+    RT("perl_local_save_array", voidTy, PointerType::getUnqual(ctx_));
+    RT("perl_local_save_hash",  voidTy, PointerType::getUnqual(ctx_));
+    RT("perl_get_autoload_name", pv);
+    RT("perl_set_pos_str",      voidTy, pv, pv);
+    RT("perl_runtime_require",  pv, i8p);
     RT("perl_local_restore_to", voidTy, Type::getInt32Ty(ctx_));
     /* special globals */
     RT("perl_get_input_sep",    pv);
@@ -317,7 +322,9 @@ RT("perl_wantarray",             pv);
 RT("perl_array_to_list_return",  pv, av);
 RT("perl_unwrap_list_return",    av, pv);
 RT("perl_threads_join",   voidTy, pv);
-    RT("perl_caller",           av);
+    RT("perl_caller",           av,     Type::getInt32Ty(ctx_));
+    RT("perl_push_call_frame",  voidTy, i8p, i8p, Type::getInt32Ty(ctx_));
+    RT("perl_pop_call_frame",   voidTy);
 RT("perl_get_plus_hash",     av);
 RT("perl_clear_named_captures", voidTy);
     RT("perl_defined",          Type::getInt32Ty(ctx_), pv);
@@ -866,7 +873,15 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return res;
     }
     if (n.kind == NK::CallerFunc) {
-        return callRT("perl_caller", {});
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *level;
+        if (n.left) {
+            Value *lv64 = callRT("perl_to_int", {emitExpr(*n.left)});
+            level = builder_.CreateTrunc(lv64, i32Ty);
+        } else {
+            level = ConstantInt::get(i32Ty, 0);
+        }
+        return callRT("perl_caller", {level});
     }
     if (n.kind == NK::ReaddirFunc) {
         Value *slot = lookupVar(n.name);
@@ -1719,6 +1734,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
 
 void CodeGen::compile(const Node &program, const std::string &modName) {
     mod_->setModuleIdentifier(modName);
+    sourceFile_ = modName;
     if (debug_) initializeDebugInfo(modName);
 
     /* collect sub definitions first so forward calls work */
@@ -1832,6 +1848,13 @@ void CodeGen::emitSub(const Node &n) {
 
     if (debug_) {
         builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
+    }
+
+    /* derive package from sub name for caller() tracking */
+    std::string savedPackage = currentPackage_;
+    {
+        auto sc = n.name.rfind("::");
+        currentPackage_ = (sc != std::string::npos) ? n.name.substr(0, sc) : "main";
     }
 
     auto *savedFn = currentFn_;
@@ -1960,6 +1983,7 @@ void CodeGen::emitSub(const Node &n) {
     localDepthAlloca_ = savedLocalDepth;
     currentSubNeedsWantarray_ = savedNeedsWantarray;
     currentFn_ = savedFn;
+    currentPackage_ = savedPackage;
 
     /* restore insert point to end of main (for any remaining stmts) */
     /* caller will set insert point back */
@@ -3134,6 +3158,8 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.name == ",")  return callRT("perl_get_dollar_comma", {});
         if (n.name == "\\") return callRT("perl_get_dollar_bsl",   {});
         if (n.name == "&")  return callRT("perl_get_dollar_amp",   {});
+        /* $AUTOLOAD — set by dispatch when AUTOLOAD is called */
+        if (n.name == "AUTOLOAD") return callRT("perl_get_autoload_name", {});
         {
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
@@ -3317,9 +3343,46 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_getpid", {});
     }
 
+    case NK::LocalArray: {
+        auto git = fileArrayGlobals_.find(n.name);
+        if (git != fileArrayGlobals_.end()) {
+            /* file-scope global: slot is the GlobalVariable* (PerlArray**) */
+            callRT("perl_local_save_array", {git->second});
+            Value *newAV = callRT("perl_array_new", {});
+            if (n.left) {
+                /* local @arr = LIST — extend newAV with rhs */
+                Value *src = emitArrayPtr(*n.left);
+                if (src) callRT("perl_array_extend", {newAV, src});
+                else {
+                    Value *v = emitExpr(*n.left);
+                    callRT("perl_array_push", {newAV, v});
+                }
+            }
+            builder_.CreateStore(newAV, git->second);
+        }
+        /* function-scope arrays have no stable slot; no-op for now */
+        return perlUndef();
+    }
+
+    case NK::LocalHash: {
+        auto git = fileHashGlobals_.find(n.name);
+        if (git != fileHashGlobals_.end()) {
+            callRT("perl_local_save_hash", {git->second});
+            Value *newHV = callRT("perl_hash_new", {});
+            if (n.left) {
+                Value *listArr = callRT("perl_array_new", {});
+                for (auto &e : n.left->args)
+                    callRT("perl_array_push", {listArr, emitExpr(*e)});
+                callRT("perl_hash_from_list", {newHV, listArr});
+            }
+            builder_.CreateStore(newHV, git->second);
+        }
+        return perlUndef();
+    }
+
     case NK::RequireStmt: {
-        /* treat as no-op at runtime — modules loaded at compile time */
-        return perlInt(1);
+        Value *modStr = builder_.CreateGlobalStringPtr(n.sval);
+        return callRT("perl_runtime_require", {modStr});
     }
 
     case NK::Redo: {
@@ -3446,6 +3509,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Assign: {
+        /* pos($str) = N — set regex match position */
+        if (n.left->kind == NK::PosFunc) {
+            Value *str = n.left->left ? emitExpr(*n.left->left)
+                       : (lookupVar("_") ? builder_.CreateLoad(perlPtrTy_, lookupVar("_")) : perlUndef());
+            Value *pos = emitExpr(*n.right);
+            callRT("perl_set_pos_str", {str, pos});
+            return pos;
+        }
         /* ($a,$b,...) = list */
         if (n.left->kind == NK::ArrayLit) {
             callCtx_ = 1;
@@ -4646,7 +4717,17 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_wantarray", {});
 
     case NK::CallerFunc: {
-        Value *av = callRT("perl_caller", {});
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *level;
+        if (n.left) {
+            Value *lv64 = callRT("perl_to_int", {emitExpr(*n.left)});
+            level = builder_.CreateTrunc(lv64, i32Ty);
+        } else {
+            level = ConstantInt::get(i32Ty, 0);
+        }
+        Value *av = callRT("perl_caller", {level});
+        if (callCtx_ == 1) return av;   /* list context: return full array */
+        /* scalar context: return package name (first element) */
         return callRT("perl_array_get", {av, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
     }
 
@@ -4914,7 +4995,16 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         /* thread instance methods — dispatch handles PERL_THREAD objects */
         Value *methodStr = builder_.CreateGlobalStringPtr(n.sval);
-        return callRT("perl_dispatch_method", {obj, methodStr, argsArr});
+        {
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *pkgStr  = builder_.CreateGlobalStringPtr(currentPackage_);
+            Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_);
+            Value *lineVal = ConstantInt::get(i32Ty, n.line);
+            callRT("perl_push_call_frame", {pkgStr, fileStr, lineVal});
+            Value *r = callRT("perl_dispatch_method", {obj, methodStr, argsArr});
+            callRT("perl_pop_call_frame", {});
+            return r;
+        }
     }
 
     default:
@@ -5156,9 +5246,15 @@ Value *CodeGen::emitCall(const Node &n) {
             freeIfOwned(v);
         }
         auto *i32Ty = Type::getInt32Ty(ctx_);
+        /* push call frame so caller() inside the callee can inspect the call site */
+        Value *pkgStr  = builder_.CreateGlobalStringPtr(currentPackage_, "caller.pkg");
+        Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_,     "caller.file");
+        Value *lineVal = ConstantInt::get(i32Ty, n.line);
+        callRT("perl_push_call_frame", {pkgStr, fileStr, lineVal});
         Value *ctxVal = ConstantInt::get(i32Ty, callCtx_);
         callCtx_ = 0;
         Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
+        callRT("perl_pop_call_frame", {});
         callRT("perl_array_free", {argsArr});
         return retVal;
     }
