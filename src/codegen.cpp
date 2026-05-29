@@ -141,6 +141,12 @@ void CodeGen::declareRuntime() {
     RT("perl_mod",           pv,  pv, pv);
     RT("perl_pow",           pv,  pv, pv);
     RT("perl_negate",        pv,  pv);
+    RT("perl_bitand",        pv,  pv, pv);
+    RT("perl_bitor",         pv,  pv, pv);
+    RT("perl_bitxor",        pv,  pv, pv);
+    RT("perl_bitnot",        pv,  pv);
+    RT("perl_lshift",        pv,  pv, pv);
+    RT("perl_rshift",        pv,  pv, pv);
     RT("perl_concat",        pv,  pv, pv);
     RT("perl_repeat_str",    pv,  pv, pv);
     RT("perl_num_eq",        pv,  pv, pv);
@@ -326,6 +332,8 @@ RT("perl_threads_join",   voidTy, pv);
     RT("perl_push_call_frame",  voidTy, i8p, i8p, Type::getInt32Ty(ctx_));
     RT("perl_pop_call_frame",   voidTy);
 RT("perl_get_plus_hash",     av);
+    RT("perl_plus_hash_get",     pv, pv);
+    RT("perl_plus_hash_keys",    av);
 RT("perl_clear_named_captures", voidTy);
     RT("perl_defined",          Type::getInt32Ty(ctx_), pv);
     /* filesystem */
@@ -536,9 +544,14 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return lookupArray(n.name);
     }
     if (n.kind == NK::KeysFunc) {
-        Value *h = lookupHash(n.name);
-        if (!h) return callRT("perl_array_new", {});
-        Value *av = callRT("perl_hash_keys", {h});
+        Value *av;
+        if (n.name == "+") {
+            av = callRT("perl_plus_hash_keys", {});
+        } else {
+            Value *h = lookupHash(n.name);
+            if (!h) return callRT("perl_array_new", {});
+            av = callRT("perl_hash_keys", {h});
+        }
         if (!n.sval.empty()) callRT("perl_array_sort_str", {av}); /* "sort" flag */
         return av;
     }
@@ -3468,6 +3481,12 @@ Value *CodeGen::emitExpr(const Node &n) {
             freeIfOwned(operand);
             return result;
         }
+        if (n.sval == "~") {
+            Value *operand = emitExpr(*n.left);
+            Value *result  = callRT("perl_bitnot", {operand});
+            freeIfOwned(operand);
+            return result;
+        }
         if (n.sval == "pre++" || n.sval == "pre--" ||
             n.sval == "post++" || n.sval == "post--") {
             /* fast path: unboxed integer variable */
@@ -3748,12 +3767,46 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::CompoundAssign: {
+        /* short-circuit compound assignments: ||= &&= //= */
+        if (n.sval == "||" || n.sval == "&&" || n.sval == "//") {
+            auto *fn    = builder_.GetInsertBlock()->getParent();
+            auto *rhsBB = BasicBlock::Create(ctx_, "sca.rhs", fn);
+            auto *endBB = BasicBlock::Create(ctx_, "sca.end", fn);
+            Value *lhsPtr = emitLValue(*n.left);
+            if (!lhsPtr) return perlUndef();
+            Value *lhsVal = builder_.CreateLoad(perlPtrTy_, lhsPtr);
+            Value *test;
+            if (n.sval == "//")
+                test = builder_.CreateICmpNE(callRT("perl_defined", {lhsVal}),
+                                             ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+            else {
+                Value *b = callRT("perl_is_true", {lhsVal});
+                test = builder_.CreateICmpNE(b, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+                if (n.sval == "&&") test = builder_.CreateNot(test); /* assign when false */
+            }
+            builder_.CreateCondBr(test, endBB, rhsBB);
+            builder_.SetInsertPoint(rhsBB);
+            Value *rhsVal = emitExpr(*n.right);
+            callRT("perl_assign", {lhsVal, rhsVal});
+            freeIfOwned(rhsVal);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            return lhsVal;
+        }
         auto applyOp = [&](Value *lv, Value *rv) -> Value * {
-            if      (n.sval == "+") return callRT("perl_add",    {lv, rv});
-            else if (n.sval == "-") return callRT("perl_sub",    {lv, rv});
-            else if (n.sval == "*") return callRT("perl_mul",    {lv, rv});
-            else if (n.sval == "/") return callRT("perl_div",    {lv, rv});
-            else if (n.sval == ".") return callRT("perl_concat", {lv, rv});
+            if      (n.sval == "+")  return callRT("perl_add",        {lv, rv});
+            else if (n.sval == "-")  return callRT("perl_sub",        {lv, rv});
+            else if (n.sval == "*")  return callRT("perl_mul",        {lv, rv});
+            else if (n.sval == "/")  return callRT("perl_div",        {lv, rv});
+            else if (n.sval == ".")  return callRT("perl_concat",     {lv, rv});
+            else if (n.sval == "%")  return callRT("perl_mod",        {lv, rv});
+            else if (n.sval == "**") return callRT("perl_pow",        {lv, rv});
+            else if (n.sval == "x")  return callRT("perl_repeat_str", {lv, rv});
+            else if (n.sval == "&")  return callRT("perl_bitand",     {lv, rv});
+            else if (n.sval == "|")  return callRT("perl_bitor",      {lv, rv});
+            else if (n.sval == "^")  return callRT("perl_bitxor",     {lv, rv});
+            else if (n.sval == "<<") return callRT("perl_lshift",     {lv, rv});
+            else if (n.sval == ">>") return callRT("perl_rshift",     {lv, rv});
             else return perlUndef();
         };
         /* int/float var: $x op= rhs */
@@ -4193,12 +4246,20 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *key = emitExpr(*n.left);
             return callRT("perl_env_get", {key});
         }
+        if (n.name == "+") {
+            Value *key = emitExpr(*n.left);
+            return callRT("perl_plus_hash_get", {key});
+        }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
         return emitHashGetRef(hv, *n.left);
     }
 
     case NK::KeysFunc: {
+        if (n.name == "+") {
+            Value *av = callRT("perl_plus_hash_keys", {});
+            return callRT("perl_array_len", {av});
+        }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlInt(0);
         /* in scalar context return count; sort flag handled by emitArrayPtr */
@@ -5144,6 +5205,8 @@ Value *CodeGen::emitBinOp(const Node &n) {
         {"+",  "perl_add"   }, {"-",  "perl_sub"   }, {"*",  "perl_mul"   },
         {"/",  "perl_div"   }, {"%",  "perl_mod"   }, {"**", "perl_pow"   },
         {".",  "perl_concat"},
+        {"&",  "perl_bitand"}, {"|",  "perl_bitor" }, {"^",  "perl_bitxor"},
+        {"<<", "perl_lshift"}, {">>", "perl_rshift"},
         {"==", "perl_num_eq"}, {"!=", "perl_num_ne"},
         {"<",  "perl_num_lt"}, {">",  "perl_num_gt"},
         {"<=", "perl_num_le"}, {">=", "perl_num_ge"},

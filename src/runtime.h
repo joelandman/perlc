@@ -80,6 +80,12 @@ PerlValue *perl_div(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_pow(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_negate(const PerlValue *a);
+PerlValue *perl_bitand(const PerlValue *a, const PerlValue *b);
+PerlValue *perl_bitor(const PerlValue *a, const PerlValue *b);
+PerlValue *perl_bitxor(const PerlValue *a, const PerlValue *b);
+PerlValue *perl_bitnot(const PerlValue *a);
+PerlValue *perl_lshift(const PerlValue *a, const PerlValue *b);
+PerlValue *perl_rshift(const PerlValue *a, const PerlValue *b);
 
 /* string ops */
 PerlValue *perl_concat(const PerlValue *a, const PerlValue *b);
@@ -431,6 +437,8 @@ int perl_pop_wantarray(void);
 PerlValue *perl_wantarray(void);
 PerlArray *perl_caller(int level);             /* caller(N) — returns (pkg,file,line) at N levels up */
 PerlValue *perl_get_plus_hash(void);
+PerlValue *perl_plus_hash_get(PerlValue *key);
+PerlArray *perl_plus_hash_keys(void);
 void perl_clear_named_captures(void);
 
 /* ── eval / exception handling ───────────────────────────────────────────── */

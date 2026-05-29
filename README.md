@@ -71,7 +71,7 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 ### Core Language Features (Nearly Complete)
 
-**Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--` (including magical string increment), compound assignment
+**Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--` (including magical string increment), compound assignment (`+=` `-=` `*=` `/=` `.=` `%=` `**=` `||=` `&&=` `//=` `&=` `|=` `^=` `<<=` `>>=` `x=`)
 
 **Arrays**: `@arr`, push/pop/shift/unshift (all flatten array args), `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`; `my @a = (@b, @c)` properly flattens
 
@@ -91,7 +91,7 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
-**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`
+**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`, named captures `(?<name>...)` → `$+{name}` / `keys %+`
 
 **tr///**: `$s =~ tr/SEARCH/REPLACE/flags` — character translation; flags: `d` (delete), `s` (squeeze), `c` (complement); ranges `a-z`; returns count
 
@@ -101,7 +101,7 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **File I/O**: `open(my $fh, mode, file)`, `open(my $fh, "modeFile")` (2-arg), `close($fh)`, `<$fh>` (scalar readline), `my @lines = <$fh>` (array readline), `print $fh`, `say $fh`, `printf $fh`, `eof($fh)`, `die`, `print STDERR`, `unlink`
 
-**Operators**: `<=>` (spaceship numeric), `cmp` (spaceship string)
+**Operators**: `<=>` (spaceship numeric), `cmp` (spaceship string), `x` (string repetition), bitwise `&` `|` `^` `~` `<<` `>>`, low-precedence `and` `or` `not`
 
 **List ops**: `map { BLOCK } LIST`, `grep { BLOCK } LIST`, `sort { CMP } LIST` (with `$a`/`$b` comparator patterns), `reverse @arr` (array), `scalar reverse $str` (string)
 
@@ -117,7 +117,11 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **Builtins**: chomp, chop, length, substr, join, split, push, pop, shift, unshift, splice, sort, keys, values, exists, delete, scalar, defined, ref, warn, print, say, printf, sprintf, unlink
 
-**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space)
+**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space), `"@{expr}"`, `"@$ref"`, `"${\expr}"`
+
+**Array last index**: `$#arr` (equivalent to `scalar(@arr) - 1`)
+
+**`qq{...}`**: double-quoted string with balanced brace support — nested `{` `}` do not terminate the string
 
 **Command-line**: `@ARGV` (arguments), `$0` (program name); generated `main` accepts `int argc, char **argv`
 
@@ -150,13 +154,15 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 ## Known Limitations
 
 - `wantarray`: always returns false (scalar context); full context tracking not implemented
-- `caller()`: stub implementation only
+- `caller()`: stub implementation only (returns empty list)
 - `local` for arrays and hashes: scalars and special vars (`$!`, `$/`) only
+- `AUTOLOAD` method dispatch: not implemented
 - `tie` / `untie`: not implemented (use `opendir`/`readdir` for directories)
 - Regex modifiers `x` (extended) and `e` (eval replacement): not supported
 - Runtime `require` / `do FILE`: modules only loaded at compile time via `use` inlining
-- `AUTOLOAD`, `DESTROY`: not implemented
+- `DESTROY`: not implemented
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
+- `or`/`and`/`not` precedence in `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0`); wrap in parens if needed
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
 - REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
 - JIT mode: experimental, may have stability issues

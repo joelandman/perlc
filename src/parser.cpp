@@ -208,12 +208,17 @@ NodePtr Parser::parseStmt() {
             fhname = cur().text; advance();
         } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
             TK t2 = peek(2).kind;
-            /* only treat $var as filehandle when the next token starts a new
-             * expression — not when it's an operator or list separator */
-            /* LBRACKET/LBRACE excluded: $arr[i] and $hash{k} are subscripts, not fh */
             bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
                             t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                            t2 == TK::IDENT  || t2 == TK::LPAREN);
+                            t2 == TK::LPAREN);
+            if (!isFhCtx && t2 == TK::IDENT) {
+                const std::string &t2txt = peek(2).text;
+                static const std::string cmpOps[] = {"eq","ne","lt","gt","le","ge","cmp","x","xor","and","or","not",""};
+                bool isCmpOp = false;
+                for (int i = 0; !cmpOps[i].empty(); i++)
+                    if (t2txt == cmpOps[i]) { isCmpOp = true; break; }
+                isFhCtx = !isCmpOp;
+            }
             if (isFhCtx) { pos_++; fhname = advance().text; }
         }
         bool hasParen = check(TK::LPAREN);
@@ -604,7 +609,16 @@ NodePtr Parser::parsePrint(bool isSay) {
         /* LBRACKET/LBRACE excluded: $arr[i] and $hash{k} are subscripts, not fh */
         bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
                         t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                        t2 == TK::IDENT  || t2 == TK::LPAREN);
+                        t2 == TK::LPAREN);
+        /* IDENT at t2 only if it's not a string-comparison or x operator */
+        if (!isFhCtx && t2 == TK::IDENT) {
+            const std::string &t2txt = peek(2).text;
+            static const std::string cmpOps[] = {"eq","ne","lt","gt","le","ge","cmp","x","xor","and","or","not",""};
+            bool isCmpOp = false;
+            for (int i = 0; !cmpOps[i].empty(); i++)
+                if (t2txt == cmpOps[i]) { isCmpOp = true; break; }
+            isFhCtx = !isCmpOp;
+        }
         if (isFhCtx) {
             pos_++;  /* skip $ */
             fhname = advance().text;  /* variable name */
@@ -761,7 +775,38 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
 
 /* ── expressions ─────────────────────────────────────────────────────────── */
 
-NodePtr Parser::parseExpr()    { return parseAssign(); }
+NodePtr Parser::parseExpr()    { return parseLowOr(); }
+
+/* low-precedence: or / xor (below assignment) */
+NodePtr Parser::parseLowOr() {
+    auto lhs = parseLowAnd();
+    while (check(TK::KW_OR) || (cur().kind == TK::IDENT && cur().text == "xor")) {
+        int line = cur().line; advance();
+        auto rhs = parseLowAnd();
+        lhs = makeBin("||", std::move(lhs), std::move(rhs), line);
+    }
+    return lhs;
+}
+
+/* low-precedence: and (below assignment) */
+NodePtr Parser::parseLowAnd() {
+    auto lhs = parseLowNot();
+    while (check(TK::KW_AND)) {
+        int line = cur().line; advance();
+        auto rhs = parseLowNot();
+        lhs = makeBin("&&", std::move(lhs), std::move(rhs), line);
+    }
+    return lhs;
+}
+
+/* low-precedence: not (below assignment) */
+NodePtr Parser::parseLowNot() {
+    if (check(TK::KW_NOT)) {
+        int line = cur().line; advance();
+        return makeUnary("!", parseLowNot(), line);
+    }
+    return parseAssign();
+}
 
 NodePtr Parser::parseAssign() {
     auto lhs = parseTernary();
@@ -775,17 +820,38 @@ NodePtr Parser::parseAssign() {
     }
     /* compound assignment */
     TK k = cur().kind;
-    if (k == TK::PLUS_ASSIGN || k == TK::MINUS_ASSIGN ||
-        k == TK::STAR_ASSIGN || k == TK::SLASH_ASSIGN || k == TK::DOT_ASSIGN) {
-        std::string op; advance();
-        if (k == TK::PLUS_ASSIGN)  op = "+";
-        else if (k == TK::MINUS_ASSIGN) op = "-";
-        else if (k == TK::STAR_ASSIGN)  op = "*";
-        else if (k == TK::SLASH_ASSIGN) op = "/";
-        else op = ".";
+    /* x= is two tokens (IDENT "x" followed by ASSIGN) */
+    bool isXAssign = (k == TK::IDENT && cur().text == "x" && peek(1).kind == TK::ASSIGN);
+    if (isXAssign || k == TK::PLUS_ASSIGN || k == TK::MINUS_ASSIGN ||
+        k == TK::STAR_ASSIGN || k == TK::SLASH_ASSIGN || k == TK::DOT_ASSIGN ||
+        k == TK::PERCENT_ASSIGN || k == TK::POW_ASSIGN ||
+        k == TK::OR_ASSIGN || k == TK::AND_ASSIGN || k == TK::DEFINED_OR_ASSIGN ||
+        k == TK::BITAND_ASSIGN || k == TK::BITOR_ASSIGN || k == TK::BITXOR_ASSIGN ||
+        k == TK::LSHIFT_ASSIGN || k == TK::RSHIFT_ASSIGN || k == TK::X_ASSIGN) {
+        std::string op;
+        if (isXAssign) { advance(); advance(); op = "x"; } /* skip 'x' and '=' */
+        else {
+            advance();
+            switch (k) {
+                case TK::PLUS_ASSIGN:     op = "+";  break;
+                case TK::MINUS_ASSIGN:    op = "-";  break;
+                case TK::STAR_ASSIGN:     op = "*";  break;
+                case TK::SLASH_ASSIGN:    op = "/";  break;
+                case TK::DOT_ASSIGN:      op = ".";  break;
+                case TK::PERCENT_ASSIGN:  op = "%";  break;
+                case TK::POW_ASSIGN:      op = "**"; break;
+                case TK::OR_ASSIGN:       op = "||"; break;
+                case TK::AND_ASSIGN:      op = "&&"; break;
+                case TK::DEFINED_OR_ASSIGN: op = "//"; break;
+                case TK::BITAND_ASSIGN:   op = "&";  break;
+                case TK::BITOR_ASSIGN:    op = "|";  break;
+                case TK::BITXOR_ASSIGN:   op = "^";  break;
+                case TK::LSHIFT_ASSIGN:   op = "<<"; break;
+                case TK::RSHIFT_ASSIGN:   op = ">>"; break;
+                default: op = "x"; break;
+            }
+        }
         auto rhs = parseAssign();
-        /* desugar lhs op= rhs → lhs = lhs op rhs */
-        /* need a clone of lhs — since we already moved it, build assign directly */
         auto n = std::make_unique<Node>(); n->kind = NK::CompoundAssign;
         n->sval = op; n->left = std::move(lhs); n->right = std::move(rhs); n->line = line;
         return n;
@@ -820,7 +886,7 @@ NodePtr Parser::parseTernary() {
 
 NodePtr Parser::parseOr() {
     auto lhs = parseAnd();
-    while (check(TK::OR2) || check(TK::KW_OR) || check(TK::DEFINED_OR)) {
+    while (check(TK::OR2) || check(TK::DEFINED_OR)) {
         int line = cur().line;
         std::string op = check(TK::DEFINED_OR) ? "//" : "||";
         advance();
@@ -831,25 +897,59 @@ NodePtr Parser::parseOr() {
 }
 
 NodePtr Parser::parseAnd() {
-    auto lhs = parseNot();
-    while (check(TK::AND2) || check(TK::KW_AND)) {
+    auto lhs = parseBitOr();
+    while (check(TK::AND2)) {
         int line = cur().line; advance();
-        auto rhs = parseNot();
+        auto rhs = parseBitOr();
         lhs = makeBin("&&", std::move(lhs), std::move(rhs), line);
     }
     return lhs;
 }
 
+NodePtr Parser::parseBitOr() {
+    auto lhs = parseBitAnd();
+    while (check(TK::OR) || check(TK::CARET)) {
+        int line = cur().line;
+        std::string op = check(TK::CARET) ? "^" : "|";
+        advance();
+        auto rhs = parseBitAnd();
+        lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
+    }
+    return lhs;
+}
+
+NodePtr Parser::parseBitAnd() {
+    auto lhs = parseNot();
+    while (check(TK::AND)) {
+        int line = cur().line; advance();
+        auto rhs = parseNot();
+        lhs = makeBin("&", std::move(lhs), std::move(rhs), line);
+    }
+    return lhs;
+}
+
 NodePtr Parser::parseNot() {
-    if (check(TK::NOT) || check(TK::KW_NOT)) {
+    if (check(TK::NOT)) {
         int line = cur().line; advance();
         return makeUnary("!", parseNot(), line);
     }
     return parseCmp();
 }
 
-NodePtr Parser::parseBinding() {
+NodePtr Parser::parseShift() {
     auto lhs = parseAdd();
+    while (check(TK::LSHIFT) || check(TK::RSHIFT)) {
+        int line = cur().line;
+        std::string op = check(TK::LSHIFT) ? "<<" : ">>";
+        advance();
+        auto rhs = parseAdd();
+        lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
+    }
+    return lhs;
+}
+
+NodePtr Parser::parseBinding() {
+    auto lhs = parseShift();
     while (check(TK::BIND) || check(TK::NBIND)) {
         bool negated = check(TK::NBIND);
         int line = cur().line; advance();
@@ -940,9 +1040,14 @@ NodePtr Parser::parseAdd() {
 
 NodePtr Parser::parseMul() {
     auto lhs = parseUnary();
-    while (check(TK::STAR) || check(TK::SLASH) || check(TK::PERCENT)) {
+    while (check(TK::STAR) || check(TK::SLASH) || check(TK::PERCENT) ||
+           (cur().kind == TK::IDENT && cur().text == "x" && peek(1).kind != TK::ASSIGN)) {
         int line = cur().line;
-        std::string op; op += (check(TK::STAR) ? '*' : (check(TK::SLASH) ? '/' : '%'));
+        std::string op;
+        if (check(TK::STAR))  op = "*";
+        else if (check(TK::SLASH)) op = "/";
+        else if (check(TK::PERCENT)) op = "%";
+        else op = "x"; /* IDENT "x" */
         advance();
         auto rhs = parseUnary();
         lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
@@ -954,6 +1059,7 @@ NodePtr Parser::parseUnary() {
     int line = cur().line;
     if (check(TK::MINUS)) { advance(); return makeUnary("-", parsePow(), line); }
     if (check(TK::NOT))   { advance(); return makeUnary("!", parsePow(), line); }
+    if (check(TK::TILDE)) { advance(); return makeUnary("~", parsePow(), line); }
     if (check(TK::PLUS_PLUS)) {
         advance(); return makeUnary("pre++", parsePostfix(), line);
     }
@@ -1267,6 +1373,14 @@ NodePtr Parser::parsePrimary() {
 
     /* scalar variable: $name  or  $$ref (scalar deref) */
     if (check(TK::SCALAR)) {
+        /* $#arr — last index (scalar(@arr) - 1) */
+        if (!cur().text.empty() && cur().text[0] == '#') {
+            std::string arrname = cur().text.substr(1);
+            advance();
+            auto scNode = std::make_unique<Node>();
+            scNode->kind = NK::ScalarFunc; scNode->name = arrname; scNode->line = line;
+            return makeBin("-", std::move(scNode), makeInt(1, line), line);
+        }
         /* $^O and similar control variables — text encodes "^X" */
         if (cur().text.size() == 2 && cur().text[0] == '^') {
             char ctrl = cur().text[1];
@@ -1276,6 +1390,20 @@ NodePtr Parser::parsePrimary() {
                 n->sval = "osname"; n->line = line; return n;
             }
             return makeScalar(std::string("^") + ctrl, line);
+        }
+        /* $+ — named-capture hash (single-token: SCALAR text="+") */
+        if (cur().text == "+") {
+            advance();
+            if (check(TK::LBRACE)) {
+                advance();
+                auto key = parseExpr();
+                consume(TK::RBRACE, "}");
+                auto n = std::make_unique<Node>();
+                n->kind = NK::HashElem; n->name = "+";
+                n->left = std::move(key); n->line = line;
+                return n;
+            }
+            return makeScalar("+", line);
         }
         advance(); /* skip $ */
         /* $@ — eval error variable */

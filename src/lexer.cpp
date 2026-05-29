@@ -155,9 +155,16 @@ Token Lexer::readRegex() {
         char c = src_[pos_];
         if (c == '/') { pos_++; break; }
         if (c == '\\' && pos_ + 1 < src_.size()) {
-            pattern += c;
-            pattern += src_[++pos_];
-            pos_++;
+            char nxt = src_[pos_ + 1];
+            if (nxt == '\\') {
+                /* \\ in source → single \ in pattern (Perl regex semantics) */
+                pattern += '\\';
+                pos_ += 2;
+            } else {
+                pattern += c;
+                pattern += src_[++pos_];
+                pos_++;
+            }
             continue;
         }
         if (c == '\n') line_++;
@@ -306,11 +313,34 @@ std::vector<Token> Lexer::tokenize() {
             toks.push_back({TK::QWORDS, words, line_}); continue;
         }
 
-        /* q{} qq{} */
+        /* q{} qq{} — with balanced-brace support */
         if (c == 'q' && (peek(1) == '{' || peek(1) == 'q')) {
             bool dq = (peek(1) == 'q');
             pos_ += 2;
-            if (peek() == '{') { pos_++; }
+            if (peek() == '{') {
+                pos_++; /* skip '{' */
+                /* balanced brace scan */
+                std::string raw;
+                int depth = 1;
+                while (pos_ < src_.size() && depth > 0) {
+                    char ch = src_[pos_];
+                    if (ch == '\\' && pos_+1 < src_.size()) {
+                        char esc = src_[pos_+1]; pos_ += 2;
+                        switch (esc) {
+                            case 'n': raw += '\n'; break; case 't': raw += '\t'; break;
+                            case 'r': raw += '\r'; break; case '\\': raw += '\\'; break;
+                            default:  raw += '\\'; raw += esc; break;
+                        }
+                        continue;
+                    }
+                    if (ch == '{') depth++;
+                    else if (ch == '}') { if (--depth == 0) { pos_++; break; } }
+                    if (ch == '\n') line_++;
+                    raw += ch; pos_++;
+                }
+                Token t{TK::STRING, dq ? "\x01" + raw : raw, line_};
+                toks.push_back(t); continue;
+            }
             Token t = readString('}');
             if (dq) t.text = "\x01" + t.text;
             toks.push_back(t); continue;
@@ -359,6 +389,18 @@ std::vector<Token> Lexer::tokenize() {
             TK k = (c == '$') ? TK::SCALAR : TK::ARRAY;
             pos_++;
             toks.push_back({k, std::string(1, c), line_});
+            /* $#arr — last index of array */
+            if (c == '$' && pos_ < src_.size() && src_[pos_] == '#') {
+                char nxt = (pos_+1 < src_.size()) ? src_[pos_+1] : 0;
+                if (isalpha((unsigned char)nxt) || nxt == '_') {
+                    pos_++; /* skip '#' */
+                    std::string arrname;
+                    while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+                        arrname += src_[pos_++];
+                    toks.back().text = "#" + arrname;
+                    continue;
+                }
+            }
     if (c == '$' && pos_ < src_.size() && src_[pos_] == '+') {
       pos_++;
       toks.back().text = "+";
@@ -392,7 +434,7 @@ std::vector<Token> Lexer::tokenize() {
             }();
             if (afterValue) {
                 pos_++;
-                if (peek() == '=') { pos_++; toks.push_back({TK::PLUS_ASSIGN, "%=", line_}); }
+                if (peek() == '=') { pos_++; toks.push_back({TK::PERCENT_ASSIGN, "%=", line_}); }
                 else toks.push_back({TK::PERCENT, "%", line_});
             } else {
                 pos_++;
@@ -414,17 +456,15 @@ std::vector<Token> Lexer::tokenize() {
             }();
             pos_++; /* consume '/' */
             if (afterValue) {
-                if (peek() == '/') { pos_++; toks.push_back({TK::DEFINED_OR, "//", line_}); }
+                if (peek() == '/') {
+                    pos_++;
+                    if (peek() == '=') { pos_++; toks.push_back({TK::DEFINED_OR_ASSIGN, "//=", line_}); }
+                    else toks.push_back({TK::DEFINED_OR, "//", line_});
+                }
                 else if (peek() == '=') { pos_++; toks.push_back({TK::SLASH_ASSIGN, "/=", line_}); }
                 else toks.push_back({TK::SLASH, "/", line_});
             } else {
                 toks.push_back(readRegex());
-            }
-            /* ||= defined-or assignment operator */
-            if (peek() == '|' && peek(1) == '|' && peek(2) == '=') {
-                pos_ += 3;
-                toks.push_back({TK::OR_ASSIGN, "||=", line_});
-                continue;
             }
             continue;
         }
@@ -474,7 +514,11 @@ std::vector<Token> Lexer::tokenize() {
                 }
                 break;
             case '*':
-                if (peek() == '*') { pos_++; toks.push_back({TK::STAR_STAR, "**", line_}); }
+                if (peek() == '*') {
+                    pos_++;
+                    if (peek() == '=') { pos_++; toks.push_back({TK::POW_ASSIGN, "**=", line_}); }
+                    else toks.push_back({TK::STAR_STAR, "**", line_});
+                }
                 else if (peek() == '=') { pos_++; toks.push_back({TK::STAR_ASSIGN, "*=", line_}); }
                 else toks.push_back({TK::STAR, "*", line_});
                 break;
@@ -501,7 +545,9 @@ std::vector<Token> Lexer::tokenize() {
                     pos_++; /* consume second < */
                     Token t = readHeredoc();
                     if (t.kind != TK::EOF_TOK) { toks.push_back(t); break; }
-                    /* fallthrough: treat as unknown (no bare << operator in Perl we need) */
+                    /* not a heredoc — emit shift operator */
+                    if (peek() == '=') { pos_++; toks.push_back({TK::LSHIFT_ASSIGN, "<<=", line_}); }
+                    else toks.push_back({TK::LSHIFT, "<<", line_});
                     break;
                 }
                 if (peek() == '=' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '>') {
@@ -531,16 +577,38 @@ std::vector<Token> Lexer::tokenize() {
                 break;
             }
             case '>':
-                if (peek() == '=') { pos_++; toks.push_back({TK::GE, ">=", line_}); }
+                if (peek() == '>') {
+                    pos_++;
+                    if (peek() == '=') { pos_++; toks.push_back({TK::RSHIFT_ASSIGN, ">>=", line_}); }
+                    else toks.push_back({TK::RSHIFT, ">>", line_});
+                }
+                else if (peek() == '=') { pos_++; toks.push_back({TK::GE, ">=", line_}); }
                 else toks.push_back({TK::GT, ">", line_});
                 break;
             case '&':
-                if (peek() == '&') { pos_++; toks.push_back({TK::AND2, "&&", line_}); }
+                if (peek() == '&') {
+                    pos_++;
+                    if (peek() == '=') { pos_++; toks.push_back({TK::AND_ASSIGN, "&&=", line_}); }
+                    else toks.push_back({TK::AND2, "&&", line_});
+                }
+                else if (peek() == '=') { pos_++; toks.push_back({TK::BITAND_ASSIGN, "&=", line_}); }
                 else toks.push_back({TK::AND, "&", line_});
                 break;
             case '|':
-                if (peek() == '|') { pos_++; toks.push_back({TK::OR2, "||", line_}); }
+                if (peek() == '|') {
+                    pos_++;
+                    if (peek() == '=') { pos_++; toks.push_back({TK::OR_ASSIGN, "||=", line_}); }
+                    else toks.push_back({TK::OR2, "||", line_});
+                }
+                else if (peek() == '=') { pos_++; toks.push_back({TK::BITOR_ASSIGN, "|=", line_}); }
                 else toks.push_back({TK::OR, "|", line_});
+                break;
+            case '^':
+                if (peek() == '=') { pos_++; toks.push_back({TK::BITXOR_ASSIGN, "^=", line_}); }
+                else toks.push_back({TK::CARET, "^", line_});
+                break;
+            case '~':
+                toks.push_back({TK::TILDE, "~", line_});
                 break;
             default:
                 /* skip unknown */

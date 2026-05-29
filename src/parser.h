@@ -48,14 +48,20 @@ private:
     NodePtr parseModifier(NodePtr stmt, int line);
 
     NodePtr parseExpr();
+    NodePtr parseLowOr();
+    NodePtr parseLowAnd();
+    NodePtr parseLowNot();
     NodePtr parseAssign();
     NodePtr parseTernary();
     NodePtr parseRange();
     NodePtr parseOr();
     NodePtr parseAnd();
+    NodePtr parseBitOr();
+    NodePtr parseBitAnd();
     NodePtr parseNot();
     NodePtr parseCmp();
     NodePtr parseBinding();
+    NodePtr parseShift();
     NodePtr parseAdd();
     NodePtr parseMul();
     NodePtr parseUnary();

@@ -4,7 +4,7 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 27/27 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, and DESTROY. **New features include XS interface and DBI/SQLite integration**.
+**Current Status**: Core language features are ~99% implemented with 35/35 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, DESTROY, XS interface, and DBI/SQLite integration. **New: bitwise operators, shift operators, all compound assignments, `$#arr`, `x` string repetition, named-capture `$+{key}` / `keys %+`, `qq{...}` balanced braces, low-precedence `or`/`and`/`not`**.
 
 ## Build & Test
 
@@ -44,7 +44,7 @@ make clean
 
 ### Core Language
 - **Variables & Literals**: scalars, arrays, hashes, integers, floats, strings (single/double-quoted with interpolation), `undef`
-- **Operators**: arithmetic, string (`.` , `x`), range (`..`), comparisons (`==`, `eq`, `<=>`, `cmp`), logical, increment/decrement (`++`/`--` including magical string increment), compound assignment, ternary
+- **Operators**: arithmetic, string (`.`, `x` repetition), range (`..`), comparisons (`==`, `eq`, `<=>`, `cmp`), logical (`&&`, `||`, `!`, `//`), low-precedence (`and`, `or`, `not`), bitwise (`&`, `|`, `^`, `~`, `<<`, `>>`), increment/decrement (`++`/`--` including magical string increment), compound assignment (`+=`, `-=`, `*=`, `/=`, `.=`, `%=`, `**=`, `||=`, `&&=`, `//=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `x=`), ternary
 - **Control Flow**: `if`/`elsif`/`else`, `unless`, `while`/`until` (including `while (my $var = expr)`), `do-while`/`do-until`, C-style `for`, `foreach`, `last`/`next`, statement modifiers
 - **Subroutines**: named and anonymous subs, recursion, `@_`, list unpacking, code references (`\&sub`, `$f->()`), `ref()` returning `"CODE"`
 - **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort` (including `sort { BLOCK }`), `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete`, `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`
@@ -59,7 +59,7 @@ make clean
 
 ### Advanced Features
 - **References**: all types (`\$x`, `\@arr`, `\%hash`, `\&sub`), anonymous arrays/hashes, dereferencing (`$$ref`, `@$ref`, `%$ref`, `->`), `ref()`
-- **Regex (PCRE2)**: `=~`/`!~`, captures (`$1`-`$9`), substitution (`s///`), `/g` iterator and list context, `split` with regex, flags `i/g/s/m`, named captures `(?<name>)` → `%+{name}`
+- **Regex (PCRE2)**: `=~`/`!~`, captures (`$1`-`$9`), substitution (`s///`), `/g` iterator and list context, `split` with regex, flags `i/g/s/m`, named captures `(?<name>)` → `$+{name}` / `keys %+`
 - **String Interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`, `"@arr"` (space-joined)
 - **Heredocs**: `<<END`, `<<'END'`, `<<"END"` with proper interpolation and lexer support
 - **Special Variables**: `$_` (default for many builtins), `$!` (errno), `$/` (input separator with `local` support)
@@ -91,21 +91,22 @@ make clean
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (26/26)
+## Passing Tests (35/35)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
 - Data structures: `hash.pl`, `refs.pl`, `builtins.pl`, `builtins2.pl`
-- I/O & strings: `fileio.pl`, `sprintf.pl`
-- Advanced: `regex.pl`, `regex_g.pl`, `advanced.pl`, `features.pl`
+- I/O & strings: `fileio.pl`, `fileops.pl`, `sprintf.pl`
+- Advanced: `regex.pl`, `regex_g.pl`, `regex_named.pl`, `advanced.pl`, `features.pl`
 - OOP & modules: `oop.pl`, `closures.pl`, `usemod.pl`, `inherit.pl`
-- Modern features: `defaults.pl`, `newfeatures.pl` (state, wantarray stub, caller stub, $!, $/, BEGIN/END, defined(), local blocks)
+- Modern features: `defaults.pl`, `newfeatures.pl`, `interp.pl` (string interpolation), `misc.pl`, `tr.pl`, `wantarray.pl`
 - Performance benchmarks: `fibn.pl` (Fibonacci), `mbs.pl` (Mandelbrot set 512×512×80 iters)
 - Tier 1 builtins: `tier1.pl` (rand/srand, time/localtime/gmtime, sleep/alarm, sort { BLOCK }, List::Util)
 - Tier 2 builtins: `tier2.pl` ($/.$,/$\/$&, POSIX::floor/ceil/fmod/strftime, Scalar::Util::blessed/reftype/looks_like_number, seek/tell/binmode, stat/lstat, glob, isa/can, our @ISA)
 - Tier 3 builtins: `tier3.pl` ($$/$^O, fileno, read, truncate, each %hash, pos, getpid)
 - Threads: `threads.pl` (create/join/tid/self, closure capture, thread isolation, threads::shared scalars/arrays/hashes, lock/cond_wait/cond_signal/cond_broadcast)
 - Object lifecycle: `destroy.pl` (DESTROY on scope exit, undef assignment, overwrite, loop, data access in destructor)
+- String eval (JIT): `eval_string.pl`
 
 ## Known Limitations
 
@@ -140,6 +141,10 @@ The following features are **not yet implemented** or only partially supported:
 - `threads::shared` hash support tested and working (`my %hash : shared` / `lock(%hash)` / concurrent key writes from multiple threads)
 - Overload, prototypes, globs, signals, pack/unpack, unicode handling
 - Many complex CPAN modules (parser may fail on advanced OO/`our`/POD; simplify scripts as needed)
+- `local @arr` / `local %hash` — only scalars and special vars supported
+- `AUTOLOAD` method dispatch
+- `caller()` — stub only (returns empty list)
+- `or`/`and`/`not` precedence relative to `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0` as in real Perl); use explicit parens
 
 ## Key Implementation Details
 
@@ -152,4 +157,4 @@ The following features are **not yet implemented** or only partially supported:
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 25-test suite.
+**Last Updated**: Current state reflects all features demonstrated in the 35-test suite.

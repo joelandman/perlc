@@ -72,3 +72,10 @@ test: $(TARGET)
 	@echo "=== tier3.pl        ===" && ./$(TARGET) tests/tier3.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== threads.pl      ===" && ./$(TARGET) tests/threads.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== destroy.pl      ===" && ./$(TARGET) tests/destroy.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== eval_string.pl  ===" && ./$(TARGET) tests/eval_string.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null
+	@echo "=== fileops.pl      ===" && ./$(TARGET) tests/fileops.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== interp.pl       ===" && ./$(TARGET) tests/interp.pl       -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== misc.pl         ===" && ./$(TARGET) tests/misc.pl         -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== tr.pl           ===" && ./$(TARGET) tests/tr.pl           -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== wantarray.pl    ===" && ./$(TARGET) tests/wantarray.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== regex_named.pl  ===" && ./$(TARGET) tests/regex_named.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test

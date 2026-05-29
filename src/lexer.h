@@ -66,8 +66,18 @@ enum class TK {
     STR_EQ, STR_NE, STR_LT, STR_GT, STR_LE, STR_GE,  /* string cmp */
     AND, OR, NOT, AND2, OR2,             /* &&, ||, ! */
     DEFINED_OR,                          /* // */
+    TILDE,                               /* ~ bitwise NOT */
+    CARET,                               /* ^ bitwise XOR */
+    LSHIFT,                              /* << */
+    RSHIFT,                              /* >> */
     ASSIGN,
-    PLUS_ASSIGN, MINUS_ASSIGN, STAR_ASSIGN, SLASH_ASSIGN, DOT_ASSIGN, OR_ASSIGN,
+    PLUS_ASSIGN, MINUS_ASSIGN, STAR_ASSIGN, SLASH_ASSIGN, DOT_ASSIGN,
+    PERCENT_ASSIGN, POW_ASSIGN,          /* %= **= */
+    OR_ASSIGN, AND_ASSIGN,               /* ||= &&= */
+    DEFINED_OR_ASSIGN,                   /* //= */
+    X_ASSIGN,                            /* x= */
+    BITAND_ASSIGN, BITOR_ASSIGN, BITXOR_ASSIGN,  /* &= |= ^= */
+    LSHIFT_ASSIGN, RSHIFT_ASSIGN,        /* <<= >>= */
     PLUS_PLUS, MINUS_MINUS,
     QUESTION, BACKSLASH,
     /* special */

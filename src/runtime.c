@@ -699,6 +699,27 @@ PerlValue *perl_negate(const PerlValue *a) {
     return perl_alloc_float(-perl_to_float(a));
 }
 
+/* ── bitwise ops ─────────────────────────────────────────────────────────── */
+
+PerlValue *perl_bitand(const PerlValue *a, const PerlValue *b) {
+    return perl_alloc_int(perl_to_int(a) & perl_to_int(b));
+}
+PerlValue *perl_bitor(const PerlValue *a, const PerlValue *b) {
+    return perl_alloc_int(perl_to_int(a) | perl_to_int(b));
+}
+PerlValue *perl_bitxor(const PerlValue *a, const PerlValue *b) {
+    return perl_alloc_int(perl_to_int(a) ^ perl_to_int(b));
+}
+PerlValue *perl_bitnot(const PerlValue *a) {
+    return perl_alloc_int(~perl_to_int(a));
+}
+PerlValue *perl_lshift(const PerlValue *a, const PerlValue *b) {
+    return perl_alloc_int(perl_to_int(a) << perl_to_int(b));
+}
+PerlValue *perl_rshift(const PerlValue *a, const PerlValue *b) {
+    return perl_alloc_int((unsigned long long)perl_to_int(a) >> perl_to_int(b));
+}
+
 /* ── string ops ──────────────────────────────────────────────────────────── */
 
 PerlValue *perl_concat(const PerlValue *a, const PerlValue *b) {
@@ -2491,30 +2512,26 @@ static void populate_named_captures(pcre2_match_data *md, const char *s, pcre2_c
   if (perl_plus_hash) perl_hash_free(perl_plus_hash);
   perl_plus_hash = perl_hash_new();
 
-  uint32_t namecount;
-  pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT, &namecount);
-  if (namecount == 0) return;
-
-  PCRE2_SIZE name_table_entry_size;
-  uint32_t name_entry_size;
-  uint32_t name_count;
-  pcre2_pattern_info(re, PCRE2_INFO_NAMETABLE, &name_table_entry_size);
+  uint32_t name_count, name_entry_size;
+  pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT,     &name_count);
+  if (name_count == 0) return;
   pcre2_pattern_info(re, PCRE2_INFO_NAMEENTRYSIZE, &name_entry_size);
-  pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT, &name_count);
 
   PCRE2_SPTR name_table;
   pcre2_pattern_info(re, PCRE2_INFO_NAMETABLE, &name_table);
   PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
 
   for (uint32_t i = 0; i < name_count; i++) {
-    PCRE2_SPTR name = name_table + name_entry_size * i;
-    uint32_t group_num = *(uint32_t *)(name_table + name_entry_size * i + name_table_entry_size);
-    size_t cstart = ov[2 * group_num], cend = ov[2 * group_num + 1];
-    if (cstart < cend) {
+    PCRE2_SPTR entry = name_table + name_entry_size * i;
+    /* first 2 bytes are group number (big-endian uint16) */
+    uint32_t group_num = (entry[0] << 8) | entry[1];
+    const char *name_str = (const char *)(entry + 2);
+    PCRE2_SIZE cstart = ov[2 * group_num], cend = ov[2 * group_num + 1];
+    if (cstart != PCRE2_UNSET && cstart < cend) {
       char *cap = malloc(cend - cstart + 1);
       memcpy(cap, s + cstart, cend - cstart);
       cap[cend - cstart] = '\0';
-      PerlValue *key = perl_alloc_string((char*)name);
+      PerlValue *key = perl_alloc_string(name_str);
       PerlValue *val = perl_alloc_string(cap);
       perl_hash_set_sv(perl_plus_hash, key, val);
       perl_free(key);
@@ -2687,6 +2704,16 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
 
 PerlValue *perl_get_plus_hash(void) {
   return perl_plus_hash ? perl_ref_hash(perl_plus_hash) : perl_alloc_undef();
+}
+
+PerlArray *perl_plus_hash_keys(void) {
+  return perl_plus_hash ? perl_hash_keys(perl_plus_hash) : perl_array_new();
+}
+
+PerlValue *perl_plus_hash_get(PerlValue *key) {
+  if (!perl_plus_hash) return perl_alloc_undef();
+  PerlValue *v = perl_hash_get_sv(perl_plus_hash, key);
+  return v ? perl_clone(v) : perl_alloc_undef();
 }
 
 void perl_clear_named_captures(void) {

@@ -828,7 +828,7 @@ int main(int argc, char **argv) {
             cmd += " -rdynamic"   /* export runtime symbols for JIT dlopen */
                    " -Wl,--whole-archive " + evalLib + " -Wl,--no-whole-archive"
                    " -L/usr/lib/llvm-18/lib -lLLVM-18 -lstdc++ -lpthread -ldl";
-        cmd += " -o " + outputFile + " -lm -lpcre2-8 2>&1";
+        cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
         int rc = system(cmd.c_str());
