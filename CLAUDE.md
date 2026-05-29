@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 35/35 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, DESTROY, XS interface, and DBI/SQLite integration. **New: bitwise operators, shift operators, all compound assignments, `$#arr`, `x` string repetition, named-capture `$+{key}` / `keys %+`, `qq{...}` balanced braces, low-precedence `or`/`and`/`not`**.
+**Current Status**: Core language features are ~99% implemented with 35/35 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, and `$Package::var` cross-package access.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 27 test programs
+make test         # runs all 35 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -59,8 +59,8 @@ make clean
 
 ### Advanced Features
 - **References**: all types (`\$x`, `\@arr`, `\%hash`, `\&sub`), anonymous arrays/hashes, dereferencing (`$$ref`, `@$ref`, `%$ref`, `->`), `ref()`
-- **Regex (PCRE2)**: `=~`/`!~`, captures (`$1`-`$9`), substitution (`s///`), `/g` iterator and list context, `split` with regex, flags `i/g/s/m`, named captures `(?<name>)` → `$+{name}` / `keys %+`
-- **String Interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`, `"@arr"` (space-joined)
+- **Regex (PCRE2)**: `=~`/`!~`, captures (`$1`-`$9`), substitution (`s///`), `/g` iterator and list context, `split` with regex, flags `i/g/s/m/e` (`/e` evaluates replacement as Perl code), named captures `(?<name>)` → `$+{name}` / `keys %+`
+- **String Interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$Pkg::var"`, `"@Pkg::arr"`, `"$@"`, `"$0"`, `"$1"`, `"@arr"` (space-joined), `"$hash{$var}"` (variable key), `"$arr[$i]"` (variable index)
 - **Heredocs**: `<<END`, `<<'END'`, `<<"END"` with proper interpolation and lexer support
 - **Special Variables**: `$_` (default for many builtins), `$!` (errno), `$/` (input separator with `local` support)
 - **State Variables**: `state $x` — persistent per-sub variables with lazy initialization
@@ -77,14 +77,19 @@ make clean
 - **threads::shared**: `use threads::shared`; `my $x : shared` / `my @arr : shared` / `my %hash : shared`; `lock($x)` / `lock(@arr)` / `lock(%hash)` with auto-unlock at block exit; `cond_wait($x)` / `cond_signal($x)` / `cond_broadcast($x)`; `PerlSharedVar` struct wraps PerlValue with embedded pthread_mutex+cond; shared vars bypass thread isolation (original pointer shared across threads)
 
 ### Object-Oriented Programming
-- `package`, `bless`, `->` method calls (class and instance)
-- `use parent`/`use base` with ISA chain traversal
+- `package`, `bless`, `->` method calls (class and instance), chained `->m1->m2->m3`
+- `use parent`/`use base` (including `-norequire`) with ISA chain traversal
 - `SUPER::` dispatch
+- `AUTOLOAD` — catches unknown method calls; `$AUTOLOAD` set to `"Package::method"`
+- `DESTROY` — fires on scope exit, undef/overwrite, for both hash-backed and array-backed blessed objects
+- `caller()` — returns `(package, filename, line)` at any call depth; `caller(N)` for outer frames
+- `$Package::var`, `@Package::arr`, `%Package::hash` — cross-package variable access
 - Method registration and dynamic dispatch via `perl_dispatch_method`
 
 ### Advanced Perl Semantics
 - **Closures**: lexical capture of `my` variables by stable pointer, nested closures, independent instances
-- **Local**: dynamic scoping for scalars and special variables (`local $x`, `local $/`, block-scoped restore)
+- **Local**: dynamic scoping for scalars, arrays, and hashes (`local $x`, `local @arr`, `local %hash`, `local $/`, `local @ARGV`; block-scoped restore)
+- **Array/hash assignment**: `@arr = @other`, `@arr = ()` (clear), `%h = (list)` (replaces all entries), `(LIST)[i]` subscript on sort/map/grep/caller results
 - **Exceptions**: `eval { BLOCK }` with `$@` support using `setjmp`/`longjmp`
 - **BEGIN/END**: `BEGIN` runs inline, `END` registered via `atexit()`
 - **Modules**: `use Module` with recursive inlining, `@EXPORT`/`@EXPORT_OK` support, constant subs via `use constant`. The new `-pm` flag automatically detects missing modules (excluding pragmas), installs them via `cpanm --local-lib lib` into `lib/lib/perl5/`, and updates search paths.
@@ -115,21 +120,16 @@ The following features are **not yet implemented** or only partially supported:
 ### Context and Call Stack
 - `wantarray` context propagation: implemented for list vs. scalar context at call sites (`my @list = func()` correctly calls in list context); `wantarray` builtin returns correct value within a sub
 
-### Scoping
-- `local` for arrays and hashes (only scalars and special vars like `$!`/`$/` supported)
-
 ### Module System
 - `require Module::Name` and `require "file.pm"` are implemented (compile-time inlining, same as `use`); runtime `require` and `do FILE` are not yet supported
-
 - Pragmas that aren't backed by `.pm` files are silently ignored
 - `tie` / `untie` (use `opendir`/`readdir` instead; see rewritten `testscripts/cputemp.pl`)
 
 ### Regex
-- Modifiers `x` (extended) and `e` (eval replacement)
+- Modifier `x` (extended/whitespace-ignoring patterns) not supported; `e` (eval replacement) is now implemented
 
 ### OOP
-- `AUTOLOAD` method
-- `DESTROY` is now implemented (fires on scope exit, undef assignment, overwrite)
+- `DESTROY` fires for both hash-backed and array-backed blessed objects (scope exit, undef assignment, overwrite)
 
 ### Reference Operations
 - `unshift @{EXPR}, val` (though `push @{EXPR}` works)
@@ -138,12 +138,9 @@ The following features are **not yet implemented** or only partially supported:
 - `-g` flag supported: adds debugging symbols + **Perl source line mapping** via LLVM debug metadata (visible in gdb/lldb)
 
 ### Not Yet Implemented
-- `threads::shared` hash support tested and working (`my %hash : shared` / `lock(%hash)` / concurrent key writes from multiple threads)
-- Overload, prototypes, globs, signals, pack/unpack, unicode handling
+- Overload, prototypes, typeglobs, signals, `pack`/`unpack`, unicode handling
 - Many complex CPAN modules (parser may fail on advanced OO/`our`/POD; simplify scripts as needed)
-- `local @arr` / `local %hash` — only scalars and special vars supported
-- `AUTOLOAD` method dispatch
-- `caller()` — stub only (returns empty list)
+- `exists $h{a}{b}` chained hash subscript without arrow (use `$h{a}->{b}` instead)
 - `or`/`and`/`not` precedence relative to `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0` as in real Perl); use explicit parens
 
 ## Key Implementation Details
@@ -157,4 +154,4 @@ The following features are **not yet implemented** or only partially supported:
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 35-test suite.
+**Last Updated**: Current state reflects all features demonstrated in the 35-test suite, plus completeness.pl passing entirely.

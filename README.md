@@ -73,9 +73,9 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **Scalars**: integers, floats, strings, undef, all arithmetic/string/comparison operators, ternary `?:`, `++`/`--` (including magical string increment), compound assignment (`+=` `-=` `*=` `/=` `.=` `%=` `**=` `||=` `&&=` `//=` `&=` `|=` `^=` `<<=` `>>=` `x=`)
 
-**Arrays**: `@arr`, push/pop/shift/unshift (all flatten array args), `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`; `my @a = (@b, @c)` properly flattens
+**Arrays**: `@arr`, push/pop/shift/unshift (all flatten array args), `$arr[i]`, `scalar @arr`, join, split, sort, `chomp @arr`; `my @a = (@b, @c)` properly flattens; `@arr = @other` copy; `@arr = ()` clear; `(sort { } @arr)[0]` list subscript
 
-**Hashes**: `%hash`, `$h{key}`, keys/values/exists/delete, hash-from-list init
+**Hashes**: `%hash`, `$h{key}`, keys/values/exists/delete, hash-from-list init; `%h = (list)` replaces all entries
 
 **Control Flow**: if/elsif/else, unless, while (including `while (my $var = expr)`), until, do-while, do-until, C-style for, foreach, last, next, return
 
@@ -87,11 +87,11 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **`$_` as default variable**: `foreach (@arr) { }` loops over `$_`; `while (<FH>)` assigns to `$_`; `chomp`/`chop` without args operate on `$_`; bare `/regex/`, `s///`, `tr///` bind to `$_`
 
-**`local`**: `local $x` / `local $x = val` — dynamic save/restore for scalars and special variables
+**`local`**: `local $x`, `local @arr`, `local %hash` — dynamic save/restore for scalars, arrays, hashes, and special variables (`local @ARGV`, `local $/`, etc.)
 
 **References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
-**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`, named captures `(?<name>...)` → `$+{name}` / `keys %+`
+**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m/e), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`, named captures `(?<name>...)` → `$+{name}` / `keys %+`; `/e` evaluates replacement as Perl expression
 
 **tr///**: `$s =~ tr/SEARCH/REPLACE/flags` — character translation; flags: `d` (delete), `s` (squeeze), `c` (complement); ranges `a-z`; returns count
 
@@ -117,11 +117,15 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **Builtins**: chomp, chop, length, substr, join, split, push, pop, shift, unshift, splice, sort, keys, values, exists, delete, scalar, defined, ref, warn, print, say, printf, sprintf, unlink
 
-**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$hash{key}"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space), `"@{expr}"`, `"@$ref"`, `"${\expr}"`
+**String interpolation**: `"$var"`, `"${var}"`, `"$arr[i]"`, `"$arr[$i]"`, `"$hash{key}"`, `"$hash{$var}"`, `"$Pkg::var"`, `"@Pkg::arr"`, `"$@"`, `"$0"`, `"$1"`-`"$9"`, `"@arr"` (joined with space), `"@{expr}"`, `"@$ref"`, `"${\expr}"`
 
 **Array last index**: `$#arr` (equivalent to `scalar(@arr) - 1`)
 
 **`qq{...}`**: double-quoted string with balanced brace support — nested `{` `}` do not terminate the string
+
+**`chomp` return value**: returns number of characters removed (1 or 0), not the modified string
+
+**`substr` as lvalue**: `substr($str, offset, len) = $replacement` — replaces a substring in-place
 
 **Command-line**: `@ARGV` (arguments), `$0` (program name); generated `main` accepts `int argc, char **argv`
 
@@ -137,9 +141,9 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **Closures**: anonymous subs capture outer lexical `my` scalar variables by stable pointer; multiple captures; independent closure instances; nested closures
 
-**Object-Oriented Programming**: `package Foo;`, `bless($ref, $class)`, `$obj->method(args)`, `Foo->method(args)` (class method), `ref($obj)` → class name
+**Object-Oriented Programming**: `package Foo;`, `bless($ref, $class)`, `$obj->method(args)`, `Foo->method(args)` (class method), `ref($obj)` → class name, chained method calls (`->m1->m2->m3`), `AUTOLOAD` (catches unknown methods, sets `$AUTOLOAD`), `DESTROY` (fires for hash-backed and array-backed objects), `caller()` returns `(package, file, line)`, `$Package::var` cross-package variable access
 
-**Inheritance**: `use parent 'Base'` / `use base 'Base'`; inherited method lookup; method override; `SUPER::` dispatch
+**Inheritance**: `use parent 'Base'` / `use base 'Base'` (including `-norequire`); inherited method lookup; method override; `SUPER::` dispatch
 
 **Module Loading**: `use Module` loads `.pm` files from `{scriptDir, scriptDir/lib, lib, .}`; recursively inlines modules; method dispatch across module boundaries
 
@@ -153,15 +157,12 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 ## Known Limitations
 
-- `wantarray`: always returns false (scalar context); full context tracking not implemented
-- `caller()`: stub implementation only (returns empty list)
-- `local` for arrays and hashes: scalars and special vars (`$!`, `$/`) only
-- `AUTOLOAD` method dispatch: not implemented
+- `wantarray`: context propagation implemented for list vs. scalar at call sites; `wantarray` builtin returns correct value within a sub
 - `tie` / `untie`: not implemented (use `opendir`/`readdir` for directories)
-- Regex modifiers `x` (extended) and `e` (eval replacement): not supported
+- Regex modifier `x` (extended/whitespace-ignoring): not supported; `/e` (eval replacement) is supported
 - Runtime `require` / `do FILE`: modules only loaded at compile time via `use` inlining
-- `DESTROY`: not implemented
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
+- `exists $h{a}{b}` chained subscript without arrow: use `$h{a}->{b}` instead
 - `or`/`and`/`not` precedence in `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0`); wrap in parens if needed
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
 - REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
