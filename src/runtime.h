@@ -202,6 +202,7 @@ PerlValue *perl_hash_delete_str(PerlHash *h, const char *key);
 
 /* list operations */
 PerlArray *perl_hash_keys(PerlHash *h);    /* returns new PerlArray* of key strings */
+PerlArray *perl_hash_slice(PerlHash *h, PerlArray *keys); /* values for key list */
 PerlArray *perl_hash_values(PerlHash *h);  /* returns new PerlArray* of values */
 PerlValue *perl_hash_size(PerlHash *h);    /* returns int count of key-value pairs */
 

@@ -1477,6 +1477,23 @@ PerlArray *perl_hash_keys(PerlHash *h) {
     return a;
 }
 
+/* Return array of values for a dynamic list of keys (hash slice) */
+PerlArray *perl_hash_slice(PerlHash *h, PerlArray *keys) {
+    PerlArray *result = perl_array_new();
+    for (long long i = 0; i < keys->len; i++) {
+        PerlValue *val = perl_hash_get_sv(h, keys->elems[i]);
+        if (val) {
+            perl_array_push(result, val);
+            perl_free(val);
+        } else {
+            PerlValue *u = perl_alloc_undef();
+            perl_array_push(result, u);
+            perl_free(u);
+        }
+    }
+    return result;
+}
+
 PerlArray *perl_hash_values(PerlHash *h) {
     PerlArray *a = perl_array_new();
     for (int i = 0; i < PERL_HASH_BUCKETS; i++) {

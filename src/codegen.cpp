@@ -198,6 +198,7 @@ void CodeGen::declareRuntime() {
     RT("perl_hash_exists_str",   Type::getInt32Ty(ctx_), av, strPtrTy);
     RT("perl_hash_delete_str",   pv,  av, strPtrTy);
     RT("perl_hash_keys",     av,  av);
+    RT("perl_hash_slice",    av,  av, av);
     RT("perl_hash_values",   av,  av);
     RT("perl_hash_size",     pv,  av);
     RT("perl_hash_from_list",voidTy, av, av);
@@ -879,13 +880,17 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::HashSlice) {
         Value *hv  = lookupHash(n.name);
         Value *res = callRT("perl_array_new", {});
-        /* args may be an ArrayLit (from qw() or (list)) — flatten */
         auto pushHashKey = [&](const Node &keyNode) {
             if (keyNode.kind == NK::ArrayLit) {
                 for (auto &k : keyNode.args) {
                     Value *elem = hv ? emitHashGetRef(hv, *k) : perlUndef();
                     callRT("perl_array_push", {res, elem});
                 }
+            } else if (Value *kav = emitArrayPtr(keyNode)) {
+                /* dynamic array of keys: @h{@arr} */
+                Value *slice = hv ? callRT("perl_hash_slice", {hv, kav})
+                                  : callRT("perl_array_new", {});
+                callRT("perl_array_extend", {res, slice});
             } else {
                 Value *elem = hv ? emitHashGetRef(hv, keyNode) : perlUndef();
                 callRT("perl_array_push", {res, elem});
@@ -4858,6 +4863,10 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *elem = hv ? emitHashGetRef(hv, *k) : perlUndef();
                     callRT("perl_array_push", {res, elem});
                 }
+            } else if (Value *kav = emitArrayPtr(keyNode)) {
+                Value *slice = hv ? callRT("perl_hash_slice", {hv, kav})
+                                  : callRT("perl_array_new", {});
+                callRT("perl_array_extend", {res, slice});
             } else {
                 Value *elem = hv ? emitHashGetRef(hv, keyNode) : perlUndef();
                 callRT("perl_array_push", {res, elem});

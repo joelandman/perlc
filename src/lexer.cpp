@@ -449,6 +449,8 @@ std::vector<Token> Lexer::tokenize() {
                 switch (toks.back().kind) {
                     case TK::INT: case TK::FLOAT: case TK::STRING: case TK::REGEX:
                     case TK::IDENT: case TK::RPAREN: case TK::RBRACKET:
+                    case TK::RBRACE:   /* } // default — hash/block result */
+                    case TK::KW_UNDEF: /* undef // default */
                     case TK::PLUS_PLUS: case TK::MINUS_MINUS:
                         return true;
                     default: return false;
