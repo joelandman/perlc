@@ -147,6 +147,7 @@ void       perl_array_set(PerlArray *a, long long idx, PerlValue *v);
 PerlValue *perl_array_len(PerlArray *a);
 void perl_array_clear(PerlArray *a);
 void perl_array_replace(PerlArray *dst, PerlArray *src);
+PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n);
 void       perl_array_sort_str(PerlArray *a);
 void       perl_array_extend(PerlArray *dst, PerlArray *src);
 PerlValue *perl_array_shift(PerlArray *a);
@@ -158,6 +159,7 @@ long long  perl_chomp_array(PerlArray *a); /* chomp every element; returns total
 PerlValue *perl_chop(PerlValue *v);        /* remove and return last character */
 PerlValue *perl_length(PerlValue *v);
 PerlValue *perl_substr2(PerlValue *str, PerlValue *off);
+void perl_substr_replace(PerlValue *str, PerlValue *off, PerlValue *len, PerlValue *repl);
 PerlValue *perl_substr3(PerlValue *str, PerlValue *off, PerlValue *len);
 PerlValue *perl_join(PerlValue *sep, PerlArray *arr);
 PerlArray *perl_split(PerlValue *sep, PerlValue *str);
@@ -182,6 +184,7 @@ typedef struct PerlHash {
 PerlHash *perl_hash_new(void);
 PerlHash *perl_anon_hash_new(void); /* like perl_hash_new but refcount=1 (anonymous) */
 void       perl_hash_free(PerlHash *h);
+void       perl_hash_clear(PerlHash *h);
 void       perl_hash_make_shared(PerlHash *h); /* threads::shared: init mu */
 void       perl_lock_hash(PerlHash *h);        /* lock + push auto-unlock */
 

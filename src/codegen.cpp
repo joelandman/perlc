@@ -149,6 +149,8 @@ void CodeGen::declareRuntime() {
     RT("perl_rshift",        pv,  pv, pv);
     RT("perl_concat",        pv,  pv, pv);
     RT("perl_repeat_str",    pv,  pv, pv);
+    RT("perl_substr_replace",voidTy, pv, pv, pv, pv);
+    RT("perl_repeat_list",   av,  av, pv);
     RT("perl_num_eq",        pv,  pv, pv);
     RT("perl_num_ne",        pv,  pv, pv);
     RT("perl_num_lt",        pv,  pv, pv);
@@ -180,6 +182,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_len",     pv,  av);
     RT("perl_array_clear",   voidTy, av);
     RT("perl_array_replace", voidTy, av, av);
+    RT("perl_hash_clear",    voidTy, av);
     /* hash */
     RT("perl_hash_new",      av);   /* reuse av as opaque ptr */
     RT("perl_anon_hash_new", av);
@@ -542,6 +545,19 @@ Value *CodeGen::perlFloat(double v) {
 /* Returns a PerlArray* Value for expressions that produce arrays.
    Used by foreach and array-context assignments. */
 Value *CodeGen::emitArrayPtr(const Node &n) {
+    /* (LIST) x N — list repetition in array context */
+    if (n.kind == NK::BinOp && n.sval == "x" && n.left) {
+        Value *srcArr = emitArrayPtr(*n.left);
+        if (!srcArr) {
+            /* scalar or single-element expr — wrap in 1-element array */
+            srcArr = callRT("perl_array_new", {});
+            Value *v = emitExpr(*n.left);
+            callRT("perl_array_push", {srcArr, v});
+            freeIfOwned(v);
+        }
+        Value *nv = emitExpr(*n.right);
+        return callRT("perl_repeat_list", {srcArr, nv});
+    }
     if (n.kind == NK::ArrayVar) {
         return lookupArray(n.name);
     }
@@ -1443,7 +1459,11 @@ bool CodeGen::canEmitF64(const Node &n) {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
         if (lookupFloatVar(nm)) return true;
-        return fileScalarGlobals_.count(nm) != 0;  /* file-scope globals assumed numeric */
+        /* Only treat file-scope globals as numeric if they have no special runtime accessor */
+        static const std::unordered_set<std::string> specialVars =
+            {"AUTOLOAD","!","/",".","\\",",","&","0","_"};
+        if (specialVars.count(nm)) return false;
+        return fileScalarGlobals_.count(nm) != 0;
     }
     case NK::BinOp: {
         if (n.sval == "**" && n.right && n.right->kind == NK::IntLit && n.right->ival == 2)
@@ -1494,12 +1514,16 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
         if (Value *fa = lookupFloatVar(nm))
             return builder_.CreateLoad(f64, fa, nm + ".f");
-        /* file-scope global: load PV* and coerce to double */
+        /* file-scope global: load PV* and coerce to double — skip special-accessor vars */
         {
-            auto git = fileScalarGlobals_.find(nm);
-            if (git != fileScalarGlobals_.end()) {
-                Value *pv = builder_.CreateLoad(perlPtrTy_, git->second, nm + ".gpv");
-                return callRT("perl_to_float", {pv});
+            static const std::unordered_set<std::string> noFloat =
+                {"AUTOLOAD","!","/",".","\\",",","&","0","_"};
+            if (!noFloat.count(nm)) {
+                auto git = fileScalarGlobals_.find(nm);
+                if (git != fileScalarGlobals_.end()) {
+                    Value *pv = builder_.CreateLoad(perlPtrTy_, git->second, nm + ".gpv");
+                    return callRT("perl_to_float", {pv});
+                }
             }
         }
         return nullptr;
@@ -2160,14 +2184,12 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         }
         if (builder_.GetInsertBlock()->getTerminator()) { break; }
     }
+    /* Clone result before popScope() frees variables it may reference */
+    if (result && !llvm::isa<llvm::ConstantPointerNull>(result))
+        result = callRT("perl_clone", {result});
     popScope();
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
-    /* Stage 29: return null (non-owned) when no expression produced a real value
-       (e.g. last stmt was a loop or a void list-assign).
-       perl_free(null) is a noop; perl_assign(dst,null) assigns undef; all other
-       runtime functions already guard against null src — so this is safe and
-       eliminates 50M alloc_undef+free pairs for advance() in nb.pl. */
     if (!result || llvm::isa<llvm::ConstantPointerNull>(result))
         result = llvm::ConstantPointerNull::get(perlPtrTy_);
     return result;
@@ -2216,8 +2238,9 @@ void CodeGen::emitStmt(const Node &n) {
                     Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
                 builder_.CreateStore(hv, gv);
                 fileHashGlobals_[nm] = gv;
-                /* do NOT declareHash — lookupHash loads fresh from GlobalVariable,
-                   which is required for local %hash to work correctly */
+                /* also register as Package::name for cross-package access */
+                if (currentPackage_ != "main") fileHashGlobals_[currentPackage_ + "::" + nm] = gv;
+                /* do NOT declareHash — lookupHash loads fresh from GlobalVariable */
             } else {
                 declareHash(nm, hv);
             }
@@ -2246,6 +2269,8 @@ void CodeGen::emitStmt(const Node &n) {
                     Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
                 builder_.CreateStore(av, gv);
                 fileArrayGlobals_[nm] = gv;
+                /* also register as Package::name for cross-package access */
+                if (currentPackage_ != "main") fileArrayGlobals_[currentPackage_ + "::" + nm] = gv;
                 /* do NOT declareArray — lookupArray loads fresh from GlobalVariable */
             } else {
                 declareArray(nm, av);
@@ -2299,6 +2324,9 @@ void CodeGen::emitStmt(const Node &n) {
                 }
                 fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
+                /* also register as Package::name for cross-package access */
+                if (currentPackage_ != "main")
+                    fileScalarGlobals_[currentPackage_ + "::" + nm] = gv;
             } else {
                 /* Unbox numeric scalars: skip PerlValue* alloca entirely.
                    Guard: 1D ArrowDeref may return an array/hash ref, not a scalar. */
@@ -3159,6 +3187,10 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
+    case NK::PackageStmt:
+        currentPackage_ = n.sval;
+        break;
+
     default:
         emitExpr(n);
     }
@@ -3541,6 +3573,16 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Assign: {
+        /* substr($str, off, len) = val — 4-arg substr as lvalue */
+        if (n.left->kind == NK::SubstrFunc && n.left->args.size() >= 3) {
+            Value *str = emitExpr(*n.left->args[0]);
+            Value *off = emitExpr(*n.left->args[1]);
+            Value *len = emitExpr(*n.left->args[2]);
+            Value *val = emitExpr(*n.right);
+            callRT("perl_substr_replace", {str, off, len, val});
+            freeIfOwned(val);
+            return str;
+        }
         /* pos($str) = N — set regex match position */
         if (n.left->kind == NK::PosFunc) {
             Value *str = n.left->left ? emitExpr(*n.left->left)
@@ -3673,10 +3715,15 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::HashVar) {
             Value *hv = lookupHash(n.left->name);
             if (!hv) return perlUndef();
+            callRT("perl_hash_clear", {hv});
             Value *listArr = callRT("perl_array_new", {});
             if (n.right->kind == NK::ArrayLit) {
                 for (auto &elem : n.right->args)
                     callRT("perl_array_push", {listArr, emitExpr(*elem)});
+            } else {
+                Value *src = emitArrayPtr(*n.right);
+                if (src) callRT("perl_array_extend", {listArr, src});
+                else     callRT("perl_array_push", {listArr, emitExpr(*n.right)});
             }
             callRT("perl_hash_from_list", {hv, listArr});
             return perlUndef();
@@ -4219,8 +4266,8 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* chomp/chop on scalar */
         Value *v = emitExpr(*n.left);
         if (isChop) return callRT("perl_chop", {v});
-        callRT("perl_chomp", {v});
-        return v;
+        Value *removed = callRT("perl_chomp", {v});
+        return callRT("perl_alloc_int", {removed});
     }
 
     case NK::LengthFunc:

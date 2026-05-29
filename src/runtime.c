@@ -746,6 +746,14 @@ PerlValue *perl_repeat_str(const PerlValue *str, const PerlValue *n) {
     return r;
 }
 
+PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n_pv) {
+    long long reps = perl_to_int(n_pv);
+    PerlArray *dst = perl_array_new();
+    for (long long i = 0; i < reps; i++)
+        perl_array_extend(dst, src);
+    return dst;
+}
+
 /* ── numeric comparisons ─────────────────────────────────────────────────── */
 
 HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
@@ -1156,6 +1164,26 @@ PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
     return r;
 }
 
+void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, PerlValue *repl) {
+    char *s     = perl_to_string(str);
+    char *r     = perl_to_string(repl);
+    long long slen = (long long)strlen(s);
+    long long off  = perl_to_int(off_v);
+    long long n    = perl_to_int(len_v);
+    substr_bounds(slen, &off, &n);
+    long long rlen  = (long long)strlen(r);
+    long long newlen = slen - n + rlen;
+    char *buf = malloc((size_t)newlen + 1);
+    memcpy(buf, s, (size_t)off);
+    memcpy(buf + off, r, (size_t)rlen);
+    memcpy(buf + off + rlen, s + off + n, (size_t)(slen - off - n));
+    buf[newlen] = '\0';
+    if (str->tag == PERL_STRING) free(str->sval);
+    str->tag  = PERL_STRING;
+    str->sval = buf;
+    free(s); free(r);
+}
+
 PerlValue *perl_join(PerlValue *sep, PerlArray *arr) {
     char *ssep = perl_to_string(sep);
     size_t seplen = strlen(ssep);
@@ -1276,6 +1304,22 @@ void perl_hash_free(PerlHash *h) {
     }
     if (h->mu) { pthread_mutex_destroy(h->mu); free(h->mu); }
     free(h);
+}
+
+void perl_hash_clear(PerlHash *h) {
+    if (!h) return;
+    for (int i = 0; i < PERL_HASH_BUCKETS; i++) {
+        PerlHashEntry *e = h->buckets[i];
+        while (e) {
+            PerlHashEntry *next = e->next;
+            free(e->key);
+            perl_free(e->val);
+            free(e);
+            e = next;
+        }
+        h->buckets[i] = NULL;
+    }
+    h->size = 0;
 }
 
 void perl_hash_make_shared(PerlHash *h) {

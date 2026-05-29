@@ -42,6 +42,12 @@ NodePtr Parser::parseProgram() {
             if (check(TK::IDENT) &&
                 (cur().text == "parent" || cur().text == "base")) {
                 advance();
+                /* skip optional -norequire flag (and trailing comma) */
+                if (check(TK::MINUS)) {
+                    advance(); /* skip - */
+                    if (check(TK::IDENT)) advance(); /* skip norequire */
+                    match(TK::COMMA); /* skip comma before parent list */
+                }
                 std::vector<std::string> parents;
                 if (check(TK::QWORDS)) {
                     std::istringstream iss(cur().text); advance();
