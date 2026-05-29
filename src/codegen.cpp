@@ -2184,9 +2184,13 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         }
         if (builder_.GetInsertBlock()->getTerminator()) { break; }
     }
-    /* Clone result before popScope() frees variables it may reference */
-    if (result && !llvm::isa<llvm::ConstantPointerNull>(result))
+    /* Clone result before popScope() frees variables it may reference.
+       Also free the original if it was an owned temp (mirrors NK::Return logic). */
+    if (result && !llvm::isa<llvm::ConstantPointerNull>(result)) {
+        Value *orig = result;
         result = callRT("perl_clone", {result});
+        freeIfOwned(orig);
+    }
     popScope();
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
@@ -3022,9 +3026,10 @@ void CodeGen::emitStmt(const Node &n) {
 
     case NK::Return: {
         Value *v;
-        if (n.left && n.left->kind == NK::ArrayLit) {
-            /* return (LIST) — wrap for list/scalar context at runtime */
-            Value *av = emitExpr(*n.left);  /* returns PerlArray* */
+        if (n.left && (n.left->kind == NK::ArrayLit || n.left->kind == NK::ArrayVar)) {
+            /* return (LIST) or return @arr — wrap for list/scalar context at runtime */
+            Value *av = emitArrayPtr(*n.left);
+            if (!av) av = callRT("perl_array_new", {});
             v = callRT("perl_array_to_list_return", {av});
         } else {
             v = n.left ? emitExpr(*n.left) : perlUndef();
@@ -4756,6 +4761,18 @@ Value *CodeGen::emitExpr(const Node &n) {
                 return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
             }
         }
+        /* (LIST)[i] — list-producing expression used directly as array source */
+        if (n.sval == "array" && n.left) {
+            static auto isListNode = [](NK k) {
+                return k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
+                       k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::CallerFunc ||
+                       k == NK::Call;
+            };
+            if (isListNode(n.left->kind)) {
+                Value *av = emitArrayPtr(*n.left);
+                if (av) return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
+            }
+        }
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
             Value *av = callRT("perl_deref_array", {base});
@@ -4787,6 +4804,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         size_t sep = n.name.find('\x01');
         std::string repl  = n.name.substr(0, sep);
         std::string flags = n.name.substr(sep + 1);
+        if (flags.find('e') != std::string::npos) hasStringEval_ = true;
         Value *pat  = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
         Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
         Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");

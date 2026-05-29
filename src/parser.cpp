@@ -1154,7 +1154,10 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         /* adjacent subscripts after any subscriptable kind — implies implicit -> */
         auto isSubscriptableK = [](NK k) {
             return k == NK::ArrowDeref || k == NK::ArrayElem || k == NK::HashElem ||
-                   k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar;
+                   k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar ||
+                   k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
+                   k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::Call ||
+                   k == NK::CallerFunc;
         };
         if (isSubscriptableK(base->kind) && check(TK::LBRACKET)) {
             advance();
@@ -1187,7 +1190,11 @@ NodePtr Parser::parsePostfix() {
     /* enter subscript chain for explicit -> or adjacent [ / { after a subscript kind */
     auto isSubscriptable = [](NK k) {
         return k == NK::ArrowDeref || k == NK::ArrayElem || k == NK::HashElem ||
-               k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar;
+               k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar ||
+               /* list-producing expressions: (sort)[0], (map)[0], etc. */
+               k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
+               k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::Call ||
+               k == NK::CallerFunc;
     };
     if (check(TK::ARROW) ||
         (isSubscriptable(expr->kind) && (check(TK::LBRACKET) || check(TK::LBRACE)))) {
@@ -2603,6 +2610,12 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             flush(); i++;
             std::string vname;
             while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
+            /* $Pkg::var — consume ::Name chains */
+            while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
+                   i + 2 < raw.size() && (isalpha(raw[i+2]) || raw[i+2] == '_')) {
+                vname += raw[i++]; vname += raw[i++]; /* :: */
+                while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
+            }
             /* $arr[idx] */
             if (i < raw.size() && raw[i] == '[') {
                 i++;
@@ -2683,6 +2696,12 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             flush(); i++;
             std::string vname;
             while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
+            /* @Pkg::arr — consume ::Name chains */
+            while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
+                   i + 2 < raw.size() && (isalpha(raw[i+2]) || raw[i+2] == '_')) {
+                vname += raw[i++]; vname += raw[i++];
+                while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
+            }
             /* join array with space */
             auto arrNode = std::make_unique<Node>(); arrNode->kind = NK::ArrayVar;
             arrNode->name = vname; arrNode->line = line;

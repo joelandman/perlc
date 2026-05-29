@@ -478,6 +478,22 @@ HOTX void perl_free(PerlValue *v) {
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
     if (v->tag == PERL_REF_ARRAY && v->pval) {
         PerlArray *av = (PerlArray *)v->pval;
+        /* call DESTROY on blessed array objects */
+        if (av->refcount == 1 && v->blessed_class && s_destroy_depth < 100) {
+            PerlSubFnCtx fn = perl_find_method(v->blessed_class, "DESTROY");
+            if (fn) {
+                s_destroy_depth++;
+                PerlArray *args = perl_array_new();
+                PerlValue *self = perl_clone(v);
+                perl_array_push(args, self);
+                PerlValue *ret = fn(args, perl_push_wantarray(0));
+                perl_pop_wantarray();
+                perl_free(ret);
+                perl_array_free(args);
+                perl_free(self);
+                s_destroy_depth--;
+            }
+        }
         if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
     }
     if (v->tag == PERL_REF_HASH && v->pval) {
@@ -2638,12 +2654,13 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
 }
 
 long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags) {
-    /* separate /g from PCRE options */
-    int global = 0;
+    /* separate /g /e from PCRE options */
+    int global = 0, eval_repl = 0;
     char clean[64]; int ci = 0;
     for (const char *fp = flags; *fp; fp++) {
-        if (*fp == 'g') global = 1;
-        else if (ci < 63) clean[ci++] = *fp;
+        if      (*fp == 'g') global = 1;
+        else if (*fp == 'e') eval_repl = 1;
+        else if (ci < 63)    clean[ci++] = *fp;
     }
     clean[ci] = '\0';
 
@@ -2681,17 +2698,38 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
         ENSURE(pre); memcpy(out + out_len, s + pos, pre); out_len += pre;
 
         /* expand replacement: handle $0 (whole match), $1..$9 */
+        /* build expanded replacement string */
+        char *expanded = NULL; size_t exp_len = 0, exp_cap = 128;
+        expanded = malloc(exp_cap);
+#define EXPENSURE(n) do { while(exp_len+(n)+1>exp_cap){exp_cap*=2;expanded=realloc(expanded,exp_cap);} } while(0)
         for (const char *rp = repl; *rp; ) {
             if (*rp == '$' && isdigit((unsigned char)rp[1])) {
                 int n = rp[1] - '0'; rp += 2;
                 size_t cstart = (n == 0) ? mstart : (n < rc ? ov[2*n]   : 0);
                 size_t cend   = (n == 0) ? mend   : (n < rc ? ov[2*n+1] : 0);
                 size_t caplen = (cstart < cend) ? cend - cstart : 0;
-                ENSURE(caplen); memcpy(out + out_len, s + cstart, caplen); out_len += caplen;
+                EXPENSURE(caplen); memcpy(expanded + exp_len, s + cstart, caplen); exp_len += caplen;
             } else {
-                ENSURE(1); out[out_len++] = *rp++;
+                EXPENSURE(1); expanded[exp_len++] = *rp++;
             }
         }
+        expanded[exp_len] = '\0';
+        /* /e: evaluate expanded string as Perl expression */
+        const char *rep_text = expanded;
+        PerlValue *eval_result = NULL;
+        if (eval_repl && perl_eval_string_fn) {
+            eval_result = perl_eval_string_fn(expanded);
+            char *ev = perl_to_string(eval_result);
+            size_t evlen = strlen(ev);
+            ENSURE(evlen); memcpy(out + out_len, ev, evlen); out_len += evlen;
+            free(ev);
+            perl_free(eval_result);
+        } else {
+            size_t replen = exp_len;
+            ENSURE(replen); memcpy(out + out_len, rep_text, replen); out_len += replen;
+        }
+        free(expanded);
+#undef EXPENSURE
         count++;
 
         if (mend == mstart) {
