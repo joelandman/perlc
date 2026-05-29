@@ -2605,8 +2605,14 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 if (i < raw.size()) i++;
                 auto n = std::make_unique<Node>(); n->kind = NK::ArrayElem;
                 n->name = vname;
-                long long idx = idx_s.empty() ? 0 : std::stoll(idx_s);
-                n->left = makeInt(idx, line);
+                /* parse as expression to support $arr[$i] */
+                if (!idx_s.empty() && (idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
+                    Lexer il(idx_s); auto itoks = il.tokenize();
+                    n->left = Parser::parseExprFromTokens(std::move(itoks));
+                } else {
+                    long long idx = idx_s.empty() ? 0 : std::stoll(idx_s);
+                    n->left = makeInt(idx, line);
+                }
                 n->line = line;
                 parts.push_back(std::move(n));
             /* $hash{key} */
@@ -2617,7 +2623,13 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 if (i < raw.size()) i++;
                 auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
                 n->name = vname;
-                n->left = makeStr(key_s, line);
+                /* parse as expression to support $hash{$var} */
+                if (!key_s.empty() && (key_s[0] == '$' || key_s[0] == '@')) {
+                    Lexer kl(key_s); auto ktoks = kl.tokenize();
+                    n->left = Parser::parseExprFromTokens(std::move(ktoks));
+                } else {
+                    n->left = makeStr(key_s, line);
+                }
                 n->line = line;
                 parts.push_back(std::move(n));
             } else {

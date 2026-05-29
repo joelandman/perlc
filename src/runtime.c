@@ -909,6 +909,18 @@ void perl_array_free(PerlArray *a) {
     free(a);
 }
 
+void perl_array_clear(PerlArray *a) {
+    if (!a) return;
+    for (long long i = 0; i < a->len; i++) perl_free(a->elems[i]);
+    a->len = 0;
+}
+
+void perl_array_replace(PerlArray *dst, PerlArray *src) {
+    if (!dst) return;
+    perl_array_clear(dst);
+    if (src) perl_array_extend(dst, src);
+}
+
 void perl_array_make_shared(PerlArray *a) {
     if (!a || a->mu) return;
     a->mu = malloc(sizeof(pthread_mutex_t));

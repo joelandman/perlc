@@ -178,6 +178,8 @@ void CodeGen::declareRuntime() {
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
     RT("perl_array_is_all_flat", i64, av);  /* Stage 23: 1 if every elem is FLAT_ARRAY */
     RT("perl_array_len",     pv,  av);
+    RT("perl_array_clear",   voidTy, av);
+    RT("perl_array_replace", voidTy, av, av);
     /* hash */
     RT("perl_hash_new",      av);   /* reuse av as opaque ptr */
     RT("perl_anon_hash_new", av);
@@ -1801,7 +1803,13 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         Value *argc_v = mainFn->getArg(0);
         Value *argv_v = mainFn->getArg(1);
         Value *argvArr = callRT("perl_init_argv", {argc_v, argv_v});
-        declareArray("ARGV", argvArr);
+        {
+            auto *gvArgv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                Constant::getNullValue(perlPtrTy_), "g.arr.ARGV");
+            builder_.CreateStore(argvArr, gvArgv);
+            fileArrayGlobals_["ARGV"] = gvArgv;
+        }
 
         Value *dollar0 = callRT("perl_get_dollar0", {});
         auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
@@ -2208,8 +2216,11 @@ void CodeGen::emitStmt(const Node &n) {
                     Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
                 builder_.CreateStore(hv, gv);
                 fileHashGlobals_[nm] = gv;
+                /* do NOT declareHash — lookupHash loads fresh from GlobalVariable,
+                   which is required for local %hash to work correctly */
+            } else {
+                declareHash(nm, hv);
             }
-            declareHash(nm, hv);
             if (n.ival & 1) callRT("perl_hash_make_shared", {hv});
             if (n.right) {
                 Value *listArr = emitArrayPtr(*n.right);
@@ -2235,8 +2246,10 @@ void CodeGen::emitStmt(const Node &n) {
                     Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
                 builder_.CreateStore(av, gv);
                 fileArrayGlobals_[nm] = gv;
+                /* do NOT declareArray — lookupArray loads fresh from GlobalVariable */
+            } else {
+                declareArray(nm, av);
             }
-            declareArray(nm, av);
             if (n.ival & 1) callRT("perl_array_make_shared", {av});
             /* our @ISA = ('Parent', ...) — wire up ISA chain */
             if (nm == "ISA" && n.right && !n.sval.empty()) {
@@ -3630,6 +3643,31 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *val = emitExpr(*n.right);
             emitHashSet(hv, *n.left->left, val);
             return val;
+        }
+        /* @arr = RHS — also fixes @arr = () clearing */
+        if (n.left->kind == NK::ArrayVar) {
+            Value *av_lhs = lookupArray(n.left->name);
+            if (av_lhs) {
+                callCtx_ = 1;
+                Value *av_rhs = emitArrayPtr(*n.right);
+                callCtx_ = 0;
+                if (av_rhs) {
+                    callRT("perl_array_replace", {av_lhs, av_rhs});
+                } else if (n.right->kind == NK::ArrayLit && n.right->args.empty()) {
+                    callRT("perl_array_clear", {av_lhs});
+                } else {
+                    callRT("perl_array_clear", {av_lhs});
+                    Value *tmp = callRT("perl_array_new", {});
+                    if (n.right->kind == NK::ArrayLit) {
+                        for (auto &e : n.right->args)
+                            callRT("perl_array_push", {tmp, emitExpr(*e)});
+                    } else {
+                        callRT("perl_array_push", {tmp, emitExpr(*n.right)});
+                    }
+                    callRT("perl_array_replace", {av_lhs, tmp});
+                }
+            }
+            return perlUndef();
         }
         /* %h = (list) */
         if (n.left->kind == NK::HashVar) {
