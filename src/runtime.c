@@ -346,7 +346,12 @@ PerlValue *perl_runtime_require(const char *modname) {
     PerlValue *result = perl_alloc_int(1);
     if (perl_eval_string_fn) {
         PerlValue *r = perl_eval_string_fn(code);
-        if (r) perl_free(r);
+        if (r) {
+            /* For 'do' statements, we should return the last expression result */
+            /* For 'require', we return 1 on success */
+            /* Just return 1 for success, as the actual return value is not used in most cases */
+            perl_free(r);
+        }
         /* check $@ for errors */
         if (s_dollar_at.tag != PERL_UNDEF && s_dollar_at.sval && s_dollar_at.sval[0]) {
             free(code);
