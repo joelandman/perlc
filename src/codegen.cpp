@@ -4476,6 +4476,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::DeleteFunc: {
+        if (n.sval == "array") {
+            Value *av = lookupArray(n.name);
+            if (!av) return perlUndef();
+            Value *idx = emitIdx(*n.left);
+            Value *old = callRT("perl_array_get", {av, idx});
+            callRT("perl_array_set", {av, idx, perlUndef()});
+            return old;
+        }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
         return emitHashDelete(hv, *n.left);

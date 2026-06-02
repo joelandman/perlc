@@ -1659,16 +1659,23 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* delete $h{key} */
+    /* delete $h{key}  or  delete $arr[N] */
     if (check(TK::KW_DELETE)) {
         advance();
         consume(TK::SCALAR, "$");
         std::string nm = cur().text; advance();
-        consume(TK::LBRACE, "{");
-        auto key = parseExpr();
-        consume(TK::RBRACE, "}");
         auto n = std::make_unique<Node>(); n->kind = NK::DeleteFunc;
-        n->name = nm; n->left = std::move(key); n->line = line;
+        n->name = nm; n->line = line;
+        if (check(TK::LBRACKET)) {
+            advance();
+            n->left = parseExpr();
+            consume(TK::RBRACKET, "]");
+            n->sval = "array";
+        } else {
+            consume(TK::LBRACE, "{");
+            n->left = parseExpr();
+            consume(TK::RBRACE, "}");
+        }
         return n;
     }
 
