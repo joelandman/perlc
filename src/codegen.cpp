@@ -4468,6 +4468,15 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ExistsFunc: {
+        if (n.sval == "array") {
+            Value *av = lookupArray(n.name);
+            if (!av) return perlInt(0);
+            Value *idx = emitIdx(*n.left);
+            Value *elem = callRT("perl_array_get_ref", {av, idx});
+            Value *def  = callRT("perl_defined", {elem});
+            return callRT("perl_alloc_int",
+                {builder_.CreateSExt(def, Type::getInt64Ty(ctx_))});
+        }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlInt(0);
         Value *r = emitHashExists(hv, *n.left);

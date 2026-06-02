@@ -1646,16 +1646,25 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* exists $h{key} */
+    /* exists $h{key}  or  exists $arr[N]  (with optional parens) */
     if (check(TK::KW_EXISTS)) {
         advance();
+        bool hasParen = match(TK::LPAREN);
         consume(TK::SCALAR, "$");
         std::string nm = cur().text; advance();
-        consume(TK::LBRACE, "{");
-        auto key = parseExpr();
-        consume(TK::RBRACE, "}");
         auto n = std::make_unique<Node>(); n->kind = NK::ExistsFunc;
-        n->name = nm; n->left = std::move(key); n->line = line;
+        n->name = nm; n->line = line;
+        if (check(TK::LBRACKET)) {
+            advance();
+            n->left = parseExpr();
+            consume(TK::RBRACKET, "]");
+            n->sval = "array";
+        } else {
+            consume(TK::LBRACE, "{");
+            n->left = parseExpr();
+            consume(TK::RBRACE, "}");
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
         return n;
     }
 
