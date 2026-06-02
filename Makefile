@@ -79,3 +79,4 @@ test: $(TARGET)
 	@echo "=== tr.pl           ===" && ./$(TARGET) tests/tr.pl           -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== wantarray.pl    ===" && ./$(TARGET) tests/wantarray.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
 	@echo "=== regex_named.pl  ===" && ./$(TARGET) tests/regex_named.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+	@echo "=== completeness.pl ===" && ./$(TARGET) tests/completeness.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
