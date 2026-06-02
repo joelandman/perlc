@@ -1433,6 +1433,98 @@ HOTX int perl_hash_exists_str(PerlHash *h, const char *key) {
     return hash_find(h, key) != NULL;
 }
 
+/* ── autovivification ────────────────────────────────────────────────────── */
+
+/* Ensure $h{key} holds a hash ref; create one if missing/undef.  Return the
+   inner PerlHash* so the caller can set a subkey without a second lookup. */
+PerlHash *perl_hash_autoviv_hash(PerlHash *h, const char *key) {
+    PerlHashEntry *e = hash_find(h, key);
+    if (e) {
+        if (e->val->tag == PERL_REF_HASH) return (PerlHash *)e->val->pval;
+        PerlHash *inner = perl_anon_hash_new();
+        PerlValue *ref  = perl_ref_hash(inner);
+        perl_free(e->val);
+        e->val = ref;
+        return inner;
+    }
+    PerlHash *inner = perl_anon_hash_new();
+    PerlValue *ref  = perl_ref_hash(inner);
+    unsigned int b  = hash_str(key);
+    PerlHashEntry *ne = malloc(sizeof *ne);
+    ne->key  = strdup(key); ne->val = ref;
+    ne->next = h->buckets[b]; h->buckets[b] = ne; h->size++;
+    return inner;
+}
+
+PerlHash *perl_hash_autoviv_hash_sv(PerlHash *h, PerlValue *key) {
+    char *ks = perl_to_string(key);
+    PerlHash *r = perl_hash_autoviv_hash(h, ks);
+    free(ks); return r;
+}
+
+/* Ensure $h{key} holds an array ref; create one if missing/undef. */
+PerlArray *perl_hash_autoviv_array(PerlHash *h, const char *key) {
+    PerlHashEntry *e = hash_find(h, key);
+    if (e) {
+        if (e->val->tag == PERL_REF_ARRAY) return (PerlArray *)e->val->pval;
+        PerlArray *inner = perl_anon_array_new();
+        PerlValue *ref   = perl_ref_array(inner);
+        perl_free(e->val);
+        e->val = ref;
+        return inner;
+    }
+    PerlArray *inner = perl_anon_array_new();
+    PerlValue *ref   = perl_ref_array(inner);
+    unsigned int b   = hash_str(key);
+    PerlHashEntry *ne = malloc(sizeof *ne);
+    ne->key  = strdup(key); ne->val = ref;
+    ne->next = h->buckets[b]; h->buckets[b] = ne; h->size++;
+    return inner;
+}
+
+/* Ensure $a[idx] holds a hash ref; create one if missing/undef. */
+PerlHash *perl_array_autoviv_hash(PerlArray *a, long long idx) {
+    long long i = idx < 0 ? idx + a->len : idx;
+    if (i >= 0 && i < a->len && a->elems[i]->tag == PERL_REF_HASH)
+        return (PerlHash *)a->elems[i]->pval;
+    PerlHash *inner = perl_anon_hash_new();
+    PerlValue *ref  = perl_ref_hash(inner);
+    perl_array_set(a, idx, ref);  /* clones ref → inner->refcount bumped */
+    perl_free(ref);               /* drop original ref; inner survives via clone */
+    return inner;
+}
+
+/* Ensure $a[idx] holds an array ref; create one if missing/undef. */
+PerlArray *perl_array_autoviv_array(PerlArray *a, long long idx) {
+    long long i = idx < 0 ? idx + a->len : idx;
+    if (i >= 0 && i < a->len && a->elems[i]->tag == PERL_REF_ARRAY)
+        return (PerlArray *)a->elems[i]->pval;
+    PerlArray *inner = perl_anon_array_new();
+    PerlValue *ref   = perl_ref_array(inner);
+    perl_array_set(a, idx, ref);
+    perl_free(ref);
+    return inner;
+}
+
+/* Lvalue hash-slice assignment: @h{@keys} = @vals  (zip keys→vals) */
+void perl_hash_assign_slice(PerlHash *h, PerlArray *keys, PerlArray *vals) {
+    long long n = keys->len < vals->len ? keys->len : vals->len;
+    for (long long i = 0; i < n; i++) {
+        char *key = perl_to_string(keys->elems[i]);
+        perl_hash_set_str(h, key, vals->elems[i]);
+        free(key);
+    }
+}
+
+/* Lvalue array-slice assignment: @a[@indices] = @vals  (zip indices→vals) */
+void perl_array_assign_slice(PerlArray *a, PerlArray *indices, PerlArray *vals) {
+    long long n = indices->len < vals->len ? indices->len : vals->len;
+    for (long long i = 0; i < n; i++) {
+        long long idx = perl_to_int(indices->elems[i]);
+        perl_array_set(a, idx, vals->elems[i]);
+    }
+}
+
 PerlValue *perl_hash_delete_str(PerlHash *h, const char *key) {
     unsigned int b = hash_str(key);
     PerlHashEntry **pp = &h->buckets[b];

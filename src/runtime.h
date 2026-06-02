@@ -206,6 +206,17 @@ PerlArray *perl_hash_slice(PerlHash *h, PerlArray *keys); /* values for key list
 PerlArray *perl_hash_values(PerlHash *h);  /* returns new PerlArray* of values */
 PerlValue *perl_hash_size(PerlHash *h);    /* returns int count of key-value pairs */
 
+/* autovivification: ensure slot holds a ref of the right type, create if needed */
+PerlHash  *perl_hash_autoviv_hash(PerlHash *h, const char *key);
+PerlHash  *perl_hash_autoviv_hash_sv(PerlHash *h, PerlValue *key);
+PerlArray *perl_hash_autoviv_array(PerlHash *h, const char *key);
+PerlHash  *perl_array_autoviv_hash(PerlArray *a, long long idx);
+PerlArray *perl_array_autoviv_array(PerlArray *a, long long idx);
+
+/* lvalue slice assignment */
+void perl_hash_assign_slice(PerlHash *h, PerlArray *keys, PerlArray *vals);
+void perl_array_assign_slice(PerlArray *a, PerlArray *indices, PerlArray *vals);
+
 /* initialise hash from flat list (k1,v1,k2,v2,...) */
 void       perl_hash_from_list(PerlHash *h, PerlArray *list);
 void       perl_array_extend_hash(PerlArray *dst, PerlHash *h); /* append k,v pairs */

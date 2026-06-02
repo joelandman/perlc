@@ -202,6 +202,13 @@ void CodeGen::declareRuntime() {
     RT("perl_hash_values",   av,  av);
     RT("perl_hash_size",     pv,  av);
     RT("perl_hash_from_list",voidTy, av, av);
+    RT("perl_hash_autoviv_hash",    av, av, strPtrTy);
+    RT("perl_hash_autoviv_hash_sv", av, av, pv);
+    RT("perl_hash_autoviv_array",   av, av, strPtrTy);
+    RT("perl_array_autoviv_hash",   av, av, i64);
+    RT("perl_array_autoviv_array",  av, av, i64);
+    RT("perl_hash_assign_slice",    voidTy, av, av, av);
+    RT("perl_array_assign_slice",   voidTy, av, av, av);
     RT("perl_array_sort_str",   voidTy, av);
     RT("perl_array_extend",     voidTy, av, av);
     RT("perl_array_extend_hash",voidTy, av, av);
@@ -3746,12 +3753,37 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_assign", {target, rhs});
             return rhs;
         }
-        /* $ref->[i] = val  or  $ref->{k} = val */
+        /* $ref->[i] = val  or  $ref->{k} = val  (with autovivification) */
         if (n.left->kind == NK::ArrowDeref) {
-            Value *base = emitExpr(*n.left->left);
             if (n.left->sval == "array") {
                 Value *idx = emitIdx(*n.left->right);
                 Value *rhs = emitExpr(*n.right);
+                /* autovivify $h{k}[i] = val */
+                if (n.left->left->kind == NK::HashElem) {
+                    Value *outerHv = lookupHash(n.left->left->name);
+                    if (!outerHv) return perlUndef();
+                    Value *innerAv;
+                    if (Value *kp = constKeyPtr(*n.left->left->left, builder_))
+                        innerAv = callRT("perl_hash_autoviv_array", {outerHv, kp});
+                    else {
+                        Value *key = emitExpr(*n.left->left->left);
+                        innerAv = callRT("perl_hash_autoviv_array_sv", {outerHv, key});
+                        freeIfOwned(key);
+                    }
+                    callRT("perl_array_set", {innerAv, idx, rhs});
+                    return rhs;
+                }
+                /* autovivify $a[i][j] = val */
+                if (n.left->left->kind == NK::ArrayElem) {
+                    Value *outerAv = lookupArray(n.left->left->name);
+                    if (!outerAv) return perlUndef();
+                    Value *outerIdx = emitIdx(*n.left->left->left);
+                    Value *innerAv  = callRT("perl_array_autoviv_array", {outerAv, outerIdx});
+                    callRT("perl_array_set", {innerAv, idx, rhs});
+                    return rhs;
+                }
+                /* regular $ref->[i] = val */
+                Value *base = emitExpr(*n.left->left);
                 /* Stage 22: always dispatch flat/norm to avoid perl_deref_array
                    lazy-converting FLAT_ARRAY PVs (keeps all bodies flat throughout). */
                 auto *i8T32  = Type::getInt8Ty(ctx_);
@@ -3787,9 +3819,29 @@ Value *CodeGen::emitExpr(const Node &n) {
                 builder_.SetInsertPoint(mBB32);
                 return rhs;
             } else {
+                /* hash case — autovivify $h{k}{subk} = val or $a[i]{subk} = val */
                 Value *rhs = emitExpr(*n.right);
-                Value *hv = callRT("perl_deref_hash", {base});
-                freeIfOwned(base);
+                Value *hv;
+                if (n.left->left->kind == NK::HashElem) {
+                    Value *outerHv = lookupHash(n.left->left->name);
+                    if (!outerHv) return perlUndef();
+                    if (Value *kp = constKeyPtr(*n.left->left->left, builder_))
+                        hv = callRT("perl_hash_autoviv_hash", {outerHv, kp});
+                    else {
+                        Value *key = emitExpr(*n.left->left->left);
+                        hv = callRT("perl_hash_autoviv_hash_sv", {outerHv, key});
+                        freeIfOwned(key);
+                    }
+                } else if (n.left->left->kind == NK::ArrayElem) {
+                    Value *av = lookupArray(n.left->left->name);
+                    if (!av) return perlUndef();
+                    Value *outerIdx = emitIdx(*n.left->left->left);
+                    hv = callRT("perl_array_autoviv_hash", {av, outerIdx});
+                } else {
+                    Value *base = emitExpr(*n.left->left);
+                    hv = callRT("perl_deref_hash", {base});
+                    freeIfOwned(base);
+                }
                 emitHashSet(hv, *n.left->right, rhs);
                 return rhs;
             }
@@ -3801,6 +3853,55 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *rhs = emitExpr(*n.right);
             callRT("perl_array_set", {av, emitIdx(*n.left->left), rhs});
             return rhs;
+        }
+        /* @arr[i,j,...] = list  (lvalue array slice) */
+        if (n.left->kind == NK::ArraySlice) {
+            Value *av = lookupArray(n.left->name);
+            if (!av) return perlUndef();
+            Value *idxArr = callRT("perl_array_new", {});
+            for (auto &idxNode : n.left->args)
+                callRT("perl_array_push", {idxArr, emitExpr(*idxNode)});
+            callCtx_ = 1;
+            Value *rhsArr = emitArrayPtr(*n.right);
+            callCtx_ = 0;
+            if (!rhsArr) {
+                rhsArr = callRT("perl_array_new", {});
+                if (n.right->kind == NK::ArrayLit)
+                    for (auto &e : n.right->args)
+                        callRT("perl_array_push", {rhsArr, emitExpr(*e)});
+                else
+                    callRT("perl_array_push", {rhsArr, emitExpr(*n.right)});
+            }
+            callRT("perl_array_assign_slice", {av, idxArr, rhsArr});
+            return perlUndef();
+        }
+        /* @h{LIST} = list  (lvalue hash slice) */
+        if (n.left->kind == NK::HashSlice) {
+            Value *hv = lookupHash(n.left->name);
+            if (!hv) return perlUndef();
+            Value *keyArr = callRT("perl_array_new", {});
+            for (auto &keyNode : n.left->args) {
+                if (keyNode->kind == NK::ArrayLit)
+                    for (auto &k : keyNode->args)
+                        callRT("perl_array_push", {keyArr, emitExpr(*k)});
+                else if (Value *kav = emitArrayPtr(*keyNode))
+                    callRT("perl_array_extend", {keyArr, kav});
+                else
+                    callRT("perl_array_push", {keyArr, emitExpr(*keyNode)});
+            }
+            callCtx_ = 1;
+            Value *rhsArr = emitArrayPtr(*n.right);
+            callCtx_ = 0;
+            if (!rhsArr) {
+                rhsArr = callRT("perl_array_new", {});
+                if (n.right->kind == NK::ArrayLit)
+                    for (auto &e : n.right->args)
+                        callRT("perl_array_push", {rhsArr, emitExpr(*e)});
+                else
+                    callRT("perl_array_push", {rhsArr, emitExpr(*n.right)});
+            }
+            callRT("perl_hash_assign_slice", {hv, keyArr, rhsArr});
+            return perlUndef();
         }
         /* opendir assignment: opendir(my $dh, path) stores DIRHANDLE into $dh */
         if (n.left->kind == NK::ScalarVar && n.right &&
