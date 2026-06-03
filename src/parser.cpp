@@ -1552,15 +1552,45 @@ NodePtr Parser::parsePrimary() {
             n->name = nm; n->sval = "scalar"; n->line = line;
             return n;
         }
-        /* scalar @arr or scalar(@arr) */
-        if (check(TK::ARRAY) || (check(TK::LPAREN) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::ARRAY)) {
-            bool hasParen = match(TK::LPAREN);
-            consume(TK::ARRAY, "@");
-            std::string nm = cur().text; advance();
-            if (hasParen) consume(TK::RPAREN, ")");
-            auto n = std::make_unique<Node>(); n->kind = NK::ScalarFunc;
-            n->name = nm; n->line = line;
-            return n;
+        /* scalar @arr / scalar(@arr) / scalar @{expr} / scalar @$ref */
+        {
+            bool hasParen = false;
+            bool isArr = check(TK::ARRAY);
+            bool isArrParen = !isArr && check(TK::LPAREN) &&
+                              pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::ARRAY;
+            if (isArr || isArrParen) {
+                hasParen = isArrParen && match(TK::LPAREN);
+                consume(TK::ARRAY, "@");
+                if (check(TK::LBRACE)) {           /* @{expr} */
+                    advance();
+                    auto inner = parseExpr();
+                    consume(TK::RBRACE, "}");
+                    if (hasParen) consume(TK::RPAREN, ")");
+                    /* wrap in DerefArray and return as ScalarFunc-equivalent */
+                    auto deref = std::make_unique<Node>(); deref->kind = NK::DerefArray;
+                    deref->left = std::move(inner); deref->line = line;
+                    /* scalar of a deref: emit DerefArray then take length */
+                    auto sc = std::make_unique<Node>(); sc->kind = NK::ScalarFunc;
+                    sc->left = std::move(deref); sc->line = line;
+                    return sc;
+                } else if (check(TK::SCALAR)) {    /* @$ref */
+                    advance();
+                    std::string nm = cur().text; advance();
+                    if (hasParen) consume(TK::RPAREN, ")");
+                    auto ref = makeScalar(nm, line);
+                    auto deref = std::make_unique<Node>(); deref->kind = NK::DerefArray;
+                    deref->left = std::move(ref); deref->line = line;
+                    auto sc = std::make_unique<Node>(); sc->kind = NK::ScalarFunc;
+                    sc->left = std::move(deref); sc->line = line;
+                    return sc;
+                } else {                           /* @name */
+                    std::string nm = cur().text; advance();
+                    if (hasParen) consume(TK::RPAREN, ")");
+                    auto n = std::make_unique<Node>(); n->kind = NK::ScalarFunc;
+                    n->name = nm; n->line = line;
+                    return n;
+                }
+            }
         }
         /* scalar EXPR — evaluate EXPR in scalar context; just parse it */
         auto inner = parsePrimary();
@@ -1570,21 +1600,68 @@ NodePtr Parser::parsePrimary() {
 
     if (check(TK::ARRAY)) {
         advance(); /* skip @ */
-        /* @{EXPR} — block deref */
+        /* @{EXPR} — deref or hash/array ref slice */
         if (check(TK::LBRACE)) {
             advance();
             auto inner = parseExpr();
             consume(TK::RBRACE, "}");
+            /* @{$href}{keys} — hash ref slice */
+            if (check(TK::LBRACE)) {
+                advance();
+                auto n = std::make_unique<Node>(); n->kind = NK::HashSlice; n->line = line;
+                n->left = std::move(inner); /* ref expr stored in left */
+                while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
+                    n->args.push_back(parseExpr());
+                    if (!match(TK::COMMA)) break;
+                }
+                consume(TK::RBRACE, "}");
+                return n;
+            }
+            /* @{$aref}[indices] — array ref slice */
+            if (check(TK::LBRACKET)) {
+                advance();
+                auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice; n->line = line;
+                n->left = std::move(inner);
+                while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
+                    n->args.push_back(parseExpr());
+                    if (!match(TK::COMMA)) break;
+                }
+                consume(TK::RBRACKET, "]");
+                return n;
+            }
             auto n = std::make_unique<Node>(); n->kind = NK::DerefArray;
             n->left = std::move(inner); n->line = line;
             return n;
         }
-        /* @$ref — array deref */
+        /* @$ref — array deref (or slice if followed by {/[) */
         if (check(TK::SCALAR)) {
             advance();
             std::string nm = cur().text; advance();
+            auto refExpr = makeScalar(nm, line);
+            if (check(TK::LBRACE)) { /* @$href{keys} — hash ref slice */
+                advance();
+                auto n = std::make_unique<Node>(); n->kind = NK::HashSlice; n->line = line;
+                n->left = std::move(refExpr);
+                while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
+                    n->args.push_back(parseExpr());
+                    if (!match(TK::COMMA)) break;
+                }
+                consume(TK::RBRACE, "}");
+                return n;
+            }
+            if (check(TK::LBRACKET)) { /* @$aref[indices] — array ref slice */
+                advance();
+                auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice; n->line = line;
+                n->left = std::move(refExpr);
+                while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
+                    n->args.push_back(parseExpr());
+                    if (!match(TK::COMMA)) break;
+                }
+                consume(TK::RBRACKET, "]");
+                return n;
+            }
             auto n = std::make_unique<Node>(); n->kind = NK::DerefArray;
-            n->left = makeScalar(nm, line); n->line = line;
+            n->left = std::move(refExpr); n->line = line;
             return n;
         }
         std::string nm = cur().text; advance();

@@ -556,6 +556,12 @@ Value *CodeGen::perlFloat(double v) {
 /* Returns a PerlArray* Value for expressions that produce arrays.
    Used by foreach and array-context assignments. */
 Value *CodeGen::emitArrayPtr(const Node &n) {
+    /* LO..HI range in list context → perl_range returns PerlArray* */
+    if (n.kind == NK::Range) {
+        Value *lo = emitExpr(*n.left);
+        Value *hi = emitExpr(*n.right);
+        return callRT("perl_range", {lo, hi});
+    }
     /* (LIST) x N — list repetition in array context */
     if (n.kind == NK::BinOp && n.sval == "x" && n.left) {
         Value *srcArr = emitArrayPtr(*n.left);
@@ -840,19 +846,36 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         /* emit block / expr with $_ in scope */
         pushScope();
         declareVar("_", udAlloca);
-        Value *blockResult;
-        if (n.body)       blockResult = emitBlockLast(*n.body);
-        else if (n.left)  blockResult = emitExpr(*n.left);
-        else              blockResult = perlUndef();
-        popScope();
 
         if (isMap) {
-            callRT("perl_array_push", {resultArr, blockResult});
-            Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
-            builder_.CreateStore(i2, iAlloca);
-            builder_.CreateBr(condBB);
+            /* For map, try array path first so `map { @$_ } @aoa` flattens.
+               Emit all-but-last stmts normally, then handle the last expression
+               via emitArrayPtr (extend) or emitExpr (push). */
+            Value *mapAv = nullptr;
+            Value *mapPv = nullptr;
+            if (n.body && !n.body->args.empty()) {
+                const auto &stmts = n.body->args;
+                for (size_t si = 0; si + 1 < stmts.size(); si++)
+                    emitStmt(*stmts[si]);
+                const Node &last = *stmts.back();
+                const Node *e = (last.kind == NK::ExprStmt && last.left)
+                                ? last.left.get() : nullptr;
+                if (e) { mapAv = emitArrayPtr(*e); if (!mapAv) mapPv = emitExpr(*e); }
+                else   emitStmt(last);
+            } else if (n.left) {
+                mapAv = emitArrayPtr(*n.left);
+                if (!mapAv) mapPv = emitExpr(*n.left);
+            }
+            popScope();
+            if (mapAv)      callRT("perl_array_extend", {resultArr, mapAv});
+            else if (mapPv) callRT("perl_array_push",   {resultArr, mapPv});
         } else {
             /* grep: push element if block result is true */
+            Value *blockResult;
+            if (n.body)       blockResult = emitBlockLast(*n.body);
+            else if (n.left)  blockResult = emitExpr(*n.left);
+            else              blockResult = perlUndef();
+            popScope();
             Value *tv    = callRT("perl_is_true", {blockResult});
             Value *cond  = builder_.CreateICmpNE(tv, ConstantInt::get(i32, 0));
             auto *pushBB = BasicBlock::Create(ctx_, "grep.push", fn);
@@ -862,12 +885,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             builder_.SetInsertPoint(pushBB);
             callRT("perl_array_push", {resultArr, elem});
             builder_.CreateBr(nextBB);
-
             builder_.SetInsertPoint(nextBB);
-            Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
-            builder_.CreateStore(i2, iAlloca);
-            builder_.CreateBr(condBB);
         }
+
+        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+        builder_.CreateStore(i2, iAlloca);
+        builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(exitBB);
         return resultArr;
@@ -890,7 +913,14 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return callRT("perl_splice", {av, off, len, repl});
     }
     if (n.kind == NK::ArraySlice) {
-        Value *av  = lookupArray(n.name);
+        Value *av;
+        if (n.left) {              /* @{$aref}[...] or @$aref[...] */
+            Value *ref = emitExpr(*n.left);
+            av = callRT("perl_deref_array", {ref});
+            freeIfOwned(ref);
+        } else {
+            av = lookupArray(n.name);
+        }
         Value *res = callRT("perl_array_new", {});
         for (auto &idxNode : n.args) {
             Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(*idxNode)}) : perlUndef();
@@ -899,7 +929,14 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return res;
     }
     if (n.kind == NK::HashSlice) {
-        Value *hv  = lookupHash(n.name);
+        Value *hv;
+        if (n.left) {              /* @{$href}{...} or @$href{...} */
+            Value *ref = emitExpr(*n.left);
+            hv = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+        } else {
+            hv = lookupHash(n.name);
+        }
         Value *res = callRT("perl_array_new", {});
         auto pushHashKey = [&](const Node &keyNode) {
             if (keyNode.kind == NK::ArrayLit) {
@@ -958,6 +995,9 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 if (arg->kind == NK::HashVar) {
                     Value *hv = lookupHash(arg->name);
                     if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
+                }
+                if (Value *av = emitArrayPtr(*arg)) {
+                    callRT("perl_array_extend", {argsArr, av}); continue;
                 }
                 Value *v = emitExpr(*arg);
                 callRT("perl_array_push", {argsArr, v});
@@ -2069,7 +2109,15 @@ static bool hasWantarrayOrUserCall(const Node &n) {
     if (n.kind == NK::WantarrayFunc) return true;
     if (n.kind == NK::Call)         return true;  /* any user-defined sub call */
     /* return (LIST) uses perl_array_to_list_return which reads wantarray stack */
-    if (n.kind == NK::Return && n.left && n.left->kind == NK::ArrayLit) return true;
+    if (n.kind == NK::Return && n.left) {
+        NK lk = n.left->kind;
+        if (lk == NK::ArrayLit || lk == NK::ArrayVar || lk == NK::MapFunc ||
+            lk == NK::GrepFunc || lk == NK::SortFunc || lk == NK::DerefArray ||
+            lk == NK::ReverseFunc) return true;
+    }
+    /* implicit list return from grep/map/sort also reads wantarray stack */
+    if (n.kind == NK::MapFunc || n.kind == NK::GrepFunc ||
+        n.kind == NK::SortFunc) return true;
     bool r = false;
     if (n.left)  r = r || hasWantarrayOrUserCall(*n.left);
     if (n.right) r = r || hasWantarrayOrUserCall(*n.right);
@@ -2204,7 +2252,20 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         const Node &stmt = *n.args[i];
         bool isLast = (i + 1 == n.args.size());
         if (isLast && stmt.kind == NK::ExprStmt && stmt.left) {
-            result = emitExpr(*stmt.left);
+            /* If the last expr produces a list (grep/map/sort/etc.) and we're in
+               a wantarray-aware sub, wrap it for list/scalar context propagation. */
+            const Node &le = *stmt.left;
+            NK lk = le.kind;
+            bool isListProducer = (lk == NK::MapFunc || lk == NK::GrepFunc ||
+                                   lk == NK::SortFunc || lk == NK::DerefArray ||
+                                   lk == NK::ReverseFunc);
+            if (isListProducer && currentSubNeedsWantarray_) {
+                Value *av = emitArrayPtr(le);
+                if (!av) av = callRT("perl_array_new", {});
+                result = callRT("perl_array_to_list_return", {av});
+            } else {
+                result = emitExpr(le);
+            }
         } else {
             emitStmt(stmt);
         }
@@ -2462,16 +2523,28 @@ void CodeGen::emitStmt(const Node &n) {
                     callRT(isSay ? "perl_say" : "perl_print", {v});
                 }
             } else if (n.args.size() == 1) {
-                if (Value *av = emitArrayPtr(*n.args[0]))
+                /* Only expand @arr / @$ref / @{expr} — not function calls which may
+                   return scalars and must go through perl_say for the newline. */
+                NK ak = n.args[0]->kind;
+                bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
+                                        ak == NK::ArraySlice || ak == NK::HashSlice);
+                Value *av = isExplicitArray ? emitArrayPtr(*n.args[0]) : nullptr;
+                if (av) {
                     callRT("perl_print_array", {av});
-                else {
+                    if (isSay) callRT("perl_print_string",
+                                     {builder_.CreateGlobalString("\n", ".nl")});
+                } else {
                     Value *v = emitExpr(*n.args[0]);
                     callRT(isSay ? "perl_say" : "perl_print", {v});
                 }
             } else {
                 for (size_t i = 0; i < n.args.size(); i++) {
                     if (i > 0) callRT("perl_print_sep", {});
-                    if (Value *av = emitArrayPtr(*n.args[i]))
+                    NK ak = n.args[i]->kind;
+                    bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
+                                            ak == NK::ArraySlice || ak == NK::HashSlice);
+                    Value *av = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
+                    if (av)
                         callRT("perl_print_array", {av});
                     else
                         callRT("perl_print", {emitExpr(*n.args[i])});
@@ -3073,8 +3146,11 @@ void CodeGen::emitStmt(const Node &n) {
 
     case NK::Return: {
         Value *v;
-        if (n.left && (n.left->kind == NK::ArrayLit || n.left->kind == NK::ArrayVar)) {
-            /* return (LIST) or return @arr — wrap for list/scalar context at runtime */
+        if (n.left && (n.left->kind == NK::ArrayLit || n.left->kind == NK::ArrayVar ||
+                       n.left->kind == NK::MapFunc  || n.left->kind == NK::GrepFunc ||
+                       n.left->kind == NK::SortFunc || n.left->kind == NK::DerefArray ||
+                       n.left->kind == NK::ReverseFunc)) {
+            /* return list-producing expr — wrap for list/scalar context at runtime */
             Value *av = emitArrayPtr(*n.left);
             if (!av) av = callRT("perl_array_new", {});
             v = callRT("perl_array_to_list_return", {av});
@@ -4360,6 +4436,16 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::Call: return emitCall(n);
 
     case NK::ScalarFunc: {
+        if (n.left) {
+            /* scalar @{expr} or scalar @$ref — deref then take length */
+            Value *av = emitArrayPtr(*n.left);
+            if (!av) {
+                Value *ref = emitExpr(*n.left);
+                av = callRT("perl_deref_array", {ref});
+                freeIfOwned(ref);
+            }
+            return callRT("perl_array_len", {av});
+        }
         Value *av = lookupArray(n.name);
         if (!av) return perlInt(0);
         return callRT("perl_array_len", {av});
@@ -5595,6 +5681,11 @@ Value *CodeGen::emitCall(const Node &n) {
             if (arg->kind == NK::HashVar) {
                 Value *hv = lookupHash(arg->name);
                 if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
+            }
+            /* Range, DerefArray, AnonArray and other list-producers expand in @_ */
+            if (Value *av = emitArrayPtr(*arg)) {
+                callRT("perl_array_extend", {argsArr, av});
+                continue;
             }
             Value *v = emitExpr(*arg);
             callRT("perl_array_push", {argsArr, v});
