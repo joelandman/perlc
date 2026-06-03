@@ -4,7 +4,7 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 36/36 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation (including through call chains and implicit returns of grep/map/sort), require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, labeled `next`/`last`, `map { @$_ }` flattening, hash-ref slices `@{$href}{LIST}`, `scalar(@{$ref})`, and range expansion in function call args.
+**Current Status**: Core language features are ~99% implemented with 36/36 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation (including through call chains and implicit returns of grep/map/sort), require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, labeled `next`/`last`, `map { @$_ }` flattening, hash-ref slices `@{$href}{LIST}`, `scalar(@{$ref})`, range expansion in function call args, anonymous sub implicit return, `$h{k}++` on missing keys, and `sort { } qw(...)` lists.
 
 ## Build & Test
 
@@ -47,7 +47,7 @@ make clean
 - **Operators**: arithmetic, string (`.`, `x` repetition), range (`..`), comparisons (`==`, `eq`, `<=>`, `cmp`), logical (`&&`, `||`, `!`, `//`), low-precedence (`and`, `or`, `not`), bitwise (`&`, `|`, `^`, `~`, `<<`, `>>`), increment/decrement (`++`/`--` including magical string increment), compound assignment (`+=`, `-=`, `*=`, `/=`, `.=`, `%=`, `**=`, `||=`, `&&=`, `//=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `x=`), ternary
 - **Control Flow**: `if`/`elsif`/`else`, `unless`, `while`/`until` (including `while (my $var = expr)`), `do-while`/`do-until`, C-style `for`, `foreach`, `last`/`next`/`redo` with optional labels (`LABEL: for ... { next LABEL }`), statement modifiers
 - **Subroutines**: named and anonymous subs, recursion, `@_`, list unpacking, code references (`\&sub`, `$f->()`), `ref()` returning `"CODE"`
-- **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort` (including `sort { BLOCK }`), `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete` (all accepting `%{$ref}` / `%$ref` deref forms; `exists`/`delete` support both `$h{k}` and `$arr[N]`), `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`; `print @arr` prints all elements
+- **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort` (including `sort { BLOCK }`, `sort { BLOCK } qw(...)`, `sort { BLOCK } @arr`), `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete` (all accepting `%{$ref}` / `%$ref` deref forms; `exists`/`delete` support both `$h{k}` and `$arr[N]`), `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`; `print @arr` prints all elements
 - **Time**: `time`, `localtime`, `gmtime` (list context → 9-element list: sec,min,hour,mday,mon,year,wday,yday,isdst)
 - **Randomness**: `rand [MAX]`, `srand [SEED]`
 - **Process**: `sleep SECS`, `alarm SECS`
@@ -88,7 +88,7 @@ make clean
 
 ### Advanced Perl Semantics
 - **Closures**: lexical capture of `my` variables by stable pointer, nested closures, independent instances
-- **Subs returning lists**: `sub f { grep { ... } @_ }` / `sub f { map { ... } @_ }` / `sub f { sort @_ }` correctly return lists in list context and count in scalar context; `return grep/map/sort` also propagates list context
+- **Subs returning lists**: `sub f { grep { ... } @_ }` / `sub f { map { ... } @_ }` / `sub f { sort @_ }` correctly return lists in list context and count in scalar context; `return grep/map/sort` also propagates list context; anonymous subs (`sub { expr }->()`) correctly return the last expression's value
 - **Local**: dynamic scoping for scalars, arrays, and hashes (`local $x`, `local @arr`, `local %hash`, `local $/`, `local @ARGV`; block-scoped restore)
 - **Array/hash assignment**: `@arr = @other`, `@arr = ()` (clear), `%h = (list)` (replaces all entries), `(LIST)[i]` subscript on sort/map/grep/caller results; lvalue slices `@arr[i,j] = list` and `@h{qw(a b)} = list`; autovivification `$h{a}{b} = val`, `$a[i]{k} = val`, `push @{$h{k}}, val`; `map { @$_ } @aoa` flattening; range `1..N` expands in function call args
 - **Exceptions**: `eval { BLOCK }` with `$@` support using `setjmp`/`longjmp`
@@ -151,4 +151,4 @@ The following features are **not yet implemented** or only partially supported:
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 36-test suite. Recent additions: lvalue slices, autovivification, labeled loops, `keys/values %{$ref}`, `push @{$h{k}}` autoviv, `print @arr`, array-in-boolean-context, wantarray chain propagation, `exists`/`delete` improvements, `map { @$_ }` flattening, `scalar(@{$ref})`, `@{$href}{LIST}` hash-ref slices, subs returning grep/map/sort in list context, `func(1..N)` range expansion in call args.
+**Last Updated**: Current state reflects all features demonstrated in the 36-test suite. Recent additions: lvalue slices, autovivification, labeled loops, `keys/values %{$ref}`, `push @{$h{k}}` autoviv, `print @arr`, array-in-boolean-context, wantarray chain propagation, `exists`/`delete` improvements, `map { @$_ }` flattening, `scalar(@{$ref})`, `@{$href}{LIST}` hash-ref slices, subs returning grep/map/sort in list context, `func(1..N)` range expansion in call args, anonymous sub implicit return, `$h{k}++`/`$h{k}+=n` on missing keys, `sort { } qw(...)` list support.
