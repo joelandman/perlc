@@ -2914,14 +2914,25 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
 }
 
 PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str) {
+    PerlArray *arr = perl_array_new();
+    char *s = perl_to_string(str);
+    size_t slen = strlen(s);
+
+    /* empty pattern: split into individual characters (Perl semantics) */
+    if (pattern[0] == '\0') {
+        for (size_t i = 0; i < slen; i++) {
+            char ch[2] = {s[i], '\0'};
+            PerlValue *v = perl_alloc_string(ch);
+            perl_array_push(arr, v); perl_free(v);
+        }
+        free(s);
+        return arr;
+    }
+
     int errcode; PCRE2_SIZE erroffset;
     pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
                                    pcre_flags(flags), &errcode, &erroffset, NULL);
-    PerlArray *arr = perl_array_new();
-    if (!re) return arr;
-
-    char *s = perl_to_string(str);
-    size_t slen = strlen(s);
+    if (!re) { free(s); return arr; }
     size_t pos = 0;
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
 

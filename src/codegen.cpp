@@ -868,6 +868,13 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 mapAv = emitArrayPtr(*n.left);
                 if (!mapAv) mapPv = emitExpr(*n.left);
             }
+            /* Clone scalar result before popScope() frees scope variables it may
+               reference (e.g. last expr is a ScalarVar whose alloca is being freed). */
+            if (mapPv && !llvm::isa<llvm::ConstantPointerNull>(mapPv)) {
+                Value *orig = mapPv;
+                mapPv = callRT("perl_clone", {mapPv});
+                freeIfOwned(orig);
+            }
             popScope();
             if (mapAv)      callRT("perl_array_extend", {resultArr, mapAv});
             else if (mapPv) callRT("perl_array_push",   {resultArr, mapPv});
