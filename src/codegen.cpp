@@ -134,6 +134,8 @@ void CodeGen::declareRuntime() {
     RT("perl_print",         voidTy, pv);
     RT("perl_say",           voidTy, pv);
     RT("perl_print_string",  voidTy, i8p);
+    RT("perl_print_array",   voidTy, av);
+    RT("perl_current_wantarray_ctx", Type::getInt32Ty(ctx_));
     RT("perl_add",           pv,  pv, pv);
     RT("perl_sub",           pv,  pv, pv);
     RT("perl_mul",           pv,  pv, pv);
@@ -205,6 +207,7 @@ void CodeGen::declareRuntime() {
     RT("perl_hash_autoviv_hash",    av, av, strPtrTy);
     RT("perl_hash_autoviv_hash_sv", av, av, pv);
     RT("perl_hash_autoviv_array",   av, av, strPtrTy);
+    RT("perl_hash_autoviv_array_sv",av, av, pv);
     RT("perl_array_autoviv_hash",   av, av, i64);
     RT("perl_array_autoviv_array",  av, av, i64);
     RT("perl_hash_assign_slice",    voidTy, av, av, av);
@@ -571,7 +574,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     }
     if (n.kind == NK::KeysFunc) {
         Value *av;
-        if (n.name == "+") {
+        if (n.left) {                      /* keys %{$ref} or keys %$ref */
+            Value *ref = emitExpr(*n.left);
+            Value *h   = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+            av = callRT("perl_hash_keys", {h});
+        } else if (n.name == "+") {
             av = callRT("perl_plus_hash_keys", {});
         } else {
             Value *h = lookupHash(n.name);
@@ -582,6 +590,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return av;
     }
     if (n.kind == NK::ValuesFunc) {
+        if (n.left) {                      /* values %{$ref} or values %$ref */
+            Value *ref = emitExpr(*n.left);
+            Value *h   = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+            return callRT("perl_hash_values", {h});
+        }
         Value *h = lookupHash(n.name);
         return h ? callRT("perl_hash_values", {h}) : callRT("perl_array_new", {});
     }
@@ -2448,12 +2462,19 @@ void CodeGen::emitStmt(const Node &n) {
                     callRT(isSay ? "perl_say" : "perl_print", {v});
                 }
             } else if (n.args.size() == 1) {
-                Value *v = emitExpr(*n.args[0]);
-                callRT(isSay ? "perl_say" : "perl_print", {v});
+                if (Value *av = emitArrayPtr(*n.args[0]))
+                    callRT("perl_print_array", {av});
+                else {
+                    Value *v = emitExpr(*n.args[0]);
+                    callRT(isSay ? "perl_say" : "perl_print", {v});
+                }
             } else {
                 for (size_t i = 0; i < n.args.size(); i++) {
                     if (i > 0) callRT("perl_print_sep", {});
-                    callRT("perl_print", {emitExpr(*n.args[i])});
+                    if (Value *av = emitArrayPtr(*n.args[i]))
+                        callRT("perl_print_array", {av});
+                    else
+                        callRT("perl_print", {emitExpr(*n.args[i])});
                 }
                 if (isSay) {
                     auto *nl = builder_.CreateGlobalString("\n", ".nl");
@@ -2529,6 +2550,7 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.push_back(exit);
         loopContinues_.push_back(cond);
         loopRedos_.push_back(body);
+        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, cond, body});
 
         /* If condition is 'my $var = rhs', hoist the variable allocation before
          * the loop so the alloca and stable PerlValue* are created exactly once.
@@ -2576,6 +2598,7 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.pop_back();
         loopContinues_.pop_back();
         loopRedos_.pop_back();
+        if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
         break;
     }
@@ -2772,6 +2795,7 @@ void CodeGen::emitStmt(const Node &n) {
             loopExits_.push_back(exit);
             loopContinues_.push_back(stepBB);
             loopRedos_.push_back(bodyBB);
+            if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, stepBB, bodyBB});
 
             /* Stage 23: call perl_array_is_all_flat ONCE before the loop for each
                derefAV that will be row-dereffed in the body. The result is stored
@@ -2954,6 +2978,7 @@ void CodeGen::emitStmt(const Node &n) {
             loopExits_.pop_back();
             loopContinues_.pop_back();
             loopRedos_.pop_back();
+            if (!n.sval.empty()) loopLabels_.pop_back();
             builder_.SetInsertPoint(exit);
             break;
         }
@@ -2989,6 +3014,7 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.push_back(exit);
         loopContinues_.push_back(stepBB);
         loopRedos_.push_back(bodyBB);
+        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, stepBB, bodyBB});
 
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
@@ -3020,6 +3046,7 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.pop_back();
         loopContinues_.pop_back();
         loopRedos_.pop_back();
+        if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
         callRT("perl_free", {loopPv});
         if (ownsTmpArr) callRT("perl_array_free", {tmpArr});
@@ -3027,13 +3054,21 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::Last:
-        if (!loopExits_.empty())
+        if (!n.sval.empty()) {
+            for (auto it = loopLabels_.rbegin(); it != loopLabels_.rend(); ++it)
+                if (it->name == n.sval) { builder_.CreateBr(it->exit); break; }
+        } else if (!loopExits_.empty()) {
             builder_.CreateBr(loopExits_.back());
+        }
         break;
 
     case NK::Next:
-        if (!loopContinues_.empty())
+        if (!n.sval.empty()) {
+            for (auto it = loopLabels_.rbegin(); it != loopLabels_.rend(); ++it)
+                if (it->name == n.sval) { builder_.CreateBr(it->cont); break; }
+        } else if (!loopContinues_.empty()) {
             builder_.CreateBr(loopContinues_.back());
+        }
         break;
 
     case NK::Return: {
@@ -3150,7 +3185,21 @@ void CodeGen::emitStmt(const Node &n) {
 
     case NK::PushStmt: {
         Value *av;
-        if (n.left) {
+        if (n.left && n.left->kind == NK::HashElem) {
+            Value *hv = lookupHash(n.left->name);
+            if (!hv) break;
+            if (Value *kp = constKeyPtr(*n.left->left, builder_))
+                av = callRT("perl_hash_autoviv_array", {hv, kp});
+            else {
+                Value *key = emitExpr(*n.left->left);
+                av = callRT("perl_hash_autoviv_array_sv", {hv, key});  /* uses _sv fallback */
+                freeIfOwned(key);
+            }
+        } else if (n.left && n.left->kind == NK::ArrayElem) {
+            Value *outerAv = lookupArray(n.left->name);
+            if (!outerAv) break;
+            av = callRT("perl_array_autoviv_array", {outerAv, emitIdx(*n.left->left)});
+        } else if (n.left) {
             Value *ref = emitExpr(*n.left);
             av = callRT("perl_deref_array", {ref});
         } else {
@@ -3167,7 +3216,21 @@ void CodeGen::emitStmt(const Node &n) {
 
     case NK::UnshiftStmt2: {
         Value *av;
-        if (n.left) {
+        if (n.left && n.left->kind == NK::HashElem) {
+            Value *hv = lookupHash(n.left->name);
+            if (!hv) break;
+            if (Value *kp = constKeyPtr(*n.left->left, builder_))
+                av = callRT("perl_hash_autoviv_array", {hv, kp});
+            else {
+                Value *key = emitExpr(*n.left->left);
+                av = callRT("perl_hash_autoviv_array_sv", {hv, key});
+                freeIfOwned(key);
+            }
+        } else if (n.left && n.left->kind == NK::ArrayElem) {
+            Value *outerAv = lookupArray(n.left->name);
+            if (!outerAv) break;
+            av = callRT("perl_array_autoviv_array", {outerAv, emitIdx(*n.left->left)});
+        } else if (n.left) {
             Value *ref = emitExpr(*n.left);
             av = callRT("perl_deref_array", {ref});
         } else {
@@ -3261,10 +3324,9 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ArrayVar: {
-        /* @arr in scalar/expr context — return the PerlArray* as opaque ptr */
-        /* (used as rhs of list assignment) */
+        /* @arr in scalar context — return the element count as PerlValue* */
         Value *av = lookupArray(n.name);
-        return av ? av : perlUndef();
+        return av ? callRT("perl_array_len", {av}) : perlInt(0);
     }
 
     case NK::ArrayLit: {
@@ -5544,7 +5606,15 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_,     "caller.file");
         Value *lineVal = ConstantInt::get(i32Ty, n.line);
         callRT("perl_push_call_frame", {pkgStr, fileStr, lineVal});
-        Value *ctxVal = ConstantInt::get(i32Ty, callCtx_);
+        Value *ctxVal;
+        if (callCtx_ == 1) {
+            ctxVal = ConstantInt::get(i32Ty, 1);
+        } else if (currentSubNeedsWantarray_) {
+            /* propagate the current frame's context to nested calls */
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        } else {
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        }
         callCtx_ = 0;
         Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
         callRT("perl_pop_call_frame", {});

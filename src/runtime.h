@@ -114,6 +114,8 @@ PerlValue *perl_or(const PerlValue *a, const PerlValue *b);
 void perl_print(const PerlValue *v);
 void perl_say(const PerlValue *v);
 void perl_print_string(const char *s);
+/* wantarray context peek */
+int perl_current_wantarray_ctx(void);
 
 /* increment / decrement (in-place, returns v) */
 PerlValue *perl_inc(PerlValue *v);
@@ -152,6 +154,7 @@ void       perl_array_sort_str(PerlArray *a);
 void       perl_array_extend(PerlArray *dst, PerlArray *src);
 PerlValue *perl_array_shift(PerlArray *a);
 void       perl_array_unshift(PerlArray *a, PerlValue *v);
+void       perl_print_array(PerlArray *a); /* print all elements with $, between them */
 
 /* ── string builtins ─────────────────────────────────────────────────────── */
 long long  perl_chomp(PerlValue *v);       /* remove trailing \n in-place, returns removed count */
@@ -210,6 +213,7 @@ PerlValue *perl_hash_size(PerlHash *h);    /* returns int count of key-value pai
 PerlHash  *perl_hash_autoviv_hash(PerlHash *h, const char *key);
 PerlHash  *perl_hash_autoviv_hash_sv(PerlHash *h, PerlValue *key);
 PerlArray *perl_hash_autoviv_array(PerlHash *h, const char *key);
+PerlArray *perl_hash_autoviv_array_sv(PerlHash *h, PerlValue *key);
 PerlHash  *perl_array_autoviv_hash(PerlArray *a, long long idx);
 PerlArray *perl_array_autoviv_array(PerlArray *a, long long idx);
 

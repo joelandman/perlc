@@ -182,6 +182,16 @@ void perl_print_ors_fh(PerlValue *fh) {
     perl_print_fh(fh, &s_dollar_bsl);
 }
 
+/* forward decl — PerlArray defined later in this file */
+typedef struct PerlArray PerlArray;
+void perl_print_array(PerlArray *a) {
+    for (long long i = 0; i < a->len; i++) {
+        if (i > 0) perl_print_sep();
+        perl_print(a->elems[i]);
+    }
+}
+
+
 /* $! — errno as a string */
 static PerlValue s_dollar_bang = { .tag = PERL_UNDEF };
 PerlValue *perl_get_dollar_bang(void) {
@@ -210,6 +220,11 @@ int perl_pop_wantarray(void) {
 }
 PerlValue *perl_wantarray(void) {
   return perl_alloc_int(s_wantarray_stack[s_wantarray_depth - 1]);
+}
+
+/* peek current wantarray context without modifying the stack */
+int perl_current_wantarray_ctx(void) {
+    return (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
 }
 
 /* list-context return: wrap PerlArray* in REF_ARRAY if wantarray, else take last elem */
@@ -1459,6 +1474,12 @@ PerlHash *perl_hash_autoviv_hash(PerlHash *h, const char *key) {
 PerlHash *perl_hash_autoviv_hash_sv(PerlHash *h, PerlValue *key) {
     char *ks = perl_to_string(key);
     PerlHash *r = perl_hash_autoviv_hash(h, ks);
+    free(ks); return r;
+}
+
+PerlArray *perl_hash_autoviv_array_sv(PerlHash *h, PerlValue *key) {
+    char *ks = perl_to_string(key);
+    PerlArray *r = perl_hash_autoviv_array(h, ks);
     free(ks); return r;
 }
 

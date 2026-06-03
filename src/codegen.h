@@ -114,9 +114,11 @@ private:
     enum class PPKind { Int, Float, DerefAV };
     std::unordered_map<std::string, PPKind> prePromotedArgs_;
     /* loop control blocks */
+    struct LoopLabel { std::string name; llvm::BasicBlock *exit; llvm::BasicBlock *cont; llvm::BasicBlock *redo; };
     std::vector<llvm::BasicBlock *> loopExits_;
     std::vector<llvm::BasicBlock *> loopContinues_;
     std::vector<llvm::BasicBlock *> loopRedos_;  /* redo target = body start */
+    std::vector<LoopLabel>          loopLabels_; /* labeled loop support */
     /* local() save depth at function entry (alloca holding i32) */
     llvm::Value *localDepthAlloca_ = nullptr;
     /* caller() support: current package name and source file */

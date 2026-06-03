@@ -172,6 +172,25 @@ NodePtr Parser::parseStmt() {
         return n;
     }
     if (check(TK::KW_WHILE))   return parseWhile();
+    /* LABEL: for/foreach/while/until
+       The lexer folds `OUTER:` into one IDENT token whose text ends with `:`.
+       Detect that and peek at the next token for a loop keyword. */
+    if (check(TK::IDENT)) {
+        const std::string &txt = cur().text;
+        bool isLabel = txt.size() >= 2 && txt.back() == ':' &&
+                       !(txt.size() >= 2 && txt[txt.size()-2] == ':'); /* not '::' */
+        if (isLabel) {
+            TK nextTok = pos_ + 1 < toks_.size() ? toks_[pos_+1].kind : TK::EOF_TOK;
+            if (nextTok == TK::KW_FOR || nextTok == TK::KW_FOREACH ||
+                nextTok == TK::KW_WHILE || nextTok == TK::KW_UNTIL) {
+                std::string label = txt.substr(0, txt.size() - 1); /* strip trailing : */
+                advance(); /* consume the LABEL: token */
+                NodePtr loop = parseStmt();
+                if (loop) loop->sval = label;
+                return loop;
+            }
+        }
+    }
     if (check(TK::KW_UNTIL)) {
         advance();
         consume(TK::LPAREN, "(");
@@ -248,11 +267,13 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_LAST)) {
         advance();
         auto n = std::make_unique<Node>(); n->kind = NK::Last; n->line = line;
+        if (check(TK::IDENT)) { n->sval = cur().text; advance(); } /* optional label */
         return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_NEXT)) {
         advance();
         auto n = std::make_unique<Node>(); n->kind = NK::Next; n->line = line;
+        if (check(TK::IDENT)) { n->sval = cur().text; advance(); } /* optional label */
         return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_REDO)) {
@@ -1688,16 +1709,26 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* keys %h  /  values %h */
+    /* keys %h / keys %{$ref} / keys %$ref  (and values) */
     if (check(TK::KW_KEYS) || check(TK::KW_VALUES)) {
         bool isKeys = check(TK::KW_KEYS); advance();
         bool hasParen = match(TK::LPAREN);
         consume(TK::HASH, "%");
-        std::string nm = cur().text; advance();
-        if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>();
         n->kind = isKeys ? NK::KeysFunc : NK::ValuesFunc;
-        n->name = nm; n->line = line;
+        n->line = line;
+        if (check(TK::LBRACE)) {           /* %{expr} */
+            advance();
+            n->left = parseExpr();
+            consume(TK::RBRACE, "}");
+        } else if (check(TK::SCALAR)) {    /* %$ref */
+            advance();
+            std::string nm = cur().text; advance();
+            n->left = makeScalar(nm, line);
+        } else {                           /* %name */
+            n->name = cur().text; advance();
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
         return n;
     }
 
