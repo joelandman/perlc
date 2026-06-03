@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 35/35 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation, require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, and `$Package::var` cross-package access.
+**Current Status**: Core language features are ~99% implemented with 36/36 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation (including through call chains), require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, and labeled `next`/`last`.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 35 test programs
+make test         # runs all 36 test programs
 make clean
 
 ./perlc foo.pl -o output            # compile and link
@@ -45,9 +45,9 @@ make clean
 ### Core Language
 - **Variables & Literals**: scalars, arrays, hashes, integers, floats, strings (single/double-quoted with interpolation), `undef`
 - **Operators**: arithmetic, string (`.`, `x` repetition), range (`..`), comparisons (`==`, `eq`, `<=>`, `cmp`), logical (`&&`, `||`, `!`, `//`), low-precedence (`and`, `or`, `not`), bitwise (`&`, `|`, `^`, `~`, `<<`, `>>`), increment/decrement (`++`/`--` including magical string increment), compound assignment (`+=`, `-=`, `*=`, `/=`, `.=`, `%=`, `**=`, `||=`, `&&=`, `//=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `x=`), ternary
-- **Control Flow**: `if`/`elsif`/`else`, `unless`, `while`/`until` (including `while (my $var = expr)`), `do-while`/`do-until`, C-style `for`, `foreach`, `last`/`next`, statement modifiers
+- **Control Flow**: `if`/`elsif`/`else`, `unless`, `while`/`until` (including `while (my $var = expr)`), `do-while`/`do-until`, C-style `for`, `foreach`, `last`/`next`/`redo` with optional labels (`LABEL: for ... { next LABEL }`), statement modifiers
 - **Subroutines**: named and anonymous subs, recursion, `@_`, list unpacking, code references (`\&sub`, `$f->()`), `ref()` returning `"CODE"`
-- **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort` (including `sort { BLOCK }`), `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete`, `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`
+- **Builtins**: `print`/`say`/`printf`/`sprintf`, `chomp`/`chop`, `length`/`substr`, `join`/`split`/`sort` (including `sort { BLOCK }`), `push`/`pop`/`shift`/`unshift`/`splice`, `keys`/`values`/`exists`/`delete` (all accepting `%{$ref}` / `%$ref` deref forms; `exists`/`delete` support both `$h{k}` and `$arr[N]`), `defined`, `ref`, `warn`, `die`, `abs`/`int`/`sqrt`, `uc`/`lc`/`ucfirst`/`lcfirst`, `index`/`rindex`, `chr`/`ord`/`hex`/`oct`, `reverse`, `map`/`grep`; `print @arr` prints all elements
 - **Time**: `time`, `localtime`, `gmtime` (list context → 9-element list: sec,min,hour,mday,mon,year,wday,yday,isdst)
 - **Randomness**: `rand [MAX]`, `srand [SEED]`
 - **Process**: `sleep SECS`, `alarm SECS`
@@ -89,14 +89,14 @@ make clean
 ### Advanced Perl Semantics
 - **Closures**: lexical capture of `my` variables by stable pointer, nested closures, independent instances
 - **Local**: dynamic scoping for scalars, arrays, and hashes (`local $x`, `local @arr`, `local %hash`, `local $/`, `local @ARGV`; block-scoped restore)
-- **Array/hash assignment**: `@arr = @other`, `@arr = ()` (clear), `%h = (list)` (replaces all entries), `(LIST)[i]` subscript on sort/map/grep/caller results
+- **Array/hash assignment**: `@arr = @other`, `@arr = ()` (clear), `%h = (list)` (replaces all entries), `(LIST)[i]` subscript on sort/map/grep/caller results; lvalue slices `@arr[i,j] = list` and `@h{qw(a b)} = list`; autovivification `$h{a}{b} = val`, `$a[i]{k} = val`, `push @{$h{k}}, val`
 - **Exceptions**: `eval { BLOCK }` with `$@` support using `setjmp`/`longjmp`
 - **BEGIN/END**: `BEGIN` runs inline, `END` registered via `atexit()`
 - **Modules**: `use Module` with recursive inlining, `@EXPORT`/`@EXPORT_OK` support, constant subs via `use constant`. The new `-pm` flag automatically detects missing modules (excluding pragmas), installs them via `cpanm --local-lib lib` into `lib/lib/perl5/`, and updates search paths.
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (35/35)
+## Passing Tests (36/36)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
@@ -112,27 +112,22 @@ All tests in `tests/` pass:
 - Threads: `threads.pl` (create/join/tid/self, closure capture, thread isolation, threads::shared scalars/arrays/hashes, lock/cond_wait/cond_signal/cond_broadcast)
 - Object lifecycle: `destroy.pl` (DESTROY on scope exit, undef assignment, overwrite, loop, data access in destructor)
 - String eval (JIT): `eval_string.pl`
+- Completeness: `completeness.pl` (caller(), local @arr/local %hash, AUTOLOAD, pos() write, runtime require)
 
 ## Known Limitations
 
 The following features are **not yet implemented** or only partially supported:
 
 ### Context and Call Stack
-- `wantarray` context propagation: implemented for list vs. scalar context at call sites (`my @list = func()` correctly calls in list context); `wantarray` builtin returns correct value within a sub
+- `wantarray` context propagation: fully implemented — list vs. scalar context at call sites, `wantarray` builtin, and propagation through call chains (`sub outer { inner() }` inherits the caller's context)
 
 ### Module System
 - `require Module::Name` and `require "file.pm"` are implemented (compile-time inlining, same as `use`); runtime `require` and `do FILE` are not yet supported
 - Pragmas that aren't backed by `.pm` files are silently ignored
-- `tie` / `untie` (use `opendir`/`readdir` instead; see rewritten `testscripts/cputemp.pl`)
+- `tie` / `untie` not implemented
 
 ### Regex
-- Modifier `x` (extended/whitespace-ignoring patterns) not supported; `e` (eval replacement) is now implemented
-
-### OOP
-- `DESTROY` fires for both hash-backed and array-backed blessed objects (scope exit, undef assignment, overwrite)
-
-### Reference Operations
-- `unshift @{EXPR}, val` (though `push @{EXPR}` works)
+- Modifier `x` (extended/whitespace-ignoring patterns) not supported
 
 ### Command-line / Debugging
 - `-g` flag supported: adds debugging symbols + **Perl source line mapping** via LLVM debug metadata (visible in gdb/lldb)
@@ -142,6 +137,7 @@ The following features are **not yet implemented** or only partially supported:
 - Many complex CPAN modules (parser may fail on advanced OO/`our`/POD; simplify scripts as needed)
 - `exists $h{a}{b}` chained hash subscript without arrow (use `$h{a}->{b}` instead)
 - `or`/`and`/`not` precedence relative to `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0` as in real Perl); use explicit parens
+- `do FILE` runtime file execution (only compile-time `require` works)
 
 ## Key Implementation Details
 
@@ -154,4 +150,4 @@ The following features are **not yet implemented** or only partially supported:
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 35-test suite, plus completeness.pl passing entirely.
+**Last Updated**: Current state reflects all features demonstrated in the 36-test suite. Recent additions: lvalue slices, autovivification, labeled loops, `keys/values %{$ref}`, `push @{$h{k}}` autoviv, `print @arr`, array-in-boolean-context, wantarray chain propagation, `exists`/`delete` with parens and on array elements.
