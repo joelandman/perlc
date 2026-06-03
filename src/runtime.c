@@ -1448,6 +1448,25 @@ HOTX int perl_hash_exists_str(PerlHash *h, const char *key) {
     return hash_find(h, key) != NULL;
 }
 
+/* Return a writable pointer to $h{key}, creating an undef slot if missing.
+   Unlike perl_hash_get_str_ref, never returns the read-only sentinel. */
+PerlValue *perl_hash_lvalue_str(PerlHash *h, const char *key) {
+    PerlHashEntry *e = hash_find(h, key);
+    if (e) return e->val;
+    PerlValue *v = perl_alloc_undef();
+    unsigned int b = hash_str(key);
+    PerlHashEntry *ne = malloc(sizeof *ne);
+    ne->key = strdup(key); ne->val = v;
+    ne->next = h->buckets[b]; h->buckets[b] = ne; h->size++;
+    return v;
+}
+
+PerlValue *perl_hash_lvalue_sv(PerlHash *h, PerlValue *key) {
+    char *ks = perl_to_string(key);
+    PerlValue *r = perl_hash_lvalue_str(h, ks);
+    free(ks); return r;
+}
+
 /* ── autovivification ────────────────────────────────────────────────────── */
 
 /* Ensure $h{key} holds a hash ref; create one if missing/undef.  Return the

@@ -196,6 +196,8 @@ void CodeGen::declareRuntime() {
     /* constant C-string key variants — no strdup overhead */
     auto *strPtrTy = PointerType::get(Type::getInt8Ty(ctx_), 0);
     RT("perl_hash_get_str_ref",  pv,  av, strPtrTy);
+    RT("perl_hash_lvalue_str",   pv,  av, strPtrTy);
+    RT("perl_hash_lvalue_sv",    pv,  av, pv);
     RT("perl_hash_set_str",      voidTy, av, strPtrTy, pv);
     RT("perl_hash_exists_str",   Type::getInt32Ty(ctx_), av, strPtrTy);
     RT("perl_hash_delete_str",   pv,  av, strPtrTy);
@@ -1032,6 +1034,17 @@ Value *CodeGen::emitHashGetRef(Value *hv, const Node &keyNode) {
         return callRT("perl_hash_get_str_ref", {hv, kp});
     Value *key = emitExpr(keyNode);
     Value *r   = callRT("perl_hash_get_sv_ref", {hv, key});
+    freeIfOwned(key);
+    return r;
+}
+
+/* Like emitHashGetRef but returns a writable slot (creates undef if missing).
+   Use for ++ / -- / compound-assign targets to avoid mutating the sentinel. */
+Value *CodeGen::emitHashLValueRef(Value *hv, const Node &keyNode) {
+    if (Value *kp = constKeyPtr(keyNode, builder_))
+        return callRT("perl_hash_lvalue_str", {hv, kp});
+    Value *key = emitExpr(keyNode);
+    Value *r   = callRT("perl_hash_lvalue_sv", {hv, key});
     freeIfOwned(key);
     return r;
 }
@@ -3706,20 +3719,29 @@ Value *CodeGen::emitExpr(const Node &n) {
                 }
             }
         }
+        /* For hash-element targets, use lvalue accessor so missing keys get a
+           writable slot instead of mutating the shared read-only undef sentinel. */
+        auto emitIncTarget = [&](bool wantLValue) -> Value * {
+            if (wantLValue && n.left && n.left->kind == NK::HashElem) {
+                Value *hv = lookupHash(n.left->name);
+                if (hv) return emitHashLValueRef(hv, *n.left->left);
+            }
+            return n.left ? emitExpr(*n.left) : perlUndef();
+        };
         if (n.sval == "pre++") {
-            Value *v = emitExpr(*n.left); callRT("perl_inc", {v}); return v;
+            Value *v = emitIncTarget(true); callRT("perl_inc", {v}); return v;
         }
         if (n.sval == "pre--") {
-            Value *v = emitExpr(*n.left); callRT("perl_dec", {v}); return v;
+            Value *v = emitIncTarget(true); callRT("perl_dec", {v}); return v;
         }
         if (n.sval == "post++") {
-            Value *orig = emitExpr(*n.left);
+            Value *orig = emitIncTarget(true);
             Value *copy = callRT("perl_clone", {orig});
             callRT("perl_inc", {orig});
             return copy;
         }
         if (n.sval == "post--") {
-            Value *orig = emitExpr(*n.left);
+            Value *orig = emitIncTarget(true);
             Value *copy = callRT("perl_clone", {orig});
             callRT("perl_dec", {orig});
             return copy;
@@ -4223,7 +4245,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::HashElem) {
             Value *hv = lookupHash(n.left->name);
             if (!hv) return perlUndef();
-            Value *lhsVal = emitHashGetRef(hv, *n.left->left);
+            Value *lhsVal = emitHashLValueRef(hv, *n.left->left); /* writable slot */
             Value *rhsVal = emitExpr(*n.right);
             Value *result = applyOp(lhsVal, rhsVal);
             freeIfOwned(lhsVal);
@@ -5326,14 +5348,14 @@ Value *CodeGen::emitExpr(const Node &n) {
             declareVar(captureNames[i], alloca);
         }
         currentSubBody_ = n.body.get();
-        emitBlock(*n.body);
+        Value *lastVal = emitBlockLast(*n.body);   /* capture last expr for implicit return */
         currentSubBody_ = savedSubBody;
         if (!builder_.GetInsertBlock()->getTerminator()) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
-            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_pop_wantarray", {});
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_local_restore_to", {depth});
-            builder_.CreateRet(perlUndef());
+            builder_.CreateRet(lastVal ? lastVal : perlUndef());
         }
         popScope();
         /* restore state */

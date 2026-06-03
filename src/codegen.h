@@ -186,6 +186,7 @@ private:
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);
+    llvm::Value *emitHashLValueRef(llvm::Value *hv, const Node &keyNode);
     void         emitHashSet(llvm::Value *hv, const Node &keyNode, llvm::Value *val);
     llvm::Value *emitHashExists(llvm::Value *hv, const Node &keyNode);
     llvm::Value *emitHashDelete(llvm::Value *hv, const Node &keyNode);

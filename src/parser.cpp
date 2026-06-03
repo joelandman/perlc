@@ -1851,13 +1851,20 @@ NodePtr Parser::parsePrimary() {
             n->body = std::move(sortBlock);
             return n;
         }
-        if (check(TK::LPAREN)) {
-            advance();
-            while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
-                elems.push_back(parseExpr());
-                if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+        if (check(TK::LPAREN) || check(TK::QWORDS)) {
+            if (check(TK::QWORDS)) {
+                /* sort { } qw(a b c) — expand inline */
+                std::string text = cur().text; advance();
+                std::istringstream iss(text); std::string w;
+                while (iss >> w) elems.push_back(makeStr(w, line));
+            } else {
+                advance();
+                while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                    elems.push_back(parseExpr());
+                    if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+                }
+                consume(TK::RPAREN, ")");
             }
-            consume(TK::RPAREN, ")");
         }
         auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
         n->args = std::move(elems); n->sval = sortMode; n->line = line;
