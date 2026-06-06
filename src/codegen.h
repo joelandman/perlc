@@ -125,6 +125,15 @@ private:
     std::string currentPackage_ = "main";
     std::string sourceFile_;
 
+    /* AST-level inline subs: subs with (my (@params)=@_; return expr) body.
+       At call sites these are expanded directly, bypassing @_ construction. */
+    struct InlineSub {
+        std::vector<std::string> params;  /* param names without $ */
+        const Node *bodyExpr;            /* the single return expression */
+    };
+    std::unordered_map<std::string, InlineSub> inlineSubs_;
+    llvm::Value *tryEmitInline(const Node &callNode);  /* returns nullptr if not inlineable */
+
     /* runtime function declarations */
     std::unordered_map<std::string, llvm::Function *> rtFuncs_;
 

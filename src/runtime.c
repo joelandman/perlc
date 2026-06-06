@@ -1122,9 +1122,15 @@ void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
         a->cap *= 2;
         a->elems = realloc(a->elems, a->cap * sizeof(PerlValue *));
     }
-    while (a->len <= idx) a->elems[a->len++] = perl_alloc_undef();
-    perl_free(a->elems[idx]);
-    a->elems[idx] = perl_clone(v);
+    if (a->len <= idx) {
+        /* Sequential extension: fill gaps with undef, then directly clone v
+           into the target slot without allocating+freeing an intermediate undef. */
+        while (a->len < idx) a->elems[a->len++] = perl_alloc_undef();
+        a->elems[a->len++] = perl_clone(v);
+    } else {
+        perl_free(a->elems[idx]);
+        a->elems[idx] = perl_clone(v);
+    }
 }
 
 /* Mutate an existing array element's float value in-place without allocation.

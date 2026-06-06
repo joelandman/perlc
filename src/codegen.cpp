@@ -1877,9 +1877,11 @@ Value *CodeGen::emitExprF64(const Node &n) {
                         }
                         builder_.CreateBr(mBB);
                         auto *pBBp = builder_.GetInsertBlock();
-                        /* Normal path: fall back to deref + get_ref + to_float */
+                        /* Normal path: fall back to deref + get_ref + to_float.
+                           Use _ro (pure) so LLVM can hoist the deref out of inner
+                           loops when pv is loop-invariant (e.g. row access pattern). */
                         builder_.SetInsertPoint(nBB);
-                        Value *normArr = callRT("perl_deref_array", {pv});
+                        Value *normArr = callRT("perl_deref_array_ro", {pv});
                         Value *normElem = callRT("perl_array_get_ref", {normArr, emitIdx(*n.right)});
                         Value *normFv   = callRT("perl_to_float", {normElem});
                         builder_.CreateBr(mBB);
@@ -1924,6 +1926,38 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     for (auto &stmt : program.args)
         if (stmt->kind == NK::SubDef)
             subs.push_back(stmt.get());
+
+    /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
+       These are expanded at call sites without @_ construction. */
+    for (auto *s : subs) {
+        if (!s->body) continue;
+        const Node &body = *s->body;
+        /* Need exactly: FlatBlock(my $p1; my $p2; ...; assign-from-@_) + Return */
+        if (body.args.size() != 2) continue;
+        const Node &fb = *body.args[0];
+        const Node &ret = *body.args[1];
+        if (fb.kind != NK::FlatBlock || ret.kind != NK::Return || !ret.left) continue;
+        if (fb.args.empty()) continue;
+        /* Last stmt in FlatBlock: ExprStmt(Assign(ArrayLit(vars), @_)) */
+        const Node &lastFb = *fb.args.back();
+        if (lastFb.kind != NK::ExprStmt || !lastFb.left) continue;
+        const Node &asgn = *lastFb.left;
+        if (asgn.kind != NK::Assign || !asgn.right || !asgn.left) continue;
+        if (asgn.right->kind != NK::ArrayVar || asgn.right->name != "_") continue;
+        if (asgn.left->kind != NK::ArrayLit) continue;
+        /* Extract scalar param names */
+        std::vector<std::string> params;
+        bool allScalar = true;
+        for (auto &p : asgn.left->args) {
+            if (p->kind == NK::ScalarVar) {
+                std::string nm = p->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                params.push_back(nm);
+            } else { allScalar = false; break; }
+        }
+        if (!allScalar || params.empty()) continue;
+        inlineSubs_[s->name] = {params, ret.left.get()};
+    }
 
     /* pre-declare all subs as Functions */
     for (auto *s : subs) {
@@ -5704,7 +5738,61 @@ Value *CodeGen::emitBinOp(const Node &n) {
     return perlUndef();
 }
 
+/* Try to expand a user-defined sub call inline, bypassing @_ construction.
+   Inlineable subs have the form: my ($p1,..) = @_; return expr.
+   Returns nullptr if not inlineable; otherwise returns the expanded result.
+   Safety: args are stored directly (no clone). FLOAT_PAIR fast path avoids
+   deref_array mutation; _ro norm path is pure and LLVM-hoistable. */
+Value *CodeGen::tryEmitInline(const Node &n) {
+    auto it = inlineSubs_.find(n.name);
+    if (it == inlineSubs_.end()) return nullptr;
+    const auto &is = it->second;
+    if (n.args.size() != is.params.size()) return nullptr;
+
+    /* Evaluate each argument, trying recursive inline for nested sub calls.
+       Bail out if any arg is a list-producing expression (can't bind directly). */
+    std::vector<Value *> argVals;
+    std::vector<Value *> ownedArgs;
+    for (size_t i = 0; i < is.params.size(); i++) {
+        Value *v = nullptr;
+        /* Recursively inline nested sub calls */
+        if (n.args[i]->kind == NK::Call)
+            v = tryEmitInline(*n.args[i]);
+        /* Bail if arg would need list-expansion */
+        if (!v && emitArrayPtr(*n.args[i]) != nullptr) {
+            /* emitArrayPtr emitted IR — clean up by emitting a fresh expr instead.
+               Actually emitArrayPtr has side effects; if it returned a PerlArray*
+               we can't easily undo it, so just fall back to normal call. */
+            return nullptr;
+        }
+        if (!v) v = emitExpr(*n.args[i]);
+        argVals.push_back(v);
+        if (isOwnedTemp(v)) ownedArgs.push_back(v);
+    }
+
+    /* Bind params to args via temporary allocas (no clone — arg PV* shared). */
+    pushScope();
+    for (size_t i = 0; i < is.params.size(); i++) {
+        auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+        builder_.CreateStore(argVals[i], slot);
+        declareVar(is.params[i], slot);
+    }
+
+    /* Emit the body expression */
+    Value *result = emitExpr(*is.bodyExpr);
+
+    /* Clean up param scope (don't free param slot PVs — we don't own them) */
+    popScope();
+
+    /* Free owned arg temps (e.g. cadd result passed to outer cadd) */
+    for (Value *v : ownedArgs) callRT("perl_free", {v});
+    return result;
+}
+
 Value *CodeGen::emitCall(const Node &n) {
+    /* Try AST-level inline first: eliminates @_ construction for simple subs. */
+    if (Value *v = tryEmitInline(n)) return v;
+
     /* eval EXPR — JIT-based string eval */
     if (n.name == "eval") {
         hasStringEval_ = true;
