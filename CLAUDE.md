@@ -4,7 +4,7 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 36/36 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation (including through call chains and implicit returns of grep/map/sort), require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, labeled `next`/`last`, `map { @$_ }` flattening, hash-ref slices `@{$href}{LIST}`, `scalar(@{$ref})`, range expansion in function call args, anonymous sub implicit return, `$h{k}++` on missing keys, `sort { } qw(...)` lists, `split //` into characters, and correct map body scoping.
+**Current Status**: Core language features are ~99% implemented with 36/36 test programs passing. Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared, wantarray context propagation (including through call chains and implicit returns of grep/map/sort), require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, labeled `next`/`last`, `map { @$_ }` flattening, hash-ref slices `@{$href}{LIST}`, `scalar(@{$ref})`, range expansion in function call args, anonymous sub implicit return, `$h{k}++` on missing keys, `sort { } qw(...)` lists, `split //` into characters, correct map body scoping, `PERL_FLOAT_PAIR` inline complex numbers, `PERL_LIST_RESULT` correct list-return tag, and AST-level sub inlining.
 
 ## Build & Test
 
@@ -31,13 +31,18 @@ make clean
 ## Architecture
 
 - **PerlValue**: `{ PerlTag tag; union { long long ival; double fval; char *sval; void *pval; }; long long matchpos; char *blessed_class; }`
-- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7, CODE_REF=8, FLAT_ARRAY=10`
-- **PerlArray**: `{ PerlValue **elems; long long len, cap; int refcount; }`
+- **PerlTag**: `UNDEF=0, INT=1, FLOAT=2, STRING=3, REF_SCALAR=4, REF_ARRAY=5, REF_HASH=6, FILEHANDLE=7, CODE_REF=8, FLAT_ARRAY=10, THREAD=11, LIST_RESULT=12, FLOAT_PAIR=13`
+- **PerlArray**: `{ PerlValue **elems; long long len, cap; int refcount; pthread_mutex_t *mu; }`
 - **PerlHash**: 64-bucket chained hash table
 - **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime (critical for references and closures)
 - **Codegen pattern**: every operation calls into C runtime via `callRT("perl_xyz", {args...})`
 - **Scope model**: parallel scope stacks for scalars, arrays, hashes, float vars, int vars, and DerefAV-cached array-ref params
-- **FLAT_ARRAY**: all-numeric AnonArray literals with ≥4 elements compile to `double[]` inline (tag=10, pval=double*, matchpos=count), eliminating PV boxing in hot loops; `perl_assign` deep-copies the double[] for correct ownership semantics
+- **FLAT_ARRAY** (tag=10): all-numeric AnonArray literals with ≥4 elements compile to `double[]` inline (pval=double*, matchpos=count), eliminating PV boxing in hot loops
+- **LIST_RESULT** (tag=12): wraps a PerlArray* returned from a sub in list context; `perl_unwrap_list_return` spreads only this tag, not plain REF_ARRAY, so scalar refs like `[$re,$im]` are never incorrectly flattened into argument lists
+- **FLOAT_PAIR** (tag=13): 2-element all-float AnonArray stored inline in one PerlValue (fval=elem[0], matchpos bits=elem[1]); eliminates inner PerlArray + 2 float PV allocations per complex number; `$z->[0]`/`$z->[1]` become direct field loads via runtime tag-check branch (perfectly predicted); `perl_assign` preserves matchpos for FLOAT_PAIR
+- **AST-level sub inliner** (`tryEmitInline`): detects subs with body `my (@params)=@_; return expr`; at call sites evaluates args and binds to temp allocas without @_ construction or cloning; recursive for nested calls; `canEmitF64(NK::Call)` + `emitExprF64(NK::Call)` extend the F64 fast path through inlineable float-body subs (e.g. `cabs2($z) < 4.0` emits as pure double comparison)
+- **PV slab allocator**: `pv_alloc()` cold miss allocates 128 PVs contiguously (calloc), linking via pval; keeps pool entries cache-hot for tight loops with many short-lived PVs
+- **PerlArray freelist pool** (`pa_alloc`/`pa_pool_push`): reuses struct + elems buffer across alloc/free cycles; PA_POOL_CAP_MAX=4096 preserves large row elems buffers
 - **Module loading**: `use Module` recursively inlines `.pm` files at compile time via `inlineModules()`
 
 ## Major Implemented Features
@@ -147,8 +152,8 @@ The following features are **not yet implemented** or only partially supported:
 - **Module Inlining**: `use` statements cause recursive parsing and token stream concatenation
 - **Regex**: Uses PCRE2 with custom iterator state per `PerlValue` (`matchpos`)
 - **Error Handling**: `die`/`eval` uses `jmp_buf` with careful stack management
-- **Performance**: LLVM optimization (O2 + LTO) + C runtime with freelist pool allocator; no GC (manual via `perl_free`). Extensive unboxing optimizations: float scalar vars (`floatScopes_`), unboxed arithmetic (`canEmitF64`/`emitExprF64`), FLAT_ARRAY for numeric arrays, DerefAV cache for array-ref @_ params, borrow reads for array/hash elements, TBAA metadata for alias disambiguation. nb.pl n=5M runs in 0.22s vs Perl's ~33s (~150× faster).
+- **Performance**: LLVM optimization (O2 + LTO) + C runtime with freelist pool allocator; no GC (manual via `perl_free`). Extensive unboxing optimizations: float scalar vars (`floatScopes_`), unboxed arithmetic (`canEmitF64`/`emitExprF64`), FLAT_ARRAY for numeric arrays, FLOAT_PAIR for 2-element float arrays, AST-level sub inlining (eliminates @_ construction), DerefAV cache for array-ref @_ params, borrow reads for array/hash elements, TBAA metadata for alias disambiguation, PV slab allocator, PerlArray freelist pool. nb.pl n=5M runs in 0.34s vs Perl's ~33s (~97× faster); mbs.pl (512×512 Mandelbrot) runs in 1.8s vs Perl's ~22s (~12.6× faster).
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 36-test suite. Recent additions: lvalue slices, autovivification, labeled loops, `keys/values %{$ref}`, `push @{$h{k}}` autoviv, `print @arr`, array-in-boolean-context, wantarray chain propagation, `exists`/`delete` improvements, `map { @$_ }` flattening, `scalar(@{$ref})`, `@{$href}{LIST}` hash-ref slices, subs returning grep/map/sort in list context, `func(1..N)` range expansion in call args, anonymous sub implicit return, `$h{k}++`/`$h{k}+=n` on missing keys, `sort { } qw(...)` list support, `split //` char-splitting, map body result scoping.
+**Last Updated**: Current state reflects all features demonstrated in the 36-test suite. Recent additions: lvalue slices, autovivification, labeled loops, `keys/values %{$ref}`, `push @{$h{k}}` autoviv, `print @arr`, array-in-boolean-context, wantarray chain propagation, `exists`/`delete` improvements, `map { @$_ }` flattening, `scalar(@{$ref})`, `@{$href}{LIST}` hash-ref slices, subs returning grep/map/sort in list context, `func(1..N)` range expansion in call args, anonymous sub implicit return, `$h{k}++`/`$h{k}+=n` on missing keys, `sort { } qw(...)` list support, `split //` char-splitting, map body result scoping, `PERL_FLOAT_PAIR` inline 2-element float arrays (tag=13), `PERL_LIST_RESULT` correct list-return semantics (tag=12), AST-level sub inliner (`tryEmitInline`) with F64 context propagation, PV slab allocator, PerlArray freelist pool, and `perl_array_set` sequential-fill optimization.
