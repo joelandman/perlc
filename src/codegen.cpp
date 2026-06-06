@@ -173,7 +173,9 @@ void CodeGen::declareRuntime() {
     RT("perl_array_new",      av);
     RT("perl_anon_array_new", av);
     RT("perl_array_free",    voidTy, av);
-    RT("perl_array_push",         voidTy, av, pv);
+    RT("perl_array_free_nc", voidTy, av);
+    RT("perl_array_push",    voidTy, av, pv);
+    RT("perl_array_push_nc", voidTy, av, pv);
     RT("perl_array_push_capture", voidTy, av, pv);
     RT("perl_array_pop",     pv,  av);
     RT("perl_array_get",     pv,  av, i64);
@@ -229,6 +231,7 @@ void CodeGen::declareRuntime() {
     RT("perl_split",    av,   pv, pv);
     /* references */
     RT("perl_alloc_flat_array", pv, i64);
+    RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
     RT("perl_ref_hash",     pv, av);  /* PerlHash* treated as opaque av */
@@ -1105,7 +1108,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_ref_type", "perl_ref_array", "perl_ref_scalar",
         "perl_clone", "perl_sprintf", "perl_array_len",
         /* single-arg math/string builtins */
-        "perl_alloc_flat_array",
+        "perl_alloc_flat_array", "perl_alloc_float_pair",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
         "perl_uc_str", "perl_lc_str", "perl_ucfirst_str", "perl_lcfirst_str",
         "perl_chr_val", "perl_ord_val",
@@ -1579,10 +1582,20 @@ bool CodeGen::canEmitF64(const Node &n) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
             if (lookupDerefAV(nm)) return true;
+            /* FLOAT_PAIR fast path: $z->[0] or $z->[1] where $z may be a FLOAT_PAIR PV.
+               Emits a tag-check branch; branch is well-predicted so overhead is minimal. */
+            if (n.right && n.right->kind == NK::IntLit &&
+                (n.right->ival == 0 || n.right->ival == 1) && lookupVar(nm))
+                return true;
         }
         return false;
     case NK::HashElem:
         return lookupHash(n.name) != nullptr;
+    case NK::Call: {
+        /* Inlineable subs whose body is purely numeric can be emitted as F64. */
+        auto it = inlineSubs_.find(n.name);
+        return it != inlineSubs_.end() && canEmitF64(*it->second.bodyExpr);
+    }
     default:
         return false;
     }
@@ -1834,6 +1847,57 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
                     return callRT("perl_to_float", {elem});
                 }
+                /* FLOAT_PAIR fast path: $z->[0] or $z->[1] where tag may be FLOAT_PAIR (13).
+                   Emits a runtime tag check; branch is perfectly predicted once type is fixed. */
+                if (n.right && n.right->kind == NK::IntLit &&
+                    (n.right->ival == 0 || n.right->ival == 1)) {
+                    if (Value *slot = lookupVar(nm)) {
+                        auto *i32Ty = Type::getInt32Ty(ctx_);
+                        auto *i64Ty = Type::getInt64Ty(ctx_);
+                        auto *f64Ty = Type::getDoubleTy(ctx_);
+                        auto *i8Ty  = Type::getInt8Ty(ctx_);
+                        Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
+                        Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
+                        Value *isPair = builder_.CreateICmpEQ(tag,
+                            ConstantInt::get(i32Ty, 13), "ispair");
+                        auto *curFn = builder_.GetInsertBlock()->getParent();
+                        auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
+                        auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
+                        auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
+                        builder_.CreateCondBr(isPair, pBB, nBB);
+                        /* FLOAT_PAIR path: direct field load */
+                        builder_.SetInsertPoint(pBB);
+                        Value *pairFv;
+                        if (n.right->ival == 0) {
+                            /* fval at byte offset 8 */
+                            Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                i8Ty, pv, 8, "fp.re.ptr");
+                            pairFv = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                        } else {
+                            /* matchpos (i64) at byte offset 16, bitcast to double */
+                            Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                i8Ty, pv, 16, "fp.im.ptr");
+                            Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                            pairFv = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                        }
+                        builder_.CreateBr(mBB);
+                        auto *pBBp = builder_.GetInsertBlock();
+                        /* Normal path: fall back to deref + get_ref + to_float.
+                           Use _ro (pure) so LLVM can hoist the deref out of inner
+                           loops when pv is loop-invariant (e.g. row access pattern). */
+                        builder_.SetInsertPoint(nBB);
+                        Value *normArr = callRT("perl_deref_array_ro", {pv});
+                        Value *normElem = callRT("perl_array_get_ref", {normArr, emitIdx(*n.right)});
+                        Value *normFv   = callRT("perl_to_float", {normElem});
+                        builder_.CreateBr(mBB);
+                        auto *nBBp = builder_.GetInsertBlock();
+                        builder_.SetInsertPoint(mBB);
+                        auto *phi = builder_.CreatePHI(f64Ty, 2, "fp.val");
+                        phi->addIncoming(pairFv, pBBp);
+                        phi->addIncoming(normFv, nBBp);
+                        return phi;
+                    }
+                }
             }
             return nullptr;
         } else {
@@ -1849,6 +1913,30 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!hv) return nullptr;
         Value *elem = emitHashGetRef(hv, *n.left);
         return callRT("perl_to_float", {elem});
+    }
+    case NK::Call: {
+        /* Inlineable sub with a float body — emit the body directly in F64 context,
+           skipping boxing entirely (e.g. cabs2($zp) in a comparison). */
+        auto it = inlineSubs_.find(n.name);
+        if (it == inlineSubs_.end()) return nullptr;
+        const auto &is = it->second;
+        if (!canEmitF64(*is.bodyExpr) || n.args.size() != is.params.size()) return nullptr;
+        pushScope();
+        std::vector<Value *> ownedArgs;
+        auto *f64Ty = Type::getDoubleTy(ctx_);
+        for (size_t i = 0; i < is.params.size(); i++) {
+            Value *argVal = nullptr;
+            if (n.args[i]->kind == NK::Call) argVal = tryEmitInline(*n.args[i]);
+            if (!argVal) argVal = emitExpr(*n.args[i]);
+            auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+            builder_.CreateStore(argVal, slot);
+            declareVar(is.params[i], slot);
+            if (isOwnedTemp(argVal)) ownedArgs.push_back(argVal);
+        }
+        Value *f64val = emitExprF64(*is.bodyExpr);
+        popScope();
+        for (Value *v : ownedArgs) callRT("perl_free", {v});
+        return f64val;
     }
     default:
         return nullptr;
@@ -1868,13 +1956,46 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         if (stmt->kind == NK::SubDef)
             subs.push_back(stmt.get());
 
+    /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
+       These are expanded at call sites without @_ construction. */
+    for (auto *s : subs) {
+        if (!s->body) continue;
+        const Node &body = *s->body;
+        /* Need exactly: FlatBlock(my $p1; my $p2; ...; assign-from-@_) + Return */
+        if (body.args.size() != 2) continue;
+        const Node &fb = *body.args[0];
+        const Node &ret = *body.args[1];
+        if (fb.kind != NK::FlatBlock || ret.kind != NK::Return || !ret.left) continue;
+        if (fb.args.empty()) continue;
+        /* Last stmt in FlatBlock: ExprStmt(Assign(ArrayLit(vars), @_)) */
+        const Node &lastFb = *fb.args.back();
+        if (lastFb.kind != NK::ExprStmt || !lastFb.left) continue;
+        const Node &asgn = *lastFb.left;
+        if (asgn.kind != NK::Assign || !asgn.right || !asgn.left) continue;
+        if (asgn.right->kind != NK::ArrayVar || asgn.right->name != "_") continue;
+        if (asgn.left->kind != NK::ArrayLit) continue;
+        /* Extract scalar param names */
+        std::vector<std::string> params;
+        bool allScalar = true;
+        for (auto &p : asgn.left->args) {
+            if (p->kind == NK::ScalarVar) {
+                std::string nm = p->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                params.push_back(nm);
+            } else { allScalar = false; break; }
+        }
+        if (!allScalar || params.empty()) continue;
+        inlineSubs_[s->name] = {params, ret.left.get()};
+    }
+
     /* pre-declare all subs as Functions */
     for (auto *s : subs) {
         auto *ft = FunctionType::get(perlPtrTy_,
                         {arrayPtrTy_, Type::getInt32Ty(ctx_)},  /* PerlArray* args, int ctx */
                         false);
-        Function::Create(ft, Function::ExternalLinkage,
+        auto *fn = Function::Create(ft, Function::ExternalLinkage,
                          subLLVMName(s->name), mod_.get());
+        fn->addFnAttr(Attribute::AlwaysInline);
     }
 
     /* emit main(int argc, char **argv) */
@@ -4992,6 +5113,16 @@ Value *CodeGen::emitExpr(const Node &n) {
                 for (auto &a : x.args) if (has1DArrow(*a)) return true;
                 return false;
             };
+            /* FLOAT_PAIR: exactly 2 float elements, no has1DArrow guard needed
+               because emitExprF64 handles 1D ArrowDerefs via runtime tag check. */
+            if (n.args.size() == 2) {
+                bool allF64 = canEmitF64(*n.args[0]) && canEmitF64(*n.args[1]);
+                if (allF64) {
+                    Value *re = emitExprF64(*n.args[0]);
+                    Value *im = emitExprF64(*n.args[1]);
+                    return callRT("perl_alloc_float_pair", {re, im});
+                }
+            }
             bool allFloat = true;
             for (auto &e : n.args) {
                 if (!canEmitF64(*e) || has1DArrow(*e)) { allFloat = false; break; }
@@ -5636,7 +5767,72 @@ Value *CodeGen::emitBinOp(const Node &n) {
     return perlUndef();
 }
 
+/* Try to expand a user-defined sub call inline, bypassing @_ construction.
+   Inlineable subs have the form: my ($p1,..) = @_; return expr.
+   Returns nullptr if not inlineable; otherwise returns the expanded result.
+   Safety: args are stored directly (no clone). FLOAT_PAIR fast path avoids
+   deref_array mutation; _ro norm path is pure and LLVM-hoistable. */
+Value *CodeGen::tryEmitInline(const Node &n) {
+    auto it = inlineSubs_.find(n.name);
+    if (it == inlineSubs_.end()) return nullptr;
+    const auto &is = it->second;
+    if (n.args.size() != is.params.size()) return nullptr;
+
+    /* Evaluate each argument, trying recursive inline for nested sub calls.
+       Bail out if any arg is a list-producing expression (can't bind directly). */
+    std::vector<Value *> argVals;
+    std::vector<Value *> ownedArgs;
+    for (size_t i = 0; i < is.params.size(); i++) {
+        Value *v = nullptr;
+        /* Recursively inline nested sub calls */
+        if (n.args[i]->kind == NK::Call)
+            v = tryEmitInline(*n.args[i]);
+        /* Bail if arg would need list-expansion */
+        if (!v && emitArrayPtr(*n.args[i]) != nullptr) {
+            /* emitArrayPtr emitted IR — clean up by emitting a fresh expr instead.
+               Actually emitArrayPtr has side effects; if it returned a PerlArray*
+               we can't easily undo it, so just fall back to normal call. */
+            return nullptr;
+        }
+        if (!v) v = emitExpr(*n.args[i]);
+        argVals.push_back(v);
+        if (isOwnedTemp(v)) ownedArgs.push_back(v);
+    }
+
+    /* Bind params to args via temporary allocas (no clone — arg PV* shared).
+       Also add float allocas when the arg is canEmitF64 so the body can use
+       the F64 path for params (enables FLOAT_PAIR for cplx(float, float)). */
+    pushScope();
+    auto *f64Ty = Type::getDoubleTy(ctx_);
+    for (size_t i = 0; i < is.params.size(); i++) {
+        auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+        builder_.CreateStore(argVals[i], slot);
+        declareVar(is.params[i], slot);
+        /* If the original arg node is F64-capable, expose it as a float var too. */
+        if (canEmitF64(*n.args[i])) {
+            if (Value *fv = emitExprF64(*n.args[i])) {
+                auto *fslot = builder_.CreateAlloca(f64Ty, nullptr, "f$" + is.params[i]);
+                builder_.CreateStore(fv, fslot);
+                if (!floatScopes_.empty()) floatScopes_.back()[is.params[i]] = fslot;
+            }
+        }
+    }
+
+    /* Emit the body expression */
+    Value *result = emitExpr(*is.bodyExpr);
+
+    /* Clean up param scope (don't free param slot PVs — we don't own them) */
+    popScope();
+
+    /* Free owned arg temps (e.g. cadd result passed to outer cadd) */
+    for (Value *v : ownedArgs) callRT("perl_free", {v});
+    return result;
+}
+
 Value *CodeGen::emitCall(const Node &n) {
+    /* Try AST-level inline first: eliminates @_ construction for simple subs. */
+    if (Value *v = tryEmitInline(n)) return v;
+
     /* eval EXPR — JIT-based string eval */
     if (n.name == "eval") {
         hasStringEval_ = true;
@@ -5700,9 +5896,11 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_isa_check", {a, b});
     }
     if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+        /* Use push_nc (no-clone) for scalar args so we skip 63M clone/free per
+           mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
+           after the call; non-owned (ScalarVar, borrow) need no action. */
         Value *argsArr = callRT("perl_array_new", {});
         for (auto &arg : n.args) {
-            /* @arr and %hash are splatted into @_ (flattened) */
             if (arg->kind == NK::ArrayVar) {
                 Value *av = lookupArray(arg->name);
                 if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
@@ -5711,7 +5909,6 @@ Value *CodeGen::emitCall(const Node &n) {
                 Value *hv = lookupHash(arg->name);
                 if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
             }
-            /* Range, DerefArray, AnonArray and other list-producers expand in @_ */
             if (Value *av = emitArrayPtr(*arg)) {
                 callRT("perl_array_extend", {argsArr, av});
                 continue;
@@ -5721,7 +5918,6 @@ Value *CodeGen::emitCall(const Node &n) {
             freeIfOwned(v);
         }
         auto *i32Ty = Type::getInt32Ty(ctx_);
-        /* push call frame so caller() inside the callee can inspect the call site */
         Value *pkgStr  = builder_.CreateGlobalStringPtr(currentPackage_, "caller.pkg");
         Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_,     "caller.file");
         Value *lineVal = ConstantInt::get(i32Ty, n.line);
@@ -5730,7 +5926,6 @@ Value *CodeGen::emitCall(const Node &n) {
         if (callCtx_ == 1) {
             ctxVal = ConstantInt::get(i32Ty, 1);
         } else if (currentSubNeedsWantarray_) {
-            /* propagate the current frame's context to nested calls */
             ctxVal = callRT("perl_current_wantarray_ctx", {});
         } else {
             ctxVal = ConstantInt::get(i32Ty, 0);
@@ -5786,7 +5981,8 @@ void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
         if (stmt->kind == NK::SubDef) subs.push_back(stmt.get());
     for (auto *s : subs) {
         auto *ft = FunctionType::get(pv, {arrayPtrTy_, Type::getInt32Ty(ctx_)}, false);
-        Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
+        auto *fn = Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
+        fn->addFnAttr(Attribute::AlwaysInline);
     }
 
     /* emit: PerlValue *funcName() */
