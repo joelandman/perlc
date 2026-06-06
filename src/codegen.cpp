@@ -1591,6 +1591,11 @@ bool CodeGen::canEmitF64(const Node &n) {
         return false;
     case NK::HashElem:
         return lookupHash(n.name) != nullptr;
+    case NK::Call: {
+        /* Inlineable subs whose body is purely numeric can be emitted as F64. */
+        auto it = inlineSubs_.find(n.name);
+        return it != inlineSubs_.end() && canEmitF64(*it->second.bodyExpr);
+    }
     default:
         return false;
     }
@@ -1908,6 +1913,30 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!hv) return nullptr;
         Value *elem = emitHashGetRef(hv, *n.left);
         return callRT("perl_to_float", {elem});
+    }
+    case NK::Call: {
+        /* Inlineable sub with a float body — emit the body directly in F64 context,
+           skipping boxing entirely (e.g. cabs2($zp) in a comparison). */
+        auto it = inlineSubs_.find(n.name);
+        if (it == inlineSubs_.end()) return nullptr;
+        const auto &is = it->second;
+        if (!canEmitF64(*is.bodyExpr) || n.args.size() != is.params.size()) return nullptr;
+        pushScope();
+        std::vector<Value *> ownedArgs;
+        auto *f64Ty = Type::getDoubleTy(ctx_);
+        for (size_t i = 0; i < is.params.size(); i++) {
+            Value *argVal = nullptr;
+            if (n.args[i]->kind == NK::Call) argVal = tryEmitInline(*n.args[i]);
+            if (!argVal) argVal = emitExpr(*n.args[i]);
+            auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+            builder_.CreateStore(argVal, slot);
+            declareVar(is.params[i], slot);
+            if (isOwnedTemp(argVal)) ownedArgs.push_back(argVal);
+        }
+        Value *f64val = emitExprF64(*is.bodyExpr);
+        popScope();
+        for (Value *v : ownedArgs) callRT("perl_free", {v});
+        return f64val;
     }
     default:
         return nullptr;
@@ -5770,12 +5799,23 @@ Value *CodeGen::tryEmitInline(const Node &n) {
         if (isOwnedTemp(v)) ownedArgs.push_back(v);
     }
 
-    /* Bind params to args via temporary allocas (no clone — arg PV* shared). */
+    /* Bind params to args via temporary allocas (no clone — arg PV* shared).
+       Also add float allocas when the arg is canEmitF64 so the body can use
+       the F64 path for params (enables FLOAT_PAIR for cplx(float, float)). */
     pushScope();
+    auto *f64Ty = Type::getDoubleTy(ctx_);
     for (size_t i = 0; i < is.params.size(); i++) {
         auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
         builder_.CreateStore(argVals[i], slot);
         declareVar(is.params[i], slot);
+        /* If the original arg node is F64-capable, expose it as a float var too. */
+        if (canEmitF64(*n.args[i])) {
+            if (Value *fv = emitExprF64(*n.args[i])) {
+                auto *fslot = builder_.CreateAlloca(f64Ty, nullptr, "f$" + is.params[i]);
+                builder_.CreateStore(fv, fslot);
+                if (!floatScopes_.empty()) floatScopes_.back()[is.params[i]] = fslot;
+            }
+        }
     }
 
     /* Emit the body expression */
