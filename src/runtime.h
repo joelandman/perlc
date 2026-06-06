@@ -17,8 +17,10 @@ typedef enum {
     PERL_FILEHANDLE = 7,
     PERL_CODE_REF   = 8,
     PERL_DIRHANDLE  = 9,
-    PERL_FLAT_ARRAY = 10, /* flat double[] — pval=double*, matchpos=len */
-    PERL_THREAD     = 11, /* thread object  — pval=PerlThread* */
+    PERL_FLAT_ARRAY   = 10, /* flat double[] — pval=double*, matchpos=len */
+    PERL_THREAD       = 11, /* thread object  — pval=PerlThread* */
+    PERL_LIST_RESULT  = 12, /* list-context sub return — pval=PerlArray*; spread by perl_unwrap_list_return */
+    PERL_FLOAT_PAIR   = 13, /* 2-elem float array inline: fval=elem[0], matchpos bits=elem[1]; no inner PerlArray */
 } PerlTag;
 
 /* PV_FLAG_SHARED: variable is a threads::shared variable (PerlSharedVar). */
@@ -52,6 +54,7 @@ PerlValue *perl_alloc_int(long long v);
 PerlValue *perl_alloc_float(double v);
 PerlValue *perl_alloc_string(const char *s);
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
+PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);
 PerlValue *perl_make_shared_scalar(void); /* threads::shared — returns PerlSharedVar->pv */

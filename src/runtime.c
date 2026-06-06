@@ -6,6 +6,7 @@
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
@@ -42,6 +43,42 @@ static inline PerlValue *pv_alloc(void) {
 static inline void pv_pool_push(PerlValue *v) {
     v->pval      = pv_freelist_;
     pv_freelist_ = v;
+}
+
+/* ── PerlArray freelist pool ─────────────────────────────────────────────── *
+ * Each sub call creates a PerlArray for @_ and frees it after. For tight
+ * loops (e.g. mbs.pl calling cmul/cadd 21M times) this is ~84M malloc/free
+ * pairs and dominates sys time. Pool both the struct and the elems buffer:
+ * the "next" pointer is stored in a->mu (a void* field unused outside locks).
+ * Max cap preserved is PA_POOL_CAP_MAX; larger elems are freed to prevent bloat.
+ */
+#define PA_POOL_CAP_MAX 4096
+static __thread PerlArray *pa_pool_ = NULL;
+
+static inline PerlArray *pa_alloc(void) {
+    if (__builtin_expect(pa_pool_ != NULL, 1)) {
+        PerlArray *a = pa_pool_;
+        pa_pool_ = (PerlArray *)a->mu;  /* restore pool chain from mu field */
+        a->mu = NULL;
+        a->len = 0;
+        a->refcount = 0;
+        /* a->elems and a->cap are preserved from the previous use */
+        return a;
+    }
+    PerlArray *a = malloc(sizeof *a);
+    a->len = 0; a->cap = 8; a->refcount = 0; a->mu = NULL;
+    a->elems = malloc(a->cap * sizeof(PerlValue *));
+    return a;
+}
+
+static inline void pa_pool_push(PerlArray *a) {
+    if (a->cap > PA_POOL_CAP_MAX) {
+        free(a->elems);
+        a->elems = malloc(8 * sizeof(PerlValue *));
+        a->cap = 8;
+    }
+    a->mu = (pthread_mutex_t *)pa_pool_;   /* store next in mu field */
+    pa_pool_ = a;
 }
 
 /* ── local() save/restore stack ─────────────────────────────────────────── */
@@ -232,7 +269,7 @@ PerlValue *perl_array_to_list_return(PerlArray *av) {
     int ctx = (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
     if (ctx) {
         PerlValue *r = pv_alloc();
-        r->tag = PERL_REF_ARRAY;
+        r->tag = PERL_LIST_RESULT;  /* distinct from PERL_REF_ARRAY so scalar refs are not spread */
         r->flags = 0; r->matchpos = 0; r->blessed_class = NULL;
         r->pval = av;
         av->refcount = 1;
@@ -245,10 +282,13 @@ PerlValue *perl_array_to_list_return(PerlArray *av) {
     }
 }
 
-/* caller-side unwrap: extract PerlArray* from list-context function result */
+/* caller-side unwrap: extract PerlArray* from list-context function result.
+   Only PERL_LIST_RESULT (from perl_array_to_list_return) is spread; plain
+   PERL_REF_ARRAY scalar refs are passed as a single element so that e.g.
+   cadd(cmul($z,$z), $c) does not incorrectly flatten the cmul return ref. */
 PerlArray *perl_unwrap_list_return(PerlValue *pv) {
     if (!pv) return perl_array_new();
-    if (pv->tag == PERL_REF_ARRAY && pv->pval) {
+    if (pv->tag == PERL_LIST_RESULT && pv->pval) {
         PerlArray *av = (PerlArray *)pv->pval;
         pv->pval = NULL;
         perl_free(pv);
@@ -426,6 +466,17 @@ HOTX PerlValue *perl_alloc_float(double f) {
     return v;
 }
 
+/* 2-element float array stored inline in one PerlValue: no inner PerlArray, no heap.
+   fval = elem[0]; matchpos bits reinterpreted as double = elem[1]. */
+PerlValue *perl_alloc_float_pair(double re, double im) {
+    PerlValue *v = pv_alloc();
+    v->tag = PERL_FLOAT_PAIR;
+    v->fval = re;
+    memcpy(&v->matchpos, &im, sizeof(double)); /* bitcast double→long long */
+    v->blessed_class = NULL;
+    return v;
+}
+
 PerlValue *perl_alloc_flat_array(long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLAT_ARRAY;
@@ -475,7 +526,8 @@ PerlValue *perl_clone(const PerlValue *src) {
     PerlValue *v = pv_alloc();
     *v = *src;
     v->flags = 0;      /* clones are never shared — that's a property of the slot, not the value */
-    v->matchpos = 0;
+    /* FLOAT_PAIR stores the imaginary part in matchpos — must NOT be zeroed. */
+    if (src->tag != PERL_FLOAT_PAIR) v->matchpos = 0;
     v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     if (src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
@@ -483,6 +535,11 @@ PerlValue *perl_clone(const PerlValue *src) {
     } else if (src->tag == PERL_REF_HASH && src->pval) {
         PerlHash *hv = (PerlHash *)src->pval;
         if (hv->refcount > 0) hv->refcount++;
+    } else if (src->tag == PERL_LIST_RESULT && src->pval) {
+        /* LIST_RESULT wraps a PerlArray* — increment refcount so freeIfOwned
+           on the original doesn't free the array while the clone still holds it. */
+        PerlArray *av = (PerlArray *)src->pval;
+        if (av->refcount > 0) av->refcount++;
     }
     return v;
 }
@@ -496,6 +553,10 @@ HOTX void perl_free(PerlValue *v) {
     if (v->flags & PV_FLAG_SHARED) return;
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
+    if (v->tag == PERL_LIST_RESULT && v->pval) {
+        PerlArray *av = (PerlArray *)v->pval;
+        if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
+    }
     if (v->tag == PERL_REF_ARRAY && v->pval) {
         PerlArray *av = (PerlArray *)v->pval;
         /* call DESTROY on blessed array objects */
@@ -577,7 +638,7 @@ char *perl_to_string(const PerlValue *v) {
             snprintf(buf, sizeof buf, "%g", v->fval);
             return strdup(buf);
         case PERL_STRING:
-            return strdup(v->sval);
+            return strdup(v->sval ? v->sval : "");
         case PERL_REF_SCALAR:
             if (v->blessed_class)
                 snprintf(buf, sizeof buf, "%s=SCALAR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
@@ -933,14 +994,11 @@ PerlValue *perl_dec(PerlValue *v) {
 /* ── arrays ──────────────────────────────────────────────────────────────── */
 
 PerlArray *perl_array_new(void) {
-    PerlArray *a = malloc(sizeof *a);
-    a->len = 0; a->cap = 8; a->refcount = 0; a->mu = NULL;
-    a->elems = malloc(a->cap * sizeof(PerlValue *));
-    return a;
+    return pa_alloc();
 }
 
 PerlArray *perl_anon_array_new(void) {
-    PerlArray *a = perl_array_new();
+    PerlArray *a = pa_alloc();
     a->refcount = 1;
     return a;
 }
@@ -948,9 +1006,9 @@ PerlArray *perl_anon_array_new(void) {
 void perl_array_free(PerlArray *a) {
     if (!a) return;
     for (long long i = 0; i < a->len; i++) perl_free(a->elems[i]);
-    free(a->elems);
-    if (a->mu) { pthread_mutex_destroy(a->mu); free(a->mu); }
-    free(a);
+    /* shared arrays have a mutex — clean it up then fall through to pool */
+    if (a->mu) { pthread_mutex_destroy(a->mu); free(a->mu); a->mu = NULL; }
+    pa_pool_push(a);
 }
 
 void perl_array_clear(PerlArray *a) {
@@ -1686,9 +1744,7 @@ PerlValue *perl_deref_scalar(PerlValue *ref) {
 PerlArray *perl_deref_array(PerlValue *ref) {
     if (!ref) return perl_array_new();
     if (ref->tag == PERL_FLAT_ARRAY) {
-        /* Lazy conversion: box flat double[] into a proper PerlArray in-place.
-           Mutates the PV from FLAT_ARRAY to REF_ARRAY so subsequent accesses
-           (including the Stage 22 inline GEP path) see the correct tag. */
+        /* Lazy conversion: box flat double[] into a proper PerlArray in-place. */
         long long n = ref->matchpos;
         double *dbl = (double *)ref->pval;
         PerlArray *av = perl_anon_array_new();
@@ -1698,6 +1754,19 @@ PerlArray *perl_deref_array(PerlValue *ref) {
             perl_free(fv);
         }
         free(dbl);
+        ref->tag   = PERL_REF_ARRAY;
+        ref->pval  = av;
+        ref->matchpos = 0;
+        return av;
+    }
+    if (ref->tag == PERL_FLOAT_PAIR) {
+        /* Lazy conversion: expand inline (re,im) into a 2-element PerlArray. */
+        double im; memcpy(&im, &ref->matchpos, sizeof(double));
+        PerlArray *av = perl_anon_array_new();
+        PerlValue *re_pv = perl_alloc_float(ref->fval);
+        PerlValue *im_pv = perl_alloc_float(im);
+        perl_array_push(av, re_pv); perl_free(re_pv);
+        perl_array_push(av, im_pv); perl_free(im_pv);
         ref->tag   = PERL_REF_ARRAY;
         ref->pval  = av;
         ref->matchpos = 0;
@@ -1721,11 +1790,12 @@ PerlValue *perl_ref_type(PerlValue *ref) {
     if (!ref) return perl_alloc_string("");
     if (ref->blessed_class) return perl_alloc_string(ref->blessed_class);
     switch (ref->tag) {
-        case PERL_REF_SCALAR: return perl_alloc_string("SCALAR");
-        case PERL_REF_ARRAY:  return perl_alloc_string("ARRAY");
-        case PERL_REF_HASH:   return perl_alloc_string("HASH");
-        case PERL_CODE_REF:   return perl_alloc_string("CODE");
-        default:              return perl_alloc_string("");
+        case PERL_REF_SCALAR:  return perl_alloc_string("SCALAR");
+        case PERL_REF_ARRAY:   return perl_alloc_string("ARRAY");
+        case PERL_FLOAT_PAIR:  return perl_alloc_string("ARRAY");
+        case PERL_REF_HASH:    return perl_alloc_string("HASH");
+        case PERL_CODE_REF:    return perl_alloc_string("CODE");
+        default:               return perl_alloc_string("");
     }
 }
 
@@ -3281,6 +3351,10 @@ static PerlArray *perl_argv_arr = NULL;
 static PerlValue  perl_dollar0_val = { .tag = PERL_STRING };
 
 PerlArray *perl_init_argv(int argc, char **argv) {
+    /* Prevent glibc from returning heap pages to OS between frees (reduces page
+       faults from re-allocation in tight loops with many short-lived objects). */
+    mallopt(M_TRIM_THRESHOLD, -1);
+    mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024); /* only mmap for >64MB allocs */
     perl_argv_arr = perl_array_new();
     /* $0 = script name (argv[0]) */
     perl_dollar0_val.sval = strdup(argc > 0 ? argv[0] : "");

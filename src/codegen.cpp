@@ -229,6 +229,7 @@ void CodeGen::declareRuntime() {
     RT("perl_split",    av,   pv, pv);
     /* references */
     RT("perl_alloc_flat_array", pv, i64);
+    RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
     RT("perl_ref_hash",     pv, av);  /* PerlHash* treated as opaque av */
@@ -1105,7 +1106,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_ref_type", "perl_ref_array", "perl_ref_scalar",
         "perl_clone", "perl_sprintf", "perl_array_len",
         /* single-arg math/string builtins */
-        "perl_alloc_flat_array",
+        "perl_alloc_flat_array", "perl_alloc_float_pair",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
         "perl_uc_str", "perl_lc_str", "perl_ucfirst_str", "perl_lcfirst_str",
         "perl_chr_val", "perl_ord_val",
@@ -1579,6 +1580,11 @@ bool CodeGen::canEmitF64(const Node &n) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
             if (lookupDerefAV(nm)) return true;
+            /* FLOAT_PAIR fast path: $z->[0] or $z->[1] where $z may be a FLOAT_PAIR PV.
+               Emits a tag-check branch; branch is well-predicted so overhead is minimal. */
+            if (n.right && n.right->kind == NK::IntLit &&
+                (n.right->ival == 0 || n.right->ival == 1) && lookupVar(nm))
+                return true;
         }
         return false;
     case NK::HashElem:
@@ -1834,6 +1840,55 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
                     return callRT("perl_to_float", {elem});
                 }
+                /* FLOAT_PAIR fast path: $z->[0] or $z->[1] where tag may be FLOAT_PAIR (13).
+                   Emits a runtime tag check; branch is perfectly predicted once type is fixed. */
+                if (n.right && n.right->kind == NK::IntLit &&
+                    (n.right->ival == 0 || n.right->ival == 1)) {
+                    if (Value *slot = lookupVar(nm)) {
+                        auto *i32Ty = Type::getInt32Ty(ctx_);
+                        auto *i64Ty = Type::getInt64Ty(ctx_);
+                        auto *f64Ty = Type::getDoubleTy(ctx_);
+                        auto *i8Ty  = Type::getInt8Ty(ctx_);
+                        Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
+                        Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
+                        Value *isPair = builder_.CreateICmpEQ(tag,
+                            ConstantInt::get(i32Ty, 13), "ispair");
+                        auto *curFn = builder_.GetInsertBlock()->getParent();
+                        auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
+                        auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
+                        auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
+                        builder_.CreateCondBr(isPair, pBB, nBB);
+                        /* FLOAT_PAIR path: direct field load */
+                        builder_.SetInsertPoint(pBB);
+                        Value *pairFv;
+                        if (n.right->ival == 0) {
+                            /* fval at byte offset 8 */
+                            Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                i8Ty, pv, 8, "fp.re.ptr");
+                            pairFv = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                        } else {
+                            /* matchpos (i64) at byte offset 16, bitcast to double */
+                            Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                i8Ty, pv, 16, "fp.im.ptr");
+                            Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                            pairFv = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                        }
+                        builder_.CreateBr(mBB);
+                        auto *pBBp = builder_.GetInsertBlock();
+                        /* Normal path: fall back to deref + get_ref + to_float */
+                        builder_.SetInsertPoint(nBB);
+                        Value *normArr = callRT("perl_deref_array", {pv});
+                        Value *normElem = callRT("perl_array_get_ref", {normArr, emitIdx(*n.right)});
+                        Value *normFv   = callRT("perl_to_float", {normElem});
+                        builder_.CreateBr(mBB);
+                        auto *nBBp = builder_.GetInsertBlock();
+                        builder_.SetInsertPoint(mBB);
+                        auto *phi = builder_.CreatePHI(f64Ty, 2, "fp.val");
+                        phi->addIncoming(pairFv, pBBp);
+                        phi->addIncoming(normFv, nBBp);
+                        return phi;
+                    }
+                }
             }
             return nullptr;
         } else {
@@ -1873,8 +1928,9 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         auto *ft = FunctionType::get(perlPtrTy_,
                         {arrayPtrTy_, Type::getInt32Ty(ctx_)},  /* PerlArray* args, int ctx */
                         false);
-        Function::Create(ft, Function::ExternalLinkage,
+        auto *fn = Function::Create(ft, Function::ExternalLinkage,
                          subLLVMName(s->name), mod_.get());
+        fn->addFnAttr(Attribute::AlwaysInline);
     }
 
     /* emit main(int argc, char **argv) */
@@ -4992,6 +5048,16 @@ Value *CodeGen::emitExpr(const Node &n) {
                 for (auto &a : x.args) if (has1DArrow(*a)) return true;
                 return false;
             };
+            /* FLOAT_PAIR: exactly 2 float elements, no has1DArrow guard needed
+               because emitExprF64 handles 1D ArrowDerefs via runtime tag check. */
+            if (n.args.size() == 2) {
+                bool allF64 = canEmitF64(*n.args[0]) && canEmitF64(*n.args[1]);
+                if (allF64) {
+                    Value *re = emitExprF64(*n.args[0]);
+                    Value *im = emitExprF64(*n.args[1]);
+                    return callRT("perl_alloc_float_pair", {re, im});
+                }
+            }
             bool allFloat = true;
             for (auto &e : n.args) {
                 if (!canEmitF64(*e) || has1DArrow(*e)) { allFloat = false; break; }
@@ -5786,7 +5852,8 @@ void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
         if (stmt->kind == NK::SubDef) subs.push_back(stmt.get());
     for (auto *s : subs) {
         auto *ft = FunctionType::get(pv, {arrayPtrTy_, Type::getInt32Ty(ctx_)}, false);
-        Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
+        auto *fn = Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
+        fn->addFnAttr(Attribute::AlwaysInline);
     }
 
     /* emit: PerlValue *funcName() */
