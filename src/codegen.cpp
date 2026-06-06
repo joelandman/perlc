@@ -173,7 +173,9 @@ void CodeGen::declareRuntime() {
     RT("perl_array_new",      av);
     RT("perl_anon_array_new", av);
     RT("perl_array_free",    voidTy, av);
-    RT("perl_array_push",         voidTy, av, pv);
+    RT("perl_array_free_nc", voidTy, av);
+    RT("perl_array_push",    voidTy, av, pv);
+    RT("perl_array_push_nc", voidTy, av, pv);
     RT("perl_array_push_capture", voidTy, av, pv);
     RT("perl_array_pop",     pv,  av);
     RT("perl_array_get",     pv,  av, i64);
@@ -5766,9 +5768,11 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_isa_check", {a, b});
     }
     if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+        /* Use push_nc (no-clone) for scalar args so we skip 63M clone/free per
+           mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
+           after the call; non-owned (ScalarVar, borrow) need no action. */
         Value *argsArr = callRT("perl_array_new", {});
         for (auto &arg : n.args) {
-            /* @arr and %hash are splatted into @_ (flattened) */
             if (arg->kind == NK::ArrayVar) {
                 Value *av = lookupArray(arg->name);
                 if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
@@ -5777,7 +5781,6 @@ Value *CodeGen::emitCall(const Node &n) {
                 Value *hv = lookupHash(arg->name);
                 if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
             }
-            /* Range, DerefArray, AnonArray and other list-producers expand in @_ */
             if (Value *av = emitArrayPtr(*arg)) {
                 callRT("perl_array_extend", {argsArr, av});
                 continue;
@@ -5787,7 +5790,6 @@ Value *CodeGen::emitCall(const Node &n) {
             freeIfOwned(v);
         }
         auto *i32Ty = Type::getInt32Ty(ctx_);
-        /* push call frame so caller() inside the callee can inspect the call site */
         Value *pkgStr  = builder_.CreateGlobalStringPtr(currentPackage_, "caller.pkg");
         Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_,     "caller.file");
         Value *lineVal = ConstantInt::get(i32Ty, n.line);
@@ -5796,7 +5798,6 @@ Value *CodeGen::emitCall(const Node &n) {
         if (callCtx_ == 1) {
             ctxVal = ConstantInt::get(i32Ty, 1);
         } else if (currentSubNeedsWantarray_) {
-            /* propagate the current frame's context to nested calls */
             ctxVal = callRT("perl_current_wantarray_ctx", {});
         } else {
             ctxVal = ConstantInt::get(i32Ty, 0);

@@ -141,6 +141,8 @@ PerlArray *perl_array_new(void);
 PerlArray *perl_anon_array_new(void); /* like perl_array_new but refcount=1 (anonymous) */
 long long perl_array_is_all_flat(PerlArray *av); /* 1 if all elems are FLAT_ARRAY */
 void       perl_array_free(PerlArray *a);
+void       perl_array_push_nc(PerlArray *a, PerlValue *v);  /* no-clone push; caller owns v */
+void       perl_array_free_nc(PerlArray *a);                /* free array without freeing elements */
 void       perl_array_make_shared(PerlArray *a); /* threads::shared: init mu */
 void       perl_lock_array(PerlArray *a);        /* lock + push auto-unlock */
 void       perl_array_push(PerlArray *a, PerlValue *v);

@@ -30,14 +30,24 @@
 /* Per-thread freelist: no mutex needed since each thread has its own */
 static __thread PerlValue *pv_freelist_ = NULL;
 
+/* Slab size: allocate this many PVs at once on a cold miss.
+ * Contiguous allocation keeps pool entries cache-hot, dramatically reducing
+ * the cache-miss penalty that dominates perl_clone time in tight loops. */
+#define PV_SLAB 128
+
 static inline PerlValue *pv_alloc(void) {
     if (__builtin_expect(pv_freelist_ != NULL, 1)) {
         PerlValue *v  = pv_freelist_;
         pv_freelist_  = (PerlValue *)v->pval;
         return v;
     }
-    /* calloc zeroes flags (and all other fields) on fresh allocation */
-    return calloc(1, sizeof(PerlValue));
+    /* Cold miss: allocate a contiguous slab, return first entry, link rest. */
+    PerlValue *slab = calloc(PV_SLAB, sizeof(PerlValue));
+    for (int i = PV_SLAB - 1; i >= 1; i--) {
+        slab[i].pval  = (void *)pv_freelist_;
+        pv_freelist_  = &slab[i];
+    }
+    return &slab[0];   /* slab[0] is already zeroed by calloc */
 }
 
 static inline void pv_pool_push(PerlValue *v) {
@@ -742,6 +752,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         double *copy = (double *)malloc((size_t)n * sizeof(double));
         memcpy(copy, (double *)src->pval, (size_t)n * sizeof(double));
         dst->pval = copy;
+    } else if (src->tag == PERL_FLOAT_PAIR) {
+        /* matchpos holds the imaginary part as double bits — must NOT be zeroed. */
     } else {
         dst->matchpos = 0;
     }
@@ -1058,6 +1070,26 @@ void perl_array_push_capture(PerlArray *a, PerlValue *v) {
         a->elems[a->len++] = v;        /* shared: store original pointer */
     else
         a->elems[a->len++] = perl_clone(v);
+}
+
+/* Push without cloning: the caller retains ownership of v and guarantees v
+   outlives the array. Used for @_ construction in emitCall so we avoid 63M
+   clone/free pairs per mbs.pl run. Never call on a persistent array. */
+void perl_array_push_nc(PerlArray *a, PerlValue *v) {
+    if (a->len >= a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 8;
+        a->elems = realloc(a->elems, a->cap * sizeof(PerlValue *));
+    }
+    a->elems[a->len++] = v;   /* no perl_clone */
+}
+
+/* Free array without freeing elements: companion to perl_array_push_nc.
+   Elements are owned by the caller, not this array. */
+void perl_array_free_nc(PerlArray *a) {
+    if (!a) return;
+    /* do NOT call perl_free on elems — caller owns them */
+    if (a->mu) { pthread_mutex_destroy(a->mu); free(a->mu); a->mu = NULL; }
+    pa_pool_push(a);
 }
 
 PerlValue *perl_array_pop(PerlArray *a) {
