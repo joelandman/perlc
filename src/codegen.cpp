@@ -425,6 +425,18 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_cond_wait",          voidTy, pv);
     RT("perl_cond_signal",        voidTy, pv);
     RT("perl_cond_broadcast",     voidTy, pv);
+    /* Phase 3: atomic primitives for shared scalars.  perl_atomic_load
+       takes a pv and returns the same pointer (the load is the
+       cell-pointer itself; the function is essentially an acquire fence
+       around the codegen's plain load).  perl_atomic_store/inc/dec/add
+       do refcount + write with a release fence.  perl_atomic_add is
+       called for `$shared += N`; it takes the lazy-installed SharedMutex
+       to make the RMW atomic. */
+    RT("perl_atomic_load",        pv,   pv);
+    RT("perl_atomic_store",       pv,   pv, pv);
+    RT("perl_atomic_inc",         pv,   pv);
+    RT("perl_atomic_dec",         pv,   pv);
+    RT("perl_atomic_add",         pv,   pv, pv);
     /* threads */
     RT("perl_threads_create",   pv, pv, av);
     RT("perl_threads_join",     pv, pv);
@@ -763,6 +775,10 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         }
     }
     if (n.kind == NK::DerefArray) {
+        Value *ref = emitExpr(*n.left);
+        return callRT("perl_deref_array", {ref});
+    }
+    if (n.kind == NK::PostfixDeref && n.sval == "all_array") {
         Value *ref = emitExpr(*n.left);
         return callRT("perl_deref_array", {ref});
     }
@@ -2529,7 +2545,15 @@ void CodeGen::emitStmt(const Node &n) {
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
             bool isShared = (n.ival & 1) != 0;
             if (isShared) {
-                /* threads::shared variable: allocate PerlSharedVar, skip unboxing */
+                /* threads::shared variable: Phase-2 layout.  The cell IS the
+                   PerlValue; no wrapper, no per-cell mutex at allocation.
+                   The SharedMutex is lazy-installed on the first lock() or
+                   cond_wait() call (see get_or_install_mutex in runtime.c).
+                   Shared scalars must not be unboxed to int/float — that
+                   would lose the PV_FLAG_SHARED bit and break cross-thread
+                   visibility.  The "no int/float unbox" invariant is
+                   upheld by storing in the regular scopes_ map and
+                   skipping the intScopes_/floatScopes_ paths below. */
                 auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
                 Value *pv = callRT("perl_make_shared_scalar", {});
                 builder_.CreateStore(pv, alloca);
@@ -2540,6 +2564,7 @@ void CodeGen::emitStmt(const Node &n) {
                     freeIfOwned(init);
                 }
                 declareVar(nm, alloca);
+                sharedScalarNames_.insert(nm);  /* Phase 3: route through perl_atomic_* */
                 break;
             }
             if (atFileScope) {
@@ -2668,7 +2693,8 @@ void CodeGen::emitStmt(const Node &n) {
                    return scalars and must go through perl_say for the newline. */
                 NK ak = n.args[0]->kind;
                 bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
-                                        ak == NK::ArraySlice || ak == NK::HashSlice);
+                                        ak == NK::ArraySlice || ak == NK::HashSlice ||
+                                        (ak == NK::PostfixDeref && n.args[0]->sval == "all_array"));
                 Value *av = isExplicitArray ? emitArrayPtr(*n.args[0]) : nullptr;
                 if (av) {
                     callRT("perl_print_array", {av});
@@ -2683,7 +2709,8 @@ void CodeGen::emitStmt(const Node &n) {
                     if (i > 0) callRT("perl_print_sep", {});
                     NK ak = n.args[i]->kind;
                     bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
-                                            ak == NK::ArraySlice || ak == NK::HashSlice);
+                                            ak == NK::ArraySlice || ak == NK::HashSlice ||
+                                            (ak == NK::PostfixDeref && n.args[i]->sval == "all_array"));
                     Value *av = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
                     if (av)
                         callRT("perl_print_array", {av});
@@ -3531,6 +3558,20 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         auto *slot = lookupVar(n.name);
         if (!slot) return perlUndef();
+        /* Phase 3: shared scalars are routed through perl_atomic_load so
+           the acquire fence pairs with the writer's release fence in
+           perl_atomic_store / perl_atomic_inc / perl_atomic_add.  On x86
+           the fence is a compiler barrier only; on aarch64 it emits ldar.
+           This subsumes the old perl_shared_load (which the Phase 1
+           minimal fix used) — the release fence is now on the writer. */
+        {
+            std::string nm = n.name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (sharedScalarNames_.count(nm)) {
+                Value *pv = builder_.CreateLoad(perlPtrTy_, slot, n.name);
+                return callRT("perl_atomic_load", {pv});
+            }
+        }
         return builder_.CreateLoad(perlPtrTy_, slot, n.name);
     }
 
@@ -3857,19 +3898,62 @@ Value *CodeGen::emitExpr(const Node &n) {
             return n.left ? emitExpr(*n.left) : perlUndef();
         };
         if (n.sval == "pre++") {
-            Value *v = emitIncTarget(true); callRT("perl_inc", {v}); return v;
+            Value *v = emitIncTarget(true);
+            /* Phase 3: shared scalars use the atomic inc, which takes the
+               lazy-installed SharedMutex and then release-fences.  Plain
+               (non-shared) scalars still go through perl_inc. */
+            if (n.left && n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (sharedScalarNames_.count(nm)) {
+                    callRT("perl_atomic_inc", {v});
+                    return v;
+                }
+            }
+            callRT("perl_inc", {v});
+            return v;
         }
         if (n.sval == "pre--") {
-            Value *v = emitIncTarget(true); callRT("perl_dec", {v}); return v;
+            Value *v = emitIncTarget(true);
+            if (n.left && n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (sharedScalarNames_.count(nm)) {
+                    callRT("perl_atomic_dec", {v});
+                    return v;
+                }
+            }
+            callRT("perl_dec", {v});
+            return v;
         }
         if (n.sval == "post++") {
             Value *orig = emitIncTarget(true);
+            /* Phase 3: shared scalars — clone-then-atomic-inc so post++ can
+               return the old value (Perl semantics) without a race window. */
+            if (n.left && n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (sharedScalarNames_.count(nm)) {
+                    Value *copy = callRT("perl_clone", {orig});
+                    callRT("perl_atomic_inc", {orig});
+                    return copy;
+                }
+            }
             Value *copy = callRT("perl_clone", {orig});
             callRT("perl_inc", {orig});
             return copy;
         }
         if (n.sval == "post--") {
             Value *orig = emitIncTarget(true);
+            if (n.left && n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (sharedScalarNames_.count(nm)) {
+                    Value *copy = callRT("perl_clone", {orig});
+                    callRT("perl_atomic_dec", {orig});
+                    return copy;
+                }
+            }
             Value *copy = callRT("perl_clone", {orig});
             callRT("perl_dec", {orig});
             return copy;
@@ -4239,11 +4323,58 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
         }
         {
+        /* Phase 3: shared scalars with RMW-shaped RHS — pattern-match
+           `$shared = $shared OP N` and translate to perl_atomic_add so
+           the read-modify-write is atomic under the SharedMutex.  This
+           is the same operation as `+=` etc. (which goes through
+           CompoundAssign) but written out longhand; in the wild both
+           forms are common (e.g. `$x = $x + 1` and `$x++`). */
+        if (n.left->kind == NK::ScalarVar) {
+            std::string nm = n.left->name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (sharedScalarNames_.count(nm) && n.right->kind == NK::BinOp) {
+                bool isNumeric = (n.right->sval == "+" || n.right->sval == "-" ||
+                                  n.right->sval == "*" || n.right->sval == "/" ||
+                                  n.right->sval == "%");
+                /* pattern: lhs is one of the BinOp's operands */
+                bool lhsOnLeft  = n.right->left  && n.right->left->kind == NK::ScalarVar
+                                && n.right->left->name  == n.left->name;
+                bool lhsOnRight = n.right->right && n.right->right->kind == NK::ScalarVar
+                                && n.right->right->name == n.left->name;
+                if (isNumeric && (lhsOnLeft || lhsOnRight)) {
+                    Value *lhs = emitLValue(*n.left);
+                    if (lhs) {
+                        Value *lhsVal = builder_.CreateLoad(perlPtrTy_, lhs);
+                        /* evaluate the *other* operand only; the shared
+                           var is read inside perl_atomic_add under the
+                           mutex, so re-evaluating it here would race. */
+                        const Node &other = lhsOnLeft ? *n.right->right : *n.right->left;
+                        Value *rhsVal = emitExpr(other);
+                        Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
+                        freeIfOwned(rhsVal);
+                        return r;
+                    }
+                }
+            }
+        }
         Value *rhs = emitExpr(*n.right);
         Value *lhs = emitLValue(*n.left);
         if (lhs) {
             /* perl_assign model: mutate the stable PerlValue* in-place */
             Value *lhsVal = builder_.CreateLoad(perlPtrTy_, lhs);
+            /* Phase 3: shared scalars route through perl_atomic_store so
+               the write is release-fenced (pairs with perl_atomic_load's
+               acquire on the reader side).  Same payload-update logic
+               as perl_assign (refcount, string deep-copy, tag dispatch);
+               see the implementation in runtime.c. */
+            if (n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (sharedScalarNames_.count(nm)) {
+                    callRT("perl_atomic_store", {lhsVal, rhs});
+                    return rhs;
+                }
+            }
             callRT("perl_assign", {lhsVal, rhs});
         }
         return rhs;
@@ -4576,6 +4707,35 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (!lhsPtr) return perlUndef();
         Value *lhsVal = builder_.CreateLoad(perlPtrTy_, lhsPtr);
         Value *rhsVal = emitExpr(*n.right);
+
+        /* Phase 3: shared scalars route through the atomic primitive.
+           For numeric ops we use perl_atomic_add, which takes the
+           lazy-installed SharedMutex (correct for RMW).  For other ops
+           (., x, &, |, ^, <<, >>, **) we fall back to non-atomic
+           applyOp + a release-fenced perl_atomic_store — the read-modify-
+           write is not atomic for these, but the write side still has
+           a release fence so the result is visible to other threads. */
+        if (n.left->kind == NK::ScalarVar) {
+            std::string nm = n.left->name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (sharedScalarNames_.count(nm)) {
+                bool isNumeric = (n.sval == "+" || n.sval == "-" ||
+                                  n.sval == "*" || n.sval == "/" ||
+                                  n.sval == "%");
+                if (isNumeric) {
+                    Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
+                    freeIfOwned(rhsVal);
+                    return lhsVal;
+                }
+                /* non-numeric: applyOp + atomic store (release-fenced) */
+                Value *result = applyOp(lhsVal, rhsVal);
+                freeIfOwned(rhsVal);
+                callRT("perl_atomic_store", {lhsVal, result});
+                freeIfOwned(result);
+                return lhsVal;
+            }
+        }
+
         Value *result = applyOp(lhsVal, rhsVal);
         freeIfOwned(rhsVal);
         callRT("perl_assign", {lhsVal, result});
@@ -5183,6 +5343,30 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_deref_hash", {ref});
     }
 
+    case NK::PostfixDeref: {
+        /* $r->@* / $r->%* / $r->$* — explicit postfix dereference.
+           sval is "all_array" / "all_hash" / "scalar".  In scalar/boolean
+           context (e.g. `( $x->@* ) ? ... : ...`) we return the array/hash
+           size; callers that want the raw array go through emitArrayPtr. */
+        Value *ref = emitExpr(*n.left);
+        if (n.sval == "all_array") {
+            Value *av = callRT("perl_deref_array", {ref});
+            freeIfOwned(ref);
+            /* perl_array_len returns a PerlValue* (PV), which is the correct
+               scalar-context answer (true iff non-empty) and is what
+               `emitBlockLast` consumers expect. */
+            return callRT("perl_array_len", {av});
+        } else if (n.sval == "all_hash") {
+            Value *hv = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+            return callRT("perl_hash_size", {hv});
+        } else { /* "scalar" */
+            Value *pv = callRT("perl_deref_scalar", {ref});
+            freeIfOwned(ref);
+            return pv;
+        }
+    }
+
     case NK::ArrowDeref: {
         if (n.sval == "array" && n.left && n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
@@ -5197,7 +5381,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             static auto isListNode = [](NK k) {
                 return k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
                        k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::CallerFunc ||
-                       k == NK::Call;
+                       k == NK::Call || k == NK::PostfixDeref;
             };
             if (isListNode(n.left->kind)) {
                 Value *av = emitArrayPtr(*n.left);
@@ -5271,7 +5455,18 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ArraySlice: {
-        Value *av  = lookupArray(n.name);
+        /* Two forms:
+           (a) @arr[i,j,...]  — n.name non-empty, n.left null
+           (b) $r->@[i,j,...] — n.name empty, n.left is a ref expr
+           Resolve the source array accordingly. */
+        Value *av  = nullptr;
+        if (!n.name.empty()) {
+            av = lookupArray(n.name);
+        } else if (n.left) {
+            Value *ref = emitExpr(*n.left);
+            av = callRT("perl_deref_array", {ref});
+            freeIfOwned(ref);
+        }
         Value *res = callRT("perl_array_new", {});
         for (auto &idxNode : n.args) {
             Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(*idxNode)}) : perlUndef();
@@ -5281,7 +5476,17 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::HashSlice: {
-        Value *hv  = lookupHash(n.name);
+        /* Two forms:
+           (a) %h{k1,k2,...}  — n.name non-empty, n.left null
+           (b) $r->%{k1,k2,...} — n.name empty, n.left is a ref expr */
+        Value *hv  = nullptr;
+        if (!n.name.empty()) {
+            hv = lookupHash(n.name);
+        } else if (n.left) {
+            Value *ref = emitExpr(*n.left);
+            hv = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+        }
         Value *res = callRT("perl_array_new", {});
         auto pushHashKey2 = [&](const Node &keyNode) {
             if (keyNode.kind == NK::ArrayLit) {
@@ -5657,12 +5862,13 @@ Value *CodeGen::emitBinOp(const Node &n) {
         builder_.SetInsertPoint(rhsBB);
         Value *rv = emitExpr(*n.right);
         auto *rBB = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
+        bool rhsTerminated = rBB->getTerminator() != nullptr;
+        if (!rhsTerminated) builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
         auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "and.result");
         phi->addIncoming(lv, lBB);
-        phi->addIncoming(rv, rBB);
+        if (!rhsTerminated) phi->addIncoming(rv, rBB);
         return phi;
     }
     if (n.sval == "||") {
@@ -5678,12 +5884,13 @@ Value *CodeGen::emitBinOp(const Node &n) {
         builder_.SetInsertPoint(rhsBB);
         Value *rv = emitExpr(*n.right);
         auto *rBB = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
+        bool rhsTerminated = rBB->getTerminator() != nullptr;
+        if (!rhsTerminated) builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
         auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "or.result");
         phi->addIncoming(lv, lBB);
-        phi->addIncoming(rv, rBB);
+        if (!rhsTerminated) phi->addIncoming(rv, rBB);
         return phi;
     }
     /* defined-or: $a // $b — return $a if defined, else $b */
@@ -5700,12 +5907,13 @@ Value *CodeGen::emitBinOp(const Node &n) {
         builder_.SetInsertPoint(rhsBB);
         Value *rv = emitExpr(*n.right);
         auto *rBB = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
+        bool rhsTerminated = rBB->getTerminator() != nullptr;
+        if (!rhsTerminated) builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
         auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "defor.result");
         phi->addIncoming(lv, lBB);
-        phi->addIncoming(rv, rBB);
+        if (!rhsTerminated) phi->addIncoming(rv, rBB);
         return phi;
     }
     /* ternary */
@@ -5722,17 +5930,19 @@ Value *CodeGen::emitBinOp(const Node &n) {
         builder_.SetInsertPoint(thenBB);
         Value *tv = emitExpr(*n.left);
         auto *tb  = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
+        bool thenTerminated = tb->getTerminator() != nullptr;
+        if (!thenTerminated) builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(elseBB);
         Value *ev = emitExpr(*n.right);
         auto *eb  = builder_.GetInsertBlock();
-        builder_.CreateBr(endBB);
+        bool elseTerminated = eb->getTerminator() != nullptr;
+        if (!elseTerminated) builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
         auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "tern.result");
         phi->addIncoming(tv, tb);
-        phi->addIncoming(ev, eb);
+        if (!elseTerminated) phi->addIncoming(ev, eb);
         return phi;
     }
 

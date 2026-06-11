@@ -51,6 +51,9 @@ private:
     NodePtr parseLowOr();
     NodePtr parseLowAnd();
     NodePtr parseLowNot();
+    NodePtr parseOrRhs();  /* rhs of low-precedence or/and — may be a stmt */
+    NodePtr parseDieWarnBody(bool isDie, int line);  /* die/warn body without leading KW or trailing `;` */
+    NodePtr parseLastNextRedoBody(NK kind, int line);  /* last/next/redo body without leading KW or trailing `;` */
     NodePtr parseAssign();
     NodePtr parseTernary();
     NodePtr parseRange();

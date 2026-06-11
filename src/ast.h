@@ -72,6 +72,9 @@ enum class NK {
     DerefArray,   /* @$ref      – left = ref expr           */
     DerefHash,    /* %$ref      – left = ref expr           */
     ArrowDeref,   /* $r->[i] or $r->{k} – left=base, right=subscript, sval="array"/"hash" */
+    PostfixDeref, /* $r->@* / $r->%* / $r->$* / $r->@[LIST] / $r->%{LIST}
+                     left = ref expr, sval = "all_array" / "all_hash" / "scalar"
+                                          / "slice_array" / "slice_hash"   */
     RefFunc,      /* ref($x)    – left = expr               */
     /* regex */
     Range,        /* lo..hi             – left=lo, right=hi                           */

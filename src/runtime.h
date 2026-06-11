@@ -23,7 +23,7 @@ typedef enum {
     PERL_FLOAT_PAIR   = 13, /* 2-elem float array inline: fval=elem[0], matchpos bits=elem[1]; no inner PerlArray */
 } PerlTag;
 
-/* PV_FLAG_SHARED: variable is a threads::shared variable (PerlSharedVar). */
+/* PV_FLAG_SHARED: cell is a threads::shared variable (see SharedMutex below). */
 #define PV_FLAG_SHARED 1u
 
 typedef struct PerlValue {
@@ -39,31 +39,48 @@ typedef struct PerlValue {
     char     *blessed_class; /* NULL unless bless'd */
 } PerlValue;
 
-/* PerlSharedVar: a PerlValue with an embedded mutex+condvar for threads::shared.
-   The PerlValue MUST be the first member so that (PerlValue*) == (PerlSharedVar*). */
+/* PV_FLAG_SHARED: variable is a threads::shared variable.  With the new
+   layout (Phase 2 of THREADS_SHARED_ATOMIC_PLAN.md) the cell *is* the
+   PerlValue; the SharedMutex is allocated lazily on first lock()/cond_wait()
+   and kept in a process-wide side-table keyed by the cell address.  The
+   old `PerlSharedVar` wrapper has been removed — see git log for the
+   one-shot ABI break that landed with this change. */
 #include <pthread.h>
-typedef struct {
-    PerlValue       pv;
+#include <stdatomic.h>
+
+typedef struct SharedMutex {
     pthread_mutex_t mu;
     pthread_cond_t  cond;
-} PerlSharedVar;
+} SharedMutex;
 
 /* allocation */
 PerlValue *perl_alloc_undef(void);
 PerlValue *perl_alloc_int(long long v);
 PerlValue *perl_alloc_float(double v);
+
 PerlValue *perl_alloc_string(const char *s);
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);
-PerlValue *perl_make_shared_scalar(void); /* threads::shared — returns PerlSharedVar->pv */
+PerlValue *perl_make_shared_scalar(void); /* threads::shared — alloc bare PV with PV_FLAG_SHARED, no mutex yet */
 
 /* threads::shared — lock/cond */
 void perl_lock_shared(PerlValue *pv);          /* lock scalar shared var + push auto-unlock */
+void perl_unlock_shared(PerlValue *pv);        /* explicit unlock */
+int  perl_cond_timedwait(PerlValue *pv, long long timeout_ms); /* timed wait */
+void perl_cond_broadcast_shared(PerlValue *pv); /* broadcast to all */
 void perl_cond_wait(PerlValue *pv);            /* cond_wait on shared var's condvar */
 void perl_cond_signal(PerlValue *pv);          /* cond_signal */
 void perl_cond_broadcast(PerlValue *pv);       /* cond_broadcast */
+
+/* atomic operations for threads::shared */
+PerlValue *perl_atomic_load(PerlValue *pv);
+PerlValue *perl_atomic_store(PerlValue *pv, PerlValue *v);
+PerlValue *perl_atomic_swap(PerlValue *pv, PerlValue *v);
+PerlValue *perl_atomic_inc(PerlValue *pv);
+PerlValue *perl_atomic_dec(PerlValue *pv);
+PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta);
 
 /* coercions */
 long long  perl_to_int(const PerlValue *v);

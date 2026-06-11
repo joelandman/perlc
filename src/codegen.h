@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /* A scope frame maps variable names → alloca (PerlValue*) */
@@ -91,6 +92,18 @@ private:
        Eliminates redundant loads like body[j][6] appearing 3× in the velocity-update
        block; invalidated only when the exact (outerNm, idxNm, elemIdx) is written. */
     std::unordered_map<std::string, llvm::Value *> flatDoubleCache_;
+
+    /* Phase 3: names of shared scalars (declared with `: shared`).  Used
+       to route reads/writes through the atomic primitive helpers so the
+       codegen for `$x`, `$x = v`, `$x++`, `$x += N` (on a shared scalar)
+       calls perl_atomic_load / perl_atomic_store / perl_atomic_inc /
+       perl_atomic_dec / perl_atomic_add instead of plain loads and the
+       non-atomic perl_assign.  The set is populated in `case NK::My`
+       (shared branch) and is read in `case NK::ScalarVar` (rval),
+       `case NK::Assign` (ScalarVar LHS), `case NK::UnaryOp` (++/-- on
+       shared ScalarVar), and `case NK::CompoundAssign` (numeric op on
+       shared ScalarVar). */
+    std::unordered_set<std::string> sharedScalarNames_;
 
     /* file-scope (top-level my) globals — accessible from subroutines */
     std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;

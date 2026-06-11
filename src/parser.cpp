@@ -266,20 +266,15 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_RETURN)) { return parseModifier(parseReturn(),      line); }
     if (check(TK::KW_LAST)) {
         advance();
-        auto n = std::make_unique<Node>(); n->kind = NK::Last; n->line = line;
-        if (check(TK::IDENT)) { n->sval = cur().text; advance(); } /* optional label */
-        return parseModifier(std::move(n), line);
+        return parseModifier(parseLastNextRedoBody(NK::Last, line), line);
     }
     if (check(TK::KW_NEXT)) {
         advance();
-        auto n = std::make_unique<Node>(); n->kind = NK::Next; n->line = line;
-        if (check(TK::IDENT)) { n->sval = cur().text; advance(); } /* optional label */
-        return parseModifier(std::move(n), line);
+        return parseModifier(parseLastNextRedoBody(NK::Next, line), line);
     }
     if (check(TK::KW_REDO)) {
         advance();
-        auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line;
-        return parseModifier(std::move(n), line);
+        return parseModifier(parseLastNextRedoBody(NK::Redo, line), line);
     }
     /* lock(EXPR) — threads::shared scope lock */
     if (check(TK::KW_LOCK)) {
@@ -316,13 +311,8 @@ NodePtr Parser::parseStmt() {
     if (check(TK::LBRACE))    return parseBlock();
     if (check(TK::KW_DIE) || check(TK::KW_WARN)) {
         bool isDie = check(TK::KW_DIE); advance();
-        NodePtr msg;
-        if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK))
-            msg = parseExpr();
-        auto n = std::make_unique<Node>();
-        n->kind = isDie ? NK::DieStmt : NK::WarnStmt; n->line = line;
-        n->left = std::move(msg);
-        return parseModifier(std::move(n), line);
+        auto stmt = parseDieWarnBody(isDie, line);
+        return parseModifier(std::move(stmt), line);
     }
 
     /* expression statement */
@@ -743,6 +733,30 @@ NodePtr Parser::parseReturn() {
     return n;
 }
 
+/* parseDieWarnBody / parseLastNextRedoBody — split-out bodies for the
+   `die`/`warn`/`last`/`next` statement-keyword parsers.  These DO NOT
+   call parseModifier (so they leave the `;` to the caller) and DO NOT
+   consume the leading keyword.  Used by `parseOrRhs` to parse the
+   rhs of `expr or die ...` without the double-parseModifier pitfall
+   that arises from invoking the full `parseStmt` recursively. */
+NodePtr Parser::parseDieWarnBody(bool isDie, int line) {
+    NodePtr msg;
+    if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK))
+        msg = parseExpr();
+    auto n = std::make_unique<Node>();
+    n->kind = isDie ? NK::DieStmt : NK::WarnStmt; n->line = line;
+    n->left = std::move(msg);
+    return n;
+}
+
+NodePtr Parser::parseLastNextRedoBody(NK kind, int line) {
+    auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+    if (kind == NK::Last || kind == NK::Next) {
+        if (check(TK::IDENT)) { n->sval = cur().text; advance(); } /* optional label */
+    }
+    return n;
+}
+
 /* ── statement modifiers ─────────────────────────────────────────────────── */
 
 bool Parser::isModifier() const {
@@ -809,7 +823,7 @@ NodePtr Parser::parseLowOr() {
     auto lhs = parseLowAnd();
     while (check(TK::KW_OR) || (cur().kind == TK::IDENT && cur().text == "xor")) {
         int line = cur().line; advance();
-        auto rhs = parseLowAnd();
+        NodePtr rhs = parseOrRhs();
         lhs = makeBin("||", std::move(lhs), std::move(rhs), line);
     }
     return lhs;
@@ -820,10 +834,46 @@ NodePtr Parser::parseLowAnd() {
     auto lhs = parseLowNot();
     while (check(TK::KW_AND)) {
         int line = cur().line; advance();
-        auto rhs = parseLowNot();
+        NodePtr rhs = parseOrRhs();
         lhs = makeBin("&&", std::move(lhs), std::move(rhs), line);
     }
     return lhs;
+}
+
+/* Parse the right-hand side of a low-precedence `or` or `and`.  If the
+   next token is a statement keyword (return/last/next/redo/die/warn/
+   print/say/printf/push/pop/shift/unshift/eval), parse it as a full
+   statement and wrap it in a Block so the short-circuit `||`/`&&`
+   codegen treats it as a value.  Otherwise, descend normally through
+   parseLowNot.  Note: we must NOT call `parseStmt` here, because the
+   inner statement parsers (e.g. `die`) call `parseModifier` which
+   consumes the trailing `;` — but the OUTER `parseStmt` (which invoked
+   `parseExpr` → `parseLowOr` → `parseOrRhs`) also calls `parseModifier`
+   on the resulting BinOp, and that outer call would then misread the
+   *next* statement's keyword as a modifier on the whole expression.
+   We instead dispatch directly to the body parsers (parseReturn,
+   parseDieWarnBody, etc.) which stop BEFORE `parseModifier`, leaving
+   the `;` for the outer caller. */
+NodePtr Parser::parseOrRhs() {
+    TK k = cur().kind;
+    int line = cur().line;
+    NodePtr stmt;
+    if      (k == TK::KW_RETURN) { stmt = parseReturn(); }
+    else if (k == TK::KW_DIE)    { stmt = parseDieWarnBody(true,  line); }
+    else if (k == TK::KW_WARN)   { stmt = parseDieWarnBody(false, line); }
+    else if (k == TK::KW_LAST)   { stmt = parseLastNextRedoBody(NK::Last, line); }
+    else if (k == TK::KW_NEXT)   { stmt = parseLastNextRedoBody(NK::Next, line); }
+    else if (k == TK::KW_REDO)   { auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
+    else if (k == TK::KW_PRINT)  { stmt = parsePrint(false); }
+    else if (k == TK::KW_SAY)    { stmt = parsePrint(true);  }
+    else if (k == TK::KW_PUSH)   { stmt = parsePush();       }
+    else if (k == TK::KW_UNSHIFT){ stmt = parseUnshift();    }
+    else {
+        return parseLowNot();
+    }
+    NodeList stmts;
+    stmts.push_back(std::move(stmt));
+    return makeBlock(std::move(stmts), line);
 }
 
 /* low-precedence: not (below assignment) */
@@ -1144,6 +1194,72 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                 base = std::move(n);
                 continue;
             }
+            /* Postfix dereference: $r->@* / $r->%* / $r->$* / $r->@[$i,$j] / $r->%{...} */
+            if (check(TK::ARRAY)) {
+                advance();
+                if (check(TK::STAR)) {   /* $r->@* */
+                    advance();
+                    auto n = std::make_unique<Node>(); n->kind = NK::PostfixDeref;
+                    n->sval = "all_array"; n->left = std::move(base); n->line = line;
+                    base = std::move(n);
+                    continue;
+                }
+                if (check(TK::LBRACKET)) {  /* $r->@[$i,$j,...] */
+                    advance();
+                    /* Emit ArrowDeref("array") with base=$r, but with implicit
+                       array-ref from the postfix deref. We model the slice as
+                       ArraySlice with left = the ref expr so the existing
+                       ArraySlice codegen path picks it up. */
+                    auto refExpr = std::move(base);
+                    auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice;
+                    n->left  = std::move(refExpr);
+                    n->line  = line;
+                    while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
+                        n->args.push_back(parseExpr());
+                        if (!match(TK::COMMA)) break;
+                    }
+                    consume(TK::RBRACKET, "]");
+                    base = std::move(n);
+                    continue;
+                }
+                /* $r->@  (no *, no [...]) — error */
+                throw std::runtime_error("Parse error line " + std::to_string(line) +
+                    ": expected '*' or '[' after '->@'");
+            }
+            if (check(TK::HASH)) {
+                advance();
+                if (check(TK::STAR)) {   /* $r->%* */
+                    advance();
+                    auto n = std::make_unique<Node>(); n->kind = NK::PostfixDeref;
+                    n->sval = "all_hash"; n->left = std::move(base); n->line = line;
+                    base = std::move(n);
+                    continue;
+                }
+                if (check(TK::LBRACE)) {  /* $r->%{k1,k2} */
+                    advance();
+                    auto refExpr = std::move(base);
+                    auto n = std::make_unique<Node>(); n->kind = NK::HashSlice;
+                    n->left  = std::move(refExpr);
+                    n->line  = line;
+                    while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
+                        n->args.push_back(parseExpr());
+                        if (!match(TK::COMMA)) break;
+                    }
+                    consume(TK::RBRACE, "}");
+                    base = std::move(n);
+                    continue;
+                }
+                throw std::runtime_error("Parse error line " + std::to_string(line) +
+                    ": expected '*' or '{' after '->%'");
+            }
+            if (check(TK::SCALAR) && peek(1).kind == TK::STAR) { /* $r->$* */
+                advance();  /* skip $ */
+                advance();  /* skip * */
+                auto n = std::make_unique<Node>(); n->kind = NK::PostfixDeref;
+                n->sval = "scalar"; n->left = std::move(base); n->line = line;
+                base = std::move(n);
+                continue;
+            }
             /* ->method(args), ->SUPER::method(args) — method call
                Accept any identifier-like token (keywords can be method names) */
             if ([&]{ const std::string &t = cur().text;
@@ -1178,7 +1294,8 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                    k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar ||
                    k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
                    k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::Call ||
-                   k == NK::CallerFunc;
+                   k == NK::CallerFunc || k == NK::PostfixDeref ||
+                   k == NK::ArraySlice || k == NK::HashSlice;
         };
         if (isSubscriptableK(base->kind) && check(TK::LBRACKET)) {
             advance();
@@ -1215,7 +1332,8 @@ NodePtr Parser::parsePostfix() {
                /* list-producing expressions: (sort)[0], (map)[0], etc. */
                k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
                k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::Call ||
-               k == NK::CallerFunc;
+               k == NK::CallerFunc || k == NK::PostfixDeref ||
+               k == NK::ArraySlice || k == NK::HashSlice;
     };
     if (check(TK::ARROW) ||
         (isSubscriptable(expr->kind) && (check(TK::LBRACKET) || check(TK::LBRACE)))) {

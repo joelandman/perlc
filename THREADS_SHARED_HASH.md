@@ -12,9 +12,9 @@ my %shared_hash : shared;
 ```
 
 ### Thread Safety
-- Shared hashes use embedded mutexes for thread-safe access
-- All modifications must be protected by `lock(%shared_hash)` 
-- The same synchronization primitives apply as for shared scalars and arrays
+- Shared hashes use embedded mutexes for thread-safe access.
+- The atomicity model for scalars (see `THREADS_SHARED_ATOMIC.md`) does **not** apply to hashes; all hash modifications must be protected by `lock(%shared_hash)`. The `lock()` primitive is still required because a hash is a multi-field data structure and a per-cell fence is not enough to make a multi-key read-modify-write atomic.
+- The same synchronization primitives apply as for shared scalars and arrays.
 
 ### Usage Pattern
 ```perl
@@ -38,10 +38,10 @@ for my $t (@threads) { $t->join(); }
 
 ## Key Features
 
-1. **Thread-safe Access**: Multiple threads can safely read and write to shared hashes
-2. **Locking Mechanism**: Requires explicit locking with `lock(%shared_hash)` for atomic operations
-3. **Visibility**: Changes made by one thread are immediately visible to other threads
-4. **Isolation**: Non-shared variables remain thread-local as expected
+1. **Thread-safe Access**: Multiple threads can safely read and write to shared hashes.
+2. **Locking Mechanism**: Requires explicit locking with `lock(%shared_hash)` for atomic operations.
+3. **Visibility**: Changes made by one thread are immediately visible to other threads.
+4. **Isolation**: Non-shared variables remain thread-local as expected.
 
 ## Test Status
 
@@ -88,13 +88,14 @@ unlock(%counter);
 
 ## Limitations
 
-- Requires explicit locking for all access patterns
-- Cannot perform complex operations without proper locking
-- Performance considerations for high-contention scenarios
+- Requires explicit locking for all access patterns (no per-cell atomicity for hashes, unlike scalars).
+- Cannot perform complex operations without proper locking.
+- Performance considerations for high-contention scenarios.
 
 ## References
 
-This functionality is part of the broader threads::shared implementation documented in the compiler as:
+This functionality is part of the broader threads::shared implementation. See also:
+- `THREADS_SHARED_ATOMIC.md` — the memory model and atomic-primitive contract for shared scalars (read/write/RMW without `lock()`).
 - `my %hash : shared` - shared hash variables
-- `lock(%hash)` - lock for thread-safe access  
+- `lock(%hash)` - lock for thread-safe access
 - `unlock(%hash)` - unlock (automatically handled with block scope)

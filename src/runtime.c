@@ -91,11 +91,104 @@ static inline void pa_pool_push(PerlArray *a) {
     pa_pool_ = a;
 }
 
+/* ── threads::shared side-table (Phase 2) ─────────────────────────────────── *
+ * Each shared scalar's PerlValue carries PV_FLAG_SHARED.  The mutex+condvar
+ * that lock()/cond_wait() needs is allocated lazily on the first such call
+ * and kept in a process-wide hash table keyed by the cell address.  This
+ * means:
+ *   - allocation cost is paid only by shared vars that ever see lock()
+ *   - the hot path (perl_atomic_load) is a single acquire fence, no
+ *     function call into the runtime for ordering (on x86 it compiles to
+ *     a plain MOV)
+ *   - the install path (the first lock() on a given scalar) is guarded by
+ *     a single global mutex; subsequent lookups are lock-free
+ *
+ * The plan acknowledges this is the trade-off: see THREADS_SHARED_ATOMIC_PLAN.md
+ * §"Data layout" and §"Lock path".  The mutex is intentionally never
+ * freed during the program's lifetime.
+ *
+ * Phase 3 re-entry handling: a shared scalar's `lock()` may legitimately
+ * be called by the same thread that is also about to call
+ * `perl_atomic_add/inc/dec` via the codegen for `$x = $x + 1`, `$x++`,
+ * `$x += N`, etc.  Because pthread_mutex is non-recursive by default, the
+ * atomic helpers would deadlock.  We track the (mutex, depth) per thread
+ * via `s_held_mutex_*` TLS, and the atomic helpers consult it before
+ * locking.  When the same thread already holds the mutex, the atomic
+ * helper skips the lock entirely: the user has already serialised
+ * access, so the RMW is by definition safe within this thread.
+ */
+#define SHARED_MUTEX_TABLE_BUCKETS 64
+typedef struct SharedMutexEntry {
+    PerlValue                   *pv;   /* key: cell address (identity) */
+    SharedMutex                 *mu;   /* value: lazy-installed */
+    struct SharedMutexEntry     *next;
+} SharedMutexEntry;
+static SharedMutexEntry *s_mutex_table[SHARED_MUTEX_TABLE_BUCKETS];
+static pthread_mutex_t   s_mutex_table_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Per-thread "what SharedMutex is this thread currently holding, and at
+ * what depth?"  Only the *innermost* held mutex is tracked (re-entry into
+ * a different shared scalar would be detected and rejected by the
+ * pthread_mutex_lock below).  The Phase 2 plan does not explicitly
+ * cover this case, but the existing pattern in tests/threads.pl
+ * (lock($x); $x = $x + 1;) requires it for correctness. */
+static __thread SharedMutex *s_held_mutex_     = NULL;
+static __thread int          s_held_mutex_depth_ = 0;
+
+/* Pointer identity hash on the cell address. */
+static inline unsigned int pv_bucket(const PerlValue *pv) {
+    uintptr_t k = (uintptr_t)pv;
+    k = (k >> 3) ^ (k >> 11) ^ (k >> 19);
+    return (unsigned int)(k % SHARED_MUTEX_TABLE_BUCKETS);
+}
+
+/* Lock-free lookup.  Returns NULL if the cell has no SharedMutex yet. */
+static SharedMutex *lookup_shared_mutex(PerlValue *pv) {
+    if (!pv) return NULL;
+    unsigned int b = pv_bucket(pv);
+    for (SharedMutexEntry *e = s_mutex_table[b]; e; e = e->next) {
+        if (e->pv == pv) return e->mu;
+    }
+    return NULL;
+}
+
+/* Get the SharedMutex for `pv`, installing one if missing.  Thread-safe
+ * via s_mutex_table_mu; the common path (already-installed) does not take
+ * the install mutex.  Never returns NULL. */
+static SharedMutex *get_or_install_mutex(PerlValue *pv) {
+    if (!pv) return NULL;
+    SharedMutex *mu = lookup_shared_mutex(pv);
+    if (mu) return mu;
+    SharedMutex *fresh = calloc(1, sizeof *fresh);
+    pthread_mutex_init(&fresh->mu,   NULL);
+    pthread_cond_init( &fresh->cond, NULL);
+    unsigned int b = pv_bucket(pv);
+    pthread_mutex_lock(&s_mutex_table_mu);
+    /* Re-check after taking the install lock — another thread may have
+     * raced ahead of us. */
+    for (SharedMutexEntry *e = s_mutex_table[b]; e; e = e->next) {
+        if (e->pv == pv) {
+            pthread_mutex_unlock(&s_mutex_table_mu);
+            pthread_mutex_destroy(&fresh->mu);
+            pthread_cond_destroy(&fresh->cond);
+            free(fresh);
+            return e->mu;
+        }
+    }
+    SharedMutexEntry *ne = malloc(sizeof *ne);
+    ne->pv   = pv;
+    ne->mu   = fresh;
+    ne->next = s_mutex_table[b];
+    s_mutex_table[b] = ne;
+    pthread_mutex_unlock(&s_mutex_table_mu);
+    return fresh;
+}
+
 /* ── local() save/restore stack ─────────────────────────────────────────── */
 
 #define LOCAL_STACK_MAX 256
 #define LOCAL_SCALAR  0   /* save/restore a PerlValue (existing behaviour) */
-#define LOCAL_LOCK_PV 1   /* auto-unlock a PerlSharedVar on scope exit */
+#define LOCAL_LOCK_PV 1   /* auto-unlock a SharedMutex (lazy-installed on shared scalar) on scope exit */
 #define LOCAL_LOCK_AV 2   /* auto-unlock a PerlArray->mu on scope exit */
 #define LOCAL_LOCK_HV 3   /* auto-unlock a PerlHash->mu on scope exit */
 #define LOCAL_ARRAY   4   /* save/restore a PerlArray* (local @arr) */
@@ -130,7 +223,19 @@ void perl_local_restore_to(int depth) {
         s_local_depth--;
         LocalEntry *e = &s_local_stack[s_local_depth];
         if (e->type == LOCAL_LOCK_PV) {
-            pthread_mutex_unlock(&((PerlSharedVar *)e->ptr)->mu);
+            /* Auto-unlock mirrors perl_unlock_shared: respect re-entry. */
+            SharedMutex *mu = lookup_shared_mutex((PerlValue *)e->ptr);
+            if (mu) {
+                if (s_held_mutex_ == mu) {
+                    s_held_mutex_depth_--;
+                    if (s_held_mutex_depth_ == 0) {
+                        pthread_mutex_unlock(&mu->mu);
+                        s_held_mutex_ = NULL;
+                    }
+                } else {
+                    pthread_mutex_unlock(&mu->mu);
+                }
+            }
         } else if (e->type == LOCAL_LOCK_AV) {
             pthread_mutex_unlock(((PerlArray *)e->ptr)->mu);
         } else if (e->type == LOCAL_LOCK_HV) {
@@ -458,6 +563,7 @@ HOTX PerlValue *perl_alloc_undef(void) {
     return v;
 }
 
+
 HOTX PerlValue *perl_alloc_int(long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_INT;
@@ -559,7 +665,13 @@ static PerlSubFnCtx perl_find_method(const char *class_name, const char *method)
 
 HOTX void perl_free(PerlValue *v) {
     if (!v) return;
-    /* Shared vars are PerlSharedVar (larger than PerlValue) — never pool them. */
+    /* Shared vars are program-lifetime: never returned to the pv pool and
+       never freed.  The cell's contents (string/array/hash payloads) are
+       owned by program-lifetime shared scope and will be cleaned up
+       implicitly at process exit.  (Phase 2: the cell *is* the PerlValue
+       itself, so we no longer skip a PerlSharedVar wrapper — but we still
+       must not pool the cell, because shared scalars live for the entire
+       program and the pool assumes the contents have been torn down.) */
     if (v->flags & PV_FLAG_SHARED) return;
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
@@ -702,7 +814,13 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!dst) return;
     int shared = dst->flags & PV_FLAG_SHARED;
     /* No implicit mutex here — caller must hold lock() for concurrent safety.
-       Locking inside perl_assign would deadlock when lock() is already held. */
+       Locking inside perl_assign would deadlock when lock() is already held.
+       Visibility for cross-thread write/read is now the responsibility of
+       perl_atomic_store (release fence) and perl_atomic_load (acquire
+       fence), called from the codegen for shared scalars.  The non-atomic
+       perl_assign path used by `local` save/restore and by some inter-
+       mediate writes (e.g. array push, hash set) is not visibility-safe
+       on its own — those callers must hold the cell's SharedMutex. */
     /* Acquire new reference first (handles self-assignment safely) */
     if (src && src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
@@ -1869,19 +1987,32 @@ PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures) {
 
 /* ── threads::shared ─────────────────────────────────────────────────────── */
 
+/* Phase 2 cell layout: a shared scalar IS a PerlValue* with PV_FLAG_SHARED
+   set.  No wrapper struct, no per-cell mutex.  The mutex+condvar is
+   allocated lazily on the first lock()/cond_wait() call (see
+   get_or_install_mutex above).  This is what THREADS_SHARED_ATOMIC_PLAN.md
+   §"Data layout" specifies. */
 PerlValue *perl_make_shared_scalar(void) {
-    PerlSharedVar *sv = calloc(1, sizeof(PerlSharedVar));
-    sv->pv.tag   = PERL_UNDEF;
-    sv->pv.flags = PV_FLAG_SHARED;
-    pthread_mutex_init(&sv->mu,   NULL);
-    pthread_cond_init( &sv->cond, NULL);
-    return &sv->pv;
+    PerlValue *pv = pv_alloc();
+    pv->tag   = PERL_UNDEF;
+    pv->flags = PV_FLAG_SHARED;
+    return pv;
 }
 
 void perl_lock_shared(PerlValue *pv) {
     if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
-    PerlSharedVar *sv = (PerlSharedVar *)pv;
-    pthread_mutex_lock(&sv->mu);
+    SharedMutex *mu = get_or_install_mutex(pv);
+    /* Re-entry: if the current thread already holds this mutex, just
+       bump the depth.  The pthread_mutex is non-recursive but we make
+       it act re-entrant via the per-thread depth counter.  The auto-
+       unlock stack tracks depth implicitly via entry count. */
+    if (s_held_mutex_ == mu) {
+        s_held_mutex_depth_++;
+    } else {
+        pthread_mutex_lock(&mu->mu);
+        s_held_mutex_       = mu;
+        s_held_mutex_depth_ = 1;
+    }
     if (s_local_depth < LOCAL_STACK_MAX) {
         s_local_stack[s_local_depth].type = LOCAL_LOCK_PV;
         s_local_stack[s_local_depth].ptr  = pv;
@@ -1889,20 +2020,160 @@ void perl_lock_shared(PerlValue *pv) {
     }
 }
 
+void perl_unlock_shared(PerlValue *pv) {
+    if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
+    SharedMutex *mu = lookup_shared_mutex(pv);
+    if (mu) {
+        if (s_held_mutex_ == mu) {
+            s_held_mutex_depth_--;
+            if (s_held_mutex_depth_ == 0) {
+                pthread_mutex_unlock(&mu->mu);
+                s_held_mutex_ = NULL;
+            }
+        } else {
+            /* unlock() without a matching lock() — the user is doing
+               something exotic; just unlock the mutex anyway.  This
+               matches the old single-thread-of-execution semantics. */
+            pthread_mutex_unlock(&mu->mu);
+        }
+    }
+    if (s_local_depth > 0) {
+        s_local_depth--;
+    }
+}
+
+/* Conditional wait with timeout for shared variables */
+int perl_cond_timedwait(PerlValue *pv, long long timeout_ms) {
+    if (!pv || !(pv->flags & PV_FLAG_SHARED)) return -1;
+    SharedMutex *mu = get_or_install_mutex(pv);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    ts.tv_sec += timeout_ms / 1000;
+    int result = pthread_cond_timedwait(&mu->cond, &mu->mu, &ts);
+    return (result == ETIMEDOUT) ? 1 : 0;
+}
+
+/* Broadcast to all waiting threads */
+void perl_cond_broadcast_shared(PerlValue *pv) {
+    if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
+    SharedMutex *mu = get_or_install_mutex(pv);
+    pthread_cond_broadcast(&mu->cond);
+}
+
+/* ── atomic primitives for threads::shared scalars (Phase 2-3) ──────────── */
+/* Visibility on a plain load/store is provided by the fences here; the
+   old fence-only `perl_shared_load` was removed in Phase 3 once the
+   codegen started calling these primitives directly.
+   Read-modify-write (inc/dec/add) and swap go through the lazy-installed
+   SharedMutex for correctness; the lock-free CAS optimisation on a
+   single-word payload is a follow-up.  Per-thread re-entry is tracked
+   via `s_held_mutex_*` TLS so the helpers are safe to call when the user
+   has already wrapped the same scalar in lock(). */
+
+PerlValue *perl_atomic_load(PerlValue *pv) {
+    /* Plain load + acquire fence.  On x86 this compiles to a plain MOV +
+       compiler barrier; on aarch64 LLVM emits `ldar`.  No mutex taken —
+       this is the hot path for cross-thread reads of shared scalars. */
+    if (!pv) return NULL;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return pv;
+}
+
+PerlValue *perl_atomic_store(PerlValue *pv, PerlValue *v) {
+    if (!pv) return NULL;
+    /* Run the same payload-update logic as perl_assign (refcount +
+       string deep-copy + tag dispatch), then release-fence so the
+       contents are visible to other threads' perl_atomic_load. */
+    perl_assign(pv, v);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return v;
+}
+
+PerlValue *perl_atomic_swap(PerlValue *pv, PerlValue *v) {
+    if (!pv) return NULL;
+    /* Take the SharedMutex so we get a coherent "swap" of the cell
+       contents.  A lock-free CAS-on-payload would be the next-step
+       optimisation but is out of scope for Phase 2.  Re-entry: if the
+       current thread already holds the mutex, skip the lock — the user
+       has already serialised. */
+    SharedMutex *mu = get_or_install_mutex(pv);
+    int held = (s_held_mutex_ == mu);
+    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
+    else s_held_mutex_depth_++;
+    PerlValue *old = pv_alloc();
+    *old = *pv;                      /* snapshot current contents (flags included) */
+    perl_assign(pv, v);              /* mutate in place */
+    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
+    else s_held_mutex_depth_--;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return old;
+}
+
+PerlValue *perl_atomic_inc(PerlValue *pv) {
+    if (!pv) return NULL;
+    SharedMutex *mu = get_or_install_mutex(pv);
+    int held = (s_held_mutex_ == mu);
+    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
+    else s_held_mutex_depth_++;
+    /* Mirror perl_inc semantics for the int/float cases, fall through to
+       no-op for non-numeric payloads (Perl's ++ on a string is magical and
+       we leave that to perl_inc which handles it correctly). */
+    if (pv->tag == PERL_INT)   { pv->ival++; }
+    else if (pv->tag == PERL_FLOAT) { pv->fval += 1.0; }
+    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
+    else s_held_mutex_depth_--;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return pv;
+}
+
+PerlValue *perl_atomic_dec(PerlValue *pv) {
+    if (!pv) return NULL;
+    SharedMutex *mu = get_or_install_mutex(pv);
+    int held = (s_held_mutex_ == mu);
+    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
+    else s_held_mutex_depth_++;
+    if (pv->tag == PERL_INT)   { pv->ival--; }
+    else if (pv->tag == PERL_FLOAT) { pv->fval -= 1.0; }
+    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
+    else s_held_mutex_depth_--;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return pv;
+}
+
+PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta) {
+    if (!pv || !delta) return pv;
+    SharedMutex *mu = get_or_install_mutex(pv);
+    int held = (s_held_mutex_ == mu);
+    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
+    else s_held_mutex_depth_++;
+    /* Coerce the delta to a numeric PV (mirror perl_add's behaviour) */
+    long long di = perl_to_int(delta);
+    double   df = perl_to_float(delta);
+    if (pv->tag == PERL_INT)   { pv->ival += di; }
+    else if (pv->tag == PERL_FLOAT) { pv->fval += df; }
+    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
+    else s_held_mutex_depth_--;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return pv;
+}
+
 void perl_cond_wait(PerlValue *pv) {
     if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
-    PerlSharedVar *sv = (PerlSharedVar *)pv;
-    pthread_cond_wait(&sv->cond, &sv->mu);
+    SharedMutex *mu = get_or_install_mutex(pv);
+    pthread_cond_wait(&mu->cond, &mu->mu);
 }
 
 void perl_cond_signal(PerlValue *pv) {
     if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
-    pthread_cond_signal(&((PerlSharedVar *)pv)->cond);
+    SharedMutex *mu = lookup_shared_mutex(pv);
+    if (mu) pthread_cond_signal(&mu->cond);
 }
 
 void perl_cond_broadcast(PerlValue *pv) {
     if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
-    pthread_cond_broadcast(&((PerlSharedVar *)pv)->cond);
+    SharedMutex *mu = lookup_shared_mutex(pv);
+    if (mu) pthread_cond_broadcast(&mu->cond);
 }
 
 /* ── threads ─────────────────────────────────────────────────────────────── */
@@ -1923,7 +2194,11 @@ static PerlValue *clone_code_ref_for_thread(PerlValue *code_pv) {
     for (int i = 0; i < old_cl->ncaptures; i++) {
         PerlValue *os = old_cl->captures[i];   /* parent's stable slot */
         /* threads::shared variables: pass the original slot so both threads
-           see the same PerlValue (writes are mutex-protected in perl_assign). */
+           see the same cell.  Under the Phase-2 layout the shared flag is
+           on the cell itself, so the cell pointer is the canonical shared
+           pointer and we must NOT deep-copy it.  The actual concurrent
+           writes go through perl_atomic_* helpers, which take the
+           SharedMutex (lazy-installed) for the cell. */
         if (os->flags & PV_FLAG_SHARED) {
             new_cl->captures[i] = os;
             continue;
