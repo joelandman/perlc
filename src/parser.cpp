@@ -522,6 +522,16 @@ NodePtr Parser::parseMy() {
             if (!match(TK::COMMA)) break;
         }
         consume(TK::RPAREN, ")");
+        /* Sub-task 3: `our ($a, $b) : shared = ...` form.  Parse the
+           `: shared` attribute (if present) and apply it to every
+           variable in the list.  This mirrors the single-var form
+           at line 562. */
+        bool listShared = false;
+        if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
+                toks_[pos_ + 1].text == "shared") {
+            advance(); advance();
+            listShared = true;
+        }
         NodePtr rhs;
         if (match(TK::ASSIGN)) rhs = parseExpr();
         match(TK::SEMI);
@@ -530,6 +540,7 @@ NodePtr Parser::parseMy() {
         for (auto &vd : allVars) {
             auto decl = std::make_unique<Node>(); decl->kind = NK::My;
             decl->name = vd.sigil + vd.name; decl->line = line;
+            if (listShared) decl->ival = 1;  /* shared flag */
             stmts.push_back(std::move(decl));
         }
         if (rhs) {

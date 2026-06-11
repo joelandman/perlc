@@ -138,6 +138,16 @@ private:
     std::string currentPackage_ = "main";
     std::string sourceFile_;
 
+    /* Sub-task 2 (named-sub closure capture): the AST nodes of every
+       top-level named sub.  Populated in `compile()` (and the
+       eval-string JIT), consumed by `case NK::RefSub` when emitting
+       `\&subname` so it can build a closure that captures the
+       enclosing scope's shared scalars.  The matching sub body
+       emission in `emitSub()` reads `subCaptures_[name]` to know
+       which captures to load with `perl_get_capture(i)`. */
+    std::vector<const Node *> subs_;
+    std::unordered_map<std::string, std::vector<std::string>> subCaptures_;
+
     /* AST-level inline subs: subs with (my (@params)=@_; return expr) body.
        At call sites these are expanded directly, bypassing @_ construction. */
     struct InlineSub {

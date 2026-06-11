@@ -623,9 +623,10 @@ static int runRepl(bool debugSymbols, int optLevel, bool verbose, bool pauseMode
                     rtSrc = "src/runtime.c";
 
                 std::string outFile = "/tmp/_perlc_repl_out_" + std::to_string(getpid());
-                std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native";
+                std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native"
+                                  " -Wno-atomic-alignment";
                 if (debugSymbols) cmd += " -g";
-                cmd += " " + tmpIR + " " + rtSrc + " -o " + outFile + " -lm -lpcre2-8 2>&1";
+                cmd += " " + tmpIR + " " + rtSrc + " -o " + outFile + " -lm -lpcre2-8 -latomic 2>&1";
 
                 int rc = system(cmd.c_str());
                 unlink(tmpIR.c_str());
@@ -821,14 +822,15 @@ int main(int argc, char **argv) {
                              "eval EXPR will return undef\n";
         }
 
-        std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native";
+        std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native"
+                          " -Wno-atomic-alignment";
         if (debugSymbols) cmd += " -g";
         cmd += " " + tmpIR + " " + rtSrc;
         if (!evalLib.empty())
             cmd += " -rdynamic"   /* export runtime symbols for JIT dlopen */
                    " -Wl,--whole-archive " + evalLib + " -Wl,--no-whole-archive"
                    " -L/usr/lib/llvm-18/lib -lLLVM-18 -lstdc++ -lpthread -ldl";
-        cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 2>&1";
+        cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
         int rc = system(cmd.c_str());

@@ -2061,15 +2061,84 @@ void perl_cond_broadcast_shared(PerlValue *pv) {
     pthread_cond_broadcast(&mu->cond);
 }
 
-/* ── atomic primitives for threads::shared scalars (Phase 2-3) ──────────── */
-/* Visibility on a plain load/store is provided by the fences here; the
-   old fence-only `perl_shared_load` was removed in Phase 3 once the
-   codegen started calling these primitives directly.
-   Read-modify-write (inc/dec/add) and swap go through the lazy-installed
-   SharedMutex for correctness; the lock-free CAS optimisation on a
-   single-word payload is a follow-up.  Per-thread re-entry is tracked
-   via `s_held_mutex_*` TLS so the helpers are safe to call when the user
-   has already wrapped the same scalar in lock(). */
+/* ── atomic primitives for threads::shared scalars (Phase 2-4) ──────────── */
+/* Visibility on a plain load/store is provided by the fences in
+   perl_atomic_load / perl_atomic_store; the codegen calls these
+   directly for shared scalars (no separate perl_shared_load primitive).
+   Read-modify-write (inc/dec/add) goes through a lock-free CAS loop
+   for the int and float payload shapes, and falls back to the
+   lazy-installed SharedMutex for everything else (string, ref, array,
+   hash, undef, code_ref, filehandle, list_result, float_pair,
+   flat_array, thread).  perl_atomic_swap also takes the mutex
+   because swapping requires replacing the whole cell.  Per-thread
+   re-entry is tracked via `s_held_mutex_*` TLS so the helpers are
+   safe to call when the user has already wrapped the same scalar
+   in lock().
+
+   Lock-free CAS design (Phase 4): the 16 bytes at the start of
+   PerlValue — { tag (4B), flags (4B), ival/fval/sval/pval (8B) } —
+   are exposed as a packed struct PerlValueAtomic16.  The CAS covers
+   the tag + flags + 8-byte value, which is exactly what an RMW on
+   an int or float scalar needs to update atomically.  On x86_64 the
+   primitive compiles to lock cmpxchg16b; on aarch64 to ldxp+stxp.
+   The address of every PerlValue is 16-byte aligned (slab allocation
+   via calloc(128, 32)), so the alignment requirement is met.
+   Anything where the 16 bytes don't include the full payload state
+   (string, ref, float_pair) or where the 16 bytes don't fit a
+   single-store mutation (e.g. ++ on a string needs to allocate a
+   fresh string and bump the pointer) falls back to the mutex path. */
+
+typedef struct {
+    PerlTag      tag;
+    unsigned int flags;
+    union {
+        long long ival;
+        double    fval;
+        char     *sval;
+        void     *pval;
+    } v;
+} PerlValueAtomic16;
+_Static_assert(sizeof(PerlValueAtomic16) == 16,
+               "PerlValueAtomic16 must be exactly 16 bytes for cmpxchg16b / ldxp+stxp");
+_Static_assert(offsetof(PerlValue, ival) == 8,
+               "ival field must sit at offset 8 inside PerlValue so the "
+               "atomic-16 shadow covers {tag, flags, ival}");
+
+/* Acquire-load the {tag, flags, value} 16 bytes from a PerlValue.
+   The payload's ival/fval are read by the caller after this returns.
+   On x86 this compiles to a plain MOV + compiler barrier; on aarch64
+   LLVM emits LDAR (16-byte load-acquire).  Used by perl_atomic_load
+   on the int/float path. */
+static inline void perl_atomic16_load(PerlValue *pv, PerlValueAtomic16 *out) {
+    /* Use a 16-byte aligned local to satisfy __atomic_load's natural
+       alignment requirement; the load itself targets the 16-byte
+       shadow {tag, flags, ival/fval} inside *pv.  The slab allocator
+       guarantees pv is 16-byte aligned (calloc(128, 32) where
+       alignof(PerlValue) >= 16 on x86_64), so the CAS/load target
+       is naturally aligned. */
+    _Alignas(16) PerlValueAtomic16 aligned_out;
+    __atomic_load((PerlValueAtomic16 *)pv, &aligned_out, __ATOMIC_ACQUIRE);
+    *out = aligned_out;
+}
+
+/* Strong CAS on the 16-byte payload shadow.  Returns 1 on success
+   (out is unchanged), 0 on failure (out is updated with the observed
+   value so the caller can retry).  ACQ_REL ordering so subsequent
+   reads in the caller see the value, and the writer's RMW is
+   visible to subsequent readers' acquire loads. */
+static inline int perl_atomic16_cas(PerlValue *pv,
+                                    PerlValueAtomic16 *expected,
+                                    const PerlValueAtomic16 *desired) {
+    return __atomic_compare_exchange(
+        (PerlValueAtomic16 *)pv, expected, (PerlValueAtomic16 *)desired,
+        0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+/* Release-store the 16-byte payload shadow.  Used by perl_atomic_store
+   on the int/float path. */
+static inline void perl_atomic16_store(PerlValue *pv, const PerlValueAtomic16 *src) {
+    __atomic_store((PerlValueAtomic16 *)pv, (PerlValueAtomic16 *)src, __ATOMIC_RELEASE);
+}
 
 PerlValue *perl_atomic_load(PerlValue *pv) {
     /* Plain load + acquire fence.  On x86 this compiles to a plain MOV +
@@ -2090,70 +2159,128 @@ PerlValue *perl_atomic_store(PerlValue *pv, PerlValue *v) {
     return v;
 }
 
-PerlValue *perl_atomic_swap(PerlValue *pv, PerlValue *v) {
-    if (!pv) return NULL;
-    /* Take the SharedMutex so we get a coherent "swap" of the cell
-       contents.  A lock-free CAS-on-payload would be the next-step
-       optimisation but is out of scope for Phase 2.  Re-entry: if the
-       current thread already holds the mutex, skip the lock — the user
-       has already serialised. */
+/* Helper: take the SharedMutex with re-entry tracking.  Returns 1 if
+   the caller should re-acquire (i.e. not currently held by this
+   thread), 0 if it's already held.  Used by the RMW fallback paths. */
+static inline int atomic_mutex_acquire(PerlValue *pv) {
     SharedMutex *mu = get_or_install_mutex(pv);
-    int held = (s_held_mutex_ == mu);
-    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
-    else s_held_mutex_depth_++;
+    if (s_held_mutex_ == mu) {
+        s_held_mutex_depth_++;
+        return 0;  /* already held — caller skips pthread_mutex_lock */
+    }
+    pthread_mutex_lock(&mu->mu);
+    s_held_mutex_       = mu;
+    s_held_mutex_depth_ = 1;
+    return 1;  /* newly held — caller must pthread_mutex_unlock on the way out */
+}
+static inline void atomic_mutex_release(int newly_held) {
+    if (newly_held) {
+        pthread_mutex_unlock(&s_held_mutex_->mu);
+        s_held_mutex_ = NULL;
+        s_held_mutex_depth_ = 0;
+    } else {
+        s_held_mutex_depth_--;
+    }
+}
+
+/* Lock-free integer increment via 16-byte CAS on {tag, flags, ival}.
+   Returns 1 on success (RMW done lock-free), 0 on CAS-abort
+   (caller should retry).  The CAS is strong (no spurious failure);
+   the only retry is for actual contention. */
+static inline int try_atomic_inc_int(PerlValue *pv, long long delta) {
+    PerlValueAtomic16 cur, next;
+    perl_atomic16_load(pv, &cur);
+    while (1) {
+        if (cur.tag != PERL_INT) return 0;   /* not an int — caller falls back */
+        next = cur;
+        next.v.ival += delta;
+        if (perl_atomic16_cas(pv, &cur, &next)) return 1;
+        /* CAS failed — cur was reloaded by gcc, retry */
+    }
+}
+
+/* Lock-free float increment via 16-byte CAS on {tag, flags, fval}. */
+static inline int try_atomic_inc_float(PerlValue *pv, double delta) {
+    PerlValueAtomic16 cur, next;
+    perl_atomic16_load(pv, &cur);
+    while (1) {
+        if (cur.tag != PERL_FLOAT) return 0;
+        next = cur;
+        next.v.fval += delta;
+        if (perl_atomic16_cas(pv, &cur, &next)) return 1;
+    }
+}
+
+/* Lock-free integer/float add (used for `+= N` where N may be a
+   different numeric type — caller coerces the delta). */
+static inline int try_atomic_add_int (PerlValue *pv, long long di) { return try_atomic_inc_int (pv, di); }
+static inline int try_atomic_add_float(PerlValue *pv, double   df) { return try_atomic_inc_float(pv, df); }
+
+PerlValue *perl_atomic_swap(PerlValue *pv, PerlValue *v) {
+    /* swap replaces the whole cell, including matchpos and blessed_class
+       (16 bytes don't cover them).  Take the SharedMutex. */
+    if (!pv) return NULL;
+    int newly_held = atomic_mutex_acquire(pv);
     PerlValue *old = pv_alloc();
     *old = *pv;                      /* snapshot current contents (flags included) */
     perl_assign(pv, v);              /* mutate in place */
-    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
-    else s_held_mutex_depth_--;
+    atomic_mutex_release(newly_held);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     return old;
 }
 
 PerlValue *perl_atomic_inc(PerlValue *pv) {
     if (!pv) return NULL;
-    SharedMutex *mu = get_or_install_mutex(pv);
-    int held = (s_held_mutex_ == mu);
-    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
-    else s_held_mutex_depth_++;
-    /* Mirror perl_inc semantics for the int/float cases, fall through to
-       no-op for non-numeric payloads (Perl's ++ on a string is magical and
-       we leave that to perl_inc which handles it correctly). */
+    /* Lock-free fast path for int/float payloads.  On the rare
+       contention case, gcc's __atomic_compare_exchange spins for us
+       without falling back to the kernel. */
+    if (pv->tag == PERL_INT) {
+        if (try_atomic_inc_int(pv, 1)) return pv;
+    } else if (pv->tag == PERL_FLOAT) {
+        if (try_atomic_inc_float(pv, 1.0)) return pv;
+    }
+    /* Fallback: non-numeric payload, or contended int/float that we
+       abandoned (in practice we never abandon on x86/aarch64, but be
+       robust).  Take the mutex. */
+    int newly_held = atomic_mutex_acquire(pv);
     if (pv->tag == PERL_INT)   { pv->ival++; }
     else if (pv->tag == PERL_FLOAT) { pv->fval += 1.0; }
-    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
-    else s_held_mutex_depth_--;
+    atomic_mutex_release(newly_held);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     return pv;
 }
 
 PerlValue *perl_atomic_dec(PerlValue *pv) {
     if (!pv) return NULL;
-    SharedMutex *mu = get_or_install_mutex(pv);
-    int held = (s_held_mutex_ == mu);
-    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
-    else s_held_mutex_depth_++;
+    if (pv->tag == PERL_INT) {
+        if (try_atomic_inc_int(pv, -1)) return pv;
+    } else if (pv->tag == PERL_FLOAT) {
+        if (try_atomic_inc_float(pv, -1.0)) return pv;
+    }
+    int newly_held = atomic_mutex_acquire(pv);
     if (pv->tag == PERL_INT)   { pv->ival--; }
     else if (pv->tag == PERL_FLOAT) { pv->fval -= 1.0; }
-    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
-    else s_held_mutex_depth_--;
+    atomic_mutex_release(newly_held);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     return pv;
 }
 
 PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta) {
     if (!pv || !delta) return pv;
-    SharedMutex *mu = get_or_install_mutex(pv);
-    int held = (s_held_mutex_ == mu);
-    if (!held) { pthread_mutex_lock(&mu->mu); s_held_mutex_ = mu; s_held_mutex_depth_ = 1; }
-    else s_held_mutex_depth_++;
     /* Coerce the delta to a numeric PV (mirror perl_add's behaviour) */
     long long di = perl_to_int(delta);
     double   df = perl_to_float(delta);
+    /* Lock-free fast path.  try_atomic_* returns 0 if the tag isn't
+       INT or FLOAT respectively, in which case we fall through. */
+    if (pv->tag == PERL_INT) {
+        if (try_atomic_add_int(pv, di)) return pv;
+    } else if (pv->tag == PERL_FLOAT) {
+        if (try_atomic_add_float(pv, df)) return pv;
+    }
+    int newly_held = atomic_mutex_acquire(pv);
     if (pv->tag == PERL_INT)   { pv->ival += di; }
     else if (pv->tag == PERL_FLOAT) { pv->fval += df; }
-    if (!held) { pthread_mutex_unlock(&mu->mu); s_held_mutex_ = NULL; s_held_mutex_depth_ = 0; }
-    else s_held_mutex_depth_--;
+    atomic_mutex_release(newly_held);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     return pv;
 }

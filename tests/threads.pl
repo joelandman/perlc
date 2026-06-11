@@ -136,4 +136,36 @@ for my $i (1..3) {
 for my $t (@bcast_thrs) { $t->join(); }
 print "cond_broadcast_ok=" . ($bcast_count == 3 ? "yes" : "no") . "\n";  # yes
 
+# Test: named-sub closure capture of a shared scalar.
+# A named sub (sub name { ... } rather than my $x = sub { ... })
+# that closes over a shared scalar and is dispatched via
+# threads->create(\&name, ...) must see the shared cell, not a
+# thread-local deep copy.  Pre-Sub-task-2 the RefSub path produced
+# a plain code ref with ncaptures=0, so the worker's read of the
+# captured shared var saw uninitialised memory and the assertion
+# below failed.  Now that RefSub builds a closure with the captured
+# shared cell, each worker increments the same cell the parent
+# sees.  We verify by checking that the parent's final value of
+# the shared counter is the sum of all increments performed by
+# all threads (race-free, since perl_atomic_inc is a single CAS
+# on the int/float payload per the lock-free CAS work).
+sub worker_named {
+    my $times = $_[0];
+    for (1..$times) { $counter_named++; }
+    return 1;  # tag the thread as completed
+}
+my $counter_named : shared = 0;
+my $per_thread_named = 100;
+my $n_threads_named = 5;
+my @worker_thrs;
+for my $i (1..$n_threads_named) {
+    push @worker_thrs, threads->create(\&worker_named, $per_thread_named);
+}
+for my $t (@worker_thrs) {
+    $t->join();
+}
+# Final counter must equal n_threads * per_thread (race-free increment).
+print "named_sub_closure_total=$counter_named\n";
+print "named_sub_closure_ok=" . ($counter_named == $n_threads_named * $per_thread_named ? "yes" : "no") . "\n";
+
 print "threads_done\n";

@@ -198,6 +198,71 @@ push @failures, "cond_broadcast_ok"      unless $bcast_count == 4;
 push @failures, "lock_scope_released_ok" unless $arr_sum == $arr_expected;
 push @failures, "plain_isolated"         unless $plain == 0;
 
+# ── Test 8: `our $x : shared` ───────────────────────────────────────────────
+# Verifies the Sub-task 3 parser+codegen support.  Three sub-assertions:
+#   8a. basic `our $x : shared` at file scope: thread increments visible to
+#       the parent (and the parent sees the final value).
+#   8b. `our ($a, $b) : shared` list form: the parser's (LIST) path also
+#       accepts the `: shared` attribute and the resulting cells behave
+#       like the single-name form.
+#   8c. cross-package access: `our $x : shared` inside `package Foo` is
+#       reachable as `$Foo::x` from `package main`, and a thread
+#       spawned from main can mutate it via `\&Foo::worker` (named-sub
+#       dispatch from a different package).
+our $our_shared_counter : shared = 0;
+{
+    my $n_threads = 5;
+    my @our_thrs;
+    for (1..$n_threads) {
+        push @our_thrs, threads->create(sub {
+            for (1..200) { $our_shared_counter = $our_shared_counter + 1; }
+            return 1;
+        });
+    }
+    for my $t (@our_thrs) { $t->join(); }
+}
+my $our_expected = 5 * 200;
+print "our_shared_total=$our_shared_counter\n";
+print "our_shared_ok=" . ($our_shared_counter == $our_expected ? "yes" : "no") . "\n";
+push @failures, "our_shared_ok" unless $our_shared_counter == $our_expected;
+
+# 8b: list form
+our ($our_a, $our_b) : shared = (10, 20);
+{
+    my @our_list_thrs;
+    for (1..5) {
+        push @our_list_thrs, threads->create(sub {
+            $our_a = $our_a + 2;
+            $our_b = $our_b + 5;
+            return 1;
+        });
+    }
+    for my $t (@our_list_thrs) { $t->join(); }
+}
+# 5 workers: a += 10 (10→20), b += 25 (20→45)
+print "our_list_a=$our_a our_list_b=$our_b\n";
+print "our_list_ok=" . ($our_a == 20 && $our_b == 45 ? "yes" : "no") . "\n";
+push @failures, "our_list_ok" unless ($our_a == 20 && $our_b == 45);
+
+# 8c: cross-package `our $x : shared` + threads::create
+package Foo;
+our $xpkg_shared : shared = 0;
+sub bump {
+    for (1..50) { $xpkg_shared++; }
+    return 1;
+}
+package main;
+{
+    my @xpkg_thrs;
+    for (1..4) {
+        push @xpkg_thrs, threads->create(\&Foo::bump);
+    }
+    for my $t (@xpkg_thrs) { $t->join(); }
+}
+print "xpkg_shared_via_Foo=$Foo::xpkg_shared\n";
+print "xpkg_shared_ok=" . ($Foo::xpkg_shared == 4 * 50 ? "yes" : "no") . "\n";
+push @failures, "xpkg_shared_ok" unless $Foo::xpkg_shared == 4 * 50;
+
 my %expect_fail;
 my @unexpected = grep { !$expect_fail{$_} } @failures;
 my @expected_failures = grep { $expect_fail{$_} } @failures;

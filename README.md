@@ -139,13 +139,17 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 
 **State Variables**: `state $x [= expr]` — per-sub static variable; initialized once (lazily on first call); mutations persist across calls
 
-**Closures**: anonymous subs capture outer lexical `my` scalar variables by stable pointer; multiple captures; independent closure instances; nested closures
+**Closures**: anonymous subs capture outer lexical `my` scalar variables by stable pointer; multiple captures; independent closure instances; nested closures.  **Named subs** (`\&worker` passed to `threads->create`) also build a `PerlClosure` and capture shared scalars in the enclosing scope — the runtime's `clone_code_ref_for_thread` preserves the cell pointer for `PV_FLAG_SHARED` cells so spawned threads see the same cell the parent sees.
 
 **Object-Oriented Programming**: `package Foo;`, `bless($ref, $class)`, `$obj->method(args)`, `Foo->method(args)` (class method), `ref($obj)` → class name, chained method calls (`->m1->m2->m3`), `AUTOLOAD` (catches unknown methods, sets `$AUTOLOAD`), `DESTROY` (fires for hash-backed and array-backed objects), `caller()` returns `(package, file, line)`, `$Package::var` cross-package variable access
 
 **Inheritance**: `use parent 'Base'` / `use base 'Base'` (including `-norequire`); inherited method lookup; method override; `SUPER::` dispatch
 
 **Module Loading**: `use Module` loads `.pm` files from `{scriptDir, scriptDir/lib, lib, .}`; recursively inlines modules; method dispatch across module boundaries
+
+**Threads** (`use threads`): `threads->create(sub{...}, @args)`, `$thr->join()`, `$thr->detach()`, `$thr->tid()`, `threads->self()`, `threads->list()`, `threads->yield()`.  Each thread gets its own thread-local freelist/eval-stack.  Closure captures are deep-copied per thread for isolation; **shared** captured scalars (declared with `: shared`) preserve the cell pointer across the clone so cross-thread writes are visible.
+
+**threads::shared** (`use threads::shared`): `my $x : shared` (or `our $x : shared`, or `our ($a, $b) : shared = ...`) declares scalars/arrays/hashes as cross-thread shared.  Shared scalars use a tagged-cell layout (`PerlValue*` with `PV_FLAG_SHARED`, no wrapper).  Reads/writes go through `perl_atomic_load` / `perl_atomic_store`; RMW on int/float payloads (`$x++`, `$x = $x + 1`, `$x += N`) goes through a **lock-free 16-byte CAS-on-payload** (`cmpxchg16b` on x86_64 / `ldxp+stxp` on aarch64) — no syscall, no kernel scheduling.  Non-numeric payloads fall back to a lazy-installed per-cell `SharedMutex` (allocated only on the first `lock()` / `cond_wait()` call).  `lock($x)` / `cond_wait($x)` / `cond_signal($x)` / `cond_broadcast($x)` with per-thread re-entry.  See `THREADS_SHARED_ATOMIC.md` for the full memory model and cost table.
 
 **BEGIN/END Blocks**: `BEGIN { }` runs inline at point of declaration; `END { }` compiles as function registered via `atexit()`, runs at program exit
 
@@ -181,6 +185,14 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 - Database connectivity framework with standard DBI functions
 - Support for database connections, prepared statements, and query execution
 - Integration with Perl's value system through `PerlValue*` return types
+
+### Concurrency (`threads` + `threads::shared`)
+- **`use threads`**: native pthreads; `threads->create`, `->join`, `->detach`, `->tid`, `->self`, `->list`, `->yield`; thread-local freelist/eval-stack
+- **`use threads::shared`**: `my $x : shared` / `our $x : shared` / `our ($a, $b) : shared`; tagged-cell layout; cross-thread reads/writes visible without `lock()`; RMW atomicity without `lock()`
+- **Lock-free 16-byte CAS-on-payload** for int/float RMW: a single `cmpxchg16b` on x86_64 / `ldxp+stxp` on aarch64 per `$x++` or `$x = $x + 1`
+- **Lazy-installed SharedMutex** side-table: per-cell mutex allocated on the first `lock()` / `cond_wait()` call; per-thread re-entry on `lock($x); $x = $x + 1`
+- **`cond_wait` / `cond_signal` / `cond_broadcast`** with standard pthread semantics
+- **Named-sub closure capture**: `\&worker` passed to `threads->create` builds a `PerlClosure` and captures shared scalars in the enclosing scope
 
 ## Architecture
 

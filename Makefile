@@ -2,11 +2,24 @@ CXX      := clang++-18
 LLVM_CFG := llvm-config-18
 LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 # strip -fno-exceptions so we can use C++ exceptions in our code
-CXXFLAGS := $(filter-out -fno-exceptions,$(LLVM_CXXFLAGS)) -std=c++17 -g -Wall -Wno-unused-function -fexceptions
-LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core orcjit native) -lpthread -ldl -lpcre2-8 -lsqlite3
+# -mcx16: enable cmpxchg16b for the lock-free 16-byte CAS on shared
+#         scalar payloads.  This is the default on x86_64-v2 and
+#         later; we set it explicitly so the codegen uses cmpxchg16b
+#         on every supported CPU.
+# -Wno-atomic-alignment: silence the conservative "exceeds the max
+#         lock-free size (8 bytes)" warning on the 16-byte CAS.
+#         The CAS is lock-free on x86_64 (cmpxchg16b) and aarch64
+#         (ldxp+stxp); clang's warning is a portability warning.
+CXXFLAGS := $(filter-out -fno-exceptions,$(LLVM_CXXFLAGS)) -std=c++17 -g -Wall -Wno-unused-function -Wno-atomic-alignment -fexceptions -mcx16
+# -latomic: link the libatomic runtime for the 16-byte __atomic_*
+#          builtins on hosts that don't have a direct cmpxchg16b.
+#          (x86_64-v2+ inlines it; older hosts need the shim.)
+LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core orcjit native) -lpthread -ldl -lpcre2-8 -lsqlite3 -latomic
 
 CC       := clang-18
-CFLAGS   := -g -O2
+# -mcx16 + -Wno-atomic-alignment: same rationale as the C++ flags above;
+# needed for the runtime.c atomic primitives.
+CFLAGS   := -g -O2 -mcx16 -Wno-atomic-alignment
 
 SRCDIR   := src
 OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o

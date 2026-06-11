@@ -1967,14 +1967,15 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     if (debug_) initializeDebugInfo(modName);
 
     /* collect sub definitions first so forward calls work */
-    std::vector<const Node *> subs;
+    subs_.clear();
+    subCaptures_.clear();
     for (auto &stmt : program.args)
         if (stmt->kind == NK::SubDef)
-            subs.push_back(stmt.get());
+            subs_.push_back(stmt.get());
 
     /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
        These are expanded at call sites without @_ construction. */
-    for (auto *s : subs) {
+    for (auto *s : subs_) {
         if (!s->body) continue;
         const Node &body = *s->body;
         /* Need exactly: FlatBlock(my $p1; my $p2; ...; assign-from-@_) + Return */
@@ -2005,7 +2006,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     }
 
     /* pre-declare all subs as Functions */
-    for (auto *s : subs) {
+    for (auto *s : subs_) {
         auto *ft = FunctionType::get(perlPtrTy_,
                         {arrayPtrTy_, Type::getInt32Ty(ctx_)},  /* PerlArray* args, int ctx */
                         false);
@@ -2037,7 +2038,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     inMainBody_ = true;
 
     /* register all subs in the method dispatch table (before user code runs) */
-    for (auto *s : subs) {
+    for (auto *s : subs_) {
         if (s->name.find("::") != std::string::npos) {
             Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
             auto *fn = mod_->getFunction(subLLVMName(s->name));
@@ -2087,7 +2088,7 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
 
     inMainBody_ = false;
     /* emit sub bodies */
-    for (auto *s : subs) emitSub(*s);
+    for (auto *s : subs_) emitSub(*s);
 
     if (debug_) {
         dib_->finalize();
@@ -2156,6 +2157,29 @@ void CodeGen::emitSub(const Node &n) {
         builder_.CreateStore(udv, slotUs);
         declareVar("_", slotUs);
         trackPv(udv);  /* ensure $_ stable pv is freed on scope exit */
+    }
+
+    /* Sub-task 2 (named-sub closure capture): if the sub has a
+       capture list (built at the RefSub site when the sub was
+       referenced via \&subname), install local allocas for each
+       captured shared scalar and load them from
+       `perl_get_capture(i)`.  This is the same pattern AnonSub
+       uses.  Without this step, named subs called from
+       threads->create would read whatever was in the local
+       allocas (uninitialised or stale). */
+    if (n.body) {
+        auto it = subCaptures_.find(n.name);
+        if (it != subCaptures_.end()) {
+            auto i64Ty = Type::getInt64Ty(ctx_);
+            const auto &caps = it->second;
+            for (size_t i = 0; i < caps.size(); i++) {
+                Value *pv = callRT("perl_get_capture",
+                                   {ConstantInt::get(i64Ty, (long long)i)});
+                auto *capSlot = builder_.CreateAlloca(perlPtrTy_, nullptr, caps[i] + ".cap");
+                builder_.CreateStore(pv, capSlot);
+                declareVar(caps[i], capSlot);
+            }
+        }
     }
 
     /* capture local() save depth at function entry.
@@ -2553,17 +2577,43 @@ void CodeGen::emitStmt(const Node &n) {
                    would lose the PV_FLAG_SHARED bit and break cross-thread
                    visibility.  The "no int/float unbox" invariant is
                    upheld by storing in the regular scopes_ map and
-                   skipping the intScopes_/floatScopes_ paths below. */
-                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
-                Value *pv = callRT("perl_make_shared_scalar", {});
-                builder_.CreateStore(pv, alloca);
-                /* no trackPv — shared vars have program lifetime */
+                   skipping the intScopes_/floatScopes_ paths below.
+
+                   Sub-task 3 (`our $x : shared`): at file scope, also
+                   register the cell pointer in fileScalarGlobals_ so
+                   cross-package access (e.g. `$Foo::counter` from
+                   package main, or threads->create(\&Foo::inc))
+                   resolves to the same cell the package-local $x
+                   uses.  Without this, $Foo::counter would be undef
+                   because the lookup falls through to
+                   packageScalarMap_ which only knows about my $x
+                   declared in main.  We register under both the bare
+                   name (for in-package reads) and the qualified name
+                   (for cross-package reads), matching the existing
+                   `my $scalar` file-scope path at line 2606. */
+                Value *pv;
+                if (atFileScope) {
+                    auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                        GlobalValue::InternalLinkage,
+                        Constant::getNullValue(perlPtrTy_), "g." + nm);
+                    pv = callRT("perl_make_shared_scalar", {});
+                    builder_.CreateStore(pv, gv);
+                    fileScalarGlobals_[nm] = gv;
+                    if (currentPackage_ != "main")
+                        fileScalarGlobals_[currentPackage_ + "::" + nm] = gv;
+                    declareVar(nm, gv);
+                } else {
+                    auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+                    pv = callRT("perl_make_shared_scalar", {});
+                    builder_.CreateStore(pv, alloca);
+                    /* no trackPv — shared vars have program lifetime */
+                    declareVar(nm, alloca);
+                }
                 if (n.right) {
                     Value *init = emitExpr(*n.right);
                     callRT("perl_assign", {pv, init});
                     freeIfOwned(init);
                 }
-                declareVar(nm, alloca);
                 sharedScalarNames_.insert(nm);  /* Phase 3: route through perl_atomic_* */
                 break;
             }
@@ -5727,7 +5777,84 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto *subFn = mod_->getFunction(subLLVMName(n.name));
         if (!subFn) return perlUndef();
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
-        return callRT("perl_make_code_ref", {fnPtr});
+
+        /* Sub-task 2: scan the sub body for shared scalars in scope.
+           If any are referenced, build a closure (with captures) so
+           that when the sub is later called via threads->create (or
+           any other indirection that goes through
+           clone_code_ref_for_thread), the captures survive and the
+           shared cells are passed by original pointer rather than
+           deep-copied.  We remember the capture list in subCaptures_
+           so the matching sub body emission in emitSub() can install
+           the corresponding `perl_get_capture(i)` initialisers. */
+        std::vector<std::string> captureNames;
+        std::vector<llvm::Value*> captureVals;
+        /* Look up the sub's AST.  We stored a pointer to it in subs_
+           in compile() (and the eval-string JIT).  If we can't find
+           the AST (e.g. the sub is forward-declared but not yet
+           seen), fall back to a plain code ref. */
+        const Node *subAst = nullptr;
+        for (auto *s : subs_) {
+            if (s->name == n.name) { subAst = s; break; }
+        }
+        if (subAst && subAst->body) {
+            std::set<std::string> usedNames;
+            collectAllScalarNames(*subAst->body, usedNames);
+            for (auto &nm : usedNames) {
+                if (nm == "_") continue;
+                /* Only capture names that are *shared scalars in
+                   scope at the RefSub site*.  Unshared captures
+                   don't need closure support — the runtime
+                   already deep-copies them through the existing
+                   code-ref path.  We restrict to shared scalars
+                   to keep the closure small and to match the
+                   contract that closures only carry state the
+                   sub actually needs to mutate. */
+                if (!sharedScalarNames_.count(nm)) continue;
+                /* Resolve the current scope's alloca for this name.
+                   We need the *cell* (PerlValue*) loaded from the
+                   alloca, which is exactly what the closure carries.
+                   `lookupVar` returns the alloca for the name in the
+                   innermost scope where it was declared. */
+                llvm::Value *slot = lookupVar(nm);
+                if (!slot) continue;
+                /* If the name is a file-scope global (top-level my
+                   that lives in a global slot), lookupVar returns
+                   the GlobalVariable directly.  We need to skip
+                   those for now because the closure capture
+                   machinery expects a stack-allocated PerlValue*;
+                   file-scope shared scalars use a different
+                   codegen path (see fileScalarGlobals_) and don't
+                   need closure capture to be visible to threads
+                   (they live in a stable global cell). */
+                if (isa<llvm::GlobalVariable>(slot)) continue;
+                captureNames.push_back(nm);
+                captureVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
+            }
+        }
+
+        if (captureNames.empty()) {
+            return callRT("perl_make_code_ref", {fnPtr});
+        }
+
+        /* Record the capture list for the sub body emission.  This
+           is keyed by sub name; if the same sub is referenced from
+           multiple call sites we want a single canonical capture
+           list (the order must match what the sub body expects
+           via perl_get_capture). */
+        if (!subCaptures_.count(n.name)) {
+            subCaptures_[n.name] = captureNames;
+        }
+
+        /* Build the captures array — a PerlArray* holding the cell
+           pointers of the captured shared scalars.  Pushing the cell
+           pointers in is enough; the runtime side of the closure
+           (perl_call_code_ref) wires s_current_captures to the array
+           so the sub body can fetch them with perl_get_capture(i). */
+        Value *capsAv = callRT("perl_array_new", {});
+        for (auto *pv : captureVals)
+            callRT("perl_array_push_capture", {capsAv, pv});
+        return callRT("perl_make_closure", {fnPtr, capsAv});
     }
 
     case NK::CallCodeRef: {
@@ -6186,10 +6313,11 @@ void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
     auto *i32Ty = Type::getInt32Ty(ctx_);
 
     /* Pre-declare any subs so forward calls work (mirrors compile()) */
-    std::vector<const Node *> subs;
+    subs_.clear();
+    subCaptures_.clear();
     for (auto &stmt : program.args)
-        if (stmt->kind == NK::SubDef) subs.push_back(stmt.get());
-    for (auto *s : subs) {
+        if (stmt->kind == NK::SubDef) subs_.push_back(stmt.get());
+    for (auto *s : subs_) {
         auto *ft = FunctionType::get(pv, {arrayPtrTy_, Type::getInt32Ty(ctx_)}, false);
         auto *fn = Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
         fn->addFnAttr(Attribute::AlwaysInline);
@@ -6234,7 +6362,7 @@ void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
         builder_.CreateRet(lastVal);
 
     /* emit sub bodies (mirrors compile()) */
-    for (auto *s : subs) emitSub(*s);
+    for (auto *s : subs_) emitSub(*s);
 }
 
 /* ── output ──────────────────────────────────────────────────────────────── */
