@@ -203,7 +203,7 @@ NodePtr Parser::parseStmt() {
     }
     if (check(TK::KW_FOR))     return parseFor();
     if (check(TK::KW_FOREACH)) return parseForeach();
-    if (check(TK::KW_DO)) {
+    if (check(TK::KW_DO) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
         advance();
         auto blk = parseBlock();
         /* do { } while/until (cond) — post-condition loop */
@@ -1367,6 +1367,16 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_DO) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
         advance(); /* consume 'do' */
         return parseBlock();
+    }
+
+    /* do EXPR — runtime file load/eval */
+    if (check(TK::KW_DO)) {
+        advance(); /* consume 'do' */
+        auto n = std::make_unique<Node>();
+        n->kind = NK::DoFile;
+        n->line = line;
+        n->left = parseExpr();
+        return n;
     }
 
     /* undef */
@@ -2997,4 +3007,3 @@ NodeList Parser::parseArgList() {
     consume(TK::RPAREN, ")");
     return args;
 }
-

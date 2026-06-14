@@ -21,6 +21,9 @@ typedef enum {
     PERL_THREAD       = 11, /* thread object  — pval=PerlThread* */
     PERL_LIST_RESULT  = 12, /* list-context sub return — pval=PerlArray*; spread by perl_unwrap_list_return */
     PERL_FLOAT_PAIR   = 13, /* 2-elem float array inline: fval=elem[0], matchpos bits=elem[1]; no inner PerlArray */
+    PERL_DBI_DBH      = 14, /* DBI database handle — pval=PerlDBIHandle* */
+    PERL_DBI_STH      = 15, /* DBI statement handle — pval=PerlDBIStatement* */
+    PERL_XS_PTR       = 16, /* opaque native pointer — pval=void* */
 } PerlTag;
 
 /* PV_FLAG_SHARED: cell is a threads::shared variable (see SharedMutex below). */
@@ -61,6 +64,7 @@ PerlValue *perl_alloc_float(double v);
 PerlValue *perl_alloc_string(const char *s);
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
+PerlValue *perl_alloc_xs_ptr(void *p);
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);
 PerlValue *perl_make_shared_scalar(void); /* threads::shared — alloc bare PV with PV_FLAG_SHARED, no mutex yet */
@@ -358,6 +362,7 @@ PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a cl
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
 void       perl_register_method(const char *key, PerlSubFnCtx fn);
+PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx);
 /* ── threads ─────────────────────────────────────────────────────────────── */
 #include <pthread.h>
 typedef struct PerlThread {
@@ -511,6 +516,12 @@ void perl_set_pos_str(PerlValue *pv, PerlValue *pos);
 
 /* ── runtime require ─────────────────────────────────────────────────────── */
 PerlValue *perl_runtime_require(const char *modname);
+PerlValue *perl_do_file(PerlValue *path_pv);
+
+/* ── XS / FFI ────────────────────────────────────────────────────────────── */
+PerlValue *perl_xs_load_library(PerlValue *libname_pv);
+PerlValue *perl_xs_call_dynamic(PerlValue *libname_pv, PerlValue *funcname_pv,
+                                PerlValue *signature_pv, PerlArray *args);
 
 /* ── DBI/SQLite integration ──────────────────────────────────────────────── */
 /* SQLite database handle */
@@ -518,7 +529,18 @@ typedef struct PerlDBIHandle {
     void *db; /* SQLite database handle */
     char *dbname;
     int is_connected;
+    int refcount;
+    char *last_error;
 } PerlDBIHandle;
+
+typedef struct PerlDBIStatement {
+    void *stmt;              /* sqlite3_stmt* */
+    PerlDBIHandle *dbh;
+    int done;
+    int rows_affected;
+    int refcount;
+    char *last_error;
+} PerlDBIStatement;
 
 /* Database connection */
 PerlValue *perl_dbi_connect(PerlValue *dsn, PerlValue *username, PerlValue *password);

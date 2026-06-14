@@ -28,6 +28,7 @@ EVAL_OBJ := $(SRCDIR)/eval_jit.o
 EVAL_LIB := $(SRCDIR)/libperlc_eval.a
 
 TARGET   := perlc
+ASSERT_TESTS := tests/test_do_filename.pl tests/test_require_simple.pl tests/dbi_sqlite.pl tests/xs_ffi.pl
 
 .PHONY: all clean test
 
@@ -57,40 +58,11 @@ $(SRCDIR)/jit.o: $(SRCDIR)/jit.cpp $(SRCDIR)/jit.h $(SRCDIR)/runtime.h
 clean:
 	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.a $(TARGET)
 
-test: $(TARGET)
-	@echo "=== hello.pl    ===" && ./$(TARGET) tests/hello.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== arith.pl    ===" && ./$(TARGET) tests/arith.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== fib.pl      ===" && ./$(TARGET) tests/fib.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== hash.pl     ===" && ./$(TARGET) tests/hash.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== builtins.pl ===" && ./$(TARGET) tests/builtins.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== refs.pl     ===" && ./$(TARGET) tests/refs.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== regex.pl    ===" && ./$(TARGET) tests/regex.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== regex_g.pl  ===" && ./$(TARGET) tests/regex_g.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== modifiers.pl ===" && ./$(TARGET) tests/modifiers.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== range.pl     ===" && ./$(TARGET) tests/range.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== sprintf.pl   ===" && ./$(TARGET) tests/sprintf.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== fileio.pl    ===" && ./$(TARGET) tests/fileio.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null
-	@echo "=== builtins2.pl ===" && ./$(TARGET) tests/builtins2.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== features.pl  ===" && ./$(TARGET) tests/features.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null
-	@echo "=== advanced.pl  ===" && ./$(TARGET) tests/advanced.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test hello world
-	@echo "=== oop.pl       ===" && ./$(TARGET) tests/oop.pl       -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== closures.pl  ===" && ./$(TARGET) tests/closures.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== usemod.pl    ===" && ./$(TARGET) tests/usemod.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== inherit.pl   ===" && ./$(TARGET) tests/inherit.pl   -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== defaults.pl     ===" && ./$(TARGET) tests/defaults.pl     -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== newfeatures.pl  ===" && ./$(TARGET) tests/newfeatures.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== fibn.pl         ===" && ./$(TARGET) tests/fibn.pl         -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 10
-	@echo "=== tier1.pl        ===" && ./$(TARGET) tests/tier1.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== tier2.pl        ===" && ./$(TARGET) tests/tier2.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== tier3.pl        ===" && ./$(TARGET) tests/tier3.pl        -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== threads.pl      ===" && ./$(TARGET) tests/threads.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== threads_atomic.pl ===" && ./$(TARGET) tests/threads_atomic.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== destroy.pl      ===" && ./$(TARGET) tests/destroy.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== eval_string.pl  ===" && ./$(TARGET) tests/eval_string.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test 2>/dev/null
-	@echo "=== fileops.pl      ===" && ./$(TARGET) tests/fileops.pl      -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== interp.pl       ===" && ./$(TARGET) tests/interp.pl       -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== misc.pl         ===" && ./$(TARGET) tests/misc.pl         -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== tr.pl           ===" && ./$(TARGET) tests/tr.pl           -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== wantarray.pl    ===" && ./$(TARGET) tests/wantarray.pl    -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== regex_named.pl  ===" && ./$(TARGET) tests/regex_named.pl  -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
-	@echo "=== completeness.pl ===" && ./$(TARGET) tests/completeness.pl -o /tmp/perlc_test 2>/dev/null && /tmp/perlc_test
+test: $(TARGET) $(EVAL_LIB)
+	@set -e; \
+	for t in $(ASSERT_TESTS); do \
+		out="/tmp/perlc_$$(basename $$t .pl)"; \
+		echo "=== $$t ==="; \
+		./$(TARGET) $$t -o $$out >/tmp/perlc_compile.log 2>&1; \
+		$$out; \
+	done

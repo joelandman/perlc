@@ -458,29 +458,12 @@ static bool isCompleteStatement(const std::vector<Token> &toks) {
     return false;
 }
 
-/* Run REPL: compile each statement with perlc, subroutines persist between statements.
-   Note: scalar/array/hash variables don't persist (each compiles separately) unless jitMode is enabled.
-   Subroutines DO persist because they're accumulated in the AST. */
-static int runRepl(bool debugSymbols, int optLevel, bool verbose, bool pauseMode, bool jitMode) {
+/* Run REPL: compile each statement with perlc, subroutines persist between
+   statements, and scalar/array/hash variables do not. */
+static int runRepl(bool debugSymbols, int optLevel, bool verbose, bool pauseMode) {
     std::cout << "perlc REPL - type 'quit' or 'exit' to exit, 'help' for commands\n";
     std::cout << "Enter complete statements (end with ;).\n";
-    if (jitMode) {
-        std::cout << "JIT mode enabled - variables will persist between statements.\n\n";
-    } else {
-        std::cout << "Note: Subroutines persist. Scalars/arrays/hashes do not persist between statements.\n\n";
-    }
-
-    /* Initialize JIT if requested */
-    std::unique_ptr<PerlJIT> jit;
-    if (jitMode) {
-        jit = std::make_unique<PerlJIT>();
-        if (!jit->isReady()) {
-            std::cerr << "Failed to initialize JIT, falling back to external compilation\n";
-            jit.reset();
-        } else {
-            std::cout << "JIT initialized successfully!\n";
-        }
-    }
+    std::cout << "Note: Subroutines persist. Scalars/arrays/hashes do not persist between statements.\n\n";
 
     std::string accum;
     std::vector<NodePtr> savedSubs;
@@ -589,60 +572,46 @@ static int runRepl(bool debugSymbols, int optLevel, bool verbose, bool pauseMode
 
             NodePtr fullAst = makeBlock(std::move(allStmts), 1);
 
-            if (jit) {
-                /* Use JIT compilation */
-                CodeGen cg(debugSymbols, optLevel);
-                cg.compile(*fullAst, "repl");
+            CodeGen cg(debugSymbols, optLevel);
+            cg.compile(*fullAst, "repl");
 
-                /* Get the module and add to JIT */
-                std::unique_ptr<llvm::Module> mod = cg.releaseModule();
-                if (mod) {
-                    jit->addModule(std::move(mod));
-                    std::cout << "[JIT compiled]\n";
+            std::string tmpIR = "/tmp/_perlc_repl_" + std::to_string(getpid()) + ".ll";
+            cg.writeIR(tmpIR);
+
+            std::string rtSrc;
+            {
+                char self[1024] = {};
+                ssize_t len = readlink("/proc/self/exe", self, sizeof(self)-1);
+                if (len > 0) {
+                    std::string dir(self, len);
+                    auto sl = dir.rfind('/');
+                    if (sl != std::string::npos) dir = dir.substr(0, sl);
+                    rtSrc = dir + "/src/runtime.c";
                 }
+            }
+            if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
+                rtSrc = "src/runtime.c";
+
+            std::string outFile = "/tmp/_perlc_repl_out_" + std::to_string(getpid());
+            std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native"
+                              " -Wno-atomic-alignment";
+            if (debugSymbols) cmd += " -g";
+            cmd += " " + tmpIR + " " + rtSrc + " -o " + outFile + " -lm -lpcre2-8 -latomic 2>&1";
+
+            int rc = system(cmd.c_str());
+            unlink(tmpIR.c_str());
+
+            if (rc == 0) {
+                cmd = outFile + " 2>&1";
+                FILE *fp = popen(cmd.c_str(), "r");
+                if (fp) {
+                    char buf[4096];
+                    while (fgets(buf, sizeof(buf), fp)) std::cout << buf;
+                    pclose(fp);
+                }
+                unlink(outFile.c_str());
             } else {
-                /* Use external compilation (default) */
-                CodeGen cg(debugSymbols, optLevel);
-                cg.compile(*fullAst, "repl");
-
-                std::string tmpIR = "/tmp/_perlc_repl_" + std::to_string(getpid()) + ".ll";
-                cg.writeIR(tmpIR);
-
-                std::string rtSrc;
-                {
-                    char self[1024] = {};
-                    ssize_t len = readlink("/proc/self/exe", self, sizeof(self)-1);
-                    if (len > 0) {
-                        std::string dir(self, len);
-                        auto sl = dir.rfind('/');
-                        if (sl != std::string::npos) dir = dir.substr(0, sl);
-                        rtSrc = dir + "/src/runtime.c";
-                    }
-                }
-                if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
-                    rtSrc = "src/runtime.c";
-
-                std::string outFile = "/tmp/_perlc_repl_out_" + std::to_string(getpid());
-                std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native"
-                                  " -Wno-atomic-alignment";
-                if (debugSymbols) cmd += " -g";
-                cmd += " " + tmpIR + " " + rtSrc + " -o " + outFile + " -lm -lpcre2-8 -latomic 2>&1";
-
-                int rc = system(cmd.c_str());
-                unlink(tmpIR.c_str());
-
-                if (rc == 0) {
-                    cmd = outFile + " 2>&1";
-                    FILE *fp = popen(cmd.c_str(), "r");
-                    if (fp) {
-                        char buf[4096];
-                        while (fgets(buf, sizeof(buf), fp)) std::cout << buf;
-                        pclose(fp);
-                    }
-                    unlink(outFile.c_str());
-                } else {
-                    std::cerr << "Compilation failed.\n";
-                }
+                std::cerr << "Compilation failed.\n";
             }
 
             if (pauseMode) {
@@ -676,8 +645,7 @@ static void usage(const char *prog) {
               << "  -pm         Download and install missing Perl modules via cpanm\n"
               << "  -g          Generate debugging symbols\n"
               << "  -i, --repl  Interactive REPL mode (read-eval-print loop)\n"
-              << "  -p, --pause Pause after each statement in REPL mode\n"
-              << "  --jit       Use JIT compilation (experimental, enables variable persistence in REPL)\n";
+              << "  -p, --pause Pause after each statement in REPL mode\n";
 }
 
 int main(int argc, char **argv) {
@@ -688,7 +656,7 @@ int main(int argc, char **argv) {
     std::string inputFile;
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
-    bool replMode = false, pauseMode = false, jitMode = false;
+    bool replMode = false, pauseMode = false;
     int optLevel = 2;
 
     for (int i = 1; i < argc; i++) {
@@ -699,7 +667,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-g"))         debugSymbols = true;
         else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--repl")) replMode = true;
         else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--pause")) pauseMode = true;
-        else if (!strcmp(argv[i], "--jit"))     jitMode = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outputFile = argv[++i];
         else if (strncmp(argv[i], "-O", 2) == 0) {
             if (argv[i][2] == '\0') {
@@ -720,7 +687,7 @@ int main(int argc, char **argv) {
 
     /* REPL mode: interactive read-eval-print loop */
     if (replMode) {
-        return runRepl(debugSymbols, optLevel, verbose, pauseMode, jitMode);
+        return runRepl(debugSymbols, optLevel, verbose, pauseMode);
     }
 
     /* read source */
