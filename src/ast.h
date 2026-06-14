@@ -128,6 +128,7 @@ enum class NK {
     EachFunc,    /* each %hash       – name=hash_name; returns (k,v) pair   */
     PosFunc,     /* pos($str)        – left=str (opt, else $_)              */
     RequireStmt, /* require Module   – sval=module_name                     */
+    DoFile,      /* do EXPR          – left=filename expr                   */
     Redo,        /* redo             – no children                          */
     GetpidFunc,  /* getpid()         – no children; returns $$              */
     LockStmt,    /* lock(EXPR)       – sval="scalar"/"array"/"hash", name=var */

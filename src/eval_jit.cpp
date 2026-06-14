@@ -12,6 +12,7 @@
 #include <mutex>
 #include <memory>
 #include <string>
+#include <vector>
 #include <setjmp.h>
 
 using namespace llvm;
@@ -19,6 +20,14 @@ using namespace llvm;
 static std::unique_ptr<PerlJIT> g_jit;
 static std::mutex               g_jit_mutex;
 static std::atomic<int>         g_eval_counter{0};
+
+static std::string eval_sub_llvm_name(const std::string &name) {
+    std::string result = name;
+    size_t pos;
+    while ((pos = result.find("::")) != std::string::npos)
+        result.replace(pos, 2, "__");
+    return "perlsub_" + result;
+}
 
 static PerlValue *jit_eval_impl(const char *code) {
     /* ── parse ── */
@@ -35,9 +44,14 @@ static PerlValue *jit_eval_impl(const char *code) {
     }
 
     NodePtr ast;
+    std::vector<std::string> namedSubs;
     try {
         Parser parser(std::move(toks));
         ast = parser.parseProgram();
+        for (auto &stmt : ast->args) {
+            if (stmt->kind == NK::SubDef && stmt->name.find("::") != std::string::npos)
+                namedSubs.push_back(stmt->name);
+        }
     } catch (const std::exception &e) {
         PerlValue *err = perl_alloc_string(e.what());
         perl_assign(perl_get_dollar_at(), err);
@@ -77,6 +91,11 @@ static PerlValue *jit_eval_impl(const char *code) {
         std::lock_guard<std::mutex> lk(g_jit_mutex);
         g_jit->addModuleWithContext(std::move(mod), std::move(ctx));
         fn = (EvalFn)g_jit->getSymbolAddress(funcName);
+        for (const auto &subName : namedSubs) {
+            void *subAddr = g_jit->getSymbolAddress(eval_sub_llvm_name(subName));
+            if (subAddr)
+                perl_register_method(subName.c_str(), (PerlSubFnCtx)subAddr);
+        }
     }
 
     if (!fn) {

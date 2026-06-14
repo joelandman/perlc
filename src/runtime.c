@@ -458,78 +458,148 @@ void perl_eval_pop(void) {
 
 PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
 
-/* ── runtime require ─────────────────────────────────────────────────────── */
-PerlValue *perl_runtime_require(const char *modname) {
-    if (!modname || !*modname) return perl_alloc_int(1);
+static void perl_set_dollar_at_cstr(const char *msg) {
+    PerlValue pv = { .tag = PERL_STRING, .sval = (char *)(msg ? msg : "") };
+    perl_assign(&s_dollar_at, &pv);
+}
 
-    /* Convert Foo::Bar → Foo/Bar.pm  or use literal string as path */
-    char path[1024];
-    if (strstr(modname, "::")) {
-        size_t n = strlen(modname);
-        if (n >= sizeof(path) - 4) return perl_alloc_undef();
+static int perl_resolve_runtime_path(const char *name, int module_semantics,
+                                     char *resolved, size_t resolved_sz) {
+    char candidate[1024];
+    if (!name || !*name) return 0;
+
+    if (module_semantics && strstr(name, "::")) {
+        size_t n = strlen(name);
+        if (n >= sizeof(candidate) - 4) return 0;
         size_t j = 0;
         for (size_t i = 0; i < n; i++) {
-            if (modname[i] == ':' && i + 1 < n && modname[i+1] == ':') {
-                path[j++] = '/'; i++;
+            if (name[i] == ':' && i + 1 < n && name[i + 1] == ':') {
+                candidate[j++] = '/';
+                i++;
             } else {
-                path[j++] = modname[i];
+                candidate[j++] = name[i];
             }
         }
-        /* append .pm if not already present */
-        if (j < 3 || memcmp(path + j - 3, ".pm", 3) != 0) {
-            path[j++] = '.'; path[j++] = 'p'; path[j++] = 'm';
+        if (j < 3 || memcmp(candidate + j - 3, ".pm", 3) != 0) {
+            candidate[j++] = '.';
+            candidate[j++] = 'p';
+            candidate[j++] = 'm';
         }
-        path[j] = '\0';
+        candidate[j] = '\0';
     } else {
-        snprintf(path, sizeof(path), "%s", modname);
+        snprintf(candidate, sizeof(candidate), "%s", name);
     }
 
-    /* Search @INC for the file (simple fallback: current dir + lib/) */
+    FILE *f = fopen(candidate, "r");
+    if (f) {
+        fclose(f);
+        snprintf(resolved, resolved_sz, "%s", candidate);
+        return 1;
+    }
+
+    char libpath[1024];
+    snprintf(libpath, sizeof(libpath), "lib/%s", candidate);
+    f = fopen(libpath, "r");
+    if (f) {
+        fclose(f);
+        snprintf(resolved, resolved_sz, "%s", libpath);
+        return 1;
+    }
+
+    if (module_semantics) {
+        char errmsg[1200];
+        snprintf(errmsg, sizeof(errmsg), "Can't locate %s in @INC", candidate);
+        perl_set_dollar_at_cstr(errmsg);
+    } else {
+        char errmsg[1200];
+        snprintf(errmsg, sizeof(errmsg), "do \"%s\" failed, '.' is no longer in @INC; did you mean do \"./%s\"?", candidate, candidate);
+        perl_set_dollar_at_cstr(errmsg);
+    }
+    return 0;
+}
+
+static char *perl_read_runtime_file(const char *path) {
     FILE *f = fopen(path, "r");
-    if (!f) {
-        char libpath[1024];
-        snprintf(libpath, sizeof(libpath), "lib/%s", path);
-        f = fopen(libpath, "r");
-        if (!f) {
-            /* not found — set $@ and return undef */
-            char errmsg[1200];
-            snprintf(errmsg, sizeof(errmsg), "Can't locate %s in @INC", path);
-            PerlValue msg = { .tag = PERL_STRING, .sval = errmsg };
-            perl_assign(&s_dollar_at, &msg);
-            return perl_alloc_undef();
-        }
-        snprintf(path, sizeof(path), "%s", libpath);
-        fclose(f);
-    } else {
-        fclose(f);
+    char *code;
+    long sz;
+    size_t got;
+
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    rewind(f);
+
+    code = malloc((size_t)sz + 1);
+    if (!code) { fclose(f); return NULL; }
+    got = fread(code, 1, (size_t)sz, f);
+    fclose(f);
+    code[got] = '\0';
+    return code;
+}
+
+static PerlValue *perl_eval_loaded_code(const char *code) {
+    if (!code) return perl_alloc_undef();
+    if (!perl_eval_string_fn) {
+        perl_set_dollar_at_cstr("eval: string eval not available (recompile with eval support)");
+        return perl_alloc_undef();
+    }
+    return perl_eval_string_fn(code);
+}
+
+/* ── runtime require ─────────────────────────────────────────────────────── */
+PerlValue *perl_runtime_require(const char *modname) {
+    char path[1024];
+    char *code;
+    PerlValue *result;
+
+    if (!modname || !*modname) return perl_alloc_int(1);
+    if (!perl_resolve_runtime_path(modname, 1, path, sizeof(path)))
+        return perl_alloc_undef();
+
+    code = perl_read_runtime_file(path);
+    if (!code) {
+        perl_set_dollar_at_cstr("require: failed to read file");
+        return perl_alloc_undef();
     }
 
-    /* Read the file */
-    f = fopen(path, "r");
-    if (!f) return perl_alloc_undef();
-    fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
-    char *code = malloc(sz + 1);
-    if (!code) { fclose(f); return perl_alloc_undef(); }
-    fread(code, 1, sz, f); code[sz] = '\0'; fclose(f);
-
-    /* Execute via JIT eval if available */
-    PerlValue *result = perl_alloc_int(1);
-    if (perl_eval_string_fn) {
-        PerlValue *r = perl_eval_string_fn(code);
-        if (r) {
-            /* For 'do' statements, we should return the last expression result */
-            /* For 'require', we return 1 on success */
-            /* Just return 1 for success, as the actual return value is not used in most cases */
-            perl_free(r);
-        }
-        /* check $@ for errors */
-        if (s_dollar_at.tag != PERL_UNDEF && s_dollar_at.sval && s_dollar_at.sval[0]) {
-            free(code);
-            return perl_alloc_undef();
-        }
-    }
+    result = perl_eval_loaded_code(code);
     free(code);
-    return result;
+    if (!result) return perl_alloc_undef();
+    if (s_dollar_at.tag != PERL_UNDEF && s_dollar_at.sval && s_dollar_at.sval[0]) {
+        perl_free(result);
+        return perl_alloc_undef();
+    }
+
+    perl_free(result);
+    return perl_alloc_int(1);
+}
+
+PerlValue *perl_do_file(PerlValue *path_pv) {
+    char resolved[1024];
+    char *path;
+    char *code;
+    PerlValue *result;
+
+    if (!path_pv || path_pv->tag == PERL_UNDEF) return perl_alloc_undef();
+    path = perl_to_string(path_pv);
+    if (!path) return perl_alloc_undef();
+
+    if (!perl_resolve_runtime_path(path, 0, resolved, sizeof(resolved))) {
+        free(path);
+        return perl_alloc_undef();
+    }
+    free(path);
+
+    code = perl_read_runtime_file(resolved);
+    if (!code) {
+        perl_set_dollar_at_cstr("do: failed to read file");
+        return perl_alloc_undef();
+    }
+
+    result = perl_eval_loaded_code(code);
+    free(code);
+    return result ? result : perl_alloc_undef();
 }
 
 /* ── string eval ─────────────────────────────────────────────────────────── */
@@ -602,6 +672,15 @@ PerlValue *perl_alloc_flat_array(long long n) {
     return v;
 }
 
+PerlValue *perl_alloc_xs_ptr(void *p) {
+    PerlValue *v = pv_alloc();
+    v->tag = PERL_XS_PTR;
+    v->pval = p;
+    v->matchpos = 0;
+    v->blessed_class = NULL;
+    return v;
+}
+
 /* Returns 1 if every element of av is a PERL_FLAT_ARRAY PV, 0 otherwise.
    Used by Stage 23 codegen to guard flat-only loop specializations. */
 long long perl_array_is_all_flat(PerlArray *av) {
@@ -656,12 +735,20 @@ PerlValue *perl_clone(const PerlValue *src) {
            on the original doesn't free the array while the clone still holds it. */
         PerlArray *av = (PerlArray *)src->pval;
         if (av->refcount > 0) av->refcount++;
+    } else if (src->tag == PERL_DBI_DBH && src->pval) {
+        ((PerlDBIHandle *)src->pval)->refcount++;
+    } else if (src->tag == PERL_DBI_STH && src->pval) {
+        ((PerlDBIStatement *)src->pval)->refcount++;
     }
     return v;
 }
 
 static __thread int s_destroy_depth = 0;
 static PerlSubFnCtx perl_find_method(const char *class_name, const char *method);
+static PerlDBIHandle *perl_dbi_get_dbh(PerlValue *pv);
+static PerlDBIStatement *perl_dbi_get_sth(PerlValue *pv);
+static void perl_dbi_handle_release(PerlDBIHandle *dbh);
+static void perl_dbi_statement_release(PerlDBIStatement *sth);
 
 HOTX void perl_free(PerlValue *v) {
     if (!v) return;
@@ -679,6 +766,10 @@ HOTX void perl_free(PerlValue *v) {
         PerlArray *av = (PerlArray *)v->pval;
         if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
     }
+    if (v->tag == PERL_DBI_STH && v->pval)
+        perl_dbi_statement_release((PerlDBIStatement *)v->pval);
+    if (v->tag == PERL_DBI_DBH && v->pval)
+        perl_dbi_handle_release((PerlDBIHandle *)v->pval);
     if (v->tag == PERL_REF_ARRAY && v->pval) {
         PerlArray *av = (PerlArray *)v->pval;
         /* call DESTROY on blessed array objects */
@@ -734,6 +825,7 @@ __attribute__((pure)) HOTX long long perl_to_int(const PerlValue *v) {
         case PERL_INT:    return v->ival;
         case PERL_FLOAT:  return (long long)v->fval;
         case PERL_STRING: return atoll(v->sval);
+        case PERL_XS_PTR: return (long long)(uintptr_t)v->pval;
         default:          return 0;
     }
 }
@@ -744,6 +836,7 @@ __attribute__((pure)) HOTX double perl_to_float(const PerlValue *v) {
         case PERL_INT:    return (double)v->ival;
         case PERL_FLOAT:  return v->fval;
         case PERL_STRING: return atof(v->sval);
+        case PERL_XS_PTR: return (double)(uintptr_t)v->pval;
         default:          return 0.0;
     }
 }
@@ -782,6 +875,16 @@ char *perl_to_string(const PerlValue *v) {
         case PERL_FILEHANDLE:
             snprintf(buf, sizeof buf, "GLOB(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
+        case PERL_XS_PTR:
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=PTR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "PTR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            return strdup(buf);
+        case PERL_DBI_DBH:
+            return strdup("DBI::db");
+        case PERL_DBI_STH:
+            return strdup("DBI::st");
         default:
             return strdup("");
     }
@@ -805,6 +908,9 @@ int perl_is_true(const PerlValue *v) {
         case PERL_FLAT_ARRAY:
             return 1;
         case PERL_FILEHANDLE:
+        case PERL_XS_PTR:
+        case PERL_DBI_DBH:
+        case PERL_DBI_STH:
             return v->pval != NULL;
         default: return 0;
     }
@@ -828,6 +934,10 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     } else if (src && src->tag == PERL_REF_HASH && src->pval) {
         PerlHash *hv = (PerlHash *)src->pval;
         if (hv->refcount > 0) hv->refcount++;
+    } else if (src && src->tag == PERL_DBI_DBH && src->pval) {
+        ((PerlDBIHandle *)src->pval)->refcount++;
+    } else if (src && src->tag == PERL_DBI_STH && src->pval) {
+        ((PerlDBIStatement *)src->pval)->refcount++;
     }
     /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
@@ -856,6 +966,10 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         }
         if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
     }
+    if (dst->tag == PERL_DBI_STH && dst->pval)
+        perl_dbi_statement_release((PerlDBIStatement *)dst->pval);
+    if (dst->tag == PERL_DBI_DBH && dst->pval)
+        perl_dbi_handle_release((PerlDBIHandle *)dst->pval);
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
@@ -1951,6 +2065,7 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_FLOAT_PAIR:  return perl_alloc_string("ARRAY");
         case PERL_REF_HASH:    return perl_alloc_string("HASH");
         case PERL_CODE_REF:    return perl_alloc_string("CODE");
+        case PERL_XS_PTR:      return perl_alloc_string("PTR");
         default:               return perl_alloc_string("");
     }
 }
@@ -2545,6 +2660,21 @@ void perl_register_method(const char *key, PerlSubFnCtx fn) {
     }
 }
 
+PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx) {
+    if (!name) return perl_alloc_undef();
+    for (int i = 0; i < s_method_count; i++) {
+        if (strcmp(s_method_table[i].key, name) == 0) {
+            PerlSubFnCtx fn = s_method_table[i].fn;
+            PerlValue *result;
+            if (!fn) return perl_alloc_undef();
+            result = fn(args, perl_push_wantarray(ctx));
+            perl_pop_wantarray();
+            return result;
+        }
+    }
+    return perl_alloc_undef();
+}
+
 /* walk class and its @ISA chain; returns NULL if not found */
 static PerlSubFnCtx perl_find_method(const char *class_name, const char *method) {
     const char *cls = class_name;
@@ -2574,6 +2704,64 @@ static PerlValue s_autoload_pv = { .tag = PERL_UNDEF };
 PerlValue *perl_get_autoload_name(void) { return &s_autoload_pv; }
 
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
+    if (obj && obj->tag == PERL_STRING && obj->sval && strcmp(obj->sval, "DBI") == 0) {
+        if (strcmp(method, "connect") == 0) {
+            PerlValue *dsn  = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+            PerlValue *user = (args && args->len > 1) ? args->elems[1] : perl_alloc_undef();
+            PerlValue *pass = (args && args->len > 2) ? args->elems[2] : perl_alloc_undef();
+            return perl_dbi_connect(dsn, user, pass);
+        }
+    }
+    if (obj && obj->tag == PERL_DBI_DBH) {
+        if (strcmp(method, "prepare") == 0)
+            return perl_dbi_prepare(obj, (args && args->len > 0) ? args->elems[0] : perl_alloc_undef());
+        if (strcmp(method, "disconnect") == 0)
+            return perl_dbi_disconnect(obj);
+        if (strcmp(method, "commit") == 0)
+            return perl_dbi_commit(obj);
+        if (strcmp(method, "rollback") == 0)
+            return perl_dbi_rollback(obj);
+        if (strcmp(method, "errstr") == 0)
+            return perl_dbi_error(obj);
+        if (strcmp(method, "do") == 0) {
+            PerlValue *sth = perl_dbi_prepare(obj, (args && args->len > 0) ? args->elems[0] : perl_alloc_undef());
+            PerlValue *ret;
+            if (!sth || sth->tag == PERL_UNDEF) return perl_alloc_undef();
+            ret = perl_dbi_execute(sth, NULL);
+            perl_free(sth);
+            return ret;
+        }
+    }
+    if (obj && obj->tag == PERL_DBI_STH) {
+        if (strcmp(method, "execute") == 0)
+            return perl_dbi_execute(obj, args);
+        if (strcmp(method, "fetchrow_arrayref") == 0)
+            return perl_dbi_fetch(obj);
+        if (strcmp(method, "fetchall_arrayref") == 0)
+            return perl_dbi_fetchall(obj);
+        if (strcmp(method, "rows") == 0)
+            return perl_dbi_rows(obj);
+        if (strcmp(method, "finish") == 0) {
+            PerlDBIStatement *sth = perl_dbi_get_sth(obj);
+            if (sth && sth->stmt) sqlite3_reset((sqlite3_stmt *)sth->stmt);
+            return perl_alloc_int(1);
+        }
+        if (strcmp(method, "errstr") == 0) {
+            PerlDBIStatement *sth = perl_dbi_get_sth(obj);
+            return perl_alloc_string((sth && sth->last_error) ? sth->last_error : "");
+        }
+        if (strcmp(method, "fetchrow_array") == 0) {
+            PerlValue *rowref = perl_dbi_fetch(obj);
+            if (!rowref || rowref->tag == PERL_UNDEF) return perl_alloc_undef();
+            if (rowref->tag == PERL_REF_ARRAY && rowref->pval) {
+                PerlValue *ret = perl_array_to_list_return((PerlArray *)rowref->pval);
+                rowref->pval = NULL;
+                perl_free(rowref);
+                return ret;
+            }
+            return rowref;
+        }
+    }
     /* thread instance methods */
     if (obj && obj->tag == PERL_THREAD) {
         if (strcmp(method, "join")    == 0) return perl_threads_join(obj);
@@ -4030,6 +4218,7 @@ PerlValue *perl_su_reftype(PerlValue *v) {
     case PERL_REF_ARRAY:  return perl_alloc_string("ARRAY");
     case PERL_REF_HASH:   return perl_alloc_string("HASH");
     case PERL_CODE_REF:   return perl_alloc_string("CODE");
+    case PERL_XS_PTR:     return perl_alloc_string("PTR");
     default:              return perl_alloc_undef();
     }
 }
@@ -4170,6 +4359,7 @@ PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv) {
         case PERL_REF_HASH:   tname = "HASH"; break;
         case PERL_REF_SCALAR: tname = "SCALAR"; break;
         case PERL_CODE_REF:   tname = "CODE"; break;
+        case PERL_XS_PTR:     tname = "PTR"; break;
         default: break;
         }
         if (tname && strcmp(tname, want) == 0) return perl_alloc_int(1);
@@ -4323,162 +4513,469 @@ PerlValue *perl_get_os_name(void) {
     return perl_alloc_string("linux");
 }
 
-/* ── XS interface support ────────────────────────────────────────────────── */
+/* ── XS / FFI support ───────────────────────────────────────────────────── */
 
-/* XS library handle - for dynamically loaded C libraries */
-typedef struct PerlXSModule {
-    void *handle;             /* dlopen handle */
-    char *name;               /* module name */
-    struct PerlXSModule *next; /* next module in list */
-} PerlXSModule;
-
-/* Global list of loaded XS modules */
-static __thread PerlXSModule *s_xs_modules = NULL;
-
-/* XS function wrapper - holds a C function pointer and its signature */
-typedef struct PerlXSFunc {
-    char *name;               /* function name */
-    void *func_ptr;           /* pointer to C function */
-    int num_args;             /* number of arguments */
-    char *arg_types;          /* argument types (e.g. "ii" for 2 ints) */
-    char *ret_type;           /* return type */
-    struct PerlXSFunc *next;  /* next function in list */
-} PerlXSFunc;
-
-/* XS module information structure */
 typedef struct PerlXSModuleInfo {
-    char *name;               /* module name */
-    void *handle;             /* dlopen handle */
-    PerlXSFunc *funcs;        /* list of functions */
-    struct PerlXSModuleInfo *next; /* next module */
+    char *name;
+    void *handle;
+    struct PerlXSModuleInfo *next;
 } PerlXSModuleInfo;
 
-/* Global list of loaded XS modules */
+typedef enum {
+    XS_TYPE_INVALID = 0,
+    XS_TYPE_VOID,
+    XS_TYPE_LONG,
+    XS_TYPE_DOUBLE,
+    XS_TYPE_STRING,
+    XS_TYPE_PTR,
+} PerlXSType;
+
+typedef struct {
+    PerlXSType ret_type;
+    PerlXSType arg_types[4];
+    int arg_count;
+} PerlXSSignature;
+
 static __thread PerlXSModuleInfo *s_xs_module_list = NULL;
 
-/* Load a dynamic library (equivalent to dlopen) */
-PerlValue *perl_xs_load_library(PerlValue *libname_pv) {
-    if (!libname_pv || libname_pv->tag == PERL_UNDEF) {
-        return perl_alloc_undef();
+static void perl_xs_set_error(const char *msg) {
+    perl_set_dollar_at_cstr(msg ? msg : "XS call failed");
+}
+
+static PerlXSModuleInfo *perl_xs_find_module(const char *libname) {
+    PerlXSModuleInfo *module = s_xs_module_list;
+    while (module) {
+        if (strcmp(module->name, libname) == 0) return module;
+        module = module->next;
     }
-    
-    char *libname = perl_to_string(libname_pv);
-    if (!libname) {
-        return perl_alloc_undef();
+    return NULL;
+}
+
+static PerlXSModuleInfo *perl_xs_find_or_load_module(const char *libname) {
+    PerlXSModuleInfo *module;
+    void *handle;
+
+    if (!libname || !*libname) {
+        perl_xs_set_error("XS::load_library: missing library name");
+        return NULL;
     }
-    
-    /* Try to load the library */
-    void *handle = dlopen(libname, RTLD_LAZY);
+
+    module = perl_xs_find_module(libname);
+    if (module) return module;
+
+    handle = dlopen(libname, RTLD_LAZY);
     if (!handle) {
-        /* Set error in $@ or return undef */
-        free(libname);
-        return perl_alloc_undef();
+        perl_xs_set_error(dlerror());
+        return NULL;
     }
-    
-    /* Create module info */
-    PerlXSModuleInfo *module = calloc(1, sizeof(PerlXSModuleInfo));
+
+    module = calloc(1, sizeof(*module));
     if (!module) {
         dlclose(handle);
-        free(libname);
-        return perl_alloc_undef();
+        perl_xs_set_error("XS::load_library: out of memory");
+        return NULL;
     }
-    
+
     module->name = strdup(libname);
     module->handle = handle;
     module->next = s_xs_module_list;
     s_xs_module_list = module;
-    
+    return module;
+}
+
+static PerlXSType perl_xs_parse_type_name(const char *name) {
+    if (strcmp(name, "void") == 0) return XS_TYPE_VOID;
+    if (strcmp(name, "long") == 0 || strcmp(name, "int") == 0 ||
+        strcmp(name, "size_t") == 0 || strcmp(name, "ssize_t") == 0) return XS_TYPE_LONG;
+    if (strcmp(name, "double") == 0) return XS_TYPE_DOUBLE;
+    if (strcmp(name, "string") == 0 || strcmp(name, "str") == 0) return XS_TYPE_STRING;
+    if (strcmp(name, "ptr") == 0 || strcmp(name, "pointer") == 0) return XS_TYPE_PTR;
+    return XS_TYPE_INVALID;
+}
+
+static void perl_xs_trim_token(char *s) {
+    char *start = s;
+    char *end;
+    size_t len;
+
+    if (!s) return;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != s) memmove(s, start, strlen(start) + 1);
+    len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) s[--len] = '\0';
+    end = s + len;
+    (void)end;
+}
+
+static int perl_xs_parse_signature(const char *sig, PerlXSSignature *out) {
+    char retbuf[32];
+    char argbuf[128];
+    const char *lp;
+    const char *rp;
+    size_t retlen;
+    size_t arglen;
+    char *cursor;
+
+    if (!sig || !out) return 0;
+    memset(out, 0, sizeof(*out));
+
+    lp = strchr(sig, '(');
+    rp = strrchr(sig, ')');
+    if (!lp || !rp || rp < lp) return 0;
+
+    retlen = (size_t)(lp - sig);
+    arglen = (size_t)(rp - lp - 1);
+    if (retlen == 0 || retlen >= sizeof(retbuf) || arglen >= sizeof(argbuf)) return 0;
+
+    memcpy(retbuf, sig, retlen);
+    retbuf[retlen] = '\0';
+    memcpy(argbuf, lp + 1, arglen);
+    argbuf[arglen] = '\0';
+    perl_xs_trim_token(retbuf);
+    perl_xs_trim_token(argbuf);
+
+    out->ret_type = perl_xs_parse_type_name(retbuf);
+    if (out->ret_type == XS_TYPE_INVALID) return 0;
+
+    cursor = argbuf;
+    while (*cursor) {
+        char *comma;
+        PerlXSType arg_type;
+
+        if (out->arg_count >= 4) return 0;
+        comma = strchr(cursor, ',');
+        if (comma) *comma = '\0';
+        perl_xs_trim_token(cursor);
+        arg_type = perl_xs_parse_type_name(cursor);
+        if (arg_type == XS_TYPE_INVALID) return 0;
+        out->arg_types[out->arg_count++] = arg_type;
+        if (!comma) break;
+        cursor = comma + 1;
+    }
+    return 1;
+}
+
+PerlValue *perl_xs_load_library(PerlValue *libname_pv) {
+    char *libname;
+    PerlXSModuleInfo *module;
+    PerlValue empty = { .tag = PERL_UNDEF };
+
+    if (!libname_pv || libname_pv->tag == PERL_UNDEF) {
+        perl_xs_set_error("XS::load_library: missing library name");
+        return perl_alloc_undef();
+    }
+
+    libname = perl_to_string(libname_pv);
+    if (!libname) {
+        perl_xs_set_error("XS::load_library: invalid library name");
+        return perl_alloc_undef();
+    }
+
+    module = perl_xs_find_or_load_module(libname);
     free(libname);
-    
-    /* Return a reference to the module (as a string for now) */
-    PerlValue *result = perl_alloc_string(module->name);
+    if (!module) return perl_alloc_undef();
+
+    perl_assign(&s_dollar_at, &empty);
+    return perl_alloc_string(module->name);
+}
+
+static int perl_xs_signature_code(const PerlXSSignature *sig) {
+    int code = 0;
+    for (int i = 0; i < sig->arg_count; i++)
+        code |= ((int)sig->arg_types[i] << (i * 4));
+    return code;
+}
+
+#define XS_CODE1(a0) ((int)(a0))
+#define XS_CODE2(a0, a1) (XS_CODE1(a0) | ((int)(a1) << 4))
+#define XS_CODE3(a0, a1, a2) (XS_CODE2(a0, a1) | ((int)(a2) << 8))
+#define XS_CODE4(a0, a1, a2, a3) (XS_CODE3(a0, a1, a2) | ((int)(a3) << 12))
+
+#define XS_TYPES_1(M) \
+    M(XS_TYPE_LONG, long long, long_args[0]); \
+    M(XS_TYPE_DOUBLE, double, double_args[0]); \
+    M(XS_TYPE_STRING, const char *, string_args[0]); \
+    M(XS_TYPE_PTR, void *, ptr_args[0]);
+
+#define XS_TYPES_2(M) \
+    XS_TYPES_2_A(M, XS_TYPE_LONG, long long, long_args[0]); \
+    XS_TYPES_2_A(M, XS_TYPE_DOUBLE, double, double_args[0]); \
+    XS_TYPES_2_A(M, XS_TYPE_STRING, const char *, string_args[0]); \
+    XS_TYPES_2_A(M, XS_TYPE_PTR, void *, ptr_args[0]);
+
+#define XS_TYPES_2_A(M, E0, T0, A0) \
+    M(E0, T0, A0, XS_TYPE_LONG, long long, long_args[1]); \
+    M(E0, T0, A0, XS_TYPE_DOUBLE, double, double_args[1]); \
+    M(E0, T0, A0, XS_TYPE_STRING, const char *, string_args[1]); \
+    M(E0, T0, A0, XS_TYPE_PTR, void *, ptr_args[1]);
+
+#define XS_TYPES_3(M) \
+    XS_TYPES_3_A(M, XS_TYPE_LONG, long long, long_args[0]); \
+    XS_TYPES_3_A(M, XS_TYPE_DOUBLE, double, double_args[0]); \
+    XS_TYPES_3_A(M, XS_TYPE_STRING, const char *, string_args[0]); \
+    XS_TYPES_3_A(M, XS_TYPE_PTR, void *, ptr_args[0]);
+
+#define XS_TYPES_3_A(M, E0, T0, A0) \
+    XS_TYPES_3_B(M, E0, T0, A0, XS_TYPE_LONG, long long, long_args[1]); \
+    XS_TYPES_3_B(M, E0, T0, A0, XS_TYPE_DOUBLE, double, double_args[1]); \
+    XS_TYPES_3_B(M, E0, T0, A0, XS_TYPE_STRING, const char *, string_args[1]);
+
+#define XS_TYPES_3_B(M, E0, T0, A0, E1, T1, A1) \
+    M(E0, T0, A0, E1, T1, A1, XS_TYPE_LONG, long long, long_args[2]); \
+    M(E0, T0, A0, E1, T1, A1, XS_TYPE_DOUBLE, double, double_args[2]); \
+    M(E0, T0, A0, E1, T1, A1, XS_TYPE_STRING, const char *, string_args[2]); \
+    M(E0, T0, A0, E1, T1, A1, XS_TYPE_PTR, void *, ptr_args[2]);
+
+#define XS_TYPES_4(M) \
+    XS_TYPES_4_A(M, XS_TYPE_LONG, long long, long_args[0]); \
+    XS_TYPES_4_A(M, XS_TYPE_DOUBLE, double, double_args[0]); \
+    XS_TYPES_4_A(M, XS_TYPE_STRING, const char *, string_args[0]); \
+    XS_TYPES_4_A(M, XS_TYPE_PTR, void *, ptr_args[0]);
+
+#define XS_TYPES_4_A(M, E0, T0, A0) \
+    XS_TYPES_4_B(M, E0, T0, A0, XS_TYPE_LONG, long long, long_args[1]); \
+    XS_TYPES_4_B(M, E0, T0, A0, XS_TYPE_DOUBLE, double, double_args[1]); \
+    XS_TYPES_4_B(M, E0, T0, A0, XS_TYPE_STRING, const char *, string_args[1]);
+
+#define XS_TYPES_4_B(M, E0, T0, A0, E1, T1, A1) \
+    XS_TYPES_4_C(M, E0, T0, A0, E1, T1, A1, XS_TYPE_LONG, long long, long_args[2]); \
+    XS_TYPES_4_C(M, E0, T0, A0, E1, T1, A1, XS_TYPE_DOUBLE, double, double_args[2]); \
+    XS_TYPES_4_C(M, E0, T0, A0, E1, T1, A1, XS_TYPE_STRING, const char *, string_args[2]);
+
+#define XS_TYPES_4_C(M, E0, T0, A0, E1, T1, A1, E2, T2, A2) \
+    M(E0, T0, A0, E1, T1, A1, E2, T2, A2, XS_TYPE_LONG, long long, long_args[3]); \
+    M(E0, T0, A0, E1, T1, A1, E2, T2, A2, XS_TYPE_DOUBLE, double, double_args[3]); \
+    M(E0, T0, A0, E1, T1, A1, E2, T2, A2, XS_TYPE_STRING, const char *, string_args[3]); \
+    M(E0, T0, A0, E1, T1, A1, E2, T2, A2, XS_TYPE_PTR, void *, ptr_args[3]);
+
+#define XS_CASE_VOID_1(E0, T0, A0) \
+    case XS_CODE1(E0): ((void (*)(T0))sym)(A0); result = perl_alloc_undef(); break
+#define XS_CASE_VOID_2(E0, T0, A0, E1, T1, A1) \
+    case XS_CODE2(E0, E1): ((void (*)(T0, T1))sym)(A0, A1); result = perl_alloc_undef(); break
+#define XS_CASE_VOID_3(E0, T0, A0, E1, T1, A1, E2, T2, A2) \
+    case XS_CODE3(E0, E1, E2): ((void (*)(T0, T1, T2))sym)(A0, A1, A2); result = perl_alloc_undef(); break
+#define XS_CASE_VOID_4(E0, T0, A0, E1, T1, A1, E2, T2, A2, E3, T3, A3) \
+    case XS_CODE4(E0, E1, E2, E3): ((void (*)(T0, T1, T2, T3))sym)(A0, A1, A2, A3); result = perl_alloc_undef(); break
+
+#define XS_CASE_LONG_1(E0, T0, A0) \
+    case XS_CODE1(E0): result = perl_alloc_int(((long long (*)(T0))sym)(A0)); break
+#define XS_CASE_LONG_2(E0, T0, A0, E1, T1, A1) \
+    case XS_CODE2(E0, E1): result = perl_alloc_int(((long long (*)(T0, T1))sym)(A0, A1)); break
+#define XS_CASE_LONG_3(E0, T0, A0, E1, T1, A1, E2, T2, A2) \
+    case XS_CODE3(E0, E1, E2): result = perl_alloc_int(((long long (*)(T0, T1, T2))sym)(A0, A1, A2)); break
+#define XS_CASE_LONG_4(E0, T0, A0, E1, T1, A1, E2, T2, A2, E3, T3, A3) \
+    case XS_CODE4(E0, E1, E2, E3): result = perl_alloc_int(((long long (*)(T0, T1, T2, T3))sym)(A0, A1, A2, A3)); break
+
+#define XS_CASE_DOUBLE_1(E0, T0, A0) \
+    case XS_CODE1(E0): result = perl_alloc_float(((double (*)(T0))sym)(A0)); break
+#define XS_CASE_DOUBLE_2(E0, T0, A0, E1, T1, A1) \
+    case XS_CODE2(E0, E1): result = perl_alloc_float(((double (*)(T0, T1))sym)(A0, A1)); break
+#define XS_CASE_DOUBLE_3(E0, T0, A0, E1, T1, A1, E2, T2, A2) \
+    case XS_CODE3(E0, E1, E2): result = perl_alloc_float(((double (*)(T0, T1, T2))sym)(A0, A1, A2)); break
+#define XS_CASE_DOUBLE_4(E0, T0, A0, E1, T1, A1, E2, T2, A2, E3, T3, A3) \
+    case XS_CODE4(E0, E1, E2, E3): result = perl_alloc_float(((double (*)(T0, T1, T2, T3))sym)(A0, A1, A2, A3)); break
+
+#define XS_CASE_STRING_1(E0, T0, A0) \
+    case XS_CODE1(E0): do { const char *raw = ((const char *(*)(T0))sym)(A0); result = raw ? perl_alloc_string(raw) : perl_alloc_undef(); } while (0); break
+#define XS_CASE_STRING_2(E0, T0, A0, E1, T1, A1) \
+    case XS_CODE2(E0, E1): do { const char *raw = ((const char *(*)(T0, T1))sym)(A0, A1); result = raw ? perl_alloc_string(raw) : perl_alloc_undef(); } while (0); break
+#define XS_CASE_STRING_3(E0, T0, A0, E1, T1, A1, E2, T2, A2) \
+    case XS_CODE3(E0, E1, E2): do { const char *raw = ((const char *(*)(T0, T1, T2))sym)(A0, A1, A2); result = raw ? perl_alloc_string(raw) : perl_alloc_undef(); } while (0); break
+#define XS_CASE_STRING_4(E0, T0, A0, E1, T1, A1, E2, T2, A2, E3, T3, A3) \
+    case XS_CODE4(E0, E1, E2, E3): do { const char *raw = ((const char *(*)(T0, T1, T2, T3))sym)(A0, A1, A2, A3); result = raw ? perl_alloc_string(raw) : perl_alloc_undef(); } while (0); break
+
+#define XS_CASE_PTR_1(E0, T0, A0) \
+    case XS_CODE1(E0): do { void *raw = ((void *(*)(T0))sym)(A0); result = raw ? perl_alloc_xs_ptr(raw) : perl_alloc_undef(); } while (0); break
+#define XS_CASE_PTR_2(E0, T0, A0, E1, T1, A1) \
+    case XS_CODE2(E0, E1): do { void *raw = ((void *(*)(T0, T1))sym)(A0, A1); result = raw ? perl_alloc_xs_ptr(raw) : perl_alloc_undef(); } while (0); break
+#define XS_CASE_PTR_3(E0, T0, A0, E1, T1, A1, E2, T2, A2) \
+    case XS_CODE3(E0, E1, E2): do { void *raw = ((void *(*)(T0, T1, T2))sym)(A0, A1, A2); result = raw ? perl_alloc_xs_ptr(raw) : perl_alloc_undef(); } while (0); break
+#define XS_CASE_PTR_4(E0, T0, A0, E1, T1, A1, E2, T2, A2, E3, T3, A3) \
+    case XS_CODE4(E0, E1, E2, E3): do { void *raw = ((void *(*)(T0, T1, T2, T3))sym)(A0, A1, A2, A3); result = raw ? perl_alloc_xs_ptr(raw) : perl_alloc_undef(); } while (0); break
+
+PerlValue *perl_xs_call_dynamic(PerlValue *libname_pv, PerlValue *funcname_pv,
+                                PerlValue *signature_pv, PerlArray *args) {
+    char *libname = NULL;
+    char *funcname = NULL;
+    char *signature = NULL;
+    PerlXSSignature parsed;
+    int sig_code;
+    PerlXSModuleInfo *module;
+    void *sym;
+    long long long_args[4] = {0, 0, 0, 0};
+    double double_args[4] = {0.0, 0.0, 0.0, 0.0};
+    char *string_args[4] = {NULL, NULL, NULL, NULL};
+    void *ptr_args[4] = {NULL, NULL, NULL, NULL};
+    PerlValue *result = NULL;
+    PerlValue empty = { .tag = PERL_UNDEF };
+
+    if (!libname_pv || !funcname_pv || !signature_pv) {
+        perl_xs_set_error("XS::call: expected library, symbol, and signature");
+        return perl_alloc_undef();
+    }
+
+    libname = perl_to_string(libname_pv);
+    funcname = perl_to_string(funcname_pv);
+    signature = perl_to_string(signature_pv);
+    if (!libname || !funcname || !signature) {
+        perl_xs_set_error("XS::call: invalid arguments");
+        goto fail;
+    }
+
+    if (!perl_xs_parse_signature(signature, &parsed)) {
+        perl_xs_set_error("XS::call: unsupported signature");
+        goto fail;
+    }
+
+    if ((args ? args->len : 0) != parsed.arg_count) {
+        perl_xs_set_error("XS::call: argument count does not match signature");
+        goto fail;
+    }
+    sig_code = perl_xs_signature_code(&parsed);
+
+    module = perl_xs_find_or_load_module(libname);
+    if (!module) goto fail;
+
+    dlerror();
+    sym = dlsym(module->handle, funcname);
+    if (!sym) {
+        const char *errmsg = dlerror();
+        perl_xs_set_error(errmsg ? errmsg : "XS::call: symbol lookup failed");
+        goto fail;
+    }
+
+    for (int i = 0; i < parsed.arg_count; i++) {
+        PerlValue *arg = args->elems[i];
+        switch (parsed.arg_types[i]) {
+            case XS_TYPE_LONG:
+                long_args[i] = perl_to_int(arg);
+                break;
+            case XS_TYPE_DOUBLE:
+                double_args[i] = perl_to_float(arg);
+                break;
+            case XS_TYPE_STRING:
+                string_args[i] = perl_to_string(arg);
+                if (!string_args[i]) {
+                    perl_xs_set_error("XS::call: failed to convert string argument");
+                    goto fail;
+                }
+                break;
+            case XS_TYPE_PTR:
+                if (!arg || arg->tag == PERL_UNDEF) {
+                    ptr_args[i] = NULL;
+                } else if (arg->tag == PERL_XS_PTR) {
+                    ptr_args[i] = arg->pval;
+                } else if (arg->tag == PERL_STRING) {
+                    string_args[i] = perl_to_string(arg);
+                    if (!string_args[i]) {
+                        perl_xs_set_error("XS::call: failed to convert pointer argument");
+                        goto fail;
+                    }
+                    ptr_args[i] = string_args[i];
+                } else {
+                    ptr_args[i] = (void *)(uintptr_t)perl_to_int(arg);
+                }
+                break;
+            default:
+                perl_xs_set_error("XS::call: unsupported argument type");
+                goto fail;
+        }
+    }
+
+    switch (parsed.ret_type) {
+        case XS_TYPE_VOID:
+            if (parsed.arg_count == 0) {
+                ((void (*)(void))sym)();
+                result = perl_alloc_undef();
+            } else switch (sig_code) {
+                XS_TYPES_1(XS_CASE_VOID_1);
+                XS_TYPES_2(XS_CASE_VOID_2);
+                XS_TYPES_3(XS_CASE_VOID_3);
+                XS_TYPES_4(XS_CASE_VOID_4);
+                default:
+                    perl_xs_set_error("XS::call: unsupported void signature");
+                    goto fail;
+            }
+            break;
+        case XS_TYPE_LONG:
+            if (parsed.arg_count == 0) result = perl_alloc_int(((long long (*)(void))sym)());
+            else switch (sig_code) {
+                XS_TYPES_1(XS_CASE_LONG_1);
+                XS_TYPES_2(XS_CASE_LONG_2);
+                XS_TYPES_3(XS_CASE_LONG_3);
+                XS_TYPES_4(XS_CASE_LONG_4);
+                default:
+                    perl_xs_set_error("XS::call: unsupported long signature");
+                    goto fail;
+            }
+            break;
+        case XS_TYPE_DOUBLE:
+            if (parsed.arg_count == 0) result = perl_alloc_float(((double (*)(void))sym)());
+            else switch (sig_code) {
+                XS_TYPES_1(XS_CASE_DOUBLE_1);
+                XS_TYPES_2(XS_CASE_DOUBLE_2);
+                XS_TYPES_3(XS_CASE_DOUBLE_3);
+                XS_TYPES_4(XS_CASE_DOUBLE_4);
+                default:
+                    perl_xs_set_error("XS::call: unsupported double signature");
+                    goto fail;
+            }
+            break;
+        case XS_TYPE_STRING:
+            if (parsed.arg_count == 0) {
+                const char *raw = ((const char *(*)(void))sym)();
+                result = raw ? perl_alloc_string(raw) : perl_alloc_undef();
+            } else switch (sig_code) {
+                XS_TYPES_1(XS_CASE_STRING_1);
+                XS_TYPES_2(XS_CASE_STRING_2);
+                XS_TYPES_3(XS_CASE_STRING_3);
+                XS_TYPES_4(XS_CASE_STRING_4);
+                default:
+                    perl_xs_set_error("XS::call: unsupported string signature");
+                    goto fail;
+            }
+            break;
+        case XS_TYPE_PTR:
+            if (parsed.arg_count == 0) {
+                void *raw = ((void *(*)(void))sym)();
+                result = raw ? perl_alloc_xs_ptr(raw) : perl_alloc_undef();
+            } else switch (sig_code) {
+                XS_TYPES_1(XS_CASE_PTR_1);
+                XS_TYPES_2(XS_CASE_PTR_2);
+                XS_TYPES_3(XS_CASE_PTR_3);
+                XS_TYPES_4(XS_CASE_PTR_4);
+                default:
+                    perl_xs_set_error("XS::call: unsupported ptr signature");
+                    goto fail;
+            }
+            break;
+        default:
+            perl_xs_set_error("XS::call: unsupported return type");
+            goto fail;
+    }
+
+    perl_assign(&s_dollar_at, &empty);
+    goto done;
+
+fail:
+    if (!result) result = perl_alloc_undef();
+
+done:
+    for (int i = 0; i < 4; i++) {
+        if (string_args[i]) free(string_args[i]);
+    }
+    if (libname) free(libname);
+    if (funcname) free(funcname);
+    if (signature) free(signature);
     return result;
 }
 
-/* Get a function from a loaded library */
-PerlValue *perl_xs_get_function(PerlValue *libname_pv, PerlValue *funcname_pv) {
-    if (!libname_pv || libname_pv->tag == PERL_UNDEF ||
-        !funcname_pv || funcname_pv->tag == PERL_UNDEF) {
-        return perl_alloc_undef();
-    }
-    
-    char *libname = perl_to_string(libname_pv);
-    char *funcname = perl_to_string(funcname_pv);
-    
-    if (!libname || !funcname) {
-        if (libname) free(libname);
-        if (funcname) free(funcname);
-        return perl_alloc_undef();
-    }
-    
-    /* Find the module */
-    PerlXSModuleInfo *module = s_xs_module_list;
-    while (module && strcmp(module->name, libname) != 0) {
-        module = module->next;
-    }
-    
-    if (!module) {
-        /* Module not loaded */
-        free(libname);
-        free(funcname);
-        return perl_alloc_undef();
-    }
-    
-    /* Get the function from the library */
-    void *func_ptr = dlsym(module->handle, funcname);
-    if (!func_ptr) {
-        free(libname);
-        free(funcname);
-        return perl_alloc_undef();
-    }
-    
-    /* Return function pointer as a reference (for now, we'll just return the function name) */
-    PerlValue *result = perl_alloc_string(funcname);
-    
-    free(libname);
-    free(funcname);
-    
-    return result;
-}
-
-/* Call a C function through XS */
-PerlValue *perl_xs_call_function(PerlValue *funcname_pv, PerlArray *args) {
-    if (!funcname_pv || funcname_pv->tag == PERL_UNDEF || !args) {
-        return perl_alloc_undef();
-    }
-    
-    /* In a real implementation, we would:
-       1. Find the function by name
-       2. Convert PerlValue arguments to C arguments
-       3. Call the function
-       4. Convert result back to PerlValue
-    */
-    
-    /* For now, just return undef to indicate not implemented */
-    return perl_alloc_undef();
-}
-
-/* Cleanup XS modules on exit */
 void perl_xs_cleanup(void) {
     PerlXSModuleInfo *module = s_xs_module_list;
     while (module) {
         PerlXSModuleInfo *next = module->next;
-        if (module->handle) {
-            dlclose(module->handle);
-        }
-        if (module->name) {
-            free(module->name);
-        }
-        /* Free function list */
-        PerlXSFunc *func = module->funcs;
-        while (func) {
-            PerlXSFunc *next_func = func->next;
-            if (func->name) free(func->name);
-            if (func->arg_types) free(func->arg_types);
-            if (func->ret_type) free(func->ret_type);
-            free(func);
-            func = next_func;
-        }
+        if (module->handle) dlclose(module->handle);
+        if (module->name) free(module->name);
         free(module);
         module = next;
     }
@@ -4490,164 +4987,312 @@ void perl_xs_cleanup(void) {
 /* SQLite integration - DBI-like interface */
 #include <sqlite3.h>
 
+static void perl_dbi_set_error(PerlDBIHandle *dbh, const char *msg) {
+    if (!dbh) return;
+    if (dbh->last_error) free(dbh->last_error);
+    dbh->last_error = strdup(msg ? msg : "");
+}
+
+static void perl_dbi_stmt_set_error(PerlDBIStatement *sth, const char *msg) {
+    if (!sth) return;
+    if (sth->last_error) free(sth->last_error);
+    sth->last_error = strdup(msg ? msg : "");
+    if (sth->dbh) perl_dbi_set_error(sth->dbh, msg);
+}
+
+static const char *perl_dbi_sqlite_path(const char *dsn) {
+    static const char prefix[] = "dbi:SQLite:dbname=";
+    return (dsn && strncmp(dsn, prefix, sizeof(prefix) - 1) == 0)
+        ? dsn + sizeof(prefix) - 1
+        : dsn;
+}
+
+static PerlValue *perl_dbi_wrap_dbh(PerlDBIHandle *dbh) {
+    PerlValue *pv = pv_alloc();
+    pv->tag = PERL_DBI_DBH;
+    pv->flags = 0;
+    pv->pval = dbh;
+    pv->matchpos = 0;
+    pv->blessed_class = strdup("DBI::db");
+    return pv;
+}
+
+static PerlValue *perl_dbi_wrap_sth(PerlDBIStatement *sth) {
+    PerlValue *pv = pv_alloc();
+    pv->tag = PERL_DBI_STH;
+    pv->flags = 0;
+    pv->pval = sth;
+    pv->matchpos = 0;
+    pv->blessed_class = strdup("DBI::st");
+    return pv;
+}
+
+static PerlDBIHandle *perl_dbi_get_dbh(PerlValue *pv) {
+    return (pv && pv->tag == PERL_DBI_DBH) ? (PerlDBIHandle *)pv->pval : NULL;
+}
+
+static PerlDBIStatement *perl_dbi_get_sth(PerlValue *pv) {
+    return (pv && pv->tag == PERL_DBI_STH) ? (PerlDBIStatement *)pv->pval : NULL;
+}
+
+static void perl_dbi_handle_release(PerlDBIHandle *dbh) {
+    if (!dbh) return;
+    if (--dbh->refcount > 0) return;
+    if (dbh->db) sqlite3_close((sqlite3 *)dbh->db);
+    if (dbh->dbname) free(dbh->dbname);
+    if (dbh->last_error) free(dbh->last_error);
+    free(dbh);
+}
+
+static void perl_dbi_statement_release(PerlDBIStatement *sth) {
+    if (!sth) return;
+    if (--sth->refcount > 0) return;
+    if (sth->stmt) sqlite3_finalize((sqlite3_stmt *)sth->stmt);
+    if (sth->dbh) perl_dbi_handle_release(sth->dbh);
+    if (sth->last_error) free(sth->last_error);
+    free(sth);
+}
+
+static int perl_dbi_bind_params(sqlite3_stmt *stmt, PerlArray *params) {
+    long long i;
+    if (!params) return SQLITE_OK;
+    for (i = 0; i < params->len; i++) {
+        PerlValue *pv = params->elems[i];
+        int idx = (int)i + 1;
+        int rc = SQLITE_OK;
+        if (!pv || pv->tag == PERL_UNDEF) {
+            rc = sqlite3_bind_null(stmt, idx);
+        } else if (pv->tag == PERL_INT) {
+            rc = sqlite3_bind_int64(stmt, idx, pv->ival);
+        } else if (pv->tag == PERL_FLOAT) {
+            rc = sqlite3_bind_double(stmt, idx, pv->fval);
+        } else {
+            char *s = perl_to_string(pv);
+            rc = sqlite3_bind_text(stmt, idx, s, -1, SQLITE_TRANSIENT);
+            free(s);
+        }
+        if (rc != SQLITE_OK) return rc;
+    }
+    return SQLITE_OK;
+}
+
+static PerlValue *perl_dbi_column_value(sqlite3_stmt *stmt, int col) {
+    switch (sqlite3_column_type(stmt, col)) {
+        case SQLITE_INTEGER:
+            return perl_alloc_int(sqlite3_column_int64(stmt, col));
+        case SQLITE_FLOAT:
+            return perl_alloc_float(sqlite3_column_double(stmt, col));
+        case SQLITE_TEXT:
+            return perl_alloc_string((const char *)sqlite3_column_text(stmt, col));
+        case SQLITE_NULL:
+            return perl_alloc_undef();
+        default:
+            return perl_alloc_string((const char *)sqlite3_column_text(stmt, col));
+    }
+}
+
+static PerlArray *perl_dbi_fetch_row(sqlite3_stmt *stmt) {
+    int cols = sqlite3_column_count(stmt);
+    int i;
+    PerlArray *row = perl_array_new();
+    for (i = 0; i < cols; i++) {
+        PerlValue *pv = perl_dbi_column_value(stmt, i);
+        perl_array_push(row, pv);
+        perl_free(pv);
+    }
+    return row;
+}
+
 /* DBI connection - returns a reference to a database handle */
 PerlValue *perl_dbi_connect(PerlValue *dsn_pv, PerlValue *username_pv, PerlValue *password_pv) {
-    if (!dsn_pv || dsn_pv->tag == PERL_UNDEF) {
-        return perl_alloc_undef();
-    }
+    char *dsn;
+    const char *path;
+    sqlite3 *db = NULL;
+    PerlDBIHandle *handle;
+    int rc;
+    (void)username_pv;
+    (void)password_pv;
 
-    char *dsn = perl_to_string(dsn_pv);
-    if (!dsn) {
-        return perl_alloc_undef();
-    }
+    if (!dsn_pv || dsn_pv->tag == PERL_UNDEF) return perl_alloc_undef();
+    dsn = perl_to_string(dsn_pv);
+    if (!dsn) return perl_alloc_undef();
+    path = perl_dbi_sqlite_path(dsn);
 
-    /* For simplicity, we'll treat dsn as the database path */
-    sqlite3 *db;
-    int rc = sqlite3_open(dsn, &db);
+    rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {
+        perl_set_dollar_at_cstr(sqlite3_errmsg(db));
         sqlite3_close(db);
         free(dsn);
         return perl_alloc_undef();
     }
 
-    /* Create a handle structure */
-    PerlDBIHandle *handle = calloc(1, sizeof(PerlDBIHandle));
-    if (!handle) {
-        sqlite3_close(db);
-        free(dsn);
-        return perl_alloc_undef();
-    }
-
+    handle = calloc(1, sizeof(PerlDBIHandle));
     handle->db = db;
-    handle->dbname = strdup(dsn);
+    handle->dbname = strdup(path ? path : "");
     handle->is_connected = 1;
-
-    /* Return a reference to this handle (as a string) */
-    PerlValue *result = perl_alloc_string(dsn);
-    
+    handle->refcount = 1;
+    handle->last_error = strdup("");
     free(dsn);
-    return result;
+    return perl_dbi_wrap_dbh(handle);
 }
 
 /* Disconnect from database */
 PerlValue *perl_dbi_disconnect(PerlValue *dbh_pv) {
-    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
-        return perl_alloc_undef();
+    PerlDBIHandle *dbh = perl_dbi_get_dbh(dbh_pv);
+    if (!dbh) return perl_alloc_undef();
+    if (dbh->db) {
+        sqlite3_close((sqlite3 *)dbh->db);
+        dbh->db = NULL;
     }
-
-    /* In a real implementation, we would:
-       1. Find the database handle from the reference
-       2. Close the connection
-       3. Free resources
-    */
-    return perl_alloc_int(1); /* success */
+    dbh->is_connected = 0;
+    return perl_alloc_int(1);
 }
 
 /* Prepare SQL statement */
 PerlValue *perl_dbi_prepare(PerlValue *dbh_pv, PerlValue *sql_pv) {
-    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF || !sql_pv || sql_pv->tag == PERL_UNDEF) {
+    PerlDBIHandle *dbh = perl_dbi_get_dbh(dbh_pv);
+    PerlDBIStatement *sth;
+    sqlite3_stmt *stmt = NULL;
+    char *sql;
+    int rc;
+
+    if (!dbh || !sql_pv || sql_pv->tag == PERL_UNDEF) return perl_alloc_undef();
+    sql = perl_to_string(sql_pv);
+    rc = sqlite3_prepare_v2((sqlite3 *)dbh->db, sql, -1, &stmt, NULL);
+    free(sql);
+    if (rc != SQLITE_OK) {
+        perl_dbi_set_error(dbh, sqlite3_errmsg((sqlite3 *)dbh->db));
         return perl_alloc_undef();
     }
 
-    /* In a real implementation, we would:
-       1. Find the database handle
-       2. Prepare the SQL statement
-       3. Return a statement handle
-    */
-    return perl_alloc_string("prepared_statement");
+    sth = calloc(1, sizeof(PerlDBIStatement));
+    sth->stmt = stmt;
+    sth->dbh = dbh;
+    sth->done = 0;
+    sth->rows_affected = 0;
+    sth->refcount = 1;
+    sth->last_error = strdup("");
+    dbh->refcount++;
+    return perl_dbi_wrap_sth(sth);
 }
 
 /* Execute SQL statement */
 PerlValue *perl_dbi_execute(PerlValue *sth_pv, PerlArray *params) {
-    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
+    PerlDBIStatement *sth = perl_dbi_get_sth(sth_pv);
+    sqlite3_stmt *stmt;
+    int rc;
+    if (!sth) return perl_alloc_undef();
+    stmt = (sqlite3_stmt *)sth->stmt;
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    rc = perl_dbi_bind_params(stmt, params);
+    if (rc != SQLITE_OK) {
+        perl_dbi_stmt_set_error(sth, sqlite3_errmsg((sqlite3 *)sth->dbh->db));
         return perl_alloc_undef();
     }
-
-    /* In a real implementation, we would:
-       1. Find the statement handle
-       2. Execute with parameters
-       3. Return result
-    */
-    return perl_alloc_int(1); /* success */
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        sth->done = 0;
+        return perl_alloc_int(1);
+    }
+    if (rc == SQLITE_DONE) {
+        sth->done = 1;
+        sth->rows_affected = sqlite3_changes((sqlite3 *)sth->dbh->db);
+        return perl_alloc_int(sth->rows_affected >= 0 ? sth->rows_affected : 1);
+    }
+    perl_dbi_stmt_set_error(sth, sqlite3_errmsg((sqlite3 *)sth->dbh->db));
+    return perl_alloc_undef();
 }
 
-/* Fetch row */
+/* Fetch row as array ref */
 PerlValue *perl_dbi_fetch(PerlValue *sth_pv) {
-    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
+    PerlDBIStatement *sth = perl_dbi_get_sth(sth_pv);
+    sqlite3_stmt *stmt;
+    int rc;
+    PerlArray *row;
+    if (!sth) return perl_alloc_undef();
+    stmt = (sqlite3_stmt *)sth->stmt;
+    rc = sqlite3_data_count(stmt) > 0 ? SQLITE_ROW : sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
+        sth->done = 1;
         return perl_alloc_undef();
     }
-
-    /* In a real implementation, we would:
-       1. Find the statement handle
-       2. Fetch the next row
-       3. Return row data
-    */
-    return perl_alloc_undef(); /* no more rows */
+    if (rc != SQLITE_ROW) {
+        perl_dbi_stmt_set_error(sth, sqlite3_errmsg((sqlite3 *)sth->dbh->db));
+        return perl_alloc_undef();
+    }
+    row = perl_dbi_fetch_row(stmt);
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) sth->done = 1;
+    return perl_ref_array(row);
 }
 
-/* Fetch all rows */
+/* Fetch all rows as array-ref of array-refs */
 PerlValue *perl_dbi_fetchall(PerlValue *sth_pv) {
-    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
+    PerlDBIStatement *sth = perl_dbi_get_sth(sth_pv);
+    sqlite3_stmt *stmt;
+    PerlArray *rows;
+    int rc;
+    if (!sth) return perl_alloc_undef();
+    stmt = (sqlite3_stmt *)sth->stmt;
+    rows = perl_array_new();
+    rc = sqlite3_data_count(stmt) > 0 ? SQLITE_ROW : sqlite3_step(stmt);
+    while (rc == SQLITE_ROW) {
+        PerlArray *row = perl_dbi_fetch_row(stmt);
+        PerlValue *row_ref = perl_ref_array(row);
+        perl_array_push(rows, row_ref);
+        perl_free(row_ref);
+        rc = sqlite3_step(stmt);
+    }
+    if (rc == SQLITE_DONE) sth->done = 1;
+    if (rc != SQLITE_DONE) {
+        perl_array_free(rows);
+        perl_dbi_stmt_set_error(sth, sqlite3_errmsg((sqlite3 *)sth->dbh->db));
         return perl_alloc_undef();
     }
-
-    /* In a real implementation, we would:
-       1. Find the statement handle
-       2. Fetch all rows
-       3. Return array of rows
-    */
-    PerlArray *arr = perl_array_new();
-    return perl_array_to_list_return(arr);
+    return perl_ref_array(rows);
 }
 
 /* Get number of rows affected */
 PerlValue *perl_dbi_rows(PerlValue *sth_pv) {
-    if (!sth_pv || sth_pv->tag == PERL_UNDEF) {
-        return perl_alloc_undef();
-    }
-
-    /* In a real implementation, we would:
-       1. Find the statement handle
-       2. Return number of rows affected
-    */
-    return perl_alloc_int(0);
+    PerlDBIStatement *sth = perl_dbi_get_sth(sth_pv);
+    if (!sth) return perl_alloc_undef();
+    return perl_alloc_int(sth->rows_affected);
 }
 
 /* Commit transaction */
 PerlValue *perl_dbi_commit(PerlValue *dbh_pv) {
-    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
+    PerlDBIHandle *dbh = perl_dbi_get_dbh(dbh_pv);
+    char *errmsg = NULL;
+    int rc;
+    if (!dbh) return perl_alloc_undef();
+    rc = sqlite3_exec((sqlite3 *)dbh->db, "COMMIT", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        perl_dbi_set_error(dbh, errmsg ? errmsg : "commit failed");
+        sqlite3_free(errmsg);
         return perl_alloc_undef();
     }
-
-    /* In a real implementation, we would:
-       1. Find the database handle
-       2. Commit transaction
-    */
-    return perl_alloc_int(1); /* success */
+    return perl_alloc_int(1);
 }
 
 /* Rollback transaction */
 PerlValue *perl_dbi_rollback(PerlValue *dbh_pv) {
-    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
+    PerlDBIHandle *dbh = perl_dbi_get_dbh(dbh_pv);
+    char *errmsg = NULL;
+    int rc;
+    if (!dbh) return perl_alloc_undef();
+    rc = sqlite3_exec((sqlite3 *)dbh->db, "ROLLBACK", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        perl_dbi_set_error(dbh, errmsg ? errmsg : "rollback failed");
+        sqlite3_free(errmsg);
         return perl_alloc_undef();
     }
-
-    /* In a real implementation, we would:
-       1. Find the database handle
-       2. Rollback transaction
-    */
-    return perl_alloc_int(1); /* success */
+    return perl_alloc_int(1);
 }
 
 /* Get error information */
 PerlValue *perl_dbi_error(PerlValue *dbh_pv) {
-    if (!dbh_pv || dbh_pv->tag == PERL_UNDEF) {
-        return perl_alloc_undef();
-    }
-
-    /* In a real implementation, we would:
-       1. Find the database handle
-       2. Return error information
-    */
-    return perl_alloc_string("No error");
+    PerlDBIHandle *dbh = perl_dbi_get_dbh(dbh_pv);
+    if (!dbh) return perl_alloc_undef();
+    return perl_alloc_string(dbh->last_error ? dbh->last_error : "");
 }

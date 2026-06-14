@@ -339,6 +339,11 @@ void CodeGen::declareRuntime() {
     RT("perl_get_autoload_name", pv);
     RT("perl_set_pos_str",      voidTy, pv, pv);
     RT("perl_runtime_require",  pv, i8p);
+    RT("perl_do_file",          pv, pv);
+    RT("perl_call_named_sub",   pv, i8p, av, Type::getInt32Ty(ctx_));
+    RT("perl_xs_load_library",  pv, pv);
+    RT("perl_xs_call_dynamic",  pv, pv, pv, pv, av);
+    RT("perl_dbi_connect",      pv, pv, pv, pv);
     RT("perl_local_restore_to", voidTy, Type::getInt32Ty(ctx_));
     /* special globals */
     RT("perl_get_input_sep",    pv);
@@ -3826,9 +3831,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RequireStmt: {
+        hasStringEval_ = true;
         Value *modStr = builder_.CreateGlobalStringPtr(n.sval);
         return callRT("perl_runtime_require", {modStr});
     }
+
+    case NK::DoFile:
+        hasStringEval_ = true;
+        return callRT("perl_do_file", {emitExpr(*n.left)});
 
     case NK::Redo: {
         if (!loopRedos_.empty()) {
@@ -6232,6 +6242,39 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
         return callRT("perl_isa_check", {a, b});
     }
+    if (n.name == "DBI::connect") {
+        Value *dsn  = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *user = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *pass = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+        Value *ret = callRT("perl_dbi_connect", {dsn, user, pass});
+        freeIfOwned(dsn);
+        freeIfOwned(user);
+        freeIfOwned(pass);
+        return ret;
+    }
+    if (n.name == "XS::load_library") {
+        Value *lib = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *ret = callRT("perl_xs_load_library", {lib});
+        freeIfOwned(lib);
+        return ret;
+    }
+    if (n.name == "XS::call") {
+        Value *lib = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *func = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *sig = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+        Value *av = callRT("perl_array_new", {});
+        for (size_t i = 3; i < n.args.size(); i++) {
+            Value *arg = emitExpr(*n.args[i]);
+            callRT("perl_array_push", {av, arg});
+            freeIfOwned(arg);
+        }
+        Value *ret = callRT("perl_xs_call_dynamic", {lib, func, sig, av});
+        callRT("perl_array_free", {av});
+        freeIfOwned(lib);
+        freeIfOwned(func);
+        freeIfOwned(sig);
+        return ret;
+    }
     if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
         /* Use push_nc (no-clone) for scalar args so we skip 63M clone/free per
            mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
@@ -6270,6 +6313,40 @@ Value *CodeGen::emitCall(const Node &n) {
         callCtx_ = 0;
         Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
         callRT("perl_pop_call_frame", {});
+        callRT("perl_array_free", {argsArr});
+        return retVal;
+    }
+    if (n.name.find("::") != std::string::npos) {
+        Value *argsArr = callRT("perl_array_new", {});
+        for (auto &arg : n.args) {
+            if (arg->kind == NK::ArrayVar) {
+                Value *av = lookupArray(arg->name);
+                if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
+            }
+            if (arg->kind == NK::HashVar) {
+                Value *hv = lookupHash(arg->name);
+                if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
+            }
+            if (Value *av = emitArrayPtr(*arg)) {
+                callRT("perl_array_extend", {argsArr, av});
+                continue;
+            }
+            Value *v = emitExpr(*arg);
+            callRT("perl_array_push", {argsArr, v});
+            freeIfOwned(v);
+        }
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *ctxVal;
+        if (callCtx_ == 1) {
+            ctxVal = ConstantInt::get(i32Ty, 1);
+        } else if (currentSubNeedsWantarray_) {
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        } else {
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        }
+        callCtx_ = 0;
+        Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
+        Value *retVal = callRT("perl_call_named_sub", {nameStr, argsArr, ctxVal});
         callRT("perl_array_free", {argsArr});
         return retVal;
     }
@@ -6334,6 +6411,15 @@ void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
     pushScope();
     fileScopeDepth_ = (int)scopes_.size() + 1;
     inMainBody_ = true;
+
+    /* register package-qualified subs before eval code runs */
+    for (auto *s : subs_) {
+        if (s->name.find("::") != std::string::npos) {
+            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+            auto *fn = mod_->getFunction(subLLVMName(s->name));
+            callRT("perl_register_method", {keyStr, fn});
+        }
+    }
 
     /* $_ available inside eval */
     Value *underscoreVal = callRT("perl_alloc_undef", {});

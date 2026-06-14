@@ -13,7 +13,7 @@ A Perl compiler that translates Perl source to LLVM IR and links a C runtime to 
 
 ```bash
 make        # produces ./perlc
-make test   # runs all test programs and prints their output
+make test   # runs assertion-based MVP contract tests
 make clean
 ```
 
@@ -26,7 +26,6 @@ make clean
 ./perlc -pm program.pl                  # install missing modules then compile
 ./perlc -i                              # interactive REPL mode
 ./perlc -i -p                           # REPL with pause after each statement
-./perlc -i --jit                        # REPL with JIT compilation (experimental)
 ```
 
 ### REPL Mode (`-i` / `--repl`)
@@ -52,20 +51,6 @@ Pauses after each statement in REPL mode for debugging:
 ```
 
 Press ENTER to continue, or 'q' to quit.
-
-### JIT Mode (`--jit`) [Experimental]
-
-Enable JIT compilation in REPL mode for variable persistence:
-
-```bash
-./perlc -i --jit
-```
-
-The JIT compiles code in-memory rather than writing to disk and invoking clang. This enables:
-- Faster REPL iteration (no external compilation)
-- Future variable persistence between statements
-
-Note: JIT mode is experimental. Use the default (external compilation) for production work.
 
 ## Implemented Features
 
@@ -164,27 +149,33 @@ Note: JIT mode is experimental. Use the default (external compilation) for produ
 - `wantarray`: context propagation implemented for list vs. scalar at call sites; `wantarray` builtin returns correct value within a sub
 - `tie` / `untie`: not implemented (use `opendir`/`readdir` for directories)
 - Regex modifier `x` (extended/whitespace-ignoring): not supported; `/e` (eval replacement) is supported
-- Runtime `require` / `do FILE`: modules only loaded at compile time via `use` inlining
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
 - `exists $h{a}{b}` chained subscript without arrow: use `$h{a}->{b}` instead
 - `or`/`and`/`not` precedence in `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0`); wrap in parens if needed
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
 - REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
-- JIT mode: experimental, may have stability issues
+- XS is an MVP FFI-style interface, not full Perl XS bootstrap/module compatibility
+- DBI support is currently the SQLite subset exercised by the contract tests
 
 **Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
 
 ## New Features Implemented
 
-### XS Interface
-- Dynamic loading of C libraries via `perl_xs_load()` function
-- Support for calling C functions from Perl code using XS-like interface
-- Function signature handling and proper argument passing
+### Runtime Loading
+- Runtime `require "path.pm"` support
+- `do "path.pl"` support with return value propagation and `$@` on load/parse/runtime failure
+- Shared file-loading path used by `require`, `do FILE`, and string `eval`
+
+### XS / FFI Interface
+- `XS::load_library("libname")` loads and caches shared libraries with `dlopen`
+- `XS::call($lib, "symbol", "signature", @args)` calls native functions through a constrained ABI bridge
+- Supported MVP types: `long`, `double`, `string`, `ptr`, `void`; supported across scalar-only signatures up to 4 arguments as validated by the contract tests
+- `ptr` values are opaque native pointers suitable for handles and buffers; null pointer returns map to `undef`
 
 ### DBI/SQLite Integration
-- Database connectivity framework with standard DBI functions
-- Support for database connections, prepared statements, and query execution
-- Integration with Perl's value system through `PerlValue*` return types
+- SQLite-backed DBI subset: `connect`, `prepare`, `execute`, `do`, `fetchrow_arrayref`, `fetchall_arrayref`, `rows`, `disconnect`, `errstr`
+- Prepared statements and result rows are represented as native runtime handle/value types
+- Errors propagate back into Perl-visible DBI error state and `$@` where applicable
 
 ### Concurrency (`threads` + `threads::shared`)
 - **`use threads`**: native pthreads; `threads->create`, `->join`, `->detach`, `->tid`, `->self`, `->list`, `->yield`; thread-local freelist/eval-stack
