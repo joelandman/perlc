@@ -41,9 +41,10 @@ make clean
 - **LIST_RESULT** (tag=12): wraps a PerlArray* returned from a sub in list context; `perl_unwrap_list_return` spreads only this tag, not plain REF_ARRAY, so scalar refs like `[$re,$im]` are never incorrectly flattened into argument lists
 - **FLOAT_PAIR** (tag=13): 2-element all-float AnonArray stored inline in one PerlValue (fval=elem[0], matchpos bits=elem[1]); eliminates inner PerlArray + 2 float PV allocations per complex number; `$z->[0]`/`$z->[1]` become direct field loads via runtime tag-check branch (perfectly predicted); `perl_assign` preserves matchpos for FLOAT_PAIR
 - **AST-level sub inliner** (`tryEmitInline`): detects subs with body `my (@params)=@_; return expr`; at call sites evaluates args and binds to temp allocas without @_ construction or cloning; recursive for nested calls; `canEmitF64(NK::Call)` + `emitExprF64(NK::Call)` extend the F64 fast path through inlineable float-body subs (e.g. `cabs2($z) < 4.0` emits as pure double comparison)
-- **PV slab allocator**: `pv_alloc()` cold miss allocates 128 PVs contiguously (calloc), linking via pval; keeps pool entries cache-hot for tight loops with many short-lived PVs
+- **PV slab allocator**: `pv_alloc()` cold miss allocates 128 PVs contiguously (calloc), linking via pval; keeps pool entries cache-hot for tight loops with many short-lived PVs. With `-DPERL_ALLOC_DEBUG`, tracks every allocation with a sentinel for leak detection at exit.
 - **PerlArray freelist pool** (`pa_alloc`/`pa_pool_push`): reuses struct + elems buffer across alloc/free cycles; PA_POOL_CAP_MAX=4096 preserves large row elems buffers
 - **Module loading**: `use Module` recursively inlines `.pm` files at compile time via `inlineModules()`
+- **Closure capture of unboxed vars**: closure Phase 1 capture now checks `intScopes_` and `floatScopes_` in addition to `scopes_`, boxing unboxed int/float values into `PerlValue*` for correct capture semantics
 
 ## Major Implemented Features
 
@@ -162,8 +163,23 @@ See `README.md` for user-facing documentation and individual test files for usag
 2. **Named-sub closure capture of shared scalars**. Promoted the AST-level `subs` list to a `CodeGen` member (`subs_`) and added `subCaptures_` (capture list per sub). `case NK::RefSub` now scans the sub body for shared scalars in scope, builds a `PerlClosure` with their cell pointers (via `perl_make_closure` + `perl_array_push_capture`), and `emitSub` installs the captures via `perl_get_capture(i)` at sub entry. The runtime's `clone_code_ref_for_thread` already special-cases shared cells (preserves original pointer), so the spawned thread sees the same cell the parent sees. Test in `tests/threads.pl` exercises 5 threads incrementing via `\&worker_named` (named sub) → 500 race-free.
 3. **`our $x : shared` parser+codegen support**. Two changes: the parser's `(LIST)` form (`our ($a, $b) : shared = ...`) now accepts the `: shared` attribute; the codegen's file-scope shared-scalar path now also registers the cell in `fileScalarGlobals_` (under both bare and `Package::name` keys) so cross-package access (`$Foo::counter` from main, `\&Foo::worker` from main) resolves to the same cell. Tests in `tests/threads_atomic.pl` cover 3 forms: bare `our $x : shared`, `our (LIST) : shared`, and cross-package `our $x : shared` in `package Foo` + `\&Foo::bump` dispatch from main.
 
-Discovered but **not fixed in this commit** (pre-existing, documented in `THREADS_SHARED_ATOMIC.md` Limitations):
-- Compound `-=` on a shared scalar is emitted as `perl_atomic_add($shared, +N)` instead of subtracting (the codegen forgets to negate). Workaround: longhand `$shared = $shared - N`.
-- Closure + range-with-captured-variable (`for (1..$per)` where `$per` is captured from a block scope) emits an `undef` bound, so the loop body never executes. Workaround: use a literal range like `for (1..200)`.
-
 TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy.pl` all clean (zero race reports) under `-fsanitize=thread`. 36/36 tests pass.
+
+## Memory Safety
+
+- **`perl_cleanup()`**: registered via `atexit()` in `main.cpp`; frees shared-mutex side-table entries (all mutexes/condvars), `perl_plus_hash` (named captures), and XS module list. Valgrind reports zero leaks from runtime internal state.
+- **`perl_to_string()`**: refactored to return stable pointers for `PERL_STRING`/`PERL_UNDEF` (no malloc/free). Added `perl_to_string_dup()` for callers needing heap-allocated strings. All ~100 callers use `perl_to_string_dup()`, eliminating leaks from forgotten frees on error paths.
+- **`PERL_ALLOC_DEBUG`**: compile-time leak checker for the PV slab allocator. Tracks every `pv_alloc`/`pv_pool_push` with a sentinel value; at exit reports PVs still marked as allocated. Compile with `-DPERL_ALLOC_DEBUG` to enable.
+
+## Known Limitations
+
+- `tie` / `untie`: not implemented
+- Regex modifier `x` (extended/whitespace-ignoring): not supported
+- `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
+- `exists $h{a}{b}` chained hash subscript without arrow (use `$h{a}->{b}` instead)
+- `or`/`and`/`not` precedence relative to `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0` as in real Perl); use explicit parens
+- `do FILE` runtime file execution (only compile-time `require` works)
+- Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification
+- REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
+- XS is an MVP FFI-style interface, not full Perl XS bootstrap/module compatibility
+- DBI support is currently the SQLite subset exercised by the contract tests

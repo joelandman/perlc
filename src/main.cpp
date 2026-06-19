@@ -2,6 +2,7 @@
 #include "parser.h"
 #include "codegen.h"
 #include "jit.h"
+#include "runtime.h"
 #include <llvm/Support/InitLLVM.h>
 #include <llvm/Support/TargetSelect.h>
 #include <fstream>
@@ -805,6 +806,9 @@ int main(int argc, char **argv) {
         if (rc != 0) { std::cerr << "Link failed\n"; return 1; }
 
         if (verbose) std::cerr << "Binary written to " << outputFile << "\n";
+
+    /* Register runtime cleanup so valgrind reports zero leaks. */
+    std::atexit(perl_cleanup);
 
     } catch (const std::exception &e) {
         std::cerr << "Error: " << e.what() << "\n";

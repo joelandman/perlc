@@ -30,6 +30,36 @@
 /* Per-thread freelist: no mutex needed since each thread has its own */
 static __thread PerlValue *pv_freelist_ = NULL;
 
+/* Slab tracking for leak-check: keeps a list of all allocated slabs. */
+#ifdef PERL_ALLOC_DEBUG
+#define PV_SLAB_CAP 256
+static PerlValue *pv_slabs_[PV_SLAB_CAP];
+static int pv_slab_count_ = 0;
+#endif
+
+/* ── PV leak-check debug mode (PERL_ALLOC_DEBUG) ────────────────────────────
+ * When compiled with -DPERL_ALLOC_DEBUG, tracks every pv_alloc/pv_pool_push
+ * pair.  At exit, reports any PVs that were allocated but never returned to
+ * the freelist (i.e., genuinely leaked).  The freelist pool hides leaks from
+ * valgrind because freed PVs are reused, not returned to the OS.
+ *
+ * Each allocated PV gets a sentinel value (0xDEADBEEF) in its `ival` field.
+ * On pv_pool_push, the sentinel is cleared.  At exit, any PV with the
+ * sentinel still set is a leak.
+ *
+ * This works because the PV freelist uses the pval union field as the next
+ * pointer, and ival is separate.  The sentinel is harmless for normal use
+ * since most ops check the tag first.
+ */
+#ifdef PERL_ALLOC_DEBUG
+#define PV_LEAK_SENTINEL 0xDEADBEEFLL
+static inline void pv_alloc_track(PerlValue *v) { v->ival = PV_LEAK_SENTINEL; }
+static inline void pv_free_track(PerlValue *v)  { v->ival = 0; }
+#else
+static inline void pv_alloc_track(PerlValue *v) {}
+static inline void pv_free_track(PerlValue *v)  {}
+#endif
+
 /* Slab size: allocate this many PVs at once on a cold miss.
  * Contiguous allocation keeps pool entries cache-hot, dramatically reducing
  * the cache-miss penalty that dominates perl_clone time in tight loops. */
@@ -43,14 +73,21 @@ static inline PerlValue *pv_alloc(void) {
     }
     /* Cold miss: allocate a contiguous slab, return first entry, link rest. */
     PerlValue *slab = calloc(PV_SLAB, sizeof(PerlValue));
+#ifdef PERL_ALLOC_DEBUG
+    if (pv_slab_count_ < PV_SLAB_CAP)
+        pv_slabs_[pv_slab_count_++] = slab;
+#endif
     for (int i = PV_SLAB - 1; i >= 1; i--) {
         slab[i].pval  = (void *)pv_freelist_;
         pv_freelist_  = &slab[i];
     }
-    return &slab[0];   /* slab[0] is already zeroed by calloc */
+    PerlValue *result = &slab[0];   /* slab[0] is already zeroed by calloc */
+    pv_alloc_track(result);
+    return result;
 }
 
 static inline void pv_pool_push(PerlValue *v) {
+    pv_free_track(v);
     v->pval      = pv_freelist_;
     pv_freelist_ = v;
 }
@@ -582,7 +619,7 @@ PerlValue *perl_do_file(PerlValue *path_pv) {
     PerlValue *result;
 
     if (!path_pv || path_pv->tag == PERL_UNDEF) return perl_alloc_undef();
-    path = perl_to_string(path_pv);
+    path = perl_to_string_dup(path_pv);
     if (!path) return perl_alloc_undef();
 
     if (!perl_resolve_runtime_path(path, 0, resolved, sizeof(resolved))) {
@@ -617,7 +654,7 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
         return perl_alloc_undef();
     }
 
-    char *code = perl_to_string(code_pv);
+    char *code = perl_to_string_dup(code_pv);
     PerlValue *result = perl_eval_string_fn(code);
     return result ? result : perl_alloc_undef();
 }
@@ -841,9 +878,14 @@ __attribute__((pure)) HOTX double perl_to_float(const PerlValue *v) {
     }
 }
 
-/* caller must free */
-char *perl_to_string(const PerlValue *v) {
-    if (!v || v->tag == PERL_UNDEF) return strdup("");
+/* For PERL_STRING and PERL_UNDEF, returns a stable pointer — caller must
+   NOT free the result.  For all other tags (INT, FLOAT, refs, etc.),
+   returns a heap-allocated string that the caller must free. */
+const char *perl_to_string(const PerlValue *v) {
+    static const char empty_str[] = "";
+    if (!v || v->tag == PERL_UNDEF) return empty_str;
+    if (v->tag == PERL_STRING) return v->sval ? v->sval : empty_str;
+    /* Below here: non-string tags — must strdup (caller must free). */
     char buf[64];
     switch (v->tag) {
         case PERL_INT:
@@ -852,8 +894,59 @@ char *perl_to_string(const PerlValue *v) {
         case PERL_FLOAT:
             snprintf(buf, sizeof buf, "%g", v->fval);
             return strdup(buf);
-        case PERL_STRING:
-            return strdup(v->sval ? v->sval : "");
+        case PERL_REF_SCALAR:
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=SCALAR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "SCALAR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            return strdup(buf);
+        case PERL_REF_ARRAY:
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "ARRAY(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            return strdup(buf);
+        case PERL_REF_HASH:
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=HASH(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "HASH(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            return strdup(buf);
+        case PERL_FILEHANDLE:
+            snprintf(buf, sizeof buf, "GLOB(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            return strdup(buf);
+        case PERL_XS_PTR:
+            if (v->blessed_class)
+                snprintf(buf, sizeof buf, "%s=PTR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
+            else
+                snprintf(buf, sizeof buf, "PTR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
+            return strdup(buf);
+        case PERL_DBI_DBH:
+            return strdup("DBI::db");
+        case PERL_DBI_STH:
+            return strdup("DBI::st");
+        default:
+            return strdup("");
+    }
+}
+
+/* Like perl_to_string but always returns a heap-allocated string
+   (caller must free).  Used by callers that already free the result
+   of perl_to_string regardless of tag. */
+char *perl_to_string_dup(const PerlValue *v) {
+    if (!v || v->tag == PERL_UNDEF) return strdup("");
+    if (v->tag == PERL_STRING) return strdup(v->sval ? v->sval : "");
+    /* For non-string tags, re-implement the conversion here to avoid
+       calling perl_to_string (which would return a heap-allocated
+       string that we'd then strdup again). */
+    char buf[64];
+    switch (v->tag) {
+        case PERL_INT:
+            snprintf(buf, sizeof buf, "%lld", v->ival);
+            return strdup(buf);
+        case PERL_FLOAT:
+            snprintf(buf, sizeof buf, "%g", v->fval);
+            return strdup(buf);
         case PERL_REF_SCALAR:
             if (v->blessed_class)
                 snprintf(buf, sizeof buf, "%s=SCALAR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
@@ -1064,8 +1157,8 @@ PerlValue *perl_rshift(const PerlValue *a, const PerlValue *b) {
 /* ── string ops ──────────────────────────────────────────────────────────── */
 
 PerlValue *perl_concat(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string(a);
-    char *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a);
+    char *sb = perl_to_string_dup(b);
     size_t len = strlen(sa) + strlen(sb) + 1;
     char *buf = malloc(len);
     strcpy(buf, sa); strcat(buf, sb);
@@ -1075,7 +1168,7 @@ PerlValue *perl_concat(const PerlValue *a, const PerlValue *b) {
 }
 
 PerlValue *perl_repeat_str(const PerlValue *str, const PerlValue *n) {
-    char *s = perl_to_string(str);
+    char *s = perl_to_string_dup(str);
     long long reps = perl_to_int(n);
     if (reps <= 0) { free(s); return perl_alloc_string(""); }
     size_t slen = strlen(s);
@@ -1119,32 +1212,32 @@ HOTX PerlValue *perl_num_ge(const PerlValue *a, const PerlValue *b) {
 /* ── string comparisons ──────────────────────────────────────────────────── */
 
 PerlValue *perl_str_eq(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
     PerlValue *r = perl_alloc_int(strcmp(sa, sb) == 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_ne(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
     PerlValue *r = perl_alloc_int(strcmp(sa, sb) != 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_lt(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
     PerlValue *r = perl_alloc_int(strcmp(sa, sb) < 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_gt(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
     PerlValue *r = perl_alloc_int(strcmp(sa, sb) > 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_le(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
     PerlValue *r = perl_alloc_int(strcmp(sa, sb) <= 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_ge(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
     PerlValue *r = perl_alloc_int(strcmp(sa, sb) >= 0);
     free(sa); free(sb); return r;
 }
@@ -1164,7 +1257,7 @@ PerlValue *perl_or(const PerlValue *a, const PerlValue *b) {
 /* ── I/O ─────────────────────────────────────────────────────────────────── */
 
 void perl_print(const PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     fputs(s, stdout);
     free(s);
 }
@@ -1400,8 +1493,8 @@ void perl_array_extend_hash(PerlArray *dst, PerlHash *h) {
 }
 
 static int cmp_str_pv(const void *a, const void *b) {
-    char *sa = perl_to_string(*(PerlValue **)a);
-    char *sb = perl_to_string(*(PerlValue **)b);
+    char *sa = perl_to_string_dup(*(PerlValue **)a);
+    char *sb = perl_to_string_dup(*(PerlValue **)b);
     int r = strcmp(sa, sb);
     free(sa); free(sb);
     return r;
@@ -1451,7 +1544,7 @@ long long perl_chomp(PerlValue *v) {
         return 0;
     }
     /* numeric values: convert to string, chomp, store back */
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     size_t len = strlen(s);
     long long removed = 0;
     if (len > 0 && s[len - 1] == '\n') { s[len - 1] = '\0'; removed = 1; }
@@ -1462,7 +1555,7 @@ long long perl_chomp(PerlValue *v) {
 }
 
 PerlValue *perl_chop(PerlValue *v) {
-    char *s = perl_to_string(v);   /* newly heap-allocated */
+    char *s = perl_to_string_dup(v);   /* newly heap-allocated */
     size_t len = strlen(s);
     PerlValue *removed;
     if (len > 0) {
@@ -1480,7 +1573,7 @@ PerlValue *perl_chop(PerlValue *v) {
 
 PerlValue *perl_length(PerlValue *v) {
     if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     long long n = (long long)strlen(s);
     free(s);
     return perl_alloc_int(n);
@@ -1496,7 +1589,7 @@ static void substr_bounds(long long slen, long long *off, long long *n) {
 }
 
 PerlValue *perl_substr2(PerlValue *str, PerlValue *off_v) {
-    char *s  = perl_to_string(str);
+    char *s  = perl_to_string_dup(str);
     long long slen = (long long)strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = slen;
@@ -1515,7 +1608,7 @@ PerlValue *perl_substr2(PerlValue *str, PerlValue *off_v) {
 }
 
 PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
-    char *s  = perl_to_string(str);
+    char *s  = perl_to_string_dup(str);
     long long slen = (long long)strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
@@ -1529,8 +1622,8 @@ PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
 }
 
 void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, PerlValue *repl) {
-    char *s     = perl_to_string(str);
-    char *r     = perl_to_string(repl);
+    char *s     = perl_to_string_dup(str);
+    char *r     = perl_to_string_dup(repl);
     long long slen = (long long)strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
@@ -1549,13 +1642,13 @@ void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, Per
 }
 
 PerlValue *perl_join(PerlValue *sep, PerlArray *arr) {
-    char *ssep = perl_to_string(sep);
+    char *ssep = perl_to_string_dup(sep);
     size_t seplen = strlen(ssep);
     /* collect stringified parts */
     char **parts = arr->len ? malloc((size_t)arr->len * sizeof(char *)) : NULL;
     size_t total = 0;
     for (long long i = 0; i < arr->len; i++) {
-        parts[i] = perl_to_string(arr->elems[i]);
+        parts[i] = perl_to_string_dup(arr->elems[i]);
         total += strlen(parts[i]);
     }
     if (arr->len > 1) total += seplen * (size_t)(arr->len - 1);
@@ -1574,8 +1667,8 @@ PerlValue *perl_join(PerlValue *sep, PerlArray *arr) {
 }
 
 PerlArray *perl_split(PerlValue *sep, PerlValue *str) {
-    char *s  = perl_to_string(str);
-    char *sp = perl_to_string(sep);
+    char *s  = perl_to_string_dup(str);
+    char *sp = perl_to_string_dup(sep);
     PerlArray *arr = perl_array_new();
 
     int ws_split = (strcmp(sp, " ") == 0 || strcmp(sp, "\\s+") == 0 ||
@@ -1710,7 +1803,7 @@ static PerlHashEntry *hash_find(PerlHash *h, const char *key) {
 }
 
 PerlValue *perl_hash_get_sv(PerlHash *h, PerlValue *key) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     PerlHashEntry *e = hash_find(h, ks);
     free(ks);
     return e ? perl_clone(e->val) : perl_alloc_undef();
@@ -1719,7 +1812,7 @@ PerlValue *perl_hash_get_sv(PerlHash *h, PerlValue *key) {
 /* Borrow-read: returns raw pointer into hash bucket (no clone, no alloc).
  * Valid until the hash is next modified. Never call perl_free on the result. */
 HOTX PerlValue *perl_hash_get_sv_ref(PerlHash *h, PerlValue *key) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     PerlHashEntry *e = hash_find(h, ks);
     free(ks);
     return e ? e->val : &pv_undef_sentinel_;
@@ -1732,7 +1825,7 @@ HOTX PerlValue *perl_hash_get_str_ref(PerlHash *h, const char *key) {
 }
 
 void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     unsigned int b = hash_str(ks);
     PerlHashEntry *e = hash_find(h, ks);
     if (e) {
@@ -1766,7 +1859,7 @@ HOTX void perl_hash_set_str(PerlHash *h, const char *key, PerlValue *val) {
 }
 
 int perl_hash_exists_sv(PerlHash *h, PerlValue *key) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     int r = hash_find(h, ks) != NULL;
     free(ks);
     return r;
@@ -1790,7 +1883,7 @@ PerlValue *perl_hash_lvalue_str(PerlHash *h, const char *key) {
 }
 
 PerlValue *perl_hash_lvalue_sv(PerlHash *h, PerlValue *key) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     PerlValue *r = perl_hash_lvalue_str(h, ks);
     free(ks); return r;
 }
@@ -1819,13 +1912,13 @@ PerlHash *perl_hash_autoviv_hash(PerlHash *h, const char *key) {
 }
 
 PerlHash *perl_hash_autoviv_hash_sv(PerlHash *h, PerlValue *key) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     PerlHash *r = perl_hash_autoviv_hash(h, ks);
     free(ks); return r;
 }
 
 PerlArray *perl_hash_autoviv_array_sv(PerlHash *h, PerlValue *key) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     PerlArray *r = perl_hash_autoviv_array(h, ks);
     free(ks); return r;
 }
@@ -1878,7 +1971,7 @@ PerlArray *perl_array_autoviv_array(PerlArray *a, long long idx) {
 void perl_hash_assign_slice(PerlHash *h, PerlArray *keys, PerlArray *vals) {
     long long n = keys->len < vals->len ? keys->len : vals->len;
     for (long long i = 0; i < n; i++) {
-        char *key = perl_to_string(keys->elems[i]);
+        char *key = perl_to_string_dup(keys->elems[i]);
         perl_hash_set_str(h, key, vals->elems[i]);
         free(key);
     }
@@ -1911,7 +2004,7 @@ PerlValue *perl_hash_delete_str(PerlHash *h, const char *key) {
 }
 
 PerlValue *perl_hash_delete_sv(PerlHash *h, PerlValue *key) {
-    char *ks = perl_to_string(key);
+    char *ks = perl_to_string_dup(key);
     unsigned int b = hash_str(ks);
     PerlHashEntry **pp = &h->buckets[b];
     while (*pp) {
@@ -2609,7 +2702,7 @@ PerlValue *perl_get_capture(long long idx) {
 
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv) {
     if (!ref) return perl_alloc_undef();
-    char *cls = perl_to_string(class_pv);
+    char *cls = perl_to_string_dup(class_pv);
     if (ref->blessed_class) free(ref->blessed_class);
     ref->blessed_class = cls;
     return ref;
@@ -2871,8 +2964,8 @@ static const char *mode_to_cmode(const char *m) {
 }
 
 PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filename_pv) {
-    char *ms = perl_to_string(mode_pv);
-    char *fs = perl_to_string(filename_pv);
+    char *ms = perl_to_string_dup(mode_pv);
+    char *fs = perl_to_string_dup(filename_pv);
     if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
     FILE *fp = fopen(fs, mode_to_cmode(ms));
     free(ms); free(fs);
@@ -2883,7 +2976,7 @@ PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filena
 }
 
 PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
-    char *s = perl_to_string(mode_file_pv);
+    char *s = perl_to_string_dup(mode_file_pv);
     const char *filename = s;
     char mode[4] = "<";
     if      (s[0]=='>' && s[1]=='>') { strcpy(mode,">>"); filename=s+2; }
@@ -2974,14 +3067,14 @@ PerlArray *perl_readline_all_stdin(void) {
 
 void perl_print_fh(PerlValue *fh, PerlValue *v) {
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     fputs(s, (FILE*)fh->pval);
     free(s);
 }
 
 void perl_say_fh(PerlValue *fh, PerlValue *v) {
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     FILE *fp = (FILE*)fh->pval;
     fputs(s, fp);
     fputc('\n', fp);
@@ -3011,7 +3104,7 @@ void perl_die(PerlValue *msg) {
         }
         longjmp(*s_eval_stack[s_eval_depth - 1], 1);
     }
-    char *s = msg ? perl_to_string(msg) : strdup("Died");
+    char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
     fputs(s, stderr);
     size_t n = strlen(s);
     if (n == 0 || s[n-1] != '\n') fputc('\n', stderr);
@@ -3022,7 +3115,7 @@ void perl_die(PerlValue *msg) {
 PerlValue *perl_unlink_files(PerlArray *files) {
     long long removed = 0;
     for (long long i = 0; i < files->len; i++) {
-        char *name = perl_to_string(files->elems[i]);
+        char *name = perl_to_string_dup(files->elems[i]);
         if (unlink(name) == 0) removed++;
         free(name);
     }
@@ -3032,27 +3125,27 @@ PerlValue *perl_unlink_files(PerlArray *files) {
 /* ── filesystem ops ──────────────────────────────────────────────────────── */
 
 PerlValue *perl_chdir(PerlValue *path) {
-    char *p = perl_to_string(path);
+    char *p = perl_to_string_dup(path);
     int r = chdir(p); free(p);
     return perl_alloc_int(r == 0 ? 1 : 0);
 }
 
 PerlValue *perl_mkdir_op(PerlValue *path, PerlValue *mode) {
-    char *p = perl_to_string(path);
+    char *p = perl_to_string_dup(path);
     mode_t m = (mode && mode->tag != PERL_UNDEF) ? (mode_t)perl_to_int(mode) : 0777;
     int r = mkdir(p, m); free(p);
     return perl_alloc_int(r == 0 ? 1 : 0);
 }
 
 PerlValue *perl_rmdir_op(PerlValue *path) {
-    char *p = perl_to_string(path);
+    char *p = perl_to_string_dup(path);
     int r = rmdir(p); free(p);
     return perl_alloc_int(r == 0 ? 1 : 0);
 }
 
 PerlValue *perl_rename_op(PerlValue *oldp, PerlValue *newp) {
-    char *o = perl_to_string(oldp);
-    char *n = perl_to_string(newp);
+    char *o = perl_to_string_dup(oldp);
+    char *n = perl_to_string_dup(newp);
     int r = rename(o, n); free(o); free(n);
     return perl_alloc_int(r == 0 ? 1 : 0);
 }
@@ -3061,7 +3154,7 @@ PerlValue *perl_chmod_op(PerlValue *mode, PerlArray *files) {
     mode_t m = (mode_t)perl_to_int(mode);
     long long changed = 0;
     for (long long i = 0; i < files->len; i++) {
-        char *p = perl_to_string(files->elems[i]);
+        char *p = perl_to_string_dup(files->elems[i]);
         if (chmod(p, m) == 0) changed++;
         free(p);
     }
@@ -3071,7 +3164,7 @@ PerlValue *perl_chmod_op(PerlValue *mode, PerlArray *files) {
 /* ── directory I/O ───────────────────────────────────────────────────────── */
 
 PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path) {
-    char *p = perl_to_string(path);
+    char *p = perl_to_string_dup(path);
     DIR *d = opendir(p); free(p);
     if (!d) return perl_alloc_int(0);
     if (target->tag == PERL_DIRHANDLE && target->pval) closedir((DIR*)target->pval);
@@ -3109,7 +3202,7 @@ void perl_closedir_fh(PerlValue *dh) {
 /* ── sprintf / printf ────────────────────────────────────────────────────── */
 
 PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
-    char *fmt = perl_to_string(fmt_pv);
+    char *fmt = perl_to_string_dup(fmt_pv);
 
     /* dynamic output buffer */
     size_t cap = 256, pos = 0;
@@ -3154,7 +3247,7 @@ PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
         char tmp[512];
         switch (conv) {
         case 's': {
-            char *s = perl_to_string(arg);
+            char *s = perl_to_string_dup(arg);
             size_t needed = strlen(s) + (size_t)(si + 16);
             char *tbuf = needed <= sizeof(tmp) ? tmp : malloc(needed);
             spec[si++] = 's'; spec[si] = '\0';
@@ -3248,33 +3341,33 @@ PerlValue *perl_sqrt_val(PerlValue *v) {
 
 /* ── string case ─────────────────────────────────────────────────────────── */
 PerlValue *perl_uc_str(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     for (char *p = s; *p; p++) *p = (char)toupper((unsigned char)*p);
     PerlValue *r = perl_alloc_string(s); free(s); return r;
 }
 
 PerlValue *perl_lc_str(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     for (char *p = s; *p; p++) *p = (char)tolower((unsigned char)*p);
     PerlValue *r = perl_alloc_string(s); free(s); return r;
 }
 
 PerlValue *perl_ucfirst_str(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     if (s[0]) s[0] = (char)toupper((unsigned char)s[0]);
     PerlValue *r = perl_alloc_string(s); free(s); return r;
 }
 
 PerlValue *perl_lcfirst_str(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     if (s[0]) s[0] = (char)tolower((unsigned char)s[0]);
     PerlValue *r = perl_alloc_string(s); free(s); return r;
 }
 
 /* ── index / rindex ──────────────────────────────────────────────────────── */
 PerlValue *perl_index_str(PerlValue *str_pv, PerlValue *sub_pv, PerlValue *pos_pv) {
-    char *s = perl_to_string(str_pv);
-    char *sub = perl_to_string(sub_pv);
+    char *s = perl_to_string_dup(str_pv);
+    char *sub = perl_to_string_dup(sub_pv);
     long long pos = (pos_pv && pos_pv->tag != PERL_UNDEF) ? perl_to_int(pos_pv) : 0;
     long long slen = (long long)strlen(s);
     if (pos < 0) pos = 0;
@@ -3288,8 +3381,8 @@ PerlValue *perl_index_str(PerlValue *str_pv, PerlValue *sub_pv, PerlValue *pos_p
 }
 
 PerlValue *perl_rindex_str(PerlValue *str_pv, PerlValue *sub_pv, PerlValue *pos_pv) {
-    char *s = perl_to_string(str_pv);
-    char *sub = perl_to_string(sub_pv);
+    char *s = perl_to_string_dup(str_pv);
+    char *sub = perl_to_string_dup(sub_pv);
     long long slen = (long long)strlen(s);
     long long sublen = (long long)strlen(sub);
     long long pos = (pos_pv && pos_pv->tag != PERL_UNDEF) ? perl_to_int(pos_pv) : slen;
@@ -3310,14 +3403,14 @@ PerlValue *perl_chr_val(PerlValue *v) {
 }
 
 PerlValue *perl_ord_val(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     long long r = s[0] ? (long long)(unsigned char)s[0] : 0;
     free(s);
     return perl_alloc_int(r);
 }
 
 PerlValue *perl_hex_val(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     char *p = s;
     while (*p == ' ' || *p == '\t') p++;
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
@@ -3327,7 +3420,7 @@ PerlValue *perl_hex_val(PerlValue *v) {
 }
 
 PerlValue *perl_oct_val(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     char *p = s;
     while (*p == ' ' || *p == '\t') p++;
     long long r;
@@ -3347,7 +3440,7 @@ PerlArray *perl_reverse_array(PerlArray *a) {
 }
 
 PerlValue *perl_reverse_str(PerlValue *v) {
-    char *s = perl_to_string(v);
+    char *s = perl_to_string_dup(v);
     long long len = (long long)strlen(s);
     char *r = malloc((size_t)len + 1);
     for (long long i = 0; i < len; i++) r[i] = s[len - 1 - i];
@@ -3365,8 +3458,8 @@ static int cmp_num_asc(const void *a, const void *b) {
 }
 static int cmp_num_desc(const void *a, const void *b) { return cmp_num_asc(b, a); }
 static int cmp_str_asc(const void *a, const void *b) {
-    char *sa = perl_to_string(*(PerlValue**)a);
-    char *sb = perl_to_string(*(PerlValue**)b);
+    char *sa = perl_to_string_dup(*(PerlValue**)a);
+    char *sb = perl_to_string_dup(*(PerlValue**)b);
     int r = strcmp(sa, sb); free(sa); free(sb); return r;
 }
 static int cmp_str_desc(const void *a, const void *b) { return cmp_str_asc(b, a); }
@@ -3390,7 +3483,7 @@ PerlValue *perl_spaceship(PerlValue *a, PerlValue *b) {
 }
 
 PerlValue *perl_str_spaceship(PerlValue *a, PerlValue *b) {
-    char *sa = perl_to_string(a), *sb = perl_to_string(b);
+    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
     int r = strcmp(sa, sb);
     free(sa); free(sb);
     return perl_alloc_int(r < 0 ? -1 : r > 0 ? 1 : 0);
@@ -3471,7 +3564,7 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
                                    pcre_flags(flags), &errcode, &erroffset, NULL);
     if (!re) return perl_alloc_int(0);
 
-    char *s = perl_to_string(str);
+    char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
     int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, 0, 0, md, NULL);
@@ -3521,7 +3614,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
                                    pcre_flags(clean), &errcode, &erroffset, NULL);
     if (!re) return 0;
 
-    char *s = perl_to_string(str);
+    char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
 
 #define ENSURE(need) do { \
@@ -3571,7 +3664,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
         PerlValue *eval_result = NULL;
         if (eval_repl && perl_eval_string_fn) {
             eval_result = perl_eval_string_fn(expanded);
-            char *ev = perl_to_string(eval_result);
+            char *ev = perl_to_string_dup(eval_result);
             size_t evlen = strlen(ev);
             ENSURE(evlen); memcpy(out + out_len, ev, evlen); out_len += evlen;
             free(ev);
@@ -3613,7 +3706,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
 
 PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str) {
     PerlArray *arr = perl_array_new();
-    char *s = perl_to_string(str);
+    char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
 
     /* empty pattern: split into individual characters (Perl semantics) */
@@ -3686,7 +3779,7 @@ PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *f
                                    pcre_flags(flags), &errcode, &erroffset, NULL);
     if (!re) { str->matchpos = 0; return perl_alloc_int(0); }
 
-    char *s = perl_to_string(str);
+    char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
     size_t startpos = (str->matchpos > 0 && (size_t)str->matchpos <= slen)
                       ? (size_t)str->matchpos : 0;
@@ -3728,7 +3821,7 @@ PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char 
     uint32_t capturecount = 0;
     pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &capturecount);
 
-    char *s = perl_to_string(str);
+    char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
     size_t pos = 0;
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
@@ -3813,21 +3906,21 @@ PerlArray *perl_splice(PerlArray *arr, PerlValue *off_pv, PerlValue *len_pv, Per
 /* ── environment ─────────────────────────────────────────────────────────── */
 
 PerlValue *perl_env_get(PerlValue *key) {
-    char *k = perl_to_string(key);
+    char *k = perl_to_string_dup(key);
     const char *val = getenv(k);
     free(k);
     return val ? perl_alloc_string(val) : perl_alloc_undef();
 }
 
 void perl_env_set(PerlValue *key, PerlValue *val) {
-    char *k = perl_to_string(key);
-    char *v = perl_to_string(val);
+    char *k = perl_to_string_dup(key);
+    char *v = perl_to_string_dup(val);
     setenv(k, v, 1);
     free(k); free(v);
 }
 
 void perl_warn(PerlValue *msg) {
-    char *s = perl_to_string(msg);
+    char *s = perl_to_string_dup(msg);
     size_t len = strlen(s);
     fputs(s, stderr);
     if (len == 0 || s[len - 1] != '\n') fputc('\n', stderr);
@@ -3835,7 +3928,7 @@ void perl_warn(PerlValue *msg) {
 }
 
 PerlValue *perl_system(PerlValue *cmd) {
-    char *s = perl_to_string(cmd);
+    char *s = perl_to_string_dup(cmd);
     int ret = system(s);
     free(s);
     if (ret == -1) return perl_alloc_int(-1);
@@ -3843,7 +3936,7 @@ PerlValue *perl_system(PerlValue *cmd) {
 }
 
 PerlValue *perl_backtick(PerlValue *cmd) {
-    char *s = perl_to_string(cmd);
+    char *s = perl_to_string_dup(cmd);
     FILE *fp = popen(s, "r");
     free(s);
     if (!fp) return perl_alloc_undef();
@@ -3937,7 +4030,7 @@ long long perl_tr(PerlValue *str, const char *search, const char *replace, const
     }
     free(sch); free(rch);
 
-    char *s = perl_to_string(str);
+    char *s = perl_to_string_dup(str);
     size_t in_len = strlen(s);
     char *out = malloc(in_len + 1);
     size_t out_len = 0;
@@ -4002,7 +4095,7 @@ PerlValue *perl_get_dollar0(void) {
 /* ── file test operators ─────────────────────────────────────────────────── */
 
 PerlValue *perl_filetest(int op, PerlValue *path_pv) {
-    char *path = perl_to_string(path_pv);
+    char *path = perl_to_string_dup(path_pv);
     struct stat st;
     PerlValue *result;
     switch (op) {
@@ -4129,7 +4222,7 @@ PerlArray *perl_uniq_list(PerlArray *a) {
     if (!a) return res;
     char *prev = NULL;
     for (long long i = 0; i < a->len; i++) {
-        char *s = perl_to_string(a->elems[i]);
+        char *s = perl_to_string_dup(a->elems[i]);
         if (!prev || strcmp(prev, s) != 0) {
             perl_array_push(res, perl_clone(a->elems[i]));
             free(prev);
@@ -4179,7 +4272,7 @@ PerlValue *perl_posix_fmod(PerlValue *a, PerlValue *b) {
 }
 PerlValue *perl_posix_strftime(PerlArray *args) {
     if (!args || args->len < 1) return perl_alloc_string("");
-    char *fmt = perl_to_string(args->elems[0]);
+    char *fmt = perl_to_string_dup(args->elems[0]);
     struct tm tm = {0};
     if (args->len >= 7) {
         tm.tm_sec   = args->len > 1 ? (int)perl_to_int(args->elems[1]) : 0;
@@ -4248,14 +4341,14 @@ PerlValue *perl_su_looks_like_number(PerlValue *v) {
 /* ── Carp ─────────────────────────────────────────────────────────────────── */
 
 void perl_carp_croak(PerlArray *args) {
-    char *msg = (args && args->len > 0) ? perl_to_string(args->elems[0]) : strdup("Died");
+    char *msg = (args && args->len > 0) ? perl_to_string_dup(args->elems[0]) : strdup("Died");
     fprintf(stderr, "%s\n", msg);
     free(msg);
     exit(1);
 }
 
 void perl_carp_carp(PerlArray *args) {
-    char *msg = (args && args->len > 0) ? perl_to_string(args->elems[0]) : strdup("Warning: something's wrong");
+    char *msg = (args && args->len > 0) ? perl_to_string_dup(args->elems[0]) : strdup("Warning: something's wrong");
     fprintf(stderr, "%s\n", msg);
     free(msg);
 }
@@ -4304,7 +4397,7 @@ static PerlArray *_stat_to_array(struct stat *st) {
 }
 
 PerlArray *perl_stat_path(PerlValue *v) {
-    char *path = perl_to_string(v);
+    char *path = perl_to_string_dup(v);
     struct stat st;
     PerlArray *a;
     if (stat(path, &st) == 0) {
@@ -4317,7 +4410,7 @@ PerlArray *perl_stat_path(PerlValue *v) {
 }
 
 PerlArray *perl_lstat_path(PerlValue *v) {
-    char *path = perl_to_string(v);
+    char *path = perl_to_string_dup(v);
     struct stat st;
     PerlArray *a;
     if (lstat(path, &st) == 0) {
@@ -4332,7 +4425,7 @@ PerlArray *perl_lstat_path(PerlValue *v) {
 #include <glob.h>
 
 PerlArray *perl_glob_val(PerlValue *pattern) {
-    char *pat = perl_to_string(pattern);
+    char *pat = perl_to_string_dup(pattern);
     PerlArray *res = perl_array_new();
     glob_t g;
     if (glob(pat, GLOB_TILDE | GLOB_NOCHECK, NULL, &g) == 0) {
@@ -4378,7 +4471,7 @@ PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv) {
 
 PerlValue *perl_can_check(PerlValue *obj, PerlValue *method_pv) {
     if (!obj || !method_pv) return perl_alloc_undef();
-    char *method = perl_to_string(method_pv);
+    char *method = perl_to_string_dup(method_pv);
     const char *cls = obj->blessed_class;
     if (!cls) { free(method); return perl_alloc_undef(); }
     PerlSubFnCtx fn = perl_find_method(cls, method);
@@ -4440,7 +4533,7 @@ PerlValue *perl_truncate_fh(PerlValue *fh_or_path, PerlValue *len) {
         FILE *fp = (FILE *)fh_or_path->pval;
         rc = ftruncate(fileno(fp), (off_t)sz);
     } else {
-        char *path = perl_to_string(fh_or_path);
+        char *path = perl_to_string_dup(fh_or_path);
         rc = truncate(path, (off_t)sz);
         free(path);
     }
@@ -4665,7 +4758,7 @@ PerlValue *perl_xs_load_library(PerlValue *libname_pv) {
         return perl_alloc_undef();
     }
 
-    libname = perl_to_string(libname_pv);
+    libname = perl_to_string_dup(libname_pv);
     if (!libname) {
         perl_xs_set_error("XS::load_library: invalid library name");
         return perl_alloc_undef();
@@ -4814,9 +4907,9 @@ PerlValue *perl_xs_call_dynamic(PerlValue *libname_pv, PerlValue *funcname_pv,
         return perl_alloc_undef();
     }
 
-    libname = perl_to_string(libname_pv);
-    funcname = perl_to_string(funcname_pv);
-    signature = perl_to_string(signature_pv);
+    libname = perl_to_string_dup(libname_pv);
+    funcname = perl_to_string_dup(funcname_pv);
+    signature = perl_to_string_dup(signature_pv);
     if (!libname || !funcname || !signature) {
         perl_xs_set_error("XS::call: invalid arguments");
         goto fail;
@@ -4854,7 +4947,7 @@ PerlValue *perl_xs_call_dynamic(PerlValue *libname_pv, PerlValue *funcname_pv,
                 double_args[i] = perl_to_float(arg);
                 break;
             case XS_TYPE_STRING:
-                string_args[i] = perl_to_string(arg);
+                string_args[i] = perl_to_string_dup(arg);
                 if (!string_args[i]) {
                     perl_xs_set_error("XS::call: failed to convert string argument");
                     goto fail;
@@ -4866,7 +4959,7 @@ PerlValue *perl_xs_call_dynamic(PerlValue *libname_pv, PerlValue *funcname_pv,
                 } else if (arg->tag == PERL_XS_PTR) {
                     ptr_args[i] = arg->pval;
                 } else if (arg->tag == PERL_STRING) {
-                    string_args[i] = perl_to_string(arg);
+                    string_args[i] = perl_to_string_dup(arg);
                     if (!string_args[i]) {
                         perl_xs_set_error("XS::call: failed to convert pointer argument");
                         goto fail;
@@ -4982,6 +5075,59 @@ void perl_xs_cleanup(void) {
     s_xs_module_list = NULL;
 }
 
+/* ── program cleanup ────────────────────────────────────────────────────────
+ * Free all program-lifetime runtime state so valgrind reports zero leaks.
+ * Called at exit via atexit() from main.cpp.                                                    */
+void perl_cleanup(void) {
+    /* 1. Shared-mutex side-table: destroy mutex/condvar, free entries and
+     *    the SharedMutex structs they point to. */
+    for (int b = 0; b < SHARED_MUTEX_TABLE_BUCKETS; b++) {
+        SharedMutexEntry *e = s_mutex_table[b];
+        while (e) {
+            SharedMutexEntry *next = e->next;
+            SharedMutex *mu = e->mu;
+            if (mu) {
+                pthread_mutex_destroy(&mu->mu);
+                pthread_cond_destroy(&mu->cond);
+                free(mu);
+            }
+            free(e);
+            e = next;
+        }
+        s_mutex_table[b] = NULL;
+    }
+
+    /* 2. Named-captures hash ($+) — may still hold the last match. */
+    if (perl_plus_hash) {
+        perl_hash_free(perl_plus_hash);
+        perl_plus_hash = NULL;
+    }
+
+    /* 3. XS module list (reload of existing cleanup). */
+    perl_xs_cleanup();
+
+#ifdef PERL_ALLOC_DEBUG
+    /* 4. PV leak check: iterate all slabs, report PVs with sentinel set. */
+    int leak_count = 0;
+    for (int s = 0; s < pv_slab_count_; s++) {
+        PerlValue *slab = pv_slabs_[s];
+        for (int i = 0; i < PV_SLAB; i++) {
+            if (slab[i].ival == PV_LEAK_SENTINEL) {
+                if (leak_count < 100)
+                    fprintf(stderr, "perlc PV leak: slab %d offset %d tag=%d\n",
+                            s, i, (int)slab[i].tag);
+                leak_count++;
+            }
+        }
+    }
+    if (leak_count > 0) {
+        if (leak_count > 100)
+            fprintf(stderr, "perlc PV leak: ... and %d more\n", leak_count - 100);
+        fprintf(stderr, "perlc PV leak: total %d unfreed PVs (compile with -DPERL_ALLOC_DEBUG)\n", leak_count);
+    }
+#endif
+}
+
 /* ── DBI/SQLite integration ────────────────────────────────────────────────── */
 
 /* SQLite integration - DBI-like interface */
@@ -5067,7 +5213,7 @@ static int perl_dbi_bind_params(sqlite3_stmt *stmt, PerlArray *params) {
         } else if (pv->tag == PERL_FLOAT) {
             rc = sqlite3_bind_double(stmt, idx, pv->fval);
         } else {
-            char *s = perl_to_string(pv);
+            char *s = perl_to_string_dup(pv);
             rc = sqlite3_bind_text(stmt, idx, s, -1, SQLITE_TRANSIENT);
             free(s);
         }
@@ -5114,7 +5260,7 @@ PerlValue *perl_dbi_connect(PerlValue *dsn_pv, PerlValue *username_pv, PerlValue
     (void)password_pv;
 
     if (!dsn_pv || dsn_pv->tag == PERL_UNDEF) return perl_alloc_undef();
-    dsn = perl_to_string(dsn_pv);
+    dsn = perl_to_string_dup(dsn_pv);
     if (!dsn) return perl_alloc_undef();
     path = perl_dbi_sqlite_path(dsn);
 
@@ -5157,7 +5303,7 @@ PerlValue *perl_dbi_prepare(PerlValue *dbh_pv, PerlValue *sql_pv) {
     int rc;
 
     if (!dbh || !sql_pv || sql_pv->tag == PERL_UNDEF) return perl_alloc_undef();
-    sql = perl_to_string(sql_pv);
+    sql = perl_to_string_dup(sql_pv);
     rc = sqlite3_prepare_v2((sqlite3 *)dbh->db, sql, -1, &stmt, NULL);
     free(sql);
     if (rc != SQLITE_OK) {

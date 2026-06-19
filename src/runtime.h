@@ -89,7 +89,8 @@ PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta);
 /* coercions */
 long long  perl_to_int(const PerlValue *v);
 double     perl_to_float(const PerlValue *v);
-char      *perl_to_string(const PerlValue *v);   /* caller must free */
+const char *perl_to_string(const PerlValue *v);   /* stable for PERL_STRING/undef, heap for others */
+char       *perl_to_string_dup(const PerlValue *v); /* always heap-allocated (caller must free) */
 int        perl_defined(const PerlValue *v);
 int        perl_is_true(const PerlValue *v);
 
@@ -553,6 +554,9 @@ PerlValue *perl_dbi_rows(PerlValue *sth);
 PerlValue *perl_dbi_commit(PerlValue *dbh);
 PerlValue *perl_dbi_rollback(PerlValue *dbh);
 PerlValue *perl_dbi_error(PerlValue *dbh);
+
+/* ── program cleanup (free shared-mutex side-table, named-captures hash, etc.) */
+void perl_cleanup(void);
 
 /* ── string eval hook ────────────────────────────────────────────────────── */
 /* Set by eval_jit.cpp (linked only when program uses eval EXPR).
