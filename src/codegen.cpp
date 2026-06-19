@@ -4409,23 +4409,27 @@ Value *CodeGen::emitExpr(const Node &n) {
                            var is read inside perl_atomic_add under the
                            mutex, so re-evaluating it here would race. */
                         const Node &other = lhsOnLeft ? *n.right->right : *n.right->left;
-                        Value *rhsVal = emitExpr(other);
-                        /* For subtraction, negate delta so perl_atomic_add
-                           performs subtraction.  For *, /, % there is no
-                           atomic RMW primitive — skip the atomic path and
-                           fall through to the non-atomic perl_assign below. */
-                        if (n.right->sval == "-") {
-                            rhsVal = builder_.CreateFNeg(rhsVal);
-                            Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
-                            freeIfOwned(rhsVal);
-                            return r;
-                        } else if (n.right->sval == "+") {
-                            Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
-                            freeIfOwned(rhsVal);
-                            return r;
-                        }
-                        /* *, /, %: skip atomic path, fall through */
-                        freeIfOwned(rhsVal);
+                         Value *rhsVal = emitExpr(other);
+                         /* For subtraction, negate delta so perl_atomic_add
+                            performs subtraction.  For *, /, % there is no
+                            atomic RMW primitive — skip the atomic path and
+                            fall through to the non-atomic perl_assign below. */
+                         if (n.right->sval == "-") {
+                             Value *floatVal = callRT("perl_to_float", {rhsVal});
+                             Value *negFloat = builder_.CreateFNeg(floatVal);
+                             freeIfOwned(floatVal);
+                             Value *negBoxed = boxF64(negFloat);
+                             Value *r = callRT("perl_atomic_add", {lhsVal, negBoxed});
+                             freeIfOwned(negBoxed);
+                             freeIfOwned(rhsVal);
+                             return r;
+                         } else if (n.right->sval == "+") {
+                             Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
+                             freeIfOwned(rhsVal);
+                             return r;
+                         }
+                         /* *, /, %: skip atomic path, fall through */
+                         freeIfOwned(rhsVal);
                     }
                 }
             }
@@ -4791,28 +4795,32 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
-       if (sharedScalarNames_.count(nm)) {
-                 bool isNumeric = (n.sval == "+" || n.sval == "-" ||
-                                   n.sval == "*" || n.sval == "/" ||
-                                   n.sval == "%");
-                 if (isNumeric) {
-                     /* For subtraction, negate delta so perl_atomic_add
-                        performs subtraction.  For *, /, % there is no
-                        atomic RMW primitive — fall through to the
-                        non-atomic perl_assign below. */
-                     if (n.sval == "-") {
-                         rhsVal = builder_.CreateFNeg(rhsVal);
-                         Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
-                         freeIfOwned(rhsVal);
-                         return lhsVal;
-                     } else if (n.sval == "+") {
-                         Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
-                         freeIfOwned(rhsVal);
-                         return lhsVal;
-                     }
-                     /* *, /, %: skip atomic path, fall through */
-                     freeIfOwned(rhsVal);
-                 }
+      if (sharedScalarNames_.count(nm)) {
+                  bool isNumeric = (n.sval == "+" || n.sval == "-" ||
+                                    n.sval == "*" || n.sval == "/" ||
+                                    n.sval == "%");
+                  if (isNumeric) {
+                      /* For subtraction, negate delta so perl_atomic_add
+                         performs subtraction.  For *, /, % there is no
+                         atomic RMW primitive — fall through to the
+                         non-atomic perl_assign below. */
+                      if (n.sval == "-") {
+                          Value *floatVal = callRT("perl_to_float", {rhsVal});
+                          Value *negFloat = builder_.CreateFNeg(floatVal);
+                          freeIfOwned(floatVal);
+                          Value *negBoxed = boxF64(negFloat);
+                          Value *r = callRT("perl_atomic_add", {lhsVal, negBoxed});
+                          freeIfOwned(negBoxed);
+                          freeIfOwned(rhsVal);
+                          return lhsVal;
+                      } else if (n.sval == "+") {
+                          Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
+                          freeIfOwned(rhsVal);
+                          return lhsVal;
+                      }
+                      /* *, /, %: skip atomic path, fall through */
+                      freeIfOwned(rhsVal);
+                  }
                 /* non-numeric: applyOp + atomic store (release-fenced) */
                 Value *result = applyOp(lhsVal, rhsVal);
                 freeIfOwned(rhsVal);
@@ -5734,17 +5742,23 @@ Value *CodeGen::emitExpr(const Node &n) {
             } else {
                 /* Check int/float unboxed scopes — unboxed vars are stored
                    in intScopes_/floatScopes_, not in scopes_.  We need to
-                   box them into a PerlValue* so the closure can capture them. */
+                   box them into a PerlValue* so the closure can capture them.
+                   Create a stable alloca to hold the boxed value, then load
+                   the PerlValue* from it (matching the pattern for regular captures). */
                 if (Value *ia = lookupIntVar(nm)) {
                     Value *ival = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
                     Value *boxed = boxI64(ival);
+                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
-                    captureVals.push_back(boxed);
+                    captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
                 } else if (Value *fa = lookupFloatVar(nm)) {
                     Value *fval = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
                     Value *boxed = boxF64(fval);
+                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
-                    captureVals.push_back(boxed);
+                    captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
                 }
             }
         }
