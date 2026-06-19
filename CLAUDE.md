@@ -11,6 +11,7 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl opera
 ```bash
 make              # builds ./perlc
 make test         # runs all 36 test programs
+make test-tsan    # runs threads.pl, threads_atomic.pl, destroy.pl with -fsanitize=thread
 make clean
 
 ./perlc foo.pl -o output            # compile and link
