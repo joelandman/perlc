@@ -2606,11 +2606,15 @@ void CodeGen::emitStmt(const Node &n) {
             Value *av = nullptr;
             if (n.right) { callCtx_ = 1; av = emitArrayPtr(*n.right); callCtx_ = 0; }
             if (!av) {
-                av = callRT("perl_array_new", {});
-                /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
-                   push the value as a single element */
-                if (n.right) callRT("perl_array_push", {av, emitExpr(*n.right)});
-            }
+                 av = callRT("perl_array_new", {});
+                 /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
+                    push the value as a single element */
+                 if (n.right) {
+                     callCtx_ = 1;
+                     callRT("perl_array_push", {av, emitExpr(*n.right)});
+                     callCtx_ = 0;
+                 }
+             }
             if (atFileScope) {
                 auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
                     GlobalValue::InternalLinkage,
@@ -4226,17 +4230,19 @@ Value *CodeGen::emitExpr(const Node &n) {
                     callRT("perl_array_replace", {av_lhs, av_rhs});
                 } else if (n.right->kind == NK::ArrayLit && n.right->args.empty()) {
                     callRT("perl_array_clear", {av_lhs});
-                } else {
-                    callRT("perl_array_clear", {av_lhs});
-                    Value *tmp = callRT("perl_array_new", {});
-                    if (n.right->kind == NK::ArrayLit) {
-                        for (auto &e : n.right->args)
-                            callRT("perl_array_push", {tmp, emitExpr(*e)});
-                    } else {
-                        callRT("perl_array_push", {tmp, emitExpr(*n.right)});
-                    }
-                    callRT("perl_array_replace", {av_lhs, tmp});
-                }
+           } else {
+                     callRT("perl_array_clear", {av_lhs});
+                     Value *tmp = callRT("perl_array_new", {});
+                     if (n.right->kind == NK::ArrayLit) {
+                         for (auto &e : n.right->args)
+                             callRT("perl_array_push", {tmp, emitExpr(*e)});
+                     } else {
+                         callCtx_ = 1;
+                         callRT("perl_array_push", {tmp, emitExpr(*n.right)});
+                         callCtx_ = 0;
+                     }
+                     callRT("perl_array_replace", {av_lhs, tmp});
+                 }
             }
             return perlUndef();
         }
@@ -6011,7 +6017,20 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (src) callRT("perl_array_extend", {av, src});
             else     callRT("perl_array_push",   {av, emitExpr(*arg)});
         }
-        return callRT("perl_call_code_ref", {ref, av});
+        /* Set wantarray context for the called sub */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *ctxVal;
+        if (callCtx_ == 1) {
+            ctxVal = ConstantInt::get(i32Ty, 1);
+        } else if (currentSubNeedsWantarray_) {
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        } else {
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        }
+        callRT("perl_push_wantarray", {ctxVal});
+        Value *result = callRT("perl_call_code_ref", {ref, av});
+        callRT("perl_pop_wantarray", {});
+        return result;
     }
 
     case NK::PackageStmt:
