@@ -1485,7 +1485,7 @@ void perl_array_extend(PerlArray *dst, PerlArray *src) {
         perl_array_push(dst, src->elems[i]);
 }
 
-void perl_array_extend_hash(PerlArray *dst, PerlHash *h) {
+  void perl_array_extend_hash(PerlArray *dst, PerlHash *h) {
     for (int i = 0; i < PERL_HASH_BUCKETS; i++) {
         for (PerlHashEntry *e = h->buckets[i]; e; e = e->next) {
             PerlValue *kv = perl_alloc_string(e->key);
@@ -1493,6 +1493,20 @@ void perl_array_extend_hash(PerlArray *dst, PerlHash *h) {
             perl_free(kv);
             perl_array_push(dst, e->val);
         }
+    }
+}
+
+/* Unwrap PERL_LIST_RESULT and extend dst array with its elements.
+   If pv is not PERL_LIST_RESULT, push pv as a single element. */
+void perl_array_push_list_or_scalar(PerlArray *dst, PerlValue *pv) {
+    if (!pv) return;
+    if (pv->tag == PERL_LIST_RESULT && pv->pval) {
+        PerlArray *av = (PerlArray *)pv->pval;
+        for (long long i = 0; i < av->len; i++)
+            perl_array_push(dst, av->elems[i]);
+        perl_free(pv);  /* free the LIST_RESULT wrapper */
+    } else {
+        perl_array_push(dst, pv);
     }
 }
 
@@ -2717,7 +2731,9 @@ PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
     int         saved_n    = s_ncaptures;
     s_current_captures = cl->captures;
     s_ncaptures        = cl->ncaptures;
-    PerlValue *result = ((PerlSubFnCtx)cl->fn)(args, perl_push_wantarray(0));
+    /* Use caller's wantarray context (set by codegen via perl_push_wantarray) */
+    int ctx = perl_current_wantarray_ctx();
+    PerlValue *result = ((PerlSubFnCtx)cl->fn)(args, perl_push_wantarray(ctx));
     perl_pop_wantarray();
     s_current_captures = saved_caps;
     s_ncaptures        = saved_n;

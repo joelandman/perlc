@@ -219,6 +219,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_sort_str",   voidTy, av);
     RT("perl_array_extend",     voidTy, av, av);
     RT("perl_array_extend_hash",voidTy, av, av);
+    RT("perl_array_push_list_or_scalar", voidTy, av, pv);
     RT("perl_array_shift",      pv,  av);
     RT("perl_array_unshift",    voidTy, av, pv);
     /* string builtins */
@@ -2605,16 +2606,17 @@ void CodeGen::emitStmt(const Node &n) {
             std::string nm = n.name.substr(1);
             Value *av = nullptr;
             if (n.right) { callCtx_ = 1; av = emitArrayPtr(*n.right); callCtx_ = 0; }
-            if (!av) {
-                 av = callRT("perl_array_new", {});
-                 /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
-                    push the value as a single element */
-                 if (n.right) {
-                     callCtx_ = 1;
-                     callRT("perl_array_push", {av, emitExpr(*n.right)});
-                     callCtx_ = 0;
-                 }
-             }
+           if (!av) {
+                  av = callRT("perl_array_new", {});
+                  /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
+                     push the value as a single element */
+                  if (n.right) {
+                      callCtx_ = 1;
+                      Value *rhsVal = emitExpr(*n.right);
+                      callRT("perl_array_push_list_or_scalar", {av, rhsVal});
+                      callCtx_ = 0;
+                  }
+              }
             if (atFileScope) {
                 auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
                     GlobalValue::InternalLinkage,
@@ -4231,18 +4233,19 @@ Value *CodeGen::emitExpr(const Node &n) {
                 } else if (n.right->kind == NK::ArrayLit && n.right->args.empty()) {
                     callRT("perl_array_clear", {av_lhs});
            } else {
-                     callRT("perl_array_clear", {av_lhs});
-                     Value *tmp = callRT("perl_array_new", {});
-                     if (n.right->kind == NK::ArrayLit) {
-                         for (auto &e : n.right->args)
-                             callRT("perl_array_push", {tmp, emitExpr(*e)});
-                     } else {
-                         callCtx_ = 1;
-                         callRT("perl_array_push", {tmp, emitExpr(*n.right)});
-                         callCtx_ = 0;
-                     }
-                     callRT("perl_array_replace", {av_lhs, tmp});
-                 }
+                      callRT("perl_array_clear", {av_lhs});
+                      Value *tmp = callRT("perl_array_new", {});
+                      if (n.right->kind == NK::ArrayLit) {
+                          for (auto &e : n.right->args)
+                              callRT("perl_array_push", {tmp, emitExpr(*e)});
+                      } else {
+                          callCtx_ = 1;
+                          Value *rhsVal = emitExpr(*n.right);
+                          callRT("perl_array_push_list_or_scalar", {tmp, rhsVal});
+                          callCtx_ = 0;
+                      }
+                      callRT("perl_array_replace", {av_lhs, tmp});
+                  }
             }
             return perlUndef();
         }

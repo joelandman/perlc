@@ -255,6 +255,7 @@ void perl_array_assign_slice(PerlArray *a, PerlArray *indices, PerlArray *vals);
 /* initialise hash from flat list (k1,v1,k2,v2,...) */
 void       perl_hash_from_list(PerlHash *h, PerlArray *list);
 void       perl_array_extend_hash(PerlArray *dst, PerlHash *h); /* append k,v pairs */
+void       perl_array_push_list_or_scalar(PerlArray *dst, PerlValue *pv); /* unwrap LIST_RESULT or push scalar */
 
 /* ── array manipulation ──────────────────────────────────────────────────── */
 /* splice(@arr, off, len, repl) — removes/inserts elements, returns removed */
