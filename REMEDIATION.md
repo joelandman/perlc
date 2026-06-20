@@ -1,33 +1,11 @@
-# REMEDIATION.md — Most Important Remediation Items
+# REMEDIATION.md — Critical Fixes Needed
 
-All 5 items have been implemented and tested. See git log for details.
+1. **Fix `NK::EvalBlock` LLVM codegen crash** — `eval { BLOCK }` produces invalid LLVM IR; `endBB` lacks a `ret` instruction causing `Function return type does not match operand type of return inst!`. Fix: add `builder_.CreateRet(perlUndef())` after `perl_eval_pop` in `codegen.cpp`'s `NK::EvalBlock` case. Test: `tests/eval_exception.pl` fails. Severity: **COMPILER CRASH** — blocks any program using block eval.
 
-## 1. [DONE] Program-level cleanup — `perl_cleanup()`
+2. **Fix `require` caching bug** — `test_require_simple.pl` fails on `require_loads_named_sub` and `require_repeat_keeps_sub_available`. Runtime `require` does not register named subs from `.pm` files in the dispatch table. Fix: ensure `perl_runtime_require` adds subs to the code reference table. Test: `tests/test_require_simple.pl` fails. Severity: **BLOCKS MODULE LOADING** — runtime `require` is non-functional.
 
-Implemented in `runtime.c` and registered via `atexit()` in `main.cpp`. Frees:
-- Shared-mutex side-table entries (destroys all mutexes/condvars, frees entries)
-- `perl_plus_hash` (named captures from PCRE2)
-- XS module list via `perl_xs_cleanup()`
+3. **Fix compound `-=` on shared scalars** — `$shared -= 5` emits `perl_atomic_add($shared, +5)` instead of subtracting; delta is not negated before the atomic add. Fix: negate delta via `perl_to_float` → `fneg` → `boxF64` before `perl_atomic_add`. Test: `tests/regression_bugs.pl` `regression_multi_subtract` fails. Severity: **DATA CORRUPTION** — shared scalar arithmetic produces wrong results.
 
-Result: valgrind reports zero leaks from runtime internal state.
+4. **Add `*=` `/=` `%=` atomic RMW for shared scalars** — These compound ops fall through to non-atomic `perl_assign` instead of using atomic RMW primitives. For int/float payloads, use lock-free 16-byte CAS-on-payload (same pattern as `$x++`). For non-numeric tags, fall back to SharedMutex. Test: `tests/regression_bugs.pl` `regression_multiply` fails. Severity: **DATA RACE** — concurrent shared scalar updates can lose updates.
 
-## 2. [DONE] Compound `-=` on shared scalars
-
-Fixed in `codegen.cpp` in both the CompoundAssign path and the longhand RMW path (`$shared = $shared OP N`). For `-`: negates the delta before calling `perl_atomic_add`. For `*`, `/`, `%`: falls through to non-atomic `perl_assign` (no atomic RMW primitive exists for these ops).
-
-## 3. [DONE] `perl_to_string` ownership contract
-
-Refactored in `runtime.c`/`runtime.h`:
-- `perl_to_string()` now returns a **stable pointer** for `PERL_STRING` and `PERL_UNDEF` (no malloc/free needed)
-- Added `perl_to_string_dup()` that always returns heap-allocated strings for callers that need to free
-- All ~100 callers updated to use `perl_to_string_dup()`, eliminating leaks from forgotten frees on error paths
-
-## 4. [DONE] `--leak-check` debug mode for PV allocator
-
-Added `PERL_ALLOC_DEBUG` compile flag. Tracks every `pv_alloc`/`pv_pool_push` pair using a sentinel value (`0xDEADBEEF`) in the `ival` field. At program exit, iterates all allocated slabs and reports any PVs with the sentinel still set. Slab allocation is tracked via a per-process list (`pv_slabs_[]`). Compile with `-DPERL_ALLOC_DEBUG` to enable.
-
-## 5. [DONE] Closure + range-with-captured-variable codegen bug
-
-**Root cause**: Unboxed int/float vars (`my $per = 5`) are stored in `intScopes_`/`floatScopes_`, but closure capture (Phase 1) only checked `scopes_` via `lookupVar()`. The closure never captured the variable, so `emitExpr()` returned `perlUndef()`.
-
-**Fix**: Closure capture Phase 1 now also checks `intScopes_` and `floatScopes_`. For unboxed int/float vars, the value is loaded and boxed into a `PerlValue*` for capture. The closure body then finds the captured variable via `lookupVar()`.
+5. **Fix closure + range with captured variable** — `for (1..$per)` where `$per` is captured from outer scope emits `undef` bound in anonymous subs. The range expansion in function call args path does not correctly handle captured variables. Fix: ensure captured variables are properly boxed before range expansion. Test: `tests/regression_bugs.pl` `regression_anon_range` fails. Severity: **CORRECTNESS BUG** — closures with ranges produce wrong values.

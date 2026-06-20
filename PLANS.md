@@ -2,36 +2,47 @@
 
 ## Correctness Plans
 
-1. **Add valgrind/memcheck verification to test harness.** Run all 36 tests under `valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all` and fix every reported leak. Currently there is no automated memory-safety gate in CI. The PV slab allocator and PerlArray freelist pool hide leaks from standard tools, but shared-mutex side-table entries, `perl_plus_hash` (named captures), PCRE2 resources, and any `perl_to_string` callers that forget to free are invisible to the current test suite.
+1. **Fix `NK::EvalBlock` LLVM codegen crash.** `eval { BLOCK }` produces invalid LLVM IR because `endBB` lacks a `ret` instruction — LLVM verify error: `Function return type does not match operand type of return inst! ret ptr %17 i32`. Fix: add `builder_.CreateRet(perlUndef())` after `perl_eval_pop` in the `endBB` block. This is a compiler crash blocking any program using block eval from compiling. Test: `tests/eval_exception.pl` currently fails.
 
-2. **[DONE] Add TSan to `make test` for threaded tests.** `make test-tsan` builds `perlc_tsan` with `-fsanitize=thread` and runs `threads.pl`, `threads_atomic.pl`, and `destroy.pl`. All 3 tests pass with zero data race reports, confirming correctness of shared scalars, the shared-mutex side-table, and closure-capture arrays.
+2. **Fix `require` caching bug.** `test_require_simple.pl` fails on `require_loads_named_sub` and `require_repeat_keeps_sub_available`. The runtime `require` does not properly register named subs from `.pm` files in the dispatch table. Fix: ensure `perl_runtime_require` adds subs to the code reference table so they're callable via dispatch. Test: `tests/test_require_simple.pl` currently fails.
 
-3. **Expand context-propagation edge cases.** The `wantarray` builtin and context propagation are documented as "fully implemented" but only `wantarray.pl` tests the simple cases. Add tests for: `grep`/`map`/`sort` inside nested subs called from list context (`sub outer { inner() }` where `inner` calls `grep`), `return` of implicit-last-expression in anonymous subs in list context, and `wantarray` inside deeply nested closures. These are the code paths most likely to diverge from Perl 5 semantics.
+3. **Fix compound `-=` on shared scalars.** `$shared -= 5` emits `perl_atomic_add($shared, +5)` instead of subtracting — the delta is not negated before the atomic add. Fix: negate delta via `perl_to_float` → `fneg` → `boxF64` before `perl_atomic_add`. Test: `tests/regression_bugs.pl` `regression_multi_subtract` currently fails.
 
-4. **Add exception-safety tests for `eval`/`die` in complex nesting.** `eval_string.pl` tests string eval but there are no tests for: `die` inside a method called from `eval`, `eval` inside `eval` (nested exception trapping), `$@` scoping with `local`, `die` inside a `DESTROY` block, and `eval` inside a thread. These stress the `jmp_buf`/`setjmp` infrastructure and the per-thread eval-stack.
+4. **Add `*=` `/=` `%=` atomic RMW for shared scalars.** These compound ops fall through to non-atomic `perl_assign` instead of using atomic RMW primitives. For int/float payloads, use lock-free 16-byte CAS-on-payload (same pattern as `$x++`). For non-numeric tags, fall back to SharedMutex. Test: `tests/regression_bugs.pl` `regression_multiply` currently fails.
 
-5. **Add regression tests for known bugs.** Document and test the two known issues from CLAUDE.md: (a) compound `-=` on a shared scalar emits `perl_atomic_add` instead of subtracting (test `$shared -= 5` and verify result), (b) closure + range-with-captured-variable emits `undef` bound (test `my $per = 5; my $x = 3; for (1..$per) { $x++ }`). Each known bug should have a test that fails on the buggy version and passes on the fixed version.
+5. **Add valgrind/memcheck verification to test harness.** No automated memory-safety gate exists. The PV slab allocator and PerlArray freelist pool hide leaks from standard tools. Add `make test-valgrind` that runs all 36 tests under `valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all`. Fix every reported leak (currently 4,096 bytes "still reachable" from PV slab at exit).
 
 ## Completeness Plans
 
-1. **Implement `tie`/`untie` with a minimal TIESCALAR/TIEARRAY/TIEHASH interface.** The most commonly used CPAN modules (e.g. `DB_File`, `Tie::Hash::Cached`) depend on `tie`. A minimal implementation supporting `TIESCALAR`, `TIEARRAY`, `TIEHASH` with `FETCH`, `STORE`, `FETCHSIZE`, `STORESIZE` would cover the majority of use cases. Start with `TIEHASH` since it is the most complex and most commonly needed.
+1. **Implement `tie`/`untie` with minimal TIESCALAR/TIEARRAY/TIEHASH interface.** The most commonly used CPAN modules (e.g. `DB_File`, `Tie::Hash::Cached`) depend on `tie`. A minimal implementation supporting `TIESCALAR`, `TIEARRAY`, `TIEHASH` with `FETCH`, `STORE`, `FETCHSIZE`, `STORESIZE` would cover the majority of use cases. Start with `TIEHASH` since it is the most complex and most commonly needed.
 
-2. **Add unicode and UTF-8 support.** Currently strings are byte-only. Adding `use utf8`, `use Encode`, and the `unicode` pragma would require: (a) UTF-8 decoding in the lexer for source files, (b) UTF-8 aware `length`, `substr`, `index`, `rindex`, and regex operations in the runtime, (c) `chr`/`ord` for code points above 255. This is a large effort but essential for CPAN compatibility.
+2. **Implement `do FILE` runtime execution.** `require` is implemented (compile-time inlining) but `do "file.pl"` is not. `do` differs from `require` in that it executes the file each time (no caching), returns the last expression's value, and sets `$@` on parse/runtime failure. Reuse the file-loading path and add a non-caching execution mode.
 
-3. **Implement `do FILE` runtime execution.** `require` is implemented (compile-time inlining) but `do "file.pl"` is not. `do` differs from `require` in that it executes the file each time (no caching), returns the last expression's value, and sets `$@` on parse/runtime failure. This is a small addition to the existing `require` infrastructure — reuse the file-loading path and add a non-caching execution mode.
+3. **Add `pack`/`unpack` for binary data serialization.** These are among the most-used builtins for network protocols, file formats, and FFI. Start with the most common format codes: `C`, `c`, `S`, `s`, `L`, `l`, `N`, `V`, `F`, `D`, `A`, `a`, `H`, `h`, `B`, `b`, `x`, `X`, `@`. The runtime would interpret format strings and produce/consume byte buffers, integrating with `ptr` values in the XS interface.
 
-4. **Add `pack`/`unpack` for binary data serialization.** These are among the most-used builtins for network protocols, file formats, and FFI. Start with the most common format codes: `C`, `c`, `S`, `s`, `L`, `l`, `N`, `V`, `F`, `D`, `A`, `a`, `H`, `h`, `B`, `b`, `x`, `X`, `@`. The runtime would interpret format strings and produce/consume byte buffers, integrating with `ptr` values in the XS interface.
+4. **Add UTF-8/unicode support.** Currently strings are byte-only. Adding `use utf8`, `use Encode`, and the `unicode` pragma would require: (a) UTF-8 decoding in the lexer for source files, (b) UTF-8 aware `length`, `substr`, `index`, `rindex`, and regex operations in the runtime, (c) `chr`/`ord` for code points above 255. This is a large effort but essential for CPAN compatibility.
 
-5. **Fix the REPL to persist scalar/array/hash variables between statements.** Currently only subroutines persist in REPL mode. Adding variable persistence requires: (a) a REPL state struct holding the top-level scope allocas, (b) codegen that emits variable initialization only on first statement and subsequent statements only assign to existing allocas, (c) a mechanism to reset state on `clear`. This would make the REPL a viable development tool for interactive Perl.
+5. **Fix closure + range with captured variable.** `for (1..$per)` where `$per` is captured from outer scope emits `undef` bound in anonymous subs. The range expansion in function call args path does not correctly handle captured variables. Fix: ensure captured variables are properly boxed before range expansion. Test: `tests/regression_bugs.pl` `regression_anon_range` currently fails.
 
 ## Performance Plans
 
-1. **[DONE] Build a systematic benchmarking framework.** Created `bench/bench.sh` with standardized benchmarks (fibn.pl, mbs.pl, nb.pl, regex_heavy.pl) that report perlc/Perl elapsed times and ratios. Results logged to `bench/results.csv`. Supports `-n N` for averaging, `--baseline`/`--compare` for tracking improvements.
+1. **Reduce PV boxing overhead in regex path.** Regex-heavy workloads are ~3x slower than Perl (826ms vs 260ms on regex_heavy benchmark). Perl's regex engine is highly optimized; perlc's PCRE2 calls + PV boxing overhead outweigh JIT benefits. Consider inline PCRE2 API calls that avoid PerlValue boxing for the common case of matching numeric strings or pre-boxed values.
 
-2. **[DONE] Cache compiled PCRE2 regex patterns.** Added per-thread LRU cache (max 256 entries) in `runtime.c`. Keyed by (pattern ‖ flags), uses `__thread` storage to avoid locking. All 5 regex functions (`perl_regex_match`, `perl_regex_subst`, `perl_split_regex`, `perl_regex_match_g`, `perl_regex_match_all`) now check the cache before compiling. Cache entries freed in `perl_cleanup()`.
+2. **Implement in-process LLVM optimization passes.** Currently relies on clang-18 `-O2`. The `opt-18` integration encountered reliability issues with `system()` calls. Implement in-process optimization using LLVM's PassBuilder to run `opt -O3` passes (inlining, loop vectorization, dead-code elimination, constant propagation) before linking. This avoids temp file overhead and shell invocation issues.
 
-3. **[DONE] Profile and optimize hot paths in C runtime.** Identified top hot paths via codebase exploration: `pv_alloc()`, `perl_clone()`, `perl_free()`, `perl_assign()`, `perl_array_push()`, `perl_to_string_dup()`, `perl_deref_array()`. Added `perl_array_len_f64()` for unboxed array length reads (used by F64 fast path). The existing DerefAV cache, flat row cache, and FLOAT_PAIR fast path already eliminate major allocation hotspots.
+3. **Extend F64 fast path to cover `sprintf` format parsing and `join` with numeric args.** Currently `sprintf` and `join` always box arguments through PerlValue*. Adding F64 fast path cases for numeric-only `sprintf` formats (`%f`, `%d`, `%e`) and `join` with numeric arrays would eliminate boxing in common string-building hot loops.
 
-4. **[DONE] Extend the F64 fast path to cover more builtins.** Added `abs`, `int`, and `length` (for FLAT_ARRAY via DerefAV) to `canEmitF64`/`emitExprF64`. `abs` uses `llvm::Intrinsic::fabs`, `int` uses floor/ceil select + SIToFP for truncation toward zero, `length` calls `perl_array_len_f64()`. All avoid PerlValue boxing in hot loops.
+4. **Add string interning pool for short-lived strings.** `perl_to_string_dup()` calls `strdup()` on every string coercion. A string interning pool for short strings (< 64 bytes) would eliminate redundant allocations for common strings like `"0"`, `"1"`, `""`, `" "`, etc. This would reduce allocation pressure in tight loops.
 
-5. **Add LLVM optimization passes for the generated IR.** The `opt-18` command was integrated but encountered reliability issues with `system()` calls (file not recognized errors). The pipeline currently relies on clang-18's `-O2` optimization. Future work: implement in-process optimization using LLVM's PassBuilder to avoid temp file overhead and shell invocation issues.
+5. **Profile and optimize `perl_clone` hot path.** `perl_clone()` is called on every array element read, every regex capture, and every hash set operation. It does `strdup()` for strings and `memcpy()` for FLAT_ARRAY. Consider an inlineable read-only accessor that skips `perl_clone` when the source is known to be stable (e.g., array elements that won't be modified).
+
+## Benchmark Results (3 runs averaged)
+
+| Benchmark | perlc | Perl | Speedup |
+|-----------|-------|------|---------|
+| fibn (n=30) | 270ms | 590ms | 2.19x |
+| mbs (512×512, 80 iters) | 1,380ms | 18,990ms | 13.76x |
+| nb (n=1M) | 60ms | 5,850ms | 97.50x |
+| regex_heavy (100K items × 50) | 810ms | 260ms | 0.32x |
+
+Note: regex_heavy shows perlc slower than Perl because Perl's regex engine is highly optimized; the PCRE2 cache eliminates redundant `pcre2_compile` calls but the perlc overhead (function calls, PV boxing) still outweighs the benefit for regex-heavy workloads.
