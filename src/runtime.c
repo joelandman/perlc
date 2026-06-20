@@ -2489,9 +2489,37 @@ PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta) {
     } else if (pv->tag == PERL_FLOAT) {
         if (try_atomic_add_float(pv, df)) return pv;
     }
+    /* Ensure mutex is installed before acquiring — lazy installation
+       means it may not exist yet if no lock()/cond_wait() has been called. */
+    get_or_install_mutex(pv);
     int newly_held = atomic_mutex_acquire(pv);
     if (pv->tag == PERL_INT)   { pv->ival += di; }
     else if (pv->tag == PERL_FLOAT) { pv->fval += df; }
+    atomic_mutex_release(newly_held);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return pv;
+}
+
+/* Atomic RMW for *, /, % on shared scalars.  Uses mutex to ensure the
+   read-modify-write is atomic.  op: 1=*, 2=/, 3=% */
+PerlValue *perl_atomic_rmw(PerlValue *pv, PerlValue *rhs, int op) {
+    if (!pv || !rhs) return pv;
+    get_or_install_mutex(pv);
+    int newly_held = atomic_mutex_acquire(pv);
+    /* Read current value */
+    double df = perl_to_float(pv);
+    double rhs_f = perl_to_float(rhs);
+    double result;
+    if (op == 1) result = df * rhs_f;
+    else if (op == 2) result = rhs_f != 0.0 ? df / rhs_f : df;
+    else result = rhs_f != 0.0 ? fmod(df, rhs_f) : df;
+    /* Store result */
+    if (pv->tag == PERL_INT) {
+        pv->ival = (long long)result;
+    } else {
+        pv->tag = PERL_FLOAT;
+        pv->fval = result;
+    }
     atomic_mutex_release(newly_held);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     return pv;

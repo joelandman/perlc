@@ -18,7 +18,7 @@ my $ret = $thr->join();
 print "regression_subtract=" . ($ret == 90 ? "pass" : "fail") . "\n";
 
 # Test with multiple threads
-my $counter2 : shared = 1000;
+my $counter2 : shared = 100;
 my @threads;
 for my $i (1..10) {
     push @threads, threads->create(sub {

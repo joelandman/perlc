@@ -442,6 +442,7 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_atomic_inc",         pv,   pv);
     RT("perl_atomic_dec",         pv,   pv);
     RT("perl_atomic_add",         pv,   pv, pv);
+    RT("perl_atomic_rmw",         pv,   pv, pv, i32);
     /* threads */
     RT("perl_threads_create",   pv, pv, av);
     RT("perl_threads_join",     pv, pv);
@@ -4866,39 +4867,40 @@ Value *CodeGen::emitExpr(const Node &n) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
       if (sharedScalarNames_.count(nm)) {
-                  bool isNumeric = (n.sval == "+" || n.sval == "-" ||
-                                    n.sval == "*" || n.sval == "/" ||
-                                    n.sval == "%");
-                  if (isNumeric) {
-                      /* For subtraction, negate delta so perl_atomic_add
-                         performs subtraction.  For *, /, % there is no
-                         atomic RMW primitive — fall through to the
-                         non-atomic perl_assign below. */
-                      if (n.sval == "-") {
-                          Value *floatVal = callRT("perl_to_float", {rhsVal});
-                          Value *negFloat = builder_.CreateFNeg(floatVal);
-                          freeIfOwned(floatVal);
-                          Value *negBoxed = boxF64(negFloat);
-                          Value *r = callRT("perl_atomic_add", {lhsVal, negBoxed});
-                          freeIfOwned(negBoxed);
-                          freeIfOwned(rhsVal);
-                          return lhsVal;
-                      } else if (n.sval == "+") {
-                          Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
-                          freeIfOwned(rhsVal);
-                          return lhsVal;
-                      }
-                      /* *, /, %: skip atomic path, fall through */
-                      freeIfOwned(rhsVal);
-                  }
-                /* non-numeric: applyOp + atomic store (release-fenced) */
-                Value *result = applyOp(lhsVal, rhsVal);
-                freeIfOwned(rhsVal);
-                callRT("perl_atomic_store", {lhsVal, result});
-                freeIfOwned(result);
-                return lhsVal;
-            }
-        }
+                   bool isNumeric = (n.sval == "+" || n.sval == "-" ||
+                                     n.sval == "*" || n.sval == "/" ||
+                                     n.sval == "%");
+                   if (isNumeric) {
+                       /* For +, -, use perl_atomic_add (lock-free CAS + mutex fallback).
+                          For *, /, %, use perl_atomic_rmw which does RMW with mutex. */
+                       if (n.sval == "-") {
+                           Value *floatVal = callRT("perl_to_float", {rhsVal});
+                           Value *negFloat = builder_.CreateFNeg(floatVal);
+                           freeIfOwned(floatVal);
+                           Value *negBoxed = boxF64(negFloat);
+                           Value *r = callRT("perl_atomic_add", {lhsVal, negBoxed});
+                           freeIfOwned(negBoxed);
+                           freeIfOwned(rhsVal);
+                           return lhsVal;
+                       } else if (n.sval == "+") {
+                           Value *r = callRT("perl_atomic_add", {lhsVal, rhsVal});
+                           freeIfOwned(rhsVal);
+                           return lhsVal;
+                       }
+                       /* *, /, %: use perl_atomic_rmw with mutex protection */
+                       int opCode = (n.sval == "*") ? 1 : (n.sval == "/") ? 2 : 3;
+                       Value *r = callRT("perl_atomic_rmw", {lhsVal, rhsVal, ConstantInt::get(Type::getInt32Ty(ctx_), opCode)});
+                       freeIfOwned(rhsVal);
+                       return r;
+                   }
+                 /* non-numeric: applyOp + atomic store (release-fenced) */
+                 Value *result = applyOp(lhsVal, rhsVal);
+                 freeIfOwned(rhsVal);
+                 callRT("perl_atomic_store", {lhsVal, result});
+                 freeIfOwned(result);
+                 return lhsVal;
+             }
+         }
 
         Value *result = applyOp(lhsVal, rhsVal);
         freeIfOwned(rhsVal);

@@ -85,6 +85,7 @@ PerlValue *perl_atomic_swap(PerlValue *pv, PerlValue *v);
 PerlValue *perl_atomic_inc(PerlValue *pv);
 PerlValue *perl_atomic_dec(PerlValue *pv);
 PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta);
+PerlValue *perl_atomic_rmw(PerlValue *pv, PerlValue *rhs, int op);  /* *, /, % */
 
 /* coercions */
 long long  perl_to_int(const PerlValue *v);
