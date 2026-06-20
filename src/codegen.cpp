@@ -1127,7 +1127,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_spaceship", "perl_str_spaceship",
         "perl_array_get", "perl_hash_get_sv",
         "perl_ref_type", "perl_ref_array", "perl_ref_scalar",
-        "perl_clone", "perl_sprintf", "perl_array_len",
+        "perl_clone", "perl_sprintf", "perl_array_len", "perl_array_len_f64",
         /* single-arg math/string builtins */
         "perl_alloc_flat_array", "perl_alloc_float_pair",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
@@ -1588,6 +1588,20 @@ bool CodeGen::canEmitF64(const Node &n) {
         return n.sval == "-" && n.left && canEmitF64(*n.left);
     case NK::SqrtFunc:
         return n.left && canEmitF64(*n.left);
+    case NK::AbsFunc:
+        return n.left && canEmitF64(*n.left);
+    case NK::IntFunc:
+        return n.left && canEmitF64(*n.left);
+    case NK::LengthFunc:
+        /* length of FLAT_ARRAY: read matchpos (count) directly */
+        if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array") {
+            if (n.left->left->kind == NK::ScalarVar) {
+                std::string nm = n.left->left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (lookupDerefAV(nm)) return true;
+            }
+        }
+        return false;
     /* Array/hash element lookups can always be converted to double via perl_to_float,
        but they require emitting emitExpr calls internally — always allowed. */
     case NK::ArrayElem:
@@ -1697,6 +1711,51 @@ Value *CodeGen::emitExprF64(const Node &n) {
         auto *sqrtFn = llvm::Intrinsic::getDeclaration(mod_.get(),
             llvm::Intrinsic::sqrt, {f64});
         return builder_.CreateCall(sqrtFn, {v}, "sqrt");
+    }
+    case NK::AbsFunc: {
+        if (!canEmitF64(*n.left)) return nullptr;
+        Value *v = emitExprF64(*n.left);
+        if (!v) return nullptr;
+        auto *absFn = llvm::Intrinsic::getDeclaration(mod_.get(),
+            llvm::Intrinsic::fabs, {f64});
+        return builder_.CreateCall(absFn, {v}, "fabs");
+    }
+    case NK::IntFunc: {
+        /* int(x) on a double: truncate toward zero, convert back to double.
+           LLVM's trunc only works for int->int; for float->int we use
+           inttoptr+ptrtoint or the floor+ceil trick.  Simplest: round toward
+           zero via conditional floor/ceil. */
+        if (!canEmitF64(*n.left)) return nullptr;
+        Value *v = emitExprF64(*n.left);
+        if (!v) return nullptr;
+        /* Truncation toward zero: if v >= 0, floor(v); else ceil(v) */
+        auto *i64 = Type::getInt64Ty(ctx_);
+        Value *floored = builder_.CreateCall(
+            llvm::Intrinsic::getDeclaration(mod_.get(), llvm::Intrinsic::floor, {f64}),
+            {v}, "floor");
+        Value *ceiled = builder_.CreateCall(
+            llvm::Intrinsic::getDeclaration(mod_.get(), llvm::Intrinsic::ceil, {f64}),
+            {v}, "ceil");
+        Value *isNeg = builder_.CreateFCmpOLT(v, ConstantFP::get(f64, 0.0), "iscmp");
+        Value *truncated = builder_.CreateSelect(isNeg, ceiled, floored, "trunc");
+        /* Convert i64 back to double */
+        auto *intToFP = builder_.CreateSIToFP(truncated, f64, "int2fp");
+        return intToFP;
+    }
+    case NK::LengthFunc: {
+        /* length of FLAT_ARRAY: call perl_array_len_f64 for unboxed double */
+        if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array") {
+            if (n.left->left->kind == NK::ScalarVar) {
+                std::string nm = n.left->left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (Value *pa = lookupDerefAV(nm)) {
+                    /* Load PerlArray* and call perl_array_len_f64 */
+                    Value *arr = builder_.CreateLoad(perlPtrTy_, pa, nm + ".av");
+                    return callRT("perl_array_len_f64", {arr});
+                }
+            }
+        }
+        return nullptr;
     }
     case NK::ArrayElem:
         /* Array elements may hold refs — cannot safely emit as f64.
@@ -2089,6 +2148,17 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
         callRT("perl_local_restore_to", {depth});
     }
+
+    /* Register perl_cleanup via atexit so valgrind reports zero leaks. */
+    {
+        auto *atexitFnTy = FunctionType::get(Type::getInt32Ty(ctx_),
+                                             {PointerType::getUnqual(ctx_)}, false);
+        auto atexitFn = mod_->getOrInsertFunction("atexit", atexitFnTy);
+        auto *perlCleanupFn = mod_->getFunction("perl_cleanup");
+        if (perlCleanupFn)
+            builder_.CreateCall(cast<Function>(atexitFn.getCallee()), {perlCleanupFn});
+    }
+
     builder_.CreateRet(ConstantInt::get(Type::getInt32Ty(ctx_), 0));
 
     inMainBody_ = false;

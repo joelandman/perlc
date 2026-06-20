@@ -174,6 +174,7 @@ PerlValue *perl_array_get(PerlArray *a, long long idx);
 PerlValue *perl_array_get_ref(PerlArray *a, long long idx); /* borrow: no clone, never free result */
 void       perl_array_set(PerlArray *a, long long idx, PerlValue *v);
 PerlValue *perl_array_len(PerlArray *a);
+double perl_array_len_f64(PerlArray *a);
 void perl_array_clear(PerlArray *a);
 void perl_array_replace(PerlArray *dst, PerlArray *src);
 PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n);

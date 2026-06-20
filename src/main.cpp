@@ -790,8 +790,8 @@ int main(int argc, char **argv) {
                              "eval EXPR will return undef\n";
         }
 
-        std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native"
-                          " -Wno-atomic-alignment";
+   std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native"
+                           " -Wno-atomic-alignment";
         if (debugSymbols) cmd += " -g";
         cmd += " " + tmpIR + " " + rtSrc;
         if (!evalLib.empty())

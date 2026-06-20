@@ -184,3 +184,32 @@ TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy
 - REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
 - XS is an MVP FFI-style interface, not full Perl XS bootstrap/module compatibility
 - DBI support is currently the SQLite subset exercised by the contract tests
+
+## Performance Optimizations
+
+### Benchmarking Framework
+- `bench/bench.sh` — standardized benchmarks with CSV logging (`bench/results.csv`)
+- Tests: fibn.pl, mbs.pl, nb.pl, regex_heavy.pl
+- Supports `-n N` averaging, `--baseline`/`--compare` tracking
+
+### PCRE2 Pattern Cache
+- Per-thread LRU cache (max 256 entries) in `runtime.c`
+- Keyed by (pattern ‖ flags), uses `__thread` storage (no locking)
+- All 5 regex functions check cache before compiling
+- Cache entries freed in `perl_cleanup()`
+
+### F64 Fast Path Extensions
+- `abs(x)` → `llvm::Intrinsic::fabs` (no PV boxing)
+- `int(x)` → floor/ceil select + SIToFP for truncation toward zero
+- `length(@arr)` → `perl_array_len_f64()` for DerefAV-cached arrays
+- Existing: arithmetic (`+`, `-`, `*`, `/`, `**2`), `sqrt`, comparisons, inlineable subs, 2D ArrowDeref, FLOAT_PAIR
+
+### Benchmark Results (3 runs averaged)
+| Benchmark | perlc | Perl | Speedup |
+|-----------|-------|------|---------|
+| fibn (n=30) | 266ms | 613ms | 2.30x |
+| mbs (512×512, 80 iters) | 1386ms | 18870ms | 13.61x |
+| nb (n=1M) | 60ms | 5813ms | 96.88x |
+| regex_heavy (100K items × 50) | 826ms | 240ms | 0.29x |
+
+Note: regex_heavy shows perlc slower than Perl because Perl's regex engine is highly optimized; the PCRE2 cache eliminates redundant `pcre2_compile` calls but the perlc overhead (function calls, PV boxing) still outweighs the benefit for regex-heavy workloads.

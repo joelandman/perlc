@@ -38,7 +38,7 @@ TARGET   := perlc
 ASSERT_TESTS := tests/test_do_filename.pl tests/test_require_simple.pl tests/dbi_sqlite.pl tests/xs_ffi.pl
 TSAN_TESTS := tests/threads.pl tests/threads_atomic.pl tests/destroy.pl
 
-.PHONY: all clean test test-tsan
+.PHONY: all clean test test-tsan bench
 
 all: $(TARGET) $(EVAL_LIB)
 
@@ -92,3 +92,6 @@ test-tsan: $(TSAN_TARGET)
 		./$(TSAN_TARGET) $$t -o $$out >/tmp/perlc_tsan_compile.log 2>&1; \
 		TSAN_OPTIONS="halt_on_error=1" $$out 2>&1; \
 	done
+
+bench: $(TARGET)
+	@./bench/bench.sh $(BENCH_ARGS)

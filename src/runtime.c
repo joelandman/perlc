@@ -30,12 +30,12 @@
 /* Per-thread freelist: no mutex needed since each thread has its own */
 static __thread PerlValue *pv_freelist_ = NULL;
 
-/* Slab tracking for leak-check: keeps a list of all allocated slabs. */
-#ifdef PERL_ALLOC_DEBUG
+/* Slab tracking: keeps a list of all allocated slabs for cleanup at exit.
+ * This is always enabled (not just for PERL_ALLOC_DEBUG) so valgrind
+ * can report zero leaks. */
 #define PV_SLAB_CAP 256
 static PerlValue *pv_slabs_[PV_SLAB_CAP];
 static int pv_slab_count_ = 0;
-#endif
 
 /* ── PV leak-check debug mode (PERL_ALLOC_DEBUG) ────────────────────────────
  * When compiled with -DPERL_ALLOC_DEBUG, tracks every pv_alloc/pv_pool_push
@@ -73,10 +73,9 @@ static inline PerlValue *pv_alloc(void) {
     }
     /* Cold miss: allocate a contiguous slab, return first entry, link rest. */
     PerlValue *slab = calloc(PV_SLAB, sizeof(PerlValue));
-#ifdef PERL_ALLOC_DEBUG
-    if (pv_slab_count_ < PV_SLAB_CAP)
+    if (pv_slab_count_ < PV_SLAB_CAP) {
         pv_slabs_[pv_slab_count_++] = slab;
-#endif
+    }
     for (int i = PV_SLAB - 1; i >= 1; i--) {
         slab[i].pval  = (void *)pv_freelist_;
         pv_freelist_  = &slab[i];
@@ -1474,6 +1473,11 @@ HOTX void perl_array_update_float(PerlArray *a, long long idx, double f) {
 
 PerlValue *perl_array_len(PerlArray *a) {
     return perl_alloc_int(a->len);
+}
+
+/* F64 fast path: return array length as a bare double (no PV boxing). */
+double perl_array_len_f64(PerlArray *a) {
+    return (double)a->len;
 }
 
 void perl_array_extend(PerlArray *dst, PerlArray *src) {
@@ -3558,10 +3562,84 @@ static void populate_named_captures(pcre2_match_data *md, const char *s, pcre2_c
   }
 }
 
+/* ── PCRE2 compiled-pattern cache (per-thread LRU, max 256 entries) ─────────
+ * Keyed by (pattern ‖ flags) — read-only pcre2_code* after compilation,
+ * so no locking is needed.  LRU eviction via access-order array.             */
+
+#define REGEX_CACHE_CAP 256
+
+typedef struct RegexCacheEntry {
+    char key[128];          /* pattern ‖ flags (NUL-terminated) */
+    pcre2_code *compiled;   /* read-only after pcre2_compile */
+} RegexCacheEntry;
+
+static __thread RegexCacheEntry regex_cache_[REGEX_CACHE_CAP];
+static __thread int regex_cache_len_ = 0;
+
+static pcre2_code *regex_cache_lookup(const char *pattern, const char *flags) {
+    char key[128];
+    int ki = 0;
+    for (const char *p = pattern; *p && ki < 127; ki++, p++) key[ki] = *p;
+    key[ki++] = '\x1f';   /* unit separator */
+    for (const char *f = flags; *f && ki < 127; ki++, f++) key[ki] = *f;
+    key[ki] = '\0';
+
+    for (int i = 0; i < regex_cache_len_; i++) {
+        if (regex_cache_[i].compiled && strcmp(regex_cache_[i].key, key) == 0) {
+            /* promote to front (LRU) */
+            RegexCacheEntry tmp = regex_cache_[i];
+            for (int j = i; j > 0; j--) regex_cache_[j] = regex_cache_[j-1];
+            regex_cache_[0] = tmp;
+            return tmp.compiled;
+        }
+    }
+    return NULL;
+}
+
+static void regex_cache_insert(const char *pattern, const char *flags, pcre2_code *compiled) {
+    if (!compiled) return;
+    char key[128];
+    int ki = 0;
+    for (const char *p = pattern; *p && ki < 127; ki++, p++) key[ki] = *p;
+    key[ki++] = '\x1f';
+    for (const char *f = flags; *f && ki < 127; ki++, f++) key[ki] = *f;
+    key[ki] = '\0';
+
+    /* check if already in cache (shouldn't be, but handle it) */
+    for (int i = 0; i < regex_cache_len_; i++) {
+        if (strcmp(regex_cache_[i].key, key) == 0) {
+            regex_cache_[i].compiled = compiled;
+            RegexCacheEntry tmp = regex_cache_[i];
+            for (int j = i; j > 0; j--) regex_cache_[j] = regex_cache_[j-1];
+            regex_cache_[0] = tmp;
+            return;
+        }
+    }
+
+    /* evict LRU (last entry) if full */
+    if (regex_cache_len_ >= REGEX_CACHE_CAP) {
+        pcre2_code_free(regex_cache_[regex_cache_len_ - 1].compiled);
+        regex_cache_[regex_cache_len_ - 1].compiled = NULL;
+        regex_cache_[regex_cache_len_ - 1].key[0] = '\0';
+    } else {
+        regex_cache_len_++;
+    }
+
+    /* insert at front */
+    RegexCacheEntry *dst = &regex_cache_[0];
+    for (int j = regex_cache_len_ - 1; j > 0; j--) regex_cache_[j] = regex_cache_[j-1];
+    memcpy(dst->key, key, ki + 1);
+    dst->compiled = compiled;
+}
+
 PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags) {
     int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                                   pcre_flags(flags), &errcode, &erroffset, NULL);
+    pcre2_code *re = regex_cache_lookup(pattern, flags);
+    if (!re) {
+        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                           pcre_flags(flags), &errcode, &erroffset, NULL);
+        if (re) regex_cache_insert(pattern, flags, re);
+    }
     if (!re) return perl_alloc_int(0);
 
     char *s = perl_to_string_dup(str);
@@ -3594,7 +3672,7 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
 
     free(s);
     pcre2_match_data_free(md);
-    pcre2_code_free(re);
+    /* Do NOT free re — it comes from the shared cache. */
     return perl_alloc_int(rc > 0 ? 1 : 0);
 }
 
@@ -3609,10 +3687,13 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     }
     clean[ci] = '\0';
 
+    pcre2_code *re = regex_cache_lookup(pattern, clean);
     int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                                   pcre_flags(clean), &errcode, &erroffset, NULL);
-    if (!re) return 0;
+    if (!re) {
+        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                           pcre_flags(clean), &errcode, &erroffset, NULL);
+        if (re) regex_cache_insert(pattern, clean, re);
+    }
 
     char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
@@ -3700,7 +3781,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
 
     free(s);
     pcre2_match_data_free(md);
-    pcre2_code_free(re);
+    /* Do NOT free re — it comes from the shared cache. */
     return count;
 }
 
@@ -3721,8 +3802,12 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     }
 
     int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                                   pcre_flags(flags), &errcode, &erroffset, NULL);
+    pcre2_code *re = regex_cache_lookup(pattern, flags);
+    if (!re) {
+        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                           pcre_flags(flags), &errcode, &erroffset, NULL);
+        if (re) regex_cache_insert(pattern, flags, re);
+    }
     if (!re) { free(s); return arr; }
     size_t pos = 0;
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
@@ -3748,7 +3833,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
 
     free(s);
     pcre2_match_data_free(md);
-    pcre2_code_free(re);
+    /* Do NOT free re — it comes from the shared cache. */
     return arr;
 }
 
@@ -3775,8 +3860,12 @@ void perl_clear_named_captures(void) {
 
 PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags) {
     int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                                   pcre_flags(flags), &errcode, &erroffset, NULL);
+    pcre2_code *re = regex_cache_lookup(pattern, flags);
+    if (!re) {
+        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                           pcre_flags(flags), &errcode, &erroffset, NULL);
+        if (re) regex_cache_insert(pattern, flags, re);
+    }
     if (!re) { str->matchpos = 0; return perl_alloc_int(0); }
 
     char *s = perl_to_string_dup(str);
@@ -3802,19 +3891,25 @@ PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *f
             memcpy(cap, s + cs, ce - cs); cap[ce - cs] = '\0';
             perl_captures_[i] = perl_alloc_string(cap); free(cap);
         }
-        free(s); pcre2_match_data_free(md); pcre2_code_free(re);
+        free(s); pcre2_match_data_free(md);
+        /* Do NOT free re — it comes from the shared cache. */
         return perl_alloc_int(1);
     } else {
         str->matchpos = 0;
-        free(s); pcre2_match_data_free(md); pcre2_code_free(re);
+        free(s); pcre2_match_data_free(md);
+        /* Do NOT free re — it comes from the shared cache. */
         return perl_alloc_int(0);
     }
 }
 
 PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char *flags) {
     int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                                   pcre_flags(flags), &errcode, &erroffset, NULL);
+    pcre2_code *re = regex_cache_lookup(pattern, flags);
+    if (!re) {
+        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                           pcre_flags(flags), &errcode, &erroffset, NULL);
+        if (re) regex_cache_insert(pattern, flags, re);
+    }
     PerlArray *arr = perl_array_new();
     if (!re) return arr;
 
@@ -3854,7 +3949,8 @@ PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char 
         pos = (mend > mstart) ? mend : mend + 1;
     }
 
-    free(s); pcre2_match_data_free(md); pcre2_code_free(re);
+    free(s); pcre2_match_data_free(md);
+    /* Do NOT free re — it comes from the shared cache. */
     return arr;
 }
 
@@ -5105,6 +5201,24 @@ void perl_cleanup(void) {
 
     /* 3. XS module list (reload of existing cleanup). */
     perl_xs_cleanup();
+
+    /* 4. PV slabs: free all allocated slabs so valgrind reports zero leaks.
+     * The PVs inside the slabs are either in the freelist or in use, but
+     * at exit we just free the slab memory itself (calloc'd blocks). */
+    for (int s = 0; s < pv_slab_count_; s++) {
+        free(pv_slabs_[s]);
+    }
+    pv_slab_count_ = 0;
+
+    /* 5. Per-thread PCRE2 compiled-pattern cache (main thread only). */
+    for (int i = 0; i < regex_cache_len_; i++) {
+        if (regex_cache_[i].compiled) {
+            pcre2_code_free(regex_cache_[i].compiled);
+            regex_cache_[i].compiled = NULL;
+            regex_cache_[i].key[0] = '\0';
+        }
+    }
+    regex_cache_len_ = 0;
 
 #ifdef PERL_ALLOC_DEBUG
     /* 4. PV leak check: iterate all slabs, report PVs with sentinel set. */
