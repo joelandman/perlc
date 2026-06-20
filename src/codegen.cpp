@@ -3463,7 +3463,16 @@ void CodeGen::emitStmt(const Node &n) {
             v = cloned;
         }
         emitScopeCleanup();  /* free tracked my-var pvs in all active scopes */
-        builder_.CreateRet(v);
+        /* In the main function (which returns i32), we can't emit `ret ptr`.
+           Inside an eval block, `return` is equivalent to `die` in Perl
+           semantics (no enclosing sub to return from). Call perl_die to
+           longjmp back to the eval's catch point. */
+        if (currentFn_ && currentFn_->getReturnType()->isIntegerTy() &&
+            currentFn_->getName() == "main") {
+            callRT("perl_die", {v});
+        } else {
+            builder_.CreateRet(v);
+        }
         break;
     }
 
