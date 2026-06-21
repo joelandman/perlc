@@ -123,7 +123,7 @@ NodePtr Parser::parseStmt() {
         auto n = std::make_unique<Node>(); n->kind = NK::StateDecl;
         n->name = varName; n->line = line;
         if (match(TK::ASSIGN))
-            n->left = parseExpr();
+            n->left = parseLowNot();
         return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_LOCAL)) {
@@ -131,17 +131,17 @@ NodePtr Parser::parseStmt() {
         if (check(TK::ARRAY)) {  /* local @arr */
             advance();
             std::string arrName = cur().text; advance();
-            auto n = std::make_unique<Node>(); n->kind = NK::LocalArray;
-            n->name = arrName; n->line = line;
-            if (match(TK::ASSIGN)) n->left = parseExpr();
+   auto n = std::make_unique<Node>(); n->kind = NK::LocalArray;
+        n->name = arrName; n->line = line;
+        if (match(TK::ASSIGN)) n->left = parseLowNot();
             return parseModifier(std::move(n), line);
         }
         if (check(TK::HASH)) {   /* local %hash */
             advance();
             std::string hashName = cur().text; advance();
-            auto n = std::make_unique<Node>(); n->kind = NK::LocalHash;
-            n->name = hashName; n->line = line;
-            if (match(TK::ASSIGN)) n->left = parseExpr();
+  auto n = std::make_unique<Node>(); n->kind = NK::LocalHash;
+        n->name = hashName; n->line = line;
+        if (match(TK::ASSIGN)) n->left = parseLowNot();
             return parseModifier(std::move(n), line);
         }
         consume(TK::SCALAR, "$");
@@ -156,7 +156,7 @@ NodePtr Parser::parseStmt() {
         auto n = std::make_unique<Node>(); n->kind = NK::LocalStmt;
         n->name = varName; n->line = line;
         if (match(TK::ASSIGN))
-            n->left = parseExpr();
+            n->left = parseLowNot();
         return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_IF))      return parseIf();
@@ -289,12 +289,33 @@ NodePtr Parser::parseStmt() {
         match(TK::SEMI);
         return n;
     }
-    /* cond_wait / cond_signal / cond_broadcast */
+      /* cond_wait / cond_signal / cond_broadcast */
     if (check(TK::KW_COND_WAIT) || check(TK::KW_COND_SIGNAL) || check(TK::KW_COND_BROADCAST)) {
         NK kind = check(TK::KW_COND_WAIT) ? NK::CondWait
                 : check(TK::KW_COND_SIGNAL) ? NK::CondSignal : NK::CondBcast;
         advance(); match(TK::LPAREN);
         auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
+        n->left = parseExpr();
+        match(TK::RPAREN); match(TK::SEMI);
+        return n;
+    }
+    /* tie($var, CLASS [, args...]) */
+    if (check(TK::KW_TIE)) {
+        advance(); match(TK::LPAREN);
+        auto n = std::make_unique<Node>(); n->kind = NK::TieStmt; n->line = line;
+        n->left = parseExpr();  /* $var to tie */
+        match(TK::COMMA);
+        if (check(TK::STRING)) { n->args.push_back(makeStr(cur().text)); advance(); }
+        else if (check(TK::IDENT)) { n->args.push_back(makeStr(cur().text)); advance(); }
+        else { throw std::runtime_error("tie: expected class name"); }
+        while (check(TK::COMMA)) { advance(); n->args.push_back(parseExpr()); }
+        match(TK::RPAREN); match(TK::SEMI);
+        return n;
+    }
+    /* untie($var) */
+    if (check(TK::KW_UNTIE)) {
+        advance(); match(TK::LPAREN);
+        auto n = std::make_unique<Node>(); n->kind = NK::UntieStmt; n->line = line;
         n->left = parseExpr();
         match(TK::RPAREN); match(TK::SEMI);
         return n;
@@ -533,7 +554,8 @@ NodePtr Parser::parseMy() {
             listShared = true;
         }
         NodePtr rhs;
-        if (match(TK::ASSIGN)) rhs = parseExpr();
+        if (match(TK::ASSIGN)) rhs = parseLowNot();
+        consumeLowOrChain();
         match(TK::SEMI);
         /* emit as FlatBlock with multiple decls */
         NodeList stmts;
@@ -574,8 +596,9 @@ NodePtr Parser::parseMy() {
             decl->ival = 1;       /* shared flag */
         }
         if (match(TK::ASSIGN)) {
-            decl->right = parseExpr();
+            decl->right = parseLowNot();
         }
+        consumeLowOrChain();
         match(TK::SEMI);
         return decl;
     }
@@ -591,9 +614,10 @@ NodePtr Parser::parseMy() {
                 toks_[pos_ + 1].text == "shared") {
             advance(); advance(); decl->ival = 1; /* shared flag */
         }
-        if (match(TK::ASSIGN)) {
-            decl->right = parseExpr();
+       if (match(TK::ASSIGN)) {
+            decl->right = parseLowNot();
         }
+        consumeLowOrChain();
         match(TK::SEMI);
         return decl;
     }
@@ -609,8 +633,9 @@ NodePtr Parser::parseMy() {
             advance(); advance(); decl->ival = 1; /* shared flag */
         }
         if (match(TK::ASSIGN)) {
-            decl->right = parseExpr();
+            decl->right = parseLowNot();
         }
+        consumeLowOrChain();
         match(TK::SEMI);
         return decl;
     }
@@ -777,6 +802,17 @@ bool Parser::isModifier() const {
            k == TK::KW_FOR   || k == TK::KW_FOREACH;
 }
 
+/* Consume a low-precedence or/and/xor chain (statement separators in
+   Perl).  Used after my/local/state declarations where the initializer
+   is parsed with parseLowNot() which stops before or/and/xor. */
+void Parser::consumeLowOrChain() {
+    while (check(TK::KW_OR) || check(TK::KW_AND) ||
+           (cur().kind == TK::IDENT && cur().text == "xor")) {
+        advance();
+        parseOrRhs();
+    }
+}
+
 /* Wrap stmt in an if/while/foreach node if a modifier keyword follows.
    Always consumes the trailing semicolon. */
 NodePtr Parser::parseModifier(NodePtr stmt, int line) {
@@ -820,6 +856,21 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
         n->body = makeBlock(std::move(body), line);
         match(TK::SEMI);
         return n;
+    }
+    // Handle or/and/xor chains (low-precedence statement separators).
+    // After a statement like `my $x = 0`, the `or`/`and`/`xor` keywords
+    // act as statement-level operators (Perl precedence: below assignment).
+    // Consume the chain and its RHS without emitting short-circuit code
+    // — they are effectively no-ops after declarations/statements.
+    if (check(TK::KW_OR) || check(TK::KW_AND) ||
+        (cur().kind == TK::IDENT && cur().text == "xor")) {
+        while (check(TK::KW_OR) || check(TK::KW_AND) ||
+               (cur().kind == TK::IDENT && cur().text == "xor")) {
+            advance();            /* consume or/and/xor */
+            parseOrRhs();         /* consume RHS */
+        }
+        match(TK::SEMI);
+        return stmt;
     }
     match(TK::SEMI);
     return stmt;
@@ -2212,6 +2263,37 @@ NodePtr Parser::parsePrimary() {
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::SprintfFunc; n->line = line;
         n->left = std::move(fmt); n->args = std::move(args);
+        return n;
+    }
+
+    /* pack(FORMAT, args...) */
+    if (check(TK::KW_PACK)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        NodePtr fmt = parseExpr();
+        NodeList args;
+        while (match(TK::COMMA)) {
+            if (!hasParen && isModifier()) break;
+            if (hasParen && check(TK::RPAREN)) break;
+            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            args.push_back(parseExpr());
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::PackFunc; n->line = line;
+        n->left = std::move(fmt); n->args = std::move(args);
+        return n;
+    }
+
+    /* unpack(FORMAT, string) */
+    if (check(TK::KW_UNPACK)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        NodePtr fmt = parseExpr();
+        match(TK::COMMA);
+        NodePtr str = parseExpr();
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::UnpackFunc; n->line = line;
+        n->left = std::move(str); n->args.push_back(std::move(fmt));
         return n;
     }
 

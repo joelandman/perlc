@@ -63,6 +63,7 @@ PerlValue *perl_alloc_float(double v);
 
 PerlValue *perl_alloc_string(const char *s);
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
+PerlValue *perl_alloc_float_array(long long n); /* alloc FLAT_ARRAY with n zero doubles */
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
 PerlValue *perl_alloc_xs_ptr(void *p);
 PerlValue *perl_clone(const PerlValue *v);
@@ -87,7 +88,11 @@ PerlValue *perl_atomic_dec(PerlValue *pv);
 PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta);
 PerlValue *perl_atomic_rmw(PerlValue *pv, PerlValue *rhs, int op);  /* *, /, % */
 
-/* coercions */
+ /* tie/untie */
+ PerlValue *perl_tie(PerlValue *args_arr);
+ void perl_untie(PerlValue *var_pv);
+
+ /* coercions */
 long long  perl_to_int(const PerlValue *v);
 double     perl_to_float(const PerlValue *v);
 const char *perl_to_string(const PerlValue *v);   /* stable for PERL_STRING/undef, heap for others */
@@ -297,6 +302,11 @@ PerlValue *perl_get_stdout(void);   /* returns stable STDOUT PerlValue* */
 /* ── sprintf / printf ────────────────────────────────────────────────────── */
 PerlValue *perl_sprintf(PerlValue *fmt, PerlArray *args);
 void       perl_printf(PerlValue *fmt, PerlArray *args);
+
+/* ── pack / unpack ───────────────────────────────────────────────────────── */
+PerlValue *perl_pack(PerlValue *fmt, PerlArray *args);
+PerlValue *perl_unpack(PerlValue *fmt, PerlValue *str);
+PerlArray *perl_unpack_to_array(PerlValue *fmt, PerlValue *str);
 
 /* ── math builtins ───────────────────────────────────────────────────────── */
 PerlValue *perl_abs_val(PerlValue *v);

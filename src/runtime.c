@@ -638,6 +638,71 @@ PerlValue *perl_do_file(PerlValue *path_pv) {
     return result ? result : perl_alloc_undef();
 }
 
+/* ── tie/untie (minimal TIESCALAR/TIEARRAY/TIEHASH) ───────────────────────── */
+PerlValue *perl_tie(PerlValue *args_arr) {
+    if (!args_arr || args_arr->tag != PERL_REF_ARRAY) {
+        perl_set_dollar_at_cstr("tie: expected args array ref");
+        return perl_alloc_undef();
+    }
+
+    PerlArray *arr = (PerlArray *)args_arr->pval;
+    if (!arr || arr->len < 2) {
+        perl_set_dollar_at_cstr("tie: need at least var and class");
+        return perl_alloc_undef();
+    }
+
+    PerlValue *var_pv = arr->elems[0];
+    const char *class_name = perl_to_string(arr->elems[1]);
+
+    if (!class_name || !class_name[0]) return perl_alloc_undef();
+
+    /* build extra args (skip var_pv and class_name) */
+    int extra_count = arr->len - 2;
+    PerlArray *extra_arr = perl_array_new();
+    for (int i = 2; i < arr->len; i++) {
+        perl_array_set(extra_arr, i - 2, arr->elems[i]);
+    }
+
+    /* call CLASS->TIEHASH/TIESCALAR/TIEARRAY(var, extra_args...) */
+    PerlValue *result = perl_dispatch_method(var_pv, class_name, extra_arr);
+
+    perl_array_free(extra_arr);
+
+    if (!result || result->tag == PERL_UNDEF) {
+        perl_set_dollar_at_cstr("tie: class has no TIESCALAR/TIEARRAY/TIEHASH");
+        return perl_alloc_undef();
+    }
+
+    /* bless the result */
+    PerlValue *class_pv = perl_alloc_string(class_name);
+    perl_bless(result, class_pv);
+    perl_free(class_pv);
+
+    /* store the blessed reference in the tied variable */
+    if (var_pv && var_pv->tag == PERL_REF_SCALAR) {
+        PerlValue **slot = (PerlValue **)var_pv->pval;
+        if (slot && *slot) perl_free(*slot);
+        *slot = perl_clone(result);
+    }
+
+    return result;
+}
+
+void perl_untie(PerlValue *var_pv) {
+    if (!var_pv || var_pv->tag == PERL_UNDEF) return;
+
+    PerlValue *obj = var_pv;
+    if (var_pv->tag == PERL_REF_SCALAR) {
+        PerlValue **slot = (PerlValue **)var_pv->pval;
+        if (slot && *slot) obj = *slot;
+    }
+
+    if (!obj || !obj->blessed_class) return;
+
+    /* call UNTIE() on the blessed object */
+    perl_dispatch_method(obj, "UNTIE", NULL);
+}
+
 /* ── string eval ─────────────────────────────────────────────────────────── */
 PerlEvalStringFn perl_eval_string_fn = NULL;
 
@@ -703,6 +768,17 @@ PerlValue *perl_alloc_flat_array(long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLAT_ARRAY;
     v->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
+    v->matchpos = n;
+    v->blessed_class = NULL;
+    return v;
+}
+
+PerlValue *perl_alloc_float_array(long long n) {
+    PerlValue *v = pv_alloc();
+    v->tag = PERL_FLAT_ARRAY;
+    if (n > 0) {
+        v->pval = calloc((size_t)n, sizeof(double));  /* zero-initialized */
+    }
     v->matchpos = n;
     v->blessed_class = NULL;
     return v;
@@ -1589,16 +1665,22 @@ PerlValue *perl_chop(PerlValue *v) {
     return removed;
 }
 
+/* UTF-8 helper forward declarations */
+static int utf8_encode(unsigned char *buf, long long cp);
+static int utf8_decode(const unsigned char *buf, long long *out);
+static long long utf8_strlen(const char *s);
+static long long utf8_char_to_byte(const char *s, long long n);
+
 PerlValue *perl_length(PerlValue *v) {
     if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
     char *s = perl_to_string_dup(v);
-    long long n = (long long)strlen(s);
+    long long n = utf8_strlen(s);
     free(s);
     return perl_alloc_int(n);
 }
 
-/* common helper: clamp offset/len to string bounds */
-static void substr_bounds(long long slen, long long *off, long long *n) {
+/* common helper: clamp offset/len to string bounds (UTF-8 code point aware) */
+static void substr_bounds_utf8(long long slen, long long *off, long long *n) {
     if (*off < 0) *off += slen;
     if (*off < 0) *off = 0;
     if (*off > slen) *off = slen;
@@ -1608,32 +1690,51 @@ static void substr_bounds(long long slen, long long *off, long long *n) {
 
 PerlValue *perl_substr2(PerlValue *str, PerlValue *off_v) {
     char *s  = perl_to_string_dup(str);
-    long long slen = (long long)strlen(s);
+    long long slen = utf8_strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = slen;
-    substr_bounds(slen, &off, &n);
-    PerlValue *r = perl_alloc_string(s + off);  /* NUL at s+off+n is fine — we'll truncate */
-    /* actually we need to truncate at n chars */
-    if (r->tag == PERL_STRING) r->sval[n] = '\0';  /* safe: perl_alloc_string strdup'd */
-    /* Hmm, we can't truncate that way safely; build explicitly */
-    perl_free(r);
-    char *buf = malloc((size_t)n + 1);
-    memcpy(buf, s + off, (size_t)n);
-    buf[n] = '\0';
-    r = perl_alloc_string(buf);
+    substr_bounds_utf8(slen, &off, &n);
+    long long byte_off = utf8_char_to_byte(s, off);
+    long long byte_len = utf8_char_to_byte(s + byte_off, n) - 0;
+    /* recalculate byte_len by advancing n code points */
+    const unsigned char *p = (const unsigned char *)(s + byte_off);
+    long long bc = 0;
+    for (long long c = 0; c < n; c++) {
+        if (*p < 0x80) p++;
+        else if ((*p & 0xE0) == 0xC0) p += 2;
+        else if ((*p & 0xF0) == 0xE0) p += 3;
+        else if ((*p & 0xF8) == 0xF0) p += 4;
+        else p++;
+        bc++;
+    }
+    char *buf = malloc((size_t)bc + 1);
+    memcpy(buf, s + byte_off, (size_t)bc);
+    buf[bc] = '\0';
+    PerlValue *r = perl_alloc_string(buf);
     free(buf); free(s);
     return r;
 }
 
 PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
     char *s  = perl_to_string_dup(str);
-    long long slen = (long long)strlen(s);
+    long long slen = utf8_strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
-    substr_bounds(slen, &off, &n);
-    char *buf = malloc((size_t)n + 1);
-    memcpy(buf, s + off, (size_t)n);
-    buf[n] = '\0';
+    substr_bounds_utf8(slen, &off, &n);
+    long long byte_off = utf8_char_to_byte(s, off);
+    const unsigned char *p = (const unsigned char *)(s + byte_off);
+    long long bc = 0;
+    for (long long c = 0; c < n; c++) {
+        if (*p < 0x80) p++;
+        else if ((*p & 0xE0) == 0xC0) p += 2;
+        else if ((*p & 0xF0) == 0xE0) p += 3;
+        else if ((*p & 0xF8) == 0xF0) p += 4;
+        else p++;
+        bc++;
+    }
+    char *buf = malloc((size_t)bc + 1);
+    memcpy(buf, s + byte_off, (size_t)bc);
+    buf[bc] = '\0';
     PerlValue *r = perl_alloc_string(buf);
     free(buf); free(s);
     return r;
@@ -1642,16 +1743,30 @@ PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
 void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, PerlValue *repl) {
     char *s     = perl_to_string_dup(str);
     char *r     = perl_to_string_dup(repl);
-    long long slen = (long long)strlen(s);
+    long long slen = utf8_strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
-    substr_bounds(slen, &off, &n);
+    substr_bounds_utf8(slen, &off, &n);
+    long long byte_off = utf8_char_to_byte(s, off);
+    /* calculate byte length of n code points */
+    const unsigned char *p = (const unsigned char *)(s + byte_off);
+    long long byte_n = 0;
+    for (long long c = 0; c < n; c++) {
+        if (*p < 0x80) { p++; byte_n++; }
+        else if ((*p & 0xE0) == 0xC0) { p += 2; byte_n += 2; }
+        else if ((*p & 0xF0) == 0xE0) { p += 3; byte_n += 3; }
+        else if ((*p & 0xF8) == 0xF0) { p += 4; byte_n += 4; }
+        else { p++; byte_n++; }
+    }
     long long rlen  = (long long)strlen(r);
-    long long newlen = slen - n + rlen;
+    long long newlen = (long long)(byte_off + byte_n + rlen + (slen - byte_off - (long long)strlen(s + byte_off) + byte_n));
+    /* recalculate: newlen = byte_off + rlen + (original_bytes_after_removal) */
+    long long orig_after = (long long)strlen(s) - byte_off - byte_n;
+    newlen = byte_off + rlen + orig_after;
     char *buf = malloc((size_t)newlen + 1);
-    memcpy(buf, s, (size_t)off);
-    memcpy(buf + off, r, (size_t)rlen);
-    memcpy(buf + off + rlen, s + off + n, (size_t)(slen - off - n));
+    memcpy(buf, s, (size_t)byte_off);
+    memcpy(buf + byte_off, r, (size_t)rlen);
+    memcpy(buf + byte_off + rlen, s + byte_off + byte_n, (size_t)orig_after);
     buf[newlen] = '\0';
     if (str->tag == PERL_STRING) free(str->sval);
     str->tag  = PERL_STRING;
@@ -3365,7 +3480,411 @@ void perl_printf(PerlValue *fmt, PerlArray *args) {
     perl_free(s);
 }
 
+/* ── pack / unpack ───────────────────────────────────────────────────────── */
+
+/* Helper: read a signed integer from buffer in given endianness */
+static long long read_int_from_buf(const unsigned char *buf, int size, int little_endian) {
+    long long val = 0;
+    if (little_endian) {
+        for (int i = 0; i < size; i++) val |= ((long long)buf[i]) << (i * 8);
+    } else {
+        for (int i = 0; i < size; i++) val |= ((long long)buf[i]) << ((size - 1 - i) * 8);
+    }
+    return val;
+}
+
+/* Helper: write a signed integer to buffer in given endianness */
+static void write_int_to_buf(unsigned char *buf, long long val, int size, int little_endian) {
+    if (little_endian) {
+        for (int i = 0; i < size; i++) { buf[i] = (unsigned char)(val & 0xFF); val >>= 8; }
+    } else {
+        for (int i = size - 1; i >= 0; i--) { buf[i] = (unsigned char)(val & 0xFF); val >>= 8; }
+    }
+}
+
+PerlValue *perl_pack(PerlValue *fmt_pv, PerlArray *args) {
+    char *fmt = perl_to_string_dup(fmt_pv);
+    size_t cap = 256, pos = 0;
+    char *out = malloc(cap);
+    if (!out) { free(fmt); return perl_alloc_undef(); }
+
+#define ENSURE(n) do { while (pos+(n)+1 > cap) { cap*=2; out=realloc(out,cap); } } while(0)
+#define PUT(p,n) do { ENSURE(n); memcpy(out+pos,(p),(n)); pos+=(n); } while(0)
+
+    long long argidx = 0;
+    for (const char *p = fmt; *p; ) {
+        if (*p == '\\') { p++; if (!*p) break; unsigned char c = (unsigned char)*p; PUT(&c, 1); p++; continue; }
+
+        /* read type char first */
+        char type = *p++;
+        if (!type) break;
+
+        /* read count multiplier (comes after type in Perl format) */
+        long long count = 1;
+        if (*p && *p >= '0' && *p <= '9') {
+            count = 0;
+            while (*p && *p >= '0' && *p <= '9') { count = count * 10 + (*p - '0'); p++; }
+        }
+        /* p already points past the digits or at the next type char */
+
+        int little_endian = 0;
+        int signed_flag = 0;
+        int size_bytes = 0;
+
+        switch (type) {
+        case 'a': case 'A': case 'h': case 'H': case 'b': case 'B':
+            /* string/bytes — consume one arg as string, copy raw bytes */
+            for (long long c = 0; c < count; c++) {
+                PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+                char *s = perl_to_string_dup(arg);
+                size_t slen = strlen(s);
+                ENSURE(slen);
+                memcpy(out + pos, s, slen);
+                pos += slen;
+                free(s);
+            }
+            continue;
+        case 'x': /* skip byte */
+            pos += count;
+            ENSURE(0); /* ensure buffer big enough */
+            for (size_t z = pos; z < pos; z++) out[z] = '\0';
+            continue;
+        case 'X': /* back up one byte */
+            if (pos > 0) pos -= count;
+            continue;
+        case '@': /* null to absolute position */
+            if (count > cap) { cap = count; out = realloc(out, cap); }
+            for (size_t z = pos; z < count; z++) out[z] = '\0';
+            pos = count;
+            continue;
+        case 'c': case 'C':
+            size_bytes = 1; signed_flag = (type == 'c');
+            break;
+        case 's': case 'S':
+            size_bytes = 2; signed_flag = (type == 's');
+            if (type == 'S') little_endian = 1;
+            break;
+        case 'n': case 'N':
+            size_bytes = 2; signed_flag = 0;
+            little_endian = 0; /* big-endian */
+            if (type == 'N') { size_bytes = 4; little_endian = 0; }
+            if (type == 'n') { size_bytes = 2; little_endian = 0; }
+            break;
+        case 'v': case 'V':
+            size_bytes = 2; signed_flag = 0;
+            little_endian = 1; /* little-endian */
+            if (type == 'V') { size_bytes = 4; little_endian = 1; }
+            if (type == 'v') { size_bytes = 2; little_endian = 1; }
+            break;
+        case 'l': case 'L':
+            size_bytes = 4; signed_flag = (type == 'l');
+            if (type == 'L') little_endian = 1;
+            break;
+        case 'i': case 'I':
+            size_bytes = (int)sizeof(int); signed_flag = (type == 'i');
+            if (type == 'I') little_endian = 1;
+            break;
+        case 'q': case 'Q':
+            size_bytes = 8; signed_flag = (type == 'q');
+            if (type == 'Q') little_endian = 1;
+            break;
+        case 'f':
+            size_bytes = 4;
+            for (long long c = 0; c < count; c++) {
+                PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+                float fv = (float)perl_to_float(arg);
+                ENSURE(4);
+                unsigned char *bp = (unsigned char *)(out + pos);
+                memcpy(bp, &fv, 4);
+                pos += 4;
+            }
+            continue;
+        case 'd':
+            size_bytes = 8;
+            for (long long c = 0; c < count; c++) {
+                PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+                double dv = perl_to_float(arg);
+                ENSURE(8);
+                unsigned char *bp = (unsigned char *)(out + pos);
+                memcpy(bp, &dv, 8);
+                pos += 8;
+            }
+            continue;
+        default:
+            /* unknown type — skip */
+            continue;
+        }
+
+        /* integer packing */
+        for (long long c = 0; c < count; c++) {
+            PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+            long long val = perl_to_int(arg);
+            ENSURE(size_bytes);
+            unsigned char *bp = (unsigned char *)(out + pos);
+            if (signed_flag) {
+                write_int_to_buf(bp, val, size_bytes, little_endian);
+            } else {
+                write_int_to_buf(bp, (unsigned long long)val, size_bytes, little_endian);
+            }
+            pos += size_bytes;
+        }
+    }
+
+    out[pos] = '\0';
+#undef ENSURE
+#undef PUT
+
+    free(fmt);
+    PerlValue *result = perl_alloc_string(out);
+    free(out);
+    return result;
+}
+
+PerlValue *perl_unpack(PerlValue *fmt_pv, PerlValue *str_pv) {
+    char *fmt = perl_to_string_dup(fmt_pv);
+    char *str = perl_to_string_dup(str_pv);
+    size_t slen = strlen(str);
+    size_t strpos = 0;
+
+    PerlArray *result = perl_array_new();
+    long long argidx = 0; (void)argidx;
+
+    for (const char *p = fmt; *p; ) {
+        if (*p == '\\') { p++; if (!*p) break; continue; }
+
+        /* read type char first */
+        char type = *p++;
+        if (!type) break;
+
+        /* read count multiplier (comes after type in Perl format) */
+        long long count = 1;
+        if (*p && *p >= '0' && *p <= '9') {
+            count = 0;
+            while (*p && *p >= '0' && *p <= '9') { count = count * 10 + (*p - '0'); p++; }
+        }
+        /* p already points past the digits or at the next type char */
+
+        int little_endian = 0;
+        int size_bytes = 0;
+        int is_signed = 0;
+
+        switch (type) {
+        case 'a': case 'A': case 'h': case 'H': case 'b': case 'B': {
+            /* string — read count bytes as ONE element */
+            size_t slen2 = (count > 0 && count < slen - strpos) ? (size_t)count : (slen - strpos);
+            char *s = malloc(slen2 + 1);
+            memcpy(s, str + strpos, slen2);
+            s[slen2] = '\0';
+            strpos += slen2;
+            perl_array_push(result, perl_alloc_string(s));
+            free(s);
+            continue;
+        }
+        case 'x': /* skip */
+            strpos += count;
+            continue;
+        case 'X': /* back up */
+            if (strpos > 0) strpos -= count;
+            continue;
+        case '@': /* jump to position */
+            strpos = count;
+            continue;
+        case 'c': case 'C':
+            size_bytes = 1; is_signed = (type == 'c');
+            break;
+        case 's': case 'S':
+            size_bytes = 2; is_signed = (type == 's');
+            if (type == 'S') little_endian = 1;
+            break;
+        case 'n':
+            size_bytes = 2; is_signed = 0; little_endian = 0;
+            break;
+        case 'N':
+            size_bytes = 4; is_signed = 0; little_endian = 0;
+            break;
+        case 'v':
+            size_bytes = 2; is_signed = 0; little_endian = 1;
+            break;
+        case 'V':
+            size_bytes = 4; is_signed = 0; little_endian = 1;
+            break;
+        case 'l': case 'L':
+            size_bytes = 4; is_signed = (type == 'l');
+            if (type == 'L') little_endian = 1;
+            break;
+        case 'i': case 'I':
+            size_bytes = (int)sizeof(int); is_signed = (type == 'i');
+            if (type == 'I') little_endian = 1;
+            break;
+        case 'q': case 'Q':
+            size_bytes = 8; is_signed = (type == 'q');
+            if (type == 'Q') little_endian = 1;
+            break;
+        case 'f':
+            size_bytes = 4;
+            for (long long c = 0; c < count; c++) {
+                if (strpos + 4 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
+                float fv;
+                memcpy(&fv, str + strpos, 4);
+                perl_array_push(result, perl_alloc_float((double)fv));
+                strpos += 4;
+            }
+            continue;
+        case 'd':
+            size_bytes = 8;
+            for (long long c = 0; c < count; c++) {
+                if (strpos + 8 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
+                double dv;
+                memcpy(&dv, str + strpos, 8);
+                perl_array_push(result, perl_alloc_float(dv));
+                strpos += 8;
+            }
+            continue;
+        default:
+            continue;
+        }
+
+        /* integer unpacking */
+        for (long long c = 0; c < count; c++) {
+            if (strpos + size_bytes > slen) {
+                perl_array_push(result, perl_alloc_undef());
+                continue;
+            }
+            unsigned char *bp = (unsigned char *)(str + strpos);
+            long long val = read_int_from_buf(bp, size_bytes, little_endian);
+            if (!is_signed) val &= ((1LL << (size_bytes * 8)) - 1);
+            perl_array_push(result, perl_alloc_int(val));
+            strpos += size_bytes;
+        }
+    }
+
+    free(fmt);
+    free(str);
+    return perl_ref_array(result);
+}
+
 /* ── range ───────────────────────────────────────────────────────────────── */
+
+/* Helper: unpack and return array directly (for emitArrayPtr) */
+PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
+    char *fmt = perl_to_string_dup(fmt_pv);
+    char *str = perl_to_string_dup(str_pv);
+    size_t slen = strlen(str);
+    size_t strpos = 0;
+
+    PerlArray *result = perl_array_new();
+
+    for (const char *p = fmt; *p; ) {
+        if (*p == '\\') { p++; if (!*p) break; continue; }
+
+        /* read type char first */
+        char type = *p++;
+        if (!type) break;
+
+        /* read count multiplier (comes after type in Perl format) */
+        long long count = 1;
+        if (*p && *p >= '0' && *p <= '9') {
+            count = 0;
+            while (*p && *p >= '0' && *p <= '9') { count = count * 10 + (*p - '0'); p++; }
+        }
+        /* p already points past the digits or at the next type char */
+
+        int little_endian = 0;
+        int size_bytes = 0;
+
+        switch (type) {
+        case 'a': case 'A': case 'h': case 'H': case 'b': case 'B': {
+            size_t slen2 = (count > 0 && count < slen - strpos) ? (size_t)count : (slen - strpos);
+            char *s = malloc(slen2 + 1);
+            memcpy(s, str + strpos, slen2);
+            s[slen2] = '\0';
+            strpos += slen2;
+            perl_array_push(result, perl_alloc_string(s));
+            free(s);
+            continue;
+        }
+        case 'x':
+            strpos += count;
+            continue;
+        case 'X':
+            if (strpos > 0) strpos -= count;
+            continue;
+        case '@':
+            strpos = count;
+            continue;
+        case 'c': case 'C':
+            size_bytes = 1;
+            break;
+        case 's': case 'S':
+            size_bytes = 2;
+            if (type == 'S') little_endian = 1;
+            break;
+        case 'n':
+            size_bytes = 2; little_endian = 0;
+            break;
+        case 'N':
+            size_bytes = 4; little_endian = 0;
+            break;
+        case 'v':
+            size_bytes = 2; little_endian = 1;
+            break;
+        case 'V':
+            size_bytes = 4; little_endian = 1;
+            break;
+        case 'l': case 'L':
+            size_bytes = 4;
+            if (type == 'L') little_endian = 1;
+            break;
+        case 'i': case 'I':
+            size_bytes = (int)sizeof(int);
+            if (type == 'I') little_endian = 1;
+            break;
+        case 'q': case 'Q':
+            size_bytes = 8;
+            if (type == 'Q') little_endian = 1;
+            break;
+        case 'f':
+            size_bytes = 4;
+            for (long long c = 0; c < count; c++) {
+                if (strpos + 4 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
+                float fv;
+                memcpy(&fv, str + strpos, 4);
+                perl_array_push(result, perl_alloc_float((double)fv));
+                strpos += 4;
+            }
+            continue;
+        case 'd':
+            size_bytes = 8;
+            for (long long c = 0; c < count; c++) {
+                if (strpos + 8 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
+                double dv;
+                memcpy(&dv, str + strpos, 8);
+                perl_array_push(result, perl_alloc_float(dv));
+                strpos += 8;
+            }
+            continue;
+        default:
+            continue;
+        }
+
+        for (long long c = 0; c < count; c++) {
+            if (strpos + size_bytes > slen) {
+                perl_array_push(result, perl_alloc_undef());
+                continue;
+            }
+            unsigned char *bp = (unsigned char *)(str + strpos);
+            long long val = read_int_from_buf(bp, size_bytes, little_endian);
+            if (type != 'c' && type != 's' && type != 'l' && type != 'i' && type != 'q')
+                val &= ((1LL << (size_bytes * 8)) - 1);
+            perl_array_push(result, perl_alloc_int(val));
+            strpos += size_bytes;
+        }
+    }
+
+    free(fmt);
+    free(str);
+    return result;
+}
 
 /* ── math builtins ───────────────────────────────────────────────────────── */
 PerlValue *perl_abs_val(PerlValue *v) {
@@ -3444,17 +3963,102 @@ PerlValue *perl_rindex_str(PerlValue *str_pv, PerlValue *sub_pv, PerlValue *pos_
 }
 
 /* ── chr / ord / hex / oct ───────────────────────────────────────────────── */
+
+/* UTF-8 encode: write code point to buf, return bytes written (1-4) */
+static int utf8_encode(unsigned char *buf, long long cp) {
+    if (cp < 0x80) {
+        buf[0] = (unsigned char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        buf[0] = (unsigned char)(0xC0 | (cp >> 6));
+        buf[1] = (unsigned char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (unsigned char)(0xE0 | (cp >> 12));
+        buf[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (unsigned char)(0x80 | (cp & 0x3F));
+        return 3;
+    } else if (cp < 0x110000) {
+        buf[0] = (unsigned char)(0xF0 | (cp >> 18));
+        buf[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (unsigned char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+    return 0;
+}
+
+/* UTF-8 decode: read code point from buf, return bytes consumed. Sets *out to code point. */
+static int utf8_decode(const unsigned char *buf, long long *out) {
+    if (buf[0] < 0x80) {
+        *out = buf[0];
+        return 1;
+    } else if ((buf[0] & 0xE0) == 0xC0) {
+        if (buf[1] & 0xC0) {
+            *out = ((buf[0] & 0x1F) << 6) | (buf[1] & 0x3F);
+            return 2;
+        }
+    } else if ((buf[0] & 0xF0) == 0xE0) {
+        if ((buf[1] & 0xC0) == 0x80 && (buf[2] & 0xC0) == 0x80) {
+            *out = ((buf[0] & 0x0F) << 12) | ((buf[1] & 0x3F) << 6) | (buf[2] & 0x3F);
+            return 3;
+        }
+    } else if ((buf[0] & 0xF8) == 0xF0) {
+        if ((buf[1] & 0xC0) == 0x80 && (buf[2] & 0xC0) == 0x80 && (buf[3] & 0xC0) == 0x80) {
+            *out = ((buf[0] & 0x07) << 18) | ((buf[1] & 0x3F) << 12) | ((buf[2] & 0x3F) << 6) | (buf[3] & 0x3F);
+            return 4;
+        }
+    }
+    *out = 0;
+    return 1; /* invalid sequence, consume 1 byte */
+}
+
+/* Count UTF-8 code points in string */
+static long long utf8_strlen(const char *s) {
+    long long count = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        count++;
+        if (*p < 0x80) p++;
+        else if ((*p & 0xE0) == 0xC0) p += 2;
+        else if ((*p & 0xF0) == 0xE0) p += 3;
+        else if ((*p & 0xF8) == 0xF0) p += 4;
+        else p++;
+    }
+    return count;
+}
+
+/* Get byte offset of the nth UTF-8 code point */
+static long long utf8_char_to_byte(const char *s, long long n) {
+    long long count = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p && count < n) {
+        if (*p < 0x80) p++;
+        else if ((*p & 0xE0) == 0xC0) p += 2;
+        else if ((*p & 0xF0) == 0xE0) p += 3;
+        else if ((*p & 0xF8) == 0xF0) p += 4;
+        else p++;
+        count++;
+    }
+    return (long long)(p - (const unsigned char *)s);
+}
+
 PerlValue *perl_chr_val(PerlValue *v) {
     long long n = perl_to_int(v);
-    char buf[2] = { (char)(n & 0xFF), '\0' };
-    return perl_alloc_string(buf);
+    if (n < 0) n = 0;
+    if (n > 0x10FFFF) n = 0xFFFD; /* replacement char */
+    unsigned char buf[4];
+    int len = utf8_encode(buf, n);
+    buf[len] = '\0';
+    return perl_alloc_string((char *)buf);
 }
 
 PerlValue *perl_ord_val(PerlValue *v) {
     char *s = perl_to_string_dup(v);
-    long long r = s[0] ? (long long)(unsigned char)s[0] : 0;
+    long long cp;
+    utf8_decode((const unsigned char *)s, &cp);
     free(s);
-    return perl_alloc_int(r);
+    return perl_alloc_int(cp);
 }
 
 PerlValue *perl_hex_val(PerlValue *v) {

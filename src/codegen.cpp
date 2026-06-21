@@ -1929,59 +1929,106 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
                     return callRT("perl_to_float", {elem});
                 }
-                /* FLOAT_PAIR fast path: $z->[0] or $z->[1] where tag may be FLOAT_PAIR (13).
-                   Emits a runtime tag check; branch is perfectly predicted once type is fixed. */
-                if (n.right && n.right->kind == NK::IntLit &&
-                    (n.right->ival == 0 || n.right->ival == 1)) {
-                    if (Value *slot = lookupVar(nm)) {
-                        auto *i32Ty = Type::getInt32Ty(ctx_);
-                        auto *i64Ty = Type::getInt64Ty(ctx_);
-                        auto *f64Ty = Type::getDoubleTy(ctx_);
-                        auto *i8Ty  = Type::getInt8Ty(ctx_);
-                        Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
-                        Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
-                        Value *isPair = builder_.CreateICmpEQ(tag,
-                            ConstantInt::get(i32Ty, 13), "ispair");
-                        auto *curFn = builder_.GetInsertBlock()->getParent();
-                        auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
-                        auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
-                        auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
-                        builder_.CreateCondBr(isPair, pBB, nBB);
-                        /* FLOAT_PAIR path: direct field load */
-                        builder_.SetInsertPoint(pBB);
-                        Value *pairFv;
-                        if (n.right->ival == 0) {
-                            /* fval at byte offset 8 */
-                            Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
-                                i8Ty, pv, 8, "fp.re.ptr");
-                            pairFv = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
-                        } else {
-                            /* matchpos (i64) at byte offset 16, bitcast to double */
-                            Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
-                                i8Ty, pv, 16, "fp.im.ptr");
-                            Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
-                            pairFv = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
-                        }
-                        builder_.CreateBr(mBB);
-                        auto *pBBp = builder_.GetInsertBlock();
-                        /* Normal path: fall back to deref + get_ref + to_float.
-                           Use _ro (pure) so LLVM can hoist the deref out of inner
-                           loops when pv is loop-invariant (e.g. row access pattern). */
-                        builder_.SetInsertPoint(nBB);
-                        Value *normArr = callRT("perl_deref_array_ro", {pv});
-                        Value *normElem = callRT("perl_array_get_ref", {normArr, emitIdx(*n.right)});
-                        Value *normFv   = callRT("perl_to_float", {normElem});
-                        builder_.CreateBr(mBB);
-                        auto *nBBp = builder_.GetInsertBlock();
-                        builder_.SetInsertPoint(mBB);
-                        auto *phi = builder_.CreatePHI(f64Ty, 2, "fp.val");
-                        phi->addIncoming(pairFv, pBBp);
-                        phi->addIncoming(normFv, nBBp);
-                        return phi;
-                    }
-                }
-            }
-            return nullptr;
+      /* FLOAT_PAIR / FLAT_ARRAY fast path: $z->[idx] where tag may be
+               FLOAT_PAIR (13), FLAT_ARRAY (10), or REF_ARRAY.
+               Emits runtime tag checks; branches are perfectly predicted once type is fixed. */
+                  if (n.right && lookupVar(nm)) {
+                      if (Value *slot = lookupVar(nm)) {
+                          auto *i32Ty = Type::getInt32Ty(ctx_);
+                          auto *i64Ty = Type::getInt64Ty(ctx_);
+                          auto *f64Ty = Type::getDoubleTy(ctx_);
+                          auto *i8Ty  = Type::getInt8Ty(ctx_);
+                          Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
+                          Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
+                          Value *isPair = builder_.CreateICmpEQ(tag,
+                              ConstantInt::get(i32Ty, 13), "ispair");
+                          Value *isFlat = builder_.CreateICmpEQ(tag,
+                              ConstantInt::get(i32Ty, 10), "isflat");
+                          auto *curFn = builder_.GetInsertBlock()->getParent();
+                          auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
+                          auto *flBB = BasicBlock::Create(ctx_, "fl.f",  curFn);
+                          auto *flatBB = BasicBlock::Create(ctx_, "fa.f",  curFn);
+                          auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
+                          auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
+                          /* Branch: isPair ? pBB : flBB */
+                          builder_.CreateCondBr(isPair, pBB, flBB);
+                          /* FLOAT_PAIR path: direct field load.
+                               For fixed 0/1: compile-time select.
+                               For variable index: runtime PHI between re (offset 8) and im (offset 16). */
+                          builder_.SetInsertPoint(pBB);
+                          Value *pairFv;
+                          if (n.right->kind == NK::IntLit &&
+                              (n.right->ival == 0 || n.right->ival == 1)) {
+                              if (n.right->ival == 0) {
+                                  Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                      i8Ty, pv, 8, "fp.re.ptr");
+                                  pairFv = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                              } else {
+                                  Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                      i8Ty, pv, 16, "fp.im.ptr");
+                                  Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                                  pairFv = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                              }
+                          } else {
+                              /* Variable index: PHI between re (offset 8) and im (offset 16) */
+                              auto *idxV = emitIdx(*n.right);
+                              Value *idx0 = builder_.CreateICmpEQ(idxV,
+                                  ConstantInt::get(i64Ty, 0), "idx0");
+                              auto *idxBB = BasicBlock::Create(ctx_, "fp.idx", curFn);
+                              auto *reBB = BasicBlock::Create(ctx_, "fp.re", curFn);
+                              auto *imBB = BasicBlock::Create(ctx_, "fp.im", curFn);
+                              auto *idxM = BasicBlock::Create(ctx_, "fp.idm", curFn);
+                              builder_.CreateCondBr(idx0, reBB, imBB);
+                              builder_.SetInsertPoint(reBB);
+                              Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                  i8Ty, pv, 8, "fp.re.ptr");
+                              Value *reV = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                              builder_.CreateBr(idxM);
+                              builder_.SetInsertPoint(imBB);
+                              Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                  i8Ty, pv, 16, "fp.im.ptr");
+                              Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                              Value *imV = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                              builder_.CreateBr(idxM);
+                              builder_.SetInsertPoint(idxM);
+                              auto *phiIdx = builder_.CreatePHI(f64Ty, 2, "fp.idx");
+                              phiIdx->addIncoming(reV, reBB);
+                              phiIdx->addIncoming(imV, imBB);
+                              pairFv = phiIdx;
+                          }
+                          builder_.CreateBr(mBB);
+                          auto *pBBp = builder_.GetInsertBlock();
+                          /* FLAT_ARRAY path: check isFlat, branch to flatBB or nBB */
+                          builder_.SetInsertPoint(flBB);
+                          builder_.CreateCondBr(isFlat, flatBB, nBB);
+                          /* FLAT_ARRAY fast path: load double* from pval (offset 8),
+                               GEP by index, load double directly */
+                          builder_.SetInsertPoint(flatBB);
+                          Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fa.dp");
+                          Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "fa.dpp");
+                          dblPtr = builder_.CreateBitCast(dblPtr, f64Ty->getPointerTo());
+                          Value *idx = emitIdx(*n.right);
+                          dblPtr = builder_.CreateGEP(f64Ty, dblPtr, idx, "fa.gep");
+                          Value *flatFv = builder_.CreateLoad(f64Ty, dblPtr, "fa.val");
+                          builder_.CreateBr(mBB);
+                          auto *flatBBp = builder_.GetInsertBlock();
+                          /* Normal path: fall back to deref + get_ref + to_float */
+                          builder_.SetInsertPoint(nBB);
+                          Value *normArr = callRT("perl_deref_array_ro", {pv});
+                          Value *normElem = callRT("perl_array_get_ref", {normArr, emitIdx(*n.right)});
+                          Value *normFv   = callRT("perl_to_float", {normElem});
+                          builder_.CreateBr(mBB);
+                          auto *nBBp = builder_.GetInsertBlock();
+                          builder_.SetInsertPoint(mBB);
+                          auto *phi = builder_.CreatePHI(f64Ty, 3, "fp.val");
+                          phi->addIncoming(pairFv, pBBp);
+                          phi->addIncoming(flatFv, flatBBp);
+                          phi->addIncoming(normFv, nBBp);
+                          return phi;
+                      }
+                  }
+              }
+             return nullptr;
         } else {
             Value *base = emitExpr(*n.left);
             Value *hv = callRT("perl_deref_hash", {base});
@@ -4524,6 +4571,43 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
         }
         Value *rhs = emitExpr(*n.right);
+        /* DerefAV cache for local vars: when $local = $cached->[idx], cache the
+           PerlArray* so inner-loop $local->[i] skips perl_deref_array_ro. */
+        if (n.left->kind == NK::ScalarVar && n.right->kind == NK::ArrowDeref) {
+            std::string nm = n.left->name;
+            if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            if (!lookupDerefAV(nm)) {
+                Value *base = emitExpr(*n.right->left);
+                if (Value *outerPA = lookupDerefAV(nm)) {
+                    auto *i8T = Type::getInt8Ty(ctx_);
+                    auto *i32T = Type::getInt32Ty(ctx_);
+                    auto *i64T = Type::getInt64Ty(ctx_);
+                    Value *tag = builder_.CreateLoad(i32T, base, "tag");
+                    Value *isFlat = builder_.CreateICmpEQ(tag,
+                        ConstantInt::get(i32T, 10), "isflat");
+                    auto *curFn = builder_.GetInsertBlock()->getParent();
+                    auto *fBB = BasicBlock::Create(ctx_, "lva.f", curFn);
+                    auto *nBB = BasicBlock::Create(ctx_, "lva.n", curFn);
+                    auto *mBB = BasicBlock::Create(ctx_, "lva.m", curFn);
+                    builder_.CreateCondBr(isFlat, fBB, nBB);
+                    builder_.SetInsertPoint(fBB);
+                    Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(i8T, base, 8, "lva.pv");
+                    Value *dblPtr = builder_.CreateLoad(perlPtrTy_, pvalPtr, "lva.dp");
+                    builder_.CreateBr(mBB);
+                    builder_.SetInsertPoint(nBB);
+                    Value *av = callRT("perl_deref_array_ro", {base});
+                    builder_.CreateBr(mBB);
+                    builder_.SetInsertPoint(mBB);
+                    auto *phiAv = builder_.CreatePHI(perlPtrTy_, 2, "lva.av");
+                    phiAv->addIncoming(dblPtr, fBB);
+                    phiAv->addIncoming(av, nBB);
+                    auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
+                    builder_.CreateStore(phiAv, pa);
+                    declareDerefAV(nm, pa);
+                }
+                freeIfOwned(base);
+            }
+        }
         Value *lhs = emitLValue(*n.left);
         if (lhs) {
             /* perl_assign model: mutate the stable PerlValue* in-place */
@@ -5441,24 +5525,12 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::AnonArray: {
-        /* Stage 22: all-numeric elements → flat double[] stored in a PERL_FLAT_ARRAY PV.
-           Eliminates per-element PV boxing and PV** indirection in hot loops.
-           Reads/writes outside foreach loops fall back to perl_deref_array which
-           lazy-converts FLAT_ARRAY → REF_ARRAY in-place on first such access. */
+         /* Stage 22: all-numeric elements → flat double[] stored in a PERL_FLAT_ARRAY PV.
+            Eliminates per-element PV boxing and PV** indirection in hot loops.
+            Reads/writes outside foreach loops fall back to perl_deref_array which
+            lazy-converts FLAT_ARRAY → REF_ARRAY in-place on first such access. */
         if (!n.args.empty()) {
-            /* Predicate: does the subtree contain a 1D ArrowDeref?
-               1D accesses ($ref->[$i] where base isn't another ArrowDeref) may return
-               complex array refs. FLAT_ARRAY is only safe for pure scalar float trees. */
-            std::function<bool(const Node &)> has1DArrow = [&](const Node &x) -> bool {
-                if (x.kind == NK::ArrowDeref && x.sval == "array" &&
-                    x.left && x.left->kind != NK::ArrowDeref) return true;
-                if (x.left  && has1DArrow(*x.left))  return true;
-                if (x.right && has1DArrow(*x.right)) return true;
-                for (auto &a : x.args) if (has1DArrow(*a)) return true;
-                return false;
-            };
-            /* FLOAT_PAIR: exactly 2 float elements, no has1DArrow guard needed
-               because emitExprF64 handles 1D ArrowDerefs via runtime tag check. */
+            /* FLOAT_PAIR: exactly 2 float elements → perl_alloc_float_pair */
             if (n.args.size() == 2) {
                 bool allF64 = canEmitF64(*n.args[0]) && canEmitF64(*n.args[1]);
                 if (allF64) {
@@ -5467,16 +5539,17 @@ Value *CodeGen::emitExpr(const Node &n) {
                     return callRT("perl_alloc_float_pair", {re, im});
                 }
             }
+            /* FLAT_ARRAY: all F64-capable children → flat double[] with zero-init */
             bool allFloat = true;
             for (auto &e : n.args) {
-                if (!canEmitF64(*e) || has1DArrow(*e)) { allFloat = false; break; }
+                if (!canEmitF64(*e)) { allFloat = false; break; }
             }
-            if (allFloat && n.args.size() >= 4) {
+            if (allFloat && n.args.size() >= 2) {
                 auto *i8Ty  = Type::getInt8Ty(ctx_);
                 auto *i64Ty = Type::getInt64Ty(ctx_);
                 auto *f64Ty = Type::getDoubleTy(ctx_);
                 Value *nElems  = ConstantInt::get(i64Ty, (long long)n.args.size(), true);
-                Value *flatPV  = callRT("perl_alloc_flat_array", {nElems});
+                Value *flatPV  = callRT("perl_alloc_float_array", {nElems});
                 Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(
                     i8Ty, flatPV, 8, "flat.pval.ptr");
                 Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "flat.dbl");

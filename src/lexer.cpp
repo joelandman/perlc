@@ -65,6 +65,8 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"sum",      TK::KW_SUM},       {"min",    TK::KW_MIN},    {"max",    TK::KW_MAX},
     {"first",    TK::KW_FIRST},     {"any",    TK::KW_ANY},    {"all",    TK::KW_ALL},
     {"none",     TK::KW_NONE},      {"uniq",   TK::KW_UNIQ},   {"reduce", TK::KW_REDUCE},
+    {"tie",    TK::KW_TIE},     {"untie",    TK::KW_UNTIE},
+    {"pack",   TK::KW_PACK},    {"unpack",   TK::KW_UNPACK},
 };
 
 Lexer::Lexer(std::string src) : src_(std::move(src)) {}

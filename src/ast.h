@@ -135,6 +135,8 @@ enum class NK {
     CondWait,    /* cond_wait($v)    – left=shared var expr                 */
     CondSignal,  /* cond_signal($v)  – left=shared var expr                 */
     CondBcast,   /* cond_broadcast($v) – left=shared var expr               */
+    TieStmt,     /* tie $var, CLASS, args... – args=[class, extra_args]    */
+    UntieStmt,   /* untie $var           – left=var expr                    */
     /* time / randomness / sleep */
     RandFunc,     /* rand [MAX]        – left=max (opt)                               */
     SrandFunc,    /* srand [SEED]      – left=seed (opt)                              */
@@ -153,6 +155,9 @@ enum class NK {
     AllFunc,      /* all   { BLOCK } LIST – body=block, args=list; uses $_            */
     NoneFunc,     /* none  { BLOCK } LIST – body=block, args=list; uses $_            */
     ReduceFunc,   /* reduce { BLOCK } LIST – body=block, args=list; uses $a/$b        */
+    /* pack/unpack */
+    PackFunc,     /* pack FORMAT, args...   – sval=format, args=data               */
+    UnpackFunc,   /* unpack FORMAT, string  – sval=format, left=string expr         */
 };
 
 struct Node;

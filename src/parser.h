@@ -46,6 +46,7 @@ private:
 
     bool    isModifier() const;
     NodePtr parseModifier(NodePtr stmt, int line);
+    void    consumeLowOrChain();  /* consume or/and/xor statement separators */
 
     NodePtr parseExpr();
     NodePtr parseLowOr();

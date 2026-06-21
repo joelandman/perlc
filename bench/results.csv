@@ -1,5 +1,1 @@
 name,perlc_ms,perl_ms,ratio
-fibn,270,590,2.19
-mbs,1380,18990,13.76
-nb,60,5850,97.50
-regex_heavy,810,260,0.32

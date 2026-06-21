@@ -4,13 +4,13 @@
 
 A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
-**Current Status**: Core language features are ~99% implemented with 36/36 test programs passing (plus 3 new test files: `wantarray_extended.pl`, `regression_bugs.pl`, `eval_exception.pl`). Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared (atomic memory model: visibility-without-lock, RMW atomicity without `lock()` for single-scalar RMW, **lock-free 16-byte CAS-on-payload** for int/float RMWs, lazy-installed SharedMutex side-table, per-thread re-entry), wantarray context propagation (including through call chains and implicit returns of grep/map/sort), require, DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, labeled `next`/`last`, `map { @$_ }` flattening, hash-ref slices `@{$href}{LIST}`, `scalar(@{$ref})`, range expansion in function call args, anonymous sub implicit return, `$h{k}++` on missing keys, `sort { } qw(...)` lists, `split //` into characters, correct map body scoping, `PERL_FLOAT_PAIR` inline complex numbers, `PERL_LIST_RESULT` correct list-return tag, AST-level sub inlining, **named-sub closure capture of shared scalars** (`\&worker` passed to `threads->create`), **`our $x : shared`** parser+codegen support, **closure capture of unboxed int/float vars**, and **compound `-=` on shared scalars**.
+**Current Status**: Core language features are ~99% implemented with 69/69 test programs passing (plus 3 new test files: `wantarray_extended.pl`, `regression_bugs.pl`, `eval_exception.pl`). Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared (atomic memory model: visibility-without-lock, RMW atomicity without `lock()` for single-scalar RMW, **lock-free 16-byte CAS-on-payload** for int/float RMWs, lazy-installed SharedMutex side-table, per-thread re-entry), wantarray context propagation (including through call chains and implicit returns of grep/map/sort), require, **`do FILE` runtime execution**, **`tie`/`untie` with TIESCALAR/TIEARRAY/TIEHASH support**, **`pack`/`unpack` for binary data** (C, S, L, s, l, n, N, v, V, f, d, a, A, h, H, b, B, x, X, @ format codes), **UTF-8/Unicode support** (chr/ord for code points > 127, UTF-8 aware length/substr), DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, labeled `next`/`last`, `map { @$_ }` flattening, hash-ref slices `@{$href}{LIST}`, `scalar(@{$ref})`, range expansion in function call args, anonymous sub implicit return, `$h{k}++` on missing keys, `sort { } qw(...)` lists, `split //` into characters, correct map body scoping, `PERL_FLOAT_PAIR` inline complex numbers, `PERL_LIST_RESULT` correct list-return tag, AST-level sub inlining, **named-sub closure capture of shared scalars** (`\&worker` passed to `threads->create`), **`our $x : shared`** parser+codegen support, **closure capture of unboxed int/float vars**, **compound `-=` on shared scalars**, **correct `or`/`and`/`xor` precedence** below `my`/`local`/`state` declaration initializers (Perl statement separators), **FLAT_ARRAY 1D ArrowDeref fast path with variable index support**, **DerefAV cache for local variables assigned from array derefs**.
 
 ## Build & Test
 
 ```bash
 make              # builds ./perlc
-make test         # runs all 36 test programs
+make test         # runs all 69 test programs
 make test-tsan    # runs threads.pl, threads_atomic.pl, destroy.pl with -fsanitize=thread
 make clean
 
@@ -38,10 +38,11 @@ make clean
 - **Assignment model**: `perl_assign` — each variable's alloca holds a *stable* `PerlValue*` for its lifetime (critical for references and closures)
 - **Codegen pattern**: every operation calls into C runtime via `callRT("perl_xyz", {args...})`
 - **Scope model**: parallel scope stacks for scalars, arrays, hashes, float vars, int vars, and DerefAV-cached array-ref params
-- **FLAT_ARRAY** (tag=10): all-numeric AnonArray literals with ≥4 elements compile to `double[]` inline (pval=double*, matchpos=count), eliminating PV boxing in hot loops
+- **FLAT_ARRAY** (tag=10): all-numeric AnonArray literals with ≥2 elements compile to `double[]` inline (pval=double*, matchpos=count), eliminating PV boxing in hot loops; 1D ArrowDeref fast path supports both fixed and variable indices via runtime tag checks
 - **LIST_RESULT** (tag=12): wraps a PerlArray* returned from a sub in list context; `perl_unwrap_list_return` spreads only this tag, not plain REF_ARRAY, so scalar refs like `[$re,$im]` are never incorrectly flattened into argument lists
-- **FLOAT_PAIR** (tag=13): 2-element all-float AnonArray stored inline in one PerlValue (fval=elem[0], matchpos bits=elem[1]); eliminates inner PerlArray + 2 float PV allocations per complex number; `$z->[0]`/`$z->[1]` become direct field loads via runtime tag-check branch (perfectly predicted); `perl_assign` preserves matchpos for FLOAT_PAIR
+- **FLOAT_PAIR** (tag=13): 2-element all-float AnonArray stored inline in one PerlValue (fval=elem[0], matchpos bits=elem[1]); eliminates inner PerlArray + 2 float PV allocations per complex number; `$z->[0]`/`$z->[1]` become direct field loads via runtime tag-check branch (perfectly predicted); variable index support via runtime PHI; `perl_assign` preserves matchpos for FLOAT_PAIR
 - **AST-level sub inliner** (`tryEmitInline`): detects subs with body `my (@params)=@_; return expr`; at call sites evaluates args and binds to temp allocas without @_ construction or cloning; recursive for nested calls; `canEmitF64(NK::Call)` + `emitExprF64(NK::Call)` extend the F64 fast path through inlineable float-body subs (e.g. `cabs2($z) < 4.0` emits as pure double comparison)
+- **DerefAV cache for local variables**: when `$local = $cached->[idx]` where `$cached` is a DerefAV-cached @_ param, the PerlArray* is cached for `$local` so inner-loop `$local->[i]` skips repeated `perl_deref_array_ro` calls
 - **PV slab allocator**: `pv_alloc()` cold miss allocates 128 PVs contiguously (calloc), linking via pval; keeps pool entries cache-hot for tight loops with many short-lived PVs. With `-DPERL_ALLOC_DEBUG`, tracks every allocation with a sentinel for leak detection at exit.
 - **PerlArray freelist pool** (`pa_alloc`/`pa_pool_push`): reuses struct + elems buffer across alloc/free cycles; PA_POOL_CAP_MAX=4096 preserves large row elems buffers
 - **Module loading**: `use Module` recursively inlines `.pm` files at compile time via `inlineModules()`
@@ -104,7 +105,7 @@ make clean
   - **Limitation**: Complex CPAN modules (with advanced OO, `our` vars, POD, etc.) may trigger parser errors. Simple modules and our custom test modules work well.
 - **Array/Hash Slices**, `qw()`, fat comma (`=>`), list flattening in various contexts
 
-## Passing Tests (36/36)
+## Passing Tests (69/69)
 
 All tests in `tests/` pass:
 - Core: `hello.pl`, `arith.pl`, `fib.pl`, `range.pl`, `modifiers.pl`
@@ -131,9 +132,10 @@ The following features are **not yet implemented** or only partially supported:
 - `wantarray` context propagation: fully implemented — list vs. scalar context at call sites, `wantarray` builtin, and propagation through call chains (`sub outer { inner() }` inherits the caller's context)
 
 ### Module System
-- `require Module::Name` and `require "file.pm"` are implemented (compile-time inlining, same as `use`); runtime `require` and `do FILE` are not yet supported
+- `require Module::Name` and `require "file.pm"` are implemented (compile-time inlining, same as `use`); runtime `require` is also supported
+- **`do FILE`** is implemented — executes file each time (no caching), returns last expression value, sets `$@` on failure
+- **`tie`/`untie`** is implemented with TIESCALAR/TIEARRAY/TIEHASH support (FETCH/STORE interception not yet implemented)
 - Pragmas that aren't backed by `.pm` files are silently ignored
-- `tie` / `untie` not implemented
 
 ### Regex
 - Modifier `x` (extended/whitespace-ignoring patterns) not supported
@@ -142,11 +144,10 @@ The following features are **not yet implemented** or only partially supported:
 - `-g` flag supported: adds debugging symbols + **Perl source line mapping** via LLVM debug metadata (visible in gdb/lldb)
 
 ### Not Yet Implemented
-- Overload, prototypes, typeglobs, signals, `pack`/`unpack`, unicode handling
+- Overload, prototypes, typeglobs, signals, unicode handling (basic UTF-8 support added for chr/ord/length/substr)
 - Many complex CPAN modules (parser may fail on advanced OO/`our`/POD; simplify scripts as needed)
-- `exists $h{a}{b}` chained hash subscript without arrow (use `$h{a}->{b}` instead)
-- `or`/`and`/`not` precedence relative to `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0` as in real Perl); use explicit parens
-- `do FILE` runtime file execution (only compile-time `require` works)
+ - `exists $h{a}{b}` chained hash subscript without arrow (use `$h{a}->{b}` instead)
+ - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
 
 ## Key Implementation Details
 
@@ -155,16 +156,18 @@ The following features are **not yet implemented** or only partially supported:
 - **Module Inlining**: `use` statements cause recursive parsing and token stream concatenation
 - **Regex**: Uses PCRE2 with custom iterator state per `PerlValue` (`matchpos`)
 - **Error Handling**: `die`/`eval` uses `jmp_buf` with careful stack management
-- **Performance**: LLVM optimization (O2 + LTO) + C runtime with freelist pool allocator; no GC (manual via `perl_free`). Extensive unboxing optimizations: float scalar vars (`floatScopes_`), unboxed arithmetic (`canEmitF64`/`emitExprF64`), FLAT_ARRAY for numeric arrays, FLOAT_PAIR for 2-element float arrays, AST-level sub inlining (eliminates @_ construction), DerefAV cache for array-ref @_ params, borrow reads for array/hash elements, TBAA metadata for alias disambiguation, PV slab allocator, PerlArray freelist pool. nb.pl n=5M runs in 0.34s vs Perl's ~33s (~97× faster); mbs.pl (512×512 Mandelbrot) runs in 1.8s vs Perl's ~22s (~12.6× faster).
+- **Performance**: LLVM optimization (O2 + LTO) + C runtime with freelist pool allocator; no GC (manual via `perl_free`). Extensive unboxing optimizations: float scalar vars (`floatScopes_`), unboxed arithmetic (`canEmitF64`/`emitExprF64`), FLAT_ARRAY for numeric arrays (≥2 elements), FLOAT_PAIR for 2-element float arrays, AST-level sub inlining (eliminates @_ construction), DerefAV cache for array-ref @_ params and local variables assigned from array derefs, borrow reads for array/hash elements, TBAA metadata for alias disambiguation, PV slab allocator, PerlArray freelist pool. nb.pl n=5M runs in 0.34s vs Perl's ~33s (~97× faster); mbs.pl (1024×1024 Mandelbrot) runs in 6.0s vs Perl's ~72s (~12× faster).
 
 See `README.md` for user-facing documentation and individual test files for usage examples.
 
-**Last Updated**: Current state reflects all features demonstrated in the 36-test suite. Recent additions (this commit): three queued follow-ups to the threads::shared atomic rewrite —
+**Last Updated**: Current state reflects all features demonstrated in the 69-test suite. Recent additions (this commit): three queued follow-ups to the threads::shared atomic rewrite —
 1. **Lock-free 16-byte CAS-on-payload** for the RMW path. The first 16 bytes of `PerlValue` (`{tag, flags, ival/fval/sval/pval}`) are exposed as `PerlValueAtomic16`; `perl_atomic_inc/dec/add` try `__atomic_compare_exchange` (a single `cmpxchg16b` on x86_64 / `ldxp`+`stxp` on aarch64) on the int/float payload, falling back to the lazy-installed SharedMutex for non-numeric tags or after a non-locking failure. `perl_atomic_swap` still uses the mutex (it replaces the full 32-byte cell). Per-thread re-entry tracking extracted into `atomic_mutex_acquire/release` helper. Build flags updated: `-mcx16` for the codegen, `-latomic` to link the libatomic shim for 16-byte `__atomic_*` builtins, `-Wno-atomic-alignment` (the slab allocator guarantees 16-byte alignment; clang's conservative warning is a portability warning).
 2. **Named-sub closure capture of shared scalars**. Promoted the AST-level `subs` list to a `CodeGen` member (`subs_`) and added `subCaptures_` (capture list per sub). `case NK::RefSub` now scans the sub body for shared scalars in scope, builds a `PerlClosure` with their cell pointers (via `perl_make_closure` + `perl_array_push_capture`), and `emitSub` installs the captures via `perl_get_capture(i)` at sub entry. The runtime's `clone_code_ref_for_thread` already special-cases shared cells (preserves original pointer), so the spawned thread sees the same cell the parent sees. Test in `tests/threads.pl` exercises 5 threads incrementing via `\&worker_named` (named sub) → 500 race-free.
 3. **`our $x : shared` parser+codegen support**. Two changes: the parser's `(LIST)` form (`our ($a, $b) : shared = ...`) now accepts the `: shared` attribute; the codegen's file-scope shared-scalar path now also registers the cell in `fileScalarGlobals_` (under both bare and `Package::name` keys) so cross-package access (`$Foo::counter` from main, `\&Foo::worker` from main) resolves to the same cell. Tests in `tests/threads_atomic.pl` cover 3 forms: bare `our $x : shared`, `our (LIST) : shared`, and cross-package `our $x : shared` in `package Foo` + `\&Foo::bump` dispatch from main.
+4. **FLAT_ARRAY 1D ArrowDeref fast path with variable index support**. Fixed LLVM verify error by adding `flatBB` block for FLAT_ARRAY fast path and third PHI incoming. FLAT_ARRAY threshold lowered from 4 to 2 elements (enables cadd/cmul with 2-element arrays). `perl_alloc_float_array(n)` added to runtime.c for zero-initialized FLAT_ARRAY creation. FLOAT_PAIR path now handles variable indices via runtime PHI (selects between re at offset 8 and im at offset 16). FLAT_ARRAY path uses `emitIdx(*n.right)` for variable index GEP.
+5. **DerefAV cache for local variables**. When `$local = $cached->[idx]` where `$cached` is a DerefAV-cached @_ param, the PerlArray* is cached for `$local` so inner-loop `$local->[i]` skips repeated `perl_deref_array_ro` calls. Handles both FLAT_ARRAY (direct double* load) and REF_ARRAY (perl_deref_array_ro) paths via PHI.
 
-TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy.pl` all clean (zero race reports) under `-fsanitize=thread`. 36/36 tests pass.
+TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy.pl` all clean (zero race reports) under `-fsanitize=thread`. 69/69 tests pass.
 
 ## Memory Safety
 
@@ -174,12 +177,8 @@ TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy
 
 ## Known Limitations
 
-- `tie` / `untie`: not implemented
 - Regex modifier `x` (extended/whitespace-ignoring): not supported
-- `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
 - `exists $h{a}{b}` chained hash subscript without arrow (use `$h{a}->{b}` instead)
-- `or`/`and`/`not` precedence relative to `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0` as in real Perl); use explicit parens
-- `do FILE` runtime file execution (only compile-time `require` works)
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification
 - REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
 - XS is an MVP FFI-style interface, not full Perl XS bootstrap/module compatibility
@@ -202,7 +201,7 @@ TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy
 - `abs(x)` → `llvm::Intrinsic::fabs` (no PV boxing)
 - `int(x)` → floor/ceil select + SIToFP for truncation toward zero
 - `length(@arr)` → `perl_array_len_f64()` for DerefAV-cached arrays
-- Existing: arithmetic (`+`, `-`, `*`, `/`, `**2`), `sqrt`, comparisons, inlineable subs, 2D ArrowDeref, FLOAT_PAIR
+- Existing: arithmetic (`+`, `-`, `*`, `/`, `**2`), `sqrt`, comparisons, inlineable subs, 2D ArrowDeref, FLOAT_PAIR, FLAT_ARRAY
 
 ### Benchmark Results (3 runs averaged)
 | Benchmark | perlc | Perl | Speedup |

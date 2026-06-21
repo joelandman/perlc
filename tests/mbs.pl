@@ -8,7 +8,7 @@ use strict;
 use warnings;
 use Time::HiRes qw(time);
 
-my $N    = 512;
+my $N    = 1024;
 my $NP   = $N * 1.0;
 my $xmin = -1.5;
 my $xmax = 1.0;
