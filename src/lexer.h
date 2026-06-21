@@ -40,8 +40,12 @@ enum class TK {
     KW_REQUIRE,
     /* misc builtins */
     KW_POS, KW_LOCK, KW_COND_WAIT, KW_COND_SIGNAL, KW_COND_BROADCAST,
+    /* tie/untie */
+    KW_TIE, KW_UNTIE,
     /* List::Util */
     KW_SUM, KW_MIN, KW_MAX, KW_FIRST, KW_ANY, KW_ALL, KW_NONE, KW_UNIQ, KW_REDUCE,
+    /* pack/unpack */
+    KW_PACK, KW_UNPACK,
     SPACESHIP,    /* <=> */
     FILETEST,  /* -e/-f/-d/-r/-w/-x/-z/-s/-l/-p – text = flag char */
     QWORDS,    /* qw(...) – text = space-separated words */

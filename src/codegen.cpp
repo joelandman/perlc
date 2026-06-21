@@ -4352,6 +4352,15 @@ Value *CodeGen::emitExpr(const Node &n) {
                 }
                 /* regular $ref->[i] = val */
                 Value *base = emitExpr(*n.left->left);
+                /* Check DerefAV cache for base variable */
+                std::string baseNm;
+                Value *cachedAv = nullptr;
+                if (n.left->left->kind == NK::ScalarVar) {
+                    baseNm = n.left->left->name;
+                    if (!baseNm.empty() && baseNm[0] == '$') baseNm = baseNm.substr(1);
+                    if (Value *pa = lookupDerefAV(baseNm))
+                        cachedAv = builder_.CreateLoad(arrayPtrTy_, pa, baseNm + ".av");
+                }
                 /* Stage 22: always dispatch flat/norm to avoid perl_deref_array
                    lazy-converting FLAT_ARRAY PVs (keeps all bodies flat throughout). */
                 auto *i8T32  = Type::getInt8Ty(ctx_);
@@ -4378,10 +4387,15 @@ Value *CodeGen::emitExpr(const Node &n) {
                     fst32->setMetadata(LLVMContext::MD_tbaa, tbaaFlatDoubleTag_);
                 freeIfOwned(base);
                 builder_.CreateBr(mBB32);
-                /* norm: use perl_deref_array + perl_array_set */
+                /* norm: use perl_deref_array + perl_array_set (or cached Av) */
                 builder_.SetInsertPoint(nBB32);
-                Value *av32 = callRT("perl_deref_array", {base});
-                freeIfOwned(base);
+                Value *av32;
+                if (cachedAv) {
+                    av32 = cachedAv;
+                } else {
+                    av32 = callRT("perl_deref_array", {base});
+                    freeIfOwned(base);
+                }
                 callRT("perl_array_set", {av32, idx, rhs});
                 builder_.CreateBr(mBB32);
                 builder_.SetInsertPoint(mBB32);
@@ -4577,8 +4591,10 @@ Value *CodeGen::emitExpr(const Node &n) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
             if (!lookupDerefAV(nm)) {
-                Value *base = emitExpr(*n.right->left);
-                if (Value *outerPA = lookupDerefAV(nm)) {
+                std::string baseNm = n.right->left->name;
+                if (!baseNm.empty() && baseNm[0] == '$') baseNm = baseNm.substr(1);
+                if (Value *outerPA = lookupDerefAV(baseNm)) {
+                    Value *base = emitExpr(*n.right->left);
                     auto *i8T = Type::getInt8Ty(ctx_);
                     auto *i32T = Type::getInt32Ty(ctx_);
                     auto *i64T = Type::getInt64Ty(ctx_);
@@ -4604,8 +4620,8 @@ Value *CodeGen::emitExpr(const Node &n) {
                     auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
                     builder_.CreateStore(phiAv, pa);
                     declareDerefAV(nm, pa);
+                    freeIfOwned(base);
                 }
-                freeIfOwned(base);
             }
         }
         Value *lhs = emitLValue(*n.left);
