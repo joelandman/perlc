@@ -1532,6 +1532,30 @@ Value *CodeGen::emitDerefArray(Value *ref, const std::string *cachedVarName) {
     return callRT("perl_deref_array", {ref});
 }
 
+/* ── Stage 33: known tag type tracking ───────────────────────────────────── */
+
+void CodeGen::pushKnownTypes() {
+    knownTagTypes_.emplace_back();
+}
+
+void CodeGen::popKnownTypes() {
+    if (!knownTagTypes_.empty())
+        knownTagTypes_.pop_back();
+}
+
+void CodeGen::setKnownTagType(const std::string &varName, int tag) {
+    if (!knownTagTypes_.empty())
+        knownTagTypes_.back()[varName] = tag;
+}
+
+int CodeGen::lookupKnownTagType(const std::string &varName) {
+    for (int i = (int)knownTagTypes_.size() - 1; i >= 0; i--) {
+        auto it = knownTagTypes_[i].find(varName);
+        if (it != knownTagTypes_[i].end()) return it->second;
+    }
+    return 0;
+}
+
 /* ── cached PerlArray* for array-ref @_ args (Stage 15) ─────────────────── */
 
 /* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
@@ -2095,29 +2119,83 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
                     return callRT("perl_to_float", {elem});
                 }
-      /* FLOAT_PAIR / FLAT_ARRAY fast path: $z->[idx] where tag may be
-               FLOAT_PAIR (13), FLAT_ARRAY (10), or REF_ARRAY.
-               Emits runtime tag checks; branches are perfectly predicted once type is fixed. */
-                  if (n.right && lookupVar(nm)) {
-                      if (Value *slot = lookupVar(nm)) {
-                          auto *i32Ty = Type::getInt32Ty(ctx_);
-                          auto *i64Ty = Type::getInt64Ty(ctx_);
-                          auto *f64Ty = Type::getDoubleTy(ctx_);
-                          auto *i8Ty  = Type::getInt8Ty(ctx_);
-                          Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
-                          Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
-                          Value *isPair = builder_.CreateICmpEQ(tag,
-                              ConstantInt::get(i32Ty, 13), "ispair");
-                          Value *isFlat = builder_.CreateICmpEQ(tag,
-                              ConstantInt::get(i32Ty, 10), "isflat");
-                          auto *curFn = builder_.GetInsertBlock()->getParent();
-                          auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
-                          auto *flBB = BasicBlock::Create(ctx_, "fl.f",  curFn);
-                          auto *flatBB = BasicBlock::Create(ctx_, "fa.f",  curFn);
-                          auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
-                          auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
-                          /* Branch: isPair ? pBB : flBB */
-                          builder_.CreateCondBr(isPair, pBB, flBB);
+    /* FLOAT_PAIR / FLAT_ARRAY fast path: $z->[idx] where tag may be
+                FLOAT_PAIR (13), FLAT_ARRAY (10), or REF_ARRAY.
+                Stage 33: if knownTagTypes_ has a known type, skip the tag dispatch. */
+                   if (n.right && lookupVar(nm)) {
+                       if (Value *slot = lookupVar(nm)) {
+                           auto knownTag = lookupKnownTagType(nm);
+                           auto *i32Ty = Type::getInt32Ty(ctx_);
+                           auto *i64Ty = Type::getInt64Ty(ctx_);
+                           auto *f64Ty = Type::getDoubleTy(ctx_);
+                           auto *i8Ty  = Type::getInt8Ty(ctx_);
+                           Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
+                           auto *curFn = builder_.GetInsertBlock()->getParent();
+                           /* Stage 33: use known type to skip tag dispatch */
+                           if (knownTag == 13) {
+                               /* Known FLOAT_PAIR: direct field load, no tag check */
+                               Value *pairFv;
+                               if (n.right->kind == NK::IntLit &&
+                                   (n.right->ival == 0 || n.right->ival == 1)) {
+                                   if (n.right->ival == 0) {
+                                       Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                           i8Ty, pv, 8, "fp.re.ptr");
+                                       pairFv = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                                   } else {
+                                       Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                           i8Ty, pv, 16, "fp.im.ptr");
+                                       Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                                       pairFv = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                                   }
+                               } else {
+                                   auto *idxV = emitIdx(*n.right);
+                                   Value *idx0 = builder_.CreateICmpEQ(idxV,
+                                       ConstantInt::get(i64Ty, 0), "idx0");
+                                   auto *idxBB = BasicBlock::Create(ctx_, "fp.idx", curFn);
+                                   auto *reBB = BasicBlock::Create(ctx_, "fp.re", curFn);
+                                   auto *imBB = BasicBlock::Create(ctx_, "fp.im", curFn);
+                                   auto *idxM = BasicBlock::Create(ctx_, "fp.idm", curFn);
+                                   builder_.CreateCondBr(idx0, reBB, imBB);
+                                   builder_.SetInsertPoint(reBB);
+                                   Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                       i8Ty, pv, 8, "fp.re.ptr");
+                                   Value *reV = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                                   builder_.CreateBr(idxM);
+                                   builder_.SetInsertPoint(imBB);
+                                   Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                       i8Ty, pv, 16, "fp.im.ptr");
+                                   Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                                   Value *imV = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                                   builder_.CreateBr(idxM);
+                                   builder_.SetInsertPoint(idxM);
+                                   auto *phiIdx = builder_.CreatePHI(f64Ty, 2, "fp.idx");
+                                   phiIdx->addIncoming(reV, reBB);
+                                   phiIdx->addIncoming(imV, imBB);
+                                   pairFv = phiIdx;
+                               }
+                               return pairFv;
+                           } else if (knownTag == 10) {
+                               /* Known FLAT_ARRAY: direct double[] load, no tag check */
+                               Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fa.dp");
+                               Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "fa.dpp");
+                               dblPtr = builder_.CreateBitCast(dblPtr, f64Ty->getPointerTo());
+                               Value *idx = emitIdx(*n.right);
+                               dblPtr = builder_.CreateGEP(f64Ty, dblPtr, idx, "fa.gep");
+                               return builder_.CreateLoad(f64Ty, dblPtr, "fa.val");
+                           }
+                           /* Unknown type: emit runtime tag dispatch */
+                           Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
+                           Value *isPair = builder_.CreateICmpEQ(tag,
+                               ConstantInt::get(i32Ty, 13), "ispair");
+                           Value *isFlat = builder_.CreateICmpEQ(tag,
+                               ConstantInt::get(i32Ty, 10), "isflat");
+                           auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
+                           auto *flBB = BasicBlock::Create(ctx_, "fl.f",  curFn);
+                           auto *flatBB = BasicBlock::Create(ctx_, "fa.f",  curFn);
+                           auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
+                           auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
+                           /* Branch: isPair ? pBB : flBB */
+                           builder_.CreateCondBr(isPair, pBB, flBB);
                           /* FLOAT_PAIR path: direct field load.
                                For fixed 0/1: compile-time select.
                                For variable index: runtime PHI between re (offset 8) and im (offset 16). */
@@ -4681,6 +4759,23 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            /* Stage 33: track known tag type from AnonArray RHS */
+            if (n.right->kind == NK::AnonArray) {
+                if (n.right->args.size() == 2 &&
+                    canEmitF64(*n.right->args[0]) && canEmitF64(*n.right->args[1])) {
+                    /* [float, float] → FLOAT_PAIR (tag=13) */
+                    setKnownTagType(nm, 13);
+                } else if (n.right->args.size() >= 2) {
+                    bool allF64 = true;
+                    for (auto &e : n.right->args) {
+                        if (!canEmitF64(*e)) { allF64 = false; break; }
+                    }
+                    if (allF64) {
+                        /* [float, float, ...] → FLAT_ARRAY (tag=10) */
+                        setKnownTagType(nm, 10);
+                    }
+                }
+            }
             if (Value *ia = lookupIntVar(nm)) {
                 Value *rhs = emitExprI64(*n.right);
                 if (rhs) {

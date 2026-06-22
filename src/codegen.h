@@ -109,6 +109,12 @@ private:
        load from this cache inside the loop.  Stacked per-loop for nesting. */
     std::vector<std::unordered_map<std::string, llvm::Value *>> loopDerefCache_;
 
+    /* Stage 33: known PV tag types per scope.  Tracks when a variable is
+       known to have a specific PerlTag (e.g., FLOAT_PAIR=13, FLAT_ARRAY=10).
+       Used to eliminate runtime tag dispatch in emitExprF64 ArrowDeref.
+       Stacked per-scope for nesting. */
+    std::vector<std::unordered_map<std::string, int>> knownTagTypes_;
+
     /* Phase 3: names of shared scalars (declared with `: shared`).  Used
        to route reads/writes through the atomic primitive helpers so the
        codegen for `$x`, `$x = v`, `$x++`, `$x += N` (on a shared scalar)
@@ -246,6 +252,12 @@ private:
                            const std::set<std::string> &derefTargets);
     /* Stage 32: emit perl_deref_array with cache check */
     llvm::Value *emitDerefArray(llvm::Value *ref, const std::string *cachedVarName = nullptr);
+
+    /* Stage 33: known tag type tracking */
+    void pushKnownTypes();
+    void popKnownTypes();
+    void setKnownTagType(const std::string &varName, int tag);
+    int lookupKnownTagType(const std::string &varName);
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);
