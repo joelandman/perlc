@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <vector>
 
 /* A scope frame maps variable names → alloca (PerlValue*) */
@@ -92,6 +93,21 @@ private:
        Eliminates redundant loads like body[j][6] appearing 3× in the velocity-update
        block; invalidated only when the exact (outerNm, idxNm, elemIdx) is written. */
     std::unordered_map<std::string, llvm::Value *> flatDoubleCache_;
+
+    /* Stage 32: loop-invariant PV slab — undef PVs and deref results created
+       inside loops are tracked here instead of pvScopes_.  popScope() skips
+       freeing them; they're freed once after the loop exits via
+       freeLoopInvariantPVs().  This lets LLVM's LICM hoist the alloc_undef
+       out of the loop (no free blocks it) and eliminates per-iteration frees.
+       Stacked per-loop for nested loops. */
+    std::vector<std::vector<llvm::Value *>> loopInvariantPVs_;
+
+    /* Stage 32: per-loop cache for hoisted perl_deref_array calls.
+       Key = ScalarVar name (without $), Value = PerlArray* alloca holding
+       the cached result.  When we see perl_deref_array($x) inside a loop
+       and $x is loop-invariant, we emit the call before the loop and
+       load from this cache inside the loop.  Stacked per-loop for nesting. */
+    std::vector<std::unordered_map<std::string, llvm::Value *>> loopDerefCache_;
 
     /* Phase 3: names of shared scalars (declared with `: shared`).  Used
        to route reads/writes through the atomic primitive helpers so the
@@ -215,6 +231,21 @@ private:
     llvm::Value *boxI64(llvm::Value *iv);
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons, else nullptr */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
+
+    /* Stage 32: loop-invariant PV management */
+    void pushLoopInvariantTracking();
+    void popLoopInvariantTracking();
+    void freeLoopInvariantPVs();
+    void trackLoopInvariantPV(llvm::Value *pv);
+    /* Stage 32: deref hoisting */
+    void pushDerefCache();
+    void popDerefCache();
+    llvm::Value *lookupLoopDerefCache(const std::string &varName);
+    void declareLoopDerefCache(const std::string &varName, llvm::Value *cachedPtr);
+    void emitHoistedDerefs(const Node &loopBody,
+                           const std::set<std::string> &derefTargets);
+    /* Stage 32: emit perl_deref_array with cache check */
+    llvm::Value *emitDerefArray(llvm::Value *ref, const std::string *cachedVarName = nullptr);
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);

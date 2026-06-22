@@ -517,6 +517,32 @@ void CodeGen::declareVar(const std::string &nm, Value *a) {
 }
 
 void CodeGen::trackPv(Value *pv) {
+    /* Stage 32: inside a loop, defer free for loop-invariant PVs.
+       undef PVs (perl_alloc_undef) are always loop-invariant since the
+       allocation is loop-invariant.  Deref results from loop-invariant
+       variables are also loop-invariant.  By deferring the free, LLVM's
+       LICM can hoist the alloc_undef out of the loop (no free blocks it). */
+    if (!loopExits_.empty() && pv) {
+        auto *ci = dyn_cast<CallInst>(pv);
+        if (ci) {
+            auto *fn = ci->getCalledFunction();
+            if (fn) {
+                StringRef nm = fn->getName();
+                /* undef PV from perl_alloc_undef — always loop-invariant */
+                if (nm == "perl_alloc_undef") {
+                    trackLoopInvariantPV(pv);
+                    return;
+                }
+                /* Deref result from perl_deref_array on a loop-invariant var —
+                   the PV itself is loop-invariant when cached via emitHoistedDerefs.
+                   Defer the free to let LICM hoist the call. */
+                if (nm == "perl_deref_array") {
+                    trackLoopInvariantPV(pv);
+                    return;
+                }
+            }
+        }
+    }
     if (!pvScopes_.empty()) pvScopes_.back().push_back(pv);
 }
 
@@ -1367,6 +1393,146 @@ Value *CodeGen::emitIdx(const Node &n) {
     freeIfOwned(pv);
     return i;
 }
+
+/* ── Stage 32: loop-invariant PV tracking and deref hoisting ─────────────── */
+
+void CodeGen::pushLoopInvariantTracking() {
+    if (!loopInvariantPVs_.empty() || !loopExits_.empty())
+        loopInvariantPVs_.emplace_back();
+}
+
+void CodeGen::popLoopInvariantTracking() {
+    if (!loopInvariantPVs_.empty())
+        loopInvariantPVs_.pop_back();
+}
+
+void CodeGen::freeLoopInvariantPVs() {
+    if (loopInvariantPVs_.empty()) return;
+    auto *bb = builder_.GetInsertBlock();
+    if (bb && !bb->getTerminator()) {
+        for (Value *pv : loopInvariantPVs_.back())
+            callRT("perl_free", {pv});
+    }
+    loopInvariantPVs_.pop_back();
+}
+
+void CodeGen::trackLoopInvariantPV(Value *pv) {
+    if (loopInvariantPVs_.empty()) return;
+    loopInvariantPVs_.back().push_back(pv);
+}
+
+void CodeGen::pushDerefCache() {
+    if (!loopDerefCache_.empty() || !loopExits_.empty())
+        loopDerefCache_.emplace_back();
+}
+
+void CodeGen::popDerefCache() {
+    if (!loopDerefCache_.empty())
+        loopDerefCache_.pop_back();
+}
+
+Value *CodeGen::lookupLoopDerefCache(const std::string &varName) {
+    for (int i = (int)loopDerefCache_.size() - 1; i >= 0; i--) {
+        auto it = loopDerefCache_[i].find(varName);
+        if (it != loopDerefCache_[i].end()) return it->second;
+    }
+    return nullptr;
+}
+
+void CodeGen::declareLoopDerefCache(const std::string &varName, Value *cachedPtr) {
+    if (!loopDerefCache_.empty())
+        loopDerefCache_.back()[varName] = cachedPtr;
+}
+
+/* Collect all ScalarVar names that are the direct argument of a
+   perl_deref_array call (ArrowDeref with sval=="array" whose left is
+   a ScalarVar).  Used to identify candidates for hoisting. */
+static void collectDerefTargets(const Node &n, std::set<std::string> &targets) {
+    if (n.kind == NK::ArrowDeref && n.sval == "array" &&
+        n.left && n.left->kind == NK::ScalarVar) {
+        std::string nm = n.left->name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        targets.insert(nm);
+    }
+    if (n.left)  collectDerefTargets(*n.left,  targets);
+    if (n.right) collectDerefTargets(*n.right, targets);
+    for (auto &a : n.args) collectDerefTargets(*a, targets);
+    if (n.body)  collectDerefTargets(*n.body,  targets);
+}
+
+/* Check if a ScalarVar named 'nm' is assigned (written to) anywhere in 'n'.
+   Returns true if the variable is modified, false if it's only read. */
+static bool isVarModified(const Node &n, const std::string &nm) {
+    if (n.kind == NK::ScalarVar && n.name == nm) {
+        /* Check if this is a write target (LHS of assign, etc.) */
+        return false; /* bare read — not modified at this node */
+    }
+    /* Check for assignments where nm is the LHS */
+    if (n.kind == NK::Assign && n.left &&
+        n.left->kind == NK::ScalarVar && n.left->name == nm)
+        return true;
+    /* Check for compound assigns */
+    if (n.kind == NK::CompoundAssign && n.left &&
+        n.left->kind == NK::ScalarVar && n.left->name == nm)
+        return true;
+    /* Check for increments/decrements */
+    if (n.kind == NK::UnaryOp && n.left &&
+        n.left->kind == NK::ScalarVar && n.left->name == nm) {
+        if (n.sval == "pre++" || n.sval == "post++" ||
+            n.sval == "pre--" || n.sval == "post--")
+            return true;
+    }
+    bool r = false;
+    if (n.left)  r = r || isVarModified(*n.left,  nm);
+    if (n.right) r = r || isVarModified(*n.right, nm);
+    for (auto &a : n.args) { if (!r) r = r || isVarModified(*a, nm); }
+    if (n.body)  r = r || isVarModified(*n.body,  nm);
+    for (auto &b : n.branches) {
+        if (!r && b.body) r = r || isVarModified(*b.body, nm);
+    }
+    return r;
+}
+
+/* Emit hoisted perl_deref_array calls for loop-invariant variables.
+   For each variable in 'derefTargets' that is not modified in 'body',
+   emit perl_deref_array(lookupVar(nm)) before the loop and cache the
+   PerlArray* in loopDerefCache_. */
+void CodeGen::emitHoistedDerefs(const Node &loopBody,
+                                const std::set<std::string> &derefTargets) {
+    auto *i64Ty = Type::getInt64Ty(ctx_);
+    for (const auto &nm : derefTargets) {
+        /* Skip if already cached */
+        if (lookupLoopDerefCache(nm)) continue;
+        /* Skip if variable doesn't exist in current scope */
+        if (!lookupVar(nm)) continue;
+        /* Skip if variable is modified inside the loop body */
+        if (isVarModified(loopBody, nm)) continue;
+
+        /* Emit perl_deref_array(lookupVar(nm)) */
+        Value *slot = lookupVar(nm);
+        Value *pv = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
+        Value *arr = callRT("perl_deref_array", {pv});
+
+        /* Cache in an alloca */
+        auto *cacheAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".deref");
+        builder_.CreateStore(arr, cacheAlloca);
+        declareLoopDerefCache(nm, cacheAlloca);
+    }
+}
+
+/* Emit perl_deref_array(ref), checking the loop-invariant deref cache first.
+   If 'cachedVarName' is provided and the variable is in the cache, load from
+   the cached alloca instead of calling perl_deref_array. */
+Value *CodeGen::emitDerefArray(Value *ref, const std::string *cachedVarName) {
+    if (cachedVarName) {
+        if (Value *cacheAlloca = lookupLoopDerefCache(*cachedVarName)) {
+            return builder_.CreateLoad(perlPtrTy_, cacheAlloca, (*cachedVarName) + ".deref.load");
+        }
+    }
+    return callRT("perl_deref_array", {ref});
+}
+
+/* ── cached PerlArray* for array-ref @_ args (Stage 15) ─────────────────── */
 
 /* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
    Used to decide whether a @_ scalar arg can be promoted to a float alloca.
@@ -3130,6 +3296,16 @@ void CodeGen::emitStmt(const Node &n) {
                 {hoistedArgs, ConstantInt::get(i32Ty, 0)});
             freeIfOwned(ret);
         } else {
+            /* Stage 32: hoist perl_deref_array calls for loop-invariant variables.
+               Collect deref targets (ScalarVars that are direct args of ArrowDeref),
+               then for each target that is not modified in this loop body, emit
+               perl_deref_array(lookupVar(nm)) before the loop and cache it.
+               Inside the loop, ArrowDeref emission checks the cache first. */
+            if (n.body) {
+                std::set<std::string> derefTargets;
+                collectDerefTargets(*n.body, derefTargets);
+                emitHoistedDerefs(*n.body, derefTargets);
+            }
             emitBlock(*n.body);
         }
         if (!builder_.GetInsertBlock()->getTerminator())
@@ -5663,7 +5839,19 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
-            Value *av = callRT("perl_deref_array", {base});
+            /* Stage 32: check loop-invariant deref cache */
+            Value *av;
+            if (n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (Value *cacheAlloca = lookupLoopDerefCache(nm)) {
+                    av = builder_.CreateLoad(perlPtrTy_, cacheAlloca, nm + ".deref.load");
+                } else {
+                    av = callRT("perl_deref_array", {base});
+                }
+            } else {
+                av = callRT("perl_deref_array", {base});
+            }
             freeIfOwned(base);
             return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
         } else {
