@@ -187,12 +187,6 @@ If you have an existing `threads::shared` program:
   pattern handles it correctly when the user locks; making it
   atomic-without-lock would need a CAS on the array's `len`/`elems`
   pair, which is more invasive.
-* **Compound `-=` on a shared scalar** is a known pre-existing bug
-  (e.g. `$shared -= 3` is currently emitted as `perl_atomic_add($shared, 3)`
-  — *adding* 3, not subtracting).  Workaround: write
-  `$shared = $shared - 3` (the longhand form is correctly routed
-  through `perl_atomic_add` as a negative delta).  Fix tracked
-  separately.
 
 ## Lock-free CAS design (Phase 4)
 

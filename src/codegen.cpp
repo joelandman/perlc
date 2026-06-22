@@ -6719,6 +6719,36 @@ Value *CodeGen::tryEmitInline(const Node &n) {
     const auto &is = it->second;
     if (n.args.size() != is.params.size()) return nullptr;
 
+    /* If the body is F64-capable, emit it directly in F64 context.
+       This eliminates perl_clone + boxing for inlineable subs with float bodies.
+       The returned Value* is a bare double (not a PV*) — callers must handle both cases. */
+    if (canEmitF64(*is.bodyExpr)) {
+        pushScope();
+        std::vector<Value *> ownedArgs;
+        auto *f64Ty = Type::getDoubleTy(ctx_);
+        for (size_t i = 0; i < is.params.size(); i++) {
+            Value *argVal = nullptr;
+            if (n.args[i]->kind == NK::Call) argVal = tryEmitInline(*n.args[i]);
+            if (!argVal) argVal = emitExpr(*n.args[i]);
+            auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+            builder_.CreateStore(argVal, slot);
+            declareVar(is.params[i], slot);
+            if (isOwnedTemp(argVal)) ownedArgs.push_back(argVal);
+            /* Also expose F64 arg as float var for body */
+            if (canEmitF64(*n.args[i])) {
+                if (Value *fv = emitExprF64(*n.args[i])) {
+                    auto *fslot = builder_.CreateAlloca(f64Ty, nullptr, "f$" + is.params[i]);
+                    builder_.CreateStore(fv, fslot);
+                    if (!floatScopes_.empty()) floatScopes_.back()[is.params[i]] = fslot;
+                }
+            }
+        }
+        Value *f64val = emitExprF64(*is.bodyExpr);
+        popScope();
+        for (Value *v : ownedArgs) callRT("perl_free", {v});
+        return f64val;
+    }
+
     /* Evaluate each argument, trying recursive inline for nested sub calls.
        Bail out if any arg is a list-producing expression (can't bind directly). */
     std::vector<Value *> argVals;
@@ -6771,8 +6801,20 @@ Value *CodeGen::tryEmitInline(const Node &n) {
 }
 
 Value *CodeGen::emitCall(const Node &n) {
-    /* Try AST-level inline first: eliminates @_ construction for simple subs. */
-    if (Value *v = tryEmitInline(n)) return v;
+    /* Try AST-level inline first: eliminates @_ construction for simple subs.
+       If the inlined sub returns F64, box it into a PV* before returning. */
+    if (Value *v = tryEmitInline(n)) {
+        /* Check if this is an F64 value (not a PV*). We detect this by checking
+           if the value is a ConstantFP, a PHI node of f64 type, or a binary
+           operation on f64 types. If so, box it. */
+        auto *ty = v->getType();
+        if (ty->isFloatingPointTy() && ty->getPrimitiveSizeInBits() == 64) {
+            /* Box F64 result into a PV* using perl_alloc_float */
+            Value *pv = callRT("perl_alloc_float", {v});
+            return pv;
+        }
+        return v;
+    }
 
     /* eval EXPR — JIT-based string eval */
     if (n.name == "eval") {

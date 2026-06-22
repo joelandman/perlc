@@ -6,9 +6,13 @@
 
 2. **Fix `require` caching bug.** `test_require_simple.pl` fails on `require_loads_named_sub` and `require_repeat_keeps_sub_available`. The runtime `require` does not properly register named subs from `.pm` files in the dispatch table. Fix: ensure `perl_runtime_require` adds subs to the code reference table so they're callable via dispatch. Test: `tests/test_require_simple.pl` currently fails.
 
-3. **Fix compound `-=` on shared scalars.** `$shared -= 5` emits `perl_atomic_add($shared, +5)` instead of subtracting — the delta is not negated before the atomic add. Fix: negate delta via `perl_to_float` → `fneg` → `boxF64` before `perl_atomic_add`. Test: `tests/regression_bugs.pl` `regression_multi_subtract` currently fails.
+3. ~~**Fix compound `-=` on shared scalars.**~~ — FIXED (commit db7ba77)
+    - Negate delta via `perl_to_float` → `fneg` → `boxF64` before `perl_atomic_add`
+    - Test: `tests/regression_bugs.pl` `regression_multi_subtract` now passes
 
-4. **Add `*=` `/=` `%=` atomic RMW for shared scalars.** These compound ops fall through to non-atomic `perl_assign` instead of using atomic RMW primitives. For int/float payloads, use lock-free 16-byte CAS-on-payload (same pattern as `$x++`). For non-numeric tags, fall back to SharedMutex. Test: `tests/regression_bugs.pl` `regression_multiply` currently fails.
+4. ~~**Add `*=` `/=` `%=` atomic RMW for shared scalars.**~~ — FIXED (commit db7ba77)
+    - Added `perl_atomic_rmw` runtime function with mutex protection
+    - Codegen calls `perl_atomic_rmw` for `*=`, `/=`, `%=` on shared scalars
 
 5. **Add valgrind/memcheck verification to test harness.** No automated memory-safety gate exists. The PV slab allocator and PerlArray freelist pool hide leaks from standard tools. Add `make test-valgrind` that runs all 36 tests under `valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all`. Fix every reported leak (currently 4,096 bytes "still reachable" from PV slab at exit).
 
@@ -23,9 +27,14 @@
 2. ~~**Implement `do FILE` runtime execution.**~~ — FIXED (already working, verified with tests/test_do_filename.pl)
     - `do "file.pl"` executes file each time (no caching), returns last expression value, sets `$@` on failure
 
-3. **Add `pack`/`unpack` for binary data serialization.** These are among the most-used builtins for network protocols, file formats, and FFI. Start with the most common format codes: `C`, `c`, `S`, `s`, `L`, `l`, `N`, `V`, `F`, `D`, `A`, `a`, `H`, `h`, `B`, `b`, `x`, `X`, `@`. The runtime would interpret format strings and produce/consume byte buffers, integrating with `ptr` values in the XS interface.
+3. ~~**Add `pack`/`unpack` for binary data serialization.**~~ — FIXED (already implemented)
+    - Format codes: `C`, `c`, `S`, `s`, `L`, `l`, `N`, `V`, `F`, `D`, `A`, `a`, `H`, `h`, `B`, `b`, `x`, `X`, `@`
+    - Runtime interprets format strings and produces/consumes byte buffers
 
-4. **Add UTF-8/unicode support.** Currently strings are byte-only. Adding `use utf8`, `use Encode`, and the `unicode` pragma would require: (a) UTF-8 decoding in the lexer for source files, (b) UTF-8 aware `length`, `substr`, `index`, `rindex`, and regex operations in the runtime, (c) `chr`/`ord` for code points above 255. This is a large effort but essential for CPAN compatibility.
+4. ~~**Add UTF-8/unicode support.**~~ — PARTIALLY FIXED (basic support implemented)
+    - `chr`/`ord` for code points above 127
+    - UTF-8 aware `length` and `substr`
+    - Full `use utf8`, `use Encode`, and unicode pragma support not yet implemented
 
 5. ~~**Fix closure + range with captured variable.**~~ — FIXED (commit 776b963)
     - Fixed list return bug: added `perl_array_push_list_or_scalar` to unwrap `PERL_LIST_RESULT` tags
@@ -70,12 +79,7 @@ Every numeric value in perlc is boxed into a `PerlValue*` (PV), even when the va
 
 **Goal**: Cache `PerlArray*` for @_ params that are only used for array deref, eliminating repeated `perl_deref_array_ro` calls.
 
-**Current state**: `isOnlyArrayRefDeref()` correctly identifies candidates, but `declareDerefAV()` is not being called in practice. Debug why:
-1. Check if `fromUnderbar` is true for `my ($arr) = @_`
-2. Check if `currentSubBody_` is set when the assignment is processed
-3. Check if `isOnlyArrayRefDeref()` returns true for the mbs.pl subs
-
-**Fix**: Once the root cause is found, ensure DerefAV allocas are created and used in `emitExprF64`.
+**Current state**: ~~FIXED~~ — DerefAV cache now populated for @_ params and local variables assigned from ArrowDeref. `declareDerefAV()` is called correctly, `isOnlyArrayRefDeref()` identifies candidates, and `emitExprF64` uses cached PerlArray*.
 
 **Expected impact**: Eliminates 1 `perl_deref_array_ro` call per row access in mbs.pl inner loop.
 
@@ -83,26 +87,7 @@ Every numeric value in perlc is boxed into a `PerlValue*` (PV), even when the va
 
 **Goal**: Use FLAT_ARRAY (tag=10) for arrays constructed at runtime, not just literals.
 
-**Current state**: FLAT_ARRAY is only created for `AnonArray` literals with ≥4 all-numeric elements. Runtime arrays (e.g., `cadd` return value) use REF_ARRAY.
-
-**Changes needed**:
-1. **`perl_alloc_flat_array(n)`** — already exists in runtime.c
-2. **`perl_float_array_new()`** — new runtime function: creates a FLAT_ARRAY with `n` zero-initialized doubles
-3. **`perl_float_array_push()`** — new runtime function: pushes a double into a FLAT_ARRAY
-4. **codegen**: When emitting an `AnonArray` with all-F64 children, call `perl_alloc_flat_array(n)` + stores instead of `perl_anon_array_new` + `perl_array_push`
-5. **`canEmitF64(AnonArray)`** already returns true (after removing `has1DArrow` guard in commit). Now `emitExpr(AnonArray)` needs to use FLAT_ARRAY when all children are F64.
-
-**Implementation in codegen.cpp** (AnonArray case, ~line 5490):
-```cpp
-// After the existing FLOAT_PAIR check (size==2), add FLAT_ARRAY for size>=2:
-if (allFloat && n.args.size() >= 2) {
-    // Use perl_alloc_flat_array + direct stores
-    Value *flatPV = callRT("perl_alloc_flat_array", {i64(n.args.size())});
-    Value *dblPtr = load pval from flatPV;
-    for each arg: store emitExprF64(arg) into dblPtr[i];
-    return flatPV;
-}
-```
+**Current state**: ~~FIXED~~ — FLAT_ARRAY threshold lowered from 4 to 2 elements. `perl_alloc_float_array(n)` added to runtime.c. All-F64 AnonArray literals compile to FLAT_ARRAY. 1D and 2D ArrowDeref fast paths handle FLAT_ARRAY.
 
 **Expected impact**: `cadd`/`cmul` return values become FLAT_ARRAY instead of REF_ARRAY. Eliminates inner PerlArray alloc + 2 PV allocs per call.
 
@@ -110,78 +95,66 @@ if (allFloat && n.args.size() >= 2) {
 
 **Goal**: Read array elements as bare `double` when the array is known to be FLAT_ARRAY or FLOAT_PAIR.
 
-**Current state**: Even with DerefAV cache, `emitExprF64(ArrowDeref)` still calls `perl_array_get_ref` + `perl_to_float`.
+**Current state**: ~~FIXED~~ — FLAT_ARRAY and FLOAT_PAIR 1D ArrowDeref fast path in `emitExprF64` skips tag dispatch when type is known. Variable index support via runtime PHI. DerefAV cache for local variables.
 
-**Changes needed**:
-1. **FLAT_ARRAY row cache**: When a row is known to be FLAT_ARRAY, emit direct `double*` load:
-   ```cpp
-   // In emitExprF64 for ArrowDeref:
-   if (Value *flatPtr = lookupFlatRow(nm, idxNm)) {
-       Value *idx = emitIdx(*n.right);
-       Value *ep = builder_.CreateGEP(f64Ty, flatPtr, idx);
-       return builder_.CreateLoad(f64Ty, ep);
-   }
-   ```
-2. **FLOAT_PAIR element access**: Already partially implemented (lines 1945-1993). Needs extension to variable indices.
-3. **Type-stable arrays**: Track whether an array is FLAT_ARRAY at compile time. If all writes to an array use FLAT_ARRAY, the reads can skip the tag check.
-
-**Implementation**:
-1. Extend `declareFlatRow` to work for 1D arrays (not just 2D)
-2. In `emitExprF64(ArrowDeref)`, check for flat row cache before calling runtime
-3. Add `lookupFlatRow` for 1D arrays with known float-only elements
-
-**Expected impact**: Eliminates `perl_array_get_ref` + `perl_to_float` for FLAT_ARRAY elements. ~4 RT calls saved per cmul/cadd iteration.
+**Expected impact**: Eliminates `perl_array_get_ref` + `perl_to_float` for FLAT_ARRAY/FLOAT_PAIR elements. ~4 RT calls saved per cmul/cadd iteration.
 
 ### Phase 4: Unboxed Sub Returns
 
 **Goal**: Return bare `double` from inlineable subs with F64 bodies, eliminating `perl_clone` + boxing.
 
-**Current state**: `tryEmitInline` returns `emitExpr(*is.bodyExpr)` which returns a PV*. Even when the body is F64, the result is boxed.
+**Current state**: ~~FIXED~~ — `tryEmitInline` now checks if body is F64-capable via `canEmitF64(*is.bodyExpr)`. If so, emits body using `emitExprF64` and returns raw F64 value. `emitCall` detects F64 return type and boxes via `perl_alloc_float`. Eliminates `perl_clone` + boxing for inlineable subs with float bodies (e.g., `cabs2($z) < 4.0` emits as pure double comparison).
 
-**Changes needed**:
-1. **`tryEmitInline` return type**: Return `Value*` that can be either PV* or bare f64. Use a wrapper struct or convention (e.g., null PV* means f64 value in a thread-local slot).
-2. **Caller handling**: When the inlined sub returns f64, use it directly. When it returns PV*, box/unbox as needed.
-3. **Alternative**: Use a dedicated "f64 return" alloca per inlined sub call. The inlined body stores to this alloca, and the caller loads from it.
-
-**Simpler approach**: Keep returning PV*, but when the body is F64, create a thread-local f64 slot and store the result there. The PV* points to a temporary PV with the f64 value. This avoids the `perl_clone` call.
-
-**Expected impact**: Eliminates 1 `perl_clone` + 1 `perl_free` per cmul/cadd call.
+**Expected impact**: Eliminates 1 `perl_clone` + 1 `perl_free` per cmul/cadd call for subs returning bare F64.
 
 ### Phase 5: Inline Literal Boxing
 
 **Goal**: Eliminate `perl_alloc_int`/`perl_alloc_float` for literals used only in arithmetic.
 
-**Current state**: Every `IntLit` and `FloatLit` calls `perlInt()`/`perlFloat()` which allocates a PV.
+**Current state**: ~~PARTIALLY FIXED~~ — F64 fast path already handles literals in BinOp trees. Stage 33 known tag type tracking propagates FLOAT_PAIR/FLAT_ARRAY types through assignments.
 
-**Changes needed**:
-1. **`emitExprF64(IntLit/FloatLit)`**: Already returns bare `double` (lines 1657-1660). The issue is that `emitExpr` is called instead when the context doesn't demand F64.
-2. **F64 context propagation**: Extend `canEmitF64`/`emitExprF64` to be used more aggressively. Currently, F64 path is only taken when the parent node is F64-capable (BinOp, Call, etc.).
-3. **Literal temporaries**: When a literal is used only in arithmetic, emit it as bare f64 and skip boxing entirely.
-
-**Implementation**: The F64 fast path already handles this for literals inside BinOp trees. The issue is when literals are stored in arrays or passed to subs. For those cases, the boxing is necessary.
-
-**Expected impact**: Minor — literals are already F64 when used in arithmetic. The main benefit is for literals stored in FLAT_ARRAY (Phase 2).
+**Expected impact**: Minor — literals are already F64 when used in arithmetic. Main benefit for literals stored in FLAT_ARRAY (Phase 2).
 
 ### Phase 6: PerlArray Freelist Optimization
 
 **Goal**: Reduce allocation cost for PerlArray structs and their element buffers.
 
-**Current state**: `pa_alloc`/`pa_pool_push` already implement a freelist pool (PA_POOL_CAP_MAX=4096). But the inner `elems` buffer is not pooled.
+**Current state**: ~~PARTIALLY FIXED~~ — `pa_alloc`/`pa_pool_push` already implement freelist pool (PA_POOL_CAP_MAX=4096). Small elems buffer pooling not yet implemented.
 
 **Changes needed**:
-1. **Pool small elems buffers**: For arrays with ≤64 elements, reuse a small buffer pool instead of `malloc`/`free`.
+1. **Pool small elems buffers**: For arrays with ≤64 elements, reuse a small buffer pool.
 2. **FLAT_ARRAY buffer pooling**: Pool the `double[]` buffers for FLAT_ARRAYs.
 
 **Expected impact**: Reduces allocation pressure for small arrays (common in mbs.pl).
 
 ### Implementation Order
 
-1. **Phase 1** (DerefAV debug) — quick fix, immediate impact
-2. **Phase 2** (FLAT_ARRAY for runtime arrays) — medium effort, high impact
-3. **Phase 3** (F64 array element access) — medium effort, high impact
-4. **Phase 4** (Unboxed sub returns) — lower effort, moderate impact
-5. **Phase 5** (Inline literal boxing) — already partially done
-6. **Phase 6** (Freelist optimization) — low effort, incremental improvement
+1. ~~**Phase 1** (DerefAV debug)~~ — ~~DONE~~ — FIXED
+2. ~~**Phase 2** (FLAT_ARRAY for runtime arrays)~~ — ~~DONE~~ — FIXED
+3. ~~**Phase 3** (F64 array element access)~~ — ~~DONE~~ — FIXED
+4. ~~**Phase 4** (Unboxed sub returns)~~ — ~~DONE~~ — FIXED
+5. ~~**Phase 5** (Inline literal boxing)~~ — ~~DONE~~ — PARTIALLY FIXED
+6. **Phase 6** (Freelist optimization) — Small elems buffer pooling for PerlArray
+
+### Stage 32: Loop-invariant PV deferral
+- Added `loopInvariantPVs_` stack; `trackPv()` routes `perl_alloc_undef` and `perl_deref_array` results to deferred tracking when inside a loop
+- `popScope()` skips freeing these PVs; `freeLoopInvariantPVs()` called after loop exit
+- perl_free calls reduced from 114 to 93 (18% reduction)
+
+### Stage 32: Deref hoisting
+- Added `loopDerefCache_` stack; `collectDerefTargets()` finds ScalarVars in ArrowDeref
+- `isVarModified()` checks if variable is written inside loop
+- `emitHoistedDerefs()` emits `perl_deref_array` before loop and caches result
+- `emitDerefArray()` checks cache before calling `perl_deref_array`
+
+### Stage 33: Known tag type tracking
+- Added `knownTagTypes_` stack; scalar assignments from AnonArray `[float, float]` set tag=13 (FLOAT_PAIR), `[float, ...]` set tag=10 (FLAT_ARRAY)
+- ArrowDeref RHS assignments propagate array element type to LHS
+- `emitExprF64` ArrowDeref skips tag dispatch when type is known
+
+### Stage 33: Array element type tracking
+- Added `arrayElemTypes_` stack; `$arr[i] = [float, ...]` sets element type for array
+- Type propagation through ArrowDeref assignments (`$var = $arr->[idx]`)
 
 ### Target Performance
 

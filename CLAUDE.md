@@ -166,6 +166,10 @@ See `README.md` for user-facing documentation and individual test files for usag
 3. **`our $x : shared` parser+codegen support**. Two changes: the parser's `(LIST)` form (`our ($a, $b) : shared = ...`) now accepts the `: shared` attribute; the codegen's file-scope shared-scalar path now also registers the cell in `fileScalarGlobals_` (under both bare and `Package::name` keys) so cross-package access (`$Foo::counter` from main, `\&Foo::worker` from main) resolves to the same cell. Tests in `tests/threads_atomic.pl` cover 3 forms: bare `our $x : shared`, `our (LIST) : shared`, and cross-package `our $x : shared` in `package Foo` + `\&Foo::bump` dispatch from main.
 4. **FLAT_ARRAY 1D ArrowDeref fast path with variable index support**. Fixed LLVM verify error by adding `flatBB` block for FLAT_ARRAY fast path and third PHI incoming. FLAT_ARRAY threshold lowered from 4 to 2 elements (enables cadd/cmul with 2-element arrays). `perl_alloc_float_array(n)` added to runtime.c for zero-initialized FLAT_ARRAY creation. FLOAT_PAIR path now handles variable indices via runtime PHI (selects between re at offset 8 and im at offset 16). FLAT_ARRAY path uses `emitIdx(*n.right)` for variable index GEP.
 5. **DerefAV cache for local variables**. When `$local = $cached->[idx]` where `$cached` is a DerefAV-cached @_ param, the PerlArray* is cached for `$local` so inner-loop `$local->[i]` skips repeated `perl_deref_array_ro` calls. Handles both FLAT_ARRAY (direct double* load) and REF_ARRAY (perl_deref_array_ro) paths via PHI.
+6. **Stage 32: Loop-invariant PV deferral**. Added `loopInvariantPVs_` stack; `trackPv()` routes `perl_alloc_undef` and `perl_deref_array` results to deferred tracking when inside a loop. `popScope()` skips freeing these PVs; `freeLoopInvariantPVs()` called after loop exit. perl_free calls reduced from 114 to 93 (18% reduction).
+7. **Stage 32: Deref hoisting**. Added `loopDerefCache_` stack; `collectDerefTargets()` finds ScalarVars in ArrowDeref; `isVarModified()` checks if variable is written inside loop; `emitHoistedDerefs()` emits `perl_deref_array` before loop and caches result; `emitDerefArray()` checks cache before calling `perl_deref_array`.
+8. **Stage 33: Known tag type tracking**. Added `knownTagTypes_` stack; scalar assignments from AnonArray `[float, float]` set tag=13 (FLOAT_PAIR), `[float, ...]` set tag=10 (FLAT_ARRAY); ArrowDeref RHS assignments propagate array element type to LHS; `emitExprF64` ArrowDeref skips tag dispatch when type is known.
+9. **Stage 33: Array element type tracking**. Added `arrayElemTypes_` stack; `$arr[i] = [float, ...]` sets element type for array; type propagation through ArrowDeref assignments (`$var = $arr->[idx]`).
 
 TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy.pl` all clean (zero race reports) under `-fsanitize=thread`. 69/69 tests pass.
 
@@ -203,11 +207,31 @@ TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy
 - `length(@arr)` → `perl_array_len_f64()` for DerefAV-cached arrays
 - Existing: arithmetic (`+`, `-`, `*`, `/`, `**2`), `sqrt`, comparisons, inlineable subs, 2D ArrowDeref, FLOAT_PAIR, FLAT_ARRAY
 
+### Stage 32: Loop-invariant PV deferral
+- Added `loopInvariantPVs_` stack; `trackPv()` routes `perl_alloc_undef` and `perl_deref_array` results to deferred tracking when inside a loop
+- `popScope()` skips freeing these PVs; `freeLoopInvariantPVs()` called after loop exit
+- perl_free calls reduced from 114 to 93 (18% reduction)
+
+### Stage 32: Deref hoisting
+- Added `loopDerefCache_` stack; `collectDerefTargets()` finds ScalarVars in ArrowDeref
+- `isVarModified()` checks if variable is written inside loop
+- `emitHoistedDerefs()` emits `perl_deref_array` before loop and caches result
+- `emitDerefArray()` checks cache before calling `perl_deref_array`
+
+### Stage 33: Known tag type tracking
+- Added `knownTagTypes_` stack; scalar assignments from AnonArray `[float, float]` set tag=13 (FLOAT_PAIR), `[float, ...]` set tag=10 (FLAT_ARRAY)
+- ArrowDeref RHS assignments propagate array element type to LHS
+- `emitExprF64` ArrowDeref skips tag dispatch when type is known
+
+### Stage 33: Array element type tracking
+- Added `arrayElemTypes_` stack; `$arr[i] = [float, ...]` sets element type for array
+- Type propagation through ArrowDeref assignments (`$var = $arr->[idx]`)
+
 ### Benchmark Results (3 runs averaged)
 | Benchmark | perlc | Perl | Speedup |
 |-----------|-------|------|---------|
 | fibn (n=30) | 266ms | 613ms | 2.30x |
-| mbs (512×512, 80 iters) | 1386ms | 18870ms | 13.61x |
+| mbs (1024×1024, 80 iters) | 7000ms | 72000ms | 10.29x |
 | nb (n=1M) | 60ms | 5813ms | 96.88x |
 | regex_heavy (100K items × 50) | 826ms | 240ms | 0.29x |
 
