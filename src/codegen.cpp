@@ -1556,6 +1556,38 @@ int CodeGen::lookupKnownTagType(const std::string &varName) {
     return 0;
 }
 
+void CodeGen::pushArrayElemTypes() {
+    arrayElemTypes_.emplace_back();
+}
+
+void CodeGen::popArrayElemTypes() {
+    if (!arrayElemTypes_.empty())
+        arrayElemTypes_.pop_back();
+}
+
+void CodeGen::setArrayElemType(const std::string &arrName, int elemTag) {
+    if (!arrayElemTypes_.empty())
+        arrayElemTypes_.back()[arrName] = elemTag;
+}
+
+int CodeGen::lookupArrayElemType(const std::string &arrName) {
+    for (int i = (int)arrayElemTypes_.size() - 1; i >= 0; i--) {
+        auto it = arrayElemTypes_[i].find(arrName);
+        if (it != arrayElemTypes_[i].end()) return it->second;
+    }
+    return 0;
+}
+
+void CodeGen::setFuncArgElemType(int argIdx, int elemTag) {
+    funcArgElemTypes_[argIdx] = elemTag;
+}
+
+int CodeGen::lookupFuncArgElemType(int argIdx) {
+    auto it = funcArgElemTypes_.find(argIdx);
+    if (it != funcArgElemTypes_.end()) return it->second;
+    return 0;
+}
+
 /* ── cached PerlArray* for array-ref @_ args (Stage 15) ─────────────────── */
 
 /* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
@@ -2119,7 +2151,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
                     return callRT("perl_to_float", {elem});
                 }
-    /* FLOAT_PAIR / FLAT_ARRAY fast path: $z->[idx] where tag may be
+      /* FLOAT_PAIR / FLAT_ARRAY fast path: $z->[idx] where tag may be
                 FLOAT_PAIR (13), FLAT_ARRAY (10), or REF_ARRAY.
                 Stage 33: if knownTagTypes_ has a known type, skip the tag dispatch. */
                    if (n.right && lookupVar(nm)) {
@@ -4684,6 +4716,25 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         /* $arr[i] = val */
         if (n.left->kind == NK::ArrayElem) {
+            std::string arrNm = n.left->name;
+            if (!arrNm.empty() && arrNm[0] == '@') arrNm = arrNm.substr(1);
+            /* Stage 33: track array element type from RHS */
+            if (n.right->kind == NK::AnonArray) {
+                if (n.right->args.size() == 2 &&
+                    canEmitF64(*n.right->args[0]) && canEmitF64(*n.right->args[1])) {
+                    /* [float, float] → element is FLOAT_PAIR (tag=13) */
+                    setArrayElemType(arrNm, 13);
+                } else if (n.right->args.size() >= 2) {
+                    bool allF64 = true;
+                    for (auto &e : n.right->args) {
+                        if (!canEmitF64(*e)) { allF64 = false; break; }
+                    }
+                    if (allF64) {
+                        /* [float, float, ...] → element is FLAT_ARRAY (tag=10) */
+                        setArrayElemType(arrNm, 10);
+                    }
+                }
+            }
             Value *av = lookupArray(n.left->name);
             if (!av) return perlUndef();
             Value *rhs = emitExpr(*n.right);
@@ -4756,7 +4807,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             return rhs;
         }
         /* int/float var assignment */
-        if (n.left->kind == NK::ScalarVar) {
+         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
             /* Stage 33: track known tag type from AnonArray RHS */
@@ -4773,6 +4824,19 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (allF64) {
                         /* [float, float, ...] → FLAT_ARRAY (tag=10) */
                         setKnownTagType(nm, 10);
+                    }
+                }
+            }
+            /* Stage 33: track known tag type from ArrowDeref RHS (array element load) */
+            if (n.right->kind == NK::ArrowDeref && n.right->sval == "array") {
+                /* $var = $arr->[idx] — check if $arr has known element type */
+                if (n.right->left->kind == NK::ScalarVar) {
+                    std::string arrNm = n.right->left->name;
+                    if (!arrNm.empty() && arrNm[0] == '$') arrNm = arrNm.substr(1);
+                    int elemTag = lookupArrayElemType(arrNm);
+                    if (elemTag) {
+                        /* Array has known element type — propagate to $var */
+                        setKnownTagType(nm, elemTag);
                     }
                 }
             }

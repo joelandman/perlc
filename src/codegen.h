@@ -109,11 +109,24 @@ private:
        load from this cache inside the loop.  Stacked per-loop for nesting. */
     std::vector<std::unordered_map<std::string, llvm::Value *>> loopDerefCache_;
 
-    /* Stage 33: known PV tag types per scope.  Tracks when a variable is
-       known to have a specific PerlTag (e.g., FLOAT_PAIR=13, FLAT_ARRAY=10).
-       Used to eliminate runtime tag dispatch in emitExprF64 ArrowDeref.
-       Stacked per-scope for nesting. */
+  /* Stage 33: known PV tag types per scope.  Tracks when a variable is
+        known to have a specific PerlTag (e.g., FLOAT_PAIR=13, FLAT_ARRAY=10).
+        Used to eliminate runtime tag dispatch in emitExprF64 ArrowDeref.
+        Stacked per-scope for nesting. */
     std::vector<std::unordered_map<std::string, int>> knownTagTypes_;
+
+    /* Stage 33: known element types for arrays.  Tracks when a PerlArray*
+        (identified by its alloca name or global variable name) is known to
+        contain elements of a specific tag type (e.g., all elements are
+        FLOAT_PAIR=13).  Used to eliminate tag dispatch when loading array
+        elements via ArrowDeref.  Stacked per-scope for nesting. */
+    std::vector<std::unordered_map<std::string, int>> arrayElemTypes_;
+
+    /* Stage 33: module-level known element types for function arguments.
+        Maps function argument index (0, 1, 2, ...) to known element tag type.
+        Populated when a sub is called with arrays known to contain specific types.
+        Used to propagate element types across subroutine boundaries. */
+    std::unordered_map<int, int> funcArgElemTypes_;
 
     /* Phase 3: names of shared scalars (declared with `: shared`).  Used
        to route reads/writes through the atomic primitive helpers so the
@@ -258,6 +271,14 @@ private:
     void popKnownTypes();
     void setKnownTagType(const std::string &varName, int tag);
     int lookupKnownTagType(const std::string &varName);
+    /* Stage 33: array element type tracking */
+    void pushArrayElemTypes();
+    void popArrayElemTypes();
+    void setArrayElemType(const std::string &arrName, int elemTag);
+    int lookupArrayElemType(const std::string &arrName);
+    /* Stage 33: function argument element type tracking */
+    void setFuncArgElemType(int argIdx, int elemTag);
+    int lookupFuncArgElemType(int argIdx);
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);
