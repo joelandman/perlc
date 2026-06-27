@@ -1,5 +1,5 @@
-CXX      := clang++-18
-LLVM_CFG := llvm-config-18
+CXX      := g++-15
+LLVM_CFG := llvm-config-21
 LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 # strip -fno-exceptions so we can use C++ exceptions in our code
 # -mcx16: enable cmpxchg16b for the lock-free 16-byte CAS on shared
@@ -19,18 +19,18 @@ TSAN_CFLAGS := $(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer
 #          (x86_64-v2+ inlines it; older hosts need the shim.)
 LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core orcjit native) -lpthread -ldl -lpcre2-8 -lsqlite3 -latomic
 
-CC       := clang-18
+CC       := clang-22
 # -mcx16 + -Wno-atomic-alignment: same rationale as the C++ flags above;
 # needed for the runtime.c atomic primitives.
 CFLAGS   := -g -O2 -mcx16 -Wno-atomic-alignment
 
 SRCDIR   := src
-OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o
+OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o $(SRCDIR)/ast.o
 RT_OBJ   := $(SRCDIR)/runtime.o
 EVAL_OBJ := $(SRCDIR)/eval_jit.o
 EVAL_LIB := $(SRCDIR)/libperlc_eval.a
 
-TSAN_OBJS := $(SRCDIR)/main_tsan.o $(SRCDIR)/lexer_tsan.o $(SRCDIR)/parser_tsan.o $(SRCDIR)/codegen_tsan.o $(SRCDIR)/jit_tsan.o
+TSAN_OBJS := $(SRCDIR)/main_tsan.o $(SRCDIR)/lexer_tsan.o $(SRCDIR)/parser_tsan.o $(SRCDIR)/codegen_tsan.o $(SRCDIR)/jit_tsan.o $(SRCDIR)/ast_tsan.o
 TSAN_RT_OBJ := $(SRCDIR)/runtime_tsan.o
 TSAN_TARGET := perlc_tsan
 
@@ -57,7 +57,7 @@ $(SRCDIR)/runtime_tsan.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h
 $(SRCDIR)/eval_jit.o: $(SRCDIR)/eval_jit.cpp $(SRCDIR)/eval_jit.h $(SRCDIR)/lexer.h $(SRCDIR)/parser.h $(SRCDIR)/codegen.h $(SRCDIR)/jit.h $(SRCDIR)/runtime.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-$(EVAL_LIB): $(EVAL_OBJ) $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o
+$(EVAL_LIB): $(EVAL_OBJ) $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/jit.o $(SRCDIR)/ast.o
 	ar rcs $@ $^
 
 $(SRCDIR)/%.o: $(SRCDIR)/%.cpp

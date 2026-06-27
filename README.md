@@ -1,11 +1,11 @@
 # perlc — Perl to Native Binary Compiler
 
-A Perl compiler that translates Perl source to LLVM IR and links a C runtime to produce native executables. Written in C++17 using LLVM 18.
+A Perl compiler that translates Perl source to LLVM IR and links a C runtime to produce native executables. Written in C++17 using LLVM 21.
 
 ## Requirements
 
-- `clang++` / `clang` (LLVM 18)
-- `llvm-config-18`
+- `g++-15` / `clang-22` (LLVM 21)
+- `llvm-config-21`
 - `libpcre2-8` (`apt install libpcre2-dev`)
 - `libsqlite3-dev` (for DBI/SQLite integration, `apt install libsqlite3-dev`)
 
@@ -188,7 +188,7 @@ Press ENTER to continue, or 'q' to quit.
 ## Architecture
 
 ```
-source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  clang-18  →  binary
+source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  g++-15  →  binary
                                                                            ↑
                                                                      runtime.c (linked in)
 ```
@@ -213,4 +213,4 @@ typedef struct PerlValue {
 - `src/parser.h/cpp`: Recursive-descent parser → AST
 - `src/codegen.h/cpp`: AST → LLVM IR via IRBuilder
 - `src/runtime.h/c`: C runtime: `PerlValue` tagged union and all operations
-- `src/main.cpp`: Driver: lex → parse → codegen → clang-18 link
+- `src/main.cpp`: Driver: lex → parse → codegen → g++-15 link

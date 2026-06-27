@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
+A Perl compiler targeting LLVM IR, written in C++17 with LLVM 21. All Perl operations lower to calls into a C runtime (`src/runtime.c`).
 
 **Current Status**: Core language features are ~99% implemented with 69/69 test programs passing (plus 3 new test files: `wantarray_extended.pl`, `regression_bugs.pl`, `eval_exception.pl`). Significant coverage of Perl 5 semantics including OOP, closures, regex, modules, advanced builtins, List::Util, POSIX, Scalar::Util, Tier 2 and Tier 3 builtins, threads with threads::shared (atomic memory model: visibility-without-lock, RMW atomicity without `lock()` for single-scalar RMW, **lock-free 16-byte CAS-on-payload** for int/float RMWs, lazy-installed SharedMutex side-table, per-thread re-entry), wantarray context propagation (including through call chains and implicit returns of grep/map/sort), require, **`do FILE` runtime execution**, **`tie`/`untie` with TIESCALAR/TIEARRAY/TIEHASH support**, **`pack`/`unpack` for binary data** (C, S, L, s, l, n, N, v, V, f, d, a, A, h, H, b, B, x, X, @ format codes), **UTF-8/Unicode support** (chr/ord for code points > 127, UTF-8 aware length/substr), DESTROY (hash and array objects), XS interface, DBI/SQLite integration, `caller()`, AUTOLOAD, `local @arr`/`local %hash`, `(LIST)[i]` subscript, `/e` regex modifier, `$Package::var` cross-package access, lvalue array/hash slices, autovivification, labeled `next`/`last`, `map { @$_ }` flattening, hash-ref slices `@{$href}{LIST}`, `scalar(@{$ref})`, range expansion in function call args, anonymous sub implicit return, `$h{k}++` on missing keys, `sort { } qw(...)` lists, `split //` into characters, correct map body scoping, `PERL_FLOAT_PAIR` inline complex numbers, `PERL_LIST_RESULT` correct list-return tag, AST-level sub inlining, **named-sub closure capture of shared scalars** (`\&worker` passed to `threads->create`), **`our $x : shared`** parser+codegen support, **closure capture of unboxed int/float vars**, **compound `-=` on shared scalars**, **correct `or`/`and`/`xor` precedence** below `my`/`local`/`state` declaration initializers (Perl statement separators), **FLAT_ARRAY 1D ArrowDeref fast path with variable index support**, **DerefAV cache for local variables assigned from array derefs**.
 
@@ -27,7 +27,7 @@ make clean
 | `src/parser.h/cpp` | Recursive-descent parser → AST |
 | `src/codegen.h/cpp` | AST → LLVM IR via IRBuilder |
 | `src/runtime.h/c` | C runtime: `PerlValue` tagged union + all operations |
-| `src/main.cpp` | Driver: lex→parse→codegen→clang-18 link with module inlining |
+| `src/main.cpp` | Driver: lex→parse→codegen→clang-21 link with module inlining |
 
 ## Architecture
 

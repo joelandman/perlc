@@ -42,3 +42,7 @@ hal9k,tr,.103,yes,HELLO world bonono HELLO 10 2 hll wrld abcdef abc bokeper abc*
 hal9k,usemod,.104,yes,7 42 120 1 300 MathUtils ,N/A
 hal9k,wantarray,.104,yes,1 1 scalar 1 ,N/A
 hal9k,xs_ffi,1.105,yes,clock_gettime_return_zero=ok clock_gettime_sec_positive=ok clock_gettime_nsec_range=ok clock_gettime_realtime_return_zero=ok clock_gettime_realtime_sec_positive=ok clock_gettime_realtime_nsec_range=ok,N/A
+hal9k,eval_exception,.105,yes,eval_result=undef eval_err=has_error nested_eval=inner caught eval_tests_done ,N/A
+hal9k,regression_bugs,.105,yes,regression_subtract=pass regression_multi_subtract=pass regression_closure_range=pass regression_anon_range=pass regression_multiply=pass regression_divide=pass regression_modulo=pass regression_tests,N/A
+hal9k,tree,1.106,yes,stretch tree of depth 7	 check: 255 64	 trees of depth 4	 check: 1984 16	 trees of depth 6	 check: 2032 long lived tree of depth 6	 check: 127 ,N/A
+hal9k,wantarray_extended,.104,yes,grep_nested=3,4,5 map_nested=2,4,6 sort_nested=1,2,3 anon_sub_list=1,2,3 anon_sub_implicit=2,4 nested_ctx_top=scalar nested_ctx_list_count=1 ctx_prop_scalar=scalar ctx_prop_list_count=1 thread_grep=3 ,N/A
