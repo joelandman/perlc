@@ -20,7 +20,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BENCH_DIR="$SCRIPT_DIR"
 RESULTS="$BENCH_DIR/results.csv"
 PERLC="$PROJECT_DIR/perlc"
-TIMEOUT_SEC=30
+TIMEOUT_SEC=120
 NUM_RUNS=1
 MODE="full"  # full, baseline, compare
 EXTRA_ARGS=""
@@ -160,8 +160,8 @@ run_test() {
     # fibn.pl: exponential, use N=20 (fib(20)=6765, fast)
     # nb.pl: O(N) iterations, use N=100000 (runs in ~7ms)
     case "$basename" in
-        fibn)   [[ -z "$args" ]] && args="30" ;;
-        nb)     [[ -z "$args" ]] && args="1000000" ;;
+        fibn)   [[ -z "$args" ]] && args="38" ;;
+        nb)     [[ -z "$args" ]] && args="50000000" ;;
         mbs)    args="" ;;  # hardcoded in source
     esac
 

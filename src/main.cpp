@@ -756,8 +756,9 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        /* emit IR to temp file, then use clang to link */
+    /* emit IR to temp file, then use clang to link */
         std::string tmpIR = "/tmp/_perlc_" + std::to_string(getpid()) + ".ll";
+        std::string tmpObj = "/tmp/_perlc_" + std::to_string(getpid()) + ".o";
         std::string rtObj  = "/tmp/_perlc_rt_" + std::to_string(getpid()) + ".o";
 
         cg.writeIR(tmpIR);
@@ -788,22 +789,40 @@ int main(int argc, char **argv) {
                 evalLib = candidate;
             else
                 std::cerr << "Warning: string eval used but libperlc_eval.a not found; "
-                             "eval EXPR will return undef\n";
+                              "eval EXPR will return undef\n";
         }
 
-   std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native"
-                           " -Wno-atomic-alignment";
-        if (debugSymbols) cmd += " -g";
-        cmd += " " + tmpIR + " " + rtSrc;
-        if (!evalLib.empty())
-            cmd += " -rdynamic"   /* export runtime symbols for JIT dlopen */
-                   " -Wl,--whole-archive " + evalLib + " -Wl,--no-whole-archive"
-                   " -L/usr/lib/llvm-18/lib -lLLVM-18 -lstdc++ -lpthread -ldl";
-        cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic 2>&1";
-        if (verbose) std::cerr << "[link] " << cmd << "\n";
+    /* Step 1: compile LLVM IR to object file */
+        std::string compileCmd = "clang++-22 -O" + std::to_string(optLevel) + " -march=native"
+                                " -Wno-atomic-alignment";
+        if (debugSymbols) compileCmd += " -g";
+        compileCmd += " -c " + tmpIR + " -o " + tmpObj + " 2>&1";
+        if (verbose) std::cerr << "[compile] " << compileCmd << "\n";
+        int rc = system(compileCmd.c_str());
+        if (rc != 0) { std::cerr << "LLVM IR compilation failed\n"; unlink(tmpIR.c_str()); return 1; }
 
-        int rc = system(cmd.c_str());
+        /* Step 2: compile C runtime to object file */
+        std::string rtCompileCmd = "clang-22 -O2 -march=native -c " + rtSrc + " -o " + rtObj + " 2>&1";
+        if (verbose) std::cerr << "[compile rt] " << rtCompileCmd << "\n";
+        rc = system(rtCompileCmd.c_str());
+        if (rc != 0) { std::cerr << "C runtime compilation failed\n"; unlink(tmpIR.c_str()); unlink(tmpObj.c_str()); return 1; }
+
+        /* Step 3: link everything together */
+        std::string linkCmd = "clang++-22 -O" + std::to_string(optLevel) + " -march=native"
+                             " -Wno-atomic-alignment";
+        if (debugSymbols) linkCmd += " -g";
+        linkCmd += " " + tmpObj + " " + rtObj;
+        if (!evalLib.empty())
+            linkCmd += " -rdynamic"   /* export runtime symbols for JIT dlopen */
+                       " -Wl,--whole-archive " + evalLib + " -Wl,--no-whole-archive"
+                       " -L/usr/lib/llvm-22/lib -lLLVM-22 -lstdc++ -lpthread -ldl";
+        linkCmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic 2>&1";
+        if (verbose) std::cerr << "[link] " << linkCmd << "\n";
+
+        rc = system(linkCmd.c_str());
         unlink(tmpIR.c_str());
+        unlink(tmpObj.c_str());
+        unlink(rtObj.c_str());
         if (rc != 0) { std::cerr << "Link failed\n"; return 1; }
 
         if (verbose) std::cerr << "Binary written to " << outputFile << "\n";

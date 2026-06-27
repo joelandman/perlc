@@ -1,1 +1,4 @@
 name,perlc_ms,perl_ms,ratio
+fibn,246,556,2.26
+mbs,1616,18100,11.20
+regex_heavy,640,210,0.33

@@ -232,6 +232,7 @@ void CodeGen::declareRuntime() {
     RT("perl_split",    av,   pv, pv);
     /* references */
     RT("perl_alloc_flat_array", pv, i64);
+    RT("perl_alloc_float_array", pv, i64);
     RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
@@ -1934,6 +1935,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
         lastSqrtInput_ = v;  /* Stage 30: remember input so cube opts can use x*sqrt(x) */
         auto *sqrtFn = llvm::Intrinsic::getDeclarationIfExists(mod_.get(),
             llvm::Intrinsic::sqrt, {f64});
+        if (!sqrtFn) return nullptr;
         return builder_.CreateCall(sqrtFn, {v}, "sqrt");
     }
     case NK::AbsFunc: {
@@ -1942,6 +1944,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!v) return nullptr;
         auto *absFn = llvm::Intrinsic::getDeclarationIfExists(mod_.get(),
             llvm::Intrinsic::fabs, {f64});
+        if (!absFn) return nullptr;
         return builder_.CreateCall(absFn, {v}, "fabs");
     }
     case NK::IntFunc: {
@@ -1954,12 +1957,12 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!v) return nullptr;
         /* Truncation toward zero: if v >= 0, floor(v); else ceil(v) */
         auto *i64 = Type::getInt64Ty(ctx_);
-        Value *floored = builder_.CreateCall(
-            llvm::Intrinsic::getDeclarationIfExists(mod_.get(), llvm::Intrinsic::floor, {f64}),
-            {v}, "floor");
-        Value *ceiled = builder_.CreateCall(
-            llvm::Intrinsic::getDeclarationIfExists(mod_.get(), llvm::Intrinsic::ceil, {f64}),
-            {v}, "ceil");
+        auto *floorFn = llvm::Intrinsic::getDeclarationIfExists(mod_.get(), llvm::Intrinsic::floor, {f64});
+        if (!floorFn) return nullptr;
+        Value *floored = builder_.CreateCall(floorFn, {v}, "floor");
+        auto *ceilFn = llvm::Intrinsic::getDeclarationIfExists(mod_.get(), llvm::Intrinsic::ceil, {f64});
+        if (!ceilFn) return nullptr;
+        Value *ceiled = builder_.CreateCall(ceilFn, {v}, "ceil");
         Value *isNeg = builder_.CreateFCmpOLT(v, ConstantFP::get(f64, 0.0), "iscmp");
         Value *truncated = builder_.CreateSelect(isNeg, ceiled, floored, "trunc");
         /* Convert i64 back to double */
@@ -4646,6 +4649,13 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (!baseNm.empty() && baseNm[0] == '$') baseNm = baseNm.substr(1);
                     if (Value *pa = lookupDerefAV(baseNm))
                         cachedAv = builder_.CreateLoad(arrayPtrTy_, pa, baseNm + ".av");
+                }
+                /* 2D ArrowDeref: base is PerlValue* from inner $ref->[$idx], deref to PerlArray* */
+                if (n.left->left->kind == NK::ArrowDeref) {
+                    Value *innerAv = callRT("perl_deref_array", {base});
+                    freeIfOwned(base);
+                    callRT("perl_array_set", {innerAv, idx, rhs});
+                    return rhs;
                 }
                 /* Stage 22: always dispatch flat/norm to avoid perl_deref_array
                    lazy-converting FLAT_ARRAY PVs (keeps all bodies flat throughout). */
