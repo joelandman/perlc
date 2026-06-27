@@ -1,3 +1,5 @@
+use lib "tests/lib";
+use feature "say";
 use MathOps;               # imports 'add' via @EXPORT
 use MathOps qw(subtract);  # imports 'subtract' via @EXPORT_OK (already loaded)
 use MathOps qw(multiply);  # imports 'multiply' via @EXPORT_OK (already loaded)

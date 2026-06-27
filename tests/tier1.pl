@@ -1,3 +1,4 @@
+use feature "say";
 #!/usr/bin/env perl
 use strict;
 use warnings;

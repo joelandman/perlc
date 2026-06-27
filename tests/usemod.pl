@@ -1,3 +1,5 @@
+use lib "tests/lib";
+use feature "say";
 #!/usr/bin/perl
 use strict;
 use warnings;

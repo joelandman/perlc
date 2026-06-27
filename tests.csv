@@ -1,0 +1,44 @@
+hostname,benchmark_test,time_seconds,success,output,accuracy
+hal9k,advanced,.105,yes,6 1,2,3,4,5,6 5 1,2,3,7,8 1,2,3,4,5,6 ab ba aaa Ba AAa0 0 7 CODE 10 caught error ok got: boom done ,N/A
+hal9k,arith,.105,yes,13 7 30 3.33333333333333 1 6 Hello World 10 ,N/A
+hal9k,builtins2,.104,yes,5 3.7 3 -3 4.0 HELLO world Foo bAR 6 -1 4 9 3 A 65 97 255 255 63 10 5,4,3,2,1 olleh 2,4,6,8,10 n1 n5 2,4 4,5 1,2,3,4,5 5,4,3,2,1 apple,banana,cherry cherry,banana,apple -1 0 1 -1 0 1 done ,N/A
+hal9k,builtins,.104,yes,1 4 10 20 6 hello 5 6 2 cdef bcd ef bc one, two, three a-b-c onetwothree 4 a d 3 hello foo 3 local one:two:three foo bar baz ,N/A
+hal9k,closures,.103,yes,1 2 3 1 4 12 14 5 10 2 4 6 ,N/A
+hal9k,completeness,.104,yes,caller pkg: main caller file: ok caller line: ok c0_pkg: main 1,2,3 7,8,9 1,2,3 argv: --foo --bar a=1,b=2 x=10,y=20 a=1,b=2 AUTOLOAD:foo AUTOLOAD:bar pos1: 1 pos2: 4 hello from required module done ,N/A
+hal9k,dbi_sqlite,.103,yes,dbi_connect_method=ok dbi_connect_function=ok dbi_do_create=ok dbi_prepare_insert=ok dbi_execute_insert_1=ok dbi_execute_insert_2=ok dbi_prepare_select=ok dbi_execute_select=ok dbi_fetchrow_arrayref_1,N/A
+hal9k,defaults,.104,yes,Hello, World! Line two No $name interpolation here Hello, Alice! 1 2 3 4 5 hello Hello Perl matched 99 10 ,N/A
+hal9k,destroy,.105,yes,Test 1: ok Test 2: ok Test 3: ok Test 4: ok Test 5: ok ,N/A
+hal9k,eval_string,.105,yes,3 hello ok caught 84 interpolated from eval 15 Hello, world! nested parse error caught runtime caught 14 done ,N/A
+hal9k,features,.105,yes,o hell after warn 3 apple cherry 1,2,3,4,5 1,4,5 2,3 1,10,20,30,4,5 20,40 1,3 hello_env exists file not_dir is_dir no gone 0 256 hello 3 done ,N/A
+hal9k,fibn,.104,yes,0	0 ,N/A
+hal9k,fib,.105,yes,0 1 1 2 3 5 8 13 21 34 ,N/A
+hal9k,fileio,.104,yes,line one line two line three 3 line one line three 4 eof line one answer=42 done ,N/A
+hal9k,fileops,.104,yes,7 7 12 PI MAX 2 10 20 2 a.txt,b.txt b.txt,c.txt done ,N/A
+hal9k,hash,.106,yes,1 2 3 4 10 green exists purple missing green deleted blue red yellow 3 12 ,N/A
+hal9k,hello,.105,yes,Hello, world! Hello again! ,N/A
+hal9k,inherit,.104,yes,Rex says woof Whiskers says meow Dog Cat I am a dog named Rex I am an animal named Whiskers sit, shake, roll over Fido says bark Animal ,N/A
+hal9k,interp,.104,yes,1 2 3 4 5 6 7 8 9 words: world hello 10 20 30 a b c ref2: 1 2 3 42 uc: HELLO count: 5 calc: 7 Hello world, items: 3, list: foo bar baz pi rounded: 3.14 done ,N/A
+hal9k,mbs,18.316,yes, Timing results (seconds): fill array : 0.079004 copy constant : 0.000145 run iterations: 17.863379 get magnitude : 0.081951 (sample abs(z[0,0])=2.000000) ,N/A
+hal9k,misc,.104,yes,rx_x: world rx_x_s: baz rx_ix: ok redo: count=4 redo_fires=1 redo_while: n=3 extra=1 unshift_ref: 1 2 3 4 5 unshift_scalar_ref: 10 20 30 40 unshift_href: 5 6 7 8 9 do_block: 3 do_block_str: hello worl,N/A
+hal9k,modifiers,.104,yes,positive ok 3 0 1 2 3 a b c 5 0 7 1 2 4 ,N/A
+hal9k,nbody,.104,yes, -0.169075164 -0.169075164 ,N/A
+hal9k,nb,.104,yes, -0.169075164 -0.169075164 ,N/A
+hal9k,newfeatures,.104,yes,1 2 3 12 14 scalar sep defined inner undef sep restored errno ok init=1 caller ok done end ok ,N/A
+hal9k,oop,.104,yes,Rex says woof Whiskers says meow Animal Animal Rex I am Rex and I say woof 3 Counter ,N/A
+hal9k,range,.104,yes,1 2 3 4 5 1 2 3 5 1 5 10, 11, 12, 13, 14, 15 5 3 7 0 1-2-3-4 55 ,N/A
+hal9k,refs,.104,yes,42 99 1 3 20 10 30 40 1 3 10 20 ARRAY HASH SCALAR 2 42 ,N/A
+hal9k,regex_g,.104,yes,match match match x 1 y 2 z 3 aa bb cc hello world foo 3 one two three ,N/A
+hal9k,regex_named,.106,yes, is 1 ,N/A
+hal9k,regex,.104,yes,match no xyz icase 2024 03 15 baz bar foo aaxxcc [hello] [world] one two three digits only ,N/A
+hal9k,sprintf,.104,yes,Hello, Alice! You are 30 years old. Pi is approximately 3.1416 1.234568e+04 0.000123 [ right] [left ] [00042] (foo, 99) ff FF 10 item 01: value item 02: value item 03: value 42 3.142 10,N/A
+hal9k,test_do_filename,.104,yes,do_return_value=ok do_loaded_function=ok do_missing_returns_undef=ok do_missing_sets_error=ok do_parse_error_returns_undef=ok do_parse_error_sets_error=ok do_runtime_die_returns_undef=ok do_runtime_di,N/A
+hal9k,test_require_simple,.104,yes,require_loads_named_sub=ok require_repeat_keeps_sub_available=ok require_missing_sets_error=ok test_require_simple_done ,N/A
+hal9k,threads_atomic,1.305,yes,visibility_no_lock=yes visibility_no_lock_ret=1 rmw_atomic_total=160000 rmw_atomic_expected=160000 rmw_atomic_ok=yes lock_increment_total=160000 lock_increment_ok=yes cond_wait_signal=yes cond_broadca,N/A
+hal9k,threads,.105,yes,retval=42 sum=42 tid_ok=yes main_tid=0 squares=1,4,9,16,25 closure=107 thread_saw=99 parent_saw=10 shared_ok=yes isolated_ok=yes lock_ok=yes shared_arr_ok=yes cond_ok=yes shared_hash_ok=yes cond_broad,N/A
+hal9k,tier1,.105,yes,rand ok time ok localtime ok sleep ok sum=15 min=1 max=9 uniq=1,2,3,4 first=4 any=yes all=yes none=yes reduce=5 sort_len=banana,cherry,apple,date sort_desc=4,8,3,5,1 ,N/A
+hal9k,tier2,.104,yes,dot=0 a-b-c amp=world floor=3 ceil=4 fmod=1 blessed=MyClass reftype=HASH lln1=1 lln2= lln3=1 seek_ok=yes tell_ok=yes stat_ok=yes size_ok=yes glob_ok=yes isa=yes isa2=yes isa3=no can=yes done ,N/A
+hal9k,tier3,.104,yes,pid_ok=yes os=linux fileno_ok=yes read_ok=yes truncate_ok=yes each_ok=yes pos_ok=yes pid_consistent=yes tier3_done ,N/A
+hal9k,tr,.103,yes,HELLO world bonono HELLO 10 2 hll wrld abcdef abc bokeper abc*** HelloWorld abc def ghi 2 col1|col2|col3 HELLO WORLD 6 xyyyyy Uryyb, Jbeyq! Hello, World! HELLO WORLD PERL aaabbbccc done ,N/A
+hal9k,usemod,.104,yes,7 42 120 1 300 MathUtils ,N/A
+hal9k,wantarray,.104,yes,1 1 scalar 1 ,N/A
+hal9k,xs_ffi,1.105,yes,clock_gettime_return_zero=ok clock_gettime_sec_positive=ok clock_gettime_nsec_range=ok clock_gettime_realtime_return_zero=ok clock_gettime_realtime_sec_positive=ok clock_gettime_realtime_nsec_range=ok,N/A

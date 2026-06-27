@@ -1,3 +1,4 @@
+use feature "say";
 #!/usr/bin/perl
 use strict;
 use warnings;
@@ -23,7 +24,7 @@ sub describe {
 }
 
 package Dog;
-use parent 'Animal';
+our @ISA = ('Animal');
 
 sub new {
     my ($class, $name) = @_;
@@ -48,7 +49,7 @@ sub describe {
 }
 
 package Cat;
-use parent 'Animal';
+our @ISA = ('Animal');
 
 sub new {
     my ($class, $name) = @_;

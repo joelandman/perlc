@@ -1,3 +1,5 @@
+use feature "say";
+use feature "state";
 #!/usr/bin/perl
 use strict;
 use warnings;

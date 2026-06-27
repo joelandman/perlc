@@ -1,3 +1,4 @@
+use feature "say";
 # if modifier
 say "positive" if 1;
 say "never" if 0;

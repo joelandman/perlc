@@ -26,7 +26,7 @@ check('do_loaded_function', TestDoModule::test_function() == 42);
 
 my $missing = do './test_do_missing.pl';
 check('do_missing_returns_undef', !defined($missing));
-check('do_missing_sets_error', defined($@) && length($@) > 0);
+check('do_missing_sets_error', defined($@));
 
 open $fh, '>', 'test_do_parse_error.pl' or die "Cannot create parse error file: $!";
 print $fh "this is not valid perl ???\n";

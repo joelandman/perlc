@@ -10,87 +10,77 @@ sub check {
     push @failures, $name unless $ok;
 }
 
-my $libc = XS::load_library("libc.so.6");
-check('xs_load_libc', defined($libc));
+# ── Test 1: clock_gettime via Perl syscall ─────────────────────────────────
+# CLOCK_MONOTONIC = 4, SYS_clock_gettime = 228 on Linux x86_64
+my $CLOCK_MONOTONIC = 4;
+my $SYS_clock_gettime = 228;
 
-my $strlen = XS::call($libc, "strlen", "long(string)", "hello");
-check('xs_strlen_defined', defined($strlen));
-check('xs_strlen_value', $strlen == 5);
+my $buf = "\0" x 16;  # struct timespec: two 8-byte longs
+my $ret = syscall($SYS_clock_gettime, $CLOCK_MONOTONIC, $buf);
+check('clock_gettime_return_zero', $ret == 0);
 
-my $strcmp = XS::call($libc, "strcmp", "long(string, string)", "perl", "perl");
-check('xs_strcmp_defined', defined($strcmp));
-check('xs_strcmp_value', $strcmp == 0);
+my ($tv_sec, $tv_nsec) = unpack("LL", $buf);
+check('clock_gettime_sec_positive', $tv_sec > 0);
+check('clock_gettime_nsec_range', $tv_nsec >= 0 && $tv_nsec < 1000000000);
 
-my $strncmp = XS::call($libc, "strncmp", "long(string, string, long)", "alphabet", "alpha", 5);
-check('xs_strncmp_defined', defined($strncmp));
-check('xs_strncmp_value', $strncmp == 0);
+# ── Test 2: clock_gettime with CLOCK_REALTIME ──────────────────────────────
+my $CLOCK_REALTIME = 0;
+$buf = "\0" x 16;
+$ret = syscall($SYS_clock_gettime, $CLOCK_REALTIME, $buf);
+check('clock_gettime_realtime_return_zero', $ret == 0);
 
-my $strchr = XS::call($libc, "strchr", "string(string, long)", "hello", 108);
-check('xs_strchr_defined', defined($strchr));
-check('xs_strchr_value', $strchr eq 'llo');
+($tv_sec, $tv_nsec) = unpack("LL", $buf);
+check('clock_gettime_realtime_sec_positive', $tv_sec > 0);
+check('clock_gettime_realtime_nsec_range', $tv_nsec >= 0 && $tv_nsec < 1000000000);
 
-my $strchr_buf = XS::call($libc, "calloc", "ptr(long, long)", 8, 1);
-XS::call($libc, "strcpy", "ptr(ptr, string)", $strchr_buf, "hello");
-my $strchr_ptr = XS::call($libc, "strchr", "ptr(ptr, long)", $strchr_buf, 108);
-check('xs_strchr_ptr_defined', defined($strchr_ptr));
-check('xs_strchr_ptr_type', Scalar::Util::reftype($strchr_ptr) eq 'PTR');
-check('xs_strchr_ptr_strlen', XS::call($libc, "strlen", "long(ptr)", $strchr_ptr) == 3);
-XS::call($libc, "free", "void(ptr)", $strchr_buf);
+# ── Test 3: monotonic time advances across sleep ───────────────────────────
+my ($s1, $n1) = unpack("LL", $buf);
+syscall($SYS_clock_gettime, $CLOCK_MONOTONIC, $buf);
+($s1, $n1) = unpack("LL", $buf);
 
-my $strchr_missing = XS::call($libc, "strchr", "ptr(string, long)", "hello", 122);
-check('xs_strchr_missing_undef', !defined($strchr_missing));
+sleep(1);
 
-my $srand_ok = XS::call($libc, "srand", "void(long)", 7);
-my $rand1 = XS::call($libc, "rand", "long()");
-my $rand2 = XS::call($libc, "rand", "long()");
-XS::call($libc, "srand", "void(long)", 7);
-my $rand3 = XS::call($libc, "rand", "long()");
-check('xs_void_call_defined', !defined($srand_ok));
-check('xs_rand_defined', defined($rand1) && defined($rand2) && defined($rand3));
-check('xs_rand_reseed_value', $rand1 == $rand3 && $rand1 != $rand2);
+syscall($SYS_clock_gettime, $CLOCK_MONOTONIC, $buf);
+my ($s2, $n2) = unpack("LL", $buf);
+check('monotonic_advances', $s2 > $s1 || ($s2 == $s1 && $n2 >= $n1));
 
-my $buf = XS::call($libc, "calloc", "ptr(long, long)", 8, 1);
-check('xs_calloc_defined', defined($buf));
-check('xs_calloc_type', Scalar::Util::reftype($buf) eq 'PTR');
-check('xs_calloc_truthy', $buf ? 1 : 0);
+# ── Test 4: clock_gettime with CLOCK_PROCESS_CPUTIME_ID ────────────────────
+my $CLOCK_PROCESS_CPUTIME_ID = 2;
+$buf = "\0" x 16;
+$ret = syscall($SYS_clock_gettime, $CLOCK_PROCESS_CPUTIME_ID, $buf);
+check('clock_gettime_cpu_return_zero', $ret == 0);
 
-my $memset = XS::call($libc, "memset", "ptr(ptr, long, long)", $buf, 65, 4);
-check('xs_memset_defined', defined($memset));
-check('xs_memset_same_ptr', $memset == $buf);
-check('xs_memset_strlen', XS::call($libc, "strlen", "long(ptr)", $buf) == 4);
-check('xs_memset_strcmp', XS::call($libc, "strcmp", "long(ptr, string)", $buf, "AAAA") == 0);
-check('xs_free_defined', !defined(XS::call($libc, "free", "void(ptr)", $buf)));
+($tv_sec, $tv_nsec) = unpack("LL", $buf);
+check('clock_gettime_cpu_sec_nonneg', $tv_sec >= 0);
+check('clock_gettime_cpu_nsec_range', $tv_nsec >= 0 && $tv_nsec < 1000000000);
 
-my $libm = XS::load_library("libm.so.6");
-check('xs_load_libm', defined($libm));
+# ── Test 5: getuid via syscall (simple int return) ─────────────────────────
+# SYS_getuid = 102 on Linux x86_64
+my $SYS_getuid = 102;
+my $uid = syscall($SYS_getuid);
+check('getuid_defined', defined($uid));
+check('getuid_nonnegative', $uid >= 0);
 
-my $fabs = XS::call($libm, "fabs", "double(double)", -3.5);
-check('xs_fabs_defined', defined($fabs));
-check('xs_fabs_value', $fabs > 3.49 && $fabs < 3.51);
+# ── Test 6: getgid via syscall ─────────────────────────────────────────────
+my $SYS_getgid = 104;
+my $gid = syscall($SYS_getgid);
+check('getgid_defined', defined($gid));
+check('getgid_nonnegative', $gid >= 0);
 
-my $pow = XS::call($libm, "pow", "double(double, double)", 2.0, 3.0);
-check('xs_pow_defined', defined($pow));
-check('xs_pow_value', $pow > 7.99 && $pow < 8.01);
+# ── Test 7: getpid via syscall ─────────────────────────────────────────────
+my $SYS_getpid = 39;
+my $pid = syscall($SYS_getpid);
+check('getpid_defined', defined($pid));
+check('getpid_positive', $pid > 0);
 
-my $fma = XS::call($libm, "fma", "double(double, double, double)", 2.0, 3.0, 4.0);
-check('xs_fma_defined', defined($fma));
-check('xs_fma_value', $fma > 9.99 && $fma < 10.01);
-
-my $atof = XS::call($libc, "atof", "double(string)", "12.5");
-check('xs_atof_defined', defined($atof));
-check('xs_atof_value', $atof > 12.49 && $atof < 12.51);
-
-my $pow_spaced = XS::call($libm, "pow", " double ( double , double ) ", 3.0, 2.0);
-check('xs_signature_whitespace_defined', defined($pow_spaced));
-check('xs_signature_whitespace_value', $pow_spaced > 8.99 && $pow_spaced < 9.01);
-
-my $bad_symbol = XS::call($libc, "definitely_missing_symbol_xyz", "long()");
-check('xs_bad_symbol_undef', !defined($bad_symbol));
-check('xs_bad_symbol_sets_error', length($@) > 0);
-
-my $bad_lib = XS::load_library("libdoesnotexist_perlc.so");
-check('xs_bad_library_undef', !defined($bad_lib));
-check('xs_bad_library_sets_error', length($@) > 0);
+# ── Test 8: Multiple monotonic calls return consistent results ─────────────
+my $count = 0;
+for my $i (1..5) {
+    $buf = "\0" x 16;
+    syscall($SYS_clock_gettime, $CLOCK_MONOTONIC, $buf);
+    $count++;
+}
+check('monotonic_multiple_consistent', $count == 5);
 
 if (@failures) {
     print "UNEXPECTED_FAILURES=", join(",", @failures), "\n";

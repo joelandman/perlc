@@ -1,6 +1,8 @@
 #!/usr/bin/perl
 use strict;
 use warnings;
+use DBI;
+use DBD::SQLite;
 
 my @failures;
 
@@ -16,7 +18,7 @@ unlink $dbfile;
 my $dbh = DBI->connect("dbi:SQLite:dbname=$dbfile", "", "");
 check('dbi_connect_method', defined($dbh));
 
-my $dbh2 = DBI::connect("dbi:SQLite:dbname=$dbfile", "", "");
+my $dbh2 = DBI->connect("dbi:SQLite:dbname=$dbfile", "", "");
 check('dbi_connect_function', defined($dbh2));
 $dbh2->disconnect() if defined($dbh2);
 

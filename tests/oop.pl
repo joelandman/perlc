@@ -1,3 +1,4 @@
+use feature "say";
 package Animal;
 
 sub new {

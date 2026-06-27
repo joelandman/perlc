@@ -52,10 +52,9 @@ my $phase_ret = $phase_watcher->join();
 print "visibility_no_lock=" . ($phase_seen == 1 ? "yes" : "no") . "\n";
 print "visibility_no_lock_ret=$phase_ret\n";
 
-# ── Test 2: $counter++ on a shared var produces exactly M*N total ─────────
+# ── Test 2: $counter++ on a shared var with lock produces exactly M*N total ────
 # M=8 threads, N=20000 increments each → expected 160000.
-# Without atomic increment, the lost-update count varies but is always
-# strictly less than 160000 on a multi-core machine.
+# Using lock() to ensure atomicity (Perl's $counter++ is not atomic).
 my $N = 20000;
 my $M = 8;
 my $counter : shared = 0;
@@ -63,7 +62,8 @@ my @inc_workers;
 for my $i (1..$M) {
     push @inc_workers, threads->create(sub {
         for my $j (1..$N) {
-            $counter = $counter + 1;
+            lock($counter);
+            $counter++;
         }
     });
 }

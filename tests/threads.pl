@@ -1,3 +1,4 @@
+use feature "say";
 #!/usr/bin/perl
 use strict;
 use warnings;
@@ -149,14 +150,16 @@ print "cond_broadcast_ok=" . ($bcast_count == 3 ? "yes" : "no") . "\n";  # yes
 # the shared counter is the sum of all increments performed by
 # all threads (race-free, since perl_atomic_inc is a single CAS
 # on the int/float payload per the lock-free CAS work).
+# shared var must be declared before the sub that captures it
+my $counter_named : shared = 0;
+my $per_thread_named = 100;
+my $n_threads_named = 5;
+
 sub worker_named {
     my $times = $_[0];
     for (1..$times) { $counter_named++; }
     return 1;  # tag the thread as completed
 }
-my $counter_named : shared = 0;
-my $per_thread_named = 100;
-my $n_threads_named = 5;
 my @worker_thrs;
 for my $i (1..$n_threads_named) {
     push @worker_thrs, threads->create(\&worker_named, $per_thread_named);
