@@ -4650,13 +4650,35 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (Value *pa = lookupDerefAV(baseNm))
                         cachedAv = builder_.CreateLoad(arrayPtrTy_, pa, baseNm + ".av");
                 }
-                /* 2D ArrowDeref: base is PerlValue* from inner $ref->[$idx], deref to PerlArray* */
-                if (n.left->left->kind == NK::ArrowDeref) {
-                    Value *innerAv = callRT("perl_deref_array", {base});
-                    freeIfOwned(base);
-                    callRT("perl_array_set", {innerAv, idx, rhs});
-                    return rhs;
-                }
+                 /* 2D ArrowDeref: $ref->[$idx][$j] = val — dispatch flat/norm */
+                 if (n.left->left->kind == NK::ArrowDeref) {
+                     auto *i8T2d  = Type::getInt8Ty(ctx_);
+                     auto *i32T2d = Type::getInt32Ty(ctx_);
+                     auto *f64T2d = Type::getDoubleTy(ctx_);
+                     Value *tag32d    = builder_.CreateLoad(i32T2d, base, "tag32d");
+                     setTBAA(tag32d, tbaaPvTagTag_);
+                     Value *isFlat32d = builder_.CreateICmpEQ(tag32d,
+                                          ConstantInt::get(i32T2d, 10), "isflat32d");
+                     auto *curFn2d   = builder_.GetInsertBlock()->getParent();
+                     auto *fBB2d     = BasicBlock::Create(ctx_, "w2d.f", curFn2d);
+                     auto *nBB2d     = BasicBlock::Create(ctx_, "w2d.n", curFn2d);
+                     auto *mBB2d     = BasicBlock::Create(ctx_, "w2d.m", curFn2d);
+                     builder_.CreateCondBr(isFlat32d, fBB2d, nBB2d);
+                     builder_.SetInsertPoint(fBB2d);
+                     Value *rhsF2d    = callRT("perl_to_float", {rhs});
+                     Value *pvalOff2d = builder_.CreateConstInBoundsGEP1_64(i8T2d, base, 8);
+                     Value *dblPtr2d  = builder_.CreateLoad(perlPtrTy_, pvalOff2d);
+                     builder_.CreateStore(rhsF2d, builder_.CreateGEP(f64T2d, dblPtr2d, idx));
+                     freeIfOwned(base);
+                     builder_.CreateBr(mBB2d);
+                     builder_.SetInsertPoint(nBB2d);
+                     Value *av2d = callRT("perl_deref_array", {base});
+                     freeIfOwned(base);
+                     callRT("perl_array_set", {av2d, idx, rhs});
+                     builder_.CreateBr(mBB2d);
+                     builder_.SetInsertPoint(mBB2d);
+                     return rhs;
+                 }
                 /* Stage 22: always dispatch flat/norm to avoid perl_deref_array
                    lazy-converting FLAT_ARRAY PVs (keeps all bodies flat throughout). */
                 auto *i8T32  = Type::getInt8Ty(ctx_);
@@ -5243,14 +5265,60 @@ Value *CodeGen::emitExpr(const Node &n) {
                         }
 
                         /* Stage 16: normal PV* row cache */
-                        if (Value *ra = lookupRowAV(outerNm18, idxNm)) {
-                            av = builder_.CreateLoad(perlPtrTy_, ra,
-                                                     outerNm18 + "." + idxNm + ".ra");
-                        } else {
-                            Value *innerRef = callRT("perl_array_get_ref",
-                                                     {outerArr, emitIdx(*n.left->left->right)});
-                            av = callRT("perl_deref_array", {innerRef});
-                        }
+                         if (Value *ra = lookupRowAV(outerNm18, idxNm)) {
+                             av = builder_.CreateLoad(perlPtrTy_, ra,
+                                                      outerNm18 + "." + idxNm + ".ra");
+                         } else {
+                             /* Row cache miss: dispatch FLAT_ARRAY/REF_ARRAY
+                                for inner array — get inner PV*, check tag, branch */
+                             Value *innerRef = callRT("perl_array_get_ref",
+                                                      {outerArr, emitIdx(*n.left->left->right)});
+                             auto *i8Tvi  = Type::getInt8Ty(ctx_);
+                             auto *i32Tvi = Type::getInt32Ty(ctx_);
+                             auto *f64Tvi = Type::getDoubleTy(ctx_);
+                             Value *innerTag = builder_.CreateLoad(i32Tvi, innerRef, "inner.tagvi");
+                             setTBAA(innerTag, tbaaPvTagTag_);
+                             Value *isInnerFlat = builder_.CreateICmpEQ(innerTag,
+                                                  ConstantInt::get(i32Tvi, 10), "inner.isflatvi");
+                             auto *curFnvi = builder_.GetInsertBlock()->getParent();
+                             auto *fBBvi   = BasicBlock::Create(ctx_, "vi.f", curFnvi);
+                             auto *nBBvi   = BasicBlock::Create(ctx_, "vi.n", curFnvi);
+                             auto *mBBvi   = BasicBlock::Create(ctx_, "vi.m", curFnvi);
+                             builder_.CreateCondBr(isInnerFlat, fBBvi, nBBvi);
+                             builder_.SetInsertPoint(fBBvi);
+                             Value *rhsFvi = emitExprF64(*n.right);
+                             Value *pvalOffvi = builder_.CreateConstInBoundsGEP1_64(i8Tvi, innerRef, 8);
+                             Value *dblPtrvi  = builder_.CreateLoad(perlPtrTy_, pvalOffvi);
+                             Value *innerIdx  = emitIdx(*n.left->right);
+                             Value *epvi      = builder_.CreateGEP(f64Tvi, dblPtrvi, innerIdx);
+                             auto applyF64 = [&](Value *lv, Value *rv) -> Value * {
+                                 if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
+                                 if (n.sval == "-") return builder_.CreateFSub(lv, rv);
+                                 if (n.sval == "*") return builder_.CreateFMul(lv, rv);
+                                 if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
+                                 return nullptr;
+                             };
+                             Value *lhsFvi = builder_.CreateLoad(f64Tvi, epvi);
+                             setTBAA(lhsFvi, tbaaFlatDoubleTag_);
+                             Value *resultvi = applyF64(lhsFvi, rhsFvi);
+                             if (resultvi) {
+                                 auto *stvi = builder_.CreateStore(resultvi, epvi);
+                                 stvi->setMetadata(LLVMContext::MD_tbaa, tbaaFlatDoubleTag_);
+                             }
+                             builder_.CreateBr(mBBvi);
+                             builder_.SetInsertPoint(nBBvi);
+                             av = callRT("perl_deref_array", {innerRef});
+                             freeIfOwned(innerRef);
+                             lhsVal = callRT("perl_array_get_ref", {av, innerIdx});
+                             rhsVal = emitExpr(*n.right);
+                             result = applyOp(lhsVal, rhsVal);
+                             freeIfOwned(lhsVal);
+                             freeIfOwned(rhsVal);
+                             callRT("perl_array_set", {av, innerIdx, result});
+                             builder_.CreateBr(mBBvi);
+                             builder_.SetInsertPoint(mBBvi);
+                             return result;
+                         }
                     } else {
                         Value *innerRef = callRT("perl_array_get_ref",
                                                  {outerArr, emitIdx(*n.left->left->right)});
