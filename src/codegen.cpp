@@ -1932,7 +1932,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
         Value *v = emitExprF64(*n.left);
         if (!v) return nullptr;
         lastSqrtInput_ = v;  /* Stage 30: remember input so cube opts can use x*sqrt(x) */
-        auto *sqrtFn = llvm::Intrinsic::getDeclaration(mod_.get(),
+        auto *sqrtFn = llvm::Intrinsic::getDeclarationIfExists(mod_.get(),
             llvm::Intrinsic::sqrt, {f64});
         return builder_.CreateCall(sqrtFn, {v}, "sqrt");
     }
@@ -1940,7 +1940,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!canEmitF64(*n.left)) return nullptr;
         Value *v = emitExprF64(*n.left);
         if (!v) return nullptr;
-        auto *absFn = llvm::Intrinsic::getDeclaration(mod_.get(),
+        auto *absFn = llvm::Intrinsic::getDeclarationIfExists(mod_.get(),
             llvm::Intrinsic::fabs, {f64});
         return builder_.CreateCall(absFn, {v}, "fabs");
     }
@@ -1955,10 +1955,10 @@ Value *CodeGen::emitExprF64(const Node &n) {
         /* Truncation toward zero: if v >= 0, floor(v); else ceil(v) */
         auto *i64 = Type::getInt64Ty(ctx_);
         Value *floored = builder_.CreateCall(
-            llvm::Intrinsic::getDeclaration(mod_.get(), llvm::Intrinsic::floor, {f64}),
+            llvm::Intrinsic::getDeclarationIfExists(mod_.get(), llvm::Intrinsic::floor, {f64}),
             {v}, "floor");
         Value *ceiled = builder_.CreateCall(
-            llvm::Intrinsic::getDeclaration(mod_.get(), llvm::Intrinsic::ceil, {f64}),
+            llvm::Intrinsic::getDeclarationIfExists(mod_.get(), llvm::Intrinsic::ceil, {f64}),
             {v}, "ceil");
         Value *isNeg = builder_.CreateFCmpOLT(v, ConstantFP::get(f64, 0.0), "iscmp");
         Value *truncated = builder_.CreateSelect(isNeg, ceiled, floored, "trunc");

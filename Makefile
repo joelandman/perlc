@@ -1,5 +1,5 @@
-CXX      := g++-15
-LLVM_CFG := llvm-config-21
+CXX      := clang++-22
+LLVM_CFG := llvm-config-22
 LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 # strip -fno-exceptions so we can use C++ exceptions in our code
 # -mcx16: enable cmpxchg16b for the lock-free 16-byte CAS on shared
