@@ -1,4 +1,5 @@
 # if modifier
+use 5.010;
 say "positive" if 1;
 say "never" if 0;
 

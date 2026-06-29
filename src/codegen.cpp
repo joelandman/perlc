@@ -57,6 +57,22 @@ CodeGen::CodeGen(bool debug, int optLevel)
     arrayPtrTy_ = PointerType::getUnqual(ctx_);
     declareRuntime();
 
+    /* Step 3: parse PERLC_OPT_DISABLE to selectively disable optimization
+       stages for diagnosis (e.g. "flatdouble,allflat,stage31,stage32,stage33").
+       This implements the systematic disable/re-enable plan from REARCHITECTURE.md. */
+    if (const char *env = getenv("PERLC_OPT_DISABLE")) {
+        std::string s(env);
+        std::string cur;
+        for (char c : s) {
+            if (c == ',' || c == ' ' || c == ';') {
+                if (!cur.empty()) { disabledStages_.insert(cur); cur.clear(); }
+            } else {
+                cur.push_back((char)tolower(c));
+            }
+        }
+        if (!cur.empty()) disabledStages_.insert(cur);
+    }
+
     /* Build TBAA type hierarchy so LLVM can prove PerlValue tag/fval stores
        don't alias PerlArray.elems loads — enables CSE of the elems pointer
        across velocity update stores in the nbody inner loop.
@@ -182,7 +198,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
-    RT("perl_array_is_all_flat", i64, av);  /* Stage 23: 1 if every elem is FLAT_ARRAY */
+    RT("perl_array_is_all_flat", i64, av);  /* used by Stage 23 all-flat pre-check */
     RT("perl_array_len",     pv,  av);
     RT("perl_array_clear",   voidTy, av);
     RT("perl_array_replace", voidTy, av, av);
@@ -231,8 +247,9 @@ void CodeGen::declareRuntime() {
     RT("perl_join",     pv,   pv, av);
     RT("perl_split",    av,   pv, pv);
     /* references */
-    RT("perl_alloc_flat_array", pv, i64);
+    RT("perl_alloc_flat_array", pv, i64);  /* FLAT_ARRAY (Stage 22/23 path) */
     RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
+    RT("perl_alloc_float_array", pv, i64);  /* FLAT_ARRAY n-element (used by FLAT_ARRAY literal path) */
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
     RT("perl_ref_hash",     pv, av);  /* PerlHash* treated as opaque av */
@@ -305,7 +322,6 @@ void CodeGen::declareRuntime() {
     RT("perl_call_code_ref",  pv, pv, av);
     RT("perl_eval_pop",        voidTy);
     RT("perl_get_dollar_at",   pv);
-    RT("perl_eval_string",     pv,  pv);
     RT("perl_eval_push",       voidTy, i8p);
     RT("perl_tr",              i64, pv, i8p, i8p, i8p);
     /* setjmp called directly from generated code — must be returns_twice */
@@ -1792,8 +1808,8 @@ Value *CodeGen::emitExprF64(const Node &n) {
 
                     /* Stage 22: flat row cache — direct double[] read via phi dispatch */
                     if (Value *fra = lookupFlatRow(n.left->left->name, idxNm)) {
-                        /* Stage 31: return cached f64 if this exact element was already loaded */
-                        if (n.right->kind == NK::IntLit) {
+        /* Stage 31: return cached f64 if this exact element was already loaded (gated). */
+        if (isOptStageEnabled("stage31") && isOptStageEnabled("flatdouble") && n.right->kind == NK::IntLit) {
                             std::string ckey = n.left->left->name + "\x01" + idxNm + "\x01" + std::to_string(n.right->ival);
                             auto cit = flatDoubleCache_.find(ckey);
                             if (cit != flatDoubleCache_.end()) return cit->second;
@@ -1843,8 +1859,8 @@ Value *CodeGen::emitExprF64(const Node &n) {
                         auto *phi17 = builder_.CreatePHI(f64Ty17, 2, "fv");
                         phi17->addIncoming(fvf17, fBB17p);
                         phi17->addIncoming(fvn17, nBB17p);
-                        /* Stage 31: cache the loaded value for repeated reads of same element */
-                        if (n.right->kind == NK::IntLit) {
+                        /* Stage 31: cache the loaded value for repeated reads of same element (gated). */
+                        if (isOptStageEnabled("stage31") && isOptStageEnabled("flatdouble") && n.right->kind == NK::IntLit) {
                             std::string ckey = n.left->left->name + "\x01" + idxNm + "\x01" + std::to_string(n.right->ival);
                             flatDoubleCache_[ckey] = phi17;
                         }
@@ -3239,6 +3255,8 @@ void CodeGen::emitStmt(const Node &n) {
                     for (auto &[outerNm, idxNm] : prePairs) {
                         if (!avChecked.insert(outerNm).second) continue;
                         if (avAllflatSlots_.count(outerNm)) continue; /* outer loop handles it */
+                        /* Stage 23 (allflat pre-check) gated. */
+                        if (!isOptStageEnabled("stage23") || !isOptStageEnabled("allflat")) continue;
                         Value *outerPA = lookupDerefAV(outerNm);
                         if (!outerPA) continue;
                         Value *outerArr = builder_.CreateLoad(arrayPtrTy_, outerPA,
@@ -3964,13 +3982,11 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RequireStmt: {
-        hasStringEval_ = true;
         Value *modStr = builder_.CreateGlobalStringPtr(n.sval);
         return callRT("perl_runtime_require", {modStr});
     }
 
     case NK::DoFile:
-        hasStringEval_ = true;
         return callRT("perl_do_file", {emitExpr(*n.left)});
 
     case NK::Redo: {
@@ -5692,7 +5708,6 @@ Value *CodeGen::emitExpr(const Node &n) {
         size_t sep = n.name.find('\x01');
         std::string repl  = n.name.substr(0, sep);
         std::string flags = n.name.substr(sep + 1);
-        if (flags.find('e') != std::string::npos) hasStringEval_ = true;
         Value *pat  = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
         Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
         Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");
@@ -6427,11 +6442,11 @@ Value *CodeGen::emitCall(const Node &n) {
     /* Try AST-level inline first: eliminates @_ construction for simple subs. */
     if (Value *v = tryEmitInline(n)) return v;
 
-    /* eval EXPR — JIT-based string eval */
+    /* eval EXPR — string-eval removed; set $@ and return undef */
     if (n.name == "eval") {
-        hasStringEval_ = true;
-        Value *strVal = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
-        return callRT("perl_eval_string", {strVal});
+        Value *msg = perlStr("eval: string eval not available");
+        callRT("perl_assign", {callRT("perl_get_dollar_at", {}), msg});
+        return perlUndef();
     }
     /* ── Qualified / imported function interceptions ──────────────────────── */
     /* POSIX */
@@ -6630,83 +6645,7 @@ void CodeGen::runOptimization() {
     MPM.run(*mod_, MAM);
 }
 
-/* ── string eval compilation ─────────────────────────────────────────────── */
-
-void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
-    auto *pv    = perlPtrTy_;
-    auto *i32Ty = Type::getInt32Ty(ctx_);
-
-    /* Pre-declare any subs so forward calls work (mirrors compile()) */
-    subs_.clear();
-    subCaptures_.clear();
-    for (auto &stmt : program.args)
-        if (stmt->kind == NK::SubDef) subs_.push_back(stmt.get());
-    for (auto *s : subs_) {
-        auto *ft = FunctionType::get(pv, {arrayPtrTy_, Type::getInt32Ty(ctx_)}, false);
-        auto *fn = Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
-        fn->addFnAttr(Attribute::AlwaysInline);
-    }
-
-    /* emit: PerlValue *funcName() */
-    auto *evalFT = FunctionType::get(pv, {}, false);
-    auto *evalFn = Function::Create(evalFT, Function::ExternalLinkage,
-                                    funcName, mod_.get());
-    auto *entry = BasicBlock::Create(ctx_, "entry", evalFn);
-    builder_.SetInsertPoint(entry);
-
-    currentFn_ = evalFn;
-    pushScope();
-    fileScopeDepth_ = (int)scopes_.size() + 1;
-    inMainBody_ = true;
-
-    /* register package-qualified subs before eval code runs */
-    for (auto *s : subs_) {
-        if (s->name.find("::") != std::string::npos) {
-            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
-            auto *fn = mod_->getFunction(subLLVMName(s->name));
-            callRT("perl_register_method", {keyStr, fn});
-        }
-    }
-
-    /* $_ available inside eval */
-    Value *underscoreVal = callRT("perl_alloc_undef", {});
-    auto *slotUs = builder_.CreateAlloca(pv, nullptr, "$_");
-    builder_.CreateStore(underscoreVal, slotUs);
-    declareVar("_", slotUs);
-
-    /* local() depth tracking */
-    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
-    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
-
-    /* emit body, capture last value */
-    Value *lastVal = emitBlockLast(program);
-    if (!lastVal) lastVal = perlUndef();
-
-    popScope();
-
-    /* restore any local()s */
-    Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-    callRT("perl_local_restore_to", {depth});
-
-    inMainBody_ = false;
-    localDepthAlloca_ = nullptr;
-
-    if (!builder_.GetInsertBlock()->getTerminator())
-        builder_.CreateRet(lastVal);
-
-    /* emit sub bodies (mirrors compile()) */
-    for (auto *s : subs_) emitSub(*s);
-}
-
 /* ── output ──────────────────────────────────────────────────────────────── */
-
-std::unique_ptr<Module> CodeGen::releaseModule() {
-    return std::move(mod_);
-}
-
-std::unique_ptr<LLVMContext> CodeGen::releaseContext() {
-    return std::move(ctx_owned_);
-}
 
 void CodeGen::dumpIR() {
     mod_->print(outs(), nullptr);

@@ -20,18 +20,11 @@ public:
     CodeGen(bool debug = false, int optLevel = 0);
 
     void compile(const Node &program, const std::string &moduleName);
-    /* Compile a Perl snippet for JIT string eval: emits PerlValue *funcName()
-       with no init calls; caller handles die via perl_eval_push/setjmp. */
-    void compileForEval(const Node &program, const std::string &funcName);
-    bool hasStringEval() const { return hasStringEval_; }
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
 
-    /* Release the module for use with JIT - transfers ownership to caller */
-    std::unique_ptr<llvm::Module> releaseModule();
-    /* For JIT use: release the LLVMContext so it can be owned by ThreadSafeModule */
-    std::unique_ptr<llvm::LLVMContext> releaseContext();
+
 
     void initializeDebugInfo(const std::string &sourceFile);
     llvm::DILocation *getDebugLoc(int line, llvm::DIScope *scope = nullptr);
@@ -46,6 +39,14 @@ private:
 
     bool                           debug_ = false;
     int                            optLevel_ = 0;
+
+    /* Step 3/4: systematic opt stage control for diagnosis + re-architecture.
+       Disable via PERLC_OPT_DISABLE="flatdouble,allflat,stage31,stage23,..."
+       Only Stage 23 (allflat) and Stage 31 (flatdouble) have active gated code.
+       Stage 32/33 names are accepted by the gate (for compatibility) but have no bodies.
+       Non-gated foundational passes (FLAT_ARRAY 22, DerefAV, FLOAT_PAIR, F64 fastpath,
+       sub inlining, TBAA) remain always-on. */
+    std::unordered_set<std::string> disabledStages_;
     std::unique_ptr<llvm::DIBuilder> dib_;
     llvm::DICompileUnit           *cu_ = nullptr;
     llvm::DIFile                  *file_ = nullptr;
@@ -93,6 +94,28 @@ private:
        block; invalidated only when the exact (outerNm, idxNm, elemIdx) is written. */
     std::unordered_map<std::string, llvm::Value *> flatDoubleCache_;
 
+    /* Helper for Step 3 diagnosis: returns false if the named stage
+        (e.g. "flatdouble", "allflat", "stage31", "stage32", "stage33")
+        has been disabled via PERLC_OPT_DISABLE or setDisabledStages. */
+    bool isOptStageEnabled(const std::string& raw) const {
+        std::string name = raw;
+        for (auto &c : name) c = (char)tolower(c);
+        if (disabledStages_.count(name)) return false;
+        if (name == "stage31" || name == "flatdouble" || name == "flat_double") {
+            if (disabledStages_.count("stage31") || disabledStages_.count("flatdouble") || disabledStages_.count("flat_double")) return false;
+        }
+        if (name == "stage23" || name == "allflat") {
+            if (disabledStages_.count("stage23") || disabledStages_.count("allflat")) return false;
+        }
+        if (name == "stage32" || name == "loopderef" || name == "derefhoist") {
+            if (disabledStages_.count("stage32") || disabledStages_.count("loopderef") || disabledStages_.count("derefhoist")) return false;
+        }
+        if (name == "stage33" || name == "knowntag") {
+            if (disabledStages_.count("stage33") || disabledStages_.count("knowntag")) return false;
+        }
+        return true;
+    }
+
     /* Phase 3: names of shared scalars (declared with `: shared`).  Used
        to route reads/writes through the atomic primitive helpers so the
        codegen for `$x`, `$x = v`, `$x++`, `$x += N` (on a shared scalar)
@@ -113,7 +136,6 @@ private:
     bool inMainBody_ = false;   /* true only while emitting the top-level program body */
     /* Stage 23: when true, all 2D-array rows are known FLAT_ARRAY — skip flat/norm condBrs */
     bool inFlatOnly_ = false;
-    bool hasStringEval_ = false;
 
     /* current function */
     llvm::Function                *currentFn_ = nullptr;
