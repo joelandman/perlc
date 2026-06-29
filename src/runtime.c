@@ -576,11 +576,11 @@ static char *perl_read_runtime_file(const char *path) {
 
 static PerlValue *perl_eval_loaded_code(const char *code) {
     if (!code) return perl_alloc_undef();
-    if (!perl_eval_string_fn) {
-        perl_set_dollar_at_cstr("eval: string eval not available (recompile with eval support)");
-        return perl_alloc_undef();
-    }
-    return perl_eval_string_fn(code);
+    /* runtime source eval (require/do of dynamic files) not available after JIT removal.
+       Static compile-time require/use via driver inlining still works.
+       Set $@ and return undef (consistent with string eval removal). */
+    perl_set_dollar_at_cstr("eval: runtime source loading not available (JIT removed)");
+    return perl_alloc_undef();
 }
 
 /* ── runtime require ─────────────────────────────────────────────────────── */
@@ -703,24 +703,14 @@ void perl_untie(PerlValue *var_pv) {
     perl_dispatch_method(obj, "UNTIE", NULL);
 }
 
-/* ── string eval ─────────────────────────────────────────────────────────── */
-PerlEvalStringFn perl_eval_string_fn = NULL;
-
+/* ── string eval (disabled — no JIT) ────────────────────────────────────── */
 PerlValue *perl_eval_string(PerlValue *code_pv) {
-    /* clear $@ before eval */
     PerlValue empty = { .tag = PERL_STRING, .sval = "" };
     perl_assign(&s_dollar_at, &empty);
-
-    if (!perl_eval_string_fn) {
-        PerlValue msg = { .tag = PERL_STRING,
-            .sval = "eval: string eval not available (recompile with eval support)" };
-        perl_assign(&s_dollar_at, &msg);
-        return perl_alloc_undef();
-    }
-
-    char *code = perl_to_string_dup(code_pv);
-    PerlValue *result = perl_eval_string_fn(code);
-    return result ? result : perl_alloc_undef();
+    PerlValue msg = { .tag = PERL_STRING,
+        .sval = "eval: string eval not available (JIT removed)" };
+    perl_assign(&s_dollar_at, &msg);
+    return perl_alloc_undef();
 }
 
 /* ── allocation ──────────────────────────────────────────────────────────── */
@@ -4388,20 +4378,10 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
             }
         }
         expanded[exp_len] = '\0';
-        /* /e: evaluate expanded string as Perl expression */
+        /* /e: evaluate expanded string as Perl expression — disabled (no JIT) */
         const char *rep_text = expanded;
-        PerlValue *eval_result = NULL;
-        if (eval_repl && perl_eval_string_fn) {
-            eval_result = perl_eval_string_fn(expanded);
-            char *ev = perl_to_string_dup(eval_result);
-            size_t evlen = strlen(ev);
-            ENSURE(evlen); memcpy(out + out_len, ev, evlen); out_len += evlen;
-            free(ev);
-            perl_free(eval_result);
-        } else {
-            size_t replen = exp_len;
-            ENSURE(replen); memcpy(out + out_len, rep_text, replen); out_len += replen;
-        }
+        size_t replen = exp_len;
+        ENSURE(replen); memcpy(out + out_len, rep_text, replen); out_len += replen;
         free(expanded);
 #undef EXPENSURE
         count++;

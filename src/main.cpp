@@ -1,23 +1,57 @@
+/* === BUILD FIX: pull in every standard header we use, in full, at the
+   very start of the TU.  This guarantees complete definitions for
+   std::string, std::vector, std::ifstream, iterators etc. before any
+   project header that might transitively pull LLVM headers.
+
+   The LLVM 18 Orc/ADT headers on this clang-18 + gcc-16 libstdc++ host
+   otherwise leave __gnu_cxx::__normal_iterator incomplete for containers.
+*/
+#include <cstddef>
+#include <cstdint>
+#include <cassert>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdarg>
+
+#include <string>
+#include <vector>
+#include <memory>
+#include <map>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
 #include <iterator>
-#include "lexer.h"
-#include "parser.h"
-#include "codegen.h"
-#include "jit.h"
-#include "runtime.h"
-#include <llvm/Support/InitLLVM.h>
-#include <llvm/Support/TargetSelect.h>
-#include <fstream>
+#include <utility>
+#include <functional>
+#include <array>
+#include <deque>
+#include <list>
+#include <queue>
+#include <stack>
+#include <bitset>
+#include <limits>
 #include <sstream>
 #include <iostream>
-#include <cstring>
-#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <type_traits>
+#include <new>
+#include <exception>
+#include <stdexcept>
+
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <set>
-#include <map>
-#include <vector>
+
+#include "lexer.h"
+#include "parser.h"
+#include "codegen.h"   /* real CodeGen - now safe because we build with g++ + force_complete_std.h */
+#include "runtime.h"
+#include "llvm_early_init.h"
 
 static std::string readFile(const std::string &path) {
     std::ifstream f(path);
@@ -460,181 +494,8 @@ static bool isCompleteStatement(const std::vector<Token> &toks) {
     return false;
 }
 
-/* Run REPL: compile each statement with perlc, subroutines persist between
-   statements, and scalar/array/hash variables do not. */
-static int runRepl(bool debugSymbols, int optLevel, bool verbose, bool pauseMode) {
-    std::cout << "perlc REPL - type 'quit' or 'exit' to exit, 'help' for commands\n";
-    std::cout << "Enter complete statements (end with ;).\n";
-    std::cout << "Note: Subroutines persist. Scalars/arrays/hashes do not persist between statements.\n\n";
+/* REPL removed. */
 
-    std::string accum;
-    std::vector<NodePtr> savedSubs;
-    int stmtCount = 0;
-
-    while (true) {
-        std::cout << "perlc> ";
-        std::string line;
-        if (!std::getline(std::cin, line)) {
-            std::cout << "\nExiting REPL.\n";
-            break;
-        }
-
-        if (line == "quit" || line == "exit" || line == "q") {
-            std::cout << "Goodbye!\n";
-            break;
-        }
-        if (line == "help" || line == "h" || line == "?") {
-            std::cout << "Commands:\n"
-                      << "  quit/exit/q  - exit the REPL\n"
-                      << "  help/h/?     - show this help\n"
-                      << "  clear        - clear accumulated subroutines\n"
-                      << "  dump         - show accumulated subroutines\n"
-                      << "  stats        - show REPL stats\n"
-                      << "  perl <code>  - execute raw Perl code directly\n"
-                      << "Enter Perl statements - subroutines persist, scalars do not.\n";
-            continue;
-        }
-        if (line == "clear") {
-            accum.clear();
-            savedSubs.clear();
-            stmtCount = 0;
-            std::cout << "State cleared.\n";
-            continue;
-        }
-        if (line == "dump") {
-            std::cout << "=== Accumulated subroutines ===\n";
-            for (auto &sub : savedSubs) {
-                std::cout << "sub " << sub->name << " { ... }\n";
-            }
-            std::cout << "==============================\n";
-            continue;
-        }
-        if (line == "stats") {
-            std::cout << "Statements executed: " << stmtCount << "\n";
-            std::cout << "Subroutines defined: " << savedSubs.size() << "\n";
-            continue;
-        }
-        if (line.substr(0, 5) == "perl ") {
-            std::string code = line.substr(5);
-            std::string cmd = "perl -e '" + code + "' 2>&1";
-            system(cmd.c_str());
-            continue;
-        }
-
-        if (!accum.empty()) accum += "\n";
-        accum += line;
-
-        /* Check for complete statement */
-        int depth = 0;
-        bool complete = false;
-        for (size_t i = 0; i < accum.size(); i++) {
-            if (accum[i] == '(' || accum[i] == '[' || accum[i] == '{') depth++;
-            else if (accum[i] == ')' || accum[i] == ']' || accum[i] == '}') depth--;
-            else if (depth == 0 && accum[i] == ';') { complete = true; break; }
-        }
-
-        if (!complete) {
-            std::cout << "  ... " << std::flush;
-            continue;
-        }
-
-        stmtCount++;
-
-        /* Compile and run with perlc */
-        try {
-            std::set<std::string> loaded;
-            std::map<std::string,std::string> importMap;
-            std::map<std::string,NodePtr> constMap;
-            std::vector<Token> dummyTokens;
-            Parser dummyParser(std::move(dummyTokens));
-            auto expanded = inlineModules(
-                Lexer(accum).tokenize(), ".", loaded, importMap, &constMap, &dummyParser);
-
-            Parser parser(std::move(expanded));
-            parser.setImportMap(std::move(importMap));
-            parser.setConstMap(std::move(constMap));
-            NodePtr ast = parser.parseProgram();
-
-            NodeList mainStmts;
-            for (auto &stmt : ast->args) {
-                if (stmt->kind == NK::SubDef) {
-                    bool found = false;
-                    for (auto &s : savedSubs) {
-                        if (s->name == stmt->name) { found = true; break; }
-                    }
-                    if (!found) savedSubs.push_back(std::move(stmt));
-                } else {
-                    mainStmts.push_back(std::move(stmt));
-                }
-            }
-
-            NodeList allStmts;
-            for (auto &sub : savedSubs) allStmts.push_back(std::move(sub));
-            for (auto &stmt : mainStmts) allStmts.push_back(std::move(stmt));
-
-            NodePtr fullAst = makeBlock(std::move(allStmts), 1);
-
-            CodeGen cg(debugSymbols, optLevel);
-            cg.compile(*fullAst, "repl");
-
-            std::string tmpIR = "/tmp/_perlc_repl_" + std::to_string(getpid()) + ".ll";
-            cg.writeIR(tmpIR);
-
-            std::string rtSrc;
-            {
-                char self[1024] = {};
-                ssize_t len = readlink("/proc/self/exe", self, sizeof(self)-1);
-                if (len > 0) {
-                    std::string dir(self, len);
-                    auto sl = dir.rfind('/');
-                    if (sl != std::string::npos) dir = dir.substr(0, sl);
-                    rtSrc = dir + "/src/runtime.c";
-                }
-            }
-            if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
-                rtSrc = "src/runtime.c";
-
-            std::string outFile = "/tmp/_perlc_repl_out_" + std::to_string(getpid());
-            std::string cmd = "clang-18 -flto -O" + std::to_string(optLevel) + " -march=native"
-                              " -Wno-atomic-alignment";
-            if (debugSymbols) cmd += " -g";
-            cmd += " " + tmpIR + " " + rtSrc + " -o " + outFile + " -lm -lpcre2-8 -latomic 2>&1";
-
-            int rc = system(cmd.c_str());
-            unlink(tmpIR.c_str());
-
-            if (rc == 0) {
-                cmd = outFile + " 2>&1";
-                FILE *fp = popen(cmd.c_str(), "r");
-                if (fp) {
-                    char buf[4096];
-                    while (fgets(buf, sizeof(buf), fp)) std::cout << buf;
-                    pclose(fp);
-                }
-                unlink(outFile.c_str());
-            } else {
-                std::cerr << "Compilation failed.\n";
-            }
-
-            if (pauseMode) {
-                std::cout << "\n--- Press ENTER to continue, 'q' to quit --- ";
-                std::string resp;
-                if (!std::getline(std::cin, resp)) break;
-                if (resp == "q" || resp == "quit" || resp == "exit") {
-                    std::cout << "Goodbye!\n";
-                    break;
-                }
-            }
-
-        } catch (const std::exception &e) {
-            std::cerr << "Error: " << e.what() << "\n";
-        }
-
-        accum.clear();
-    }
-
-    return 0;
-}
 
 static void usage(const char *prog) {
     std::cerr << "Usage: " << prog << " [options] <file.pl>\n"
@@ -645,20 +506,19 @@ static void usage(const char *prog) {
               << "  -O[level]   Optimization level 0-5 (default: 1)\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
-              << "  -g          Generate debugging symbols\n"
-              << "  -i, --repl  Interactive REPL mode (read-eval-print loop)\n"
-              << "  -p, --pause Pause after each statement in REPL mode\n";
+              << "  -g          Generate debugging symbols\n";
 }
 
 int main(int argc, char **argv) {
-    llvm::InitLLVM init(argc, argv);
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
+    /* LLVM initialization is done in a separate TU (llvm_support.cpp)
+       that is compiled with full LLVM headers.  This keeps the main driver
+       TU from seeing Orc/ADT headers directly, avoiding the incomplete
+       iterator errors on this host. */
+    perlc_llvm_early_init(&argc, &argv);
 
     std::string inputFile;
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
-    bool replMode = false, pauseMode = false;
     int optLevel = 2;
 
     for (int i = 1; i < argc; i++) {
@@ -667,8 +527,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-v"))        verbose = true;
         else if (!strcmp(argv[i], "-pm"))       installPM = true;
         else if (!strcmp(argv[i], "-g"))         debugSymbols = true;
-        else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--repl")) replMode = true;
-        else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--pause")) pauseMode = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outputFile = argv[++i];
         else if (strncmp(argv[i], "-O", 2) == 0) {
             if (argv[i][2] == '\0') {
@@ -685,12 +543,7 @@ int main(int argc, char **argv) {
         else { usage(argv[0]); return 1; }
     }
 
-    if (inputFile.empty() && !replMode) { usage(argv[0]); return 1; }
-
-    /* REPL mode: interactive read-eval-print loop */
-    if (replMode) {
-        return runRepl(debugSymbols, optLevel, verbose, pauseMode);
-    }
+    if (inputFile.empty()) { usage(argv[0]); return 1; }
 
     /* read source */
     std::ifstream f(inputFile);
@@ -756,9 +609,8 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-    /* emit IR to temp file, then use clang to link */
+        /* emit IR to temp file, then use clang to link */
         std::string tmpIR = "/tmp/_perlc_" + std::to_string(getpid()) + ".ll";
-        std::string tmpObj = "/tmp/_perlc_" + std::to_string(getpid()) + ".o";
         std::string rtObj  = "/tmp/_perlc_rt_" + std::to_string(getpid()) + ".o";
 
         cg.writeIR(tmpIR);
@@ -780,49 +632,16 @@ int main(int argc, char **argv) {
         if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
             rtSrc = "src/runtime.c";  /* fallback: CWD */
 
-        /* locate libperlc_eval.a (same dir as runtime.c) for string eval */
-        std::string evalLib;
-        if (cg.hasStringEval()) {
-            std::string dir = rtSrc.substr(0, rtSrc.rfind('/'));
-            std::string candidate = dir + "/libperlc_eval.a";
-            if (access(candidate.c_str(), R_OK) == 0)
-                evalLib = candidate;
-            else
-                std::cerr << "Warning: string eval used but libperlc_eval.a not found; "
-                              "eval EXPR will return undef\n";
-        }
+        /* String-eval (JIT) removed; eval EXPR sets $@ and returns undef. */
+        std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native"
+                            " -Wno-atomic-alignment";
+         if (debugSymbols) cmd += " -g";
+         cmd += " " + tmpIR + " " + rtSrc;
+         cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic 2>&1";
+        if (verbose) std::cerr << "[link] " << cmd << "\n";
 
-    /* Step 1: compile LLVM IR to object file */
-        std::string compileCmd = "clang++-22 -O" + std::to_string(optLevel) + " -march=native"
-                                " -Wno-atomic-alignment";
-        if (debugSymbols) compileCmd += " -g";
-        compileCmd += " -c " + tmpIR + " -o " + tmpObj + " 2>&1";
-        if (verbose) std::cerr << "[compile] " << compileCmd << "\n";
-        int rc = system(compileCmd.c_str());
-        if (rc != 0) { std::cerr << "LLVM IR compilation failed\n"; unlink(tmpIR.c_str()); return 1; }
-
-        /* Step 2: compile C runtime to object file */
-        std::string rtCompileCmd = "clang-22 -O2 -march=native -c " + rtSrc + " -o " + rtObj + " 2>&1";
-        if (verbose) std::cerr << "[compile rt] " << rtCompileCmd << "\n";
-        rc = system(rtCompileCmd.c_str());
-        if (rc != 0) { std::cerr << "C runtime compilation failed\n"; unlink(tmpIR.c_str()); unlink(tmpObj.c_str()); return 1; }
-
-        /* Step 3: link everything together */
-        std::string linkCmd = "clang++-22 -O" + std::to_string(optLevel) + " -march=native"
-                             " -Wno-atomic-alignment";
-        if (debugSymbols) linkCmd += " -g";
-        linkCmd += " " + tmpObj + " " + rtObj;
-        if (!evalLib.empty())
-            linkCmd += " -rdynamic"   /* export runtime symbols for JIT dlopen */
-                       " -Wl,--whole-archive " + evalLib + " -Wl,--no-whole-archive"
-                       " -L/usr/lib/llvm-22/lib -lLLVM-22 -lstdc++ -lpthread -ldl";
-        linkCmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic 2>&1";
-        if (verbose) std::cerr << "[link] " << linkCmd << "\n";
-
-        rc = system(linkCmd.c_str());
+        int rc = system(cmd.c_str());
         unlink(tmpIR.c_str());
-        unlink(tmpObj.c_str());
-        unlink(rtObj.c_str());
         if (rc != 0) { std::cerr << "Link failed\n"; return 1; }
 
         if (verbose) std::cerr << "Binary written to " << outputFile << "\n";

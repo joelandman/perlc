@@ -10,7 +10,6 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <set>
 #include <vector>
 
 /* A scope frame maps variable names → alloca (PerlValue*) */
@@ -21,18 +20,11 @@ public:
     CodeGen(bool debug = false, int optLevel = 0);
 
     void compile(const Node &program, const std::string &moduleName);
-    /* Compile a Perl snippet for JIT string eval: emits PerlValue *funcName()
-       with no init calls; caller handles die via perl_eval_push/setjmp. */
-    void compileForEval(const Node &program, const std::string &funcName);
-    bool hasStringEval() const { return hasStringEval_; }
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
 
-    /* Release the module for use with JIT - transfers ownership to caller */
-    std::unique_ptr<llvm::Module> releaseModule();
-    /* For JIT use: release the LLVMContext so it can be owned by ThreadSafeModule */
-    std::unique_ptr<llvm::LLVMContext> releaseContext();
+
 
     void initializeDebugInfo(const std::string &sourceFile);
     llvm::DILocation *getDebugLoc(int line, llvm::DIScope *scope = nullptr);
@@ -47,6 +39,14 @@ private:
 
     bool                           debug_ = false;
     int                            optLevel_ = 0;
+
+    /* Step 3/4: systematic opt stage control for diagnosis + re-architecture.
+       Disable via PERLC_OPT_DISABLE="flatdouble,allflat,stage31,stage23,..."
+       Only Stage 23 (allflat) and Stage 31 (flatdouble) have active gated code.
+       Stage 32/33 names are accepted by the gate (for compatibility) but have no bodies.
+       Non-gated foundational passes (FLAT_ARRAY 22, DerefAV, FLOAT_PAIR, F64 fastpath,
+       sub inlining, TBAA) remain always-on. */
+    std::unordered_set<std::string> disabledStages_;
     std::unique_ptr<llvm::DIBuilder> dib_;
     llvm::DICompileUnit           *cu_ = nullptr;
     llvm::DIFile                  *file_ = nullptr;
@@ -94,39 +94,27 @@ private:
        block; invalidated only when the exact (outerNm, idxNm, elemIdx) is written. */
     std::unordered_map<std::string, llvm::Value *> flatDoubleCache_;
 
-    /* Stage 32: loop-invariant PV slab — undef PVs and deref results created
-       inside loops are tracked here instead of pvScopes_.  popScope() skips
-       freeing them; they're freed once after the loop exits via
-       freeLoopInvariantPVs().  This lets LLVM's LICM hoist the alloc_undef
-       out of the loop (no free blocks it) and eliminates per-iteration frees.
-       Stacked per-loop for nested loops. */
-    std::vector<std::vector<llvm::Value *>> loopInvariantPVs_;
-
-    /* Stage 32: per-loop cache for hoisted perl_deref_array calls.
-       Key = ScalarVar name (without $), Value = PerlArray* alloca holding
-       the cached result.  When we see perl_deref_array($x) inside a loop
-       and $x is loop-invariant, we emit the call before the loop and
-       load from this cache inside the loop.  Stacked per-loop for nesting. */
-    std::vector<std::unordered_map<std::string, llvm::Value *>> loopDerefCache_;
-
-  /* Stage 33: known PV tag types per scope.  Tracks when a variable is
-        known to have a specific PerlTag (e.g., FLOAT_PAIR=13, FLAT_ARRAY=10).
-        Used to eliminate runtime tag dispatch in emitExprF64 ArrowDeref.
-        Stacked per-scope for nesting. */
-    std::vector<std::unordered_map<std::string, int>> knownTagTypes_;
-
-    /* Stage 33: known element types for arrays.  Tracks when a PerlArray*
-        (identified by its alloca name or global variable name) is known to
-        contain elements of a specific tag type (e.g., all elements are
-        FLOAT_PAIR=13).  Used to eliminate tag dispatch when loading array
-        elements via ArrowDeref.  Stacked per-scope for nesting. */
-    std::vector<std::unordered_map<std::string, int>> arrayElemTypes_;
-
-    /* Stage 33: module-level known element types for function arguments.
-        Maps function argument index (0, 1, 2, ...) to known element tag type.
-        Populated when a sub is called with arrays known to contain specific types.
-        Used to propagate element types across subroutine boundaries. */
-    std::unordered_map<int, int> funcArgElemTypes_;
+    /* Helper for Step 3 diagnosis: returns false if the named stage
+        (e.g. "flatdouble", "allflat", "stage31", "stage32", "stage33")
+        has been disabled via PERLC_OPT_DISABLE or setDisabledStages. */
+    bool isOptStageEnabled(const std::string& raw) const {
+        std::string name = raw;
+        for (auto &c : name) c = (char)tolower(c);
+        if (disabledStages_.count(name)) return false;
+        if (name == "stage31" || name == "flatdouble" || name == "flat_double") {
+            if (disabledStages_.count("stage31") || disabledStages_.count("flatdouble") || disabledStages_.count("flat_double")) return false;
+        }
+        if (name == "stage23" || name == "allflat") {
+            if (disabledStages_.count("stage23") || disabledStages_.count("allflat")) return false;
+        }
+        if (name == "stage32" || name == "loopderef" || name == "derefhoist") {
+            if (disabledStages_.count("stage32") || disabledStages_.count("loopderef") || disabledStages_.count("derefhoist")) return false;
+        }
+        if (name == "stage33" || name == "knowntag") {
+            if (disabledStages_.count("stage33") || disabledStages_.count("knowntag")) return false;
+        }
+        return true;
+    }
 
     /* Phase 3: names of shared scalars (declared with `: shared`).  Used
        to route reads/writes through the atomic primitive helpers so the
@@ -148,7 +136,6 @@ private:
     bool inMainBody_ = false;   /* true only while emitting the top-level program body */
     /* Stage 23: when true, all 2D-array rows are known FLAT_ARRAY — skip flat/norm condBrs */
     bool inFlatOnly_ = false;
-    bool hasStringEval_ = false;
 
     /* current function */
     llvm::Function                *currentFn_ = nullptr;
@@ -250,35 +237,6 @@ private:
     llvm::Value *boxI64(llvm::Value *iv);
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons, else nullptr */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
-
-    /* Stage 32: loop-invariant PV management */
-    void pushLoopInvariantTracking();
-    void popLoopInvariantTracking();
-    void freeLoopInvariantPVs();
-    void trackLoopInvariantPV(llvm::Value *pv);
-    /* Stage 32: deref hoisting */
-    void pushDerefCache();
-    void popDerefCache();
-    llvm::Value *lookupLoopDerefCache(const std::string &varName);
-    void declareLoopDerefCache(const std::string &varName, llvm::Value *cachedPtr);
-    void emitHoistedDerefs(const Node &loopBody,
-                           const std::set<std::string> &derefTargets);
-    /* Stage 32: emit perl_deref_array with cache check */
-    llvm::Value *emitDerefArray(llvm::Value *ref, const std::string *cachedVarName = nullptr);
-
-    /* Stage 33: known tag type tracking */
-    void pushKnownTypes();
-    void popKnownTypes();
-    void setKnownTagType(const std::string &varName, int tag);
-    int lookupKnownTagType(const std::string &varName);
-    /* Stage 33: array element type tracking */
-    void pushArrayElemTypes();
-    void popArrayElemTypes();
-    void setArrayElemType(const std::string &arrName, int elemTag);
-    int lookupArrayElemType(const std::string &arrName);
-    /* Stage 33: function argument element type tracking */
-    void setFuncArgElemType(int argIdx, int elemTag);
-    int lookupFuncArgElemType(int argIdx);
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);

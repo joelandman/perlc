@@ -24,5 +24,3 @@ NodePtr Node::clone() const {
     n->params = params;
     return n;
 }
-
-NodePtr nodeClone(const Node &n) { return n.clone(); }

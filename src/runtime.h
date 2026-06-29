@@ -571,12 +571,12 @@ PerlValue *perl_dbi_error(PerlValue *dbh);
 /* ── program cleanup (free shared-mutex side-table, named-captures hash, etc.) */
 void perl_cleanup(void);
 
-/* ── string eval hook ────────────────────────────────────────────────────── */
-/* Set by eval_jit.cpp (linked only when program uses eval EXPR).
-   NULL → perl_eval_string sets $@ and returns undef. */
-typedef PerlValue *(*PerlEvalStringFn)(const char *code);
-extern PerlEvalStringFn perl_eval_string_fn;
-PerlValue *perl_eval_string(PerlValue *code_pv);  /* called from JIT'd code */
+/* ── string eval removed (no JIT) ────────────────────────────────────────── */
+/* perl_eval_string sets $@ and returns undef. No runtime compilation. */
+PerlValue *perl_eval_string(PerlValue *code_pv);
+
+/* Note: runtime require/do of dynamic files now also set $@ + return undef.
+   Compile-time 'use' and static 'require' are still inlined by the driver. */
 
 #ifdef __cplusplus
 }

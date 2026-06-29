@@ -24,33 +24,7 @@ make clean
 ./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
 ./perlc program.pl -g -o output         # compile with debugging symbols (Perl source lines in gdb)
 ./perlc -pm program.pl                  # install missing modules then compile
-./perlc -i                              # interactive REPL mode
-./perlc -i -p                           # REPL with pause after each statement
 ```
-
-### REPL Mode (`-i` / `--repl`)
-
-The compiler provides an interactive read-eval-print loop for interactive Perl development:
-
-```bash
-./perlc -i
-```
-
-**Features:**
-- Reads complete Perl statements from stdin (terminated with `;`)
-- Accumulates multi-line statements (continues input until `;` at depth 0)
-- **Subroutines persist** between statements (accumulated in AST and recompiled together)
-- Commands: `quit`, `exit`, `q` (exit), `help`, `h`, `?` (help), `clear` (clear subs), `dump` (show subs), `stats` (show stats)
-- Use `perl <code>` to execute raw Perl directly (bypasses perlc)
-
-**Pause Mode (`-p` / `--pause`):**
-Pauses after each statement in REPL mode for debugging:
-
-```bash
-./perlc -i -p
-```
-
-Press ENTER to continue, or 'q' to quit.
 
 ## Implemented Features
 
@@ -153,7 +127,7 @@ Press ENTER to continue, or 'q' to quit.
 - `exists $h{a}{b}` chained subscript without arrow: use `$h{a}->{b}` instead
 - `or`/`and`/`not` precedence in `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0`); wrap in parens if needed
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
-- REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
+- string `eval` (EXPR form): not available (removed with JIT); `eval { BLOCK }` still works for exceptions
 - XS is an MVP FFI-style interface, not full Perl XS bootstrap/module compatibility
 - DBI support is currently the SQLite subset exercised by the contract tests
 
@@ -164,7 +138,7 @@ Press ENTER to continue, or 'q' to quit.
 ### Runtime Loading
 - Runtime `require "path.pm"` support
 - `do "path.pl"` support with return value propagation and `$@` on load/parse/runtime failure
-- Shared file-loading path used by `require`, `do FILE`, and string `eval`
+- Runtime `require`/`do FILE` of dynamic files now stubbed (set $@, return undef) after JIT removal; compile-time `use` and static inlining still supported
 
 ### XS / FFI Interface
 - `XS::load_library("libname")` loads and caches shared libraries with `dlopen`

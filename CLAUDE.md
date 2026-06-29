@@ -121,7 +121,7 @@ All tests in `tests/` pass:
 - Threads: `threads.pl` (create/join/tid/self, closure capture, thread isolation, threads::shared scalars/arrays/hashes, lock/cond_wait/cond_signal/cond_broadcast, **named-sub closure capture of shared scalars**)
 - Thread atomicity: `threads_atomic.pl` (Phase-1 contract for the new model — visibility-without-lock, RMW atomicity, cond_wait/signal, cond_broadcast, lock auto-release, plain-var isolation, **`our $x : shared` scalar/list/cross-package forms**; see `THREADS_SHARED_ATOMIC.md`)
 - Object lifecycle: `destroy.pl` (DESTROY on scope exit, undef assignment, overwrite, loop, data access in destructor)
-- String eval (JIT): `eval_string.pl`
+- String eval (EXPR): stubbed (sets $@, returns undef); `eval_string.pl` updated to test the stub; `eval { BLOCK }` still works via eval_exception.pl
 - Completeness: `completeness.pl` (caller(), local @arr/local %hash, AUTOLOAD, pos() write, runtime require)
 
 ## Known Limitations
@@ -184,7 +184,7 @@ TSan verification: `tests/threads_atomic.pl`, `tests/threads.pl`, `tests/destroy
 - Regex modifier `x` (extended/whitespace-ignoring): not supported
 - `exists $h{a}{b}` chained hash subscript without arrow (use `$h{a}->{b}` instead)
 - Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification
-- REPL: scalar/array/hash variables do not persist between statements (subroutines do persist)
+- string `eval` (EXPR form): not available (removed with JIT); `eval { BLOCK }` still works for exceptions; REPL removed entirely
 - XS is an MVP FFI-style interface, not full Perl XS bootstrap/module compatibility
 - DBI support is currently the SQLite subset exercised by the contract tests
 
