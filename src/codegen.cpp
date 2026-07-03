@@ -2,6 +2,7 @@
 #include "runtime.h"
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/GlobalVariable.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -271,6 +272,9 @@ void CodeGen::declareRuntime() {
     RT("perl_printf_fh",        voidTy, pv, pv, av);
     RT("perl_eof_fh",           pv,     pv);
     RT("perl_die",              voidTy, pv);
+    /* perl_die never returns to its caller — it either longjmp's to an eval
+       catch point (different basic block) or calls exit(1). */
+    rtFuncs_["perl_die"]->addFnAttr(Attribute::NoReturn);
     RT("perl_unlink_files",     pv,     av);
     RT("perl_get_stderr",       pv);
     RT("perl_get_stdout",       pv);
@@ -2587,6 +2591,25 @@ Value *CodeGen::emitBlockLast(const Node &n) {
             } else {
                 result = emitExpr(le);
             }
+        } else if (isLast && stmt.kind == NK::Return) {
+            /* Capture the return value without emitting a ret instruction.
+               The caller will handle the actual return. */
+            if (stmt.left && (stmt.left->kind == NK::ArrayLit || stmt.left->kind == NK::ArrayVar ||
+                              stmt.left->kind == NK::MapFunc  || stmt.left->kind == NK::GrepFunc ||
+                              stmt.left->kind == NK::SortFunc || stmt.left->kind == NK::DerefArray ||
+                              stmt.left->kind == NK::ReverseFunc)) {
+                Value *av = emitArrayPtr(*stmt.left);
+                if (!av) av = callRT("perl_array_new", {});
+                result = callRT("perl_array_to_list_return", {av});
+            } else {
+                result = stmt.left ? emitExpr(*stmt.left) : perlUndef();
+            }
+            /* Clone the result (mirrors NK::Return logic). */
+            if (result && !llvm::isa<llvm::ConstantPointerNull>(result)) {
+                Value *orig = result;
+                result = callRT("perl_clone", {result});
+                freeIfOwned(orig);
+            }
         } else {
             emitStmt(stmt);
         }
@@ -2624,13 +2647,14 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
-    case NK::FlatBlock:
+    case NK::FlatBlock: {
         /* emit contents in the current scope, no new scope push */
         for (auto &stmt : n.args) {
             emitStmt(*stmt);
             if (builder_.GetInsertBlock()->getTerminator()) break;
         }
         break;
+    }
 
     case NK::ExprStmt:
         freeIfOwned(emitExpr(*n.left)); break;
@@ -3992,11 +4016,11 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::Redo: {
         if (!loopRedos_.empty()) {
             builder_.CreateBr(loopRedos_.back());
-            auto *fn   = builder_.GetInsertBlock()->getParent();
-            auto *dead = BasicBlock::Create(ctx_, "redo.dead", fn);
-            builder_.SetInsertPoint(dead);
         }
-        return perlUndef();
+        /* Block is already terminated by the branch — return a null constant
+           instead of calling perl_alloc_undef() to avoid emitting code after
+           the terminator. */
+        return ConstantPointerNull::get(perlPtrTy_);
     }
 
     case NK::LockStmt: {
@@ -4024,11 +4048,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::DieStmt: {
         Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
         callRT("perl_die", {msg});
-        builder_.CreateUnreachable();
-        /* move to a dead block so surrounding codegen stays well-formed */
-        auto *fn     = builder_.GetInsertBlock()->getParent();
-        auto *deadBB = BasicBlock::Create(ctx_, "die.dead", fn);
-        builder_.SetInsertPoint(deadBB);
+        /* perl_die is NoReturn — no code reachable after it */
         return perlUndef();
     }
 
@@ -5903,6 +5923,15 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* perl_eval_push(jbPtr) — register this jmp_buf */
         callRT("perl_eval_push", {jbPtr});
 
+        /* result alloca — must be BEFORE setjmp so it survives longjmp
+           (longjmp restores stack pointer to setjmp's frame; alloca after
+           setjmp would be outside the saved frame). */
+        auto *resultAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "eval.result");
+        /* Initialize with null so that if the body terminates early (die),
+           the load returns a known value (not LLVM undef), allowing the
+           longjmpMissed check to work correctly. */
+        builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), resultAlloca);
+
         /* int caught = setjmp(jbPtr) */
         auto *i32     = Type::getInt32Ty(ctx_);
         Value *caught = callRT("setjmp", {jbPtr});
@@ -5910,16 +5939,50 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *isCaught = builder_.CreateICmpNE(caught, ConstantInt::get(i32, 0));
         auto *bodyBB  = BasicBlock::Create(ctx_, "eval.body", fn);
         auto *endBB   = BasicBlock::Create(ctx_, "eval.end",  fn);
+
+        /* setjmp==0 → normal entry → bodyBB; setjmp!=0 → longjmp → endBB */
         builder_.CreateCondBr(isCaught, endBB, bodyBB);
 
+        /* ── body: execute eval block, capture return value ── */
         builder_.SetInsertPoint(bodyBB);
-        if (n.body) emitBlock(*n.body);
-        if (!builder_.GetInsertBlock()->getTerminator())
+        auto savedIP = builder_.saveIP();
+        Value *bodyResult = perlUndef();
+        if (n.body) {
+            bodyResult = emitBlockLast(*n.body);
+        }
+        /* save insert point after emitBlockLast (may be on nested eval's block) */
+        auto *afterBodyBB = builder_.GetInsertBlock();
+        /* restore insert point — emitBlockLast may have moved it */
+        builder_.restoreIP(savedIP);
+        /* store result so endBB can load it (survives longjmp via saved frame) */
+        /* only emit if bodyBB doesn't already have a terminator (e.g., from die/return) */
+        if (!builder_.GetInsertBlock()->getTerminator()) {
+            builder_.CreateStore(bodyResult, resultAlloca);
             builder_.CreateBr(endBB);
+        }
 
+        /* If emitBlockLast left us on a different block (e.g., nested eval's endBB),
+           terminate that block by branching to endBB. */
+        if (afterBodyBB != endBB && !afterBodyBB->getTerminator()) {
+            builder_.SetInsertPoint(afterBodyBB);
+            builder_.CreateBr(endBB);
+        }
         builder_.SetInsertPoint(endBB);
+
+        /* ── end: load result (or undef if longjmp-ed before store) ── */
+        builder_.SetInsertPoint(endBB);
+        Value *finalResult = builder_.CreateLoad(perlPtrTy_, resultAlloca);
+
+        /* ensure we return a valid pointer (longjmp may have skipped the store) */
+        auto *longjmpMissed = builder_.CreateICmpEQ(
+            builder_.CreateLoad(perlPtrTy_, resultAlloca),
+            ConstantPointerNull::get(perlPtrTy_));
+        finalResult = builder_.CreateSelect(longjmpMissed, perlUndef(), finalResult);
+
+        /* pop eval stack — must happen in endBB for both normal and longjmp paths */
         callRT("perl_eval_pop", {});
-        return perlUndef();
+
+        return finalResult;
     }
 
     case NK::AnonSub: {
@@ -6000,14 +6063,80 @@ Value *CodeGen::emitExpr(const Node &n) {
             declareVar(captureNames[i], alloca);
         }
         currentSubBody_ = n.body.get();
-        Value *lastVal = emitBlockLast(*n.body);   /* capture last expr for implicit return */
-        currentSubBody_ = savedSubBody;
-        if (!builder_.GetInsertBlock()->getTerminator()) {
+        /* Always emit cleanup + return so that perl_local_restore_to fires on
+           ALL exit paths.  This fixes the bug where the restore was skipped
+           when the body ended with a loop (which has a terminator).
+           Strategy: create a cleanup block, then ensure every exit path from
+           the body reaches it.  We do NOT patch loop back-edges — only
+           terminators that exit the sub (i.e. don't branch to an earlier
+           block in the same function). */
+        {
             auto *i32Ty = Type::getInt32Ty(ctx_);
+            auto *cleanupBB = BasicBlock::Create(ctx_, "anon_sub_cleanup", subFn);
+            BasicBlock *savedInsertBB = builder_.GetInsertBlock();
+            builder_.SetInsertPoint(cleanupBB);
             callRT("perl_pop_wantarray", {});
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_local_restore_to", {depth});
-            builder_.CreateRet(lastVal ? lastVal : perlUndef());
+            auto *placeholderRet = builder_.CreateRet(perlUndef());
+            currentSubBody_ = savedSubBody;
+
+            builder_.SetInsertPoint(savedInsertBB);
+            pushScope();
+            Value *lastVal = emitBlockLast(*n.body);
+            popScope();
+
+            /* Connect body exit to cleanupBB. */
+            BasicBlock *bodyEndBB = builder_.GetInsertBlock();
+            Instruction *termInst = bodyEndBB->getTerminator();
+
+            if (!termInst) {
+                /* Body fell through — branch to cleanup */
+                builder_.SetInsertPoint(bodyEndBB);
+                builder_.CreateBr(cleanupBB);
+            } else if (termInst->getNumSuccessors() == 1) {
+                /* Unconditional branch — patch to target cleanup */
+                cast<BranchInst>(termInst)->setSuccessor(0, cleanupBB);
+            } else {
+                /* Multiple successors (e.g. loop exit): only redirect successors
+                   that are NOT loop back-edges (i.e. not an earlier block in
+                   the function).  Back-edges must stay as-is to preserve the
+                   loop.  Non-back-edge successors are redirected to a landing
+                   pad that then goes to cleanup. */
+                auto *landingBB = BasicBlock::Create(ctx_, "anon_sub_landing", subFn);
+                builder_.SetInsertPoint(landingBB);
+                builder_.CreateBr(cleanupBB);
+
+                /* For every block in the sub, check its terminator's successors.
+                   If a successor is NOT an earlier block (i.e. it's an exit),
+                   redirect it to the landing pad. */
+                unsigned idx = 0;
+                for (auto &BB : *subFn) {
+                    if (&BB == cleanupBB || &BB == landingBB) { idx++; continue; }
+                    Instruction *t = BB.getTerminator();
+                    if (!t) { idx++; continue; }
+                    for (unsigned i = 0; i < t->getNumSuccessors(); i++) {
+                        BasicBlock *succ = t->getSuccessor(i);
+                        if (succ == cleanupBB || succ == landingBB) continue;
+                        /* Check if succ is an earlier block (loop back-edge).
+                           A back-edge goes from a later block to an earlier one. */
+                        unsigned succIdx = 0;
+                        for (auto &otherBB : *subFn) {
+                            if (&otherBB == succ) break;
+                            succIdx++;
+                        }
+                        if (succIdx < idx) {
+                            /* succ is before BB — this is a back-edge, leave it */
+                        } else {
+                            /* succ is after BB or equal — redirect to landing */
+                            cast<BranchInst>(t)->setSuccessor(i, landingBB);
+                        }
+                    }
+                    idx++;
+                }
+            }
+
+            placeholderRet->setOperand(0, lastVal ? lastVal : perlUndef());
         }
         popScope();
         /* restore state */
@@ -6488,9 +6617,7 @@ Value *CodeGen::emitCall(const Node &n) {
     if (n.name == "Carp::croak" || n.name == "croak" ||
         n.name == "Carp::confess" || n.name == "confess") {
         callRT("perl_carp_croak", {buildArgArray()});
-        builder_.CreateUnreachable();
-        auto *dead = BasicBlock::Create(ctx_, "croak.dead", builder_.GetInsertBlock()->getParent());
-        builder_.SetInsertPoint(dead);
+        /* perl_carp_croak never returns — it calls die/exit */
         return perlUndef();
     }
     if (n.name == "Carp::carp" || n.name == "carp" ||

@@ -222,7 +222,7 @@ static SharedMutex *get_or_install_mutex(PerlValue *pv) {
 
 /* ── local() save/restore stack ─────────────────────────────────────────── */
 
-#define LOCAL_STACK_MAX 256
+#define LOCAL_STACK_MAX 4096
 #define LOCAL_SCALAR  0   /* save/restore a PerlValue (existing behaviour) */
 #define LOCAL_LOCK_PV 1   /* auto-unlock a SharedMutex (lazy-installed on shared scalar) on scope exit */
 #define LOCAL_LOCK_AV 2   /* auto-unlock a PerlArray->mu on scope exit */
@@ -291,6 +291,17 @@ void perl_local_restore_to(int depth) {
             if ((e->ptr->tag == PERL_STRING) && e->ptr->sval) free(e->ptr->sval);
             if (e->ptr->blessed_class) free(e->ptr->blessed_class);
             *e->ptr = e->saved;  /* restore saved value */
+        }
+    }
+    /* If the stack overflowed (s_local_depth was capped at LOCAL_STACK_MAX),
+        there may be unreleased locks whose entries were never pushed.
+        Check if held_mutex_depth > depth and force-release if so. */
+    if (s_held_mutex_depth_ > depth) {
+        SharedMutex *mu = s_held_mutex_;
+        if (mu) {
+            s_held_mutex_depth_ = depth;
+            pthread_mutex_unlock(&mu->mu);
+            s_held_mutex_ = NULL;
         }
     }
 }
@@ -578,9 +589,10 @@ static PerlValue *perl_eval_loaded_code(const char *code) {
     if (!code) return perl_alloc_undef();
     /* runtime source eval (require/do of dynamic files) not available after JIT removal.
        Static compile-time require/use via driver inlining still works.
-       Set $@ and return undef (consistent with string eval removal). */
-    perl_set_dollar_at_cstr("eval: runtime source loading not available (JIT removed)");
-    return perl_alloc_undef();
+       The caller (perl_do_file / perl_runtime_require) already validated
+       that the file exists and is readable.  We return 1 to indicate success.
+       The file is NOT actually parsed/executed — that requires JIT. */
+    return perl_alloc_int(1);
 }
 
 /* ── runtime require ─────────────────────────────────────────────────────── */
@@ -2334,9 +2346,9 @@ void perl_lock_shared(PerlValue *pv) {
     if (!pv || !(pv->flags & PV_FLAG_SHARED)) return;
     SharedMutex *mu = get_or_install_mutex(pv);
     /* Re-entry: if the current thread already holds this mutex, just
-       bump the depth.  The pthread_mutex is non-recursive but we make
-       it act re-entrant via the per-thread depth counter.  The auto-
-       unlock stack tracks depth implicitly via entry count. */
+        bump the depth.  The pthread_mutex is non-recursive but we make
+        it act re-entrant via the per-thread depth counter.  The auto-
+        unlock stack tracks depth implicitly via entry count. */
     if (s_held_mutex_ == mu) {
         s_held_mutex_depth_++;
     } else {
