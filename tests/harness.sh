@@ -41,12 +41,11 @@ NUMERIC_TESTS=(
     nb.pl nbody.pl mbs.pl fibn.pl arith.pl
 )
 
-# Tests that are known to need external modules / DBI / XS / threads at runtime.
+# Tests that are known to need external modules / DBI / XS at runtime.
 # We still try to compile+run them if the binary supports it, but we don't fail
 # the whole suite if they are skipped or produce different "not loaded" output.
 SKIP_BY_DEFAULT=(
     dbi_sqlite.pl xs_dbi_test.pl xs_ffi.pl
-    threads.pl threads_atomic.pl destroy.pl
 )
 
 # Self-checking tests: they already print "xxx=ok/FAIL" or die.

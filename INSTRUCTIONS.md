@@ -15,11 +15,15 @@ This file contains all operational instructions for agent sessions working on th
 make              # Build perlc compiler
 make clean        # Clean build artifacts
 make test         # Run assertion-based contract tests (fast)
-make test-all     # Run all tests with perl output comparison
+make test-all     # Run ALL tests with perl output comparison (harness gate)
 make test-smoke   # Run only smoke/benchmark tests
 make test-assertion  # Run only assertion tests
+make test-tsan    # Run threads/destroy tests with -fsanitize=thread
+make test-tsan-full  # Run ALL tests with -fsanitize=thread (skip DBI/XS)
+make test-valgrind  # Run ALL tests under valgrind memcheck (skip DBI/XS)
 make test-cache   # Show cached benchmark results
 make test-clear-cache  # Clear cached benchmark results
+make test-opt-matrix  # Run harness at OPT_LEVEL 0, 2, 3
 ```
 
 ### Known Build Issues
@@ -124,13 +128,25 @@ myhost.example.com,mbs.pl,2.345,yes,0.123456,0.999
 
 ## Recommended Development Workflow
 
+### Core Policy: Harness-as-Gate
+
+**`make test-all` (harness.sh) is the mandatory pre-commit gate for every change.**
+Every modification to the compiler must pass full perl-output comparison before committing.
+This ensures:
+- All smoke tests are validated against perl output
+- All assertion tests pass
+- All benchmarks are verified (using cache if available)
+- Any regression is caught immediately
+
+### Standard Workflow
+
 When applying a fix or developing new code:
 
 ```bash
 # 1. Build the compiler
 make clean && make
 
-# 2. Run ALL correctness tests (uses cache for benchmarks automatically)
+# 2. Run ALL correctness tests (harness gate — mandatory)
 make test-all
 
 # 3. If benchmarks are cached, results are reused. If not, they are recorded.
@@ -144,11 +160,28 @@ make test-all
 ./run_tests.sh --clear-cache
 ```
 
-**Key principle**: Always run `make test-all` (or `./run_tests.sh tests/`) before committing changes. This ensures:
-- All smoke tests are validated against perl output
-- All assertion tests pass
-- All benchmarks are verified (using cache if available)
-- Any regression is caught immediately
+### Safety Gates (run before merging)
+
+```bash
+# Memory safety — catches leaks from PV slab, PerlArray freelist, etc.
+make test-valgrind
+
+# Data race detection — catches threads::shared correctness issues
+make test-tsan
+make test-tsan-full   # broader coverage (all tests except DBI/XS)
+```
+
+### Optimization Debugging
+
+```bash
+# Run harness at specific optimization levels to isolate opt-stage bugs
+OPT_LEVEL=0 make test-all    # minimal optimizations
+OPT_LEVEL=2 make test-all    # default level
+OPT_LEVEL=3 make test-all    # full optimizations
+
+# Or use PERLC_OPT_DISABLE to disable specific stages
+PERLC_OPT_DISABLE="flatdouble,allflat" make test-all
+```
 
 ### When to Use `--force-benchmark`
 - After fixing a bug that could affect benchmark correctness

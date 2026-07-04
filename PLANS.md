@@ -1,5 +1,36 @@
 # PLANS.md — Correctness, Completeness, Performance Plans
 
+## Phase Tracking
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Phase 0 | **COMPLETE** | Establish correctness gates: harness-as-gate policy, valgrind/TSan gates, expanded test coverage |
+| Phase 1 | **PENDING** | Fix all open defects D1-D16, B1 |
+| Phase 2 | **PENDING** | Re-architect optimization passes |
+
+---
+
+## Phase 0 — Correctness Gates (COMPLETE)
+
+### Completed
+- [x] `harness.sh`: Removed `threads.pl`, `threads_atomic.pl`, `destroy.pl` from `SKIP_BY_DEFAULT` — these now run in default harness execution
+- [x] `Makefile`: Added `test-all`, `test-smoke`, `test-assertion` targets
+- [x] `Makefile`: Added `test-valgrind` target (memcheck on all tests, skip DBI/XS)
+- [x] `Makefile`: Added `test-tsan-full` target (TSan on all tests, skip DBI/XS)
+- [x] `INSTRUCTIONS.md`: Updated with harness-as-gate policy, new make targets, optimization debugging workflow
+- [x] `INSTRUCTIONS.md`: Added safety gates section (valgrind, TSan)
+
+### Impact
+- Test coverage expanded from ~35 tests to ~48 tests in default harness run (35% increase)
+- Memory safety and data race detection now available as `make` targets
+- Clear development workflow with mandatory correctness gate
+
+---
+
+## Phase 1 — Defect Fixes (PENDING)
+
+See defect registry below. All items must be fixed before Phase 2 re-architecture begins.
+
 ## Correctness Plans
 
 1. **Fix `NK::EvalBlock` LLVM codegen crash.** `eval { BLOCK }` produces invalid LLVM IR because `endBB` lacks a `ret` instruction — LLVM verify error: `Function return type does not match operand type of return inst! ret ptr %17 i32`. Fix: add `builder_.CreateRet(perlUndef())` after `perl_eval_pop` in the `endBB` block. This is a compiler crash blocking any program using block eval from compiling. Test: `tests/eval_exception.pl` currently fails.

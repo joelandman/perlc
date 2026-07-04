@@ -1,6 +1,15 @@
 # perlc — Test Defect Tracking
 
-This file tracks defects found during analysis, the test scripts that demonstrate them, and the commits/changes that fixed them.
+## Phase Tracking
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Phase 0 | **COMPLETE** | Establish correctness gates |
+| Phase 1 | **PENDING** | Fix all open defects D1-D16, B1 |
+
+**Note**: Status is also tracked in `PLANS.md`. `REMEDIATION.md` tracks individual fixes with commit references.
+
+---
 
 ## Test Infrastructure
 
@@ -104,46 +113,50 @@ Before the test runner was added:
 
 ## Defect Registry
 
+**Consolidated from** `TESTS.md`, `REMEDIATION.md`, and `PLANS.md`.
+Status `FIXED` entries are in `REMEDIATION.md` with commit references.
+Status `OPEN` entries in Phase 1 must be resolved before optimization re-architecture.
+
 ### Build Environment
 
-| Defect ID | Problem | Test Script | Status | Commit | Fix Summary |
-|-----------|---------|-------------|--------|--------|-------------|
-| B1 | LLVM 18 + GCC 15/16 incompatibility — `__normal_iterator` incomplete type errors | N/A (build fails) | **OPEN** | — | Downgrade GCC to 13 or migrate to LLVM 21/22 |
+| Defect ID | Problem | Test Script | Status | Fix Summary |
+|-----------|---------|-------------|--------|-------------|
+| B1 | LLVM 18 + GCC 15/16 incompatibility — `__normal_iterator` incomplete type errors | N/A (build fails) | **OPEN** | Downgrade GCC to 13 or migrate to LLVM 21/22 |
 
 ### Critical Defects
 
-| Defect ID | Problem | Test Script | Status | Commit | Fix Summary |
-|-----------|---------|-------------|--------|--------|-------------|
-| D1 | All numeric compound assignments on shared scalars go through `perl_atomic_add` — `-=` adds instead of subtracts, `*=` multiplies as addition | `threads_atomic.pl` (add `-=` test case), `run_tests.sh` will catch via output comparison | **OPEN** | — | Route `-=` to negate delta; add `perl_atomic_mul`/`div`/`rem` or emit longhand |
-| D2 | `chop @arr` calls `perl_chomp_array` instead of removing last characters | `builtins.pl` (add `chop @arr` test), `run_tests.sh` will catch via output comparison | **OPEN** | — | Add `perl_chop_array` to runtime.c or fix codegen |
-| D3 | `local @arr` / `local %hash` silently no-ops for function-scope variables | `completeness.pl` (add function-scope local test), `run_tests.sh` will catch via output comparison | **OPEN** | — | Implement save/restore for function-scope arrays/hashes |
+| Defect ID | Problem | Test Script | Status | Fix Summary |
+|-----------|---------|-------------|--------|-------------|
+| D1 | All numeric compound assignments on shared scalars go through `perl_atomic_add` — `-=` adds instead of subtracts, `*=` multiplies as addition | `threads_atomic.pl` | **VERIFY** | REMEDIATION.md says FIXED (commit db7ba77); re-test with harness |
+| D2 | `chop @arr` calls `perl_chomp_array` instead of removing last characters | `builtins.pl` | **OPEN** | Add `perl_chop_array` to runtime.c or fix codegen |
+| D3 | `local @arr` / `local %hash` silently no-ops for function-scope variables | `completeness.pl` | **OPEN** | Implement save/restore for function-scope arrays/hashes |
 
 ### High Severity Defects
 
-| Defect ID | Problem | Test Script | Status | Commit | Fix Summary |
-|-----------|---------|-------------|--------|--------|-------------|
-| D5 | Closure + range-with-captured-variable emits `undef` bound, loop never executes | `closures.pl` (add captured var in range test), `run_tests.sh` will catch | **OPEN** | — | Improve `emitBound` fallback for captured variables |
-| D6 | `for (my $i = 0; ...)` C-style init is dead code | `range.pl` or `modifiers.pl` (add C-style for with my), `run_tests.sh` will catch | **OPEN** | — | Parse `my` keyword properly in C-style for loops |
-| D7 | `s///` without second `\x01` delimiter causes `npos` underflow | `regex.pl` (add malformed substitution test), `run_tests.sh` will catch | **OPEN** | — | Add bounds checking in substitution parser |
-| D8 | `parseOrRhs` handles only small subset of statement keywords after `or`/`and` | `features.pl` (add `or eval`, `or require` tests), `run_tests.sh` will catch | **OPEN** | — | Expand keyword list or use general statement parsing |
-| D9 | `lastSqrtInput_` never cleared, can match wrong variable's square | `builtins2.pl` (add sqrt+mul test), `run_tests.sh` will catch | **OPEN** | — | Clear after use or scope per expression |
+| Defect ID | Problem | Test Script | Status | Fix Summary |
+|-----------|---------|-------------|--------|-------------|
+| D5 | Closure + range-with-captured-variable emits `undef` bound, loop never executes | `closures.pl` | **OPEN** | Improve `emitBound` fallback for captured variables |
+| D6 | `for (my $i = 0; ...)` C-style init is dead code | `range.pl` / `modifiers.pl` | **OPEN** | Parse `my` keyword properly in C-style for loops |
+| D7 | `s///` without second `\x01` delimiter causes `npos` underflow | `regex.pl` | **OPEN** | Add bounds checking in substitution parser |
+| D8 | `parseOrRhs` handles only small subset of statement keywords after `or`/`and` | `features.pl` | **OPEN** | Expand keyword list or use general statement parsing |
+| D9 | `lastSqrtInput_` never cleared, can match wrong variable's square | `builtins2.pl` | **OPEN** | Clear after use or scope per expression |
 
 ### Medium Severity Defects
 
-| Defect ID | Problem | Test Script | Status | Commit | Fix Summary |
-|-----------|---------|-------------|--------|--------|-------------|
-| D10 | Static counters (`sortCmpCounter`, `stateSeq`, `endSeq`, `anonCount`) don't reset between compilations | Verify in REPL mode | **OPEN** | — | Reset counters at start of each `compile()` |
-| D11 | `*=`, `/=`, `%=` on shared scalars emit `perl_atomic_add` (same root cause as D1) | `threads_atomic.pl` (add `*=`, `/=` test cases), `run_tests.sh` will catch | **OPEN** | — | Same fix as D1 |
-| D12 | `wantarray` context not propagated through `print`/`say`/`printf` | `wantarray.pl` (add print/wantarray test), `run_tests.sh` will catch | **OPEN** | — | Extend context propagation to all builtins |
-| D13 | DESTROY handling not visible in codegen/parser — unclear if fully functional | `destroy.pl` (verify thoroughness), `run_tests.sh` will catch | **VERIFY** | — | Confirm runtime implementation |
+| Defect ID | Problem | Test Script | Status | Fix Summary |
+|-----------|---------|-------------|--------|-------------|
+| D10 | Static counters (`sortCmpCounter`, `stateSeq`, `endSeq`, `anonCount`) don't reset between compilations | Verify in multi-compilation scenarios | **OPEN** | Reset counters at start of each `compile()` |
+| D11 | `*=`, `/=`, `%=` on shared scalars emit `perl_atomic_add` (same root cause as D1) | `threads_atomic.pl` | **VERIFY** | REMEDIATION.md says FIXED (commit db7ba77); re-test with harness |
+| D12 | `wantarray` context not propagated through `print`/`say`/`printf` | `wantarray.pl` | **OPEN** | Extend context propagation to all builtins |
+| D13 | DESTROY handling not visible in codegen/parser — unclear if fully functional | `destroy.pl` | **VERIFY** | Confirm runtime implementation |
 
 ### Low Severity Defects
 
-| Defect ID | Problem | Test Script | Status | Commit | Fix Summary |
-|-----------|---------|-------------|--------|--------|-------------|
-| D14 | Duplicated `cmpOps` array in two places in parser.cpp | N/A (code quality) | **OPEN** | — | Consolidate into single constant |
-| D15 | Hardcoded `specialVars` list duplicated in two places in codegen.cpp | N/A (code quality) | **OPEN** | — | Consolidate into single definition |
-| D16 | `xs_dbi_test.pl` is a no-op placeholder — always passes | `xs_dbi_test.pl` | **OPEN** | — | Replace with real tests or remove |
+| Defect ID | Problem | Test Script | Status | Fix Summary |
+|-----------|---------|-------------|--------|-------------|
+| D14 | Duplicated `cmpOps` array in two places in parser.cpp | N/A (code quality) | **OPEN** | Consolidate into single constant |
+| D15 | Hardcoded `specialVars` list duplicated in two places in codegen.cpp | N/A (code quality) | **OPEN** | Consolidate into single definition |
+| D16 | `xs_dbi_test.pl` is a no-op placeholder — always passes | `xs_dbi_test.pl` | **OPEN** | Replace with real tests or remove |
 
 ---
 
@@ -168,13 +181,13 @@ These features are claimed to be implemented but have NO corresponding test:
 
 ## Recommended Development Workflow
 
-When applying a fix or developing new code:
+**Harness-as-Gate Policy**: `make test-all` is the mandatory pre-commit gate. Run it before every commit.
 
 ```bash
 # 1. Build the compiler
 make clean && make
 
-# 2. Run ALL correctness tests (uses cache for benchmarks automatically)
+# 2. Run ALL correctness tests (harness gate — mandatory)
 make test-all
 
 # 3. If benchmarks are cached, results are reused. If not, they are recorded.
@@ -186,23 +199,20 @@ make test-cache
 
 # 5. To clear cache and force fresh runs:
 make test-clear-cache
+
+# 6. Safety gates before merging
+make test-valgrind    # memory safety
+make test-tsan        # data race detection (threads/destroy)
+make test-tsan-full   # broader TSan coverage
 ```
 
-**Key principle**: Always run `make test-all` (or `./run_tests.sh tests/`) before committing changes. This ensures:
-- All smoke tests are validated against perl output
-- All assertion tests pass
-- All benchmarks are verified (using cache if available)
-- Any regression is caught immediately
-
 ### When to Use `--force-benchmark`
-
 - After fixing a bug that could affect benchmark correctness
 - After optimizing code that changes algorithmic behavior
 - When adding new features that might impact performance
 - When the cache is stale (e.g., after hardware changes)
 
 ### When Cache Is Sufficient
-
 - Small fixes to unrelated code paths
 - Bug fixes that don't affect numerical output
 - Documentation/comment changes

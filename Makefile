@@ -28,7 +28,7 @@ TARGET   := perlc
 ASSERT_TESTS := tests/test_do_filename.pl tests/test_require_simple.pl tests/dbi_sqlite.pl tests/xs_ffi.pl
 TSAN_TESTS := tests/threads.pl tests/threads_atomic.pl tests/destroy.pl
 
-.PHONY: all clean test test-tsan test-full bench test-opt% test-opt-matrix
+.PHONY: all clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt% test-opt-matrix test-valgrind test-tsan-full
 
 all: $(TARGET)
 
@@ -69,6 +69,15 @@ test: $(TARGET)
 		$$out; \
 	done
 
+test-all: $(TARGET)
+	@./tests/harness.sh
+
+test-smoke: $(TARGET)
+	@./tests/harness.sh --smoke-only
+
+test-assertion: $(TARGET)
+	@./tests/harness.sh --assertion-only
+
 test-tsan: $(TSAN_TARGET)
 	@set -e; \
 	for t in $(TSAN_TESTS); do \
@@ -76,6 +85,30 @@ test-tsan: $(TSAN_TARGET)
 		echo "=== TSan: $$t ==="; \
 		./$(TSAN_TARGET) $$t -o $$out >/tmp/perlc_tsan_compile.log 2>&1; \
 		TSAN_OPTIONS="halt_on_error=1" $$out 2>&1; \
+	done
+
+test-tsan-full: $(TSAN_TARGET)
+	@set -e; \
+	for t in tests/*.pl; do \
+		base=$$(basename $$t .pl); \
+		## Skip DBI/XS tests that need external deps; threads tests covered by TSan runtime \
+		case "$$base" in dbi_sqlite|xs_dbi_test|xs_ffi) echo "SKIP TSan $$base (external deps)"; continue;; esac \
+		out="/tmp/perlc_tsan_$${base}"; \
+		echo "=== TSan: $$t ==="; \
+		./$(TSAN_TARGET) $$t -o $$out >/tmp/perlc_tsan_compile.log 2>&1; \
+		TSAN_OPTIONS="halt_on_error=1" $$out 2>&1; \
+	done
+
+test-valgrind: $(TARGET)
+	@set -e; \
+	for t in tests/*.pl; do \
+		base=$$(basename $$t .pl); \
+		## Skip DBI/XS tests that need external deps \
+		case "$$base" in dbi_sqlite|xs_dbi_test|xs_ffi) echo "SKIP VG $$base (external deps)"; continue;; esac \
+		out="/tmp/perlc_vg_$${base}"; \
+		echo "=== Valgrind: $$t ==="; \
+		./$(TARGET) $$t -o $$out >/tmp/perlc_vg_compile.log 2>&1; \
+		valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all --error-exitcode=1 $$out >/dev/null 2>&1; \
 	done
 
 test-full: $(TARGET)
