@@ -2050,11 +2050,9 @@ Value *CodeGen::emitExprF64(const Node &n) {
               }
              return nullptr;
         } else {
-            Value *base = emitExpr(*n.left);
-            Value *hv = callRT("perl_deref_hash", {base});
-            freeIfOwned(base);
-            Value *elem = emitHashGetRef(hv, *n.right);
-            return callRT("perl_to_float", {elem});
+            /* Hash ArrowDeref ($ref->{key}) — values can be any type (string, ref, etc.).
+               Cannot safely emit as F64. Fall through to regular emitExpr path. */
+            return nullptr;
         }
     }
     case NK::HashElem: {
