@@ -2063,6 +2063,29 @@ PerlArray *perl_hash_autoviv_array(PerlHash *h, const char *key) {
     PerlHashEntry *e = hash_find(h, key);
     if (e) {
         if (e->val->tag == PERL_REF_ARRAY) return (PerlArray *)e->val->pval;
+        /* FLAT_ARRAY: extract inline doubles into a proper array */
+        if (e->val->tag == PERL_FLAT_ARRAY && e->val->matchpos > 0) {
+            PerlArray *inner = perl_anon_array_new();
+            double *dptr = (double *)e->val->pval;
+            long long n = e->val->matchpos;
+            for (long long i = 0; i < n; i++)
+                perl_array_push(inner, perl_alloc_float(dptr[i]));
+            perl_free(e->val);
+            PerlValue *ref = perl_ref_array(inner);
+            e->val = ref;
+            return inner;
+        }
+        /* FLOAT_PAIR: extract two doubles */
+        if (e->val->tag == PERL_FLOAT_PAIR) {
+            PerlArray *inner = perl_anon_array_new();
+            double elem[2]; elem[0] = e->val->fval; elem[1] = (double)(long long)e->val->matchpos;
+            perl_array_push(inner, perl_alloc_float(elem[0]));
+            perl_array_push(inner, perl_alloc_float(elem[1]));
+            perl_free(e->val);
+            PerlValue *ref = perl_ref_array(inner);
+            e->val = ref;
+            return inner;
+        }
         PerlArray *inner = perl_anon_array_new();
         PerlValue *ref   = perl_ref_array(inner);
         perl_free(e->val);

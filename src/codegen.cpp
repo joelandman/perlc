@@ -1065,6 +1065,23 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             return callRT("perl_unwrap_list_return", {pv});
         }
     }
+    /* code ref call in list context: unwrap LIST_RESULT */
+    if (n.kind == NK::CallCodeRef) {
+        Value *ref = emitExpr(*n.left);
+        Value *av  = callRT("perl_array_new", {});
+        for (auto &arg : n.args) {
+            Value *src = emitArrayPtr(*arg);
+            if (src) callRT("perl_array_extend", {av, src});
+            else     callRT("perl_array_push",   {av, emitExpr(*arg)});
+        }
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *one = ConstantInt::get(i32Ty, 1);
+        callRT("perl_push_wantarray", {one});
+        Value *result = callRT("perl_call_code_ref", {ref, av});
+        callRT("perl_pop_wantarray", {});
+        callRT("perl_array_free", {av});
+        return callRT("perl_unwrap_list_return", {result});
+    }
     return nullptr;
 }
 
@@ -2585,28 +2602,43 @@ Value *CodeGen::emitBlockLast(const Node &n) {
             if (isListProducer && currentSubNeedsWantarray_) {
                 Value *av = emitArrayPtr(le);
                 if (!av) av = callRT("perl_array_new", {});
-                result = callRT("perl_array_to_list_return", {av});
+                /* grep/map/sort return COUNT in scalar context (not last element) */
+                if (lk == NK::GrepFunc || lk == NK::MapFunc || lk == NK::SortFunc) {
+                    auto *i32Ty = Type::getInt32Ty(ctx_);
+                    Value *ctx = callRT("perl_current_wantarray_ctx", {});
+                    Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
+                    Value *listResult = callRT("perl_array_to_list_return", {av});
+                    Value *scalarResult = callRT("perl_array_len", {av});
+                    result = builder_.CreateSelect(isList, listResult, scalarResult);
+                } else {
+                    result = callRT("perl_array_to_list_return", {av});
+                }
             } else {
                 result = emitExpr(le);
             }
         } else if (isLast && stmt.kind == NK::Return) {
             /* Capture the return value without emitting a ret instruction.
-               The caller will handle the actual return. */
+                The caller will handle the actual return. */
             if (stmt.left && (stmt.left->kind == NK::ArrayLit || stmt.left->kind == NK::ArrayVar ||
-                              stmt.left->kind == NK::MapFunc  || stmt.left->kind == NK::GrepFunc ||
-                              stmt.left->kind == NK::SortFunc || stmt.left->kind == NK::DerefArray ||
-                              stmt.left->kind == NK::ReverseFunc)) {
+                                stmt.left->kind == NK::MapFunc  || stmt.left->kind == NK::GrepFunc ||
+                                stmt.left->kind == NK::SortFunc || stmt.left->kind == NK::DerefArray ||
+                                stmt.left->kind == NK::ReverseFunc)) {
                 Value *av = emitArrayPtr(*stmt.left);
                 if (!av) av = callRT("perl_array_new", {});
-                result = callRT("perl_array_to_list_return", {av});
+                /* grep/map/sort return COUNT in scalar context (not last element) */
+                if (stmt.left->kind == NK::GrepFunc || stmt.left->kind == NK::MapFunc ||
+                    stmt.left->kind == NK::SortFunc) {
+                    auto *i32Ty = Type::getInt32Ty(ctx_);
+                    Value *ctx = callRT("perl_current_wantarray_ctx", {});
+                    Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
+                    Value *listResult = callRT("perl_array_to_list_return", {av});
+                    Value *scalarResult = callRT("perl_array_len", {av});
+                    result = builder_.CreateSelect(isList, listResult, scalarResult);
+                } else {
+                    result = callRT("perl_array_to_list_return", {av});
+                }
             } else {
                 result = stmt.left ? emitExpr(*stmt.left) : perlUndef();
-            }
-            /* Clone the result (mirrors NK::Return logic). */
-            if (result && !llvm::isa<llvm::ConstantPointerNull>(result)) {
-                Value *orig = result;
-                result = callRT("perl_clone", {result});
-                freeIfOwned(orig);
             }
         } else {
             emitStmt(stmt);
@@ -3535,12 +3567,23 @@ void CodeGen::emitStmt(const Node &n) {
         Value *v;
         if (n.left && (n.left->kind == NK::ArrayLit || n.left->kind == NK::ArrayVar ||
                        n.left->kind == NK::MapFunc  || n.left->kind == NK::GrepFunc ||
-                       n.left->kind == NK::SortFunc || n.left->kind == NK::DerefArray ||
-                       n.left->kind == NK::ReverseFunc)) {
+                        n.left->kind == NK::SortFunc || n.left->kind == NK::DerefArray ||
+                        n.left->kind == NK::ReverseFunc)) {
             /* return list-producing expr — wrap for list/scalar context at runtime */
             Value *av = emitArrayPtr(*n.left);
             if (!av) av = callRT("perl_array_new", {});
-            v = callRT("perl_array_to_list_return", {av});
+            /* grep/map/sort return COUNT in scalar context (not last element) */
+            if (n.left->kind == NK::GrepFunc || n.left->kind == NK::MapFunc ||
+                n.left->kind == NK::SortFunc) {
+                auto *i32Ty = Type::getInt32Ty(ctx_);
+                Value *ctx = callRT("perl_current_wantarray_ctx", {});
+                Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
+                Value *listResult = callRT("perl_array_to_list_return", {av});
+                Value *scalarResult = callRT("perl_array_len", {av});
+                v = builder_.CreateSelect(isList, listResult, scalarResult);
+            } else {
+                v = callRT("perl_array_to_list_return", {av});
+            }
         } else {
             v = n.left ? emitExpr(*n.left) : perlUndef();
         }
@@ -6044,6 +6087,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     argsArr->setName("args");
     Value *ctxArg = subFn->getArg(1);
     callRT("perl_push_wantarray", {ctxArg});
+    currentSubNeedsWantarray_ = true;
     declareArray("_", argsArr);
         /* fresh local() depth for this closure */
         {
