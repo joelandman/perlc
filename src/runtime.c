@@ -1629,6 +1629,17 @@ long long perl_chomp_array(PerlArray *a) {
     return removed;
 }
 
+PerlValue *perl_chop_array(PerlArray *a) {
+    if (!a || a->len == 0) return perl_alloc_string("");
+    PerlValue *last_removed = NULL;
+    for (long long i = 0; i < a->len; i++) {
+        PerlValue *rem = perl_chop(a->elems[i]);
+        if (last_removed) perl_free(last_removed);
+        last_removed = rem;
+    }
+    return last_removed ? last_removed : perl_alloc_string("");
+}
+
 long long perl_chomp(PerlValue *v) {
     if (!v) return 0;
     if (v->tag == PERL_STRING) {

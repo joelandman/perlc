@@ -128,7 +128,7 @@ Status `OPEN` entries in Phase 1 must be resolved before optimization re-archite
 | Defect ID | Problem | Test Script | Status | Fix Summary |
 |-----------|---------|-------------|--------|-------------|
 | D1 | All numeric compound assignments on shared scalars go through `perl_atomic_add` — `-=` adds instead of subtracts, `*=` multiplies as addition | `threads_atomic.pl` | **VERIFY** | REMEDIATION.md says FIXED (commit db7ba77); re-test with harness |
-| D2 | `chop @arr` calls `perl_chomp_array` instead of removing last characters | `builtins.pl` | **OPEN** | Add `perl_chop_array` to runtime.c or fix codegen |
+| D2 | `chop @arr` calls `perl_chomp_array` instead of removing last characters | `builtins.pl` | **FIXED** | Added `perl_chop_array` to runtime.c; codegen now calls it for the array form |
 | D3 | `local @arr` / `local %hash` silently no-ops for function-scope variables | `completeness.pl` | **OPEN** | Implement save/restore for function-scope arrays/hashes |
 
 ### High Severity Defects

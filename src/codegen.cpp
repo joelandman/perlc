@@ -242,6 +242,7 @@ void CodeGen::declareRuntime() {
     /* string builtins */
     RT("perl_chomp",       i64,  pv);
     RT("perl_chomp_array", i64,  av);
+    RT("perl_chop_array",  pv,   av);
     RT("perl_length",   pv,   pv);
     RT("perl_substr2",  pv,   pv, pv);
     RT("perl_substr3",  pv,   pv, pv, pv);
@@ -5184,13 +5185,9 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *av = lookupArray(n.left->name);
             if (av) {
                 if (isChop) { /* chop each element, return last removed char */
-                    Value *lastChar = perlStr("");
-                    Value *len = callRT("perl_to_int", {callRT("perl_array_len", {av})});
-                    /* simple loop would need LLVM loop; for now just chop each element */
-                    /* Actually call a helper — same as chomp_array for simplicity */
-                    callRT("perl_chomp_array", {av}); return perlInt(0);
+                    return callRT("perl_chop_array", {av});
                 }
-                callRT("perl_chomp_array", {av}); return perlInt(0);
+                return callRT("perl_alloc_int", {callRT("perl_chomp_array", {av})});
             }
         }
         /* chomp/chop on scalar */
@@ -5544,9 +5541,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* accumulator starts as first element */
         auto *accAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "red.acc");
         Value *first    = callRT("perl_array_get_ref", {inputArr, ConstantInt::get(i64, 0)});
-        Value *accPv    = perlUndef();
-        callRT("perl_assign", {accPv, first});
-        builder_.CreateStore(accPv, accAlloca);
+        Value *accCell  = callRT("perl_alloc_undef", {});
+        callRT("perl_assign", {accCell, first});
+        builder_.CreateStore(accCell, accAlloca);
 
         auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "red.i");
         builder_.CreateStore(ConstantInt::get(i64, 1), iAlloca); /* start from index 1 */
@@ -5574,7 +5571,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         popScope();
 
         /* update accumulator */
-        callRT("perl_assign", {accPv, blockResult});
+        callRT("perl_assign", {builder_.CreateLoad(perlPtrTy_, accAlloca), blockResult});
 
         Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
         builder_.CreateStore(i2, iAlloca);

@@ -112,7 +112,26 @@
       "Bash(time /tmp/nb_default 100000)",
       "Bash(time /tmp/nb_s4b 100000)",
       "Bash(size /tmp/nb_check)",
-      "Bash(time /tmp/nb_check 100000)"
+      "Bash(time /tmp/nb_check 100000)",
+      "Bash(./tests/harness.sh)",
+      "Bash(/tmp/arith_perlc)",
+      "Bash(/tmp/ee_perlc)",
+      "Bash(/tmp/t1_perlc)",
+      "Bash(/tmp/adv_perlc)",
+      "Bash(/tmp/feat_perlc)",
+      "Bash(/tmp/fio_perlc)",
+      "Bash(/tmp/rn_perlc)",
+      "Bash(/tmp/t2_perlc)",
+      "Bash(/tmp/mbs_perlc)",
+      "Bash(/tmp/fops_perlc)",
+      "Bash(tee /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/test_output.log)",
+      "Bash(jobs -l)",
+      "Bash(/home/joe/work/pc/perlc/perlc /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_chop_reduce.pl -o /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_chop_reduce)",
+      "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_chop_reduce)",
+      "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/tier1_before)",
+      "Bash(./tests/harness.sh tests/tier2.pl tests/wantarray_extended.pl tests/test_do_filename.pl)",
+      "Bash(xargs ls -lt)",
+      "Bash(./tests/harness.sh tests/builtins.pl)"
     ]
   }
 }

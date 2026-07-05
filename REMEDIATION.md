@@ -49,3 +49,9 @@ All issues have been fixed:
     - If so, emits body using `emitExprF64` and returns raw F64 value
     - `emitCall` detects F64 return type and boxes via `perl_alloc_float`
     - Eliminates `perl_clone` + boxing for inlineable subs with float bodies
+
+12. ~~**Fix D2: `chop @arr` behaved identically to `chomp @arr`**~~ — FIXED
+    - Added `perl_chop_array()` to runtime.c/runtime.h: chops every element in place, returns the last removed character (matching Perl's `chop LIST` semantics)
+    - `codegen.cpp` array-chop branch now calls `perl_chop_array` instead of `perl_chomp_array`
+    - Scalar `chop` return value now boxed via `perl_alloc_int` instead of leaking a bare int as `perlInt(0)`
+    - Test coverage added to `tests/builtins.pl` (scalar and array forms); verified byte-for-byte against real perl via `tests/harness.sh`

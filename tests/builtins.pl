@@ -21,6 +21,17 @@ chomp $line;
 say $line;          # hello
 say length($line);  # 5
 
+# --- chop (scalar and array) ---
+my $cs = "hello";
+my $cc = chop($cs);
+say $cc;            # o
+say $cs;            # hell
+
+my @carr = ("hello\n", "world\n", "foo");
+my $clast = chop(@carr);
+say $clast;                  # o
+say join(",", @carr);        # hello,world,fo
+
 # --- length ---
 my $s = "abcdef";
 say length($s);     # 6

@@ -194,6 +194,7 @@ void       perl_print_array(PerlArray *a); /* print all elements with $, between
 long long  perl_chomp(PerlValue *v);       /* remove trailing \n in-place, returns removed count */
 long long  perl_chomp_array(PerlArray *a); /* chomp every element; returns total removed count */
 PerlValue *perl_chop(PerlValue *v);        /* remove and return last character */
+PerlValue *perl_chop_array(PerlArray *a);  /* chop every element; returns last removed char */
 PerlValue *perl_length(PerlValue *v);
 PerlValue *perl_substr2(PerlValue *str, PerlValue *off);
 void perl_substr_replace(PerlValue *str, PerlValue *off, PerlValue *len, PerlValue *repl);
