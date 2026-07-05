@@ -43,3 +43,29 @@ while ($i <= 3) {
 print $funcs[0]->() . "\n";  # 2
 print $funcs[1]->() . "\n";  # 4
 print $funcs[2]->() . "\n";  # 6
+
+# D5: nested closure — inner closure captures a variable transitively through
+# the middle closure (the middle closure never uses the variable directly)
+sub make_outer_range {
+    my $per = shift;
+    return sub {
+        return sub {
+            my @out;
+            for (1..$per) { push @out, $_; }
+            return \@out;
+        };
+    };
+}
+my $mid = make_outer_range(3);
+my $inner = $mid->();
+print join(",", @{ $inner->() }), "\n";   # 1,2,3
+
+# D5: transitive capture of two variables at different nesting depths
+sub make_two_level {
+    my ($a, $b) = @_;
+    return sub {
+        my $c = $a;
+        return sub { return $a + $b + $c; };
+    };
+}
+print make_two_level(1, 2)->()->(), "\n";  # 4

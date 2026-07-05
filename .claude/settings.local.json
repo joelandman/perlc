@@ -135,7 +135,18 @@
       "Bash(/home/joe/work/pc/perlc/perlc /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_local_global.pl -o /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_local_global2)",
       "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_local_global2)",
       "Bash(./tests/harness.sh tests/completeness.pl)",
-      "Bash(./tests/harness.sh tests/completeness.pl tests/threads.pl tests/threads_atomic.pl tests/destroy.pl tests/builtins.pl)"
+      "Bash(./tests/harness.sh tests/completeness.pl tests/threads.pl tests/threads_atomic.pl tests/destroy.pl tests/builtins.pl)",
+      "Bash(/home/joe/work/pc/perlc/perlc /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5.pl -o /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5)",
+      "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5)",
+      "Bash(/home/joe/work/pc/perlc/perlc /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5b.pl -o /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5b)",
+      "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5b)",
+      "Bash(grep *)",
+      "Bash(/home/joe/work/pc/perlc/perlc /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5c.pl -o /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5c2)",
+      "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5c2)",
+      "Bash(/home/joe/work/pc/perlc/perlc /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5d.pl -o /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5d)",
+      "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_d5d)",
+      "Bash(./tests/harness.sh tests/closures.pl)",
+      "Bash(./tests/harness.sh tests/closures.pl tests/threads.pl tests/threads_atomic.pl tests/destroy.pl)"
     ]
   }
 }

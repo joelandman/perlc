@@ -135,7 +135,7 @@ Status `OPEN` entries in Phase 1 must be resolved before optimization re-archite
 
 | Defect ID | Problem | Test Script | Status | Fix Summary |
 |-----------|---------|-------------|--------|-------------|
-| D5 | Closure + range-with-captured-variable emits `undef` bound, loop never executes | `closures.pl` | **OPEN** | Improve `emitBound` fallback for captured variables |
+| D5 | Closure + range-with-captured-variable emits `undef` bound, loop never executes | `closures.pl` | **FIXED** | Root cause was `collectAllScalarNames()` skipping nested `AnonSub` bodies, breaking transitive capture through 2+ levels of nested closures |
 | D6 | `for (my $i = 0; ...)` C-style init is dead code | `range.pl` / `modifiers.pl` | **OPEN** | Parse `my` keyword properly in C-style for loops |
 | D7 | `s///` without second `\x01` delimiter causes `npos` underflow | `regex.pl` | **OPEN** | Add bounds checking in substitution parser |
 | D8 | `parseOrRhs` handles only small subset of statement keywords after `or`/`and` | `features.pl` | **OPEN** | Expand keyword list or use general statement parsing |

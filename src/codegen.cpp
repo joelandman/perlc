@@ -15,11 +15,15 @@
 
 using namespace llvm;
 
-/* collect all ScalarVar names referenced in a node (skip nested AnonSub/SubDef) */
+/* collect all ScalarVar names referenced in a node (skip nested SubDef —
+   named subs are compiled as standalone top-level functions, unrelated to
+   the enclosing lexical scope).  AnonSub IS recursed into: a nested closure
+   may reference an outer variable that this closure only sees transitively
+   (e.g. `sub { sub { ...$x... } }`), so it must also be captured here in
+   order to relay it to the inner closure. */
 static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
     switch (n.kind) {
     case NK::ScalarVar: names.insert(n.name); return;
-    case NK::AnonSub:   return;  /* don't recurse — nested closure handles its own captures */
     case NK::SubDef:    return;
     default: break;
     }
