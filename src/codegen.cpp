@@ -2539,7 +2539,7 @@ static bool hasDefaultVarUse(const Node &n) {
 
 /* Stage 17: skip local save/restore for blocks that contain no local() */
 static bool hasLocalStmt(const Node &n) {
-    if (n.kind == NK::LocalStmt) return true;
+    if (n.kind == NK::LocalStmt || n.kind == NK::LocalArray || n.kind == NK::LocalHash) return true;
     bool r = false;
     if (n.left)  r = r || hasLocalStmt(*n.left);
     if (n.right) r = r || hasLocalStmt(*n.right);

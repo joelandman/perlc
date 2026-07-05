@@ -329,6 +329,7 @@ void perl_local_save_hash(PerlHash **slot) {
 /* jmp_buf pointers are pushed by callers (codegen allocates jmp_buf on stack) */
 #define EVAL_STACK_MAX 64
 static __thread jmp_buf *s_eval_stack[EVAL_STACK_MAX];
+static __thread int      s_eval_local_depth[EVAL_STACK_MAX]; /* local()-stack depth at eval entry */
 static __thread int      s_eval_depth = 0;
 static __thread PerlValue s_dollar_at; /* $@ — zero-initialized = UNDEF per thread */
 
@@ -495,8 +496,10 @@ PerlArray *perl_caller(int level) {
 }
 
 void perl_eval_push(jmp_buf *jb) {
-    if (s_eval_depth < EVAL_STACK_MAX)
+    if (s_eval_depth < EVAL_STACK_MAX) {
+        s_eval_local_depth[s_eval_depth] = perl_local_save_depth();
         s_eval_stack[s_eval_depth++] = jb;
+    }
 }
 
 void perl_eval_pop(void) {
@@ -3301,6 +3304,9 @@ void perl_die(PerlValue *msg) {
             s_dollar_at.tag  = PERL_STRING;
             s_dollar_at.sval = strdup("Died");
         }
+        /* unwind local()s established since this eval block was entered,
+           mirroring Perl's dynamic-scope restore on exception unwind */
+        perl_local_restore_to(s_eval_local_depth[s_eval_depth - 1]);
         longjmp(*s_eval_stack[s_eval_depth - 1], 1);
     }
     char *s = msg ? perl_to_string_dup(msg) : strdup("Died");

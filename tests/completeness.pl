@@ -57,6 +57,26 @@ print show_H(), "\n";   # a=1,b=2
 }
 print show_H(), "\n";   # a=1,b=2  (restored)
 
+# local @arr / %hash scoped inside a sub (not just a bare block) — D3
+sub localize_G { local @G = (7, 8, 9); return show_G(); }
+print localize_G(), "\n";   # 7,8,9
+print show_G(), "\n";       # 1,2,3  (restored after sub returns)
+
+sub localize_H { local %H = (x => 10); return show_H(); }
+print localize_H(), "\n";   # x=10
+print show_H(), "\n";       # a=1,b=2  (restored after sub returns)
+
+# local @arr / %hash restored even when unwound via die/eval
+sub localize_and_die {
+    local @G = (0, 0, 0);
+    local %H = (z => 99);
+    die "boom\n";
+}
+eval { localize_and_die(); };
+print "caught: $@";
+print show_G(), "\n";   # 1,2,3  (restored despite die)
+print show_H(), "\n";   # a=1,b=2  (restored despite die)
+
 # ── 4. AUTOLOAD ──────────────────────────────────────────────────────────────
 package Magic;
 our $AUTOLOAD;   # package-level declaration

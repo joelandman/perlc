@@ -131,7 +131,11 @@
       "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/tier1_before)",
       "Bash(./tests/harness.sh tests/tier2.pl tests/wantarray_extended.pl tests/test_do_filename.pl)",
       "Bash(xargs ls -lt)",
-      "Bash(./tests/harness.sh tests/builtins.pl)"
+      "Bash(./tests/harness.sh tests/builtins.pl)",
+      "Bash(/home/joe/work/pc/perlc/perlc /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_local_global.pl -o /tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_local_global2)",
+      "Bash(/tmp/claude-1000/-home-joe-work-pc-perlc/c77599ee-297d-4967-b896-22cb0a82343b/scratchpad/t_local_global2)",
+      "Bash(./tests/harness.sh tests/completeness.pl)",
+      "Bash(./tests/harness.sh tests/completeness.pl tests/threads.pl tests/threads_atomic.pl tests/destroy.pl tests/builtins.pl)"
     ]
   }
 }

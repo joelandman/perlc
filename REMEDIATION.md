@@ -55,3 +55,8 @@ All issues have been fixed:
     - `codegen.cpp` array-chop branch now calls `perl_chop_array` instead of `perl_chomp_array`
     - Scalar `chop` return value now boxed via `perl_alloc_int` instead of leaking a bare int as `perlInt(0)`
     - Test coverage added to `tests/builtins.pl` (scalar and array forms); verified byte-for-byte against real perl via `tests/harness.sh`
+
+13. ~~**Fix D3: `local @arr`/`local %hash` silently no-op for function-scope variables**~~ — FIXED
+    - Root cause: `hasLocalStmt()` (codegen.cpp) — used both to decide whether a sub needs the local-depth save/restore alloca (`subNeedsLocal`) and whether a bare block needs it — only matched `NK::LocalStmt` (scalar `local $x`). Subs/blocks containing only `local @arr`/`local %hash` were classified as "no local() present," so `perl_local_save_array`/`perl_local_save_hash` pushed onto the runtime local-stack but the matching `perl_local_restore_to` at sub return was never emitted. Fixed by also matching `NK::LocalArray`/`NK::LocalHash`.
+    - Related defect found and fixed in the same pass: `perl_die()` (runtime.c) did a raw `longjmp` back to the enclosing `eval`'s setjmp point without ever calling `perl_local_restore_to`, so **any** `local` (scalar included) unwound via `die`/`eval` was never restored. Fixed by recording the local-stack depth at `perl_eval_push()` time (parallel `s_eval_local_depth[]` array) and restoring to it in `perl_die()` before the `longjmp`.
+    - Test coverage added to `tests/completeness.pl`: sub-scoped `local @arr`/`local %hash` (the original D3 symptom, not covered by the pre-existing bare-block test), plus a die/eval-unwind case for both. Verified byte-for-byte against real perl via `tests/harness.sh`.
