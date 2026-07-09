@@ -4439,15 +4439,23 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
         count++;
 
         if (mend == mstart) {
-            /* zero-length match: copy current char to prevent infinite loop */
-            if (pos < slen) { ENSURE(1); out[out_len++] = s[pos]; }
+            /* Zero-length match: copy the char at the match point (mstart),
+               not the old search-start `pos` — an anchor like $ can match
+               ahead of pos (e.g. at end-of-string), and the "text before
+               match" copy above already flushed s[pos..mstart) into out, so
+               re-copying s[pos] here would duplicate it. Copying the wrong
+               character also let `pos` end up as mstart+1 = slen+1 when the
+               match was exactly at end-of-string, underflowing the `slen -
+               pos` below (size_t wraps to ~SIZE_MAX) and corrupting the
+               heap via the resulting "huge remaining length" memcpy. */
+            if (mstart < slen) { ENSURE(1); out[out_len++] = s[mstart]; }
             pos = mstart + 1;
         } else {
             pos = mend;
         }
 
         if (!global) {
-            size_t rem = slen - pos;
+            size_t rem = (pos < slen) ? slen - pos : 0;
             ENSURE(rem); memcpy(out + out_len, s + pos, rem); out_len += rem; break;
         }
     }
