@@ -4264,7 +4264,19 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ArrayLit) {
             callCtx_ = 1;
             Value *rhsArr = emitArrayPtr(*n.right);
-            if (!rhsArr) rhsArr = emitExpr(*n.right);
+            if (!rhsArr) {
+                /* RHS collapsed to a bare scalar expression — e.g. `(10)` with
+                   no comma parses as just the inner IntLit, not an ArrayLit —
+                   but list-assignment context still treats it as a one-element
+                   list. Wrap it in a real PerlArray instead of passing a
+                   PerlValue* where perl_array_get_ref expects a PerlArray*
+                   (silent type confusion / OOB read otherwise). Matches the
+                   pattern already used for @arr=RHS and lvalue slices below. */
+                rhsArr = callRT("perl_array_new", {});
+                Value *v = emitExpr(*n.right);
+                callRT("perl_array_push", {rhsArr, v});
+                freeIfOwned(v);
+            }
             callCtx_ = 0;
             bool fromUnderbar = (n.right->kind == NK::ArrayVar && n.right->name == "_");
             for (size_t i = 0; i < n.left->args.size(); i++) {
