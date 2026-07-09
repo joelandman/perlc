@@ -5,8 +5,10 @@
 | Phase | Status | Description |
 |-------|--------|-------------|
 | Phase 0 | **COMPLETE** | Establish correctness gates: harness-as-gate policy, valgrind/TSan gates, expanded test coverage |
-| Phase 1 | **PENDING** | Fix all open defects D1-D16, B1 |
+| Phase 1 | **IN PROGRESS** | Fix all open defects — **see `TESTS.md` Defect Registry (re-verified 2026-07-09) for the current, accurate list**, not the stale D1-D16/B1 reference below. Original D1-D16/B1 mostly fixed/stale/not-applicable; 26 new defects found (10 CRITICAL, incl. 2 crashes), organized into a 10-item immediate-fix priority list. |
 | Phase 2 | **PENDING** | Re-architect optimization passes |
+
+**Correctness-first priority order** (per project direction: correctness → completeness → performance): the 10 CRITICAL defects in `TESTS.md` should be fixed before any further completeness or performance work, since several are crashes or silent-wrong-data bugs on extremely common Perl idioms (list-assignment unpacking, `foreach` aliasing, `sort`, chained autovivification).
 
 ---
 
@@ -33,19 +35,21 @@ See defect registry below. All items must be fixed before Phase 2 re-architectur
 
 ## Correctness Plans
 
-1. **Fix `NK::EvalBlock` LLVM codegen crash.** `eval { BLOCK }` produces invalid LLVM IR because `endBB` lacks a `ret` instruction — LLVM verify error: `Function return type does not match operand type of return inst! ret ptr %17 i32`. Fix: add `builder_.CreateRet(perlUndef())` after `perl_eval_pop` in the `endBB` block. This is a compiler crash blocking any program using block eval from compiling. Test: `tests/eval_exception.pl` currently fails.
+**Superseded 2026-07-09 — see `TESTS.md` Defect Registry for the current, accurate, actively-maintained list.** Items 1-4 below are historical (fixed/superseded); item 5 is stale (the gate it asks for already exists). Kept for history, not as an active plan.
 
-2. **Fix `require` caching bug.** `test_require_simple.pl` fails on `require_loads_named_sub` and `require_repeat_keeps_sub_available`. The runtime `require` does not properly register named subs from `.pm` files in the dispatch table. Fix: ensure `perl_runtime_require` adds subs to the code reference table so they're callable via dispatch. Test: `tests/test_require_simple.pl` currently fails.
+1. ~~**Fix `NK::EvalBlock` LLVM codegen crash.**~~ — FIXED (long since resolved; `eval_exception.pl` currently fails for an unrelated, newly-found reason — see `TESTS.md` D25, `return` inside nested `eval{}` compiling to `perl_die`).
 
-3. ~~**Fix compound `-=` on shared scalars.**~~ — FIXED (commit db7ba77)
+2. ~~**Fix `require` caching bug.**~~ — FIXED (`tests/test_require_simple.pl` currently passes in `tests/harness.sh`).
+
+3. ~~**Fix compound `-=` on shared scalars.**~~ — FIXED (commit db7ba77), re-verified 2026-07-09
     - Negate delta via `perl_to_float` → `fneg` → `boxF64` before `perl_atomic_add`
     - Test: `tests/regression_bugs.pl` `regression_multi_subtract` now passes
 
-4. ~~**Add `*=` `/=` `%=` atomic RMW for shared scalars.**~~ — FIXED (commit db7ba77)
+4. ~~**Add `*=` `/=` `%=` atomic RMW for shared scalars.**~~ — FIXED (commit db7ba77), re-verified 2026-07-09
     - Added `perl_atomic_rmw` runtime function with mutex protection
     - Codegen calls `perl_atomic_rmw` for `*=`, `/=`, `%=` on shared scalars
 
-5. **Add valgrind/memcheck verification to test harness.** No automated memory-safety gate exists. The PV slab allocator and PerlArray freelist pool hide leaks from standard tools. Add `make test-valgrind` that runs all 36 tests under `valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all`. Fix every reported leak (currently 4,096 bytes "still reachable" from PV slab at exit).
+5. ~~**Add valgrind/memcheck verification to test harness.**~~ — STALE, already done: `make test-valgrind` exists (see `Makefile`/`INSTRUCTIONS.md`) and runs the suite under `valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all`, skipping DBI/XS. Not re-run as part of this pass; re-verify leak status separately if memory safety work resumes.
 
 ## Completeness Plans
 

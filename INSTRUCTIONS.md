@@ -27,7 +27,7 @@ make test-opt-matrix  # Run harness at OPT_LEVEL 0, 2, 3
 ```
 
 ### Known Build Issues
-- LLVM 18 is incompatible with GCC 15/16 (not 13). If build fails with `__normal_iterator` errors, downgrade GCC to 13 or earlier.
+- **Verified 2026-07-09: NOT currently an issue.** `make clean && make` builds cleanly with g++ 15.2.0 + LLVM 18 on this system — `force_complete_std.h` already works around the `__normal_iterator` incomplete-type problem. If it resurfaces on a different GCC version, downgrading to GCC 13 or forcing complete libstdc++ containers earlier is the known workaround.
 - Do NOT use `-stdlib=libc++` — LLVM 18 was built with libstdc++ and mixing causes linker errors.
 - The `ast.cpp` file was created to move `Node::clone()` out of the header to fix template completeness issues.
 
@@ -222,36 +222,14 @@ The test runner eliminates the smoke test problem by providing external correctn
 
 ## Defects Summary
 
-See `TESTS.md` for the complete defect registry with IDs, locations, and fix tracking.
+**See `TESTS.md` for the complete, current defect registry** (fully re-verified 2026-07-09) — this section is a pointer, not a copy, to avoid drifting out of sync again. As of the last verification: D1/D2/D3/D5/D6/D13/D15 are FIXED or were already fixed and just undocumented; D9/D10/D16/B1's original descriptions were stale/not-applicable and have been replaced with accurate ones; and 26 previously-undocumented defects (D17-D44 numbering) were found, including several CRITICAL crashes and silent-wrong-data bugs. **Do not trust the D1-D16 list below** (kept only as a historical pointer) — read `TESTS.md`.
 
-### Critical Defects
-- **D1**: All numeric compound assignments on shared scalars go through `perl_atomic_add` — `-=` adds instead of subtracts, `*=` multiplies as addition
-- **D2**: `chop @arr` calls `perl_chomp_array` instead of removing last characters
-- **D3**: `local @arr` / `local %hash` silently no-ops for function-scope variables
-
-### High Severity Defects
-- **D5**: Closure + range-with-captured-variable emits `undef` bound
-- **D6**: `for (my $i = 0; ...)` C-style init is dead code
-- **D7**: `s///` without second `\x01` delimiter causes `npos` underflow
-- **D8**: `parseOrRhs` handles only small subset of statement keywords
-- **D9**: `lastSqrtInput_` never cleared, can match wrong variable
-
-### Build Blocker
-- **B1**: LLVM 18 + GCC 15/16 incompatibility — project cannot build on systems with GCC 15/16
+### Build Blocker — RESOLVED / stale
+- **B1** originally claimed LLVM 18 + GCC 15/16 incompatibility blocked the build. Verified NOT-APPLICABLE 2026-07-09: builds cleanly with g++ 15.2.0 + LLVM 18. See `TESTS.md` for the actual current toolchain documentation mismatch (this doc and `CLAUDE.md`/`README.md` used to disagree on LLVM 18 vs 21 — now reconciled to 18, the `Makefile`'s actual value).
 
 ## Test Coverage Gaps
 
-Features claimed to be implemented but have NO corresponding test:
-- `@{$href}{LIST}` hash-ref slices
-- `@{$aref}[LIST]` array-ref slices
-- `scalar(@{$ref})`
-- `$h{k}++` on missing keys
-- lvalue slices `@arr[i,j] = list`
-- `map { @$_ } @aoa` flattening
-- `next`/`last` with labels
-- `$Pkg::arr` / `$Pkg::hash` cross-package access
-- Carp module functions
-- `use parent -norequire`
+**See `TESTS.md`** — 9 of the original 10 "claimed but untested" items were verified working 2026-07-09 (still need smoke+deep tests written); Carp is confirmed broken (see D35/D36 in the registry), not just untested.
 
 ## Documentation Files
 
@@ -265,6 +243,8 @@ Features claimed to be implemented but have NO corresponding test:
 
 ## Source Files
 
+**Verified against actual `src/` contents 2026-07-09** — `src/jit.h/cpp` and `src/eval_jit.cpp` do NOT exist (removed with the JIT; this table was stale). Current files:
+
 | File | Role |
 |------|------|
 | `src/lexer.h/cpp` | Context-aware tokenizer |
@@ -272,9 +252,10 @@ Features claimed to be implemented but have NO corresponding test:
 | `src/parser.h/cpp` | Recursive-descent parser → AST |
 | `src/codegen.h/cpp` | AST → LLVM IR via IRBuilder |
 | `src/runtime.h/c` | C runtime: PerlValue tagged union + all operations |
-| `src/main.cpp` | Driver: lex → parse → codegen → clang link |
-| `src/jit.h/cpp` | JIT stub (non-functional, avoids LLVM header conflicts) |
-| `src/eval_jit.cpp` | String eval support |
+| `src/main.cpp` | Driver: lex → parse → codegen → clang-18 link |
+| `src/llvm_early_init.h/cpp` | One-time LLVM native-target init, called from `main.cpp` |
+
+String eval (`eval EXPR`) is a deliberate stub (sets `$@`, returns `undef`) — there is no JIT or separate eval-execution file anymore; `eval { BLOCK }` (exception handling) works via `setjmp`/`longjmp` directly in `codegen.cpp`/`runtime.c`.
 
 ## Perl Test File Requirements
 

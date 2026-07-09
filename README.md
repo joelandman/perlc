@@ -1,11 +1,11 @@
 # perlc — Perl to Native Binary Compiler
 
-A Perl compiler that translates Perl source to LLVM IR and links a C runtime to produce native executables. Written in C++17 using LLVM 21.
+A Perl compiler that translates Perl source to LLVM IR and links a C runtime to produce native executables. Written in C++17 using LLVM 18.
 
 ## Requirements
 
-- `g++-15` / `clang-22` (LLVM 21)
-- `llvm-config-21`
+- `g++` (any recent version; verified with 15.2.0) and `clang-18` (used to link generated programs)
+- `llvm-config-18`
 - `libpcre2-8` (`apt install libpcre2-dev`)
 - `libsqlite3-dev` (for DBI/SQLite integration, `apt install libsqlite3-dev`)
 
@@ -120,8 +120,8 @@ make clean
 
 ## Known Limitations
 
-- `wantarray`: context propagation implemented for list vs. scalar at call sites; `wantarray` builtin returns correct value within a sub
-- `tie` / `untie`: not implemented (use `opendir`/`readdir` for directories)
+- `wantarray`: context propagation implemented for list vs. scalar at most call sites, but NOT propagated into `print`/`printf` sub-call arguments (see `TESTS.md` D12); returns `0` instead of `undef` at top level (D43)
+- `tie` / `untie`: `TIESCALAR`/`TIEARRAY`/`TIEHASH` run at `tie` time, but **FETCH/STORE interception is not implemented** — tied variables behave as plain scalars on every subsequent read/write (see `TESTS.md` D44; use `opendir`/`readdir` for directories)
 - Regex modifier `x` (extended/whitespace-ignoring): not supported; `/e` (eval replacement) is supported
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
 - `exists $h{a}{b}` chained subscript without arrow: use `$h{a}->{b}` instead
