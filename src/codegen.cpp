@@ -3139,6 +3139,7 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.push_back(exit);
         loopContinues_.push_back(stepBB);
         loopRedos_.push_back(bodyBB);
+        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, stepBB, bodyBB});
 
         pushScope();
         if (n.init) emitStmt(*n.init);
@@ -3211,7 +3212,11 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.CreateBr(stepBB);
 
         builder_.SetInsertPoint(stepBB);
-        if (n.step) {
+        if (n.step && n.step->kind == NK::FlatBlock) {
+            /* comma-separated step (e.g. $i++, $j--) — run each item for its
+               side effect only, in the loop's own scope. */
+            for (auto &item : n.step->args) emitStmt(*item);
+        } else if (n.step) {
             /* Stage 26b: post/pre ++/-- on an unboxed int var — increment
                directly, skipping the dead alloc_int(old_val)+free round-trip. */
             bool handledStep = false;
@@ -3240,6 +3245,7 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.pop_back();
         loopContinues_.pop_back();
         loopRedos_.pop_back();
+        if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
         if (hoistedArgs) callRT("perl_array_free", {hoistedArgs});
         popScope();  /* free for-init pvs (e.g. my $i) at loop exit */
@@ -4155,8 +4161,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *cur = builder_.CreateLoad(i64, ia);
                     bool isInc = (n.sval == "pre++" || n.sval == "post++");
                     Value *delta = ConstantInt::get(i64, isInc ? 1 : -1);
-                    Value *next = isInc ? builder_.CreateAdd(cur, delta, "preinc")
-                                       : builder_.CreateSub(cur, delta, "predec");
+                    Value *next = builder_.CreateAdd(cur, delta, isInc ? "preinc" : "predec");
                     builder_.CreateStore(next, ia);
                     bool isPre = (n.sval == "pre++" || n.sval == "pre--");
                     return boxI64(isPre ? next : cur);
@@ -6033,11 +6038,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         collectAllScalarNames(*n.body, usedNames);
         std::vector<std::string> captureNames;
         std::vector<Value*>      captureVals;   /* PerlValue* loaded from outer alloca */
+        std::vector<char>        captureSigils; /* '$'/'@'/'%' — how to re-declare on the other side */
         for (auto &nm : usedNames) {
             if (nm == "_") continue;
             if (auto *slot = lookupVar(nm)) {
                 captureNames.push_back(nm);
                 captureVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
+                captureSigils.push_back('$');
             } else {
                 /* Check int/float unboxed scopes — unboxed vars are stored
                    in intScopes_/floatScopes_, not in scopes_.  We need to
@@ -6051,6 +6058,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
                     captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
+                    captureSigils.push_back('$');
                 } else if (Value *fa = lookupFloatVar(nm)) {
                     Value *fval = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
                     Value *boxed = boxF64(fval);
@@ -6058,7 +6066,37 @@ Value *CodeGen::emitExpr(const Node &n) {
                     builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
                     captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
+                    captureSigils.push_back('$');
                 }
+            }
+        }
+        /* Arrays/hashes referenced inside a closure aren't reachable through
+           collectAllScalarNames (they're @/%  sigil, and many builtins like
+           push/keys/splice reference the array/hash purely by n.name rather
+           than a nested ArrayVar/HashVar child, so a used-name AST walk would
+           be an incomplete allowlist and risk silently dropping a capture).
+           Instead, capture every block-scoped array/hash currently visible —
+           file-scope @arr/%h don't need capturing (already reachable via
+           fileArrayGlobals_/fileHashGlobals_ globals). Over-capturing here is
+           just a few extra cheap pointer boxes; under-capturing silently
+           detaches the closure's view of the array from the caller's. */
+        {
+            std::unordered_map<std::string, Value*> visibleArrays;
+            for (auto &scope : arrayScopes_)
+                for (auto &kv : scope) visibleArrays[kv.first] = kv.second;
+            for (auto &kv : visibleArrays) {
+                if (kv.first == "_") continue;
+                captureNames.push_back(kv.first);
+                captureVals.push_back(callRT("perl_ref_array", {kv.second}));
+                captureSigils.push_back('@');
+            }
+            std::unordered_map<std::string, Value*> visibleHashes;
+            for (auto &scope : hashScopes_)
+                for (auto &kv : scope) visibleHashes[kv.first] = kv.second;
+            for (auto &kv : visibleHashes) {
+                captureNames.push_back(kv.first);
+                captureVals.push_back(callRT("perl_ref_hash", {kv.second}));
+                captureSigils.push_back('%');
             }
         }
 
@@ -6096,14 +6134,20 @@ Value *CodeGen::emitExpr(const Node &n) {
             localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
         }
-        /* Phase 3: initialise captured variables as local allocas */
+        /* Phase 3: initialise captured variables in the closure's own scope */
         auto i64Ty = Type::getInt64Ty(ctx_);
         for (size_t i = 0; i < captureNames.size(); i++) {
             Value *pv = callRT("perl_get_capture",
                                {ConstantInt::get(i64Ty, (long long)i)});
-            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, captureNames[i]);
-            builder_.CreateStore(pv, alloca);
-            declareVar(captureNames[i], alloca);
+            if (captureSigils[i] == '@') {
+                declareArray(captureNames[i], callRT("perl_deref_array_ro", {pv}));
+            } else if (captureSigils[i] == '%') {
+                declareHash(captureNames[i], callRT("perl_deref_hash", {pv}));
+            } else {
+                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, captureNames[i]);
+                builder_.CreateStore(pv, alloca);
+                declareVar(captureNames[i], alloca);
+            }
         }
         currentSubBody_ = n.body.get();
         /* Always emit cleanup + return so that perl_local_restore_to fires on

@@ -408,27 +408,41 @@ NodePtr Parser::parseFor() {
         if (hasSemi) {
             /* C-style: for (init; cond; step) { } */
             consume(TK::LPAREN, "(");
+            /* comma-separated items (the C comma operator) are supported in
+               both init and step, e.g. for ($i=0,$j=10; ...; $i++,$j--).
+               Each item is either a `my`/`our` declaration or a plain expr;
+               parseMy() consumes its own trailing ';' when present, so an
+               extra match(SEMI) after the loop is always safe (no-op if
+               already consumed). Multiple items collect into a FlatBlock,
+               which emitStmt() runs in the loop's own scope (no new scope). */
+            auto parseForItem = [&]() -> NodePtr {
+                if (check(TK::KW_MY) || check(TK::KW_OUR)) return parseMy();
+                return parseExpr();
+            };
+            auto collectCommaSeq = [&](NodePtr first) -> NodePtr {
+                if (!check(TK::COMMA)) return first;
+                NodeList items;
+                items.push_back(std::move(first));
+                while (match(TK::COMMA)) items.push_back(parseForItem());
+                auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock;
+                fb->args = std::move(items); fb->line = line;
+                return fb;
+            };
+
             NodePtr init;
             if (!check(TK::SEMI)) {
-                if (check(TK::KW_MY) || check(TK::KW_OUR)) {
-                    /* parse my $x = ... without consuming semi */
-                    init = parseMy();
-                    /* parseMy consumed the semi already — we need the second one */
-                    /* Actually parseMy ends with SEMI consumed. Undo by re-inserting */
-                    /* Simpler: parseMy eats ';'. For C-for, don't call parseMy. */
-                    /* We handle this: parseMy below won't eat semi if we intercept */
-                    /* Let's just parse as expr instead */
-                } else {
-                    init = parseExpr(); match(TK::SEMI);
-                }
-            } else match(TK::SEMI);
+                init = collectCommaSeq(parseForItem());
+            }
+            match(TK::SEMI);
 
             NodePtr cond;
             if (!check(TK::SEMI)) { cond = parseExpr(); }
             match(TK::SEMI);
 
             NodePtr step;
-            if (!check(TK::RPAREN)) { step = parseExpr(); }
+            if (!check(TK::RPAREN)) {
+                step = collectCommaSeq(parseExpr());
+            }
             consume(TK::RPAREN, ")");
             auto body = parseBlock();
 
