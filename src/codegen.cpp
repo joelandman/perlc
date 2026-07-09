@@ -3503,10 +3503,11 @@ void CodeGen::emitStmt(const Node &n) {
             }
         }
 
-        /* loop variable — stable PerlValue* in alloca */
+        /* loop variable — Perl foreach aliases $_/the loop var to each element
+           in turn, so mutating it (or $_) writes back to the source array.
+           The alloca's *contents* (which PerlValue* it points at) change every
+           iteration to the array's own element cell — never a private copy. */
         auto *loopVar = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
-        Value *loopPv = perlUndef();
-        builder_.CreateStore(loopPv, loopVar);
 
         /* index counter */
         auto *idxAlloca = builder_.CreateAlloca(i64, nullptr, "foreach.idx");
@@ -3532,9 +3533,11 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.SetInsertPoint(bodyBB);
         pushScope();
         declareVar(n.name, loopVar);
-        Value *elem = callRT("perl_array_get", {tmpArr, idx});
-        callRT("perl_assign", {loopPv, elem});
-        callRT("perl_free", {elem});
+        /* Borrow (no clone) the array's own element cell — this IS the
+           aliasing: any perl_assign / ++ / etc. on the loop var mutates
+           the array in place. Never free the result (borrow contract). */
+        Value *elemRef = callRT("perl_array_get_ref", {tmpArr, idx});
+        builder_.CreateStore(elemRef, loopVar);
 
         emitBlock(*n.body);
         popScope();
@@ -3551,7 +3554,6 @@ void CodeGen::emitStmt(const Node &n) {
         loopRedos_.pop_back();
         if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
-        callRT("perl_free", {loopPv});
         if (ownsTmpArr) callRT("perl_array_free", {tmpArr});
         break;
     }
