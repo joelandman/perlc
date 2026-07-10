@@ -1091,6 +1091,15 @@ int perl_is_true(const PerlValue *v) {
 
 HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!dst) return;
+    /* Self-assignment ($x = $x, or die $@ where $@ IS the dst cell since
+       perl_get_dollar_at() returns the live global's address, not a copy)
+       is always a correct no-op — the value is already right. Below, the
+       STRING/FLAT_ARRAY paths free dst's old payload before reading src's,
+       and when dst==src that free() invalidates src too (same pointer),
+       so the later strdup/memcpy from the just-freed/NULLed src crashes.
+       Handling it here once, rather than case-by-case in every tag branch
+       below, closes the whole class of ordering bugs at once. */
+    if (dst == src) return;
     int shared = dst->flags & PV_FLAG_SHARED;
     /* No implicit mutex here — caller must hold lock() for concurrent safety.
        Locking inside perl_assign would deadlock when lock() is already held.
@@ -1532,7 +1541,11 @@ void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
            into the target slot without allocating+freeing an intermediate undef. */
         while (a->len < idx) a->elems[a->len++] = perl_alloc_undef();
         a->elems[a->len++] = perl_clone(v);
-    } else {
+    } else if (a->elems[idx] != v) {
+        /* Self-assignment ($a[i] = $a[i], e.g. via a borrowed-read RHS that
+           points at the same slot) must be a no-op — freeing the old slot
+           before cloning v would read v from memory it just freed, since
+           v IS that slot's pointer. Same bug class as perl_assign. */
         perl_free(a->elems[idx]);
         a->elems[idx] = perl_clone(v);
     }
@@ -1986,8 +1999,12 @@ void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
     unsigned int b = hash_str(ks);
     PerlHashEntry *e = hash_find(h, ks);
     if (e) {
-        perl_free(e->val);
-        e->val = perl_clone(val);
+        /* Self-assignment ($h{k} = $h{k}) must be a no-op — see the
+           identical fix/comment in perl_array_set. */
+        if (e->val != val) {
+            perl_free(e->val);
+            e->val = perl_clone(val);
+        }
         free(ks);
     } else {
         PerlHashEntry *ne = malloc(sizeof *ne);
@@ -2003,8 +2020,12 @@ HOTX void perl_hash_set_str(PerlHash *h, const char *key, PerlValue *val) {
     unsigned int b = hash_str(key);
     PerlHashEntry *e = hash_find(h, key);
     if (e) {
-        perl_free(e->val);
-        e->val = perl_clone(val);
+        /* Self-assignment ($h{k} = $h{k}) must be a no-op — see the
+           identical fix/comment in perl_array_set. */
+        if (e->val != val) {
+            perl_free(e->val);
+            e->val = perl_clone(val);
+        }
     } else {
         PerlHashEntry *ne = malloc(sizeof *ne);
         ne->key  = strdup(key);
@@ -5142,10 +5163,21 @@ PerlValue *perl_su_looks_like_number(PerlValue *v) {
 /* ── Carp ─────────────────────────────────────────────────────────────────── */
 
 void perl_carp_croak(PerlArray *args) {
-    char *msg = (args && args->len > 0) ? perl_to_string_dup(args->elems[0]) : strdup("Died");
-    fprintf(stderr, "%s\n", msg);
-    free(msg);
-    exit(1);
+    /* Route through perl_die (not fprintf+exit) so `eval { croak(...) }` —
+       the standard Carp usage pattern for turning a library error into a
+       catchable exception — actually catches it instead of killing the
+       whole process. perl_die already has the correct dual behavior:
+       longjmp to the nearest eval (setting $@) if one is active, or print
+       to stderr and exit(1) at top level if not. perl_die only reads its
+       argument (via perl_assign / perl_to_string_dup, both of which clone
+       rather than take ownership), so passing a borrowed array element or
+       a stack-local PerlValue here is safe either way. */
+    if (args && args->len > 0) {
+        perl_die(args->elems[0]);
+    } else {
+        PerlValue died = { .tag = PERL_STRING, .sval = (char *)"Died" };
+        perl_die(&died);
+    }
 }
 
 void perl_carp_carp(PerlArray *args) {
