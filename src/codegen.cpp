@@ -803,6 +803,70 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                               PointerType::getUnqual(ctx_));
             return callRT("perl_sort_custom", {av, fnPtr});
         }
+        else if (mode == "subname" && !n.name.empty()) {
+            /* sort SUBNAME LIST — named comparator sub, no braces. Unlike
+               the `custom` block above (whose body is inlined directly
+               into the wrapper comparator function, so $a/$b can just be
+               local allocas in that same function), SUBNAME is a
+               separately-compiled top-level function with its own fresh
+               scope — it can only see $a/$b if they're file-scope globals,
+               matching Perl's actual semantics ($a/$b are package globals
+               for the duration of a sort). */
+            auto *fn = mod_->getFunction(subLLVMName(n.name));
+            if (!fn) { /* sub not found (e.g. forward reference) — fall back */
+                Value *copy = callRT("perl_sort_str_asc", {av}); return copy;
+            }
+            auto ensureGlobalScalar = [&](const std::string &nm) -> Value * {
+                auto it = fileScalarGlobals_.find(nm);
+                if (it != fileScalarGlobals_.end()) return it->second;
+                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    GlobalValue::InternalLinkage, Constant::getNullValue(perlPtrTy_), "g." + nm);
+                builder_.CreateStore(perlUndef(), gv);
+                fileScalarGlobals_[nm] = gv;
+                return gv;
+            };
+            Value *gA = ensureGlobalScalar("a");
+            Value *gB = ensureGlobalScalar("b");
+
+            static int sortCmpSubCounter = 0;
+            std::string cmpName = "__sort_cmp_sub_" + std::to_string(sortCmpSubCounter++);
+            auto *i64TySn = Type::getInt64Ty(ctx_);
+            auto *cmpFTsn = FunctionType::get(i64TySn, {perlPtrTy_, perlPtrTy_}, false);
+            auto *cmpFnSn = Function::Create(cmpFTsn, Function::InternalLinkage,
+                                             cmpName, mod_.get());
+
+            auto *savedFnSn = currentFn_;
+            auto *savedBBsn = builder_.GetInsertBlock();
+
+            auto *cmpEntrySn = BasicBlock::Create(ctx_, "entry", cmpFnSn);
+            builder_.SetInsertPoint(cmpEntrySn);
+            currentFn_ = cmpFnSn;
+
+            Value *argASn = cmpFnSn->getArg(0);
+            Value *argBSn = cmpFnSn->getArg(1);
+            Value *aCell = builder_.CreateLoad(perlPtrTy_, gA, "a.cell");
+            Value *bCell = builder_.CreateLoad(perlPtrTy_, gB, "b.cell");
+            callRT("perl_assign", {aCell, argASn});
+            callRT("perl_assign", {bCell, argBSn});
+
+            /* SUBNAME() is called with no args (real Perl: $a/$b are read
+               as package globals inside the sub, not passed via @_), in
+               scalar context (a comparator returns one number). */
+            Value *emptyArgsSn = callRT("perl_array_new", {});
+            auto *i32TySn = Type::getInt32Ty(ctx_);
+            Value *scalarCtxSn = ConstantInt::get(i32TySn, 0);
+            Value *cmpCallResult = builder_.CreateCall(fn, {emptyArgsSn, scalarCtxSn});
+            callRT("perl_array_free", {emptyArgsSn});
+            Value *rvSn = callRT("perl_to_int", {cmpCallResult});
+            freeIfOwned(cmpCallResult);
+            builder_.CreateRet(rvSn);
+
+            currentFn_ = savedFnSn;
+            builder_.SetInsertPoint(savedBBsn);
+
+            Value *fnPtrSn = builder_.CreateBitCast(cmpFnSn, PointerType::getUnqual(ctx_));
+            return callRT("perl_sort_custom", {av, fnPtrSn});
+        }
         else { /* default: sort a copy lexicographically */
             Value *copy = callRT("perl_sort_str_asc", {av}); return copy;
         }

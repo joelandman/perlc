@@ -2052,6 +2052,29 @@ NodePtr Parser::parsePrimary() {
                 sortMode = "custom";
             }
         }
+        /* sort SUBNAME LIST — named comparator sub, no braces. Disambiguate
+           from "sort LIST-EXPR" (where the list happens to start with a
+           bareword, e.g. a constant) using the same rule real Perl uses:
+           ANY bareword immediately after `sort` (not a comma/fat-arrow/
+           semicolon/EOF right after it) is SUBNAME, and everything
+           following — including `(...)` — is parsed as the LIST via the
+           normal dispatch below. This is NOT "call the bareword as a
+           function": `sort get_nums()` sorts an EMPTY list (SUBNAME +
+           empty parenthesized list) in real Perl, not the result of
+           calling get_nums() — confirmed directly against real Perl
+           (`sort get_nums()` → (), `sort get_nums(9,9)` → sorts (9,9)
+           using get_nums as the comparator). A bareword followed by
+           `,`/`=>`/`;`/EOF is just a plain list element/string instead. */
+        std::string sortSubName;
+        if (sortMode.empty() && check(TK::IDENT)) {
+            TK nextTk = pos_ + 1 < (int)toks_.size() ? toks_[pos_ + 1].kind : TK::EOF_TOK;
+            if (nextTk != TK::COMMA && nextTk != TK::FATARROW &&
+                nextTk != TK::SEMI && nextTk != TK::EOF_TOK) {
+                sortSubName = cur().text;
+                advance();
+                sortMode = "subname";
+            }
+        }
         NodeList elems;
         /* sort (list) or sort list-expr */
         if (check(TK::KW_KEYS) || check(TK::KW_VALUES)) {
@@ -2059,14 +2082,14 @@ NodePtr Parser::parsePrimary() {
             inner->sval = "sort";
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
             n->left = std::move(inner); n->sval = sortMode; n->line = line;
-            n->body = std::move(sortBlock);
+            n->body = std::move(sortBlock); n->name = sortSubName;
             return n;
         }
         if (check(TK::ARRAY)) {
             auto inner = parsePrimary();
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
             n->left = std::move(inner); n->sval = sortMode; n->line = line;
-            n->body = std::move(sortBlock);
+            n->body = std::move(sortBlock); n->name = sortSubName;
             return n;
         }
         if (check(TK::LPAREN) || check(TK::QWORDS)) {
@@ -2097,12 +2120,12 @@ NodePtr Parser::parsePrimary() {
             auto inner = parseExpr();
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
             n->left = std::move(inner); n->sval = sortMode; n->line = line;
-            n->body = std::move(sortBlock);
+            n->body = std::move(sortBlock); n->name = sortSubName;
             return n;
         }
         auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
         n->args = std::move(elems); n->sval = sortMode; n->line = line;
-        n->body = std::move(sortBlock);
+        n->body = std::move(sortBlock); n->name = sortSubName;
         return n;
     }
 
