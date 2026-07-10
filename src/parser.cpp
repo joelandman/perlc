@@ -2083,6 +2083,22 @@ NodePtr Parser::parsePrimary() {
                 }
                 consume(TK::RPAREN, ")");
             }
+        } else if (!check(TK::SEMI) && !check(TK::RBRACE) && !check(TK::RPAREN) &&
+                   !check(TK::EOF_TOK) && !isModifier()) {
+            /* sort LIST-EXPR — any other list-producing expression not
+               special-cased above: sort grep{...}@arr, sort map{...}@arr,
+               sort some_func(), sort reverse @arr, etc. Previously fell
+               through with `elems` never populated, silently becoming
+               sort() (an empty list, no error). Parse it as a single
+               expression and let it flow through n->left the same way
+               `sort keys %h` / `sort @arr` already do — emitArrayPtr's
+               existing GrepFunc/MapFunc/Call/etc. cases pick it up from
+               there with no codegen changes needed. */
+            auto inner = parseExpr();
+            auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
+            n->left = std::move(inner); n->sval = sortMode; n->line = line;
+            n->body = std::move(sortBlock);
+            return n;
         }
         auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
         n->args = std::move(elems); n->sval = sortMode; n->line = line;
