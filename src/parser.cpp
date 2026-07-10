@@ -582,8 +582,22 @@ NodePtr Parser::parseMy() {
         if (rhs) {
             NodeList lhsList;
             for (auto &vd : allVars) {
-                /* strip sigil for LHS — same as old code using makeScalar */
-                lhsList.push_back(makeScalar(vd.name, line));
+                /* Preserve sigil: a trailing @rest/%rest in the LHS list
+                   must reach codegen as an ArrayVar/HashVar (not a stripped
+                   ScalarVar) so perl_assign's per-index loop can recognize
+                   it and slurp the remaining RHS elements instead of trying
+                   to bind a same-named scalar that was never declared. */
+                if (vd.sigil == "@") {
+                    auto av = std::make_unique<Node>(); av->kind = NK::ArrayVar;
+                    av->name = vd.name; av->line = line;
+                    lhsList.push_back(std::move(av));
+                } else if (vd.sigil == "%") {
+                    auto hv = std::make_unique<Node>(); hv->kind = NK::HashVar;
+                    hv->name = vd.name; hv->line = line;
+                    lhsList.push_back(std::move(hv));
+                } else {
+                    lhsList.push_back(makeScalar(vd.name, line));
+                }
             }
             auto lhsArr = std::make_unique<Node>(); lhsArr->kind = NK::ArrayLit;
             lhsArr->args = std::move(lhsList); lhsArr->line = line;

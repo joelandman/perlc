@@ -1566,6 +1566,14 @@ void perl_array_extend(PerlArray *dst, PerlArray *src) {
         perl_array_push(dst, src->elems[i]);
 }
 
+/* Like perl_array_extend, but starting at src[start] — used for the
+ * trailing @rest/%rest slurp in list assignment (my ($a,$b,@rest) = LIST). */
+void perl_array_extend_from(PerlArray *dst, PerlArray *src, long long start) {
+    if (start < 0) start = 0;
+    for (long long i = start; i < src->len; i++)
+        perl_array_push(dst, src->elems[i]);
+}
+
   void perl_array_extend_hash(PerlArray *dst, PerlHash *h) {
     for (int i = 0; i < PERL_HASH_BUCKETS; i++) {
         for (PerlHashEntry *e = h->buckets[i]; e; e = e->next) {
@@ -2238,8 +2246,17 @@ PerlValue *perl_hash_size(PerlHash *h) {
 }
 
 void perl_hash_from_list(PerlHash *h, PerlArray *list) {
-    for (long long i = 0; i + 1 < list->len; i += 2)
+    long long i;
+    for (i = 0; i + 1 < list->len; i += 2)
         perl_hash_set_sv(h, list->elems[i], list->elems[i + 1]);
+    /* Odd number of elements: Perl still assigns the trailing unpaired key,
+       with an undef value (and a "Odd number of elements" warning at
+       runtime, which perlc does not currently emit — no warnings system). */
+    if (i < list->len) {
+        PerlValue *undef = perl_alloc_undef();
+        perl_hash_set_sv(h, list->elems[i], undef);
+        perl_free(undef);
+    }
 }
 
 /* ── references ──────────────────────────────────────────────────────────── */

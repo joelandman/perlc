@@ -186,6 +186,7 @@ void perl_array_replace(PerlArray *dst, PerlArray *src);
 PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n);
 void       perl_array_sort_str(PerlArray *a);
 void       perl_array_extend(PerlArray *dst, PerlArray *src);
+void       perl_array_extend_from(PerlArray *dst, PerlArray *src, long long start); /* dst += src[start..] */
 PerlValue *perl_array_shift(PerlArray *a);
 void       perl_array_unshift(PerlArray *a, PerlValue *v);
 void       perl_print_array(PerlArray *a); /* print all elements with $, between them */

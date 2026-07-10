@@ -239,6 +239,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_assign_slice",   voidTy, av, av, av);
     RT("perl_array_sort_str",   voidTy, av);
     RT("perl_array_extend",     voidTy, av, av);
+    RT("perl_array_extend_from",voidTy, av, av, i64);
     RT("perl_array_extend_hash",voidTy, av, av);
     RT("perl_array_push_list_or_scalar", voidTy, av, pv);
     RT("perl_array_shift",      pv,  av);
@@ -4282,6 +4283,27 @@ Value *CodeGen::emitExpr(const Node &n) {
             callCtx_ = 0;
             bool fromUnderbar = (n.right->kind == NK::ArrayVar && n.right->name == "_");
             for (size_t i = 0; i < n.left->args.size(); i++) {
+                /* Trailing @rest / %rest — slurps every remaining RHS element
+                   (Perl list-assignment semantics: an array/hash in the LHS
+                   list consumes the rest of the list, not just one item). */
+                if (n.left->args[i]->kind == NK::ArrayVar) {
+                    if (Value *targetAv = lookupArray(n.left->args[i]->name)) {
+                        callRT("perl_array_clear", {targetAv});
+                        Value *startIdx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
+                        callRT("perl_array_extend_from", {targetAv, rhsArr, startIdx});
+                    }
+                    continue;
+                }
+                if (n.left->args[i]->kind == NK::HashVar) {
+                    if (Value *targetHv = lookupHash(n.left->args[i]->name)) {
+                        Value *tmpArr = callRT("perl_array_new", {});
+                        Value *startIdx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
+                        callRT("perl_array_extend_from", {tmpArr, rhsArr, startIdx});
+                        callRT("perl_hash_from_list", {targetHv, tmpArr});
+                        callRT("perl_array_free", {tmpArr});
+                    }
+                    continue;
+                }
                 /* Stage 25: pre-promoted @_ arg — check BEFORE emitLValue to prevent
                    auto-vivification of a PV for a variable that has only an unboxed alloca. */
                 if (fromUnderbar && n.left->args[i]->kind == NK::ScalarVar) {
