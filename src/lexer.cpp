@@ -157,16 +157,17 @@ Token Lexer::readRegex() {
         char c = src_[pos_];
         if (c == '/') { pos_++; break; }
         if (c == '\\' && pos_ + 1 < src_.size()) {
-            char nxt = src_[pos_ + 1];
-            if (nxt == '\\') {
-                /* \\ in source → single \ in pattern (Perl regex semantics) */
-                pattern += '\\';
-                pos_ += 2;
-            } else {
-                pattern += c;
-                pattern += src_[++pos_];
-                pos_++;
-            }
+            /* Pass every backslash-escaped sequence through to PCRE2
+               unchanged (both characters) — \\ (literal backslash), \d
+               (digit class), \s, \/ (escaped delimiter — redundant but
+               harmless for PCRE2, which allows backslash-escaping any
+               non-alphanumeric character), etc. PCRE2 does its own escape
+               interpretation; the lexer must not pre-collapse \\ to a
+               single \, or a pattern like /a\\d/ (literal backslash then
+               "d") silently becomes /a\d/ (digit metaclass) instead. */
+            pattern += c;
+            pattern += src_[++pos_];
+            pos_++;
             continue;
         }
         if (c == '\n') line_++;
