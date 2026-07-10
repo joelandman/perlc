@@ -206,6 +206,17 @@ private:
     llvm::Value *emitBinOp(const Node &n);
     llvm::Value *emitCall(const Node &n);
     llvm::Value *emitLValue(const Node &n); /* returns alloca */
+    /* Recursively resolve (autovivifying every missing intermediate level)
+       the container that `node` — a chain of HashElem/ArrayElem/ArrowDeref
+       subscripts — refers to. `wantHash` says whether the container at
+       node's own level should end up a PerlHash* (true) or PerlArray*
+       (false), i.e. what the *next* outer subscript needs. Returns nullptr
+       if the root variable isn't found. Used for $h{a}{b}{c}=val chains of
+       arbitrary depth (2-level chains happened to work before because they
+       bottom out directly at a HashElem/ArrayElem; 3+ levels didn't, because
+       the base of the outer ArrowDeref is itself another ArrowDeref, which
+       wasn't recursed into). */
+    llvm::Value *emitAutovivContainer(const Node &node, bool wantHash);
     void   emitSub(const Node &n);
 
     llvm::Value *callRT(const std::string &name,

@@ -1105,6 +1105,21 @@ static llvm::Value *constKeyPtr(const Node &n, llvm::IRBuilder<> &builder) {
     return nullptr;
 }
 
+/* True iff an ArrowDeref chain is rooted in a %hash/@array element
+ * (e.g. $h{a}{b}{c}, $a[0]{x}[1]) rather than a bare scalar/ref expression
+ * (e.g. $ref->[0][1]). Distinguishes "needs recursive autoviv through
+ * perl_(hash|array)_autoviv_*" (the only path that knows how to create a
+ * missing intermediate level) from "chain already bottoms out at a real
+ * ref/FLAT_ARRAY value that just needs a normal, non-autovivifying deref"
+ * (which must keep using the FLAT_ARRAY-aware fallback — the autoviv_*
+ * runtime helpers only recognize the PERL_REF_ARRAY/PERL_REF_HASH tags and
+ * would silently blow away an existing FLAT_ARRAY-tagged inner array). */
+static bool isElemRootedChain(const Node &n) {
+    if (n.kind == NK::HashElem || n.kind == NK::ArrayElem) return true;
+    if (n.kind == NK::ArrowDeref) return isElemRootedChain(*n.left);
+    return false;
+}
+
 Value *CodeGen::emitHashGetRef(Value *hv, const Node &keyNode) {
     if (Value *kp = constKeyPtr(keyNode, builder_))
         return callRT("perl_hash_get_str_ref", {hv, kp});
@@ -4473,6 +4488,17 @@ Value *CodeGen::emitExpr(const Node &n) {
                     callRT("perl_array_set", {innerAv, idx, rhs});
                     return rhs;
                 }
+                /* autovivify $h{a}{b}[i] = val or deeper chains — base is
+                   itself another ArrowDeref rooted in a hash/array element
+                   (2+ levels before this one). A scalar-ref-rooted chain
+                   like $ref->[0][1] is NOT routed here — it must keep using
+                   the FLAT_ARRAY-aware fallback below. */
+                if (n.left->left->kind == NK::ArrowDeref && isElemRootedChain(*n.left->left)) {
+                    Value *innerAv = emitAutovivContainer(*n.left->left, false);
+                    if (!innerAv) return perlUndef();
+                    callRT("perl_array_set", {innerAv, idx, rhs});
+                    return rhs;
+                }
                 /* regular $ref->[i] = val */
                 Value *base = emitExpr(*n.left->left);
                 /* Check DerefAV cache for base variable */
@@ -4542,6 +4568,14 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (!av) return perlUndef();
                     Value *outerIdx = emitIdx(*n.left->left->left);
                     hv = callRT("perl_array_autoviv_hash", {av, outerIdx});
+                } else if (n.left->left->kind == NK::ArrowDeref && isElemRootedChain(*n.left->left)) {
+                    /* $h{a}{b}{c} = val or deeper chains — base is itself
+                       another ArrowDeref rooted in a hash/array element
+                       (2+ levels before this one). A scalar-ref-rooted
+                       chain like $ref->{a}{b} falls to the plain-deref
+                       branch below instead, unchanged. */
+                    hv = emitAutovivContainer(*n.left->left, true);
+                    if (!hv) return perlUndef();
                 } else {
                     Value *base = emitExpr(*n.left->left);
                     hv = callRT("perl_deref_hash", {base});
@@ -6465,6 +6499,55 @@ Value *CodeGen::emitExpr(const Node &n) {
     default:
         return perlUndef();
     }
+}
+
+Value *CodeGen::emitAutovivContainer(const Node &node, bool wantHash) {
+    if (node.kind == NK::HashElem) {
+        Value *outerHv = lookupHash(node.name);
+        if (!outerHv) return nullptr;
+        const char *hashFn  = wantHash ? "perl_hash_autoviv_hash"    : "perl_hash_autoviv_array";
+        const char *hashFnSv= wantHash ? "perl_hash_autoviv_hash_sv" : "perl_hash_autoviv_array_sv";
+        if (Value *kp = constKeyPtr(*node.left, builder_))
+            return callRT(hashFn, {outerHv, kp});
+        Value *key = emitExpr(*node.left);
+        Value *result = callRT(hashFnSv, {outerHv, key});
+        freeIfOwned(key);
+        return result;
+    }
+    if (node.kind == NK::ArrayElem) {
+        Value *outerAv = lookupArray(node.name);
+        if (!outerAv) return nullptr;
+        Value *idx = emitIdx(*node.left);
+        return callRT(wantHash ? "perl_array_autoviv_hash" : "perl_array_autoviv_array",
+                       {outerAv, idx});
+    }
+    if (node.kind == NK::ArrowDeref) {
+        bool innerWantHash = (node.sval == "hash");
+        Value *container = emitAutovivContainer(*node.left, innerWantHash);
+        if (!container) return nullptr;
+        if (innerWantHash) {
+            const char *hashFn   = wantHash ? "perl_hash_autoviv_hash"    : "perl_hash_autoviv_array";
+            const char *hashFnSv = wantHash ? "perl_hash_autoviv_hash_sv" : "perl_hash_autoviv_array_sv";
+            if (Value *kp = constKeyPtr(*node.right, builder_))
+                return callRT(hashFn, {container, kp});
+            Value *key = emitExpr(*node.right);
+            Value *result = callRT(hashFnSv, {container, key});
+            freeIfOwned(key);
+            return result;
+        }
+        Value *idx = emitIdx(*node.right);
+        return callRT(wantHash ? "perl_array_autoviv_hash" : "perl_array_autoviv_array",
+                       {container, idx});
+    }
+    /* Base case: a plain ref-producing expression (e.g. a $scalar variable
+       holding a ref already). Matches the pre-existing fallback behavior
+       used elsewhere for `$ref->{k} = val` / `$ref->[i] = val` on a bare
+       scalar base — NOT full autoviv-from-undef-scalar (a separate, deeper
+       gap: TESTS.md D50), just a normal deref of whatever's there. */
+    Value *base = emitExpr(node);
+    Value *result = callRT(wantHash ? "perl_deref_hash" : "perl_deref_array", {base});
+    freeIfOwned(base);
+    return result;
 }
 
 Value *CodeGen::emitLValue(const Node &n) {
