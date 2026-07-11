@@ -3680,6 +3680,22 @@ void CodeGen::emitStmt(const Node &n) {
         } else {
             v = n.left ? emitExpr(*n.left) : perlUndef();
         }
+        /* `return` inside eval{} exits just that eval block with this value
+           (real Perl semantics — NOT die, and NOT a return from any
+           enclosing sub even if one exists; execution resumes after the
+           eval). Check this BEFORE the sub/main-level return handling
+           below, which is for when there's no enclosing eval at all. No
+           local()-restore-to-sub-depth or scope cleanup here: those are
+           calibrated for exiting the whole function, which this doesn't do
+           — matching the existing last/next precedent of no cleanup at the
+           branch site for an early exit that stays within the same
+           function. */
+        if (!evalReturnTargets_.empty()) {
+            auto &target = evalReturnTargets_.back();
+            builder_.CreateStore(v, target.resultAlloca);
+            builder_.CreateBr(target.endBB);
+            break;
+        }
         /* restore any local()s before returning; clone retval first so
            restore doesn't clobber the in-place PerlValue we're returning */
         if (localDepthAlloca_) {
@@ -3693,9 +3709,10 @@ void CodeGen::emitStmt(const Node &n) {
         }
         emitScopeCleanup();  /* free tracked my-var pvs in all active scopes */
         /* In the main function (which returns i32), we can't emit `ret ptr`.
-           Inside an eval block, `return` is equivalent to `die` in Perl
-           semantics (no enclosing sub to return from). Call perl_die to
-           longjmp back to the eval's catch point. */
+           With no enclosing eval (checked above) and no enclosing sub,
+           `return` at the top level is equivalent to `die` in Perl
+           semantics. Call perl_die to longjmp back to the nearest eval's
+           catch point (or terminate the process if there is none). */
         if (currentFn_ && currentFn_->getReturnType()->isIntegerTy() &&
             currentFn_->getName() == "main") {
             callRT("perl_die", {v});
@@ -6127,10 +6144,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* ── body: execute eval block, capture return value ── */
         builder_.SetInsertPoint(bodyBB);
         auto savedIP = builder_.saveIP();
+        evalReturnTargets_.push_back({resultAlloca, endBB});
         Value *bodyResult = perlUndef();
         if (n.body) {
             bodyResult = emitBlockLast(*n.body);
         }
+        evalReturnTargets_.pop_back();
         /* save insert point after emitBlockLast (may be on nested eval's block) */
         auto *afterBodyBB = builder_.GetInsertBlock();
         /* restore insert point — emitBlockLast may have moved it */
@@ -6142,10 +6161,17 @@ Value *CodeGen::emitExpr(const Node &n) {
             builder_.CreateBr(endBB);
         }
 
-        /* If emitBlockLast left us on a different block (e.g., nested eval's endBB),
-           terminate that block by branching to endBB. */
+        /* If emitBlockLast left us on a different block (e.g., a nested
+           eval's own endBB, reached when that nested eval was a non-last
+           statement in this eval's body — the trailing statements after it
+           get emitted into that block), terminate that block by storing
+           the actual computed body result — NOT just branching with
+           nothing stored, which silently lost bodyResult and made endBB's
+           load always see the initial null (routed through the
+           longjmpMissed check into undef, discarding the real value). */
         if (afterBodyBB != endBB && !afterBodyBB->getTerminator()) {
             builder_.SetInsertPoint(afterBodyBB);
+            builder_.CreateStore(bodyResult, resultAlloca);
             builder_.CreateBr(endBB);
         }
         builder_.SetInsertPoint(endBB);
@@ -6250,6 +6276,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto  savedIntScopes   = intScopes_;
         auto *savedLocalDepth  = localDepthAlloca_;
         auto *savedSubBody     = currentSubBody_;
+        /* A `return` inside this anon sub's body must target the anon sub
+           itself, never an enclosing eval{} — clear (and restore after)
+           so the new-sub body starts with no active eval-return target,
+           the same isolation already given to scopes_/arrayScopes_/etc. */
+        auto  savedEvalReturnTargets = evalReturnTargets_;
+        evalReturnTargets_.clear();
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
@@ -6371,6 +6403,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         intScopes_        = std::move(savedIntScopes);
         localDepthAlloca_ = savedLocalDepth;
         currentSubBody_   = savedSubBody;
+        evalReturnTargets_ = std::move(savedEvalReturnTargets);
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));

@@ -154,6 +154,17 @@ private:
     std::vector<llvm::BasicBlock *> loopContinues_;
     std::vector<llvm::BasicBlock *> loopRedos_;  /* redo target = body start */
     std::vector<LoopLabel>          loopLabels_; /* labeled loop support */
+    /* `return` inside eval{} targets the nearest enclosing eval block (its
+       value becomes the eval's result; execution resumes after the eval,
+       NOT the enclosing sub) — real Perl semantics, distinct from die.
+       Stack (not a single Value) to support nested eval{}; NK::AnonSub
+       saves/clears/restores this the same way it does scopes_ etc., since
+       an anon sub's own `return` must NOT be captured by an enclosing
+       eval — it targets the anon sub itself. Named subs don't need the
+       same save/restore: they're compiled as an entirely separate pass,
+       never nested inside this stack's push/pop in the same call frame. */
+    struct EvalReturnTarget { llvm::Value *resultAlloca; llvm::BasicBlock *endBB; };
+    std::vector<EvalReturnTarget>   evalReturnTargets_;
     /* local() save depth at function entry (alloca holding i32) */
     llvm::Value *localDepthAlloca_ = nullptr;
     /* caller() support: current package name and source file */
