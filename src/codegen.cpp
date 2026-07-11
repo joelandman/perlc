@@ -2194,17 +2194,44 @@ Value *CodeGen::emitExprF64(const Node &n) {
 
 /* ── top-level compile ───────────────────────────────────────────────────── */
 
+/* D45: named subs are always compile-time-hoisted to package scope in real
+   Perl, no matter how deeply nested in bare `{ }` blocks, if/while/for
+   bodies, or eval blocks — `{ sub f {...} }` defines a perfectly normal,
+   globally-callable `f`, not something scoped to the block. Recurse
+   through every child field a Node can hold (mirroring
+   hasWantarrayOrUserCall's traversal) so subs_ ends up with every
+   NK::SubDef in the program, regardless of nesting depth. Deliberately
+   still recurses into a found SubDef's own body (a named sub nested
+   inside another named sub is unusual but also hoisted in real Perl) and
+   into NK::AnonSub bodies (a named sub could be declared inside a
+   closure) — both fall out naturally from the generic walk with no
+   special-casing needed. */
+static void collectSubDefs(const Node &n, std::vector<const Node*> &out) {
+    if (n.kind == NK::SubDef) out.push_back(&n);
+    if (n.left)  collectSubDefs(*n.left,  out);
+    if (n.right) collectSubDefs(*n.right, out);
+    if (n.cond)  collectSubDefs(*n.cond,  out);
+    if (n.body)  collectSubDefs(*n.body,  out);
+    if (n.init)  collectSubDefs(*n.init,  out);
+    if (n.step)  collectSubDefs(*n.step,  out);
+    for (auto &a : n.args) collectSubDefs(*a, out);
+    for (auto &b : n.branches) {
+        if (b.cond) collectSubDefs(*b.cond, out);
+        if (b.body) collectSubDefs(*b.body, out);
+    }
+}
+
 void CodeGen::compile(const Node &program, const std::string &modName) {
     mod_->setModuleIdentifier(modName);
     sourceFile_ = modName;
     if (debug_) initializeDebugInfo(modName);
 
-    /* collect sub definitions first so forward calls work */
+    /* collect sub definitions first so forward calls work — recurse into
+       every block/statement, not just program's direct top-level
+       children (D45: a sub nested in a bare block is still global). */
     subs_.clear();
     subCaptures_.clear();
-    for (auto &stmt : program.args)
-        if (stmt->kind == NK::SubDef)
-            subs_.push_back(stmt.get());
+    collectSubDefs(program, subs_);
 
     /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
        These are expanded at call sites without @_ construction. */
