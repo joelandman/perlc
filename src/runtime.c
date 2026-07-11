@@ -4753,8 +4753,14 @@ PerlValue *perl_system(PerlValue *cmd) {
     char *s = perl_to_string_dup(cmd);
     int ret = system(s);
     free(s);
+    /* Real Perl's system() returns the raw wait(2) status word, not the
+       unwrapped exit code — the documented idiom is `$rc >> 8` to recover
+       the exit code (matching $?'s convention, though $? itself is not
+       yet implemented). Returning WEXITSTATUS(ret) directly here silently
+       broke that idiom for any caller following it. -1 (system() itself
+       failed to launch a child at all) is returned as-is, matching Perl. */
     if (ret == -1) return perl_alloc_int(-1);
-    return perl_alloc_int(WIFEXITED(ret) ? WEXITSTATUS(ret) : -1);
+    return perl_alloc_int(ret);
 }
 
 PerlValue *perl_backtick(PerlValue *cmd) {
