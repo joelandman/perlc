@@ -962,6 +962,20 @@ __attribute__((pure)) HOTX double perl_to_float(const PerlValue *v) {
     }
 }
 
+/* D31: default float stringification. Real Perl formats with %.15g (not
+   C's default %g, which is only 6 significant digits -- `10/3` printed
+   "3.33333" instead of "3.33333333333333"), and special-cases the values
+   %.15g renders differently from Perl: negative zero prints as plain "0"
+   (no sign), +-infinity as "Inf"/"-Inf" (capitalized, not C's "inf"), and
+   NaN as "NaN" regardless of its sign bit (glibc's %g can render a NaN
+   with a negative sign bit as "-nan", which Perl never does). */
+static void perl_format_float(char *buf, size_t bufsz, double d) {
+    if (isnan(d)) { snprintf(buf, bufsz, "NaN"); return; }
+    if (isinf(d)) { snprintf(buf, bufsz, d < 0 ? "-Inf" : "Inf"); return; }
+    if (d == 0.0) { snprintf(buf, bufsz, "0"); return; }
+    snprintf(buf, bufsz, "%.15g", d);
+}
+
 /* For PERL_STRING and PERL_UNDEF, returns a stable pointer — caller must
    NOT free the result.  For all other tags (INT, FLOAT, refs, etc.),
    returns a heap-allocated string that the caller must free. */
@@ -976,7 +990,7 @@ const char *perl_to_string(const PerlValue *v) {
             snprintf(buf, sizeof buf, "%lld", v->ival);
             return strdup(buf);
         case PERL_FLOAT:
-            snprintf(buf, sizeof buf, "%g", v->fval);
+            perl_format_float(buf, sizeof buf, v->fval);
             return strdup(buf);
         case PERL_REF_SCALAR:
             if (v->blessed_class)
@@ -1029,7 +1043,7 @@ char *perl_to_string_dup(const PerlValue *v) {
             snprintf(buf, sizeof buf, "%lld", v->ival);
             return strdup(buf);
         case PERL_FLOAT:
-            snprintf(buf, sizeof buf, "%g", v->fval);
+            perl_format_float(buf, sizeof buf, v->fval);
             return strdup(buf);
         case PERL_REF_SCALAR:
             if (v->blessed_class)
