@@ -419,6 +419,10 @@ int perl_pop_wantarray(void) {
   return s_wantarray_depth ? s_wantarray_stack[s_wantarray_depth] : 0;
 }
 PerlValue *perl_wantarray(void) {
+  /* D43: called outside any sub (empty stack) — real Perl's wantarray()
+     returns undef here, not a false-but-defined 0. Also avoids reading
+     s_wantarray_stack[-1] (out of bounds) when the stack is empty. */
+  if (s_wantarray_depth <= 0) return perl_alloc_undef();
   return perl_alloc_int(s_wantarray_stack[s_wantarray_depth - 1]);
 }
 
@@ -3239,6 +3243,7 @@ void perl_close_fh(PerlValue *fh) {
         fclose((FILE*)fh->pval);
         fh->pval = NULL;
         fh->tag  = PERL_UNDEF;
+        s_dollar_dot.ival = 0;  /* D32: real Perl resets $. on close() */
     }
 }
 
@@ -5145,25 +5150,28 @@ PerlValue *perl_su_reftype(PerlValue *v) {
 }
 
 PerlValue *perl_su_looks_like_number(PerlValue *v) {
-    if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
+    /* Real Perl's looks_like_number returns 1 for true but "" (empty
+       string, not 0) for false — logically equivalent in boolean context,
+       but the string value differs if printed/interpolated directly. */
+    if (!v || v->tag == PERL_UNDEF) return perl_alloc_string("");
     if (v->tag == PERL_INT || v->tag == PERL_FLOAT) return perl_alloc_int(1);
-    if (v->tag != PERL_STRING || !v->sval) return perl_alloc_int(0);
+    if (v->tag != PERL_STRING || !v->sval) return perl_alloc_string("");
     const char *s = v->sval;
     while (*s == ' ' || *s == '\t') s++;
     if (*s == '+' || *s == '-') s++;
-    if (*s == '\0') return perl_alloc_int(0);
+    if (*s == '\0') return perl_alloc_string("");
     int has_digit = 0;
     while (*s >= '0' && *s <= '9') { has_digit = 1; s++; }
     if (*s == '.') { s++; while (*s >= '0' && *s <= '9') { has_digit = 1; s++; } }
-    if (!has_digit) return perl_alloc_int(0);
+    if (!has_digit) return perl_alloc_string("");
     if (*s == 'e' || *s == 'E') {
         s++;
         if (*s == '+' || *s == '-') s++;
-        if (*s < '0' || *s > '9') return perl_alloc_int(0);
+        if (*s < '0' || *s > '9') return perl_alloc_string("");
         while (*s >= '0' && *s <= '9') s++;
     }
     while (*s == ' ' || *s == '\t') s++;
-    return perl_alloc_int(*s == '\0' ? 1 : 0);
+    return *s == '\0' ? perl_alloc_int(1) : perl_alloc_string("");
 }
 
 /* ── Carp ─────────────────────────────────────────────────────────────────── */
