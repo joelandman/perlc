@@ -2687,13 +2687,15 @@ Value *CodeGen::emitBlockLast(const Node &n) {
             if (isListProducer && currentSubNeedsWantarray_) {
                 Value *av = emitArrayPtr(le);
                 if (!av) av = callRT("perl_array_new", {});
-                /* grep/map/sort return COUNT in scalar context (not last element) */
+                /* grep/map return COUNT in scalar context (not last element);
+                   sort returns undef in scalar context (D29). */
                 if (lk == NK::GrepFunc || lk == NK::MapFunc || lk == NK::SortFunc) {
                     auto *i32Ty = Type::getInt32Ty(ctx_);
                     Value *ctx = callRT("perl_current_wantarray_ctx", {});
                     Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
                     Value *listResult = callRT("perl_array_to_list_return", {av});
-                    Value *scalarResult = callRT("perl_array_len", {av});
+                    Value *scalarResult = (lk == NK::SortFunc) ? perlUndef()
+                                         : callRT("perl_array_len", {av});
                     result = builder_.CreateSelect(isList, listResult, scalarResult);
                 } else {
                     result = callRT("perl_array_to_list_return", {av});
@@ -2710,14 +2712,16 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                                 stmt.left->kind == NK::ReverseFunc)) {
                 Value *av = emitArrayPtr(*stmt.left);
                 if (!av) av = callRT("perl_array_new", {});
-                /* grep/map/sort return COUNT in scalar context (not last element) */
+                /* grep/map return COUNT in scalar context (not last element);
+                   sort returns undef in scalar context (D29). */
                 if (stmt.left->kind == NK::GrepFunc || stmt.left->kind == NK::MapFunc ||
                     stmt.left->kind == NK::SortFunc) {
                     auto *i32Ty = Type::getInt32Ty(ctx_);
                     Value *ctx = callRT("perl_current_wantarray_ctx", {});
                     Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
                     Value *listResult = callRT("perl_array_to_list_return", {av});
-                    Value *scalarResult = callRT("perl_array_len", {av});
+                    Value *scalarResult = (stmt.left->kind == NK::SortFunc) ? perlUndef()
+                                         : callRT("perl_array_len", {av});
                     result = builder_.CreateSelect(isList, listResult, scalarResult);
                 } else {
                     result = callRT("perl_array_to_list_return", {av});
@@ -3665,14 +3669,16 @@ void CodeGen::emitStmt(const Node &n) {
             /* return list-producing expr — wrap for list/scalar context at runtime */
             Value *av = emitArrayPtr(*n.left);
             if (!av) av = callRT("perl_array_new", {});
-            /* grep/map/sort return COUNT in scalar context (not last element) */
+            /* grep/map return COUNT in scalar context (not last element);
+               sort returns undef in scalar context (D29). */
             if (n.left->kind == NK::GrepFunc || n.left->kind == NK::MapFunc ||
                 n.left->kind == NK::SortFunc) {
                 auto *i32Ty = Type::getInt32Ty(ctx_);
                 Value *ctx = callRT("perl_current_wantarray_ctx", {});
                 Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
                 Value *listResult = callRT("perl_array_to_list_return", {av});
-                Value *scalarResult = callRT("perl_array_len", {av});
+                Value *scalarResult = (n.left->kind == NK::SortFunc) ? perlUndef()
+                                     : callRT("perl_array_len", {av});
                 v = builder_.CreateSelect(isList, listResult, scalarResult);
             } else {
                 v = callRT("perl_array_to_list_return", {av});
@@ -5474,7 +5480,6 @@ Value *CodeGen::emitExpr(const Node &n) {
         return emitHashDelete(hv, *n.left);
     }
 
-    case NK::SortFunc:
     case NK::MapFunc:
     case NK::GrepFunc:
         /* array-producing: scalar context returns element count */
@@ -5483,6 +5488,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (!av) return perlUndef();
             return callRT("perl_array_len", {av});
         }
+    case NK::SortFunc:
+        /* D29: real Perl's sort() in scalar context returns undef (not the
+           element count like grep/map) — and doesn't even evaluate its
+           list argument or comparator block. emitExpr's contract here IS
+           scalar context (unconditionally, no runtime wantarray check
+           needed), so just return undef without touching the list. */
+        return perlUndef();
     case NK::ReverseFunc: {
         /* scalar EXPR or single scalar arg → reverse string */
         bool hasScalarCtx = (n.sval == "scalar_ctx");
