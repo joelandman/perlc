@@ -4,6 +4,17 @@
 #include <sstream>
 #include <cstdlib>
 
+/* Named low-precedence/word operators that, following a `$fh IDENT`
+   sequence in print/say/printf's filehandle-detection heuristic, indicate
+   the IDENT is actually an operator (e.g. `print $x eq $y`) rather than a
+   filehandle name (e.g. `print $fh @args`). */
+static bool isCmpOpWord(const std::string &w) {
+    static const std::string cmpOps[] = {"eq","ne","lt","gt","le","ge","cmp","x","xor","and","or","not",""};
+    for (int i = 0; !cmpOps[i].empty(); i++)
+        if (w == cmpOps[i]) return true;
+    return false;
+}
+
 Parser::Parser(std::vector<Token> tokens) : toks_(std::move(tokens)) {}
 
 NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens) {
@@ -237,12 +248,7 @@ NodePtr Parser::parseStmt() {
                             t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
                             t2 == TK::LPAREN);
             if (!isFhCtx && t2 == TK::IDENT) {
-                const std::string &t2txt = peek(2).text;
-                static const std::string cmpOps[] = {"eq","ne","lt","gt","le","ge","cmp","x","xor","and","or","not",""};
-                bool isCmpOp = false;
-                for (int i = 0; !cmpOps[i].empty(); i++)
-                    if (t2txt == cmpOps[i]) { isCmpOp = true; break; }
-                isFhCtx = !isCmpOp;
+                isFhCtx = !isCmpOpWord(peek(2).text);
             }
             if (isFhCtx) { pos_++; fhname = advance().text; }
         }
@@ -693,12 +699,7 @@ NodePtr Parser::parsePrint(bool isSay) {
                         t2 == TK::LPAREN);
         /* IDENT at t2 only if it's not a string-comparison or x operator */
         if (!isFhCtx && t2 == TK::IDENT) {
-            const std::string &t2txt = peek(2).text;
-            static const std::string cmpOps[] = {"eq","ne","lt","gt","le","ge","cmp","x","xor","and","or","not",""};
-            bool isCmpOp = false;
-            for (int i = 0; !cmpOps[i].empty(); i++)
-                if (t2txt == cmpOps[i]) { isCmpOp = true; break; }
-            isFhCtx = !isCmpOp;
+            isFhCtx = !isCmpOpWord(peek(2).text);
         }
         if (isFhCtx) {
             pos_++;  /* skip $ */
