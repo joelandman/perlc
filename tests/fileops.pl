@@ -15,9 +15,13 @@ print add(3, 4) . "\n";       # 7
 print subtract(10, 3) . "\n"; # 7
 print multiply(3, 4) . "\n";  # 12
 
-# module constants (bare names)
-print PI . "\n";     # 3.14159
-print MAX . "\n";    # 100
+# module constants declared in MathOps.pm but never added to its @EXPORT /
+# @EXPORT_OK — not exported, so (matching real Perl exactly, see D26) these
+# barewords are NOT visible as the module's PI()/MAX() subs here. With no
+# `use strict` in this file, unresolved barewords fall back to literal
+# strings rather than erroring.
+print PI . "\n";     # PI
+print MAX . "\n";    # MAX
 
 # local use constant
 print FACTOR . "\n"; # 2

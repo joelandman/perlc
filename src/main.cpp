@@ -211,7 +211,9 @@ static std::vector<Token> inlineModules(
          std::set<std::string> &loaded,
          std::map<std::string,std::string> &importMap,
          std::map<std::string,NodePtr> *constMap = nullptr,
-         Parser *parser = nullptr)
+         Parser *parser = nullptr,
+         bool isMainScript = true,
+         const std::vector<std::string> &explicitImportNames = {})
 {
     /* pragmas that are not files to load */
     static const std::set<std::string> PRAGMAS = {
@@ -227,7 +229,29 @@ static std::vector<Token> inlineModules(
         baseDir, baseDir + "/lib", "lib", "lib/lib/perl5", "."
     };
 
+    /* D26: `use constant` declared inside an inlined module must not leak
+       as a bareword-global sub the way it does for the main script's own
+       constants — real Perl only exposes it unqualified when actually
+       exported. ownExports/visibleUnqualified capture this module's own
+       @EXPORT (default-export set); explicitImportNames (passed down from
+       the `use Module qw(...)` call site that pulled this file in)
+       overrides the default when non-empty, matching Exporter semantics
+       (an explicit import list replaces @EXPORT, it doesn't add to it).
+       currentPackage tracks `package NAME;` as we scan, so the always-
+       created qualified sub (Package::NAME) names the right package. */
+    auto ownExports = scanExports(tokens);
+    std::set<std::string> visibleUnqualified;
+    if (!explicitImportNames.empty())
+        visibleUnqualified.insert(explicitImportNames.begin(), explicitImportNames.end());
+    else if (ownExports.count("EXPORT"))
+        visibleUnqualified.insert(ownExports["EXPORT"].begin(), ownExports["EXPORT"].end());
+    std::string currentPackage = "main";
+
     for (size_t i = 0; i < tokens.size(); ) {
+        if (tokens[i].kind == TK::KW_PACKAGE && i + 1 < tokens.size() &&
+            tokens[i+1].kind == TK::IDENT) {
+            currentPackage = tokens[i+1].text;
+        }
         /* ── require "file.pm" or require Module::Name ── */
         if (tokens[i].kind == TK::KW_REQUIRE &&
             i + 1 < tokens.size() &&
@@ -267,7 +291,8 @@ static std::vector<Token> inlineModules(
                 Lexer modLexer(src);
                 auto modToks = modLexer.tokenize();
                 if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK) modToks.pop_back();
-                auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser);
+                auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser,
+                                               /*isMainScript=*/false, /*explicitImportNames=*/{});
                 if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK) expanded.pop_back();
                 modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
                 return true;
@@ -313,20 +338,41 @@ static std::vector<Token> inlineModules(
             size_t defStart = ui + 2;
             size_t defEnd   = useEnd; /* exclusive */
 
-            auto emitConstSub = [&](const std::string &cname, const std::vector<Token> &valTokens) {
-                /* inject: sub CNAME { return VALUE; } */
+            auto emitOneConstSub = [&](const std::string &subName, const std::vector<Token> &valTokens) {
+                /* inject: sub SUBNAME { return VALUE; } */
                 constToks.push_back({TK::KW_SUB,    "sub",    0});
-                constToks.push_back({TK::IDENT,     cname,    0});
+                constToks.push_back({TK::IDENT,     subName,  0});
                 constToks.push_back({TK::LBRACE,    "{",      0});
                 constToks.push_back({TK::KW_RETURN, "return", 0});
                 for (const auto &vt : valTokens) constToks.push_back(vt);
                 constToks.push_back({TK::SEMI,      ";",      0});
                 constToks.push_back({TK::RBRACE,    "}",      0});
-                /* also record in constMap so bare NAME (without parens) resolves */
-                if (constMap && !valTokens.empty() && parser) {
-                    /* pre-parse the value expression to store an AST node */
-                    auto parsed = Parser::parseExprFromTokens(valTokens);
-                    if (parsed) (*constMap)[cname] = std::move(parsed);
+            };
+            auto emitConstSub = [&](const std::string &cname, const std::vector<Token> &valTokens) {
+                if (isMainScript) {
+                    /* No cross-package boundary — always create the
+                       bareword-global sub (unchanged pre-D26 behavior). */
+                    emitOneConstSub(cname, valTokens);
+                    if (constMap && !valTokens.empty() && parser) {
+                        auto parsed = Parser::parseExprFromTokens(valTokens);
+                        if (parsed) (*constMap)[cname] = std::move(parsed);
+                    }
+                    return;
+                }
+                /* D26: constant declared inside an inlined module. Always
+                   create the fully-qualified sub so explicit qualification
+                   (Package::NAME) works, matching real Perl. Only ALSO
+                   create the unqualified bareword-global sub when the name
+                   is actually exported — real Perl constants are not
+                   auto-exported just by being declared. */
+                emitOneConstSub(currentPackage + "::" + cname, valTokens);
+                if (visibleUnqualified.count(cname)) {
+                    emitOneConstSub(cname, valTokens);
+                    /* also record in constMap so bare NAME (without parens) resolves */
+                    if (constMap && !valTokens.empty() && parser) {
+                        auto parsed = Parser::parseExprFromTokens(valTokens);
+                        if (parsed) (*constMap)[cname] = std::move(parsed);
+                    }
                 }
             };
 
@@ -440,7 +486,8 @@ static std::vector<Token> inlineModules(
             if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK)
                 modToks.pop_back();
             /* recursively inline modules referenced by this module */
-            auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser);
+            auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser,
+                                           /*isMainScript=*/false, explicitImports);
             /* strip any EOF_TOK from expanded result too */
             if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK)
                 expanded.pop_back();
