@@ -433,8 +433,6 @@ static std::vector<Token> inlineModules(
             continue;
         }
 
-        if (PRAGMAS.count(modName)) continue;
-
         /* extract explicit import list: use Module qw(...) or use Module ('a','b') */
         /* tokens between modName and SEMI */
         std::vector<std::string> explicitImports;
@@ -449,6 +447,27 @@ static std::vector<Token> inlineModules(
             if (afterMod < useEnd)
                 explicitImports = extractQw(tokens, afterMod, useEnd);
         }
+
+        /* D30: Time::HiRes — built-in (no .pm file), like POSIX/
+           Scalar::Util/Carp. Unlike those, `time`/`sleep` are lexer
+           keywords with pre-existing (integer-only) builtin behavior, so
+           overriding them must be opt-in per real Perl semantics — a
+           bare `use Time::HiRes;` with no import list does NOT override
+           the builtin time()/sleep() (confirmed against real Perl).
+           Populate importMap only for explicitly requested names,
+           exactly mirroring the qw(...) list, with no default-export
+           fallback; the parser separately checks importMap_ at its
+           KW_TIME/KW_SLEEP sites, and codegen recognizes the qualified
+           "Time::HiRes::*" call names for all of them (including
+           gettimeofday/usleep, which aren't keywords and so work via the
+           same always-available bareword dispatch POSIX::floor uses). */
+        if (modName == "Time::HiRes") {
+            for (auto &name : explicitImports)
+                importMap[name] = "Time::HiRes::" + name;
+            continue;
+        }
+
+        if (PRAGMAS.count(modName)) continue;
 
         /* convert Foo::Bar → Foo/Bar.pm */
         std::string modPath = modName;

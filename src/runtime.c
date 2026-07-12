@@ -5029,6 +5029,86 @@ PerlValue *perl_alarm_val(PerlValue *secs) {
     return perl_alloc_int((long long)alarm(s));
 }
 
+/* ── Time::HiRes (D30) ───────────────────────────────────────────────────────
+   No real Time::HiRes.pm exists — this is a built-in implementation, like
+   POSIX/Scalar::Util. `time`/`sleep`'s higher-precision override is gated
+   by explicit import (see parser.cpp's KW_TIME/KW_SLEEP handling and
+   main.cpp's inlineModules()); gettimeofday/usleep/tv_interval have no
+   pre-existing builtin meaning so are always available unqualified. */
+
+PerlValue *perl_hires_time(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return perl_alloc_float((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
+}
+
+/* list context: (seconds, microseconds) */
+PerlArray *perl_hires_gettimeofday_list(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    PerlArray *a = perl_array_new();
+    perl_array_push(a, perl_alloc_int((long long)ts.tv_sec));
+    perl_array_push(a, perl_alloc_int((long long)(ts.tv_nsec / 1000)));
+    return a;
+}
+
+/* scalar context: floating-point seconds (same as perl_hires_time) */
+PerlValue *perl_hires_gettimeofday_scalar(void) {
+    return perl_hires_time();
+}
+
+/* sleep(SECONDS), fractional seconds allowed; returns actual seconds slept */
+PerlValue *perl_hires_sleep(PerlValue *secs) {
+    double s = secs ? perl_to_float(secs) : 0.0;
+    struct timespec req;
+    req.tv_sec  = (time_t)s;
+    req.tv_nsec = (long)((s - (double)req.tv_sec) * 1e9);
+    struct timespec start, end;
+    clock_gettime(CLOCK_REALTIME, &start);
+    nanosleep(&req, NULL);
+    clock_gettime(CLOCK_REALTIME, &end);
+    double elapsed = ((double)end.tv_sec - (double)start.tv_sec) +
+                      ((double)end.tv_nsec - (double)start.tv_nsec) / 1e9;
+    return perl_alloc_float(elapsed);
+}
+
+/* usleep(MICROSECONDS); returns actual microseconds slept */
+PerlValue *perl_hires_usleep(PerlValue *usecs) {
+    long long u = usecs ? perl_to_int(usecs) : 0;
+    struct timespec req;
+    req.tv_sec  = (time_t)(u / 1000000);
+    req.tv_nsec = (long)((u % 1000000) * 1000);
+    struct timespec start, end;
+    clock_gettime(CLOCK_REALTIME, &start);
+    nanosleep(&req, NULL);
+    clock_gettime(CLOCK_REALTIME, &end);
+    long long elapsed_us = (long long)(((double)end.tv_sec - (double)start.tv_sec) * 1000000.0 +
+                                        ((double)end.tv_nsec - (double)start.tv_nsec) / 1000.0);
+    return perl_alloc_int(elapsed_us);
+}
+
+/* tv_interval([$sec,$usec], [$sec,$usec] or omitted => now) => elapsed seconds */
+PerlValue *perl_hires_tv_interval(PerlValue *t0ref, PerlValue *t1ref) {
+    double t0 = 0.0, t1;
+    if (t0ref && t0ref->tag == PERL_REF_ARRAY && t0ref->pval) {
+        PerlArray *a = (PerlArray *)t0ref->pval;
+        double sec  = a->len > 0 ? perl_to_float(a->elems[0]) : 0.0;
+        double usec = a->len > 1 ? perl_to_float(a->elems[1]) : 0.0;
+        t0 = sec + usec / 1e6;
+    }
+    if (t1ref && t1ref->tag == PERL_REF_ARRAY && t1ref->pval) {
+        PerlArray *a = (PerlArray *)t1ref->pval;
+        double sec  = a->len > 0 ? perl_to_float(a->elems[0]) : 0.0;
+        double usec = a->len > 1 ? perl_to_float(a->elems[1]) : 0.0;
+        t1 = sec + usec / 1e6;
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        t1 = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    }
+    return perl_alloc_float(t1 - t0);
+}
+
 /* ── List::Util ───────────────────────────────────────────────────────────── */
 
 PerlValue *perl_sum_list(PerlArray *a) {

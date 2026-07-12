@@ -2461,6 +2461,20 @@ NodePtr Parser::parsePrimary() {
         advance();
         /* optional empty parens */
         if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
+        /* `time` is a lexer keyword with pre-existing (integer-only)
+           builtin behavior, unlike POSIX::floor etc. (plain bareword
+           calls with no keyword of their own) — so Time::HiRes's
+           higher-precision override must be opt-in, only when
+           `use Time::HiRes qw(time)` explicitly imported it (checked via
+           importMap_, populated in main.cpp's inlineModules()). A bare
+           `use Time::HiRes;` with no import list must NOT change time()'s
+           behavior — confirmed against real Perl. */
+        auto it = importMap_.find("time");
+        if (it != importMap_.end() && it->second == "Time::HiRes::time") {
+            auto n = std::make_unique<Node>(); n->kind = NK::Call;
+            n->name = it->second; n->line = line;
+            return n;
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::TimeFunc; n->line = line;
         return n;
     }
@@ -2478,12 +2492,26 @@ NodePtr Parser::parsePrimary() {
     /* ── sleep, alarm ────────────────────────────────────────────────────── */
     if (check(TK::KW_SLEEP) || check(TK::KW_ALARM)) {
         bool isSleep = check(TK::KW_SLEEP); advance();
+        bool hp = match(TK::LPAREN);
+        NodePtr arg;
+        if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier())
+            arg = parseExpr();
+        if (hp) consume(TK::RPAREN, ")");
+        /* `sleep` is a lexer keyword with pre-existing (integer-only)
+           builtin behavior — see the `time` case above for why the
+           Time::HiRes override must be opt-in via importMap_. */
+        if (isSleep) {
+            auto it = importMap_.find("sleep");
+            if (it != importMap_.end() && it->second == "Time::HiRes::sleep") {
+                auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                n->name = it->second; n->line = line;
+                if (arg) n->args.push_back(std::move(arg));
+                return n;
+            }
+        }
         auto n = std::make_unique<Node>();
         n->kind = isSleep ? NK::SleepFunc : NK::AlarmFunc; n->line = line;
-        bool hp = match(TK::LPAREN);
-        if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier())
-            n->left = parseExpr();
-        if (hp) consume(TK::RPAREN, ")");
+        n->left = std::move(arg);
         return n;
     }
 

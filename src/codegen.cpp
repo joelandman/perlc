@@ -408,6 +408,13 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_gmtime_val",   av,     pv);
     RT("perl_sleep_val",    pv,     pv);
     RT("perl_alarm_val",    pv,     pv);
+    /* Time::HiRes (D30, built-in) */
+    RT("perl_hires_time",               pv);
+    RT("perl_hires_gettimeofday_list",  av);
+    RT("perl_hires_gettimeofday_scalar",pv);
+    RT("perl_hires_sleep",              pv, pv);
+    RT("perl_hires_usleep",             pv, pv);
+    RT("perl_hires_tv_interval",        pv, pv, pv);
     /* List::Util */
     RT("perl_sum_list",     pv,  av);
     RT("perl_min_list",     pv,  av);
@@ -1107,6 +1114,14 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         if (!slot) return callRT("perl_array_new", {});
         Value *dh = builder_.CreateLoad(perlPtrTy_, slot);
         return callRT("perl_readdir_all", {dh});
+    }
+    /* Time::HiRes::gettimeofday in list context: (seconds, microseconds).
+       Must be checked before the generic user-sub Call handling below,
+       since it's a builtin name-dispatch (see emitExpr), not a real
+       LLVM-declared sub — mod_->getFunction() would never find it. */
+    if (n.kind == NK::Call &&
+        (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday")) {
+        return callRT("perl_hires_gettimeofday_list", {});
     }
     /* user-defined sub call in list context: call with ctx=1, unwrap result */
     if (n.kind == NK::Call) {
@@ -7024,6 +7039,31 @@ Value *CodeGen::emitCall(const Node &n) {
     }
     if (n.name == "POSIX::strftime" || n.name == "strftime") {
         return callRT("perl_posix_strftime", {buildArgArray()});
+    }
+    /* Time::HiRes (D30, built-in) — scalar-context path. "Time::HiRes::time"
+       and "Time::HiRes::sleep" only reach here when explicitly imported
+       (parser.cpp gates them); gettimeofday/usleep/tv_interval have no
+       pre-existing keyword meaning so are always available unqualified,
+       matching the POSIX::floor precedent above. gettimeofday's list-
+       context form is handled separately in emitArrayPtr. */
+    if (n.name == "Time::HiRes::time") {
+        return callRT("perl_hires_time", {});
+    }
+    if (n.name == "Time::HiRes::sleep") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_hires_sleep", {v});
+    }
+    if (n.name == "Time::HiRes::usleep" || n.name == "usleep") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_hires_usleep", {v});
+    }
+    if (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday") {
+        return callRT("perl_hires_gettimeofday_scalar", {});
+    }
+    if (n.name == "Time::HiRes::tv_interval" || n.name == "tv_interval") {
+        Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_hires_tv_interval", {a, b});
     }
     /* Scalar::Util */
     if (n.name == "Scalar::Util::blessed" || n.name == "blessed") {

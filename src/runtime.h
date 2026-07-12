@@ -470,6 +470,14 @@ PerlArray *perl_gmtime_val(PerlValue *t);       /* gmtime — 9-element list */
 PerlValue *perl_sleep_val(PerlValue *secs);     /* sleep — returns actual secs slept */
 PerlValue *perl_alarm_val(PerlValue *secs);     /* alarm — returns prev alarm value */
 
+/* ── Time::HiRes (D30, built-in) ──────────────────────────────────────────── */
+PerlValue *perl_hires_time(void);                       /* time() — fractional epoch seconds */
+PerlArray *perl_hires_gettimeofday_list(void);           /* list ctx: (sec, usec) */
+PerlValue *perl_hires_gettimeofday_scalar(void);         /* scalar ctx: fractional seconds */
+PerlValue *perl_hires_sleep(PerlValue *secs);            /* fractional seconds; returns actual secs slept */
+PerlValue *perl_hires_usleep(PerlValue *usecs);          /* microseconds; returns actual usecs slept */
+PerlValue *perl_hires_tv_interval(PerlValue *t0ref, PerlValue *t1ref); /* elapsed seconds between two gettimeofday refs */
+
 /* ── List::Util ───────────────────────────────────────────────────────────── */
 PerlValue *perl_sum_list(PerlArray *a);         /* sum LIST — undef if empty */
 PerlValue *perl_min_list(PerlArray *a);         /* min LIST — undef if empty */
