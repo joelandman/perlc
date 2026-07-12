@@ -111,7 +111,7 @@ private:
     void skipLineComment();
     void skipBlockComment();
     Token readNumber();
-    Token readString(char delim);
+    Token readString(char delim, bool interpolates);
     Token readHeredoc();
     Token readIdent();
     Token readRegex();

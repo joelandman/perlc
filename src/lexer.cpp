@@ -110,7 +110,7 @@ Token Lexer::readNumber() {
     return {isFloat ? TK::FLOAT : TK::INT, clean, line_};
 }
 
-Token Lexer::readString(char delim) {
+Token Lexer::readString(char delim, bool interpolates) {
     pos_++; /* skip opening delimiter */
     std::string raw;
     while (pos_ < src_.size()) {
@@ -119,6 +119,17 @@ Token Lexer::readString(char delim) {
         if (c == '\\' && pos_ + 1 < src_.size()) {
             pos_++;
             char esc = src_[pos_++];
+            if (!interpolates) {
+                /* Non-interpolating (single-quoted-style) string: real Perl
+                   only recognizes \\ (literal backslash) and \<delim>
+                   (literal delimiter, e.g. \' inside '...') as escapes —
+                   every other backslash sequence stays literal, as both
+                   characters (\n in 'a\nb' is the two characters '\' 'n',
+                   NOT a newline). */
+                if (esc == '\\' || esc == delim) raw += esc;
+                else { raw += '\\'; raw += esc; }
+                continue;
+            }
             switch (esc) {
                 case 'n':  raw += '\n'; break;
                 case 't':  raw += '\t'; break;
@@ -126,8 +137,24 @@ Token Lexer::readString(char delim) {
                 case '\\': raw += '\\'; break;
                 case '\'': raw += '\''; break;
                 case '"':  raw += '"';  break;
-                case '$':  raw += '$';  break;
-                case '@':  raw += '@';  break;
+                /* D51: \$ and \@ must NOT collapse to a bare $/@ here —
+                   the parser's interpolation scanner (parseStringInterp)
+                   re-scans this same raw text for a bare $/@ to trigger
+                   variable interpolation, and can't distinguish an
+                   escaped-literal $ from a real interpolation trigger
+                   once both look identical. A plain backslash isn't a
+                   safe marker either: "a\\$x" (an escaped backslash
+                   immediately followed by a genuine, unescaped $x)
+                   collapses \\ to one literal '\' one character earlier
+                   in this same switch, leaving that '\' directly
+                   adjacent to a real interpolation trigger — indistinguishable
+                   from an escaped \$ using a plain-backslash marker. Use
+                   \x02 (a control byte that can never otherwise appear
+                   in this raw buffer) instead, so parseStringInterp can
+                   recognize it unambiguously and treat the following
+                   character as literal. */
+                case '$':  raw += '\x02'; raw += '$'; break;
+                case '@':  raw += '\x02'; raw += '@'; break;
                 default:   raw += '\\'; raw += esc; break;
             }
             continue;
@@ -278,14 +305,14 @@ std::vector<Token> Lexer::tokenize() {
         /* strings */
         if (c == '"') {
             /* mark as double-quoted so parser can interpolate */
-            Token t = readString('"');
+            Token t = readString('"', /*interpolates=*/true);
             t.kind = TK::STRING;
             /* prefix with \x01 to distinguish dq from sq in parser */
             t.text = "\x01" + t.text;
             toks.push_back(t);
             continue;
         }
-        if (c == '\'') { toks.push_back(readString('\'')); continue; }
+        if (c == '\'') { toks.push_back(readString('\'', /*interpolates=*/false)); continue; }
 
         /* backtick command `cmd` */
         if (c == '`') {
@@ -344,7 +371,18 @@ std::vector<Token> Lexer::tokenize() {
                 Token t{TK::STRING, dq ? "\x01" + raw : raw, line_};
                 toks.push_back(t); continue;
             }
-            Token t = readString('}');
+            /* q<delim>...<delim> / qq<delim>...<delim> with a non-'{'
+               delimiter, e.g. qq(...), q[...], qq/.../ — the closing
+               delimiter must match the actual opening one (mirroring
+               qw()'s open->close mapping above); this previously
+               hardcoded '}' regardless, silently corrupting/losing
+               qq(...)-style strings entirely (confirmed: qq(hello world)
+               produced no output at all, since the scan for a literal
+               '}' that never appears ran off past the intended end). */
+            char qopen  = peek();
+            char qclose = (qopen == '(') ? ')' : (qopen == '[') ? ']' :
+                          (qopen == '{') ? '}' : (qopen == '<') ? '>' : qopen;
+            Token t = readString(qclose, /*interpolates=*/dq);
             if (dq) t.text = "\x01" + t.text;
             toks.push_back(t); continue;
         }

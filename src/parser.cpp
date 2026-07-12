@@ -2991,6 +2991,20 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
 
     size_t i = 0;
     while (i < raw.size()) {
+        /* D51: \x02 marks an escaped-literal $/@ (readString emits this
+           instead of a bare $/@ for \$ and \@, precisely so this scan
+           can tell an escaped literal apart from a real interpolation
+           trigger — both would otherwise look identical, and e.g.
+           "\$100" would have its "1" misread as the $1 capture
+           variable). A plain backslash isn't used as the marker because
+           it isn't unambiguous: "a\\$x" also produces a literal '\'
+           immediately before a genuine, unescaped $x trigger. Append
+           just the $/@ character itself and move on two positions. */
+        if (raw[i] == '\x02' && i + 1 < raw.size() && (raw[i+1] == '$' || raw[i+1] == '@')) {
+            cur_s += raw[i+1];
+            i += 2;
+            continue;
+        }
         /* $@ — eval error */
         if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '@') {
             flush();
