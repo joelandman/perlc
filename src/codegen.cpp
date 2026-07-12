@@ -1200,6 +1200,24 @@ static bool isElemRootedChain(const Node &n) {
     return false;
 }
 
+/* D50: is `n` a chain rooted in a bare scalar variable holding a ref
+ * (e.g. `$ref->{a}{b}`), where *every* level is a hash-key ArrowDeref?
+ * Safe to autovivify all the way down via emitAutovivContainer() iff so
+ * — an array-index level anywhere in the chain is deliberately excluded
+ * (conservatively kept on the older, non-autovivifying fallback path),
+ * since perl_array_autoviv_array()/perl_array_autoviv_hash() only
+ * recognize the PERL_REF_ARRAY/PERL_REF_HASH tags and would silently
+ * destroy an existing FLAT_ARRAY-tagged element if one were present at
+ * that array level — exactly the regression already identified and
+ * avoided for the element-rooted case (isElemRootedChain, D40). A hash
+ * has no FLAT_ARRAY-equivalent optimization, so an all-hash-key chain
+ * carries none of that risk regardless of how deep it goes. */
+static bool isScalarRootedAllHashChain(const Node &n) {
+    if (n.kind == NK::ScalarVar) return true;
+    if (n.kind == NK::ArrowDeref) return n.sval == "hash" && isScalarRootedAllHashChain(*n.left);
+    return false;
+}
+
 Value *CodeGen::emitHashGetRef(Value *hv, const Node &keyNode) {
     if (Value *kp = constKeyPtr(keyNode, builder_))
         return callRT("perl_hash_get_str_ref", {hv, kp});
@@ -4803,10 +4821,19 @@ Value *CodeGen::emitExpr(const Node &n) {
                 }
                 /* autovivify $h{a}{b}[i] = val or deeper chains — base is
                    itself another ArrowDeref rooted in a hash/array element
-                   (2+ levels before this one). A scalar-ref-rooted chain
-                   like $ref->[0][1] is NOT routed here — it must keep using
-                   the FLAT_ARRAY-aware fallback below. */
-                if (n.left->left->kind == NK::ArrowDeref && isElemRootedChain(*n.left->left)) {
+                   (2+ levels before this one), OR (D50) a chain rooted in
+                   a bare scalar variable where every level up to here is
+                   a hash-key access, e.g. $ref->{a}[i] — safe, since that
+                   only ever calls perl_hash_autoviv_array (hash-key
+                   based), never perl_array_autoviv_array (the one with
+                   the FLAT_ARRAY-destruction risk, D40). A scalar-ref-
+                   rooted chain with an array-index level anywhere, like
+                   $ref->[0][1], is NOT routed here — it must keep using
+                   the FLAT_ARRAY-aware fallback below (TESTS.md's D50
+                   entry). */
+                if (n.left->left->kind == NK::ArrowDeref &&
+                    (isElemRootedChain(*n.left->left) ||
+                     isScalarRootedAllHashChain(*n.left->left))) {
                     Value *innerAv = emitAutovivContainer(*n.left->left, false);
                     if (!innerAv) return perlUndef();
                     callRT("perl_array_set", {innerAv, idx, rhs});
@@ -4881,12 +4908,22 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (!av) return perlUndef();
                     Value *outerIdx = emitIdx(*n.left->left->left);
                     hv = callRT("perl_array_autoviv_hash", {av, outerIdx});
-                } else if (n.left->left->kind == NK::ArrowDeref && isElemRootedChain(*n.left->left)) {
+                } else if (n.left->left->kind == NK::ArrowDeref &&
+                           (isElemRootedChain(*n.left->left) ||
+                            isScalarRootedAllHashChain(*n.left->left))) {
                     /* $h{a}{b}{c} = val or deeper chains — base is itself
                        another ArrowDeref rooted in a hash/array element
-                       (2+ levels before this one). A scalar-ref-rooted
-                       chain like $ref->{a}{b} falls to the plain-deref
-                       branch below instead, unchanged. */
+                       (2+ levels before this one), OR (D50) a chain
+                       rooted in a bare scalar variable holding a ref
+                       where every level is a hash-key access, e.g.
+                       $ref->{a}{b} — safe to autoviv all the way down
+                       since a hash has no FLAT_ARRAY-equivalent
+                       optimization to accidentally destroy (see
+                       isScalarRootedAllHashChain's comment). A chain
+                       with an array-index level anywhere still falls to
+                       the plain-deref branch below, unchanged — that
+                       case keeps the D40-established FLAT_ARRAY safety
+                       margin (TESTS.md's D50 entry). */
                     hv = emitAutovivContainer(*n.left->left, true);
                     if (!hv) return perlUndef();
                 } else {
