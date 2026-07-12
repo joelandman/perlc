@@ -484,9 +484,34 @@ static std::vector<Token> inlineModules(
             "."
         };
 
-        /* if module already loaded, only process explicit import list */
+        /* if module already loaded, only process explicit import list —
+           still needs D26-follow-up validation (a second `use Module
+           qw(...)` of an already-loaded module with a bogus name must
+           fail exactly like the first-load path below does; re-locate
+           and re-scan the file for its exports since they weren't
+           cached from the first load). */
         if (loaded.count(modName)) {
             if (!explicitImports.empty()) {
+                for (auto &dir : searchDirs) {
+                    std::string fullPath = dir + "/" + modPath;
+                    if (access(fullPath.c_str(), R_OK) != 0) continue;
+                    auto exports = scanExports(Lexer(readFile(fullPath)).tokenize());
+                    auto exportedElsewhere = [&](const std::string &name) {
+                        for (auto &tag : {"EXPORT", "EXPORT_OK"}) {
+                            auto it = exports.find(tag);
+                            if (it == exports.end()) continue;
+                            for (auto &n : it->second) if (n == name) return true;
+                        }
+                        return false;
+                    };
+                    for (auto &name : explicitImports) {
+                        if (!exportedElsewhere(name) && !constMap->count(name)) {
+                            throw std::runtime_error("\"" + name + "\" is not exported by the " +
+                                                      modName + " module");
+                        }
+                    }
+                    break;
+                }
                 for (auto &name : explicitImports)
                     importMap[name] = modName + "::" + name;
             }
@@ -516,7 +541,35 @@ static std::vector<Token> inlineModules(
             auto exports = scanExports(modToks);
             std::vector<std::string> importList;
             if (!explicitImports.empty()) {
-                /* explicit: use Module qw(a b) — import those names */
+                /* explicit: use Module qw(a b) — import those names.
+                   D26 follow-up: validate each requested name is actually
+                   in @EXPORT or @EXPORT_OK, matching real Perl's Exporter
+                   (confirmed directly: requesting a name that's in
+                   neither is a fatal compile-time error, "NAME" is not
+                   exported by the Module module — not a runtime warning,
+                   since Exporter's import() runs at BEGIN/compile time).
+                   Constant names declared via `use constant` inside the
+                   module aren't found by scanExports() (it only scans for
+                   literal `our @EXPORT[_OK] = ...` arrays) — those are
+                   validated separately, inside the module's own recursive
+                   inlineModules() call, via the D26 fix's
+                   visibleUnqualified/explicitImportNames mechanism, so
+                   they're deliberately exempted from this check here to
+                   avoid rejecting a valid constant import. */
+                auto exportedElsewhere = [&](const std::string &name) {
+                    for (auto &tag : {"EXPORT", "EXPORT_OK"}) {
+                        auto it = exports.find(tag);
+                        if (it == exports.end()) continue;
+                        for (auto &n : it->second) if (n == name) return true;
+                    }
+                    return false;
+                };
+                for (auto &name : explicitImports) {
+                    if (!exportedElsewhere(name) && !constMap->count(name)) {
+                        throw std::runtime_error("\"" + name + "\" is not exported by the " +
+                                                  modName + " module");
+                    }
+                }
                 importList = explicitImports;
             } else {
                 /* no list: use @EXPORT by default */
