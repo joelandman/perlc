@@ -3156,7 +3156,17 @@ void CodeGen::emitStmt(const Node &n) {
                         builder_.CreateStore(fval, falloca);
                         declareFloatVar(nm, falloca);
                         /* Stage 30: if this var was assigned sqrt(x), remember x.
-                           Enables v*v → x and v*v*v → x*v (shorter sqrt critical path). */
+                           Enables v*v → x and v*v*v → x*v (shorter sqrt critical path).
+                           D9: always clear any stale association for this name
+                           first — a new `my $var = ...` declaration is a brand-new
+                           binding with no relation to a previous sqrt-tracked value
+                           of the same name, whether that previous one came from an
+                           earlier declaration in this same function or (worse) a
+                           completely unrelated sub that happened to reuse the same
+                           variable name. Leaving the old entry in place made
+                           `$a*$a` silently return the *other* sub's sqrt input
+                           instead of this variable's actual squared value. */
+                        floatSqrtOf_.erase(nm);
                         if (lastSqrtInput_) { floatSqrtOf_[nm] = lastSqrtInput_; lastSqrtInput_ = nullptr; }
                         break;
                     }
