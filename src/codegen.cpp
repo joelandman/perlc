@@ -352,6 +352,7 @@ void CodeGen::declareRuntime() {
     /* OOP */
     RT("perl_bless",                   pv,     pv, pv);
     RT("perl_register_method",         voidTy, i8p, i8p);
+    RT("perl_get_or_create_global_scalar", pv, i8p);
     RT("perl_dispatch_method",         pv,     pv, i8p, av);
     RT("perl_dispatch_method_super",   pv,     pv, i8p, i8p, av);
     RT("perl_set_isa",                 voidTy, i8p, i8p);
@@ -2295,6 +2296,7 @@ static void dfsFindCycles(const std::string &node,
 void CodeGen::compile(const Node &program, const std::string &modName, bool asDoLib) {
     mod_->setModuleIdentifier(modName);
     sourceFile_ = modName;
+    asDoLib_ = asDoLib;
     if (debug_) initializeDebugInfo(modName);
 
     /* collect sub definitions first so forward calls work — recurse into
@@ -3087,7 +3089,39 @@ void CodeGen::emitStmt(const Node &n) {
                 sharedScalarNames_.insert(nm);  /* Phase 3: route through perl_atomic_* */
                 break;
             }
-            if (atFileScope) {
+            if (atFileScope && asDoLib_) {
+                /* D58: in a --do-lib build, route file-scope scalars through
+                   the process-wide global-scalar registry instead of an
+                   ordinary per-compilation-unit GlobalVariable — each
+                   separate `do` call compiles and dlopen()s an independent
+                   shared library, so a plain GlobalVariable would give
+                   every call its own disconnected storage instead of the
+                   single persistent package-variable slot real Perl's
+                   `our`/package-scalars imply. The registry lookup runs
+                   every time this declaration executes (matching a normal
+                   GlobalVariable's "already initialized, just referenced
+                   again" behavior on repeat execution within one process);
+                   an explicit initializer (`our $x = 5`) still re-assigns
+                   every time this statement runs, exactly like the
+                   GlobalVariable path below and matching real Perl (an
+                   initializer is a normal assignment, not run-once magic —
+                   only a bare `our $x;` leaves an existing value alone). */
+                std::string qualKey = (currentPackage_.empty() || currentPackage_ == "main")
+                    ? ("main::" + nm) : (currentPackage_ + "::" + nm);
+                Value *keyStr = builder_.CreateGlobalStringPtr(qualKey);
+                Value *pv = callRT("perl_get_or_create_global_scalar", {keyStr});
+                auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "g." + nm);
+                builder_.CreateStore(pv, slot);
+                if (n.right) {
+                    Value *init = emitExpr(*n.right);
+                    callRT("perl_assign", {pv, init});
+                    freeIfOwned(init);
+                }
+                fileScalarGlobals_[nm] = slot;
+                declareVar(nm, slot);
+                if (currentPackage_ != "main")
+                    fileScalarGlobals_[currentPackage_ + "::" + nm] = slot;
+            } else if (atFileScope) {
                 /* use a global variable so subroutines can access this file-scope var */
                 auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
                     GlobalValue::InternalLinkage,

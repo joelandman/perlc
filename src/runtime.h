@@ -379,6 +379,7 @@ PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a cl
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
 void       perl_register_method(const char *key, PerlSubFnCtx fn);
 PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx);
+PerlValue *perl_get_or_create_global_scalar(const char *key); /* D58: process-wide package-scalar registry for --do-lib builds */
 /* ── threads ─────────────────────────────────────────────────────────────── */
 #include <pthread.h>
 typedef struct PerlThread {

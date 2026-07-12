@@ -131,12 +131,21 @@ private:
        shared ScalarVar). */
     std::unordered_set<std::string> sharedScalarNames_;
 
-    /* file-scope (top-level my) globals — accessible from subroutines */
-    std::unordered_map<std::string, llvm::GlobalVariable *> fileScalarGlobals_;
+    /* file-scope (top-level my) globals — accessible from subroutines.
+       fileScalarGlobals_'s value is llvm::Value* (not GlobalVariable*)
+       because D58's fix stores an AllocaInst* there instead, in --do-lib
+       builds only (see asDoLib_) — populated at runtime from a process-
+       wide registry (perl_get_or_create_global_scalar) instead of a
+       plain per-compilation-unit GlobalVariable, so a package scalar's
+       storage is actually shared across repeated `do` calls on the same
+       file. All existing consumers only ever load through the pointer
+       generically, so this is a source-compatible widening. */
+    std::unordered_map<std::string, llvm::Value *> fileScalarGlobals_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileArrayGlobals_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileHashGlobals_;
     int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */
     bool inMainBody_ = false;   /* true only while emitting the top-level program body */
+    bool asDoLib_ = false;      /* D24/D58: compiling in --do-lib mode (see compile()) */
     /* Stage 23: when true, all 2D-array rows are known FLAT_ARRAY — skip flat/norm condBrs */
     bool inFlatOnly_ = false;
 

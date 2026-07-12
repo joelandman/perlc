@@ -3129,6 +3129,39 @@ PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx) {
     return perl_alloc_undef();
 }
 
+/* ── global (package) scalar registry (D58) ──────────────────────────────────
+   A `--do-lib`-compiled file's file-scope `our`/`my` scalars are looked up
+   here (keyed by "Package::name") instead of getting an ordinary per-
+   compilation-unit GlobalVariable — each separate `do` call compiles and
+   dlopen()s an independent shared library, so a plain GlobalVariable would
+   give every call its own disconnected storage. Routing through this
+   process-wide table instead means a package scalar's storage is the same
+   stable PerlValue* across repeated `do` calls on the same file, matching
+   real Perl's package-variable semantics (same table used regardless of
+   which particular do-lib compile references the name). Same intentionally
+   simple, unlocked design as the method table above — do-lib loading isn't
+   otherwise thread-safety-hardened either, and locking only this table
+   wouldn't fix that; kept consistent rather than over-engineered. */
+typedef struct { char *key; PerlValue *pv; } GlobalScalarEntry;
+#define GLOBAL_SCALAR_TABLE_MAX 1024
+static GlobalScalarEntry s_global_scalar_table[GLOBAL_SCALAR_TABLE_MAX];
+static int s_global_scalar_count = 0;
+
+PerlValue *perl_get_or_create_global_scalar(const char *key) {
+    if (!key) return perl_alloc_undef();
+    for (int i = 0; i < s_global_scalar_count; i++) {
+        if (strcmp(s_global_scalar_table[i].key, key) == 0)
+            return s_global_scalar_table[i].pv;
+    }
+    PerlValue *pv = perl_alloc_undef();
+    if (s_global_scalar_count < GLOBAL_SCALAR_TABLE_MAX) {
+        s_global_scalar_table[s_global_scalar_count].key = strdup(key);
+        s_global_scalar_table[s_global_scalar_count].pv  = pv;
+        s_global_scalar_count++;
+    }
+    return pv;
+}
+
 /* walk class and its @ISA chain; returns NULL if not found */
 static PerlSubFnCtx perl_find_method(const char *class_name, const char *method) {
     const char *cls = class_name;
