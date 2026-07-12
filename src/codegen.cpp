@@ -2221,6 +2221,62 @@ static void collectSubDefs(const Node &n, std::vector<const Node*> &out) {
     }
 }
 
+/* D57: collect the names of every NK::Call found anywhere in an
+   expression subtree — used to detect recursion cycles among candidate
+   AST-inline subs (see below). */
+static void collectCalls(const Node &n, std::vector<std::string> &out) {
+    if (n.kind == NK::Call) out.push_back(n.name);
+    if (n.left)  collectCalls(*n.left,  out);
+    if (n.right) collectCalls(*n.right, out);
+    if (n.cond)  collectCalls(*n.cond,  out);
+    if (n.body)  collectCalls(*n.body,  out);
+    if (n.init)  collectCalls(*n.init,  out);
+    if (n.step)  collectCalls(*n.step,  out);
+    for (auto &a : n.args) collectCalls(*a, out);
+    for (auto &b : n.branches) {
+        if (b.cond) collectCalls(*b.cond, out);
+        if (b.body) collectCalls(*b.body, out);
+    }
+}
+
+/* D57: tryEmitInline() has no recursion guard — inlining a call whose
+   body (transitively, through other inlined subs) calls back to itself
+   would recurse the *compiler* forever on the same, unchanging AST node
+   (a self-recursive sub matching the inlinable shape crashed/hung the
+   compiler at compile time, confirmed even at plain file scope with no
+   block nesting involved). Standard 3-color DFS cycle detection over the
+   call graph restricted to candidate-inlineable subs (a call to a
+   non-candidate sub just becomes an ordinary, bounded function call and
+   can't participate in a cycle): 0=unvisited, 1=on the current DFS
+   stack, 2=fully explored. Finding an edge back to a node still marked
+   "on stack" means everything from that node to the top of the stack
+   forms a cycle (this also covers the direct self-recursion case, where
+   the back-edge points at the node currently being visited itself). */
+static void dfsFindCycles(const std::string &node,
+                           const std::unordered_map<std::string, std::vector<std::string>> &callGraph,
+                           std::unordered_map<std::string, int> &state,
+                           std::vector<std::string> &stack,
+                           std::set<std::string> &inCycle) {
+    state[node] = 1;
+    stack.push_back(node);
+    auto it = callGraph.find(node);
+    if (it != callGraph.end()) {
+        for (const auto &callee : it->second) {
+            int calleeState = state.count(callee) ? state[callee] : 0;
+            if (calleeState == 1) {
+                for (auto rit = stack.rbegin(); rit != stack.rend(); ++rit) {
+                    inCycle.insert(*rit);
+                    if (*rit == callee) break;
+                }
+            } else if (calleeState == 0) {
+                dfsFindCycles(callee, callGraph, state, stack, inCycle);
+            }
+        }
+    }
+    stack.pop_back();
+    state[node] = 2;
+}
+
 void CodeGen::compile(const Node &program, const std::string &modName) {
     mod_->setModuleIdentifier(modName);
     sourceFile_ = modName;
@@ -2234,7 +2290,11 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
     collectSubDefs(program, subs_);
 
     /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
-       These are expanded at call sites without @_ construction. */
+       These are expanded at call sites without @_ construction. Collected
+       into `candidates` first (not inlineSubs_ directly) so the D57
+       cycle check below can see the whole candidate set before any of
+       them become "live" for tryEmitInline(). */
+    std::unordered_map<std::string, InlineSub> candidates;
     for (auto *s : subs_) {
         if (!s->body) continue;
         const Node &body = *s->body;
@@ -2262,7 +2322,30 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
             } else { allScalar = false; break; }
         }
         if (!allScalar || params.empty()) continue;
-        inlineSubs_[s->name] = {params, ret.left.get()};
+        candidates[s->name] = {params, ret.left.get()};
+    }
+
+    /* D57: exclude any candidate that's part of a recursion cycle (direct
+       self-recursion, or mutual recursion through other candidates) —
+       see dfsFindCycles()'s comment for why inlining one would hang the
+       compiler. Everything else becomes "live" in inlineSubs_. */
+    {
+        std::unordered_map<std::string, std::vector<std::string>> callGraph;
+        for (auto &kv : candidates) {
+            std::vector<std::string> calls;
+            collectCalls(*kv.second.bodyExpr, calls);
+            for (auto &callee : calls)
+                if (candidates.count(callee)) callGraph[kv.first].push_back(callee);
+        }
+        std::set<std::string> inCycle;
+        std::unordered_map<std::string, int> dfsState;
+        for (auto &kv : candidates) {
+            if (dfsState.count(kv.first)) continue;
+            std::vector<std::string> stack;
+            dfsFindCycles(kv.first, callGraph, dfsState, stack, inCycle);
+        }
+        for (auto &kv : candidates)
+            if (!inCycle.count(kv.first)) inlineSubs_[kv.first] = kv.second;
     }
 
     /* pre-declare all subs as Functions */
