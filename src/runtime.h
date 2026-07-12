@@ -541,6 +541,7 @@ void perl_set_pos_str(PerlValue *pv, PerlValue *pos);
 /* ── runtime require ─────────────────────────────────────────────────────── */
 PerlValue *perl_runtime_require(const char *modname);
 PerlValue *perl_do_file(PerlValue *path_pv);
+void       perl_do_lib_cleanup(void);  /* D24: dlclose() do'd shared libraries */
 
 /* ── XS / FFI ────────────────────────────────────────────────────────────── */
 PerlValue *perl_xs_load_library(PerlValue *libname_pv);

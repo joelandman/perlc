@@ -19,7 +19,10 @@ class CodeGen {
 public:
     CodeGen(bool debug = false, int optLevel = 0);
 
-    void compile(const Node &program, const std::string &moduleName);
+    /* asDoLib: emit a `PerlValue *__perlc_do_run(PerlArray*, int)` entry
+       point (for a `do FILE`-loadable shared library, D24) instead of a
+       normal `main(int,char**)`. See compile()'s definition for details. */
+    void compile(const Node &program, const std::string &moduleName, bool asDoLib = false);
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();

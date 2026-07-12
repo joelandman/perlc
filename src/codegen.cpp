@@ -2292,7 +2292,7 @@ static void dfsFindCycles(const std::string &node,
     state[node] = 2;
 }
 
-void CodeGen::compile(const Node &program, const std::string &modName) {
+void CodeGen::compile(const Node &program, const std::string &modName, bool asDoLib) {
     mod_->setModuleIdentifier(modName);
     sourceFile_ = modName;
     if (debug_) initializeDebugInfo(modName);
@@ -2373,87 +2373,144 @@ void CodeGen::compile(const Node &program, const std::string &modName) {
         fn->addFnAttr(Attribute::AlwaysInline);
     }
 
-    /* emit main(int argc, char **argv) */
-    auto *i32  = Type::getInt32Ty(ctx_);
-    auto *i8p  = PointerType::getUnqual(ctx_);
-    auto *mainFT = FunctionType::get(i32, {i32, i8p}, false);
-    auto *mainFn = Function::Create(mainFT, Function::ExternalLinkage,
-                                    "main", mod_.get());
-    mainFn->getArg(0)->setName("argc");
-    mainFn->getArg(1)->setName("argv");
-    auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
-    builder_.SetInsertPoint(entry);
-
-    if (debug_) {
-        mainFn->setSubprogram(currentSP_);
-        builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
-    }
-
-    currentFn_ = mainFn;
-    pushScope();
-    /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
-    fileScopeDepth_ = (int)scopes_.size() + 1;
-    inMainBody_ = true;
-
-    /* register all subs in the method dispatch table (before user code runs) */
-    for (auto *s : subs_) {
-        if (s->name.find("::") != std::string::npos) {
-            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
-            auto *fn = mod_->getFunction(subLLVMName(s->name));
-            callRT("perl_register_method", {keyStr, fn});
-        }
-    }
-
-    /* set up @ARGV and $0 from command-line arguments */
-    {
-        Value *argc_v = mainFn->getArg(0);
-        Value *argv_v = mainFn->getArg(1);
-        Value *argvArr = callRT("perl_init_argv", {argc_v, argv_v});
-        {
-            auto *gvArgv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                GlobalValue::InternalLinkage,
-                Constant::getNullValue(perlPtrTy_), "g.arr.ARGV");
-            builder_.CreateStore(argvArr, gvArgv);
-            fileArrayGlobals_["ARGV"] = gvArgv;
-        }
-
-        Value *dollar0 = callRT("perl_get_dollar0", {});
-        auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
-        builder_.CreateStore(dollar0, slot0);
-        declareVar("0", slot0);
-
-        Value *underscoreVal = callRT("perl_alloc_undef", {});
-        auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
-        builder_.CreateStore(underscoreVal, slotUs);
-        declareVar("_", slotUs);
-    }
-
-    /* capture local() save depth at function entry */
     auto *i32Ty = Type::getInt32Ty(ctx_);
-    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
-    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+    if (!asDoLib) {
+        /* emit main(int argc, char **argv) */
+        auto *i8p  = PointerType::getUnqual(ctx_);
+        auto *mainFT = FunctionType::get(i32Ty, {i32Ty, i8p}, false);
+        auto *mainFn = Function::Create(mainFT, Function::ExternalLinkage,
+                                        "main", mod_.get());
+        mainFn->getArg(0)->setName("argc");
+        mainFn->getArg(1)->setName("argv");
+        auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
+        builder_.SetInsertPoint(entry);
 
-    emitBlock(program);
-    popScope();
+        if (debug_) {
+            mainFn->setSubprogram(currentSP_);
+            builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
+        }
 
-    callRT("perl_pop_wantarray", {});
-    /* restore any local()s before returning */
-    {
-        Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-        callRT("perl_local_restore_to", {depth});
+        currentFn_ = mainFn;
+        pushScope();
+        /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
+        fileScopeDepth_ = (int)scopes_.size() + 1;
+        inMainBody_ = true;
+
+        /* register all subs in the method dispatch table (before user code runs) */
+        for (auto *s : subs_) {
+            if (s->name.find("::") != std::string::npos) {
+                Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+                auto *fn = mod_->getFunction(subLLVMName(s->name));
+                callRT("perl_register_method", {keyStr, fn});
+            }
+        }
+
+        /* set up @ARGV and $0 from command-line arguments */
+        {
+            Value *argc_v = mainFn->getArg(0);
+            Value *argv_v = mainFn->getArg(1);
+            Value *argvArr = callRT("perl_init_argv", {argc_v, argv_v});
+            {
+                auto *gvArgv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    GlobalValue::InternalLinkage,
+                    Constant::getNullValue(perlPtrTy_), "g.arr.ARGV");
+                builder_.CreateStore(argvArr, gvArgv);
+                fileArrayGlobals_["ARGV"] = gvArgv;
+            }
+
+            Value *dollar0 = callRT("perl_get_dollar0", {});
+            auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
+            builder_.CreateStore(dollar0, slot0);
+            declareVar("0", slot0);
+
+            Value *underscoreVal = callRT("perl_alloc_undef", {});
+            auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+            builder_.CreateStore(underscoreVal, slotUs);
+            declareVar("_", slotUs);
+        }
+
+        /* capture local() save depth at function entry */
+        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+        builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+        emitBlock(program);
+        popScope();
+
+        callRT("perl_pop_wantarray", {});
+        /* restore any local()s before returning */
+        {
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+            callRT("perl_local_restore_to", {depth});
+        }
+
+        /* Register perl_cleanup via atexit so valgrind reports zero leaks. */
+        {
+            auto *atexitFnTy = FunctionType::get(Type::getInt32Ty(ctx_),
+                                                 {PointerType::getUnqual(ctx_)}, false);
+            auto atexitFn = mod_->getOrInsertFunction("atexit", atexitFnTy);
+            auto *perlCleanupFn = mod_->getFunction("perl_cleanup");
+            if (perlCleanupFn)
+                builder_.CreateCall(cast<Function>(atexitFn.getCallee()), {perlCleanupFn});
+        }
+
+        builder_.CreateRet(ConstantInt::get(i32Ty, 0));
+    } else {
+        /* D24: emit `PerlValue *__perlc_do_run(PerlArray *args, int ctx)` —
+           a `do FILE`-loadable entry point instead of `main`. No @ARGV/$0
+           setup (a do'd file doesn't get its own process argv) and no
+           atexit(perl_cleanup) registration (only the single top-level
+           program that eventually dlopen()s this .so should register
+           process-exit cleanup — this library's own runtime.c symbols
+           are never even linked in; see main.cpp's --do-lib link step).
+           The file's top-level statements are compiled exactly like a
+           sub body via emitBlockLast(), so the entry point returns the
+           value of the last statement evaluated — matching real Perl's
+           documented `do FILE` return-value contract (and the common
+           `1;` idiom at end-of-file, matching require's convention). */
+        auto *entryFT = FunctionType::get(perlPtrTy_, {arrayPtrTy_, i32Ty}, false);
+        auto *entryFn = Function::Create(entryFT, Function::ExternalLinkage,
+                                         "__perlc_do_run", mod_.get());
+        entryFn->getArg(0)->setName("args");
+        entryFn->getArg(1)->setName("ctx");
+        auto *entry = BasicBlock::Create(ctx_, "entry", entryFn);
+        builder_.SetInsertPoint(entry);
+
+        if (debug_) {
+            entryFn->setSubprogram(currentSP_);
+            builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
+        }
+
+        currentFn_ = entryFn;
+        pushScope();
+        fileScopeDepth_ = (int)scopes_.size() + 1;
+        inMainBody_ = true;
+
+        /* register all subs in the method dispatch table (before user code
+           runs) — this is what makes a do'd file's own package-qualified
+           subs (e.g. Foo::bar) callable from the *loading* process after
+           perl_do_file() returns, since the loader looks them up in this
+           same runtime-wide table via perl_call_named_sub(). */
+        for (auto *s : subs_) {
+            if (s->name.find("::") != std::string::npos) {
+                Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+                auto *fn = mod_->getFunction(subLLVMName(s->name));
+                callRT("perl_register_method", {keyStr, fn});
+            }
+        }
+
+        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+        builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+        Value *lastVal = emitBlockLast(program);
+        if (!builder_.GetInsertBlock()->getTerminator()) {
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+            callRT("perl_local_restore_to", {depth});
+            popScope();
+            builder_.CreateRet(lastVal ? lastVal : perlUndef());
+        } else {
+            popScope();  /* explicit return: already terminated this block */
+        }
     }
-
-    /* Register perl_cleanup via atexit so valgrind reports zero leaks. */
-    {
-        auto *atexitFnTy = FunctionType::get(Type::getInt32Ty(ctx_),
-                                             {PointerType::getUnqual(ctx_)}, false);
-        auto atexitFn = mod_->getOrInsertFunction("atexit", atexitFnTy);
-        auto *perlCleanupFn = mod_->getFunction("perl_cleanup");
-        if (perlCleanupFn)
-            builder_.CreateCall(cast<Function>(atexitFn.getCallee()), {perlCleanupFn});
-    }
-
-    builder_.CreateRet(ConstantInt::get(Type::getInt32Ty(ctx_), 0));
 
     inMainBody_ = false;
     /* emit sub bodies */

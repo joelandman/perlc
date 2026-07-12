@@ -569,6 +569,9 @@ static void usage(const char *prog) {
               << "  -o <out>    Output file (default: a.out)\n"
               << "  --emit-ir   Emit LLVM IR (.ll) instead of compiling\n"
               << "  --emit-bc   Emit LLVM bitcode (.bc)\n"
+              << "  --do-lib    Emit a do-FILE-loadable shared library instead of an\n"
+              << "              executable (internal use — invoked by perl_do_file() at\n"
+              << "              runtime to implement `do FILE`, D24)\n"
               << "  -O[level]   Optimization level 0-5 (default: 1)\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
@@ -585,11 +588,13 @@ int main(int argc, char **argv) {
     std::string inputFile;
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
+    bool doLib = false;
     int optLevel = 2;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
+        else if (!strcmp(argv[i], "--do-lib"))  doLib = true;
         else if (!strcmp(argv[i], "-v"))        verbose = true;
         else if (!strcmp(argv[i], "-pm"))       installPM = true;
         else if (!strcmp(argv[i], "-g"))         debugSymbols = true;
@@ -656,7 +661,7 @@ int main(int argc, char **argv) {
 
         /* codegen */
         CodeGen cg(debugSymbols, optLevel);
-        cg.compile(*ast, inputFile);
+        cg.compile(*ast, inputFile, doLib);
 
         if (emitIR) {
             std::string irFile = outputFile == "a.out"
@@ -681,15 +686,19 @@ int main(int argc, char **argv) {
 
         cg.writeIR(tmpIR);
 
-        /* find runtime.c relative to the compiler binary */
-        /* or look in same dir as this binary */
-        std::string rtSrc;
+        /* find runtime.c relative to the compiler binary; also record the
+           compiler binary's own absolute path (D24: baked into every
+           compiled executable via PERLC_SELF_PATH so perl_do_file() can
+           re-invoke this same perlc binary at runtime to compile a
+           do-FILE target into a loadable shared library). */
+        std::string rtSrc, selfPath;
         {
             /* try to find runtime.c next to the perlc binary */
             char self[1024] = {};
             ssize_t len = readlink("/proc/self/exe", self, sizeof(self)-1);
             if (len > 0) {
-                std::string dir(self, len);
+                selfPath = std::string(self, len);
+                std::string dir = selfPath;
                 auto sl = dir.rfind('/');
                 if (sl != std::string::npos) dir = dir.substr(0, sl);
                 rtSrc = dir + "/src/runtime.c";
@@ -697,13 +706,38 @@ int main(int argc, char **argv) {
         }
         if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
             rtSrc = "src/runtime.c";  /* fallback: CWD */
+        if (selfPath.empty()) selfPath = "perlc";  /* fallback: hope it's on $PATH */
+
+        if (doLib) {
+            /* D24: `do FILE`-loadable shared library. Deliberately does NOT
+               compile/link runtime.c at all — its perl_* symbol references
+               stay undefined in this .so and are resolved at dlopen() time
+               against the *loading* process's own already-linked runtime
+               (which must have been compiled with -rdynamic, see below).
+               This is what makes the do'd file share the same runtime
+               state (method dispatch table, $@, PV allocator, etc.) as
+               the program that do'd it, instead of getting an isolated
+               second copy of every runtime global. */
+            std::string cmd = "clang-18 -O" + std::to_string(optLevel) +
+                               " -march=native -Wno-atomic-alignment -shared -fPIC";
+            if (debugSymbols) cmd += " -g";
+            cmd += " " + tmpIR;
+            cmd += " -o " + outputFile + " 2>&1";
+            if (verbose) std::cerr << "[link] " << cmd << "\n";
+            int rc = system(cmd.c_str());
+            unlink(tmpIR.c_str());
+            if (rc != 0) { std::cerr << "Link failed\n"; return 1; }
+            if (verbose) std::cerr << "do-lib written to " << outputFile << "\n";
+            return 0;
+        }
 
         /* String-eval (JIT) removed; eval EXPR sets $@ and returns undef. */
         std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native"
-                            " -Wno-atomic-alignment";
+                            " -Wno-atomic-alignment -rdynamic"
+                            " -DPERLC_SELF_PATH=\"\\\"" + selfPath + "\\\"\"";
          if (debugSymbols) cmd += " -g";
          cmd += " " + tmpIR + " " + rtSrc;
-         cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic 2>&1";
+         cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic -ldl 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
         int rc = system(cmd.c_str());

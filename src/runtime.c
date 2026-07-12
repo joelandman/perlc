@@ -22,6 +22,16 @@
 #include <dlfcn.h>
 #include <sqlite3.h>
 
+/* D24: main.cpp bakes the perlc compiler's own absolute path into every
+   compiled executable via -DPERLC_SELF_PATH, so perl_do_file() can
+   re-invoke it at runtime. Builds that don't go through that dynamic
+   compile step (the perlc binary's own Makefile build, perlc_tsan) never
+   define this — perl_do_file() there is dead code (the compiler never
+   runs Perl programs itself), but it still needs to compile. */
+#ifndef PERLC_SELF_PATH
+#define PERLC_SELF_PATH "perlc"
+#endif
+
 /* ── PerlValue freelist pool ─────────────────────────────────────────────── *
  * Avoids malloc/free per temp: freed PVs go onto a singly-linked list (next
  * pointer stored in pval union field), re-used on the next alloc. The pool
@@ -630,11 +640,41 @@ PerlValue *perl_runtime_require(const char *modname) {
     return perl_alloc_int(1);
 }
 
+/* ── do FILE (D24) ────────────────────────────────────────────────────────
+   Real `do FILE` semantics require compiling and running arbitrary Perl
+   code at runtime, which isn't possible directly since the JIT was
+   removed. Implemented instead by re-invoking the perlc compiler itself
+   (via PERLC_SELF_PATH, baked into this executable at link time) as a
+   subprocess to compile the target file into a shared library
+   (`--do-lib`), then dlopen()ing it. That .so deliberately does NOT link
+   its own copy of runtime.c (see main.cpp's --do-lib link step) — its
+   perl_* symbol references stay undefined and resolve at dlopen() time
+   against *this* process's own already-linked runtime (this process must
+   have been linked with -rdynamic, also done in main.cpp), so a do'd
+   file's registered subs, $@, the PV allocator, etc. all share the same
+   runtime state as the caller, instead of an isolated second copy of
+   every global perl_do_lib_cleanup() dlclose()s at process exit — kept
+   loaded for the process's lifetime so registered subs stay callable. */
+typedef struct PerlDoLibInfo {
+    void *handle;
+    struct PerlDoLibInfo *next;
+} PerlDoLibInfo;
+static __thread PerlDoLibInfo *s_do_lib_list = NULL;
+
+void perl_do_lib_cleanup(void) {
+    PerlDoLibInfo *n = s_do_lib_list;
+    while (n) {
+        PerlDoLibInfo *next = n->next;
+        if (n->handle) dlclose(n->handle);
+        free(n);
+        n = next;
+    }
+    s_do_lib_list = NULL;
+}
+
 PerlValue *perl_do_file(PerlValue *path_pv) {
     char resolved[1024];
     char *path;
-    char *code;
-    PerlValue *result;
 
     if (!path_pv || path_pv->tag == PERL_UNDEF) return perl_alloc_undef();
     path = perl_to_string_dup(path_pv);
@@ -646,14 +686,77 @@ PerlValue *perl_do_file(PerlValue *path_pv) {
     }
     free(path);
 
-    code = perl_read_runtime_file(resolved);
-    if (!code) {
-        perl_set_dollar_at_cstr("do: failed to read file");
+    static long long s_do_counter = 0;
+    long long id = __atomic_fetch_add(&s_do_counter, 1, __ATOMIC_RELAXED);
+    char soPath[256], errPath[256];
+    snprintf(soPath,  sizeof(soPath),  "/tmp/_perlc_do_%d_%lld.so",  (int)getpid(), id);
+    snprintf(errPath, sizeof(errPath), "/tmp/_perlc_do_%d_%lld.err", (int)getpid(), id);
+
+    char cmd[2560];
+    snprintf(cmd, sizeof(cmd), "%s --do-lib \"%s\" -o \"%s\" >\"%s\" 2>&1",
+             PERLC_SELF_PATH, resolved, soPath, errPath);
+    int rc = system(cmd);
+
+    if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+        char *errtext = perl_read_runtime_file(errPath);
+        char msg[1200];
+        if (errtext && errtext[0])
+            snprintf(msg, sizeof(msg), "do \"%s\" failed: %s", resolved, errtext);
+        else
+            snprintf(msg, sizeof(msg), "do \"%s\" failed: compilation error", resolved);
+        perl_set_dollar_at_cstr(msg);
+        free(errtext);
+        unlink(soPath);
+        unlink(errPath);
+        return perl_alloc_undef();
+    }
+    unlink(errPath);
+
+    void *handle = dlopen(soPath, RTLD_NOW);
+    unlink(soPath); /* safe post-dlopen on Linux (inode stays alive while mapped) */
+    if (!handle) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "do \"%s\" failed to load: %s", resolved, dlerror());
+        perl_set_dollar_at_cstr(msg);
         return perl_alloc_undef();
     }
 
-    result = perl_eval_loaded_code(code);
-    free(code);
+    PerlSubFnCtx entry = (PerlSubFnCtx)dlsym(handle, "__perlc_do_run");
+    if (!entry) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "do \"%s\": internal error (%s)", resolved, dlerror());
+        perl_set_dollar_at_cstr(msg);
+        dlclose(handle);
+        return perl_alloc_undef();
+    }
+
+    /* keep the library loaded for the rest of the process's life — any
+       package-qualified subs it registered must stay callable. */
+    PerlDoLibInfo *info = malloc(sizeof(*info));
+    info->handle = handle;
+    info->next = s_do_lib_list;
+    s_do_lib_list = info;
+
+    /* run the file's top-level code wrapped exactly like eval{} — a
+       die() inside longjmps back here via the same s_eval_stack
+       mechanism perl_die() already uses, setting $@ and giving us
+       undef here instead of unwinding further. */
+    jmp_buf jb;
+    PerlValue *result;
+    PerlArray *emptyArgs = perl_array_new();
+    if (setjmp(jb) == 0) {
+        perl_eval_push(&jb);
+        result = entry(emptyArgs, 0); /* do FILE is always scalar context */
+        perl_eval_pop();
+        /* success: clear $@, matching eval{}'s post-success contract */
+        PerlValue empty = { .tag = PERL_STRING, .sval = "" };
+        perl_assign(&s_dollar_at, &empty);
+    } else {
+        perl_eval_pop();
+        result = perl_alloc_undef();
+        /* $@ already set by perl_die() before the longjmp */
+    }
+    perl_array_free(emptyArgs);
     return result ? result : perl_alloc_undef();
 }
 
@@ -6046,6 +6149,9 @@ void perl_cleanup(void) {
 
     /* 3. XS module list (reload of existing cleanup). */
     perl_xs_cleanup();
+
+    /* 3b. do-lib list (D24: dlopen()ed `do FILE` shared libraries). */
+    perl_do_lib_cleanup();
 
     /* 4. PV slabs: free all allocated slabs so valgrind reports zero leaks.
      * The PVs inside the slabs are either in the freelist or in use, but
