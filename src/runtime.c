@@ -5309,15 +5309,28 @@ static int sort_qsort_wrap_(const void *pa, const void *pb) {
     return r < 0 ? -1 : r > 0 ? 1 : 0;
 }
 
-PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp) {
+PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures) {
     PerlArray *res = perl_array_new();
     if (!a) return res;
     /* copy element pointers (shallow) */
     for (long long i = 0; i < a->len; i++)
         perl_array_push(res, perl_clone(a->elems[i]));
-    sort_custom_cmp_ = cmp;
+    /* D61: install the comparator's closure captures (if any) via the same
+       s_current_captures context a closure call already uses, so the
+       compiled comparator can read them with perl_get_capture(idx) — save
+       and restore rather than blindly clearing, so a comparator that
+       itself triggers a nested sort{}/closure call doesn't corrupt the
+       outer one's context. */
+    PerlSortCmpFn saved_cmp  = sort_custom_cmp_;
+    PerlValue    **saved_caps = s_current_captures;
+    int            saved_n    = s_ncaptures;
+    sort_custom_cmp_    = cmp;
+    s_current_captures  = (captures && captures->len > 0) ? captures->elems : NULL;
+    s_ncaptures         = captures ? (int)captures->len : 0;
     qsort(res->elems, (size_t)res->len, sizeof(PerlValue *), sort_qsort_wrap_);
-    sort_custom_cmp_ = NULL;
+    sort_custom_cmp_    = saved_cmp;
+    s_current_captures  = saved_caps;
+    s_ncaptures         = saved_n;
     return res;
 }
 

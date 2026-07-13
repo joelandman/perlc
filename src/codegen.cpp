@@ -421,8 +421,10 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_min_list",     pv,  av);
     RT("perl_max_list",     pv,  av);
     RT("perl_uniq_list",    av,  av);
-    /* sort with custom comparator — fn ptr passed as i8p (opaque pointer) */
-    RT("perl_sort_custom",  av,  av, i8p);
+    /* sort with custom comparator — fn ptr passed as i8p (opaque pointer);
+       third arg is the comparator's closure captures array (D61), may be
+       an empty PerlArray*. */
+    RT("perl_sort_custom",  av,  av, i8p, av);
     /* special globals (Tier 2) */
     RT("perl_get_dollar_dot",   pv);
     RT("perl_get_dollar_comma", pv);
@@ -745,6 +747,68 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             static int sortCmpCounter = 0;
             std::string cmpName = "__sort_cmp_" + std::to_string(sortCmpCounter++);
 
+            /* D61: closure-capture support for the comparator, mirroring
+               AnonSub's Phase 1 (collectAllScalarNames + "capture every
+               visible array/hash") — done here, in the *caller's* scope,
+               before cmpFn's own scope reset below wipes it out. Without
+               this, the comparator (compiled as a genuinely separate LLVM
+               function so it can be passed as a real C function pointer to
+               qsort()) previously had no way to see or modify ANY outer
+               block-scoped variable at all (only a true file-scope one,
+               via fileScalarGlobals_) — e.g. `push @observed, $a` inside
+               the comparator silently no-opped when @observed was merely
+               block-scoped. $a/$b themselves are excluded here since
+               they're bound separately below (as the function's own
+               parameters, or via the D28 file-scope-shadow check). */
+            std::set<std::string> sortUsedNames;
+            collectAllScalarNames(*n.body, sortUsedNames);
+            std::vector<std::string> sortCaptureNames;
+            std::vector<Value*>      sortCaptureVals;
+            std::vector<char>        sortCaptureSigils;
+            for (auto &nm : sortUsedNames) {
+                if (nm == "_" || nm == "a" || nm == "b") continue;
+                if (auto *slot = lookupVar(nm)) {
+                    sortCaptureNames.push_back(nm);
+                    sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
+                    sortCaptureSigils.push_back('$');
+                } else if (Value *ia = lookupIntVar(nm)) {
+                    Value *ival = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
+                    Value *boxed = boxI64(ival);
+                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    builder_.CreateStore(boxed, pvAlloca);
+                    sortCaptureNames.push_back(nm);
+                    sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
+                    sortCaptureSigils.push_back('$');
+                } else if (Value *fa = lookupFloatVar(nm)) {
+                    Value *fval = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
+                    Value *boxed = boxF64(fval);
+                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    builder_.CreateStore(boxed, pvAlloca);
+                    sortCaptureNames.push_back(nm);
+                    sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
+                    sortCaptureSigils.push_back('$');
+                }
+            }
+            {
+                std::unordered_map<std::string, Value*> visibleArrays;
+                for (auto &scope : arrayScopes_)
+                    for (auto &kv : scope) visibleArrays[kv.first] = kv.second;
+                for (auto &kv : visibleArrays) {
+                    if (kv.first == "_") continue;
+                    sortCaptureNames.push_back(kv.first);
+                    sortCaptureVals.push_back(callRT("perl_ref_array", {kv.second}));
+                    sortCaptureSigils.push_back('@');
+                }
+                std::unordered_map<std::string, Value*> visibleHashes;
+                for (auto &scope : hashScopes_)
+                    for (auto &kv : scope) visibleHashes[kv.first] = kv.second;
+                for (auto &kv : visibleHashes) {
+                    sortCaptureNames.push_back(kv.first);
+                    sortCaptureVals.push_back(callRT("perl_ref_hash", {kv.second}));
+                    sortCaptureSigils.push_back('%');
+                }
+            }
+
             auto *i64Ty = Type::getInt64Ty(ctx_);
             auto *cmpFT = FunctionType::get(i64Ty, {perlPtrTy_, perlPtrTy_}, false);
             auto *cmpFn = Function::Create(cmpFT, Function::InternalLinkage,
@@ -771,6 +835,22 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+            /* D61: re-materialize the captures collected above via
+               perl_get_capture(idx) — same pattern AnonSub bodies use. */
+            for (size_t ci = 0; ci < sortCaptureNames.size(); ci++) {
+                Value *pv = callRT("perl_get_capture",
+                                   {ConstantInt::get(i64Ty, (long long)ci)});
+                if (sortCaptureSigils[ci] == '@') {
+                    declareArray(sortCaptureNames[ci], callRT("perl_deref_array_ro", {pv}));
+                } else if (sortCaptureSigils[ci] == '%') {
+                    declareHash(sortCaptureNames[ci], callRT("perl_deref_hash", {pv}));
+                } else {
+                    auto *capAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, sortCaptureNames[ci]);
+                    builder_.CreateStore(pv, capAlloca);
+                    declareVar(sortCaptureNames[ci], capAlloca);
+                }
+            }
 
             /* bind $a and $b to the function parameters — UNLESS an
                outer, file-scope `my $a`/`my $b` already exists (D28:
@@ -829,10 +909,15 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             localDepthAlloca_ = savedLDep;
             currentSubBody_   = savedBody;
 
-            /* call perl_sort_custom(av, cmpFn) */
+            /* call perl_sort_custom(av, cmpFn, capsAv) — capsAv built from
+               the sortCaptureVals collected in the caller's own scope
+               above (D61), now that we're back in that scope. */
             Value *fnPtr = builder_.CreateBitCast(cmpFn,
                               PointerType::getUnqual(ctx_));
-            return callRT("perl_sort_custom", {av, fnPtr});
+            Value *capsAv = callRT("perl_array_new", {});
+            for (auto *cv : sortCaptureVals)
+                callRT("perl_array_push_capture", {capsAv, cv});
+            return callRT("perl_sort_custom", {av, fnPtr, capsAv});
         }
         else if (mode == "subname" && !n.name.empty()) {
             /* sort SUBNAME LIST — named comparator sub, no braces. Unlike
@@ -896,7 +981,8 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             builder_.SetInsertPoint(savedBBsn);
 
             Value *fnPtrSn = builder_.CreateBitCast(cmpFnSn, PointerType::getUnqual(ctx_));
-            return callRT("perl_sort_custom", {av, fnPtrSn});
+            Value *noCapsSn = callRT("perl_array_new", {});
+            return callRT("perl_sort_custom", {av, fnPtrSn, noCapsSn});
         }
         else { /* default: sort a copy lexicographically */
             Value *copy = callRT("perl_sort_str_asc", {av}); return copy;

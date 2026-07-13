@@ -487,7 +487,11 @@ PerlArray *perl_uniq_list(PerlArray *a);        /* uniq LIST — remove consecut
 
 /* ── sort with custom comparator ─────────────────────────────────────────── */
 typedef long long (*PerlSortCmpFn)(PerlValue *, PerlValue *);
-PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp); /* sort copy of a */
+/* captures: outer-scope variables the comparator body closes over (D61),
+   installed via the same s_current_captures/perl_get_capture mechanism a
+   closure's body already uses — may be NULL/empty for a comparator that
+   captures nothing. */
+PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures); /* sort copy of a */
 
 /* ── directory I/O ───────────────────────────────────────────────────────── */
 PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path);
