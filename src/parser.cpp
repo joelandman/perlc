@@ -3033,6 +3033,39 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             parts.push_back(makeScalar("0", line));
             i += 2; continue;
         }
+        /* $$ — PID special variable, or $$word — dereference of scalar
+           $word (D59). No case above matched $ followed by a second $,
+           so without this the first $ fell through to the plain-literal
+           default at the bottom of this loop, and the second $ was then
+           rescanned from scratch — landing on whatever *other* rule its
+           own following character happened to match (e.g. a `.` right
+           after produces $. the input-line-number variable instead:
+           "file_$$.pl" garbled into "file_$0pl"). Mirrors the
+           token-level parser's identical $$ handling for a bare
+           expression (parsePrimary): $$ followed by a letter/underscore
+           is a scalar deref (${$word}); anything else, including end of
+           string, is the PID. Subscripted deref-in-a-string
+           ($$ref[i]/$$ref{k}) is a separate, deeper, pre-existing gap —
+           not fixed here, see TESTS.md. */
+        if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '$') {
+            flush();
+            bool isIdent = i + 2 < raw.size() &&
+                           (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_');
+            if (isIdent) {
+                i += 2;
+                std::string vname;
+                while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_'))
+                    vname += raw[i++];
+                auto n = std::make_unique<Node>(); n->kind = NK::DerefScalar;
+                n->left = makeScalar(vname, line); n->line = line;
+                parts.push_back(std::move(n));
+            } else {
+                i += 2;
+                auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc; n->line = line;
+                parts.push_back(std::move(n));
+            }
+            continue;
+        }
         /* $1-$9 — capture vars */
         if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] >= '1' && raw[i+1] <= '9') {
             flush();
