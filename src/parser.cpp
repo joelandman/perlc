@@ -1388,6 +1388,43 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                    k == NK::CallerFunc || k == NK::PostfixDeref ||
                    k == NK::ArraySlice || k == NK::HashSlice;
         };
+        /* D63: $$name[idx] / $$name{key} — real Perl defines this as
+           ${name}[idx] / ${name}{key}, i.e. $name->[idx] / $name->{key}:
+           $name itself is the array/hash ref to index, with only ONE
+           level of dereference total. Before this fix, a bare `DerefScalar`
+           base here (from $$name with no subscript yet, see parsePrimary)
+           was used as-is as the ArrowDeref's base, which instead compiled
+           as "dereference $name as a scalar first, THEN deref+index THAT
+           result as an array/hash" — an extra, incorrect layer of
+           indirection. Unwrapping to the DerefScalar's own inner scalar
+           node here (once, for exactly this adjacent-subscript case) gives
+           the correct single-deref semantics; it doesn't affect a
+           subsequent chained subscript ($$aref[0][1]), since by then
+           `base` is already an ArrowDeref, not a DerefScalar, so this
+           branch is simply skipped. The EXPLICIT arrow form ($$ref->[0])
+           is a genuinely different, correctly-already-working double
+           deref — untouched, since it goes through the `->` branch above,
+           never through this adjacent-subscript one. */
+        if (base->kind == NK::DerefScalar && check(TK::LBRACKET)) {
+            advance();
+            auto idx = parseExpr();
+            consume(TK::RBRACKET, "]");
+            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+            n->sval = "array"; n->left = std::move(base->left);
+            n->right = std::move(idx); n->line = line;
+            base = std::move(n);
+            continue;
+        }
+        if (base->kind == NK::DerefScalar && check(TK::LBRACE)) {
+            advance();
+            auto key = parseExpr();
+            consume(TK::RBRACE, "}");
+            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+            n->sval = "hash"; n->left = std::move(base->left);
+            n->right = std::move(key); n->line = line;
+            base = std::move(n);
+            continue;
+        }
         if (isSubscriptableK(base->kind) && check(TK::LBRACKET)) {
             advance();
             auto idx = parseExpr();
