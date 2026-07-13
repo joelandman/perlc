@@ -772,15 +772,38 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
-            /* bind $a and $b to the function parameters */
+            /* bind $a and $b to the function parameters — UNLESS an
+               outer, file-scope `my $a`/`my $b` already exists (D28:
+               matches real Perl's well-known "my $a used in sort
+               comparison" footgun). sort's/reduce's $a/$b are
+               dynamically-aliased *package* variables in real Perl; an
+               earlier lexical `my $a` in an enclosing scope permanently
+               shadows the package variable's name for all later code in
+               that scope, including a comparator block compiled after
+               it — the block ends up reading whatever the outer lexical
+               holds (unchanging across comparisons) instead of the pair
+               actually being compared, producing a broken/non-monotonic
+               sort. This comparator body is compiled as its own,
+               separate LLVM function with a full scope reset just above,
+               so this check can only reach as far as a *file-scope*
+               shadow (via fileScalarGlobals_, untouched by that reset,
+               checked here before it would otherwise be re-declared) —
+               an outer *sub-scoped* my $a would need closure-capture
+               machinery this comparator doesn't have, and remains a
+               narrower, separate, open gap (TESTS.md's D28 entry). The
+               function still receives its two arguments unconditionally
+               either way — the sort algorithm needs them regardless of
+               whether the block's own code ends up referencing them. */
+            bool aShadowed = fileScalarGlobals_.count("a") != 0;
+            bool bShadowed = fileScalarGlobals_.count("b") != 0;
             Value *argA = cmpFn->getArg(0); argA->setName("a");
             Value *argB = cmpFn->getArg(1); argB->setName("b");
             auto *aAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "a");
             auto *bAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "b");
             builder_.CreateStore(argA, aAlloca);
             builder_.CreateStore(argB, bAlloca);
-            declareVar("a", aAlloca);
-            declareVar("b", bAlloca);
+            if (!aShadowed) declareVar("a", aAlloca);
+            if (!bShadowed) declareVar("b", bAlloca);
 
             currentSubBody_ = n.body.get();
             Value *cmpResult = emitBlockLast(*n.body);
@@ -6000,8 +6023,17 @@ Value *CodeGen::emitExpr(const Node &n) {
         callRT("perl_assign", {bPv, cur});
 
         pushScope();
-        declareVar("a", aAlloca);
-        declareVar("b", bAlloca);
+        /* D28: don't shadow $a/$b if an outer `my $a`/`my $b` is already
+           visible — matches real Perl's "my $a used in sort comparison"
+           footgun (see the identical check for sort's comparator, a few
+           hundred lines up, for the full explanation). reduce's block is
+           compiled inline in the same function/scope stack (no separate
+           LLVM function the way sort's comparator needs), so lookupVar()
+           here correctly sees both file-scope *and* enclosing-sub-scope
+           shadows — a strictly more general check than sort's, which can
+           only reach a file-scope shadow. */
+        if (!lookupVar("a")) declareVar("a", aAlloca);
+        if (!lookupVar("b")) declareVar("b", bAlloca);
         Value *blockResult = n.body ? emitBlockLast(*n.body) : perlUndef();
         popScope();
 
