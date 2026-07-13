@@ -963,6 +963,12 @@ PerlValue *perl_clone(const PerlValue *src) {
         ((PerlDBIHandle *)src->pval)->refcount++;
     } else if (src->tag == PERL_DBI_STH && src->pval) {
         ((PerlDBIStatement *)src->pval)->refcount++;
+    } else if (src->tag == PERL_CODE_REF && src->pval) {
+        /* D62: pval is shallow-copied above (*v = *src) — both v and src
+           now point at the same PerlClosure; bump its refcount so freeing
+           either one doesn't tear down the closure while the other still
+           references it. */
+        ((PerlClosure *)src->pval)->refcount++;
     }
     return v;
 }
@@ -973,6 +979,15 @@ static PerlDBIHandle *perl_dbi_get_dbh(PerlValue *pv);
 static PerlDBIStatement *perl_dbi_get_sth(PerlValue *pv);
 static void perl_dbi_handle_release(PerlDBIHandle *dbh);
 static void perl_dbi_statement_release(PerlDBIStatement *sth);
+static void perl_release_capture(PerlValue *v);   /* D62 */
+static void perl_closure_release(PerlClosure *cl); /* D62 */
+
+static inline unsigned pv_capture_count(const PerlValue *v) {
+    return (v->flags & PV_CAPTURE_MASK) >> PV_CAPTURE_SHIFT;
+}
+static inline void pv_capture_count_set(PerlValue *v, unsigned n) {
+    v->flags = (unsigned)((v->flags & ~PV_CAPTURE_MASK) | ((n << PV_CAPTURE_SHIFT) & PV_CAPTURE_MASK));
+}
 
 HOTX void perl_free(PerlValue *v) {
     if (!v) return;
@@ -984,6 +999,18 @@ HOTX void perl_free(PerlValue *v) {
        must not pool the cell, because shared scalars live for the entire
        program and the pool assumes the contents have been torn down.) */
     if (v->flags & PV_FLAG_SHARED) return;
+    /* D62: still captured by a live closure/sort-comparator? Defer the
+       real free — record that this release happened, and let whichever
+       capture-holder's own release brings the count to 0 perform the
+       actual free (see perl_release_capture below). Must come before any
+       tag-specific payload teardown: a still-captured PV must not have
+       its string/array/hash payload freed, run DESTROY, or be pooled —
+       any of those would dangle the closure(s) still holding it. */
+    unsigned ccount = pv_capture_count(v);
+    if (ccount > 0) {
+        v->flags |= PV_FLAG_CAPTURE_RELEASED;
+        return;
+    }
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
     if (v->tag == PERL_LIST_RESULT && v->pval) {
@@ -1034,11 +1061,42 @@ HOTX void perl_free(PerlValue *v) {
         }
         if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
     }
-    /* CODE_REF: pval points to a shared PerlClosure; don't free it here since
-       perl_clone() shallow-copies the pval pointer — freeing it would dangle
-       any other references to the same closure. */
+    /* CODE_REF: pval points to a refcounted PerlClosure (D62) — release
+       this wrapper's share; perl_closure_release only actually tears down
+       the closure (and releases its own captures) once no PerlValue
+       wrapper references it any more. */
+    if (v->tag == PERL_CODE_REF && v->pval) {
+        perl_closure_release((PerlClosure *)v->pval);
+    }
     if (v->blessed_class) free(v->blessed_class);
+    v->flags = 0;      /* D62: guarantee pooled PVs always start clean */
     pv_pool_push(v);   /* return struct to freelist instead of free() */
+}
+
+/* D62: decrement a captured PV's outstanding-release count; the release
+   (scope-pop or closure-teardown) that brings it to 0 *after* the
+   declaring scope has also already released its own share (recorded via
+   PV_FLAG_CAPTURE_RELEASED) performs the actual free by re-entering
+   perl_free(), which this time sees ccount==0 and falls through. */
+static void perl_release_capture(PerlValue *v) {
+    if (!v) return;
+    if (v->flags & PV_FLAG_SHARED) return;   /* never tracked — matches capture-time skip */
+    unsigned n = pv_capture_count(v);
+    if (n == 0 || n == PV_CAPTURE_MAX) return;  /* not tracked, or pinned/leaked on overflow */
+    n--;
+    pv_capture_count_set(v, n);
+    if (n == 0 && (v->flags & PV_FLAG_CAPTURE_RELEASED)) perl_free(v);
+}
+
+/* D62: release this PerlValue wrapper's share of the closure; tears the
+   closure down (freeing its captures array and itself) only once no
+   wrapper references it any more. */
+static void perl_closure_release(PerlClosure *cl) {
+    if (!cl) return;
+    if (--cl->refcount > 0) return;
+    for (int i = 0; i < cl->ncaptures; i++) perl_release_capture(cl->captures[i]);
+    free(cl->captures);
+    free(cl);
 }
 
 /* ── coercions ───────────────────────────────────────────────────────────── */
@@ -1221,7 +1279,12 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
        Handling it here once, rather than case-by-case in every tag branch
        below, closes the whole class of ordering bugs at once. */
     if (dst == src) return;
-    int shared = dst->flags & PV_FLAG_SHARED;
+    /* D62: preserve every identity-persistent bit across the reassignment
+       below, not just PV_FLAG_SHARED — dst's capture-count/released bits
+       belong to the STABLE POINTER's identity (which closures may still
+       hold), not to whatever value currently lives in it, and must
+       survive any number of perl_assign calls on that same pointer. */
+    unsigned int preserved_flags = dst->flags & (PV_FLAG_SHARED | PV_CAPTURE_MASK | PV_FLAG_CAPTURE_RELEASED);
     /* No implicit mutex here — caller must hold lock() for concurrent safety.
        Locking inside perl_assign would deadlock when lock() is already held.
        Visibility for cross-thread write/read is now the responsibility of
@@ -1241,6 +1304,11 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         ((PerlDBIHandle *)src->pval)->refcount++;
     } else if (src && src->tag == PERL_DBI_STH && src->pval) {
         ((PerlDBIStatement *)src->pval)->refcount++;
+    } else if (src && src->tag == PERL_CODE_REF && src->pval) {
+        /* D62: dst is about to shallow-copy src's pval (*dst = *src below) —
+           bump the closure's refcount so it isn't torn down while dst also
+           references it. */
+        ((PerlClosure *)src->pval)->refcount++;
     }
     /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
@@ -1273,10 +1341,15 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         perl_dbi_statement_release((PerlDBIStatement *)dst->pval);
     if (dst->tag == PERL_DBI_DBH && dst->pval)
         perl_dbi_handle_release((PerlDBIHandle *)dst->pval);
+    if (dst->tag == PERL_CODE_REF && dst->pval) {
+        /* D62: dst is about to be overwritten (*dst = *src below) — release
+           dst's old share of whatever closure it was pointing at first. */
+        perl_closure_release((PerlClosure *)dst->pval);
+    }
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
-    dst->flags = (unsigned int)shared;  /* restore shared flag — *dst = *src clobbered it */
+    dst->flags = preserved_flags;  /* restore identity bits — *dst = *src clobbered them */
     if (src->tag == PERL_STRING) {
         dst->sval = strdup(src->sval);
         dst->matchpos = 0;
@@ -1594,17 +1667,25 @@ void perl_array_push(PerlArray *a, PerlValue *v) {
     a->elems[a->len++] = perl_clone(v);
 }
 
-/* Like perl_array_push but preserves the original pointer for shared vars
-   (no clone).  Used exclusively for closure capture arrays. */
+/* Preserves the original pointer (no clone) for every capture — shared
+   vars because they're program-lifetime cells that must stay identical
+   across threads, non-shared vars because real Perl closures capture by
+   reference (D62): a mutation from either side of the closure boundary
+   must be visible to the other. Non-shared captures bump the PV's D62
+   capture-refcount so perl_free() defers the real free until every
+   capturing closure/sort-comparator (see perl_release_capture) AND the
+   declaring scope have both released their share — used exclusively for
+   closure/sort-comparator capture arrays. */
 void perl_array_push_capture(PerlArray *a, PerlValue *v) {
     if (a->len == a->cap) {
         a->cap *= 2;
         a->elems = realloc(a->elems, a->cap * sizeof(PerlValue *));
     }
-    if (v && (v->flags & PV_FLAG_SHARED))
-        a->elems[a->len++] = v;        /* shared: store original pointer */
-    else
-        a->elems[a->len++] = perl_clone(v);
+    if (v && !(v->flags & PV_FLAG_SHARED)) {
+        unsigned n = pv_capture_count(v);
+        if (n < PV_CAPTURE_MAX) pv_capture_count_set(v, n + 1);
+    }
+    a->elems[a->len++] = v;
 }
 
 /* Push without cloning: the caller retains ownership of v and guarantees v
@@ -2506,6 +2587,7 @@ static PerlValue *make_code_ref_impl(PerlSubFnCtx fp, PerlValue **caps, int ncap
     cl->ncaptures = ncaps;
     cl->captures  = ncaps > 0 ? malloc(ncaps * sizeof(PerlValue*)) : NULL;
     for (int i = 0; i < ncaps; i++) cl->captures[i] = caps[i];
+    cl->refcount = 1;   /* D62: mirrors PerlArray/PerlHash's anon-creation init */
     PerlValue *v = pv_alloc();
     v->tag = PERL_CODE_REF;
     v->pval = cl;
@@ -2521,7 +2603,11 @@ PerlValue *perl_make_code_ref(PerlSubFnCtx fp) {
 PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures) {
     int n = captures ? (int)captures->len : 0;
     PerlValue **caps = n > 0 ? captures->elems : NULL;
-    return make_code_ref_impl(fp, caps, n);
+    PerlValue *v = make_code_ref_impl(fp, caps, n);
+    /* D62: elements were already copied into cl->captures (and refcounted
+       by perl_array_push_capture) — free just the wrapper array/struct. */
+    if (captures) perl_array_free_nc(captures);
+    return v;
 }
 
 /* ── threads::shared ─────────────────────────────────────────────────────── */
@@ -2883,6 +2969,7 @@ static PerlValue *clone_code_ref_for_thread(PerlValue *code_pv) {
     PerlClosure *new_cl = malloc(sizeof *new_cl);
     new_cl->fn        = old_cl->fn;
     new_cl->ncaptures = old_cl->ncaptures;
+    new_cl->refcount  = 1;   /* D62: independent closure, own lifetime */
     new_cl->captures  = old_cl->ncaptures > 0
         ? malloc(old_cl->ncaptures * sizeof(PerlValue *)) : NULL;
     for (int i = 0; i < old_cl->ncaptures; i++) {
@@ -5309,9 +5396,24 @@ static int sort_qsort_wrap_(const void *pa, const void *pb) {
     return r < 0 ? -1 : r > 0 ? 1 : 0;
 }
 
+/* D62: release this comparator's captures — symmetric to the increment
+   perl_array_push_capture already did at the call site. There's no
+   PerlClosure/teardown event for sort's captures (unlike an AnonSub), so
+   this is the only place that can release them; without it, every scalar
+   any sort{} comparator captures would be incremented once and never
+   decremented, permanently pinning (leaking) it. */
+static void perl_sort_release_captures(PerlArray *captures) {
+    if (!captures) return;
+    for (long long i = 0; i < captures->len; i++)
+        perl_release_capture(captures->elems[i]);
+    perl_array_free_nc(captures);  /* wrapper only — elements were just
+                                       released above, or are :shared and
+                                       untouched either way */
+}
+
 PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures) {
     PerlArray *res = perl_array_new();
-    if (!a) return res;
+    if (!a) { perl_sort_release_captures(captures); return res; }
     /* copy element pointers (shallow) */
     for (long long i = 0; i < a->len; i++)
         perl_array_push(res, perl_clone(a->elems[i]));
@@ -5331,6 +5433,7 @@ PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures
     sort_custom_cmp_    = saved_cmp;
     s_current_captures  = saved_caps;
     s_ncaptures         = saved_n;
+    perl_sort_release_captures(captures);  /* D62 */
     return res;
 }
 

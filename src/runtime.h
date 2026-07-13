@@ -29,6 +29,22 @@ typedef enum {
 /* PV_FLAG_SHARED: cell is a threads::shared variable (see SharedMutex below). */
 #define PV_FLAG_SHARED 1u
 
+/* D62: closure-capture reference counting, packed into spare `flags` bits
+   (no PerlValue struct growth — see the size/alignment note on `flags`
+   below). A PV captured by a closure/sort-comparator is no longer cloned;
+   instead its capture count is bumped, and perl_free() defers the real
+   free until every capturing closure AND the declaring scope have both
+   released their share. PV_FLAG_CAPTURE_RELEASED records that the
+   declaring scope's own perl_free() call already happened while captures
+   were still outstanding, so the capture-side release that brings the
+   count to 0 knows it's safe to actually free. See perl_array_push_capture/
+   perl_free/perl_release_capture/perl_closure_release in runtime.c. */
+#define PV_FLAG_CAPTURE_RELEASED  2u
+#define PV_CAPTURE_SHIFT          2
+#define PV_CAPTURE_BITS           20
+#define PV_CAPTURE_MASK   (((1u << PV_CAPTURE_BITS) - 1) << PV_CAPTURE_SHIFT)
+#define PV_CAPTURE_MAX     ((1u << PV_CAPTURE_BITS) - 1)   /* pin-forever sentinel on overflow */
+
 typedef struct PerlValue {
     PerlTag      tag;
     unsigned int flags;       /* PV_FLAG_SHARED etc.; fits existing padding slot */
@@ -366,8 +382,11 @@ typedef PerlValue *(*PerlSubFnCtx)(PerlArray *, int ctx);
 /* PerlClosure is the heap object stored in PERL_CODE_REF pval */
 typedef struct PerlClosure {
     PerlSubFnCtx   fn;
-    PerlValue **captures;  /* borrowed PerlValue* — not owned */
+    PerlValue **captures;  /* D62: refcounted PerlValue* — see PV_CAPTURE_MASK */
     int         ncaptures;
+    int         refcount;  /* # of live PerlValue wrappers whose pval points
+                               here (mirrors PerlArray/PerlHash's refcount
+                               pattern); always >=1 while reachable */
 } PerlClosure;
 
 PerlValue *perl_make_code_ref(PerlSubFnCtx fp);                     /* no captures */
