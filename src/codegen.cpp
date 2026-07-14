@@ -5873,6 +5873,29 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.args.size() < 2) return perlUndef();
         Value *str = emitExpr(*n.args[0]);
         Value *off = emitExpr(*n.args[1]);
+        if (n.args.size() >= 4) {
+            /* D74: 4-arg substr($str,$off,$len,$repl) — real Perl replaces
+               the substring in $str in place AND returns the OLD (pre-
+               replacement) substring value. Previously this 4th arg was
+               parsed but silently ignored — codegen had no case for
+               args.size()>=4 at all, so the call behaved exactly like the
+               3-arg read-only form. `str` here is the stable PerlValue*
+               the original scalar variable's slot holds (emitExpr on a
+               plain ScalarVar returns that pointer itself, not a clone),
+               so perl_substr_replace's in-place mutation of it correctly
+               reaches back into the variable — the same stable-pointer
+               reliance the existing 3-arg lvalue-assignment form
+               (`substr(...) = val`, case NK::Assign above) already uses.
+               Neither perl_substr3 nor perl_substr_replace frees/mutates
+               their off/len args, so reusing the same off/len Values for
+               both calls below is safe. */
+            Value *len = emitExpr(*n.args[2]);
+            Value *oldVal = callRT("perl_substr3", {str, off, len});
+            Value *repl = emitExpr(*n.args[3]);
+            callRT("perl_substr_replace", {str, off, len, repl});
+            freeIfOwned(repl);
+            return oldVal;
+        }
         if (n.args.size() >= 3) {
             Value *len = emitExpr(*n.args[2]);
             return callRT("perl_substr3", {str, off, len});
