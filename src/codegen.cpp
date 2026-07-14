@@ -40,6 +40,41 @@ static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
     for (auto &a : n.args) collectAllScalarNames(*a, names);
 }
 
+/* D64: collect every scalar name referenced anywhere inside ANY closure
+   (AnonSub, or sort{}'s custom comparator) nested within `n` — used to
+   decide whether a `my $var = <literal>` declaration is safe to place on
+   the unboxed int/float fast path (intScopes_/floatScopes_), which has
+   no real PerlValue* for a closure to later capture/share; boxing a
+   snapshot at capture time instead (the existing lookupIntVar/boxI64
+   fallback) silently disconnects the closure's view from the real
+   variable. Deliberately over-approximates — a name used only in some
+   unrelated, never-actually-captured context elsewhere in the same
+   function still loses the fast path — rather than risk misclassifying
+   a genuinely captured variable as safe (a correctness bug, not just a
+   missed optimization). Computed once per function (named sub, AnonSub,
+   or the top-level program body) at compilation entry; see D64 in
+   TESTS.md and capturedNamesInCurrentFn_ in codegen.h. */
+static void collectClosureCapturedNames(const Node &n, std::unordered_set<std::string> &names) {
+    if (n.kind == NK::AnonSub || (n.kind == NK::SortFunc && n.sval == "custom")) {
+        if (n.body) {
+            std::set<std::string> inner;
+            collectAllScalarNames(*n.body, inner);
+            names.insert(inner.begin(), inner.end());
+        }
+    }
+    if (n.left)  collectClosureCapturedNames(*n.left,  names);
+    if (n.right) collectClosureCapturedNames(*n.right, names);
+    if (n.cond)  collectClosureCapturedNames(*n.cond,  names);
+    if (n.body)  collectClosureCapturedNames(*n.body,  names);
+    if (n.init)  collectClosureCapturedNames(*n.init,  names);
+    if (n.step)  collectClosureCapturedNames(*n.step,  names);
+    for (auto &b : n.branches) {
+        if (b.cond) collectClosureCapturedNames(*b.cond, names);
+        if (b.body) collectClosureCapturedNames(*b.body, names);
+    }
+    for (auto &a : n.args) collectClosureCapturedNames(*a, names);
+}
+
 /* mangle Foo::bar → perlsub_Foo__bar for valid LLVM identifiers */
 static std::string subLLVMName(const std::string &name) {
     std::string result = name;
@@ -2562,6 +2597,9 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
         localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
+        /* D64: same pre-scan as emitSub/AnonSub, for the top-level program body */
+        collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
+
         emitBlock(program);
         popScope();
 
@@ -2630,6 +2668,9 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
         localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
+        /* D64: same pre-scan as the normal-main path above */
+        collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
+
         Value *lastVal = emitBlockLast(program);
         if (!builder_.GetInsertBlock()->getTerminator()) {
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
@@ -2680,6 +2721,13 @@ void CodeGen::emitSub(const Node &n) {
         auto sc = n.name.rfind("::");
         currentPackage_ = (sc != std::string::npos) ? n.name.substr(0, sc) : "main";
     }
+
+    /* D64: pre-scan this sub's body once for names captured by any
+       closure nested within it, so `case NK::My:`'s fast-path check can
+       skip the unboxed int/float optimization for those specific names. */
+    auto savedCapturedNames = capturedNamesInCurrentFn_;
+    capturedNamesInCurrentFn_.clear();
+    if (n.body) collectClosureCapturedNames(*n.body, capturedNamesInCurrentFn_);
 
     auto *savedFn = currentFn_;
     currentFn_ = fn;
@@ -2831,6 +2879,7 @@ void CodeGen::emitSub(const Node &n) {
     currentSubNeedsWantarray_ = savedNeedsWantarray;
     currentFn_ = savedFn;
     currentPackage_ = savedPackage;
+    capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
 
     /* restore insert point to end of main (for any remaining stmts) */
     /* caller will set insert point back */
@@ -3267,11 +3316,19 @@ void CodeGen::emitStmt(const Node &n) {
                     fileScalarGlobals_[currentPackage_ + "::" + nm] = gv;
             } else {
                 /* Unbox numeric scalars: skip PerlValue* alloca entirely.
-                   Guard: 1D ArrowDeref may return an array/hash ref, not a scalar. */
+                   Guard: 1D ArrowDeref may return an array/hash ref, not a scalar.
+                   D64: also skip this fast path when `nm` is captured by some
+                   closure/sort-comparator anywhere in the current function —
+                   the fast path has no real PerlValue* for a closure to later
+                   share, so the existing capture-collection fallback
+                   (lookupIntVar/boxI64) would box a disconnected snapshot
+                   instead, silently breaking mutation visibility in either
+                   direction across the closure boundary. */
                 bool rhsMayBeRef = n.right &&
                     n.right->kind == NK::ArrowDeref && n.right->sval == "array" &&
                     n.right->left && n.right->left->kind != NK::ArrowDeref;
-                if (n.right && !atFileScope && !rhsMayBeRef) {
+                bool mayBeCaptured = capturedNamesInCurrentFn_.count(nm) != 0;
+                if (n.right && !atFileScope && !rhsMayBeRef && !mayBeCaptured) {
                     if (Value *ival = emitExprI64(*n.right)) {
                         auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
                         builder_.CreateStore(ival, ialloca);
@@ -6675,6 +6732,12 @@ Value *CodeGen::emitExpr(const Node &n) {
            the same isolation already given to scopes_/arrayScopes_/etc. */
         auto  savedEvalReturnTargets = evalReturnTargets_;
         evalReturnTargets_.clear();
+        /* D64: pre-scan this closure's own body for names captured by any
+           FURTHER-nested closure, so its own `my $var = <literal>`
+           declarations get the same fast-path guard. */
+        auto savedCapturedNames = capturedNamesInCurrentFn_;
+        capturedNamesInCurrentFn_.clear();
+        if (n.body) collectClosureCapturedNames(*n.body, capturedNamesInCurrentFn_);
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
@@ -6797,6 +6860,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         localDepthAlloca_ = savedLocalDepth;
         currentSubBody_   = savedSubBody;
         evalReturnTargets_ = std::move(savedEvalReturnTargets);
+        capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));

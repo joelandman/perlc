@@ -153,6 +153,15 @@ private:
     llvm::Function                *currentFn_ = nullptr;
     /* Stage 24a: true when current sub emitted perl_push_wantarray at entry */
     bool                           currentSubNeedsWantarray_ = true;
+    /* D64: scalar names captured by some closure (AnonSub, or sort{}'s
+       custom comparator) anywhere within the function currently being
+       compiled — computed once per function entry (emitSub/AnonSub/the
+       top-level program body) via collectClosureCapturedNames(). A `my
+       $var = <literal>` declaration whose name is in this set must not
+       use the unboxed int/float fast path (intScopes_/floatScopes_,
+       which has no real PerlValue* for a closure to later share) even
+       though the fast path would otherwise apply — see D64 in TESTS.md. */
+    std::unordered_set<std::string> capturedNamesInCurrentFn_;
     /* 0=scalar context, 1=list context — set before emitting call, consumed by emitCall */
     int                            callCtx_ = 0;
     /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
