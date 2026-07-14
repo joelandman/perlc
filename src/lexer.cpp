@@ -343,10 +343,33 @@ std::vector<Token> Lexer::tokenize() {
             toks.push_back({TK::QWORDS, words, line_}); continue;
         }
 
-        /* q{} qq{} — with balanced-brace support */
-        if (c == 'q' && (peek(1) == '{' || peek(1) == 'q')) {
+        /* q{} qq{} — with balanced-brace support.
+           D60: also recognize bare q/qq with a non-brace delimiter —
+           `q(...)`, `q[...]`, `q<...>`, `q/.../` were previously only
+           reachable via qq(...) et al; a bare single-q with one of these
+           delimiters fell through to ordinary bareword lexing entirely.
+           Deliberately restricted to this small, unambiguous bracket/
+           slash set rather than "any non-alnum punctuation": `q`, being
+           a single short letter, appears immediately before many other
+           punctuation characters in entirely unrelated contexts — most
+           importantly a hash-subscript bareword key (`$h{q}`, where
+           peek(1) is '}') — and treating those as quote-delimiter starts
+           would silently break such existing, unrelated code. Bracket/
+           slash delimiters carry no such risk: '(' '[' '<' '/' never
+           legitimately follow a bareword `q` in valid Perl outside the
+           quote-like-operator meaning. */
+        auto isQDelimStart = [](char ch) {
+            return ch == '(' || ch == '[' || ch == '<' || ch == '/';
+        };
+        if (c == 'q' && (peek(1) == '{' || peek(1) == 'q' || isQDelimStart(peek(1)))) {
             bool dq = (peek(1) == 'q');
-            pos_ += 2;
+            /* Only 'q' itself is skipped here when the delimiter is a
+               real punctuation character (not part of "qq") — the
+               delimiter itself must stay in place for the peek()=='{'
+               check and the qopen/qclose fallback just below to see it.
+               For genuine "qq", both letters are skipped, landing on the
+               delimiter that follows them instead. */
+            pos_ += (dq ? 2 : 1);
             if (peek() == '{') {
                 pos_++; /* skip '{' */
                 /* balanced brace scan */
