@@ -23,6 +23,17 @@ NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens) {
     return p.parseExpr();
 }
 
+NodeList Parser::parseExprListFromTokens(std::vector<Token> tokens) {
+    tokens.push_back({TK::EOF_TOK, "", 0});
+    Parser p(std::move(tokens));
+    NodeList args;
+    while (!p.check(TK::EOF_TOK)) {
+        args.push_back(p.parseExpr());
+        if (!p.match(TK::COMMA)) break;
+    }
+    return args;
+}
+
 Token &Parser::cur()                { return toks_[pos_]; }
 Token &Parser::peek(int off)        { size_t p = pos_ + off; return p < toks_.size() ? toks_[p] : toks_.back(); }
 bool   Parser::check(TK k)  const  { return toks_[pos_].kind == k; }
@@ -1989,12 +2000,24 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* defined($x) */
+    /* defined($x)  or  defined $x  (D34: parens used to be mandatory — a
+       hard parse error on one of the single most common Perl idioms,
+       `if (defined $x) {...}`). Real Perl's `defined` is a "named unary
+       operator": without parens it binds tighter than comparisons/equality
+       but looser than shift/additive/multiplicative, so `defined $x && $y`
+       must parse as `(defined $x) && $y`, not `defined($x && $y)`, and
+       `defined $x + 1` must parse as `defined($x + 1)`. Calling parseShift()
+       (rather than the full parseExpr()) for the no-parens case reproduces
+       exactly that precedence, since parseShift already sits directly
+       below parseBinding/parseCmp and directly above parseAdd/parseMul in
+       this parser's own precedence chain. An explicit paren still parses
+       the full expression inside, same as before — parens always override
+       precedence regardless of what's outside them. */
     if (check(TK::KW_DEFINED)) {
         advance();
-        consume(TK::LPAREN, "(");
-        auto inner = parseExpr();
-        consume(TK::RPAREN, ")");
+        bool hasParen = match(TK::LPAREN);
+        NodePtr inner = hasParen ? parseExpr() : parseShift();
+        if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::DefinedFunc;
         n->left = std::move(inner); n->line = line;
         return n;
@@ -3137,7 +3160,14 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             }
             continue;
         }
-        /* $varname possibly followed by [idx] or {key} */
+        /* $varname possibly followed by [idx]/{key}, and/or a D72 arrow-deref
+           chain: ->[idx], ->{key}, and further adjacent [idx]/{key} segments
+           (real Perl treats $ref->{a}{b} and $ref->{a}->{b} identically —
+           only the *first* subscript needs an explicit "->"). Without an
+           explicit "->" before the first subscript, it means plain
+           @varname/%varname element access ($arr[i]/$hash{k}), matching
+           pre-existing behavior; an explicit "->" (or any subscript after
+           the first one in a chain) means dereferencing $varname instead. */
         if (raw[i] == '$' && i + 1 < raw.size() && (isalpha(raw[i+1]) || raw[i+1] == '_')) {
             flush(); i++;
             std::string vname;
@@ -3148,44 +3178,79 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 vname += raw[i++]; vname += raw[i++]; /* :: */
                 while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
             }
-            /* $arr[idx] */
-            if (i < raw.size() && raw[i] == '[') {
-                i++;
-                std::string idx_s;
-                while (i < raw.size() && raw[i] != ']') idx_s += raw[i++];
-                if (i < raw.size()) i++;
-                auto n = std::make_unique<Node>(); n->kind = NK::ArrayElem;
-                n->name = vname;
-                /* parse as expression to support $arr[$i] */
-                if (!idx_s.empty() && (idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
-                    Lexer il(idx_s); auto itoks = il.tokenize();
-                    n->left = Parser::parseExprFromTokens(std::move(itoks));
-                } else {
-                    long long idx = idx_s.empty() ? 0 : std::stoll(idx_s);
-                    n->left = makeInt(idx, line);
+
+            NodePtr node = makeScalar(vname, line);
+            bool haveSubscript = false;
+            for (;;) {
+                bool arrowSeen = false;
+                size_t save = i;
+                if (i + 1 < raw.size() && raw[i] == '-' && raw[i+1] == '>') {
+                    /* Only consume "->" here if it's actually followed by a
+                       subscript — real Perl's interpolation doesn't support
+                       ->method(...)/->(...) calls, so "$obj->method" must
+                       leave "->method" as literal text for the outer scan. */
+                    if (i + 2 < raw.size() && (raw[i+2] == '[' || raw[i+2] == '{')) {
+                        i += 2;
+                        arrowSeen = true;
+                    }
                 }
-                n->line = line;
-                parts.push_back(std::move(n));
-            /* $hash{key} */
-            } else if (i < raw.size() && raw[i] == '{') {
-                i++;
-                std::string key_s;
-                while (i < raw.size() && raw[i] != '}') key_s += raw[i++];
-                if (i < raw.size()) i++;
-                auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
-                n->name = vname;
-                /* parse as expression to support $hash{$var} */
-                if (!key_s.empty() && (key_s[0] == '$' || key_s[0] == '@')) {
-                    Lexer kl(key_s); auto ktoks = kl.tokenize();
-                    n->left = Parser::parseExprFromTokens(std::move(ktoks));
-                } else {
-                    n->left = makeStr(key_s, line);
+                if (i < raw.size() && raw[i] == '[') {
+                    i++;
+                    std::string idx_s;
+                    while (i < raw.size() && raw[i] != ']') idx_s += raw[i++];
+                    if (i < raw.size()) i++;
+                    NodePtr idxExpr;
+                    if (!idx_s.empty() && (idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
+                        Lexer il(idx_s); auto itoks = il.tokenize();
+                        idxExpr = Parser::parseExprFromTokens(std::move(itoks));
+                    } else {
+                        long long idx = idx_s.empty() ? 0 : std::stoll(idx_s);
+                        idxExpr = makeInt(idx, line);
+                    }
+                    if (!arrowSeen && !haveSubscript) {
+                        /* first subscript, no "->": plain $arr[idx] */
+                        auto n = std::make_unique<Node>(); n->kind = NK::ArrayElem;
+                        n->name = vname; n->left = std::move(idxExpr); n->line = line;
+                        node = std::move(n);
+                    } else {
+                        auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+                        n->sval = "array"; n->left = std::move(node);
+                        n->right = std::move(idxExpr); n->line = line;
+                        node = std::move(n);
+                    }
+                    haveSubscript = true;
+                    continue;
                 }
-                n->line = line;
-                parts.push_back(std::move(n));
-            } else {
-                parts.push_back(makeScalar(vname, line));
+                if (i < raw.size() && raw[i] == '{') {
+                    i++;
+                    std::string key_s;
+                    while (i < raw.size() && raw[i] != '}') key_s += raw[i++];
+                    if (i < raw.size()) i++;
+                    NodePtr keyExpr;
+                    if (!key_s.empty() && (key_s[0] == '$' || key_s[0] == '@')) {
+                        Lexer kl(key_s); auto ktoks = kl.tokenize();
+                        keyExpr = Parser::parseExprFromTokens(std::move(ktoks));
+                    } else {
+                        keyExpr = makeStr(key_s, line);
+                    }
+                    if (!arrowSeen && !haveSubscript) {
+                        /* first subscript, no "->": plain $hash{key} */
+                        auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
+                        n->name = vname; n->left = std::move(keyExpr); n->line = line;
+                        node = std::move(n);
+                    } else {
+                        auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+                        n->sval = "hash"; n->left = std::move(node);
+                        n->right = std::move(keyExpr); n->line = line;
+                        node = std::move(n);
+                    }
+                    haveSubscript = true;
+                    continue;
+                }
+                if (arrowSeen) i = save;  /* rewind an unconsumed "->" */
+                break;
             }
+            parts.push_back(std::move(node));
             continue;
         }
         /* @{expr} — deref expr as array, join elements with space */
@@ -3223,7 +3288,15 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             parts.push_back(std::move(joinNode));
             continue;
         }
-        /* @arr — interpolate entire array joined by $" (default space) */
+        /* @arr — interpolate entire array joined by $" (default space); or,
+           D73, @arr[LIST]/@hash{LIST} — an array/hash SLICE, also joined
+           by $" the same way. Previously only the whole-array form was
+           recognized: "@arr[1,2]" interpolated the *entire* array (all of
+           it, space-joined) and then appended the literal, un-parsed text
+           "[1,2]" afterward, since nothing here ever looked for a
+           following [ or {; "@h{'a','b'}" was worse — @h isn't even a
+           valid array/hash name by itself, so it silently interpolated as
+           an empty array ("") followed by literal "{'a','b'}" text. */
         if (raw[i] == '@' && i + 1 < raw.size() && (isalpha(raw[i+1]) || raw[i+1] == '_')) {
             flush(); i++;
             std::string vname;
@@ -3234,13 +3307,36 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 vname += raw[i++]; vname += raw[i++];
                 while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
             }
-            /* join array with space */
-            auto arrNode = std::make_unique<Node>(); arrNode->kind = NK::ArrayVar;
-            arrNode->name = vname; arrNode->line = line;
+
+            NodePtr listNode;
+            if (i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
+                char open = raw[i], close = (open == '[') ? ']' : '}';
+                i++;
+                std::string inner;
+                int depth = 1;
+                while (i < raw.size() && depth > 0) {
+                    char c = raw[i];
+                    if (c == open) depth++;
+                    else if (c == close) { if (--depth == 0) { i++; break; } }
+                    inner += c; i++;
+                }
+                Lexer il(inner);
+                auto itoks = il.tokenize();
+                NodeList indices = Parser::parseExprListFromTokens(std::move(itoks));
+                auto n = std::make_unique<Node>();
+                n->kind = (open == '[') ? NK::ArraySlice : NK::HashSlice;
+                n->name = vname; n->args = std::move(indices); n->line = line;
+                listNode = std::move(n);
+            } else {
+                auto n = std::make_unique<Node>(); n->kind = NK::ArrayVar;
+                n->name = vname; n->line = line;
+                listNode = std::move(n);
+            }
+            /* join the (whole-array or slice) list with space */
             auto sepNode  = makeStr(" ", line);
             auto joinNode = std::make_unique<Node>(); joinNode->kind = NK::JoinFunc;
             joinNode->left = std::move(sepNode);
-            joinNode->args.push_back(std::move(arrNode));
+            joinNode->args.push_back(std::move(listNode));
             joinNode->line = line;
             parts.push_back(std::move(joinNode));
             continue;

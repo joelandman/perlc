@@ -1403,7 +1403,15 @@ HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
     long long bv = perl_to_int(b);
     if (bv == 0) { fprintf(stderr, "Illegal modulus zero\n"); exit(1); }
-    return perl_alloc_int(perl_to_int(a) % bv);
+    long long av = perl_to_int(a);
+    /* Perl's %, unlike C's, uses floored-division semantics: the result
+       always has the same sign as the right operand (or is zero) — e.g.
+       -7 % 3 == 2, 7 % -3 == -2. C's '%' truncates toward zero instead,
+       so a nonzero result with a sign mismatch against bv needs bv added
+       back to floor it. */
+    long long r = av % bv;
+    if (r != 0 && ((r < 0) != (bv < 0))) r += bv;
+    return perl_alloc_int(r);
 }
 
 PerlValue *perl_pow(const PerlValue *a, const PerlValue *b) {
@@ -3841,31 +3849,62 @@ PerlValue *perl_pack(PerlValue *fmt_pv, PerlArray *args) {
         char type = *p++;
         if (!type) break;
 
-        /* read count multiplier (comes after type in Perl format) */
+        /* read count multiplier (comes after type in Perl format): a plain
+           digit string, or '*' meaning "all remaining args" (numeric types)
+           or "the exact length of the one string arg" (a/A/h/H/b/B) — D67's
+           original wiring omitted '*' entirely, silently treating it as a
+           default count of 1 (only the first value/byte). */
         long long count = 1;
-        if (*p && *p >= '0' && *p <= '9') {
+        int starCount = 0;
+        if (*p == '*') { starCount = 1; p++; }
+        else if (*p && *p >= '0' && *p <= '9') {
             count = 0;
             while (*p && *p >= '0' && *p <= '9') { count = count * 10 + (*p - '0'); p++; }
         }
-        /* p already points past the digits or at the next type char */
+        /* p already points past the digits/'*' or at the next type char */
+        if (starCount && type != 'a' && type != 'A' && type != 'h' && type != 'H' &&
+            type != 'b' && type != 'B') {
+            /* '*' for a numeric type means "consume all remaining args"
+               (the a/A/h/H/b/B string types resolve '*' themselves, against
+               their one arg's own length, inside their own case below).
+               x/X/@ don't consume args at all; '*' there is a much rarer,
+               less-defined edge case in real Perl too — left as a no-op
+               (count 0) rather than guessed at. */
+            count = (type == 'x' || type == 'X' || type == '@') ? 0 : (args->len - argidx);
+            if (count < 0) count = 0;
+        }
 
         int little_endian = 0;
         int signed_flag = 0;
         int size_bytes = 0;
 
         switch (type) {
-        case 'a': case 'A': case 'h': case 'H': case 'b': case 'B':
-            /* string/bytes — consume one arg as string, copy raw bytes */
-            for (long long c = 0; c < count; c++) {
-                PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
-                char *s = perl_to_string_dup(arg);
-                size_t slen = strlen(s);
-                ENSURE(slen);
-                memcpy(out + pos, s, slen);
-                pos += slen;
-                free(s);
+        case 'a': case 'A': case 'h': case 'H': case 'b': case 'B': {
+            /* D67: the count for a string type is a FIELD WIDTH applied to
+               a single arg (pack("A5","hi") -> "hi   ", one arg) — NOT a
+               repeat count over that many separate args (that's only how
+               the numeric types below use their count). '*' means "the
+               field width is exactly this one arg's own length". 'A' pads
+               with spaces (and its unpack counterpart strips them back
+               off); 'a' pads with NUL bytes; h/H/b/B (hex/bit strings)
+               still just copy raw bytes rather than actually doing nibble/bit-level
+               encoding — a narrower, separate, not-fixed-here gap (see
+               TESTS.md D85). */
+            PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+            char *s = perl_to_string_dup(arg);
+            size_t slen = strlen(s);
+            size_t fieldWidth = starCount ? slen : (size_t)count;
+            ENSURE(fieldWidth);
+            size_t copyLen = slen < fieldWidth ? slen : fieldWidth;
+            memcpy(out + pos, s, copyLen);
+            if (fieldWidth > copyLen) {
+                char padChar = (type == 'A') ? ' ' : '\0';
+                memset(out + pos + copyLen, padChar, fieldWidth - copyLen);
             }
+            pos += fieldWidth;
+            free(s);
             continue;
+        }
         case 'x': /* skip byte */
             pos += count;
             ENSURE(0); /* ensure buffer big enough */
@@ -3963,131 +4002,25 @@ PerlValue *perl_pack(PerlValue *fmt_pv, PerlArray *args) {
 }
 
 PerlValue *perl_unpack(PerlValue *fmt_pv, PerlValue *str_pv) {
-    char *fmt = perl_to_string_dup(fmt_pv);
-    char *str = perl_to_string_dup(str_pv);
-    size_t slen = strlen(str);
-    size_t strpos = 0;
-
-    PerlArray *result = perl_array_new();
-    long long argidx = 0; (void)argidx;
-
-    for (const char *p = fmt; *p; ) {
-        if (*p == '\\') { p++; if (!*p) break; continue; }
-
-        /* read type char first */
-        char type = *p++;
-        if (!type) break;
-
-        /* read count multiplier (comes after type in Perl format) */
-        long long count = 1;
-        if (*p && *p >= '0' && *p <= '9') {
-            count = 0;
-            while (*p && *p >= '0' && *p <= '9') { count = count * 10 + (*p - '0'); p++; }
-        }
-        /* p already points past the digits or at the next type char */
-
-        int little_endian = 0;
-        int size_bytes = 0;
-        int is_signed = 0;
-
-        switch (type) {
-        case 'a': case 'A': case 'h': case 'H': case 'b': case 'B': {
-            /* string — read count bytes as ONE element */
-            size_t slen2 = (count > 0 && count < slen - strpos) ? (size_t)count : (slen - strpos);
-            char *s = malloc(slen2 + 1);
-            memcpy(s, str + strpos, slen2);
-            s[slen2] = '\0';
-            strpos += slen2;
-            perl_array_push(result, perl_alloc_string(s));
-            free(s);
-            continue;
-        }
-        case 'x': /* skip */
-            strpos += count;
-            continue;
-        case 'X': /* back up */
-            if (strpos > 0) strpos -= count;
-            continue;
-        case '@': /* jump to position */
-            strpos = count;
-            continue;
-        case 'c': case 'C':
-            size_bytes = 1; is_signed = (type == 'c');
-            break;
-        case 's': case 'S':
-            size_bytes = 2; is_signed = (type == 's');
-            if (type == 'S') little_endian = 1;
-            break;
-        case 'n':
-            size_bytes = 2; is_signed = 0; little_endian = 0;
-            break;
-        case 'N':
-            size_bytes = 4; is_signed = 0; little_endian = 0;
-            break;
-        case 'v':
-            size_bytes = 2; is_signed = 0; little_endian = 1;
-            break;
-        case 'V':
-            size_bytes = 4; is_signed = 0; little_endian = 1;
-            break;
-        case 'l': case 'L':
-            size_bytes = 4; is_signed = (type == 'l');
-            if (type == 'L') little_endian = 1;
-            break;
-        case 'i': case 'I':
-            size_bytes = (int)sizeof(int); is_signed = (type == 'i');
-            if (type == 'I') little_endian = 1;
-            break;
-        case 'q': case 'Q':
-            size_bytes = 8; is_signed = (type == 'q');
-            if (type == 'Q') little_endian = 1;
-            break;
-        case 'f':
-            size_bytes = 4;
-            for (long long c = 0; c < count; c++) {
-                if (strpos + 4 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
-                float fv;
-                memcpy(&fv, str + strpos, 4);
-                perl_array_push(result, perl_alloc_float((double)fv));
-                strpos += 4;
-            }
-            continue;
-        case 'd':
-            size_bytes = 8;
-            for (long long c = 0; c < count; c++) {
-                if (strpos + 8 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
-                double dv;
-                memcpy(&dv, str + strpos, 8);
-                perl_array_push(result, perl_alloc_float(dv));
-                strpos += 8;
-            }
-            continue;
-        default:
-            continue;
-        }
-
-        /* integer unpacking */
-        for (long long c = 0; c < count; c++) {
-            if (strpos + size_bytes > slen) {
-                perl_array_push(result, perl_alloc_undef());
-                continue;
-            }
-            unsigned char *bp = (unsigned char *)(str + strpos);
-            long long val = read_int_from_buf(bp, size_bytes, little_endian);
-            if (!is_signed) val &= ((1LL << (size_bytes * 8)) - 1);
-            perl_array_push(result, perl_alloc_int(val));
-            strpos += size_bytes;
-        }
-    }
-
-    free(fmt);
-    free(str);
-    return perl_ref_array(result);
+    /* Scalar-context unpack: real Perl returns just the FIRST value from
+       the list unpack() would produce in list context — NOT a reference to
+       the whole list (this function previously duplicated the entire
+       list-unpacking loop, independently of perl_unpack_to_array, and its
+       own copy of that loop had drifted: it returned perl_ref_array(result)
+       — an ARRAY ref — instead of a single scalar, and separately lacked
+       '*' count and 'A' trailing-strip support, both fixed as part of D67).
+       Delegating here eliminates the duplication and both drifted bugs at
+       once — there is now exactly one unpack-format-parsing implementation. */
+    PerlArray *arr = perl_unpack_to_array(fmt_pv, str_pv);
+    PerlValue *result = (arr->len > 0) ? perl_clone(arr->elems[0]) : perl_alloc_undef();
+    perl_array_free(arr);
+    return result;
 }
 
 /* ── range ───────────────────────────────────────────────────────────────── */
 
-/* Helper: unpack and return array directly (for emitArrayPtr) */
+/* Helper: unpack and return array directly (for emitArrayPtr; perl_unpack
+   below delegates to this for scalar context too, taking just element 0). */
 PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
     char *fmt = perl_to_string_dup(fmt_pv);
     char *str = perl_to_string_dup(str_pv);
@@ -4103,24 +4036,42 @@ PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
         char type = *p++;
         if (!type) break;
 
-        /* read count multiplier (comes after type in Perl format) */
+        /* read count multiplier: a plain digit string, or '*' meaning "all
+           remaining bytes" (a/A/h/H/b/B: as one field) or "as many whole
+           elements as fit" (numeric types) — D67's original wiring omitted
+           '*' entirely, silently defaulting to a count of 1. */
         long long count = 1;
-        if (*p && *p >= '0' && *p <= '9') {
+        int starCount = 0;
+        if (*p == '*') { starCount = 1; p++; }
+        else if (*p && *p >= '0' && *p <= '9') {
             count = 0;
             while (*p && *p >= '0' && *p <= '9') { count = count * 10 + (*p - '0'); p++; }
         }
-        /* p already points past the digits or at the next type char */
+        /* p already points past the digits/'*' or at the next type char */
 
         int little_endian = 0;
         int size_bytes = 0;
 
         switch (type) {
         case 'a': case 'A': case 'h': case 'H': case 'b': case 'B': {
-            size_t slen2 = (count > 0 && count < slen - strpos) ? (size_t)count : (slen - strpos);
-            char *s = malloc(slen2 + 1);
-            memcpy(s, str + strpos, slen2);
-            s[slen2] = '\0';
-            strpos += slen2;
+            /* D67: count/'*' is a FIELD WIDTH (one element), same as the
+               pack side. 'A' additionally strips trailing spaces and NUL
+               bytes from the extracted field (real Perl's ASCII-string
+               semantics); 'a' (raw bytes) and h/H/b/B (still just raw byte
+               copies, not real nibble/bit encoding — see TESTS.md D85) do
+               not strip anything. */
+            size_t remain = slen - strpos;
+            size_t fieldWidth = starCount ? remain : (size_t)count;
+            if (fieldWidth > remain) fieldWidth = remain;
+            size_t end = fieldWidth;
+            if (type == 'A') {
+                while (end > 0 && (str[strpos + end - 1] == ' ' || str[strpos + end - 1] == '\0'))
+                    end--;
+            }
+            char *s = malloc(end + 1);
+            memcpy(s, str + strpos, end);
+            s[end] = '\0';
+            strpos += fieldWidth;
             perl_array_push(result, perl_alloc_string(s));
             free(s);
             continue;
@@ -4167,6 +4118,7 @@ PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
             break;
         case 'f':
             size_bytes = 4;
+            if (starCount) count = (long long)((slen - strpos) / size_bytes);
             for (long long c = 0; c < count; c++) {
                 if (strpos + 4 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
                 float fv;
@@ -4177,6 +4129,7 @@ PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
             continue;
         case 'd':
             size_bytes = 8;
+            if (starCount) count = (long long)((slen - strpos) / size_bytes);
             for (long long c = 0; c < count; c++) {
                 if (strpos + 8 > slen) { perl_array_push(result, perl_alloc_undef()); continue; }
                 double dv;
@@ -4189,6 +4142,7 @@ PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
             continue;
         }
 
+        if (starCount) count = (size_bytes > 0) ? (long long)((slen - strpos) / size_bytes) : 0;
         for (long long c = 0; c < count; c++) {
             if (strpos + size_bytes > slen) {
                 perl_array_push(result, perl_alloc_undef());
@@ -4196,8 +4150,32 @@ PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
             }
             unsigned char *bp = (unsigned char *)(str + strpos);
             long long val = read_int_from_buf(bp, size_bytes, little_endian);
-            if (type != 'c' && type != 's' && type != 'l' && type != 'i' && type != 'q')
-                val &= ((1LL << (size_bytes * 8)) - 1);
+            /* D67: read_int_from_buf() just ORs raw bytes together with no
+               notion of signedness, so a narrower-than-64-bit field always
+               comes back as its unsigned interpretation (e.g. pack("c",-100)
+               unpacked as 156, pack("l",-1094861636) unpacked as
+               3200105660 — confirmed both wrong before this fix). Signed
+               types need explicit sign-extension when the field's own top
+               bit is set; unsigned types need the opposite — masking off
+               any stray high bits `read_int_from_buf`'s OR-based accumulator
+               could have inherited (there shouldn't be any given `val`
+               starts at 0, but this mirrors the pre-existing unsigned-mask
+               intent explicitly rather than relying on that). Both are
+               skipped for size_bytes==8 — a full 8 bytes already occupies
+               all of `long long`'s width (no bits to extend or mask), and
+               `1LL << 64` is undefined behavior (shift-by-width-of-type;
+               on x86/ARM it silently wraps to `1LL << 0`, which previously
+               zeroed every unsigned 8-byte unpack via `val &= 0`). */
+            if (size_bytes < 8) {
+                int isSignedType = (type == 'c' || type == 's' || type == 'l' ||
+                                     type == 'i' || type == 'q');
+                long long signBit = 1LL << (size_bytes * 8 - 1);
+                if (isSignedType) {
+                    if (val & signBit) val |= ~(signBit | (signBit - 1));
+                } else {
+                    val &= ((1LL << (size_bytes * 8)) - 1);
+                }
+            }
             perl_array_push(result, perl_alloc_int(val));
             strpos += size_bytes;
         }

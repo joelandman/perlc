@@ -236,6 +236,7 @@ private:
     llvm::Value *emitBlock(const Node &n);
     llvm::Value *emitBlockLast(const Node &n); /* emits block, returns last expr value */
     llvm::Value *emitBinOp(const Node &n);
+    llvm::Value *emitShortCircuitRhs(const Node &rhsNode); /* ||/&& RHS: real control-flow for `or return`/`and return` (D8a) */
     llvm::Value *emitCall(const Node &n);
     llvm::Value *emitLValue(const Node &n); /* returns alloca */
     /* Recursively resolve (autovivifying every missing intermediate level)
@@ -278,6 +279,7 @@ private:
     bool         canEmitI64(const Node &n);
     llvm::Value *emitExprI64(const Node &n);
     llvm::Value *boxI64(llvm::Value *iv);
+    llvm::Value *emitFlooredMod(llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem */
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons, else nullptr */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
 

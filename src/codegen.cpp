@@ -288,6 +288,9 @@ void CodeGen::declareRuntime() {
     RT("perl_substr3",  pv,   pv, pv, pv);
     RT("perl_join",     pv,   pv, av);
     RT("perl_split",    av,   pv, pv);
+    RT("perl_pack",           pv, pv, av);
+    RT("perl_unpack",         pv, pv, pv);
+    RT("perl_unpack_to_array", av, pv, pv);
     /* references */
     RT("perl_alloc_flat_array", pv, i64);  /* FLAT_ARRAY (Stage 22/23 path) */
     RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
@@ -709,6 +712,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         }
         Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
         return callRT("perl_split", {sep, str});
+    }
+    /* unpack(FORMAT, EXPR) in list context — D67 */
+    if (n.kind == NK::UnpackFunc) {
+        Value *str = emitExpr(*n.left);
+        Value *fmt = emitExpr(*n.args[0]);
+        return callRT("perl_unpack_to_array", {fmt, str});
     }
     /* stat / lstat in list context → 13-element array */
     if (n.kind == NK::StatFunc) {
@@ -1539,6 +1548,25 @@ Value *CodeGen::boxI64(Value *iv) {
     return callRT("perl_alloc_int", {iv});
 }
 
+Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
+    /* Perl's %, unlike C's, uses floored-division semantics: the result
+       always has the same sign as the right operand (or is zero) — e.g.
+       -7 % 3 == 2, 7 % -3 == -2. LLVM's SRem (like C's %) truncates toward
+       zero instead, so a nonzero result with a sign mismatch against rv
+       needs rv added back to floor it. Branchless via select, mirroring
+       perl_mod's boxed-value equivalent in runtime.c. */
+    auto *i64 = Type::getInt64Ty(ctx_);
+    Value *zero = ConstantInt::get(i64, 0);
+    Value *r = builder_.CreateSRem(lv, rv, "irem");
+    Value *rNeg = builder_.CreateICmpSLT(r, zero);
+    Value *rvNeg = builder_.CreateICmpSLT(rv, zero);
+    Value *signMismatch = builder_.CreateICmpNE(rNeg, rvNeg);
+    Value *rNonZero = builder_.CreateICmpNE(r, zero);
+    Value *needsAdjust = builder_.CreateAnd(signMismatch, rNonZero);
+    Value *adjusted = builder_.CreateAdd(r, rv);
+    return builder_.CreateSelect(needsAdjust, adjusted, r, "imod");
+}
+
 bool CodeGen::canEmitI64(const Node &n) {
     switch (n.kind) {
     case NK::IntLit: return true;
@@ -1582,7 +1610,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
         if (n.sval == "+") return builder_.CreateAdd(lv, rv, "iadd");
         if (n.sval == "-") return builder_.CreateSub(lv, rv, "isub");
         if (n.sval == "*") return builder_.CreateMul(lv, rv, "imul");
-        return builder_.CreateSRem(lv, rv, "irem");
+        return emitFlooredMod(lv, rv);
     }
     case NK::UnaryOp:
         if (n.sval == "-" && n.left && canEmitI64(*n.left)) {
@@ -1927,7 +1955,11 @@ bool CodeGen::canEmitF64(const Node &n) {
         }
         return false;
     case NK::HashElem:
-        return lookupHash(n.name) != nullptr;
+        /* Hash values can be any type (string, ref, etc.) — unlike an array,
+           there's no per-hash type tracking (D66: this used to return true
+           whenever the hash was merely in scope, silently coercing string
+           values to 0.0 via perl_to_float). Not safely float-promotable. */
+        return false;
     case NK::Call: {
         /* Inlineable subs whose body is purely numeric can be emitted as F64. */
         auto it = inlineSubs_.find(n.name);
@@ -2335,12 +2367,13 @@ Value *CodeGen::emitExprF64(const Node &n) {
             return nullptr;
         }
     }
-    case NK::HashElem: {
-        Value *hv = lookupHash(n.name);
-        if (!hv) return nullptr;
-        Value *elem = emitHashGetRef(hv, *n.left);
-        return callRT("perl_to_float", {elem});
-    }
+    case NK::HashElem:
+        /* D66: hash values can be any type (string, ref, etc.), and unlike
+           ArrayElem there's no per-hash element-type tracking to prove this
+           read is safe. Bail out to the general (correct, tag-checking) path
+           instead of blindly calling perl_to_float on a possibly-non-numeric
+           value. Mirrors the hash-ArrowDeref case just above. */
+        return nullptr;
     case NK::Call: {
         /* Inlineable sub with a float body — emit the body directly in F64 context,
            skipping boxing entirely (e.g. cabs2($zp) in a comparison). */
@@ -5372,7 +5405,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (n.sval == "+") return builder_.CreateAdd(lv, rv);
                     if (n.sval == "-") return builder_.CreateSub(lv, rv);
                     if (n.sval == "*") return builder_.CreateMul(lv, rv);
-                    if (n.sval == "%") return builder_.CreateSRem(lv, rv);
+                    if (n.sval == "%") return emitFlooredMod(lv, rv);
                     return nullptr;
                 };
                 Value *lv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
@@ -5811,6 +5844,33 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *av  = callRT("perl_array_new", {});
         for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
         return callRT("perl_sprintf", {fmt, av});
+    }
+
+    case NK::PackFunc: {
+        /* D67: parser already built this node and runtime.c already
+           implements perl_pack, but codegen had no case at all — pack()
+           silently compiled to nothing. Args must be flattened like
+           JoinFunc's list-building does (pack("C4", @arr) needs @arr's
+           4 elements individually, not scalar(@arr) — an array argument
+           passed through plain emitExpr() would give just the count). */
+        Value *fmt = emitExpr(*n.left);
+        Value *av  = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *src = emitArrayPtr(*a);
+            if (src) callRT("perl_array_extend", {av, src});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        return callRT("perl_pack", {fmt, av});
+    }
+
+    case NK::UnpackFunc: {
+        /* D67: same gap as PackFunc. Scalar context returns just the first
+           unpacked value; list context is handled separately in
+           emitArrayPtr via perl_unpack_to_array. Node layout (parser.cpp):
+           n.left = the string being unpacked, n.args[0] = the format. */
+        Value *str = emitExpr(*n.left);
+        Value *fmt = emitExpr(*n.args[0]);
+        return callRT("perl_unpack", {fmt, str});
     }
 
     case NK::JoinFunc: {
@@ -7125,6 +7185,41 @@ Value *CodeGen::emitLValue(const Node &n) {
     }
 }
 
+Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
+    /* D8a: `EXPR or return VALUE` / `EXPR and return VALUE` parse into a
+       BinOp("||"/"&&") whose RHS is a Block wrapping a single Return
+       statement (Parser::parseOrRhs). Routing that through the ordinary
+       emitExpr()->emitBlockLast() path is wrong here: emitBlockLast treats
+       a trailing Return specially by only *capturing its value* without
+       emitting a real return, on the assumption that some outer caller (a
+       sub body's own emission code, e.g. the code right after
+       emitBlockLast(program) for a sub/do-file body) will perform the
+       actual return afterward — true for that use case, but there is no
+       such outer caller here. The captured value just silently flowed into
+       the "or"/"and" result and execution fell through to the next
+       statement — confirmed exactly matching the reported bug: `f() or
+       return "X";` compiled but never actually returned "X". Detecting
+       this exact shape and dispatching straight to emitStmt() (the real
+       Return handling — eval-target check, local-restore, scope cleanup,
+       and the actual ret/branch) fixes it without touching emitBlockLast's
+       shared logic, which many other callers (sub bodies, do-file bodies,
+       ternary/if branches) correctly rely on behaving the way it already
+       does. */
+    if (rhsNode.kind == NK::Block && rhsNode.args.size() == 1 &&
+        rhsNode.args[0]->kind == NK::Return) {
+        emitStmt(*rhsNode.args[0]);
+        if (builder_.GetInsertBlock()->getTerminator()) return nullptr;
+        /* Extremely rare edge case: `return` with no enclosing sub or eval
+           ("or return X" at true top level) compiles to a bare perl_die()
+           call, which is NoReturn but not itself an LLVM terminator
+           instruction — execution never truly continues past it at
+           runtime, but the caller's PHI node still needs a well-typed
+           value here to keep the IR valid. */
+        return perlUndef();
+    }
+    return emitExpr(rhsNode);
+}
+
 Value *CodeGen::emitBinOp(const Node &n) {
     /* Fast path: stay unboxed for integer arithmetic */
     if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%") {
@@ -7148,7 +7243,7 @@ Value *CodeGen::emitBinOp(const Node &n) {
         builder_.CreateCondBr(ltrue, rhsBB, endBB);
 
         builder_.SetInsertPoint(rhsBB);
-        Value *rv = emitExpr(*n.right);
+        Value *rv = emitShortCircuitRhs(*n.right);
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);
@@ -7170,7 +7265,7 @@ Value *CodeGen::emitBinOp(const Node &n) {
         builder_.CreateCondBr(ltrue, endBB, rhsBB);
 
         builder_.SetInsertPoint(rhsBB);
-        Value *rv = emitExpr(*n.right);
+        Value *rv = emitShortCircuitRhs(*n.right);
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);

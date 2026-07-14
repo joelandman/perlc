@@ -12,6 +12,7 @@ public:
     void setImportMap(std::map<std::string, std::string> m) { importMap_ = std::move(m); }
     void setConstMap(std::map<std::string, NodePtr> m)      { constMap_  = std::move(m); }
     static NodePtr parseExprFromTokens(std::vector<Token> tokens);  /* pre-parse const value expr */
+    static NodeList parseExprListFromTokens(std::vector<Token> tokens);  /* comma-separated list, e.g. slice indices/keys */
     NodePtr parseProgram();   /* returns a Block */
 
 private:
