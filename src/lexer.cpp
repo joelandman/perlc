@@ -327,8 +327,32 @@ std::vector<Token> Lexer::tokenize() {
             toks.push_back({TK::BACKTICK, "\x01" + cmd, line_}); continue;
         }
 
+        /* D65: a bare `$`/`@`/`%` sigil is tokenized as its own, separate
+           single-character token (just "$", "@", or "%") without
+           consuming the identifier that follows — the *next* loop
+           iteration reads that identifier via the generic isalpha(c)
+           path further down. This means a variable *name* that happens
+           to start with "q"/"qq"/"qw" (e.g. $qqfoo — a plain variable,
+           not a quote operator; $q{key} for a variable literally named
+           "q"; $qw{key}/%qw for one named "qw") would otherwise be
+           caught by the q/qq/qw checks below — which exist for fresh
+           expression-start quote-like operators — silently
+           misinterpreting the variable name (or part of it) as a
+           quote-like operator instead. Confirmed this is what was
+           happening: $qqfoo produced spurious parse errors, and
+           $q{key}/$qw{key}/%qw (bare, not string-interpolated) silently
+           evaluated to the wrong value entirely (including the hash
+           *declaration* `my %qw = (...)` itself, whose "qw" was mistaken
+           for a qw()-list operator). Guard: a name immediately following
+           a bare sigil token is always a plain identifier, never a
+           quote-like operator. */
+        bool afterSigil = !toks.empty() &&
+            (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
+             toks.back().kind == TK::HASH) &&
+            toks.back().text.size() == 1;
+
         /* qw(...) – quote-word list */
-        if (c == 'q' && peek(1) == 'w' && !isalnum(peek(2)) && peek(2) != '_') {
+        if (!afterSigil && c == 'q' && peek(1) == 'w' && !isalnum(peek(2)) && peek(2) != '_') {
             pos_ += 2; /* skip 'qw' */
             char open = peek();
             char close = (open == '(') ? ')' : (open == '[') ? ']' :
@@ -361,7 +385,21 @@ std::vector<Token> Lexer::tokenize() {
         auto isQDelimStart = [](char ch) {
             return ch == '(' || ch == '[' || ch == '<' || ch == '/';
         };
-        if (c == 'q' && (peek(1) == '{' || peek(1) == 'q' || isQDelimStart(peek(1)))) {
+        /* D65: unlike qw's existing `!isalnum(peek(2)) && peek(2) != '_'`
+           guard above, the "qq" branch here had NO check at all that the
+           character after "qq" looks like a genuine delimiter — it
+           unconditionally treated whatever followed as the delimiter,
+           even an ordinary alphanumeric/underscore character. That's how
+           an identifier like "qqfoo" (peek(2)=='f') or "qq_slash"
+           (peek(2)=='_') got misparsed as qq with a bizarre single-letter
+           delimiter, scanning far ahead for another occurrence of that
+           same letter and corrupting the token stream. Mirrors qw's own
+           guard now. */
+        auto isQQDelim = [](char ch) {
+            return ch != '\0' && !isalnum((unsigned char)ch) && ch != '_';
+        };
+        if (!afterSigil && c == 'q' &&
+            (peek(1) == '{' || (peek(1) == 'q' && isQQDelim(peek(2))) || isQDelimStart(peek(1)))) {
             bool dq = (peek(1) == 'q');
             /* Only 'q' itself is skipped here when the delimiter is a
                real punctuation character (not part of "qq") — the
