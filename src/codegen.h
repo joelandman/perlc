@@ -237,6 +237,7 @@ private:
     llvm::Value *emitBlockLast(const Node &n); /* emits block, returns last expr value */
     llvm::Value *emitBinOp(const Node &n);
     llvm::Value *emitShortCircuitRhs(const Node &rhsNode); /* ||/&& RHS: real control-flow for `or return`/`and return` (D8a) */
+    bool isCallLikeForContext(const Node &n); /* D12: safe to propagate outer list context into this node's own call */
     llvm::Value *emitCall(const Node &n);
     llvm::Value *emitLValue(const Node &n); /* returns alloca */
     /* Recursively resolve (autovivifying every missing intermediate level)

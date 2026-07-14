@@ -3454,11 +3454,24 @@ void CodeGen::emitStmt(const Node &n) {
                     callRT(isSay ? "perl_say_fh" : "perl_print_fh", {fh, v});
                 }
             } else {
+                /* D12: print's arguments are always evaluated in list
+                   context in real Perl, regardless of print's own
+                   (always-scalar/void) context — a sub called *directly*
+                   as a print argument must see wantarray()==true. callCtx_
+                   is a one-shot flag consumed (reset to 0) by the first
+                   Call node's own codegen, so it must be set fresh before
+                   each argument, not once before the whole loop — and only
+                   when the argument is itself call-like (see
+                   isCallLikeForContext), or it would leak list context
+                   through an enclosing operator like `eq`/`==` into a call
+                   nested inside it, which must see scalar context instead. */
                 for (size_t i = 0; i < n.args.size(); i++) {
                     if (i > 0) callRT("perl_print_sep_fh", {fh});
                     bool lastArg = (i + 1 == n.args.size());
-                    callRT(isSay && lastArg ? "perl_say_fh" : "perl_print_fh",
-                           {fh, emitExpr(*n.args[i])});
+                    if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
+                    Value *v = emitExpr(*n.args[i]);
+                    callCtx_ = 0;
+                    callRT(isSay && lastArg ? "perl_say_fh" : "perl_print_fh", {fh, v});
                 }
             }
             if (!isSay) callRT("perl_print_ors_fh", {fh});
@@ -3476,27 +3489,41 @@ void CodeGen::emitStmt(const Node &n) {
                 bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
                                         ak == NK::ArraySlice || ak == NK::HashSlice ||
                                         (ak == NK::PostfixDeref && n.args[0]->sval == "all_array"));
+                /* D12: list context for the (possibly sole) print argument
+                   — only when it's itself call-like, see
+                   isCallLikeForContext. */
+                if (isCallLikeForContext(*n.args[0])) callCtx_ = 1;
                 Value *av = isExplicitArray ? emitArrayPtr(*n.args[0]) : nullptr;
                 if (av) {
+                    callCtx_ = 0;
                     callRT("perl_print_array", {av});
                     if (isSay) callRT("perl_print_string",
                                      {builder_.CreateGlobalString("\n", ".nl")});
                 } else {
                     Value *v = emitExpr(*n.args[0]);
+                    callCtx_ = 0;
                     callRT(isSay ? "perl_say" : "perl_print", {v});
                 }
             } else {
+                /* D12: see the filehandle-print loop above — callCtx_ must
+                   be set fresh per argument, not once before the loop, and
+                   only when the argument is itself call-like. */
                 for (size_t i = 0; i < n.args.size(); i++) {
                     if (i > 0) callRT("perl_print_sep", {});
                     NK ak = n.args[i]->kind;
                     bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
                                             ak == NK::ArraySlice || ak == NK::HashSlice ||
                                             (ak == NK::PostfixDeref && n.args[i]->sval == "all_array"));
+                    if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
                     Value *av = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
-                    if (av)
+                    if (av) {
+                        callCtx_ = 0;
                         callRT("perl_print_array", {av});
-                    else
-                        callRT("perl_print", {emitExpr(*n.args[i])});
+                    } else {
+                        Value *v = emitExpr(*n.args[i]);
+                        callCtx_ = 0;
+                        callRT("perl_print", {v});
+                    }
                 }
                 if (isSay) {
                     auto *nl = builder_.CreateGlobalString("\n", ".nl");
@@ -3509,9 +3536,23 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::PrintfStmt: {
+        /* D12: printf's format and args are all evaluated in list context
+           in real Perl. callCtx_ is a one-shot flag consumed by the first
+           Call node's own codegen, so it must be set fresh before each
+           sub-expression, not once before the whole sequence — and only
+           when that sub-expression is itself call-like, or list context
+           would leak through an enclosing scalar-forcing operator (like
+           `eq`/`==`) into a call nested inside it. */
+        if (isCallLikeForContext(*n.left)) callCtx_ = 1;
         Value *fmt = emitExpr(*n.left);
+        callCtx_ = 0;
         Value *av  = callRT("perl_array_new", {});
-        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        for (auto &a : n.args) {
+            if (isCallLikeForContext(*a)) callCtx_ = 1;
+            Value *v = emitExpr(*a);
+            callCtx_ = 0;
+            callRT("perl_array_push", {av, v});
+        }
         if (n.name == "STDERR") {
             callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
         } else if (!n.name.empty() && n.name != "STDOUT") {
@@ -7183,6 +7224,27 @@ Value *CodeGen::emitLValue(const Node &n) {
     }
     default: return nullptr;
     }
+}
+
+bool CodeGen::isCallLikeForContext(const Node &n) {
+    /* D12: print/printf's arguments are evaluated in list context in real
+       Perl, so a sub called *directly* as an argument must see
+       wantarray()==true. But callCtx_ is a blunt, unscoped one-shot flag
+       (set here, consumed by the next Call/MethodCall/CallCodeRef node's
+       own codegen) with no awareness of intervening operators — if the
+       argument is a compound expression like `ctx() eq "x"`, blindly
+       setting callCtx_=1 before evaluating the whole BinOp leaks list
+       context through "eq" into ctx(), even though real Perl's comparison
+       operators always force scalar context on their own operands
+       regardless of the outer context their *result* is used in. This
+       exact same leak already existed for `my @a = (ctx() eq "x")` before
+       this fix (a separate, pre-existing gap in callCtx_'s design, not
+       something introduced here) — confirmed directly, not fixed as part
+       of this narrower change. Restricting list-context propagation to
+       only the case where the argument's own top-level node is itself a
+       call avoids extending that leak into print/printf without needing
+       to fix callCtx_'s general design. */
+    return n.kind == NK::Call || n.kind == NK::MethodCall || n.kind == NK::CallCodeRef;
 }
 
 Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
