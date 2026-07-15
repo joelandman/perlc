@@ -2051,20 +2051,60 @@ PerlValue *perl_length(PerlValue *v) {
 }
 
 /* common helper: clamp offset/len to string bounds (UTF-8 code point aware) */
-static void substr_bounds_utf8(long long slen, long long *off, long long *n) {
-    if (*off < 0) *off += slen;
-    if (*off < 0) *off = 0;
-    if (*off > slen) *off = slen;
-    if (*n < 0 || *off + *n > slen) *n = slen - *off;
-    if (*n < 0) *n = 0;
+/* D77: real Perl's substr() returns just the in-string overlap of the
+   requested (offset,length) window, however that window relates to the
+   string — UNLESS the window doesn't overlap the string AT ALL, in which
+   case it returns `undef` (with a "substr outside of string" warning/
+   die, depending on call form). The previous implementation got both
+   halves of this wrong: a negative LENGTH ("stop N chars before the
+   end", real Perl's own documented meaning) was treated as "no
+   truncation at all" (returning too much), and an offset so far negative
+   that it fell entirely before the string was silently clamped to the
+   start instead of correctly returning `undef`/dying.
+   Algorithm (reverse-engineered empirically against real Perl across a
+   961-case (-15..15 offset) x (-15..15 length) matrix on a 10-char
+   string, 100% match, plus a separate offset-only sweep for the 2-arg
+   form — see the D77 fix's REMEDIATION.md entry for the derivation):
+     start = OFFSET; if start<0, start += slen
+     if start > slen: NOT in range (offset positioned beyond the string)
+     raw_end = slen                      if no LENGTH given (2-arg form)
+             = start + LENGTH            if LENGTH >= 0
+             = slen + LENGTH             if LENGTH < 0 ("N back from end")
+     if start < 0:
+         if raw_end < 0: NOT in range (window entirely before the string)
+         start = 0                       (partial overlap — clip to 0)
+     clamp raw_end to [start, slen]
+   Returns 1 with off/n rewritten (via the out params) to the clamped, in-bounds character
+   start/length on success; 0 (window doesn't overlap the string at all)
+   on "not in range" — callers translate that to `undef` (read forms) or
+   a catchable die (the 4-arg replace/lvalue form, matching real Perl).
+   has_length=0 is substr's 2-arg form (no LENGTH argument at all — not
+   the same as LENGTH==0); *n is ignored on input in that case. */
+static int substr_bounds_utf8(long long slen, long long *off, long long *n, int has_length) {
+    long long start = *off;
+    if (start < 0) start += slen;
+    if (start > slen) return 0;
+    long long raw_end;
+    if (!has_length)      raw_end = slen;
+    else if (*n >= 0)     raw_end = start + *n;
+    else                  raw_end = slen + *n;
+    if (start < 0) {
+        if (raw_end < 0) return 0;
+        start = 0;
+    }
+    if (raw_end < start) raw_end = start;
+    if (raw_end > slen)  raw_end = slen;
+    *off = start;
+    *n   = raw_end - start;
+    return 1;
 }
 
 PerlValue *perl_substr2(PerlValue *str, PerlValue *off_v) {
     char *s  = perl_to_string_dup(str);
     long long slen = utf8_strlen(s);
     long long off  = perl_to_int(off_v);
-    long long n    = slen;
-    substr_bounds_utf8(slen, &off, &n);
+    long long n    = 0;
+    if (!substr_bounds_utf8(slen, &off, &n, 0)) { free(s); return perl_alloc_undef(); }
     long long byte_off = utf8_char_to_byte(s, off);
     long long byte_len = utf8_char_to_byte(s + byte_off, n) - 0;
     /* recalculate byte_len by advancing n code points */
@@ -2091,7 +2131,7 @@ PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
     long long slen = utf8_strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
-    substr_bounds_utf8(slen, &off, &n);
+    if (!substr_bounds_utf8(slen, &off, &n, 1)) { free(s); return perl_alloc_undef(); }
     long long byte_off = utf8_char_to_byte(s, off);
     const unsigned char *p = (const unsigned char *)(s + byte_off);
     long long bc = 0;
@@ -2117,7 +2157,17 @@ void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, Per
     long long slen = utf8_strlen(s);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
-    substr_bounds_utf8(slen, &off, &n);
+    if (!substr_bounds_utf8(slen, &off, &n, 1)) {
+        /* D77: matches real Perl — the 4-arg replace/lvalue form dies
+           (catchable via eval) on a completely out-of-range offset,
+           leaving the target string unmodified, rather than silently
+           clamping like the read-only 2/3-arg forms' undef return. */
+        free(s); free(r);
+        static const char msg[] = "substr outside of string";
+        PerlValue diemsg = { .tag = PERL_STRING, .sval = (char *)msg, .slen = (long long)(sizeof(msg) - 1) };
+        perl_die(&diemsg);
+        return;
+    }
     long long byte_off = utf8_char_to_byte(s, off);
     /* calculate byte length of n code points */
     const unsigned char *p = (const unsigned char *)(s + byte_off);
