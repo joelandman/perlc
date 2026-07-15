@@ -3172,14 +3172,18 @@ static IsaEntry s_isa_table[ISA_TABLE_MAX];
 static int      s_isa_count = 0;
 
 void perl_set_isa(const char *child, const char *parent) {
-    /* update if already registered */
-    for (int i = 0; i < s_isa_count; i++) {
-        if (strcmp(s_isa_table[i].child, child) == 0) {
-            free(s_isa_table[i].parent);
-            s_isa_table[i].parent = strdup(parent);
-            return;
-        }
-    }
+    /* D75: this used to "update if already registered" — overwriting any
+       existing entry for `child` in place instead of adding a new one.
+       `our @ISA = ('B','C')` calls this once per @ISA element in order
+       (codegen.cpp), so for a multiple-inheritance class the SECOND call
+       (parent="C") silently overwrote the first (parent="B"), and only
+       "C" was ever remembered — a class with 2+ parents could only ever
+       see the last one. Real Perl's default (non-C3) MRO is a depth-first
+       search over @ISA in left-to-right order, which requires remembering
+       ALL parents, not just one. Fixed by always appending a new
+       (child,parent) entry — perl_isa_direct_parents/perl_find_method/
+       perl_isa_check/perl_dispatch_method_super below now do the actual
+       DFS over every registered parent instead of assuming exactly one. */
     if (s_isa_count < ISA_TABLE_MAX) {
         s_isa_table[s_isa_count].child  = strdup(child);
         s_isa_table[s_isa_count].parent = strdup(parent);
@@ -3187,11 +3191,19 @@ void perl_set_isa(const char *child, const char *parent) {
     }
 }
 
-static const char *perl_get_parent(const char *class_name) {
-    for (int i = 0; i < s_isa_count; i++)
+/* D75: collect ALL direct parents of `class_name`, in @ISA registration
+   (i.e. left-to-right @ISA list) order, into `out` (capped at `max`).
+   Returns the count found. Multiple entries for the same child are now
+   possible (see perl_set_isa above) — this walks the whole table instead
+   of returning only the first match. */
+#define ISA_MAX_DIRECT_PARENTS 16
+static int perl_isa_direct_parents(const char *class_name, const char **out, int max) {
+    int n = 0;
+    for (int i = 0; i < s_isa_count && n < max; i++) {
         if (strcmp(s_isa_table[i].child, class_name) == 0)
-            return s_isa_table[i].parent;
-    return NULL;
+            out[n++] = s_isa_table[i].parent;
+    }
+    return n;
 }
 
 /* ── method dispatch table ───────────────────────────────────────────────── */
@@ -3257,18 +3269,33 @@ PerlValue *perl_get_or_create_global_scalar(const char *key) {
     return pv;
 }
 
-/* walk class and its @ISA chain; returns NULL if not found */
-static PerlSubFnCtx perl_find_method(const char *class_name, const char *method) {
-    const char *cls = class_name;
-    while (cls) {
-        char key[512];
-        snprintf(key, sizeof key, "%s::%s", cls, method);
-        for (int i = 0; i < s_method_count; i++)
-            if (strcmp(s_method_table[i].key, key) == 0)
-                return s_method_table[i].fn;
-        cls = perl_get_parent(cls);
+/* D75: depth-first search over `class_name` and its full @ISA tree,
+   matching real Perl's default (non-C3) method resolution order — check
+   the class itself, then recursively search each of its direct @ISA
+   parents' entire subtrees in left-to-right order (the first parent's
+   whole ancestry is exhausted before the second parent is even tried),
+   not just a single linear chain. `depth` guards against a pathological
+   @ISA cycle. */
+static PerlSubFnCtx perl_find_method_dfs(const char *class_name, const char *method, int depth) {
+    if (!class_name || depth > 32) return NULL;
+    char key[512];
+    snprintf(key, sizeof key, "%s::%s", class_name, method);
+    for (int i = 0; i < s_method_count; i++)
+        if (strcmp(s_method_table[i].key, key) == 0)
+            return s_method_table[i].fn;
+    const char *parents[ISA_MAX_DIRECT_PARENTS];
+    int np = perl_isa_direct_parents(class_name, parents, ISA_MAX_DIRECT_PARENTS);
+    for (int i = 0; i < np; i++) {
+        PerlSubFnCtx fn = perl_find_method_dfs(parents[i], method, depth + 1);
+        if (fn) return fn;
     }
     return NULL;
+}
+
+/* walk class and its full @ISA tree (D75: multiple inheritance, DFS);
+   returns NULL if not found */
+static PerlSubFnCtx perl_find_method(const char *class_name, const char *method) {
+    return perl_find_method_dfs(class_name, method, 0);
 }
 
 static PerlArray *build_dispatch_args(PerlValue *obj, PerlArray *args) {
@@ -3407,16 +3434,25 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
 
 PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                                       const char *method, PerlArray *args) {
-    const char *parent = perl_get_parent(caller_pkg);
-    if (!parent) {
+    /* D75: SUPER::method searches caller_pkg's @ISA parents in order,
+       each one's full subtree via DFS (perl_find_method already does
+       this per-parent) — previously this only ever looked at a single
+       parent (whichever perl_get_parent's single-entry lookup returned),
+       so SUPER:: from a multiply-inherited class could silently miss a
+       method that only the second-or-later @ISA parent actually defines. */
+    const char *parents[ISA_MAX_DIRECT_PARENTS];
+    int np = perl_isa_direct_parents(caller_pkg, parents, ISA_MAX_DIRECT_PARENTS);
+    if (np == 0) {
         fprintf(stderr, "Can't call SUPER::%s — no parent for package \"%s\"\n",
                 method, caller_pkg);
         exit(1);
     }
-    PerlSubFnCtx fn = perl_find_method(parent, method);
+    PerlSubFnCtx fn = NULL;
+    for (int i = 0; i < np && !fn; i++)
+        fn = perl_find_method(parents[i], method);
     if (!fn) {
         fprintf(stderr, "Can't locate SUPER method \"%s\" starting from \"%s\"\n",
-                method, parent);
+                method, caller_pkg);
         exit(1);
     }
     PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
@@ -5621,6 +5657,19 @@ PerlArray *perl_glob_val(PerlValue *pattern) {
 
 /* ── UNIVERSAL: isa / can ─────────────────────────────────────────────────── */
 
+/* D75: depth-first search matching perl_find_method_dfs's traversal —
+   returns 1 if `class_name` itself, or any class reachable through its
+   full @ISA tree (all parents, not just the first), equals `want`. */
+static int perl_isa_dfs_match(const char *class_name, const char *want, int depth) {
+    if (!class_name || depth > 32) return 0;
+    if (strcmp(class_name, want) == 0) return 1;
+    const char *parents[ISA_MAX_DIRECT_PARENTS];
+    int np = perl_isa_direct_parents(class_name, parents, ISA_MAX_DIRECT_PARENTS);
+    for (int i = 0; i < np; i++)
+        if (perl_isa_dfs_match(parents[i], want, depth + 1)) return 1;
+    return 0;
+}
+
 PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv) {
     if (!obj || !class_pv) return perl_alloc_int(0);
     const char *want = (class_pv->tag == PERL_STRING && class_pv->sval)
@@ -5640,15 +5689,11 @@ PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv) {
         if (tname && strcmp(tname, want) == 0) return perl_alloc_int(1);
         return perl_alloc_int(0);
     }
-    /* walk ISA chain */
-    const char *cls = got;
-    for (int depth = 0; depth < 32; depth++) {
-        if (strcmp(cls, want) == 0) return perl_alloc_int(1);
-        const char *parent = perl_get_parent(cls);
-        if (!parent) break;
-        cls = parent;
-    }
-    return perl_alloc_int(0);
+    /* D75: walk the full @ISA tree (multiple inheritance), not just a
+       single linear chain — a class with 2+ parents (e.g. our @ISA =
+       ('B','C')) previously could only ever match against whichever
+       parent perl_get_parent's single-entry lookup happened to return. */
+    return perl_alloc_int(perl_isa_dfs_match(got, want, 0));
 }
 
 PerlValue *perl_can_check(PerlValue *obj, PerlValue *method_pv) {
