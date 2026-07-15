@@ -7482,8 +7482,34 @@ Value *CodeGen::emitBinOp(const Node &n) {
         return phi;
     }
 
+    /* D88: every operator reaching this point (arithmetic, string,
+       comparison, bitwise, `x`, `<=>`/`cmp`) always evaluates BOTH
+       operands in scalar context in real Perl, regardless of the
+       surrounding expression's own context — but callCtx_ is a blunt,
+       unscoped one-shot flag consumed by whichever Call/MethodCall/
+       CallCodeRef node happens to be evaluated next. Several call sites
+       elsewhere in this file set callCtx_=1 before evaluating an entire
+       RHS/argument expression tree without knowing (or caring) whether
+       that tree's root is itself a call or, as here, a BinOp with a call
+       buried in one of its operands — e.g. `my @a = (ctx() eq "x")`
+       previously leaked the list-context RHS's callCtx_=1 straight
+       through `eq` into `ctx()`, reporting list context even though `eq`
+       always forces scalar context on its own operands. Since every
+       non-short-circuit binary operator funnels through this single
+       spot, clearing callCtx_ here (and restoring it after) fixes the
+       leak for this whole operator class in one place, without needing
+       to audit or special-case every individual call site that sets
+       callCtx_ elsewhere in the file (D12's print/printf-specific
+       isCallLikeForContext guard remains the right, narrower fix for
+       print/printf's own list-context *propagation* into a directly-
+       nested call argument — this is the complementary fix for what
+       happens once evaluation descends into a scalar-forcing operator). */
+    int savedCallCtx = callCtx_;
+    callCtx_ = 0;
     Value *lv = emitExpr(*n.left);
+    callCtx_ = 0;
     Value *rv = emitExpr(*n.right);
+    callCtx_ = savedCallCtx;
 
     static const struct { const char *op; const char *rt; } OPS[] = {
         {"+",  "perl_add"   }, {"-",  "perl_sub"   }, {"*",  "perl_mul"   },
