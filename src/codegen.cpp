@@ -5285,6 +5285,15 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_assign", {pv, rhs});
             return rhs;
         }
+        /* D52: $@ = "..." — $@ parses to its own NK::DollarAt node (not
+           NK::ScalarVar with name "@" like $/ and $! above), so it fell
+           through emitLValue's default case (returns nullptr for anything
+           it doesn't recognize) and the assignment silently did nothing. */
+        if (n.left->kind == NK::DollarAt) {
+            Value *rhs = emitExpr(*n.right);
+            callRT("perl_assign", {callRT("perl_get_dollar_at", {}), rhs});
+            return rhs;
+        }
         /* int/float var assignment */
         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
@@ -6723,10 +6732,6 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::EvalBlock: {
-        /* $@ = "" before eval */
-        Value *emptyAt = perlStr("");
-        callRT("perl_assign", {callRT("perl_get_dollar_at", {}), emptyAt});
-
         /* allocate jmp_buf on stack (256 bytes, enough for any platform) */
         auto *i8Arr  = ArrayType::get(Type::getInt8Ty(ctx_), 256);
         auto *jbAlloca = builder_.CreateAlloca(i8Arr, nullptr, "jmp_buf");
@@ -6771,6 +6776,16 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* store result so endBB can load it (survives longjmp via saved frame) */
         /* only emit if bodyBB doesn't already have a terminator (e.g., from die/return) */
         if (!builder_.GetInsertBlock()->getTerminator()) {
+            /* D52: real Perl always resets $@="" when eval completes
+               *successfully* (reaching here, as opposed to via the
+               longjmp/die path straight to endBB below) — even
+               overriding an explicit `$@ = ...` made inside the block
+               itself. Previously this reset ran unconditionally
+               *before* the body executed, which (now that $@ is a real
+               assignment target, see D52's other fix) let an in-block
+               assignment wrongly "stick" instead of being clobbered by
+               eval's own success-clear, diverging from real Perl. */
+            callRT("perl_assign", {callRT("perl_get_dollar_at", {}), perlStr("")});
             builder_.CreateStore(bodyResult, resultAlloca);
             builder_.CreateBr(endBB);
         }
@@ -6785,6 +6800,7 @@ Value *CodeGen::emitExpr(const Node &n) {
            longjmpMissed check into undef, discarding the real value). */
         if (afterBodyBB != endBB && !afterBodyBB->getTerminator()) {
             builder_.SetInsertPoint(afterBodyBB);
+            callRT("perl_assign", {callRT("perl_get_dollar_at", {}), perlStr("")});
             builder_.CreateStore(bodyResult, resultAlloca);
             builder_.CreateBr(endBB);
         }
@@ -7284,6 +7300,18 @@ Value *CodeGen::emitLValue(const Node &n) {
     case NK::ArrayElem: {
         /* returns nullptr — array element assignment handled separately */
         return nullptr;
+    }
+    case NK::DollarAt: {
+        /* D52: $@'s underlying storage (s_dollar_at) is a stable
+           thread-local PerlValue, not a PerlValue* alloca slot like
+           ordinary scalars — wrap its address in a slot so compound
+           assignment forms ($@ .= "x", $@ ||= "y") work via the same
+           generic path as everything else. Plain `$@ = ...` is handled
+           earlier in NK::Assign directly (this covers the rest). */
+        Value *dollarAt = callRT("perl_get_dollar_at", {});
+        auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "dollarat.slot");
+        builder_.CreateStore(dollarAt, slot);
+        return slot;
     }
     default: return nullptr;
     }
