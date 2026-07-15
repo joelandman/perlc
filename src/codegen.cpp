@@ -40,20 +40,31 @@ static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
     for (auto &a : n.args) collectAllScalarNames(*a, names);
 }
 
-/* D64: collect every scalar name referenced anywhere inside ANY closure
-   (AnonSub, or sort{}'s custom comparator) nested within `n` — used to
-   decide whether a `my $var = <literal>` declaration is safe to place on
-   the unboxed int/float fast path (intScopes_/floatScopes_), which has
-   no real PerlValue* for a closure to later capture/share; boxing a
-   snapshot at capture time instead (the existing lookupIntVar/boxI64
-   fallback) silently disconnects the closure's view from the real
-   variable. Deliberately over-approximates — a name used only in some
-   unrelated, never-actually-captured context elsewhere in the same
-   function still loses the fast path — rather than risk misclassifying
-   a genuinely captured variable as safe (a correctness bug, not just a
-   missed optimization). Computed once per function (named sub, AnonSub,
-   or the top-level program body) at compilation entry; see D64 in
-   TESTS.md and capturedNamesInCurrentFn_ in codegen.h. */
+/* D64/D53: collect every scalar name referenced anywhere inside ANY
+   closure (AnonSub, or sort{}'s custom comparator) nested within `n`, OR
+   that ever has \$name (RefScalar) taken anywhere in `n` — used to decide
+   whether a `my $var = <literal>` declaration is safe to place on the
+   unboxed int/float fast path (intScopes_/floatScopes_), which has no
+   real, addressable PerlValue* for a closure to later capture/share, or
+   for \$var to point at. Boxing a snapshot on demand instead (the
+   existing lookupIntVar/boxI64 fallback used both at closure-capture time
+   and by plain `\$var` reference-taking) silently disconnects the
+   closure's/reference's view from the real variable: D64 found this for
+   closures (`sub { ...$x... }` capturing a stale copy); D53 found the
+   identical underlying issue for `\$x` (`\$x` boxes a one-off snapshot of
+   $x's current unboxed value, so `$$r = 99` mutates that disposable
+   snapshot while $x's real unboxed storage — and therefore every
+   subsequent plain read of $x — is completely unaffected; confirmed via
+   --emit-ir that a file-scope $x, which never uses this fast path at all,
+   is unaffected, isolating the bug to exactly this fast-path's blind
+   spot). Deliberately over-approximates — a name used only in some
+   unrelated, never-actually-captured/referenced context elsewhere in the
+   same function still loses the fast path — rather than risk
+   misclassifying a genuinely captured/referenced variable as safe (a
+   correctness bug, not just a missed optimization). Computed once per
+   function (named sub, AnonSub, or the top-level program body) at
+   compilation entry; see D64/D53 in TESTS.md and capturedNamesInCurrentFn_
+   in codegen.h. */
 static void collectClosureCapturedNames(const Node &n, std::unordered_set<std::string> &names) {
     if (n.kind == NK::AnonSub || (n.kind == NK::SortFunc && n.sval == "custom")) {
         if (n.body) {
@@ -61,6 +72,9 @@ static void collectClosureCapturedNames(const Node &n, std::unordered_set<std::s
             collectAllScalarNames(*n.body, inner);
             names.insert(inner.begin(), inner.end());
         }
+    }
+    if (n.kind == NK::RefScalar && n.left && n.left->kind == NK::ScalarVar) {
+        names.insert(n.left->name);
     }
     if (n.left)  collectClosureCapturedNames(*n.left,  names);
     if (n.right) collectClosureCapturedNames(*n.right, names);
