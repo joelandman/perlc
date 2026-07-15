@@ -1277,6 +1277,29 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday")) {
         return callRT("perl_hires_gettimeofday_list", {});
     }
+    /* D69: List::Util::uniq in list context. Same reasoning as
+       Time::HiRes::gettimeofday just above — "List::Util::uniq" only
+       reaches here as a qualified NK::Call (the bare "uniq" keyword form
+       is its own dedicated NK::UniqFunc node, handled elsewhere in this
+       function), and it's a builtin name-dispatch, not a real
+       LLVM-declared sub, so it must be intercepted before the generic
+       user-sub Call handling below (which previously let it fall through
+       to mod_->getFunction() finding nothing and silently returning an
+       empty list). sum/min/max don't need a list-context case here — they
+       always return a single scalar, even when called in list context. */
+    if (n.kind == NK::Call && n.name == "List::Util::uniq") {
+        Value *av = nullptr;
+        if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
+        if (!av) {
+            av = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            }
+        }
+        return callRT("perl_uniq_list", {av});
+    }
     /* user-defined sub call in list context: call with ctx=1, unwrap result */
     if (n.kind == NK::Call) {
         if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
@@ -6136,9 +6159,12 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.kind == NK::SumFunc)  return callRT("perl_sum_list", {av});
         if (n.kind == NK::MinFunc)  return callRT("perl_min_list", {av});
         if (n.kind == NK::MaxFunc)  return callRT("perl_max_list", {av});
-        /* UniqFunc: scalar context returns first element of unique list */
-        return callRT("perl_array_get", {callRT("perl_uniq_list", {av}),
-                                         ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+        /* D69: uniq in scalar context returns the COUNT of unique
+           elements (real List::Util's documented behavior) — this
+           previously returned the *first* unique element's value instead,
+           a second, separate bug from the consecutive-only dedup fixed in
+           perl_uniq_list() itself (runtime.c). */
+        return callRT("perl_array_len", {callRT("perl_uniq_list", {av})});
     }
 
     /* ── first / any / all / none ────────────────────────────────────────── */
@@ -7539,6 +7565,38 @@ Value *CodeGen::emitCall(const Node &n) {
     }
     if (n.name == "POSIX::strftime" || n.name == "strftime") {
         return callRT("perl_posix_strftime", {buildArgArray()});
+    }
+    /* D69: List::Util::sum/min/max/uniq, scalar context. These only reach
+       emitCall as a qualified NK::Call — the bare "sum"/"min"/"max"/"uniq"
+       keyword forms are their own dedicated node kinds (NK::SumFunc etc.,
+       handled in emitExpr's own switch) and never reach here at all.
+       Previously the qualified names matched none of these checks and
+       fell through to the generic "::"-qualified-call fallback further
+       below, which only knows how to call a real, separately-compiled
+       LLVM sub — since none of these are that, it silently produced an
+       empty/undef result. buildArgArray() (defined above) doesn't flatten
+       an array-variable argument's elements, so it can't be reused here;
+       this mirrors the correct flattening NK::SumFunc/MinFunc/MaxFunc/
+       UniqFunc's own emitExpr case already does. */
+    if (n.name == "List::Util::sum" || n.name == "List::Util::min" ||
+        n.name == "List::Util::max" || n.name == "List::Util::uniq") {
+        Value *av = nullptr;
+        if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
+        if (!av) {
+            av = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            }
+        }
+        if (n.name == "List::Util::sum") return callRT("perl_sum_list", {av});
+        if (n.name == "List::Util::min") return callRT("perl_min_list", {av});
+        if (n.name == "List::Util::max") return callRT("perl_max_list", {av});
+        /* uniq: scalar context returns the COUNT of unique elements
+           (matching the identical fix in the bare-keyword NK::UniqFunc
+           case above). */
+        return callRT("perl_array_len", {callRT("perl_uniq_list", {av})});
     }
     /* Time::HiRes (D30, built-in) — scalar-context path. "Time::HiRes::time"
        and "Time::HiRes::sleep" only reach here when explicitly imported

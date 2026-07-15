@@ -5346,20 +5346,31 @@ PerlValue *perl_max_list(PerlArray *a) {
 }
 
 PerlArray *perl_uniq_list(PerlArray *a) {
+    /* D69: real List::Util::uniq keeps the first occurrence of each
+       distinct value *anywhere* in the list, not just consecutive runs
+       (that was this function's original, wrong behavior — it only
+       stripped adjacent duplicates, Unix `uniq`-command style, so e.g.
+       (3,1,4,1,5,9,1) with no adjacent repeats passed through completely
+       unchanged instead of dropping the repeated 1s). Uses a hash-based
+       "seen" set keyed by each element's stringification, matching how
+       real Perl's uniq compares values (stringified equality). */
     PerlArray *res = perl_array_new();
     if (!a) return res;
-    char *prev = NULL;
+    PerlHash *seen = perl_hash_new();
+    PerlValue *marker = perl_alloc_int(1);
     for (long long i = 0; i < a->len; i++) {
         char *s = perl_to_string_dup(a->elems[i]);
-        if (!prev || strcmp(prev, s) != 0) {
+        if (!perl_hash_exists_str(seen, s)) {
+            /* perl_hash_set_str clones marker internally, so the same
+               marker PerlValue* can be reused across every insertion here
+               without being consumed or invalidated. */
+            perl_hash_set_str(seen, s, marker);
             perl_array_push(res, perl_clone(a->elems[i]));
-            free(prev);
-            prev = s;
-        } else {
-            free(s);
         }
+        free(s);
     }
-    free(prev);
+    perl_free(marker);
+    perl_hash_free(seen);
     return res;
 }
 
