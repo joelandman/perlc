@@ -51,11 +51,30 @@ typedef struct PerlValue {
     union {
         long long ival;
         double    fval;
-        char     *sval;   /* heap-allocated, NUL-terminated */
+        char     *sval;   /* heap-allocated; NUL-terminated for legacy/strlen()-
+                              based consumers, but may contain embedded NUL
+                              bytes before that terminator — `slen` below is
+                              the authoritative byte length (see D85). */
         void     *pval;   /* for reference types */
     };
     long long matchpos;      /* current /g match offset; 0 = start of string */
     char     *blessed_class; /* NULL unless bless'd */
+    /* D85: PerlValue previously had no explicit length field, so any string
+       containing an embedded NUL byte (e.g. pack("N", 1234567), a common
+       4-byte network-order pack) was silently truncated wherever the
+       runtime derived a string's length via strlen() instead of tracking
+       it explicitly — which was nearly everywhere. `slen` is the
+       authoritative byte length of `sval` for PERL_STRING-tagged values
+       (meaningless for other tags); `sval[slen]` is still always a NUL
+       terminator for backward compatibility with any remaining
+       strlen()-based consumer, but bytes *before* that position may
+       legitimately include 0x00. `_pad_reserved` exists solely to keep
+       sizeof(PerlValue) a multiple of 16 — the lock-free 16-byte CAS
+       (cmpxchg16b/ldxp+stxp, see perl_atomic_* and PerlValueAtomic16)
+       requires every slab-allocated PerlValue to stay 16-byte aligned,
+       which only holds if the struct's own size is a 16-byte multiple. */
+    long long slen;
+    long long _pad_reserved;
 } PerlValue;
 
 /* PV_FLAG_SHARED: variable is a threads::shared variable.  With the new
@@ -78,6 +97,8 @@ PerlValue *perl_alloc_int(long long v);
 PerlValue *perl_alloc_float(double v);
 
 PerlValue *perl_alloc_string(const char *s);
+PerlValue *perl_alloc_string_len(const char *s, long long len); /* D85: NUL-safe — s may contain embedded NUL bytes within the first len */
+char      *perl_to_string_dup_len(const PerlValue *v, long long *out_len); /* D85: NUL-safe perl_to_string_dup, also reports true byte length */
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_alloc_float_array(long long n); /* alloc FLAT_ARRAY with n zero doubles */
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */

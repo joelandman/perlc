@@ -257,8 +257,15 @@ void perl_local_save(PerlValue *pv) {
     s_local_stack[s_local_depth].ptr   = pv;
     s_local_stack[s_local_depth].saved = *pv;
     /* deep-copy string/blessed_class so the saved value is independent */
-    if (pv->tag == PERL_STRING && pv->sval)
-        s_local_stack[s_local_depth].saved.sval = strdup(pv->sval);
+    if (pv->tag == PERL_STRING && pv->sval) {
+        /* D85: length-aware copy — strdup would truncate at an embedded
+           NUL; `saved = *pv` above already copied pv->slen correctly. */
+        long long n = pv->slen;
+        char *copy = malloc((size_t)n + 1);
+        if (n > 0) memcpy(copy, pv->sval, (size_t)n);
+        copy[n] = '\0';
+        s_local_stack[s_local_depth].saved.sval = copy;
+    }
     if (pv->blessed_class)
         s_local_stack[s_local_depth].saved.blessed_class = strdup(pv->blessed_class);
     s_local_depth++;
@@ -351,6 +358,7 @@ static void ensure_input_sep(void) {
     if (!s_input_sep_inited) {
         s_input_sep.tag  = PERL_STRING;
         s_input_sep.sval = strdup("\n");
+        s_input_sep.slen = 1;
         s_input_sep_inited = 1;
     }
 }
@@ -409,9 +417,11 @@ PerlValue *perl_get_dollar_bang(void) {
     if (errno) {
         s_dollar_bang.tag  = PERL_STRING;
         s_dollar_bang.sval = strdup(strerror(errno));
+        s_dollar_bang.slen = (long long)strlen(s_dollar_bang.sval);
     } else {
         s_dollar_bang.tag  = PERL_STRING;
         s_dollar_bang.sval = strdup("");
+        s_dollar_bang.slen = 0;
     }
     return &s_dollar_bang;
 }
@@ -523,7 +533,11 @@ void perl_eval_pop(void) {
 PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
 
 static void perl_set_dollar_at_cstr(const char *msg) {
-    PerlValue pv = { .tag = PERL_STRING, .sval = (char *)(msg ? msg : "") };
+    /* D85: .slen must be set explicitly — perl_assign now copies exactly
+       src->slen bytes, and a designated initializer zero-inits any field
+       not listed, which would silently truncate the whole message to "". */
+    const char *m = msg ? msg : "";
+    PerlValue pv = { .tag = PERL_STRING, .sval = (char *)m, .slen = (long long)strlen(m) };
     perl_assign(&s_dollar_at, &pv);
 }
 
@@ -829,8 +843,12 @@ void perl_untie(PerlValue *var_pv) {
 PerlValue *perl_eval_string(PerlValue *code_pv) {
     PerlValue empty = { .tag = PERL_STRING, .sval = "" };
     perl_assign(&s_dollar_at, &empty);
+    static const char evalmsg[] = "eval: string eval not available (JIT removed)";
+    /* D85: .slen must be set explicitly on this literal — perl_assign now
+       copies exactly src->slen bytes, and a designated initializer
+       zero-inits any field not listed, silently truncating to "". */
     PerlValue msg = { .tag = PERL_STRING,
-        .sval = "eval: string eval not available (JIT removed)" };
+        .sval = (char *)evalmsg, .slen = (long long)(sizeof(evalmsg) - 1) };
     perl_assign(&s_dollar_at, &msg);
     return perl_alloc_undef();
 }
@@ -916,19 +934,36 @@ long long perl_array_is_all_flat(PerlArray *av) {
     return 1;
 }
 
-PerlValue *perl_alloc_string(const char *s) {
+/* D85: allocate a PERL_STRING PV whose data is exactly `len` bytes of `s`,
+   which may contain embedded NUL bytes anywhere within that range. The
+   allocated buffer is len+1 bytes, with sval[len] forced to '\0' for
+   backward compatibility with any remaining strlen()-based consumer that
+   hasn't been made length-aware — such a consumer sees a truncated PREFIX
+   (no worse than the pre-D85 behavior everywhere), while every
+   length-aware consumer (perl_to_string_dup_len, perl_clone, perl_assign,
+   perl_length, perl_print/say, perl_concat, perl_str_eq/etc., and pack/
+   unpack itself) sees the true, full data via `slen`. */
+PerlValue *perl_alloc_string_len(const char *s, long long len) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_STRING;
-    v->sval = strdup(s ? s : "");
+    if (len < 0) len = 0;
+    v->sval = malloc((size_t)len + 1);
+    if (len > 0 && s) memcpy(v->sval, s, (size_t)len);
+    v->sval[len] = '\0';
+    v->slen = len;
     v->matchpos = 0;
     v->blessed_class = NULL;
     return v;
 }
 
+PerlValue *perl_alloc_string(const char *s) {
+    return perl_alloc_string_len(s, s ? (long long)strlen(s) : 0);
+}
+
 PerlValue *perl_clone(const PerlValue *src) {
     if (!src) return perl_alloc_undef();
     if (src->tag == PERL_STRING) {
-        PerlValue *v = perl_alloc_string(src->sval);
+        PerlValue *v = perl_alloc_string_len(src->sval, src->slen);
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         return v;
     }
@@ -1194,7 +1229,18 @@ const char *perl_to_string(const PerlValue *v) {
    of perl_to_string regardless of tag. */
 char *perl_to_string_dup(const PerlValue *v) {
     if (!v || v->tag == PERL_UNDEF) return strdup("");
-    if (v->tag == PERL_STRING) return strdup(v->sval ? v->sval : "");
+    if (v->tag == PERL_STRING) {
+        /* D85: strdup() alone would truncate at the first embedded NUL —
+           allocate the true slen+1 bytes and memcpy, so a caller that goes
+           on to (incorrectly) strlen() this result is no worse off than
+           before D85, while a length-aware caller can use
+           perl_to_string_dup_len instead to get the true length too. */
+        long long n = v->slen;
+        char *r = malloc((size_t)n + 1);
+        if (n > 0) memcpy(r, v->sval ? v->sval : "", (size_t)n);
+        r[n] = '\0';
+        return r;
+    }
     /* For non-string tags, re-implement the conversion here to avoid
        calling perl_to_string (which would return a heap-allocated
        string that we'd then strdup again). */
@@ -1242,6 +1288,22 @@ char *perl_to_string_dup(const PerlValue *v) {
     }
 }
 
+/* D85: length-aware counterpart to perl_to_string_dup — for PERL_STRING
+   values, *out_len is the true byte length (v->slen), correctly reflecting
+   any embedded NUL bytes, instead of the implicit strlen() a plain char*
+   return forces on every caller. Non-string tags behave identically to
+   perl_to_string_dup (their formatted forms never contain embedded NULs),
+   with *out_len set via strlen() of the formatted result. */
+char *perl_to_string_dup_len(const PerlValue *v, long long *out_len) {
+    if (v && v->tag == PERL_STRING) {
+        if (out_len) *out_len = v->slen;
+        return perl_to_string_dup(v);
+    }
+    char *r = perl_to_string_dup(v);
+    if (out_len) *out_len = (long long)strlen(r);
+    return r;
+}
+
 int perl_defined(const PerlValue *v) {
     return v && v->tag != PERL_UNDEF;
 }
@@ -1252,8 +1314,13 @@ int perl_is_true(const PerlValue *v) {
         case PERL_INT:    return v->ival != 0;
         case PERL_FLOAT:  return v->fval != 0.0;
         case PERL_STRING:
-            return !(v->sval[0] == '\0' ||
-                     (v->sval[0] == '0' && v->sval[1] == '\0'));
+            /* D85: gate on slen, not a bare sval[0]=='\0' check — a
+               genuine 1-byte string holding just an embedded NUL
+               (slen==1, sval[0]=='\0') is neither "" nor "0" and must be
+               TRUE in real Perl, but the old check treated any string
+               whose first byte was 0x00 as falsy regardless of length. */
+            return !(v->slen == 0 ||
+                     (v->slen == 1 && v->sval[0] == '0'));
         case PERL_REF_SCALAR:
         case PERL_REF_ARRAY:
         case PERL_REF_HASH:
@@ -1351,7 +1418,15 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     *dst = *src;
     dst->flags = preserved_flags;  /* restore identity bits — *dst = *src clobbered them */
     if (src->tag == PERL_STRING) {
-        dst->sval = strdup(src->sval);
+        /* D85: strdup(src->sval) would truncate at the first embedded NUL —
+           *dst = *src above already copied src->slen correctly (a plain
+           struct-field copy), so just deep-copy exactly that many bytes
+           instead of stopping at strlen(). */
+        long long n = src->slen;
+        dst->sval = malloc((size_t)n + 1);
+        if (n > 0) memcpy(dst->sval, src->sval, (size_t)n);
+        dst->sval[n] = '\0';
+        dst->slen = n;
         dst->matchpos = 0;
     } else if (src->tag == PERL_FLAT_ARRAY && src->pval) {
         /* Deep-copy the double[] so src and dst each own their own buffer.
@@ -1448,25 +1523,34 @@ PerlValue *perl_rshift(const PerlValue *a, const PerlValue *b) {
 /* ── string ops ──────────────────────────────────────────────────────────── */
 
 PerlValue *perl_concat(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string_dup(a);
-    char *sb = perl_to_string_dup(b);
-    size_t len = strlen(sa) + strlen(sb) + 1;
-    char *buf = malloc(len);
-    strcpy(buf, sa); strcat(buf, sb);
-    PerlValue *r = perl_alloc_string(buf);
+    /* D85: NUL-safe — memcpy exact byte lengths instead of strcpy/strcat,
+       which both stop at the first embedded NUL. */
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la);
+    char *sb = perl_to_string_dup_len(b, &lb);
+    char *buf = malloc((size_t)(la + lb) + 1);
+    if (la > 0) memcpy(buf, sa, (size_t)la);
+    if (lb > 0) memcpy(buf + la, sb, (size_t)lb);
+    buf[la + lb] = '\0';
+    PerlValue *r = perl_alloc_string_len(buf, la + lb);
     free(sa); free(sb); free(buf);
     return r;
 }
 
 PerlValue *perl_repeat_str(const PerlValue *str, const PerlValue *n) {
-    char *s = perl_to_string_dup(str);
+    /* D85: NUL-safe — memcpy per repetition instead of strcat, which
+       would stop at the first embedded NUL on every iteration and never
+       actually grow the buffer past that point. */
+    long long slen_ll;
+    char *s = perl_to_string_dup_len(str, &slen_ll);
     long long reps = perl_to_int(n);
     if (reps <= 0) { free(s); return perl_alloc_string(""); }
-    size_t slen = strlen(s);
-    char *buf = malloc(slen * reps + 1);
-    buf[0] = '\0';
-    for (long long i = 0; i < reps; i++) strcat(buf, s);
-    PerlValue *r = perl_alloc_string(buf);
+    size_t slen = (size_t)slen_ll;
+    char *buf = malloc(slen * (size_t)reps + 1);
+    for (long long i = 0; i < reps; i++)
+        if (slen > 0) memcpy(buf + (size_t)i * slen, s, slen);
+    buf[slen * (size_t)reps] = '\0';
+    PerlValue *r = perl_alloc_string_len(buf, (long long)(slen * (size_t)reps));
     free(s); free(buf);
     return r;
 }
@@ -1502,34 +1586,53 @@ HOTX PerlValue *perl_num_ge(const PerlValue *a, const PerlValue *b) {
 
 /* ── string comparisons ──────────────────────────────────────────────────── */
 
+/* D85: NUL-safe tri-state comparison — memcmp up to the shorter length,
+   then break ties by length, matching Perl's byte-wise string ordering
+   (an embedded NUL is just an ordinary byte value 0, which memcmp already
+   orders correctly; strcmp would instead treat it as a false end-of-string). */
+static int perl_strcmp_len(const char *a, long long la, const char *b, long long lb) {
+    long long n = la < lb ? la : lb;
+    int c = (n > 0) ? memcmp(a, b, (size_t)n) : 0;
+    if (c != 0) return c;
+    if (la < lb) return -1;
+    if (la > lb) return 1;
+    return 0;
+}
+
 PerlValue *perl_str_eq(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
-    PerlValue *r = perl_alloc_int(strcmp(sa, sb) == 0);
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
+    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) == 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_ne(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
-    PerlValue *r = perl_alloc_int(strcmp(sa, sb) != 0);
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
+    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) != 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_lt(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
-    PerlValue *r = perl_alloc_int(strcmp(sa, sb) < 0);
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
+    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) < 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_gt(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
-    PerlValue *r = perl_alloc_int(strcmp(sa, sb) > 0);
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
+    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) > 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_le(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
-    PerlValue *r = perl_alloc_int(strcmp(sa, sb) <= 0);
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
+    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) <= 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_ge(const PerlValue *a, const PerlValue *b) {
-    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
-    PerlValue *r = perl_alloc_int(strcmp(sa, sb) >= 0);
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
+    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) >= 0);
     free(sa); free(sb); return r;
 }
 
@@ -1548,8 +1651,13 @@ PerlValue *perl_or(const PerlValue *a, const PerlValue *b) {
 /* ── I/O ─────────────────────────────────────────────────────────────────── */
 
 void perl_print(const PerlValue *v) {
-    char *s = perl_to_string_dup(v);
-    fputs(s, stdout);
+    /* D85: fwrite the true byte length instead of fputs — fputs stops at
+       the first embedded NUL, silently truncating output for e.g. a
+       pack()'d value being printed/written out (the direct binary-
+       protocol use case that motivated this fix). */
+    long long n;
+    char *s = perl_to_string_dup_len(v, &n);
+    fwrite(s, 1, (size_t)n, stdout);
     free(s);
 }
 
@@ -1604,6 +1712,7 @@ PerlValue *perl_inc(PerlValue *v) {
             }
             free(v->sval);
             v->sval = buf;
+            v->slen = (long long)strlen(buf); /* D85: buf may have grown a char (carry) — refresh slen */
             return v;
         }
     }
@@ -1823,9 +1932,11 @@ void perl_array_push_list_or_scalar(PerlArray *dst, PerlValue *pv) {
 }
 
 static int cmp_str_pv(const void *a, const void *b) {
-    char *sa = perl_to_string_dup(*(PerlValue **)a);
-    char *sb = perl_to_string_dup(*(PerlValue **)b);
-    int r = strcmp(sa, sb);
+    /* D85: NUL-safe default-sort comparator. */
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(*(PerlValue **)a, &la);
+    char *sb = perl_to_string_dup_len(*(PerlValue **)b, &lb);
+    int r = perl_strcmp_len(sa, la, sb, lb);
     free(sa); free(sb);
     return r;
 }
@@ -1877,38 +1988,46 @@ PerlValue *perl_chop_array(PerlArray *a) {
 long long perl_chomp(PerlValue *v) {
     if (!v) return 0;
     if (v->tag == PERL_STRING) {
-        size_t len = strlen(v->sval);
+        /* D85: use v->slen, not strlen() — an embedded NUL earlier in the
+           string would otherwise make strlen() find a premature "end" and
+           either miss a real trailing newline or corrupt the wrong byte. */
+        long long len = v->slen;
         if (len > 0 && v->sval[len - 1] == '\n') {
             v->sval[len - 1] = '\0';
+            v->slen = len - 1;
             return 1;
         }
         return 0;
     }
-    /* numeric values: convert to string, chomp, store back */
+    /* numeric values: convert to string, chomp, store back — stringified
+       numbers never contain embedded NULs, so strlen() here is exact. */
     char *s = perl_to_string_dup(v);
     size_t len = strlen(s);
     long long removed = 0;
-    if (len > 0 && s[len - 1] == '\n') { s[len - 1] = '\0'; removed = 1; }
+    if (len > 0 && s[len - 1] == '\n') { s[len - 1] = '\0'; removed = 1; len--; }
     if (v->tag == PERL_STRING) free(v->sval);
     v->tag = PERL_STRING;
     v->sval = s;
+    v->slen = (long long)len;
     return removed;
 }
 
 PerlValue *perl_chop(PerlValue *v) {
-    char *s = perl_to_string_dup(v);   /* newly heap-allocated */
-    size_t len = strlen(s);
+    /* D85: NUL-safe fetch of v's string form + true length. */
+    long long len;
+    char *s = perl_to_string_dup_len(v, &len);   /* newly heap-allocated */
     PerlValue *removed;
     if (len > 0) {
-        char buf[2] = { s[len - 1], '\0' };
+        removed = perl_alloc_string_len(&s[len - 1], 1); /* the removed byte may itself be NUL */
         s[len - 1] = '\0';
-        removed = perl_alloc_string(buf);
+        len--;
     } else {
         removed = perl_alloc_string("");
     }
     if (v->tag == PERL_STRING && v->sval) free(v->sval);
     v->tag  = PERL_STRING;
     v->sval = s;
+    v->slen = len;
     return removed;
 }
 
@@ -1916,12 +2035,17 @@ PerlValue *perl_chop(PerlValue *v) {
 static int utf8_encode(unsigned char *buf, long long cp);
 static int utf8_decode(const unsigned char *buf, long long *out);
 static long long utf8_strlen(const char *s);
+static long long utf8_strlen_n(const char *s, long long n); /* D85: bounded, NUL-safe variant */
 static long long utf8_char_to_byte(const char *s, long long n);
 
 PerlValue *perl_length(PerlValue *v) {
     if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
-    char *s = perl_to_string_dup(v);
-    long long n = utf8_strlen(s);
+    /* D85: NUL-safe — a string with embedded NUL bytes (e.g. pack() output)
+       must report its true byte/character count, each embedded NUL
+       counting as its own 1-byte character, not stopping length() early. */
+    long long slen_ll;
+    char *s = perl_to_string_dup_len(v, &slen_ll);
+    long long n = (v->tag == PERL_STRING) ? utf8_strlen_n(s, slen_ll) : utf8_strlen(s);
     free(s);
     return perl_alloc_int(n);
 }
@@ -2018,6 +2142,12 @@ void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, Per
     if (str->tag == PERL_STRING) free(str->sval);
     str->tag  = PERL_STRING;
     str->sval = buf;
+    /* D85: keep slen consistent with the new buffer — note substr's own
+       byte-offset math above is still strlen()/utf8-scan based internally
+       (not NUL-safe on an embedded-NUL source string), a narrower,
+       documented remaining gap; this at least avoids leaving a stale
+       slen dangling after the replace. */
+    str->slen = newlen;
     free(s); free(r);
 }
 
@@ -2736,6 +2866,14 @@ _Static_assert(sizeof(PerlValueAtomic16) == 16,
 _Static_assert(offsetof(PerlValue, ival) == 8,
                "ival field must sit at offset 8 inside PerlValue so the "
                "atomic-16 shadow covers {tag, flags, ival}");
+/* D85: adding the `slen`/`_pad_reserved` fields must keep sizeof(PerlValue)
+   a multiple of 16 — pv_alloc()'s slab (calloc(PV_SLAB, sizeof(PerlValue)))
+   packs PerlValues contiguously, and every entry must stay 16-byte aligned
+   for the cmpxchg16b/ldxp+stxp atomic path above (shared scalars are
+   slab-allocated too, via perl_make_shared_scalar -> pv_alloc). A stride
+   that isn't a 16-byte multiple would misalign every other slab entry. */
+_Static_assert(sizeof(PerlValue) % 16 == 0,
+               "sizeof(PerlValue) must be a multiple of 16 for slab alignment");
 
 /* Acquire-load the {tag, flags, value} 16 bytes from a PerlValue.
    The payload's ival/fval are read by the caller after this returns.
@@ -2998,7 +3136,14 @@ static PerlValue *clone_code_ref_for_thread(PerlValue *code_pv) {
         ns->matchpos = 0;
         ns->blessed_class = os->blessed_class ? strdup(os->blessed_class) : NULL;
         if (os->tag == PERL_STRING && os->sval) {
-            ns->sval = strdup(os->sval);
+            /* D85: length-aware copy — *ns = *os above already copied
+               os->slen correctly; strdup alone would truncate at an
+               embedded NUL. */
+            long long n = os->slen;
+            ns->sval = malloc((size_t)n + 1);
+            if (n > 0) memcpy(ns->sval, os->sval, (size_t)n);
+            ns->sval[n] = '\0';
+            ns->slen = n;
         } else if (os->tag == PERL_FLAT_ARRAY) {
             long long n = os->matchpos;
             ns->matchpos = n;
@@ -3421,6 +3566,7 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
                 free(s_autoload_pv.sval);
             s_autoload_pv.tag  = PERL_STRING;
             s_autoload_pv.sval = strdup(autoload_name);
+            s_autoload_pv.slen = (long long)strlen(autoload_name);
         } else {
             fprintf(stderr, "Can't locate object method \"%s\" via package \"%s\"\n",
                     method, class_name);
@@ -3545,7 +3691,11 @@ PerlValue *perl_readline(PerlValue *fh) {
         if (len == 0) { free(buf); return perl_alloc_undef(); }
         buf[len] = '\0';
         s_dollar_dot.ival++;
-        PerlValue *pv = perl_alloc_string(buf);
+        /* D85: slurp mode reads raw bytes via fgetc — perl_alloc_string(buf)
+           would truncate at an embedded NUL, silently losing everything a
+           binary file wrote past its first NUL byte. `len` is already the
+           exact tracked byte count. */
+        PerlValue *pv = perl_alloc_string_len(buf, (long long)len);
         free(buf);
         return pv;
     }
@@ -3566,7 +3716,10 @@ PerlValue *perl_readline(PerlValue *fh) {
     if (len == 0) { free(buf); return perl_alloc_undef(); }
     buf[len] = '\0';
     s_dollar_dot.ival++;
-    PerlValue *pv = perl_alloc_string(buf);
+    /* D85: same fix as slurp mode above — a binary read up to the line
+       separator may itself contain embedded NUL bytes before that
+       separator; `len` is already the exact tracked byte count. */
+    PerlValue *pv = perl_alloc_string_len(buf, (long long)len);
     free(buf);
     return pv;
 }
@@ -3593,16 +3746,20 @@ PerlArray *perl_readline_all_stdin(void) {
 
 void perl_print_fh(PerlValue *fh, PerlValue *v) {
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
-    char *s = perl_to_string_dup(v);
-    fputs(s, (FILE*)fh->pval);
+    /* D85: fwrite the true byte length — see perl_print's comment. This
+       is the write half of the pack -> file -> unpack binary round trip. */
+    long long n;
+    char *s = perl_to_string_dup_len(v, &n);
+    fwrite(s, 1, (size_t)n, (FILE*)fh->pval);
     free(s);
 }
 
 void perl_say_fh(PerlValue *fh, PerlValue *v) {
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
-    char *s = perl_to_string_dup(v);
+    long long n;
+    char *s = perl_to_string_dup_len(v, &n);
     FILE *fp = (FILE*)fh->pval;
-    fputs(s, fp);
+    fwrite(s, 1, (size_t)n, fp);
     fputc('\n', fp);
     free(s);
 }
@@ -3627,6 +3784,7 @@ void perl_die(PerlValue *msg) {
             if (s_dollar_at.tag == PERL_STRING && s_dollar_at.sval) free(s_dollar_at.sval);
             s_dollar_at.tag  = PERL_STRING;
             s_dollar_at.sval = strdup("Died");
+            s_dollar_at.slen = 4;
         }
         /* unwind local()s established since this eval block was entered,
            mirroring Perl's dynamic-scope restore on exception unwind */
@@ -3835,7 +3993,12 @@ PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
 #undef OUT_PUTS
 
     free(fmt);
-    PerlValue *result = perl_alloc_string(out);
+    /* D85: preserve the tracked byte length, not strlen(out) — note a %s
+       argument that itself contains an embedded NUL still truncates at
+       the inner snprintf(..., "%s", ...) call above (a libc limitation,
+       documented remaining gap); this fixes the outer buffer wrapping
+       for every other case (numeric conversions, literal % text, etc). */
+    PerlValue *result = perl_alloc_string_len(out, (long long)pos);
     free(out);
     return result;
 }
@@ -3927,8 +4090,12 @@ PerlValue *perl_pack(PerlValue *fmt_pv, PerlArray *args) {
                encoding — a narrower, separate, not-fixed-here gap (see
                TESTS.md D85). */
             PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
-            char *s = perl_to_string_dup(arg);
-            size_t slen = strlen(s);
+            /* D85: NUL-safe — the arg being packed may itself already be
+               NUL-containing binary data (e.g. re-packing a value that
+               came from an earlier unpack()). */
+            long long slen_ll;
+            char *s = perl_to_string_dup_len(arg, &slen_ll);
+            size_t slen = (size_t)slen_ll;
             size_t fieldWidth = starCount ? slen : (size_t)count;
             ENSURE(fieldWidth);
             size_t copyLen = slen < fieldWidth ? slen : fieldWidth;
@@ -4032,7 +4199,13 @@ PerlValue *perl_pack(PerlValue *fmt_pv, PerlArray *args) {
 #undef PUT
 
     free(fmt);
-    PerlValue *result = perl_alloc_string(out);
+    /* D85: this is the exact original repro — pack("N", 1234567) (and any
+       other pack producing a leading/embedded NUL byte, extremely common
+       for network-order integer packs) was silently truncated here, since
+       perl_alloc_string(out) computed its length via strlen(out) even
+       though `out`/`pos` had already correctly tracked the true byte
+       count through the whole packing loop above. */
+    PerlValue *result = perl_alloc_string_len(out, (long long)pos);
     free(out);
     return result;
 }
@@ -4059,8 +4232,13 @@ PerlValue *perl_unpack(PerlValue *fmt_pv, PerlValue *str_pv) {
    below delegates to this for scalar context too, taking just element 0). */
 PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
     char *fmt = perl_to_string_dup(fmt_pv);
-    char *str = perl_to_string_dup(str_pv);
-    size_t slen = strlen(str);
+    /* D85: the read-side counterpart to pack's fix above — strlen(str)
+       would silently truncate an unpack() call reading back exactly the
+       kind of NUL-containing binary data pack() itself now correctly
+       produces (e.g. unpack("N", pack("N", 1234567))). */
+    long long slen_ll;
+    char *str = perl_to_string_dup_len(str_pv, &slen_ll);
+    size_t slen = (size_t)slen_ll;
     size_t strpos = 0;
 
     PerlArray *result = perl_array_new();
@@ -4108,7 +4286,10 @@ PerlArray *perl_unpack_to_array(PerlValue *fmt_pv, PerlValue *str_pv) {
             memcpy(s, str + strpos, end);
             s[end] = '\0';
             strpos += fieldWidth;
-            perl_array_push(result, perl_alloc_string(s));
+            /* D85: 'a' (raw bytes) extraction may itself contain embedded
+               NULs — perl_alloc_string(s) would silently re-truncate what
+               was just correctly extracted above via perl_alloc_string_len. */
+            perl_array_push(result, perl_alloc_string_len(s, (long long)end));
             free(s);
             continue;
         }
@@ -4364,6 +4545,25 @@ static long long utf8_strlen(const char *s) {
     return count;
 }
 
+/* D85: bounded counterpart to utf8_strlen — scans exactly `n` bytes instead
+   of stopping at the first NUL, so length() is correct for a string with
+   embedded NUL bytes (each counts as its own 1-byte code point, matching
+   real Perl's byte-is-a-character-when-not-UTF8-flagged behavior). */
+static long long utf8_strlen_n(const char *s, long long n) {
+    long long count = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *end = p + n;
+    while (p < end) {
+        count++;
+        if (*p < 0x80) p++;
+        else if ((*p & 0xE0) == 0xC0) p += 2;
+        else if ((*p & 0xF0) == 0xE0) p += 3;
+        else if ((*p & 0xF8) == 0xF0) p += 4;
+        else p++;
+    }
+    return count;
+}
+
 /* Get byte offset of the nth UTF-8 code point */
 static long long utf8_char_to_byte(const char *s, long long n) {
     long long count = 0;
@@ -4386,7 +4586,11 @@ PerlValue *perl_chr_val(PerlValue *v) {
     unsigned char buf[4];
     int len = utf8_encode(buf, n);
     buf[len] = '\0';
-    return perl_alloc_string((char *)buf);
+    /* D85: chr(0) encodes to a single NUL byte — perl_alloc_string(buf)
+       would compute its length via strlen(buf), which is 0 for a buffer
+       starting with 0x00, silently discarding the character entirely.
+       utf8_encode's own return value is already the exact byte length. */
+    return perl_alloc_string_len((char *)buf, len);
 }
 
 PerlValue *perl_ord_val(PerlValue *v) {
@@ -4446,9 +4650,11 @@ static int cmp_num_asc(const void *a, const void *b) {
 }
 static int cmp_num_desc(const void *a, const void *b) { return cmp_num_asc(b, a); }
 static int cmp_str_asc(const void *a, const void *b) {
-    char *sa = perl_to_string_dup(*(PerlValue**)a);
-    char *sb = perl_to_string_dup(*(PerlValue**)b);
-    int r = strcmp(sa, sb); free(sa); free(sb); return r;
+    /* D85: NUL-safe. */
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(*(PerlValue**)a, &la);
+    char *sb = perl_to_string_dup_len(*(PerlValue**)b, &lb);
+    int r = perl_strcmp_len(sa, la, sb, lb); free(sa); free(sb); return r;
 }
 static int cmp_str_desc(const void *a, const void *b) { return cmp_str_asc(b, a); }
 
@@ -4471,8 +4677,10 @@ PerlValue *perl_spaceship(PerlValue *a, PerlValue *b) {
 }
 
 PerlValue *perl_str_spaceship(PerlValue *a, PerlValue *b) {
-    char *sa = perl_to_string_dup(a), *sb = perl_to_string_dup(b);
-    int r = strcmp(sa, sb);
+    /* D85: NUL-safe. */
+    long long la, lb;
+    char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
+    int r = perl_strcmp_len(sa, la, sb, lb);
     free(sa); free(sb);
     return perl_alloc_int(r < 0 ? -1 : r > 0 ? 1 : 0);
 }
@@ -4640,7 +4848,8 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
         { size_t ms = ov[0], me = ov[1];
           char *ms_str = malloc(me - ms + 1);
           memcpy(ms_str, s + ms, me - ms); ms_str[me-ms] = '\0';
-          s_dollar_amp.tag = PERL_STRING; s_dollar_amp.sval = ms_str; }
+          s_dollar_amp.tag = PERL_STRING; s_dollar_amp.sval = ms_str;
+          s_dollar_amp.slen = (long long)(me - ms); }
         for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
             if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
         }
@@ -4760,6 +4969,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     if (str->tag == PERL_STRING && str->sval) free(str->sval);
     str->tag  = PERL_STRING;
     str->sval = out;
+    str->slen = (long long)out_len; /* D85: out_len is already correctly tracked above */
 
     free(s);
     pcre2_match_data_free(md);
@@ -5114,8 +5324,13 @@ long long perl_tr(PerlValue *str, const char *search, const char *replace, const
     }
     free(sch); free(rch);
 
-    char *s = perl_to_string_dup(str);
-    size_t in_len = strlen(s);
+    /* D85: NUL-safe input read — tr/// is a pure byte-for-byte lookup-table
+       mapping with no UTF-8/regex involvement, so it's cheap to make fully
+       NUL-safe end to end (unlike substr/regex, which stay a documented
+       remaining gap). */
+    long long in_len_ll;
+    char *s = perl_to_string_dup_len(str, &in_len_ll);
+    size_t in_len = (size_t)in_len_ll;
     char *out = malloc(in_len + 1);
     size_t out_len = 0;
     long long count = 0;
@@ -5146,6 +5361,7 @@ long long perl_tr(PerlValue *str, const char *search, const char *replace, const
     if (str->tag == PERL_STRING && str->sval) free(str->sval);
     str->tag  = PERL_STRING;
     str->sval = out;
+    str->slen = (long long)out_len;
     free(s);
     return count;
 }
@@ -5163,6 +5379,7 @@ PerlArray *perl_init_argv(int argc, char **argv) {
     perl_argv_arr = perl_array_new();
     /* $0 = script name (argv[0]) */
     perl_dollar0_val.sval = strdup(argc > 0 ? argv[0] : "");
+    perl_dollar0_val.slen = (long long)strlen(perl_dollar0_val.sval);
     /* @ARGV = argv[1..] */
     for (int i = 1; i < argc; i++) {
         PerlValue *v = perl_alloc_string(argv[i]);
@@ -5560,7 +5777,10 @@ void perl_carp_croak(PerlArray *args) {
     if (args && args->len > 0) {
         perl_die(args->elems[0]);
     } else {
-        PerlValue died = { .tag = PERL_STRING, .sval = (char *)"Died" };
+        /* D85: .slen must be set explicitly — see perl_set_dollar_at_cstr's
+           comment for why an unset .slen on a designated-initializer
+           literal silently truncates to "". */
+        PerlValue died = { .tag = PERL_STRING, .sval = (char *)"Died", .slen = 4 };
         perl_die(&died);
     }
 }
@@ -5722,9 +5942,11 @@ PerlValue *perl_read_fh(PerlValue *fh, PerlValue *buf_pv, PerlValue *nbytes, Per
     /* write into buf_pv (which is a stable PerlValue*) */
     if (buf_pv) {
         if (off > 0) {
-            /* append at offset */
+            /* append at offset — D85: raw fread() output legitimately may
+               contain embedded NUL bytes, so use buf_pv->slen (not
+               strlen()) for the existing-buffer length. */
             char *cur = (buf_pv->tag == PERL_STRING && buf_pv->sval) ? buf_pv->sval : (char *)"";
-            long long curlen = (long long)strlen(cur);
+            long long curlen = (buf_pv->tag == PERL_STRING) ? buf_pv->slen : 0;
             if (off > curlen) off = curlen;
             char *newbuf = (char *)malloc(off + got + 1);
             memcpy(newbuf, cur, (size_t)off);
@@ -5733,10 +5955,12 @@ PerlValue *perl_read_fh(PerlValue *fh, PerlValue *buf_pv, PerlValue *nbytes, Per
             if (buf_pv->tag == PERL_STRING && buf_pv->sval) free(buf_pv->sval);
             buf_pv->tag = PERL_STRING;
             buf_pv->sval = newbuf;
+            buf_pv->slen = off + (long long)got;
         } else {
             if (buf_pv->tag == PERL_STRING && buf_pv->sval) free(buf_pv->sval);
             buf_pv->tag = PERL_STRING;
             buf_pv->sval = tmp;
+            buf_pv->slen = (long long)got;
             tmp = NULL;
         }
     }
