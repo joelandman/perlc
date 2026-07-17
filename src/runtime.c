@@ -1453,17 +1453,48 @@ HOT int both_int(const PerlValue *a, const PerlValue *b) {
 /* ── arithmetic ──────────────────────────────────────────────────────────── */
 
 HOTX PerlValue *perl_add(const PerlValue *a, const PerlValue *b) {
-    if (both_int(a, b)) return perl_alloc_int(a->ival + b->ival);
+    if (both_int(a, b)) {
+        long long r = a->ival + b->ival;
+        /* D78: Detect signed integer overflow — auto-promote to float.
+           Overflow: pos+pos=neg or neg+neg=pos. */
+        if ((b->ival > 0 && a->ival > 0 && r < 0) ||
+            (b->ival < 0 && a->ival < 0 && r > 0))
+            return perl_alloc_float((double)a->ival + (double)b->ival);
+        return perl_alloc_int(r);
+    }
     return perl_alloc_float(perl_to_float(a) + perl_to_float(b));
 }
 
 HOTX PerlValue *perl_sub(const PerlValue *a, const PerlValue *b) {
-    if (both_int(a, b)) return perl_alloc_int(a->ival - b->ival);
+    if (both_int(a, b)) {
+        long long r = a->ival - b->ival;
+        /* D78: Detect signed integer overflow — auto-promote to float.
+           Overflow: pos-neg=neg or neg-pos=pos. */
+        if ((b->ival < 0 && a->ival > 0 && r < 0) ||
+            (b->ival > 0 && a->ival < 0 && r > 0))
+            return perl_alloc_float((double)a->ival - (double)b->ival);
+        return perl_alloc_int(r);
+    }
     return perl_alloc_float(perl_to_float(a) - perl_to_float(b));
 }
 
 HOTX PerlValue *perl_mul(const PerlValue *a, const PerlValue *b) {
-    if (both_int(a, b)) return perl_alloc_int(a->ival * b->ival);
+    if (both_int(a, b)) {
+        /* D78: Detect signed integer overflow — auto-promote to float.
+           Simple check: if either operand is non-zero and the division
+           of result by one operand doesn't give back the other, overflow.
+           Also check sign patterns. */
+        long long r = a->ival * b->ival;
+        int overflow = 0;
+        if (a->ival != 0 && b->ival != 0) {
+            if (r / a->ival != b->ival) overflow = 1;
+        } else if (a->ival == 0 || b->ival == 0) {
+            /* 0 * anything = 0, no overflow */
+        }
+        if (overflow)
+            return perl_alloc_float((double)a->ival * (double)b->ival);
+        return perl_alloc_int(r);
+    }
     return perl_alloc_float(perl_to_float(a) * perl_to_float(b));
 }
 

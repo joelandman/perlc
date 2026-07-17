@@ -1528,8 +1528,16 @@ NodePtr Parser::parsePrimary() {
 
     /* integer literal */
     if (check(TK::INT)) {
-        long long v = std::stoll(cur().text, nullptr, 0);
-        advance(); return makeInt(v, line);
+        std::string text = cur().text; advance();
+        try {
+            long long v = std::stoll(text, nullptr, 0);
+            return makeInt(v, line);
+        } catch (...) {
+            /* D78: Integer literal too large for long long — parse as float
+               to match real Perl's auto-promotion on overflow. */
+            double v = std::stod(text);
+            return makeFloat(v, line);
+        }
     }
     /* float literal */
     if (check(TK::FLOAT)) {
