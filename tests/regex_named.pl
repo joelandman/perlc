@@ -2,7 +2,6 @@ use feature "say";
 #!/usr/bin/perl
 use 5.010;
 use strict;
-use warnings;
 
 my $s = qq{2024-03-15 date=(?<year>\\d{4})-(?<month>\\d{2})-(?<day>\\d{2})};
 

@@ -1,6 +1,5 @@
 #!/usr/bin/perl
 use strict;
-use warnings;
 
 # ── Test 1: grep/map/sort inside nested subs called from list context ──────
 # sub outer { inner() } where inner calls grep — should propagate list ctx

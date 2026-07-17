@@ -41,6 +41,12 @@ NUMERIC_TESTS=(
     nb.pl nbody.pl mbs.pl fibn.pl arith.pl
 )
 
+# Heavy benchmarks that need more than the default 60s timeout for real Perl.
+# Key: test filename, Value: timeout in seconds.
+declare -A LONG_TIMEOUT=(
+    [mbs.pl]=300
+)
+
 # Tests that are known to need external modules / DBI / XS at runtime.
 # We still try to compile+run them if the binary supports it, but we don't fail
 # the whole suite if they are skipped or produce different "not loaded" output.
@@ -136,6 +142,12 @@ run_one() {
         args="${ARGV_DEFAULTS[$base]}"
     fi
 
+    # Determine timeout — heavy benchmarks get a longer window
+    local test_timeout="$TIMEOUT_SEC"
+    if [[ -n "${LONG_TIMEOUT[$base]:-}" ]]; then
+        test_timeout="${LONG_TIMEOUT[$base]}"
+    fi
+
     # Build temp outputs
     local p_out c_out c_bin
     p_out=$(mktemp)
@@ -143,7 +155,7 @@ run_one() {
     c_bin=$(mktemp)
 
     # Run under perl
-    if ! timeout "$TIMEOUT_SEC" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1; then
+    if ! timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1; then
         # Some tests are expected to die (eval tests etc.). Capture anyway.
         :
     fi
@@ -175,7 +187,7 @@ run_one() {
         return 1
     fi
 
-    if ! timeout "$TIMEOUT_SEC" "$c_bin" $args >"$c_out" 2>&1; then
+    if ! timeout "$test_timeout" "$c_bin" $args >"$c_out" 2>&1; then
         :
     fi
 

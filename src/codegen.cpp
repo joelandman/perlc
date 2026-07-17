@@ -211,6 +211,7 @@ void CodeGen::declareRuntime() {
     RT("perl_mul",           pv,  pv, pv);
     RT("perl_div",           pv,  pv, pv);
     RT("perl_mod",           pv,  pv, pv);
+    RT("perl_mod_i64",       i64, i64, i64);
     RT("perl_pow",           pv,  pv, pv);
     RT("perl_negate",        pv,  pv);
     RT("perl_bitand",        pv,  pv, pv);
@@ -1591,17 +1592,11 @@ Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
        -7 % 3 == 2, 7 % -3 == -2. LLVM's SRem (like C's %) truncates toward
        zero instead, so a nonzero result with a sign mismatch against rv
        needs rv added back to floor it. Branchless via select, mirroring
-       perl_mod's boxed-value equivalent in runtime.c. */
-    auto *i64 = Type::getInt64Ty(ctx_);
-    Value *zero = ConstantInt::get(i64, 0);
-    Value *r = builder_.CreateSRem(lv, rv, "irem");
-    Value *rNeg = builder_.CreateICmpSLT(r, zero);
-    Value *rvNeg = builder_.CreateICmpSLT(rv, zero);
-    Value *signMismatch = builder_.CreateICmpNE(rNeg, rvNeg);
-    Value *rNonZero = builder_.CreateICmpNE(r, zero);
-    Value *needsAdjust = builder_.CreateAnd(signMismatch, rNonZero);
-    Value *adjusted = builder_.CreateAdd(r, rv);
-    return builder_.CreateSelect(needsAdjust, adjusted, r, "imod");
+       perl_mod's boxed-value equivalent in runtime.c.
+
+       D84: Zero-divisor check is handled by a runtime helper that calls
+       perl_die (eval-catchable) instead of exit(1). */
+    return callRT("perl_mod_i64", {lv, rv});
 }
 
 bool CodeGen::canEmitI64(const Node &n) {

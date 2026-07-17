@@ -150,9 +150,8 @@ my $t_mag      = time() - $t0;
 printf("\n");
 
 # show timings (equivalent to show(to) )
-print "Timing results (seconds):\n";
-printf( "  fill array    : %.6f\n", $t_fill );
-printf( "  copy constant : %.6f\n", $t_copy );
-printf( "  run iterations: %.6f\n", $t_iter );
-printf( "  get magnitude : %.6f (sample abs(z[0,0])=%.6f)\n",
-    $t_mag, $sample_abs );
+# NOTE: timing values are implementation-dependent and will differ between
+# perl (interpreted) and perlc (compiled). Only the computational result
+# (sample abs value) is compared for correctness.
+print "mbs_done\n";
+printf( "sample_abs=%.6f\n", $sample_abs );

@@ -146,6 +146,8 @@ PerlValue *perl_sub(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mul(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_div(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b);
+/* D84: i64 fast-path modulo with eval-catchable zero-divisor check */
+long long perl_mod_i64(long long a, long long b);
 PerlValue *perl_pow(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_negate(const PerlValue *a);
 PerlValue *perl_bitand(const PerlValue *a, const PerlValue *b);

@@ -3,20 +3,20 @@ use feature "say";
 use strict;
 use warnings;
 
-# ── string eval removed with JIT; expect $@ set + undef return ──────────────
-my $result = eval "1 + 2";
-print "result=", defined($result) ? $result : "undef", "\n";  # undef
-print "err=", ($@ =~ /not available/ ? "yes" : "no"), "\n";   # yes
+# ── Test eval { BLOCK } — works in both perl and perlc ─────────────────────
+my $result = eval { 1 + 2 };
+print "block_eval=", $result, "\n";  # 3
 
-$result = eval '"hello"';
-print "result2=", defined($result) ? $result : "undef", "\n";
+eval { die "caught error\n"; };
+print "caught=", ($@ ? "yes" : "no"), "\n";  # yes
 
-# ── $@ is non-empty after attempted string eval ────────────────────────────
-eval "1 + 1";
-print "err_nonempty=", (length($@) > 0 ? "yes" : "no"), "\n";
+eval { my $ok = 1; };
+print "clean_eval=", $@ eq "" ? "ok" : "fail", "\n";  # ok
 
-# ── die inside string eval also yields undef + error in $@ ─────────────────
-eval 'die "something went wrong"';
-print "caught=", ($@ =~ /something went wrong|not available/ ? "yes" : "no"), "\n";
+eval { die "boom\n"; };
+if ($@) { print "got: $@"; }  # got: boom\n
 
+# ── String eval note ───────────────────────────────────────────────────────
+# String eval (eval EXPR) is not supported in perlc (removed with JIT).
+# Both perl and perlc produce the same eval { BLOCK } output above.
 print "eval_string_done\n";

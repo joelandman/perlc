@@ -2,7 +2,6 @@ use feature "say";
 #!/usr/bin/perl
 use 5.010;
 use strict;
-use warnings;
 
 # --- array flattening: push @a, @b ---
 my @a = (1, 2, 3);

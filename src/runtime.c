@@ -1477,7 +1477,10 @@ HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
 
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
     long long bv = perl_to_int(b);
-    if (bv == 0) { fprintf(stderr, "Illegal modulus zero\n"); exit(1); }
+    if (bv == 0) {
+        PerlValue *msg = perl_alloc_string("Illegal modulus zero");
+        perl_die(msg);
+    }
     long long av = perl_to_int(a);
     /* Perl's %, unlike C's, uses floored-division semantics: the result
        always has the same sign as the right operand (or is zero) — e.g.
@@ -1487,6 +1490,18 @@ PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
     long long r = av % bv;
     if (r != 0 && ((r < 0) != (bv < 0))) r += bv;
     return perl_alloc_int(r);
+}
+
+/* D84: i64 fast-path modulo with eval-catchable zero-divisor check.
+   Returns the floored modulo result, or calls perl_die if divisor is zero. */
+HOTX long long perl_mod_i64(long long a, long long b) {
+    if (b == 0) {
+        PerlValue *msg = perl_alloc_string("Illegal modulus zero");
+        perl_die(msg);
+    }
+    long long r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) r += b;
+    return r;
 }
 
 PerlValue *perl_pow(const PerlValue *a, const PerlValue *b) {
@@ -2753,8 +2768,31 @@ PerlValue *perl_ref_type(PerlValue *ref) {
     if (!ref) return perl_alloc_string("");
     if (ref->blessed_class) return perl_alloc_string(ref->blessed_class);
     switch (ref->tag) {
-        case PERL_REF_SCALAR:  return perl_alloc_string("SCALAR");
+        case PERL_REF_SCALAR: {
+            /* Deref the scalar to get the referent's type.
+               ref(\$x) where $x is a plain scalar → "SCALAR"
+               ref(\$ary) where $ary is an array ref → "REF"
+               ref(\$hsh) where $hsh is a hash ref → "REF"
+               ref(\$code) where $code is a code ref → "CODE"
+               FLAT_ARRAY / FLOAT_PAIR are inline array refs → "REF" */
+            if (ref->pval) {
+                PerlValue *inner = (PerlValue *)ref->pval;
+                switch (inner->tag) {
+                    case PERL_REF_ARRAY:
+                    case PERL_REF_HASH:
+                    case PERL_CODE_REF:
+                    case PERL_REF_SCALAR:
+                    case PERL_FLAT_ARRAY:
+                    case PERL_FLOAT_PAIR:
+                    case PERL_XS_PTR:
+                        return perl_alloc_string("REF");
+                    default:               return perl_alloc_string("SCALAR");
+                }
+            }
+            return perl_alloc_string("SCALAR");
+        }
         case PERL_REF_ARRAY:   return perl_alloc_string("ARRAY");
+        case PERL_FLAT_ARRAY:  return perl_alloc_string("ARRAY");
         case PERL_FLOAT_PAIR:  return perl_alloc_string("ARRAY");
         case PERL_REF_HASH:    return perl_alloc_string("HASH");
         case PERL_CODE_REF:    return perl_alloc_string("CODE");

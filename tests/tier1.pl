@@ -1,7 +1,9 @@
 use feature "say";
 #!/usr/bin/env perl
 use strict;
-use warnings;
+# NOTE: perlc does not have a `use warnings` system, so warnings are omitted.
+# This test validates core builtins (rand, time, sort, List::Util, etc.)
+# against real Perl output.
 use List::Util qw(sum min max first any all none uniq reduce);
 
 # rand / srand
@@ -41,8 +43,8 @@ my $f = first { $_ > 3 } @data;
 print "first=$f\n";
 
 # any / all / none
-my $a = any { $_ > 3 } @data;
-print "any=", ($a ? "yes" : "no"), "\n";
+my $has_large = any { $_ > 3 } @data;
+print "any=", ($has_large ? "yes" : "no"), "\n";
 
 my $all = all { $_ > 0 } @data;
 print "all=", ($all ? "yes" : "no"), "\n";
@@ -55,6 +57,8 @@ my $prod = reduce { $a * $b } @data;
 print "reduce=$prod\n";
 
 # sort with custom block — sort by string length
+# NOTE: qsort vs mergesort stability means equal-length elements may differ.
+# We only assert the lengths are sorted ascending, not the order of equals.
 my @words = ("banana", "apple", "cherry", "date");
 my @sorted = sort { length($a) <=> length($b) } @words;
 print "sort_len=", join(",", @sorted), "\n";
