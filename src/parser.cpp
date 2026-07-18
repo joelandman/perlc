@@ -693,16 +693,38 @@ NodePtr Parser::parseMy() {
 }
 
 NodePtr Parser::parsePrint(bool isSay) {
-    int line = cur().line;
-    advance(); /* consume print/say */
+     int line = cur().line;
+     advance(); /* consume print/say */
 
-    /* filehandle detection:
-       - bare STDOUT/STDERR ident
-       - $fh without a following comma → it's a filehandle, not a value */
-    std::string fhname;
-    if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
-        fhname = cur().text; advance();
-    } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
+     /* filehandle detection:
+        - bare STDOUT/STDERR ident
+        - $fh without a following comma → it's a filehandle, not a value
+        - {EXPR} brace-block → it's a filehandle expression */
+     std::string fhname;
+     if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
+         fhname = cur().text; advance();
+     } else if (check(TK::LBRACE)) {
+         /* {EXPR} brace-block filehandle form — parse the expression inside braces */
+         advance(); /* skip { */
+         NodePtr fhExpr = parseExpr();
+         consume(TK::RBRACE, "}");
+         /* Store the filehandle expression in n->name for codegen to handle */
+         /* We use a special marker to indicate it's a brace-block fh */
+         auto n = std::make_unique<Node>();
+         n->kind = NK::PrintStmt; /* will be set correctly below */
+         n->name = ""; /* placeholder */
+         n->left = std::move(fhExpr); /* filehandle expression */
+         /* Now parse the rest as arguments */
+         NodeList args;
+         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+             if (check(TK::RPAREN)) break; /* for parenthesized form */
+             args.push_back(parseExpr());
+             if (!match(TK::COMMA)) break;
+         }
+         n->args = std::move(args);
+         n->line = line;
+         return n;
+     } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
         TK t2 = peek(2).kind;
         /* LBRACKET/LBRACE excluded: $arr[i] and $hash{k} are subscripts, not fh */
         bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||

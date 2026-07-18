@@ -3487,12 +3487,17 @@ void CodeGen::emitStmt(const Node &n) {
     case NK::SayStmt: {
         bool isSay = (n.kind == NK::SayStmt);
         /* resolve filehandle (n.name: "", "STDOUT", "STDERR", or scalar varname) */
+        /* n.left: brace-block filehandle expression (print {$fh} LIST) */
         Value *fh = nullptr;
         if (n.name == "STDERR")       fh = callRT("perl_get_stderr", {});
         else if (n.name == "STDOUT")  fh = callRT("perl_get_stdout", {});
         else if (!n.name.empty()) {
             if (auto *slot = lookupVar(n.name))
                 fh = builder_.CreateLoad(perlPtrTy_, slot);
+        }
+        /* D86: brace-block filehandle form — evaluate n.left as the fh expression */
+        if (!fh && n.left) {
+            fh = emitExpr(*n.left);
         }
         if (fh) {
             /* print/say to filehandle */
