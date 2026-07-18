@@ -2152,22 +2152,19 @@ PerlValue *perl_substr2(PerlValue *str, PerlValue *off_v) {
     long long n    = 0;
     if (!substr_bounds_utf8(slen, &off, &n, 0)) { free(s); return perl_alloc_undef(); }
     long long byte_off = utf8_char_to_byte(s, off);
-    long long byte_len = utf8_char_to_byte(s + byte_off, n) - 0;
-    /* recalculate byte_len by advancing n code points */
     const unsigned char *p = (const unsigned char *)(s + byte_off);
     long long bc = 0;
     for (long long c = 0; c < n; c++) {
-        if (*p < 0x80) p++;
-        else if ((*p & 0xE0) == 0xC0) p += 2;
-        else if ((*p & 0xF0) == 0xE0) p += 3;
-        else if ((*p & 0xF8) == 0xF0) p += 4;
-        else p++;
-        bc++;
+        if (*p < 0x80) { p++; bc++; }
+        else if ((*p & 0xE0) == 0xC0) { p += 2; bc += 2; }
+        else if ((*p & 0xF0) == 0xE0) { p += 3; bc += 3; }
+        else if ((*p & 0xF8) == 0xF0) { p += 4; bc += 4; }
+        else { p++; bc++; }
     }
     char *buf = malloc((size_t)bc + 1);
     memcpy(buf, s + byte_off, (size_t)bc);
     buf[bc] = '\0';
-    PerlValue *r = perl_alloc_string(buf);
+    PerlValue *r = perl_alloc_string_len(buf, bc);
     free(buf); free(s);
     return r;
 }
@@ -2182,17 +2179,16 @@ PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
     const unsigned char *p = (const unsigned char *)(s + byte_off);
     long long bc = 0;
     for (long long c = 0; c < n; c++) {
-        if (*p < 0x80) p++;
-        else if ((*p & 0xE0) == 0xC0) p += 2;
-        else if ((*p & 0xF0) == 0xE0) p += 3;
-        else if ((*p & 0xF8) == 0xF0) p += 4;
-        else p++;
-        bc++;
+        if (*p < 0x80) { p++; bc++; }
+        else if ((*p & 0xE0) == 0xC0) { p += 2; bc += 2; }
+        else if ((*p & 0xF0) == 0xE0) { p += 3; bc += 3; }
+        else if ((*p & 0xF8) == 0xF0) { p += 4; bc += 4; }
+        else { p++; bc++; }
     }
     char *buf = malloc((size_t)bc + 1);
     memcpy(buf, s + byte_off, (size_t)bc);
     buf[bc] = '\0';
-    PerlValue *r = perl_alloc_string(buf);
+    PerlValue *r = perl_alloc_string_len(buf, bc);
     free(buf); free(s);
     return r;
 }
