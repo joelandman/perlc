@@ -348,7 +348,12 @@ void perl_local_save_hash(PerlHash **slot) {
 static __thread jmp_buf *s_eval_stack[EVAL_STACK_MAX];
 static __thread int      s_eval_local_depth[EVAL_STACK_MAX]; /* local()-stack depth at eval entry */
 static __thread int      s_eval_depth = 0;
-static __thread PerlValue s_dollar_at; /* $@ — zero-initialized = UNDEF per thread */
+ static __thread PerlValue s_dollar_at; /* $@ — zero-initialized = UNDEF per thread */
+
+/* Forward declarations for die-related functions — needed so calls before
+   the definition (perl_mod, div-by-zero, substr) see the correct signature. */
+static char *appendDieLocation(char *msg, const char *filename, int line);
+void perl_die(PerlValue *msg, const char *filename, int line);
 
 /* $/ — input record separator (default "\n", undef = slurp mode) */
 static PerlValue s_input_sep = { .tag = PERL_STRING };
@@ -1136,12 +1141,70 @@ static void perl_closure_release(PerlClosure *cl) {
 
 /* ── coercions ───────────────────────────────────────────────────────────── */
 
+/* D79: Perl's implicit string→number coercion only recognizes decimal digits
+   (and an optional leading sign). Unlike C's atof/strtoll, it does NOT
+   auto-detect hex (0x…), octal (0…), or binary (0b…) prefixes — those are
+   reserved for explicit hex()/oct() calls only.  We implement our own
+   decimal-only parsers to avoid C library auto-detection behavior. */
+
+static __attribute__((pure)) HOTX long long perl_atoll_decimal(const char *s) {
+    if (!s) return 0;
+    long long result = 0;
+    int sign = 1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { sign = -1; s++; }
+    else if (*s == '+') s++;
+    while (*s >= '0' && *s <= '9') {
+        result = result * 10 + (*s - '0');
+        s++;
+    }
+    return sign * result;
+}
+
+static __attribute__((pure)) HOTX double perl_atof_decimal(const char *s) {
+    if (!s) return 0.0;
+    double result = 0.0;
+    int sign = 1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { sign = -1; s++; }
+    else if (*s == '+') s++;
+    while (*s >= '0' && *s <= '9') {
+        result = result * 10 + (*s - '0');
+        s++;
+    }
+    if (*s == '.') {
+        s++;
+        double frac = 0.1;
+        while (*s >= '0' && *s <= '9') {
+            result += frac * (*s - '0');
+            frac *= 0.1;
+            s++;
+        }
+    }
+    /* Skip exponent (rare in Perl string coercion, but handle for completeness) */
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        int exp_sign = 1;
+        if (*s == '-') { exp_sign = -1; s++; }
+        else if (*s == '+') s++;
+        long long exp = 0;
+        while (*s >= '0' && *s <= '9') {
+            exp = exp * 10 + (*s - '0');
+            s++;
+        }
+        double mul = 1.0;
+        for (long long i = 0; i < exp; i++) mul *= (exp_sign > 0) ? 10.0 : 0.1;
+        result *= mul;
+    }
+    return sign * result;
+}
+
 __attribute__((pure)) HOTX long long perl_to_int(const PerlValue *v) {
     if (!v) return 0;
     switch (v->tag) {
         case PERL_INT:    return v->ival;
         case PERL_FLOAT:  return (long long)v->fval;
-        case PERL_STRING: return atoll(v->sval);
+        case PERL_STRING: return perl_atoll_decimal(v->sval);
         case PERL_XS_PTR: return (long long)(uintptr_t)v->pval;
         default:          return 0;
     }
@@ -1152,7 +1215,7 @@ __attribute__((pure)) HOTX double perl_to_float(const PerlValue *v) {
     switch (v->tag) {
         case PERL_INT:    return (double)v->ival;
         case PERL_FLOAT:  return v->fval;
-        case PERL_STRING: return atof(v->sval);
+        case PERL_STRING: return perl_atof_decimal(v->sval);
         case PERL_XS_PTR: return (double)(uintptr_t)v->pval;
         default:          return 0.0;
     }
@@ -1519,11 +1582,11 @@ HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
 }
 
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
-    long long bv = perl_to_int(b);
-    if (bv == 0) {
-        PerlValue *msg = perl_alloc_string("Illegal modulus zero");
-        perl_die(msg);
-    }
+     long long bv = perl_to_int(b);
+     if (bv == 0) {
+         PerlValue *msg = perl_alloc_string("Illegal modulus zero");
+         perl_die(msg, NULL, 0);
+     }
     long long av = perl_to_int(a);
     /* Perl's %, unlike C's, uses floored-division semantics: the result
        always has the same sign as the right operand (or is zero) — e.g.
@@ -1536,12 +1599,12 @@ PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
 }
 
 /* D84: i64 fast-path modulo with eval-catchable zero-divisor check.
-   Returns the floored modulo result, or calls perl_die if divisor is zero. */
-HOTX long long perl_mod_i64(long long a, long long b) {
-    if (b == 0) {
-        PerlValue *msg = perl_alloc_string("Illegal modulus zero");
-        perl_die(msg);
-    }
+    Returns the floored modulo result, or calls perl_die if divisor is zero. */
+ HOTX long long perl_mod_i64(long long a, long long b) {
+     if (b == 0) {
+         PerlValue *msg = perl_alloc_string("Illegal modulus zero");
+         perl_die(msg, NULL, 0);
+     }
     long long r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) r += b;
     return r;
@@ -2227,7 +2290,7 @@ void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, Per
         free(s); free(r);
         static const char msg[] = "substr outside of string";
         PerlValue diemsg = { .tag = PERL_STRING, .sval = (char *)msg, .slen = (long long)(sizeof(msg) - 1) };
-        perl_die(&diemsg);
+         perl_die(&diemsg, NULL, 0);
         return;
     }
     long long byte_off = utf8_char_to_byte(s, off);
@@ -3906,33 +3969,44 @@ void perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
 }
 
 PerlValue *perl_eof_fh(PerlValue *fh) {
-    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return perl_alloc_int(1);
-    return perl_alloc_int(feof((FILE*)fh->pval) ? 1 : 0);
-}
+     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return perl_alloc_int(1);
+     return perl_alloc_int(feof((FILE*)fh->pval) ? 1 : 0);
+ }
 
-void perl_die(PerlValue *msg) {
-    if (s_eval_depth > 0) {
-        /* preserve the original value in $@ (refs stay as refs) */
-        if (msg) {
-            perl_assign(&s_dollar_at, msg);
-        } else {
-            if (s_dollar_at.tag == PERL_STRING && s_dollar_at.sval) free(s_dollar_at.sval);
-            s_dollar_at.tag  = PERL_STRING;
-            s_dollar_at.sval = strdup("Died");
-            s_dollar_at.slen = 4;
-        }
-        /* unwind local()s established since this eval block was entered,
-           mirroring Perl's dynamic-scope restore on exception unwind */
-        perl_local_restore_to(s_eval_local_depth[s_eval_depth - 1]);
-        longjmp(*s_eval_stack[s_eval_depth - 1], 1);
-    }
-    char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
-    fputs(s, stderr);
-    size_t n = strlen(s);
-    if (n == 0 || s[n-1] != '\n') fputc('\n', stderr);
-    free(s);
-    exit(1);
-}
+/* Append " at FILE line N." to a die message if it doesn't already end in \n.
+   Returns a newly-allocated string that the caller must free. */
+static char *appendDieLocation(char *msg, const char *filename, int line) {
+     size_t n = strlen(msg);
+     if (n > 0 && msg[n-1] == '\n') {
+         return strdup(msg);
+     }
+     if (filename && line > 0) {
+         char *buf = malloc(n + 48 + strlen(filename));
+         sprintf(buf, "%s at \"%s\" line %d.\n", msg, filename, line);
+         return buf;
+     }
+     char *buf = malloc(n + 20);
+     sprintf(buf, "%s at line %d.\n", msg, line);
+     return buf;
+ }
+
+void perl_die(PerlValue *msg, const char *filename, int line) {
+     if (s_eval_depth > 0) {
+         char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
+         char *full = appendDieLocation(s, filename, line);
+         PerlValue pv = { .tag = PERL_STRING, .sval = full, .slen = (long long)strlen(full) };
+         perl_assign(&s_dollar_at, &pv);
+         free(s);
+         perl_local_restore_to(s_eval_local_depth[s_eval_depth - 1]);
+         longjmp(*s_eval_stack[s_eval_depth - 1], 1);
+     }
+     char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
+     char *full = appendDieLocation(s, filename, line);
+     fputs(full, stderr);
+     free(full);
+     free(s);
+     exit(1);
+ }
 
 PerlValue *perl_unlink_files(PerlArray *files) {
     long long removed = 0;
@@ -5900,23 +5974,23 @@ PerlValue *perl_su_looks_like_number(PerlValue *v) {
 /* ── Carp ─────────────────────────────────────────────────────────────────── */
 
 void perl_carp_croak(PerlArray *args) {
-    /* Route through perl_die (not fprintf+exit) so `eval { croak(...) }` —
-       the standard Carp usage pattern for turning a library error into a
-       catchable exception — actually catches it instead of killing the
-       whole process. perl_die already has the correct dual behavior:
-       longjmp to the nearest eval (setting $@) if one is active, or print
-       to stderr and exit(1) at top level if not. perl_die only reads its
-       argument (via perl_assign / perl_to_string_dup, both of which clone
-       rather than take ownership), so passing a borrowed array element or
-       a stack-local PerlValue here is safe either way. */
-    if (args && args->len > 0) {
-        perl_die(args->elems[0]);
-    } else {
-        /* D85: .slen must be set explicitly — see perl_set_dollar_at_cstr's
-           comment for why an unset .slen on a designated-initializer
-           literal silently truncates to "". */
-        PerlValue died = { .tag = PERL_STRING, .sval = (char *)"Died", .slen = 4 };
-        perl_die(&died);
+     /* Route through perl_die (not fprintf+exit) so `eval { croak(...) }` —
+        the standard Carp usage pattern for turning a library error into a
+        catchable exception — actually catches it instead of killing the
+        whole process. perl_die already has the correct dual behavior:
+        longjmp to the nearest eval (setting $@) if one is active, or print
+        to stderr and exit(1) at top level if not. perl_die only reads its
+        argument (via perl_assign / perl_to_string_dup, both of which clone
+        rather than take ownership), so passing a borrowed array element or
+        a stack-local PerlValue here is safe either way. */
+     if (args && args->len > 0) {
+         perl_die(args->elems[0], NULL, 0);
+     } else {
+         /* D85: .slen must be set explicitly — see perl_set_dollar_at_cstr's
+            comment for why an unset .slen on a designated-initializer
+            literal silently truncates to "". */
+         PerlValue died = { .tag = PERL_STRING, .sval = (char *)"Died", .slen = 4 };
+         perl_die(&died, NULL, 0);
     }
 }
 

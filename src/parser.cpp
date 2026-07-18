@@ -93,6 +93,20 @@ NodePtr Parser::parseProgram() {
             while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
             match(TK::SEMI); continue;
         }
+        /* D48/D91: `no PRAGMA` (e.g. `no strict;`, `no warnings;`,
+           `no warnings 'CATEGORY';`) — silently ignored, matching Perl's
+           no-op for unrecognized pragmas. Handles both bare `no IDENT`
+           and `no IDENT 'arg'` forms. Skip past `;`. */
+        if (cur().kind == TK::IDENT && cur().text == "no") {
+            advance(); /* consume "no" */
+            /* consume pragma name (could be IDENT like "feature" or a keyword like strict/warnings) */
+            if (!check(TK::STRING) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                advance(); /* pragma name */
+                /* Skip optional argument string, e.g. `no warnings 'misc'` */
+                if (check(TK::STRING)) advance();
+            }
+            match(TK::SEMI); continue;
+        }
         stmts.push_back(parseStmt());
     }
     return makeBlock(std::move(stmts), 1);
@@ -703,17 +717,16 @@ NodePtr Parser::parsePrint(bool isSay) {
      std::string fhname;
      if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
          fhname = cur().text; advance();
-     } else if (check(TK::LBRACE)) {
-         /* {EXPR} brace-block filehandle form — parse the expression inside braces */
-         advance(); /* skip { */
-         NodePtr fhExpr = parseExpr();
-         consume(TK::RBRACE, "}");
-         /* Store the filehandle expression in n->name for codegen to handle */
-         /* We use a special marker to indicate it's a brace-block fh */
-         auto n = std::make_unique<Node>();
-         n->kind = NK::PrintStmt; /* will be set correctly below */
-         n->name = ""; /* placeholder */
-         n->left = std::move(fhExpr); /* filehandle expression */
+      } else if (check(TK::LBRACE)) {
+          /* {EXPR} brace-block filehandle form — parse the expression inside braces */
+          advance(); /* skip { */
+          NodePtr fhExpr = parseExpr();
+          consume(TK::RBRACE, "}");
+          /* Store the filehandle expression in n->left for codegen to handle */
+          auto n = std::make_unique<Node>();
+          n->kind = isSay ? NK::SayStmt : NK::PrintStmt;
+          n->name = "";
+          n->left = std::move(fhExpr);
          /* Now parse the rest as arguments */
          NodeList args;
          while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
@@ -992,6 +1005,39 @@ NodePtr Parser::parseOrRhs() {
     else if (k == TK::KW_SAY)    { stmt = parsePrint(true);  }
     else if (k == TK::KW_PUSH)   { stmt = parsePush();       }
     else if (k == TK::KW_UNSHIFT){ stmt = parseUnshift();    }
+    else if (k == TK::KW_PRINTF) {
+        /* printf: filehandle detection + format + args, same as parseStmt
+           but without parseModifier wrapper (the outer parseStmt handles
+           the trailing modifier, so we leave the ; for the caller). */
+        advance(); /* consume printf */
+        std::string fhname;
+        if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
+            fhname = cur().text; advance();
+        } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
+            TK t2 = peek(2).kind;
+            bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
+                            t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
+                            t2 == TK::LPAREN);
+            if (!isFhCtx && t2 == TK::IDENT) {
+                isFhCtx = !isCmpOpWord(peek(2).text);
+            }
+            if (isFhCtx) { pos_++; fhname = advance().text; }
+        }
+        bool hasParen = check(TK::LPAREN);
+        if (hasParen) advance();
+        NodePtr fmt = parseExpr();
+        NodeList args;
+        while (match(TK::COMMA)) {
+            if (!hasParen && isModifier()) break;
+            if (hasParen && check(TK::RPAREN)) break;
+            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            args.push_back(parseExpr());
+        }
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
+        n->name = fhname; n->left = std::move(fmt); n->args = std::move(args);
+        stmt = std::move(n);
+    }
     else {
         return parseLowNot();
     }

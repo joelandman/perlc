@@ -331,7 +331,7 @@ void CodeGen::declareRuntime() {
     RT("perl_say_fh",           voidTy, pv, pv);
     RT("perl_printf_fh",        voidTy, pv, pv, av);
     RT("perl_eof_fh",           pv,     pv);
-    RT("perl_die",              voidTy, pv);
+     RT("perl_die",              voidTy, pv, i8p, i32);
     /* perl_die never returns to its caller — it either longjmp's to an eval
        catch point (different basic block) or calls exit(1). */
     rtFuncs_["perl_die"]->addFnAttr(Attribute::NoReturn);
@@ -4256,9 +4256,12 @@ void CodeGen::emitStmt(const Node &n) {
            `return` at the top level is equivalent to `die` in Perl
            semantics. Call perl_die to longjmp back to the nearest eval's
            catch point (or terminate the process if there is none). */
-        if (currentFn_ && currentFn_->getReturnType()->isIntegerTy() &&
-            currentFn_->getName() == "main") {
-            callRT("perl_die", {v});
+         if (currentFn_ && currentFn_->getReturnType()->isIntegerTy() &&
+             currentFn_->getName() == "main") {
+             auto *i32Ty = Type::getInt32Ty(ctx_);
+             Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "die.file");
+             Value *lineVal = ConstantInt::get(i32Ty, n.line);
+             callRT("perl_die", {v, fileStr, lineVal});
         } else {
             builder_.CreateRet(v);
         }
@@ -4740,11 +4743,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::CondBcast:     { callRT("perl_cond_broadcast", {emitExpr(*n.left)}); return perlUndef(); }
 
     case NK::DieStmt: {
-        Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
-        callRT("perl_die", {msg});
-        /* perl_die is NoReturn — no code reachable after it */
-        return perlUndef();
-    }
+         auto *i32Ty = Type::getInt32Ty(ctx_);
+         Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
+         Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "die.file");
+         Value *lineVal = ConstantInt::get(i32Ty, n.line);
+         callRT("perl_die", {msg, fileStr, lineVal});
+         /* perl_die is NoReturn — no code reachable after it */
+         return perlUndef();
+     }
 
     case NK::UnlinkFunc: {
         Value *av = callRT("perl_array_new", {});

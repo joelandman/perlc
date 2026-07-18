@@ -334,7 +334,7 @@ void       perl_print_fh(PerlValue *fh, PerlValue *v);
 void       perl_say_fh(PerlValue *fh, PerlValue *v);
 void       perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args);
 PerlValue *perl_eof_fh(PerlValue *fh);
-void       perl_die(PerlValue *msg);
+void       perl_die(PerlValue *msg, const char *filename, int line);
 PerlValue *perl_unlink_files(PerlArray *files);
 PerlValue *perl_get_stdin(void);    /* returns stable STDIN PerlValue*  */
 PerlValue *perl_get_stderr(void);   /* returns stable STDERR PerlValue* */
