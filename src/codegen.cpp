@@ -7636,7 +7636,7 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
         return callRT("perl_posix_ceil", {v});
     }
-    if (n.name == "POSIX::fmod") {
+    if (n.name == "POSIX::fmod" || n.name == "fmod") {
         Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
         Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
         return callRT("perl_posix_fmod", {a, b});

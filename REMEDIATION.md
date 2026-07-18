@@ -501,3 +501,8 @@ Original items (1-14) — all fixed at time of writing:
     - Root cause: Two issues. (1) `perl_format_float` used `%.15g` format which produces scientific notation for large floats. (2) The F64 fast path converted large integer file-scope variables to double, losing precision before stringification could help.
     - **Fix, two parts**: (a) `perl_format_float` now checks if a float value is within i64 range and represents an exact integer (`d == (double)(long long)d`), formatting it as `%lld` instead of `%.15g`. (b) `canEmitF64` now tracks file-scope variables initialized with integer literals > 2^53 in a new `fileScalarLargeInt_` set, excluding them from the F64 fast path to prevent precision loss at the arithmetic stage.
     - Tests: `tests/d78_int_overflow_smoke.pl` now passes (previously failed due to scientific notation). `nb.pl`/`nbody.pl` still pass (float file-scope variables still use F64 fast path). Full harness: 150 tests, 0 failures.
+
+71. ~~**Fix D70: `POSIX::fmod` now works when imported unqualified**~~ — FIXED (2026-07-18)
+    - Root cause: The qualified-name interception in `emitCall` (codegen.cpp) only matched `"POSIX::fmod"`, not bare `"fmod"` — unlike `floor`/`ceil`/`strftime` which already matched both forms.
+    - **Fix**: Added `|| n.name == "fmod"` to the same check at line 7639 in `codegen.cpp`.
+    - Tests: `tests/d70_fmod_unqualified_smoke.pl` (2 checks) and `tests/d70_fmod_unqualified.pl` (20+ checks across 7 sections: qualified/unqualified forms, negative operands, float operands, variables, expressions, multiple POSIX functions) — verified byte-for-byte against real Perl.
