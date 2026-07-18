@@ -140,7 +140,11 @@ private:
        storage is actually shared across repeated `do` calls on the same
        file. All existing consumers only ever load through the pointer
        generically, so this is a source-compatible widening. */
-    std::unordered_map<std::string, llvm::Value *> fileScalarGlobals_;
+     std::unordered_map<std::string, llvm::Value *> fileScalarGlobals_;
+     /* D78: file-scope variables initialized with integer literals > 2^53.
+        These cannot safely use the F64 fast path because converting to double
+        would lose precision. Excluded from canEmitF64 for ScalarVar. */
+     std::unordered_set<std::string> fileScalarLargeInt_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileArrayGlobals_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileHashGlobals_;
     int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */

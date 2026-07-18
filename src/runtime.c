@@ -1169,6 +1169,18 @@ static void perl_format_float(char *buf, size_t bufsz, double d) {
     if (isnan(d)) { snprintf(buf, bufsz, "NaN"); return; }
     if (isinf(d)) { snprintf(buf, bufsz, d < 0 ? "-Inf" : "Inf"); return; }
     if (d == 0.0) { snprintf(buf, bufsz, "0"); return; }
+    /* D78: If the float represents an integer value within i64 range,
+       format as integer to match Perl's default stringification.
+       Perl tracks an "integer-ness" flag when integers overflow to float;
+       we approximate this by checking if the value is a whole number
+       within i64 range. */
+    if (d > -9223372036854775807.0 && d < 9223372036854775807.0) {
+        long long iv = (long long)d;
+        if ((double)iv == d) {
+            snprintf(buf, bufsz, "%lld", iv);
+            return;
+        }
+    }
     snprintf(buf, bufsz, "%.15g", d);
 }
 

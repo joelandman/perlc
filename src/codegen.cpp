@@ -1923,14 +1923,21 @@ static bool needsFloatPrec(const Node &n, const std::string &nm) {
 /* Pure predicate — can this expression be computed as a bare LLVM double?
    Never emits any IR. Returns true iff emitExprF64 will succeed. */
 bool CodeGen::canEmitF64(const Node &n) {
-    switch (n.kind) {
-    case NK::FloatLit:
-    case NK::IntLit:
-        return true;
+     switch (n.kind) {
+     case NK::FloatLit:
+         return true;
+     case NK::IntLit:
+         /* D78: Integers larger than 2^53 lose precision when converted to
+            double. Don't use the F64 fast path for such values — fall back
+            to the runtime's integer arithmetic which preserves exact values. */
+         return n.ival >= -9007199254740992LL && n.ival <= 9007199254740992LL;
     case NK::ScalarVar: {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
         if (lookupFloatVar(nm)) return true;
+        /* D78: Don't use F64 fast path for file-scope vars initialized with
+           large integer literals (> 2^53) — converting to double loses precision. */
+        if (fileScalarLargeInt_.count(nm)) return false;
         /* Only treat file-scope globals as numeric if they have no special runtime accessor */
         static const std::unordered_set<std::string> specialVars =
             {"AUTOLOAD","!","/",".","\\",",","&","0","_"};
@@ -3353,12 +3360,16 @@ void CodeGen::emitStmt(const Node &n) {
                 Value *pv = callRT("perl_get_or_create_global_scalar", {keyStr});
                 auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "g." + nm);
                 builder_.CreateStore(pv, slot);
-                if (n.right) {
-                    Value *init = emitExpr(*n.right);
-                    callRT("perl_assign", {pv, init});
-                    freeIfOwned(init);
-                }
-                fileScalarGlobals_[nm] = slot;
+                 if (n.right) {
+                     Value *init = emitExpr(*n.right);
+                     callRT("perl_assign", {pv, init});
+                     freeIfOwned(init);
+                 }
+                 /* D78: track file-scope vars initialized with large int literals */
+                 if (n.right && n.right->kind == NK::IntLit &&
+                     (n.right->ival > 9007199254740992LL || n.right->ival < -9007199254740992LL))
+                     fileScalarLargeInt_.insert(nm);
+                 fileScalarGlobals_[nm] = slot;
                 declareVar(nm, slot);
                 if (currentPackage_ != "main")
                     fileScalarGlobals_[currentPackage_ + "::" + nm] = slot;
@@ -3369,12 +3380,16 @@ void CodeGen::emitStmt(const Node &n) {
                     Constant::getNullValue(perlPtrTy_), "g." + nm);
                 Value *pv = perlUndef();
                 builder_.CreateStore(pv, gv);
-                if (n.right) {
-                    Value *init = emitExpr(*n.right);
-                    callRT("perl_assign", {pv, init});
-                    freeIfOwned(init);
-                }
-                fileScalarGlobals_[nm] = gv;
+                 if (n.right) {
+                     Value *init = emitExpr(*n.right);
+                     callRT("perl_assign", {pv, init});
+                     freeIfOwned(init);
+                 }
+                 /* D78: track file-scope vars initialized with large int literals */
+                 if (n.right && n.right->kind == NK::IntLit &&
+                     (n.right->ival > 9007199254740992LL || n.right->ival < -9007199254740992LL))
+                     fileScalarLargeInt_.insert(nm);
+                 fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
                 /* also register as Package::name for cross-package access */
                 if (currentPackage_ != "main")
