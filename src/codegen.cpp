@@ -254,8 +254,9 @@ void CodeGen::declareRuntime() {
     RT("perl_array_set",          voidTy, av, i64, pv);
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
     RT("perl_array_is_all_flat", i64, av);  /* used by Stage 23 all-flat pre-check */
-    RT("perl_array_len",     pv,  av);
-    RT("perl_array_clear",   voidTy, av);
+     RT("perl_array_len",     pv,  av);
+     RT("perl_array_last",    pv,  av);
+     RT("perl_array_clear",   voidTy, av);
     RT("perl_array_replace", voidTy, av, av);
     RT("perl_hash_clear",    voidTy, av);
     /* hash */
@@ -7462,35 +7463,67 @@ Value *CodeGen::emitBinOp(const Node &n) {
         if (!rhsTerminated) phi->addIncoming(rv, rBB);
         return phi;
     }
-    /* ternary */
-    if (n.sval == "?:") {
-        auto *fn    = builder_.GetInsertBlock()->getParent();
-        auto *thenBB = BasicBlock::Create(ctx_, "tern.then", fn);
-        auto *elseBB = BasicBlock::Create(ctx_, "tern.else", fn);
-        auto *endBB  = BasicBlock::Create(ctx_, "tern.end",  fn);
-        Value *cv   = emitExpr(*n.cond);
-        Value *cb   = callRT("perl_is_true", {cv});
-        Value *ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
-        builder_.CreateCondBr(ctrue, thenBB, elseBB);
+     /* ternary */
+     if (n.sval == "?:") {
+         auto *fn    = builder_.GetInsertBlock()->getParent();
+         auto *thenBB = BasicBlock::Create(ctx_, "tern.then", fn);
+         auto *elseBB = BasicBlock::Create(ctx_, "tern.else", fn);
+         auto *endBB  = BasicBlock::Create(ctx_, "tern.end",  fn);
+         Value *cv   = emitExpr(*n.cond);
+         Value *cb   = callRT("perl_is_true", {cv});
+         Value *ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+         builder_.CreateCondBr(ctrue, thenBB, elseBB);
 
-        builder_.SetInsertPoint(thenBB);
-        Value *tv = emitExpr(*n.left);
-        auto *tb  = builder_.GetInsertBlock();
-        bool thenTerminated = tb->getTerminator() != nullptr;
-        if (!thenTerminated) builder_.CreateBr(endBB);
+         /* Helper lambda: wrap a list-producing value based on wantarray context */
+         auto wrapListIfNeeded = [&](const Node &branchNode, Value *val) -> Value * {
+             if (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
+                 branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc ||
+                 branchNode.kind == NK::SortFunc || branchNode.kind == NK::DerefArray ||
+                 branchNode.kind == NK::ReverseFunc) {
+                 auto *i32Ty = Type::getInt32Ty(ctx_);
+                 Value *ctx = callRT("perl_current_wantarray_ctx", {});
+                 Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
+                 Value *av = (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
+                              branchNode.kind == NK::DerefArray) ? val : emitArrayPtr(branchNode);
+                 if (!av) av = callRT("perl_array_new", {});
+                 Value *listResult = callRT("perl_array_to_list_return", {av});
+                 Value *scalarResult = perlUndef();
+                 if (branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc)
+                     scalarResult = callRT("perl_array_len", {av});
+                 else if (branchNode.kind == NK::SortFunc)
+                     scalarResult = perlUndef();
+                 else if (branchNode.kind == NK::ReverseFunc)
+                     scalarResult = callRT("perl_array_len", {av});
+                 else if (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
+                          branchNode.kind == NK::DerefArray) {
+                     /* For plain list literals/vars, return last element in scalar context */
+                     scalarResult = callRT("perl_array_last", {av});
+                 }
+                 return builder_.CreateSelect(isList, listResult, scalarResult);
+             }
+             return val;
+         };
 
-        builder_.SetInsertPoint(elseBB);
-        Value *ev = emitExpr(*n.right);
-        auto *eb  = builder_.GetInsertBlock();
-        bool elseTerminated = eb->getTerminator() != nullptr;
-        if (!elseTerminated) builder_.CreateBr(endBB);
+         builder_.SetInsertPoint(thenBB);
+         Value *tv = emitExpr(*n.left);
+         tv = wrapListIfNeeded(*n.left, tv);
+         auto *tb  = builder_.GetInsertBlock();
+         bool thenTerminated = tb->getTerminator() != nullptr;
+         if (!thenTerminated) builder_.CreateBr(endBB);
 
-        builder_.SetInsertPoint(endBB);
-        auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "tern.result");
-        phi->addIncoming(tv, tb);
-        if (!elseTerminated) phi->addIncoming(ev, eb);
-        return phi;
-    }
+         builder_.SetInsertPoint(elseBB);
+         Value *ev = emitExpr(*n.right);
+         ev = wrapListIfNeeded(*n.right, ev);
+         auto *eb  = builder_.GetInsertBlock();
+         bool elseTerminated = eb->getTerminator() != nullptr;
+         if (!elseTerminated) builder_.CreateBr(endBB);
+
+         builder_.SetInsertPoint(endBB);
+         auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "tern.result");
+         phi->addIncoming(tv, tb);
+         if (!elseTerminated) phi->addIncoming(ev, eb);
+         return phi;
+     }
 
     /* D88: every operator reaching this point (arithmetic, string,
        comparison, bitwise, `x`, `<=>`/`cmp`) always evaluates BOTH
@@ -7554,11 +7587,16 @@ Value *CodeGen::emitBinOp(const Node &n) {
    Returns nullptr if not inlineable; otherwise returns the expanded result.
    Safety: args are stored directly (no clone). FLOAT_PAIR fast path avoids
    deref_array mutation; _ro norm path is pure and LLVM-hoistable. */
-Value *CodeGen::tryEmitInline(const Node &n) {
-    auto it = inlineSubs_.find(n.name);
-    if (it == inlineSubs_.end()) return nullptr;
-    const auto &is = it->second;
-    if (n.args.size() != is.params.size()) return nullptr;
+ Value *CodeGen::tryEmitInline(const Node &n) {
+     auto it = inlineSubs_.find(n.name);
+     if (it == inlineSubs_.end()) return nullptr;
+     const auto &is = it->second;
+     if (n.args.size() != is.params.size()) return nullptr;
+
+     /* Don't inline subs that use wantarray() or call other subs — inlining
+        would break wantarray context propagation (the inlined body would see
+        the caller's wantarray context instead of the sub's own). */
+     if (hasWantarrayOrUserCall(*is.bodyExpr)) return nullptr;
 
     /* Evaluate each argument, trying recursive inline for nested sub calls.
        Bail out if any arg is a list-producing expression (can't bind directly). */

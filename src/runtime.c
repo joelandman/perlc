@@ -1942,11 +1942,19 @@ HOTX void perl_array_update_float(PerlArray *a, long long idx, double f) {
     perl_array_set(a, idx, perl_alloc_float(f));
 }
 
-PerlValue *perl_array_len(PerlArray *a) {
-    return perl_alloc_int(a->len);
-}
+ PerlValue *perl_array_len(PerlArray *a) {
+     return perl_alloc_int(a->len);
+ }
 
-/* F64 fast path: return array length as a bare double (no PV boxing). */
+ /* Return the last element of an array, or undef for empty arrays — used for
+    ternary conditional scalar-context fallback when the true/false branch is
+    a list literal (e.g. `wantarray() ? (1,2,3) : "scalar"`). */
+ PerlValue *perl_array_last(PerlArray *a) {
+     if (!a || a->len == 0) return perl_alloc_undef();
+     return perl_clone(a->elems[a->len - 1]);
+ }
+
+ /* F64 fast path: return array length as a bare double (no PV boxing). */
 double perl_array_len_f64(PerlArray *a) {
     return (double)a->len;
 }
