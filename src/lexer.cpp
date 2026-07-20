@@ -253,20 +253,54 @@ Token Lexer::readHeredoc() {
 }
 
 Token Lexer::readSubst() {
-    /* pos_ is just past 's/' — read pattern / replacement / flags */
+    /* pos_ is just past 's' and the opening delimiter. Supports:
+       s/pat/repl/flags, s!pat!repl!, s{pat}{repl}, s(pat)(repl), etc. */
+    char open = src_[pos_ - 1]; /* delimiter just consumed by caller */
+    char close = open;
+    bool paired = false;
+    if      (open == '{') { close = '}'; paired = true; }
+    else if (open == '(') { close = ')'; paired = true; }
+    else if (open == '[') { close = ']'; paired = true; }
+    else if (open == '<') { close = '>'; paired = true; }
+
     auto readSection = [&](char delim) {
         std::string s;
+        int depth = 1;
         while (pos_ < src_.size()) {
             char c = src_[pos_];
-            if (c == delim) { pos_++; break; }
-            if (c == '\\' && pos_ + 1 < src_.size()) { s += c; s += src_[++pos_]; pos_++; continue; }
+            if (c == '\\' && pos_ + 1 < src_.size()) {
+                s += c; s += src_[++pos_]; pos_++; continue;
+            }
+            if (paired) {
+                if (c == open) depth++;
+                else if (c == delim) {
+                    if (--depth == 0) { pos_++; break; }
+                }
+            } else if (c == delim) { pos_++; break; }
             if (c == '\n') line_++;
             s += c; pos_++;
         }
         return s;
     };
-    std::string pattern = readSection('/');
-    std::string repl    = readSection('/');
+    std::string pattern = readSection(close);
+    /* skip optional whitespace between sections for paired delims */
+    if (paired) {
+        while (pos_ < src_.size() && (src_[pos_] == ' ' || src_[pos_] == '\t' || src_[pos_] == '\n')) {
+            if (src_[pos_] == '\n') line_++;
+            pos_++;
+        }
+        if (pos_ < src_.size()) {
+            char o2 = src_[pos_++];
+            char c2 = o2;
+            if      (o2 == '{') c2 = '}';
+            else if (o2 == '(') c2 = ')';
+            else if (o2 == '[') c2 = ']';
+            else if (o2 == '<') c2 = '>';
+            open = o2; close = c2;
+            paired = (c2 != o2);
+        }
+    }
+    std::string repl = readSection(close);
     std::string flags;
     while (pos_ < src_.size() && isalpha(src_[pos_])) flags += src_[pos_++];
     return {TK::SUBST, pattern + "\x01" + repl + "\x01" + flags, line_};
@@ -448,8 +482,22 @@ std::vector<Token> Lexer::tokenize() {
             toks.push_back(t); continue;
         }
 
-        /* s/pattern/replacement/flags — substitution operator */
-        if (c == 's' && peek(1) == '/') { pos_ += 2; toks.push_back(readSubst()); continue; }
+        /* s/pattern/replacement/flags — any non-word delimiter.
+           Not after a bare sigil ($s / @s / %s are variable names). */
+        if (c == 's' && pos_ + 1 < src_.size()) {
+            char d = peek(1);
+            bool afterBareSigil = !toks.empty() &&
+                (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
+                 toks.back().kind == TK::HASH) &&
+                toks.back().text.size() <= 1;
+            if (!afterBareSigil &&
+                !isalnum((unsigned char)d) && d != '_' && d != '\0' &&
+                d != ' ' && d != '\t' && d != '\n' && d != '\r') {
+                pos_ += 2; /* skip 's' and opening delim */
+                toks.push_back(readSubst());
+                continue;
+            }
+        }
 
         /* tr/search/replace/flags  or  y/search/replace/flags */
         if ((c == 't' && peek(1) == 'r' && peek(2) == '/') ||

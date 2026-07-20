@@ -201,7 +201,9 @@ typedef struct PerlArray {
 } PerlArray;
 
 /* list-context return helpers for wantarray */
-PerlValue *perl_array_to_list_return(PerlArray *av); /* wrap for return in list/scalar ctx */
+PerlValue *perl_array_to_list_return(PerlArray *av); /* list ctx→LIST_RESULT; scalar→last elem */
+PerlValue *perl_array_to_count_or_list(PerlArray *av); /* map/grep: list→LIST_RESULT; scalar→count */
+PerlValue *perl_array_to_sort_return(PerlArray *av);   /* sort: list→LIST_RESULT; scalar→undef */
 PerlArray *perl_unwrap_list_return(PerlValue *pv);   /* caller side: extract array from return */
 
 PerlArray *perl_array_new(void);

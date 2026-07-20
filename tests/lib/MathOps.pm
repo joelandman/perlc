@@ -1,6 +1,6 @@
 package MathOps;
 use Exporter 'import';
-our @EXPORT    = qw(add);
+our @EXPORT    = qw(add PI MAX);
 our @EXPORT_OK = qw(subtract multiply);
 
 use constant PI  => 3.14159;

@@ -20,6 +20,7 @@ private:
     size_t                          pos_ = 0;
     std::string                     currentPackage_ = "main";
     int                             subDepth_        = 0;
+    int                             anonCount_       = 0; /* D10: per-parse anon sub ids */
     std::map<std::string,std::string> importMap_;  /* short → qualified call names */
     std::map<std::string,NodePtr>     constMap_;   /* constant name → parsed AST */
 

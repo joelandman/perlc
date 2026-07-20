@@ -10,6 +10,12 @@
 
 **Correctness-first priority order** (per project direction: correctness → completeness → performance): the 10 CRITICAL defects in `TESTS.md` should be fixed before any further completeness or performance work, since several are crashes or silent-wrong-data bugs on extremely common Perl idioms (list-assignment unpacking, `foreach` aliasing, `sort`, chained autovivification).
 
+### Incremental follow-ups (rebased onto main)
+- D10: `sortCmpCounter_`/`stateSeq_`/`endSeq_`/`anonCount_` are instance state; reset in `compile()`
+- D9: clear `lastSqrtInput_` at each `emitStmt`
+- D3/`our`: `ival` bit 2 marks package globals so `local @H` works inside subs
+- D7: alternate `s///` delimiters (`s!!!`, `s{}{}`, …) + don't mislex `$s` as substitution
+
 ---
 
 ## Phase 0 — Correctness Gates (COMPLETE)

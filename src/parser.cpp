@@ -607,7 +607,8 @@ NodePtr Parser::parseMy() {
         for (auto &vd : allVars) {
             auto decl = std::make_unique<Node>(); decl->kind = NK::My;
             decl->name = vd.sigil + vd.name; decl->line = line;
-            if (listShared) decl->ival = 1;  /* shared flag */
+            if (listShared) decl->ival |= 1;  /* shared flag */
+            if (isOur) decl->ival |= 2;       /* our → package global */
             stmts.push_back(std::move(decl));
         }
         if (rhs) {
@@ -643,16 +644,17 @@ NodePtr Parser::parseMy() {
         return fb;
     }
 
-    /* my $scalar [: shared] [= expr] */
+    /* my $scalar / our $scalar [: shared] [= expr] */
     if (check(TK::SCALAR)) {
         advance(); /* skip $ */
         std::string nm = cur().text; advance();
         auto decl = std::make_unique<Node>(); decl->kind = NK::My;
         decl->name = nm; decl->line = line;
+        if (isOur) decl->ival |= 2; /* our → package global */
         if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
                 toks_[pos_ + 1].text == "shared") {
             advance(); advance(); /* skip : shared */
-            decl->ival = 1;       /* shared flag */
+            decl->ival |= 1;       /* shared flag */
         }
         if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
@@ -669,9 +671,10 @@ NodePtr Parser::parseMy() {
         auto decl = std::make_unique<Node>(); decl->kind = NK::My;
         decl->name = "@" + nm; decl->line = line;
         if (nm == "ISA") decl->sval = currentPackage_; /* tag for codegen */
+        if (isOur) decl->ival |= 2; /* our → package global */
         if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
                 toks_[pos_ + 1].text == "shared") {
-            advance(); advance(); decl->ival = 1; /* shared flag */
+            advance(); advance(); decl->ival |= 1; /* shared flag */
         }
        if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
@@ -681,15 +684,16 @@ NodePtr Parser::parseMy() {
         return decl;
     }
 
-    /* my %hash */
+    /* my %hash / our %hash */
     if (check(TK::HASH)) {
         advance(); /* skip % */
         std::string nm = cur().text; advance();
         auto decl = std::make_unique<Node>(); decl->kind = NK::My;
         decl->name = "%" + nm; decl->line = line;
+        if (isOur) decl->ival |= 2; /* our → package global */
         if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
                 toks_[pos_ + 1].text == "shared") {
-            advance(); advance(); decl->ival = 1; /* shared flag */
+            advance(); advance(); decl->ival |= 1; /* shared flag */
         }
         if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
@@ -1728,8 +1732,7 @@ NodePtr Parser::parsePrimary() {
         consume(TK::RBRACE, "}");
         auto n = std::make_unique<Node>(); n->kind = NK::AnonSub; n->line = line;
         /* generate unique name for this anonymous sub */
-        static int anonCount = 0;
-        n->name = "__anon_" + std::to_string(++anonCount);
+        n->name = "__anon_" + std::to_string(++anonCount_);
         n->body = makeBlock(std::move(stmts), line);
         return n;
     }

@@ -92,6 +92,10 @@ private:
        v*v can be replaced by x and v*v*v can be replaced by x*v (1 fewer fmul on critical path) */
     llvm::Value *lastSqrtInput_ = nullptr;
     std::unordered_map<std::string, llvm::Value *> floatSqrtOf_;
+    /* D10: per-compilation counters (reset in compile()) */
+    int sortCmpCounter_ = 0;
+    int stateSeq_ = 0;
+    int endSeq_ = 0;
     /* Stage 31: flat-double read cache: (outerNm\x01idxNm\x01elemIdx) → f64 Value*.
        Eliminates redundant loads like body[j][6] appearing 3× in the velocity-update
        block; invalidated only when the exact (outerNm, idxNm, elemIdx) is written. */
@@ -192,6 +196,11 @@ private:
     std::vector<EvalReturnTarget>   evalReturnTargets_;
     /* local() save depth at function entry (alloca holding i32) */
     llvm::Value *localDepthAlloca_ = nullptr;
+    /* eval { BLOCK }: depth + slots so `return` inside eval stores the value
+       and branches to the eval's endBB (Perl semantics) instead of die/ret. */
+    int inEval_ = 0;
+    llvm::Value *evalBodyRes_ = nullptr;       /* alloca PerlValue* */
+    llvm::BasicBlock *evalEndBB_ = nullptr;
     /* caller() support: current package name and source file */
     std::string currentPackage_ = "main";
     std::string sourceFile_;

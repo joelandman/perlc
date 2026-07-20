@@ -804,8 +804,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         else if (mode == "str_desc") return callRT("perl_sort_str_desc", {av});
         else if (mode == "custom" && n.body) {
             /* Generate a comparison function: long long cmp(PerlValue* a, PerlValue* b) */
-            static int sortCmpCounter = 0;
-            std::string cmpName = "__sort_cmp_" + std::to_string(sortCmpCounter++);
+            std::string cmpName = "__sort_cmp_" + std::to_string(sortCmpCounter_++);
 
             /* D61: closure-capture support for the comparator, mirroring
                AnonSub's Phase 1 (collectAllScalarNames + "capture every
@@ -2534,6 +2533,13 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
     asDoLib_ = asDoLib;
     if (debug_) initializeDebugInfo(modName);
 
+    /* D10: reset per-compilation counters so multi-compile is deterministic */
+    sortCmpCounter_ = 0;
+    stateSeq_ = 0;
+    endSeq_ = 0;
+    lastSqrtInput_ = nullptr;
+    floatSqrtOf_.clear();
+
     /* collect sub definitions first so forward calls work — recurse into
        every block/statement, not just program's direct top-level
        children (D45: a sub nested in a bare block is still global). */
@@ -3184,6 +3190,8 @@ Value *CodeGen::emitBlockLast(const Node &n) {
 
 void CodeGen::emitStmt(const Node &n) {
     if (builder_.GetInsertBlock()->getTerminator()) return;
+    /* D9: sqrt input tracking is per-statement; don't leak across stmts */
+    lastSqrtInput_ = nullptr;
     if (debug_ && n.line > 0) {
         builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
     }
@@ -3216,19 +3224,26 @@ void CodeGen::emitStmt(const Node &n) {
         bool isArr  = n.name[0] == '@';
         bool isHash = n.name[0] == '%';
         bool atFileScope = inMainBody_ && (int)scopes_.size() == fileScopeDepth_;
+        bool isOur = (n.ival & 2) != 0; /* package global even inside a sub */
+        bool asGlobal = atFileScope || isOur;
 
         if (isHash) {
             std::string nm = n.name.substr(1);
             Value *hv = callRT("perl_hash_new", {});
-            if (atFileScope) {
-                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                    GlobalValue::InternalLinkage,
-                    Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
+            if (asGlobal) {
+                GlobalVariable *gv = nullptr;
+                auto git = fileHashGlobals_.find(nm);
+                if (git != fileHashGlobals_.end())
+                    gv = git->second;
+                else {
+                    gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                        GlobalValue::InternalLinkage,
+                        Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
+                    fileHashGlobals_[nm] = gv;
+                    if (currentPackage_ != "main")
+                        fileHashGlobals_[currentPackage_ + "::" + nm] = gv;
+                }
                 builder_.CreateStore(hv, gv);
-                fileHashGlobals_[nm] = gv;
-                /* also register as Package::name for cross-package access */
-                if (currentPackage_ != "main") fileHashGlobals_[currentPackage_ + "::" + nm] = gv;
-                /* do NOT declareHash — lookupHash loads fresh from GlobalVariable */
             } else {
                 declareHash(nm, hv);
             }
@@ -3256,15 +3271,19 @@ void CodeGen::emitStmt(const Node &n) {
                       callCtx_ = 0;
                   }
               }
-            if (atFileScope) {
-                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                    GlobalValue::InternalLinkage,
-                    Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
-                builder_.CreateStore(av, gv);
-                fileArrayGlobals_[nm] = gv;
-                /* also register as Package::name for cross-package access */
-                if (currentPackage_ != "main") fileArrayGlobals_[currentPackage_ + "::" + nm] = gv;
-                /* do NOT declareArray — lookupArray loads fresh from GlobalVariable */
+            if (asGlobal) {
+                auto git = fileArrayGlobals_.find(nm);
+                if (git != fileArrayGlobals_.end()) {
+                    builder_.CreateStore(av, git->second);
+                } else {
+                    auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                        GlobalValue::InternalLinkage,
+                        Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
+                    builder_.CreateStore(av, gv);
+                    fileArrayGlobals_[nm] = gv;
+                    if (currentPackage_ != "main")
+                        fileArrayGlobals_[currentPackage_ + "::" + nm] = gv;
+                }
             } else {
                 declareArray(nm, av);
             }
@@ -4300,9 +4319,8 @@ void CodeGen::emitStmt(const Node &n) {
         auto *ptrTy = perlPtrTy_;
         auto *i8Ty  = Type::getInt8Ty(ctx_);
         /* module-level globals: the PerlValue* and an init flag */
-        static int stateSeq = 0;
-        std::string gname = "state.ptr." + std::to_string(stateSeq);
-        std::string gflag = "state.init." + std::to_string(stateSeq++);
+        std::string gname = "state.ptr." + std::to_string(stateSeq_);
+        std::string gflag = "state.init." + std::to_string(stateSeq_++);
         auto *gptr = new GlobalVariable(*mod_, ptrTy, false,
             GlobalValue::InternalLinkage, ConstantPointerNull::get(ptrTy), gname);
         auto *ginit = new GlobalVariable(*mod_, i8Ty, false,
@@ -4336,8 +4354,7 @@ void CodeGen::emitStmt(const Node &n) {
         /* compile END body as a function and register via atexit */
         auto *fn = builder_.GetInsertBlock()->getParent();
         auto *savedBB = builder_.GetInsertBlock();
-        static int endSeq = 0;
-        std::string endName = "perl_end_" + std::to_string(endSeq++);
+        std::string endName = "perl_end_" + std::to_string(endSeq_++);
         auto *endFnTy = FunctionType::get(Type::getVoidTy(ctx_), false);
         auto *endFn = Function::Create(endFnTy, Function::InternalLinkage, endName, mod_.get());
         auto *entryBB = BasicBlock::Create(ctx_, "entry", endFn);

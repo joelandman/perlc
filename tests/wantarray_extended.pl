@@ -152,6 +152,6 @@ my $map_count = count_map();
 print "map_scalar_ctx=$map_count\n";  # 6 (3*2)
 
 my $sort_count = count_sort();
-print "sort_scalar_ctx=$sort_count\n";  # 3
+print "sort_scalar_ctx=", (defined($sort_count) ? $sort_count : ""), "\n";  # undef in scalar
 
 print "wantarray_tests_done\n";
