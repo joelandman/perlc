@@ -44,6 +44,10 @@ typedef enum {
 #define PV_CAPTURE_BITS           20
 #define PV_CAPTURE_MASK   (((1u << PV_CAPTURE_BITS) - 1) << PV_CAPTURE_SHIFT)
 #define PV_CAPTURE_MAX     ((1u << PV_CAPTURE_BITS) - 1)   /* pin-forever sentinel on overflow */
+/* D90: string holds Unicode characters (UTF-8 encoded). length()/substr
+   count code points when set; otherwise they count raw bytes (binary /
+   pack output, byte strings). Bits 0-21 used by shared/capture above. */
+#define PV_FLAG_UTF8              (1u << 22)
 
 typedef struct PerlValue {
     PerlTag      tag;
@@ -220,6 +224,11 @@ PerlValue *perl_array_pop(PerlArray *a);
 PerlValue *perl_array_get(PerlArray *a, long long idx);
 PerlValue *perl_array_get_ref(PerlArray *a, long long idx); /* borrow: no clone, never free result */
 void       perl_array_set(PerlArray *a, long long idx, PerlValue *v);
+/* D81: delete $a[i] / element of delete @a[...] — returns prior value,
+   sets slot to undef, then trims trailing undefs (Perl's delete-on-array). */
+PerlValue *perl_array_delete(PerlArray *a, long long idx);
+/* D41: writable slot for $a[i], extending with undef if needed (local lvalue). */
+PerlValue *perl_array_lvalue(PerlArray *a, long long idx);
 PerlValue *perl_array_len(PerlArray *a);
 double perl_array_len_f64(PerlArray *a);
 void perl_array_clear(PerlArray *a);
@@ -312,7 +321,10 @@ PerlArray *perl_splice(PerlArray *arr, PerlValue *off_pv, PerlValue *len_pv, Per
 /* ── environment / system ───────────────────────────────────────────────── */
 PerlValue *perl_env_get(PerlValue *key);
 void       perl_env_set(PerlValue *key, PerlValue *val);
-void       perl_warn(PerlValue *msg);
+/* D49: warn with optional file/line (for " at FILE line N." + $SIG{__WARN__}) */
+void       perl_warn(PerlValue *msg, const char *filename, int line);
+/* D49: process-wide %SIG hash ($SIG{__WARN__}, $SIG{__DIE__}, …) */
+PerlHash  *perl_get_sig_hash(void);
 PerlValue *perl_system(PerlValue *cmd);
 PerlValue *perl_backtick(PerlValue *cmd);
 
@@ -388,6 +400,12 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
 PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags);
 PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char *flags);
 long long  perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags);
+/* D38c: s///e — eval_fn is called once per match with $1/$& already set;
+   returns a PerlValue* whose stringification becomes the replacement.
+   captures may be NULL (no outer lexical capture). */
+typedef PerlValue *(*PerlSubstEvalFn)(void);
+long long  perl_regex_subst_e(PerlValue *str, const char *pattern, const char *flags,
+                              PerlSubstEvalFn eval_fn, PerlArray *captures);
 PerlValue *perl_capture(long long n);
 PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str);
 

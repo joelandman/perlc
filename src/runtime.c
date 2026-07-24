@@ -353,7 +353,13 @@ static __thread int      s_eval_depth = 0;
 /* Forward declarations for die-related functions — needed so calls before
    the definition (perl_mod, div-by-zero, substr) see the correct signature. */
 static char *appendDieLocation(char *msg, const char *filename, int line);
+static int call_sig_handler(const char *name, PerlValue *msg_pv);
 void perl_die(PerlValue *msg, const char *filename, int line);
+
+/* D49: %SIG special hash + recursion guards (used by perl_die/perl_warn) */
+static PerlHash *s_sig_hash = NULL;
+static __thread int s_sig_warn_depth = 0;
+static __thread int s_sig_die_depth = 0;
 
 /* $/ — input record separator (default "\n", undef = slurp mode) */
 static PerlValue s_input_sep = { .tag = PERL_STRING };
@@ -431,7 +437,8 @@ PerlValue *perl_get_dollar_bang(void) {
     return &s_dollar_bang;
 }
 
-/* wantarray — returns 1 in list context, 0 in scalar; stub always 0 */
+/* wantarray context stack: 0=scalar, 1=list, 2=void (D87).
+   perl_wantarray() returns 1 / 0 / undef respectively. */
 static __thread int s_wantarray_stack[64];
 static __thread int s_wantarray_depth = 0;
 
@@ -446,9 +453,12 @@ int perl_pop_wantarray(void) {
 PerlValue *perl_wantarray(void) {
   /* D43: called outside any sub (empty stack) — real Perl's wantarray()
      returns undef here, not a false-but-defined 0. Also avoids reading
-     s_wantarray_stack[-1] (out of bounds) when the stack is empty. */
+     s_wantarray_stack[-1] (out of bounds) when the stack is empty.
+     D87: ctx==2 is genuine void context → also undef. */
   if (s_wantarray_depth <= 0) return perl_alloc_undef();
-  return perl_alloc_int(s_wantarray_stack[s_wantarray_depth - 1]);
+  int ctx = s_wantarray_stack[s_wantarray_depth - 1];
+  if (ctx == 2) return perl_alloc_undef();
+  return perl_alloc_int(ctx);
 }
 
 /* peek current wantarray context without modifying the stack */
@@ -456,10 +466,11 @@ int perl_current_wantarray_ctx(void) {
     return (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
 }
 
-/* list-context return: wrap PerlArray* in REF_ARRAY if wantarray, else take last elem */
+/* list-context return: wrap PerlArray* in LIST_RESULT if list (ctx==1),
+   else take last elem (scalar or void). */
 PerlValue *perl_array_to_list_return(PerlArray *av) {
     int ctx = (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
-    if (ctx) {
+    if (ctx == 1) {
         PerlValue *r = pv_alloc();
         r->tag = PERL_LIST_RESULT;  /* distinct from PERL_REF_ARRAY so scalar refs are not spread */
         r->flags = 0; r->matchpos = 0; r->blessed_class = NULL;
@@ -969,6 +980,7 @@ PerlValue *perl_clone(const PerlValue *src) {
     if (!src) return perl_alloc_undef();
     if (src->tag == PERL_STRING) {
         PerlValue *v = perl_alloc_string_len(src->sval, src->slen);
+        v->flags |= (src->flags & PV_FLAG_UTF8); /* D90 */
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         return v;
     }
@@ -1427,6 +1439,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
        hold), not to whatever value currently lives in it, and must
        survive any number of perl_assign calls on that same pointer. */
     unsigned int preserved_flags = dst->flags & (PV_FLAG_SHARED | PV_CAPTURE_MASK | PV_FLAG_CAPTURE_RELEASED);
+    unsigned int src_utf8 = (src && src->tag == PERL_STRING) ? (src->flags & PV_FLAG_UTF8) : 0;
     /* No implicit mutex here — caller must hold lock() for concurrent safety.
        Locking inside perl_assign would deadlock when lock() is already held.
        Visibility for cross-thread write/read is now the responsibility of
@@ -1491,7 +1504,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
-    dst->flags = preserved_flags;  /* restore identity bits — *dst = *src clobbered them */
+    dst->flags = preserved_flags | src_utf8;  /* identity bits + D90 UTF8 value bit */
     if (src->tag == PERL_STRING) {
         /* D85: strdup(src->sval) would truncate at the first embedded NUL —
            *dst = *src above already copied src->slen correctly (a plain
@@ -1654,6 +1667,10 @@ PerlValue *perl_concat(const PerlValue *a, const PerlValue *b) {
     if (lb > 0) memcpy(buf + la, sb, (size_t)lb);
     buf[la + lb] = '\0';
     PerlValue *r = perl_alloc_string_len(buf, la + lb);
+    /* D90: UTF8 if either operand is UTF8 */
+    if ((a && a->tag == PERL_STRING && (a->flags & PV_FLAG_UTF8)) ||
+        (b && b->tag == PERL_STRING && (b->flags & PV_FLAG_UTF8)))
+        r->flags |= PV_FLAG_UTF8;
     free(sa); free(sb); free(buf);
     return r;
 }
@@ -1672,6 +1689,8 @@ PerlValue *perl_repeat_str(const PerlValue *str, const PerlValue *n) {
         if (slen > 0) memcpy(buf + (size_t)i * slen, s, slen);
     buf[slen * (size_t)reps] = '\0';
     PerlValue *r = perl_alloc_string_len(buf, (long long)(slen * (size_t)reps));
+    if (str && str->tag == PERL_STRING && (str->flags & PV_FLAG_UTF8))
+        r->flags |= PV_FLAG_UTF8;
     free(s); free(buf);
     return r;
 }
@@ -1991,6 +2010,39 @@ void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
     }
 }
 
+/* D81: array-element delete. Returns a clone of the prior value (undef if
+   out of range). Replaces the slot with undef, then drops trailing undef
+   elements so `delete $a[-1]` / `delete @a[N]` at the end shrinks @a. */
+PerlValue *perl_array_delete(PerlArray *a, long long idx) {
+    if (!a) return perl_alloc_undef();
+    if (idx < 0) idx += a->len;
+    if (idx < 0 || idx >= a->len) return perl_alloc_undef();
+    PerlValue *old = perl_clone(a->elems[idx]);
+    perl_free(a->elems[idx]);
+    a->elems[idx] = perl_alloc_undef();
+    while (a->len > 0) {
+        PerlValue *e = a->elems[a->len - 1];
+        if (e && e->tag != PERL_UNDEF) break;
+        perl_free(e);
+        a->len--;
+    }
+    return old;
+}
+
+/* D41: return a writable PV* for $a[idx], creating/extending slots as undef
+   when out of range — same autoviv rules as assignment to $a[idx]. */
+PerlValue *perl_array_lvalue(PerlArray *a, long long idx) {
+    if (!a) return perl_alloc_undef();
+    if (idx < 0) idx += a->len;
+    if (idx < 0) return perl_alloc_undef();
+    while (idx >= a->cap) {
+        a->cap *= 2;
+        a->elems = realloc(a->elems, a->cap * sizeof(PerlValue *));
+    }
+    while (a->len <= idx) a->elems[a->len++] = perl_alloc_undef();
+    return a->elems[idx];
+}
+
 /* Mutate an existing array element's float value in-place without allocation.
    Falls back to perl_array_set for out-of-bounds indices. */
 HOTX void perl_array_update_float(PerlArray *a, long long idx, double f) {
@@ -2169,12 +2221,19 @@ static long long utf8_char_to_byte(const char *s, long long n);
 
 PerlValue *perl_length(PerlValue *v) {
     if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
-    /* D85: NUL-safe — a string with embedded NUL bytes (e.g. pack() output)
-       must report its true byte/character count, each embedded NUL
-       counting as its own 1-byte character, not stopping length() early. */
+    /* D85: NUL-safe via slen. D90: without PV_FLAG_UTF8, length is the
+       raw byte count (binary/pack data). With the flag, count UTF-8
+       code points — matching real Perl's SvUTF8 distinction. */
+    if (v->tag == PERL_STRING) {
+        if (v->flags & PV_FLAG_UTF8) {
+            long long n = utf8_strlen_n(v->sval ? v->sval : "", v->slen);
+            return perl_alloc_int(n);
+        }
+        return perl_alloc_int(v->slen);
+    }
     long long slen_ll;
     char *s = perl_to_string_dup_len(v, &slen_ll);
-    long long n = (v->tag == PERL_STRING) ? utf8_strlen_n(s, slen_ll) : utf8_strlen(s);
+    long long n = utf8_strlen_n(s, slen_ll);
     free(s);
     return perl_alloc_int(n);
 }
@@ -2228,58 +2287,81 @@ static int substr_bounds_utf8(long long slen, long long *off, long long *n, int 
     return 1;
 }
 
-PerlValue *perl_substr2(PerlValue *str, PerlValue *off_v) {
-    char *s  = perl_to_string_dup(str);
-    long long slen = utf8_strlen(s);
-    long long off  = perl_to_int(off_v);
-    long long n    = 0;
-    if (!substr_bounds_utf8(slen, &off, &n, 0)) { free(s); return perl_alloc_undef(); }
-    long long byte_off = utf8_char_to_byte(s, off);
+/* D90: character length / byte offset helpers honoring PV_FLAG_UTF8. */
+static long long pv_char_len(const PerlValue *str, const char *s, long long blen) {
+    if (str && str->tag == PERL_STRING && (str->flags & PV_FLAG_UTF8))
+        return utf8_strlen_n(s, blen);
+    return blen; /* byte string */
+}
+static long long pv_char_to_byte(const PerlValue *str, const char *s, long long blen, long long coff) {
+    if (str && str->tag == PERL_STRING && (str->flags & PV_FLAG_UTF8))
+        return utf8_char_to_byte(s, coff);
+    if (coff < 0) coff = 0;
+    if (coff > blen) coff = blen;
+    return coff;
+}
+static long long pv_chars_byte_count(const PerlValue *str, const char *s, long long blen,
+                                     long long byte_off, long long nchars) {
+    if (!(str && str->tag == PERL_STRING && (str->flags & PV_FLAG_UTF8))) {
+        long long left = blen - byte_off;
+        return nchars < left ? nchars : left;
+    }
     const unsigned char *p = (const unsigned char *)(s + byte_off);
+    const unsigned char *end = (const unsigned char *)(s + blen);
     long long bc = 0;
-    for (long long c = 0; c < n; c++) {
+    for (long long c = 0; c < nchars && p < end; c++) {
         if (*p < 0x80) { p++; bc++; }
         else if ((*p & 0xE0) == 0xC0) { p += 2; bc += 2; }
         else if ((*p & 0xF0) == 0xE0) { p += 3; bc += 3; }
         else if ((*p & 0xF8) == 0xF0) { p += 4; bc += 4; }
         else { p++; bc++; }
     }
+    return bc;
+}
+
+PerlValue *perl_substr2(PerlValue *str, PerlValue *off_v) {
+    long long blen;
+    char *s = perl_to_string_dup_len(str, &blen);
+    long long slen = pv_char_len(str, s, blen);
+    long long off  = perl_to_int(off_v);
+    long long n    = 0;
+    if (!substr_bounds_utf8(slen, &off, &n, 0)) { free(s); return perl_alloc_undef(); }
+    long long byte_off = pv_char_to_byte(str, s, blen, off);
+    long long bc = pv_chars_byte_count(str, s, blen, byte_off, n);
     char *buf = malloc((size_t)bc + 1);
-    memcpy(buf, s + byte_off, (size_t)bc);
+    if (bc > 0) memcpy(buf, s + byte_off, (size_t)bc);
     buf[bc] = '\0';
     PerlValue *r = perl_alloc_string_len(buf, bc);
+    if (str && str->tag == PERL_STRING && (str->flags & PV_FLAG_UTF8))
+        r->flags |= PV_FLAG_UTF8;
     free(buf); free(s);
     return r;
 }
 
 PerlValue *perl_substr3(PerlValue *str, PerlValue *off_v, PerlValue *len_v) {
-    char *s  = perl_to_string_dup(str);
-    long long slen = utf8_strlen(s);
+    long long blen;
+    char *s = perl_to_string_dup_len(str, &blen);
+    long long slen = pv_char_len(str, s, blen);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
     if (!substr_bounds_utf8(slen, &off, &n, 1)) { free(s); return perl_alloc_undef(); }
-    long long byte_off = utf8_char_to_byte(s, off);
-    const unsigned char *p = (const unsigned char *)(s + byte_off);
-    long long bc = 0;
-    for (long long c = 0; c < n; c++) {
-        if (*p < 0x80) { p++; bc++; }
-        else if ((*p & 0xE0) == 0xC0) { p += 2; bc += 2; }
-        else if ((*p & 0xF0) == 0xE0) { p += 3; bc += 3; }
-        else if ((*p & 0xF8) == 0xF0) { p += 4; bc += 4; }
-        else { p++; bc++; }
-    }
+    long long byte_off = pv_char_to_byte(str, s, blen, off);
+    long long bc = pv_chars_byte_count(str, s, blen, byte_off, n);
     char *buf = malloc((size_t)bc + 1);
-    memcpy(buf, s + byte_off, (size_t)bc);
+    if (bc > 0) memcpy(buf, s + byte_off, (size_t)bc);
     buf[bc] = '\0';
     PerlValue *r = perl_alloc_string_len(buf, bc);
+    if (str && str->tag == PERL_STRING && (str->flags & PV_FLAG_UTF8))
+        r->flags |= PV_FLAG_UTF8;
     free(buf); free(s);
     return r;
 }
 
 void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, PerlValue *repl) {
-    char *s     = perl_to_string_dup(str);
-    char *r     = perl_to_string_dup(repl);
-    long long slen = utf8_strlen(s);
+    long long sblen, rblen;
+    char *s = perl_to_string_dup_len(str, &sblen);
+    char *r = perl_to_string_dup_len(repl, &rblen);
+    long long slen = pv_char_len(str, s, sblen);
     long long off  = perl_to_int(off_v);
     long long n    = perl_to_int(len_v);
     if (!substr_bounds_utf8(slen, &off, &n, 1)) {
@@ -2293,36 +2375,25 @@ void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, Per
          perl_die(&diemsg, NULL, 0);
         return;
     }
-    long long byte_off = utf8_char_to_byte(s, off);
-    /* calculate byte length of n code points */
-    const unsigned char *p = (const unsigned char *)(s + byte_off);
-    long long byte_n = 0;
-    for (long long c = 0; c < n; c++) {
-        if (*p < 0x80) { p++; byte_n++; }
-        else if ((*p & 0xE0) == 0xC0) { p += 2; byte_n += 2; }
-        else if ((*p & 0xF0) == 0xE0) { p += 3; byte_n += 3; }
-        else if ((*p & 0xF8) == 0xF0) { p += 4; byte_n += 4; }
-        else { p++; byte_n++; }
-    }
-    long long rlen  = (long long)strlen(r);
-    long long newlen = (long long)(byte_off + byte_n + rlen + (slen - byte_off - (long long)strlen(s + byte_off) + byte_n));
-    /* recalculate: newlen = byte_off + rlen + (original_bytes_after_removal) */
-    long long orig_after = (long long)strlen(s) - byte_off - byte_n;
-    newlen = byte_off + rlen + orig_after;
+    long long byte_off = pv_char_to_byte(str, s, sblen, off);
+    long long byte_n = pv_chars_byte_count(str, s, sblen, byte_off, n);
+    long long rlen = rblen;
+    long long orig_after = sblen - byte_off - byte_n;
+    if (orig_after < 0) orig_after = 0;
+    long long newlen = byte_off + rlen + orig_after;
     char *buf = malloc((size_t)newlen + 1);
-    memcpy(buf, s, (size_t)byte_off);
-    memcpy(buf + byte_off, r, (size_t)rlen);
-    memcpy(buf + byte_off + rlen, s + byte_off + byte_n, (size_t)orig_after);
+    if (byte_off > 0) memcpy(buf, s, (size_t)byte_off);
+    if (rlen > 0) memcpy(buf + byte_off, r, (size_t)rlen);
+    if (orig_after > 0) memcpy(buf + byte_off + rlen, s + byte_off + byte_n, (size_t)orig_after);
     buf[newlen] = '\0';
     if (str->tag == PERL_STRING) free(str->sval);
     str->tag  = PERL_STRING;
     str->sval = buf;
-    /* D85: keep slen consistent with the new buffer — note substr's own
-       byte-offset math above is still strlen()/utf8-scan based internally
-       (not NUL-safe on an embedded-NUL source string), a narrower,
-       documented remaining gap; this at least avoids leaving a stale
-       slen dangling after the replace. */
     str->slen = newlen;
+    /* Keep UTF8 if source had it (repl may promote — keep simple). */
+    if (str->flags & PV_FLAG_UTF8) { /* already on str */ }
+    else if (repl && repl->tag == PERL_STRING && (repl->flags & PV_FLAG_UTF8))
+        str->flags |= PV_FLAG_UTF8;
     free(s); free(r);
 }
 
@@ -3982,7 +4053,8 @@ static char *appendDieLocation(char *msg, const char *filename, int line) {
      }
      if (filename && line > 0) {
          char *buf = malloc(n + 48 + strlen(filename));
-         sprintf(buf, "%s at \"%s\" line %d.\n", msg, filename, line);
+         /* D89: real Perl uses unquoted path: "MSG at FILE line N.\n" */
+         sprintf(buf, "%s at %s line %d.\n", msg, filename, line);
          return buf;
      }
      char *buf = malloc(n + 20);
@@ -3991,20 +4063,29 @@ static char *appendDieLocation(char *msg, const char *filename, int line) {
  }
 
 void perl_die(PerlValue *msg, const char *filename, int line) {
+     char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
+     char *full = appendDieLocation(s, filename, line);
+     free(s);
+
+     /* D49: $SIG{__DIE__} — called just before dying (eval or top-level).
+        If the handler returns, dying continues. Depth guard against recursion. */
+     if (s_sig_die_depth == 0) {
+         s_sig_die_depth++;
+         PerlValue *msg_pv = perl_alloc_string(full);
+         call_sig_handler("__DIE__", msg_pv);
+         perl_free(msg_pv);
+         s_sig_die_depth--;
+     }
+
      if (s_eval_depth > 0) {
-         char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
-         char *full = appendDieLocation(s, filename, line);
          PerlValue pv = { .tag = PERL_STRING, .sval = full, .slen = (long long)strlen(full) };
          perl_assign(&s_dollar_at, &pv);
-         free(s);
+         free(full);
          perl_local_restore_to(s_eval_local_depth[s_eval_depth - 1]);
          longjmp(*s_eval_stack[s_eval_depth - 1], 1);
      }
-     char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
-     char *full = appendDieLocation(s, filename, line);
      fputs(full, stderr);
      free(full);
-     free(s);
      exit(1);
  }
 
@@ -4107,38 +4188,79 @@ PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
 #define OUT_ENSURE(n) do { while (pos+(n)+1 > cap) { cap*=2; out=realloc(out,cap); } } while(0)
 #define OUT_PUTS(s,l) do { size_t _l=(l); OUT_ENSURE(_l); memcpy(out+pos,(s),_l); pos+=_l; } while(0)
 
-    long long argidx = 0;
+    long long seqidx = 0; /* sequential arg cursor; positional %N$ does not advance it (D82) */
 
     for (const char *p = fmt; *p; ) {
         if (*p != '%') { OUT_PUTS(p, 1); p++; continue; }
         p++;
         if (*p == '%') { OUT_PUTS("%", 1); p++; continue; }
 
+        /* D82: optional positional parameter N$ (1-based) before flags/width */
+        long long explicit_arg = -1;
+        if (*p && isdigit((unsigned char)*p)) {
+            const char *start = p;
+            while (*p && isdigit((unsigned char)*p)) p++;
+            if (*p == '$') {
+                explicit_arg = strtoll(start, NULL, 10) - 1;
+                p++; /* skip $ */
+            } else {
+                p = start; /* digits are width, not position */
+            }
+        }
+
         /* collect specifier: [flags][width][.prec]type */
         char spec[128]; int si = 1; spec[0] = '%';
         while (*p && strchr("-+ 0#", *p)) spec[si++] = *p++;
-        /* width — digits or * (from next arg) */
+        /* width — digits, *, or *N$ (positional width arg) */
         if (*p == '*') {
-            PerlValue *wa = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+            p++;
+            long long warg = -1;
+            if (*p && isdigit((unsigned char)*p)) {
+                const char *start = p;
+                while (*p && isdigit((unsigned char)*p)) p++;
+                if (*p == '$') {
+                    warg = strtoll(start, NULL, 10) - 1;
+                    p++;
+                } else {
+                    p = start;
+                }
+            }
+            if (warg < 0) warg = seqidx++;
+            PerlValue *wa = (warg >= 0 && warg < args->len) ? args->elems[warg]
+                                                            : perl_alloc_undef();
             long long w = perl_to_int(wa);
             si += snprintf(spec+si, sizeof(spec)-si-2, "%lld", w);
-            p++;
-        } else { while (*p && isdigit(*p)) spec[si++] = *p++; }
+        } else { while (*p && isdigit((unsigned char)*p)) spec[si++] = *p++; }
         /* precision */
         if (*p == '.') {
             spec[si++] = *p++;
             if (*p == '*') {
-                PerlValue *pa = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+                p++;
+                long long parg = -1;
+                if (*p && isdigit((unsigned char)*p)) {
+                    const char *start = p;
+                    while (*p && isdigit((unsigned char)*p)) p++;
+                    if (*p == '$') {
+                        parg = strtoll(start, NULL, 10) - 1;
+                        p++;
+                    } else {
+                        p = start;
+                    }
+                }
+                if (parg < 0) parg = seqidx++;
+                PerlValue *pa = (parg >= 0 && parg < args->len) ? args->elems[parg]
+                                                                : perl_alloc_undef();
                 long long pr = perl_to_int(pa);
                 si += snprintf(spec+si, sizeof(spec)-si-2, "%lld", pr);
-                p++;
-            } else { while (*p && isdigit(*p)) spec[si++] = *p++; }
+            } else { while (*p && isdigit((unsigned char)*p)) spec[si++] = *p++; }
         }
         /* skip length modifiers (l, ll, h, hh, L, z, t, j) — we normalise internally */
         while (*p && strchr("lhLztj", *p)) p++;
         char conv = *p ? *p++ : 's';
 
-        PerlValue *arg = (argidx < args->len) ? args->elems[argidx++] : perl_alloc_undef();
+        long long varg = (explicit_arg >= 0) ? explicit_arg : seqidx++;
+        PerlValue *arg = (varg >= 0 && varg < args->len) ? args->elems[varg]
+                                                         : perl_alloc_undef();
 
         char tmp[512];
         switch (conv) {
@@ -4793,19 +4915,36 @@ PerlValue *perl_chr_val(PerlValue *v) {
     if (n < 0) n = 0;
     if (n > 0x10FFFF) n = 0xFFFD; /* replacement char */
     unsigned char buf[4];
-    int len = utf8_encode(buf, n);
+    int len;
+    /* D90: real Perl — chr(0..255) is a single raw byte (no UTF8 flag);
+       chr(>255) is a Unicode character (UTF-8 encoded, SvUTF8 on). */
+    if (n <= 255) {
+        buf[0] = (unsigned char)n;
+        len = 1;
+    } else {
+        len = utf8_encode(buf, n);
+    }
     buf[len] = '\0';
-    /* D85: chr(0) encodes to a single NUL byte — perl_alloc_string(buf)
-       would compute its length via strlen(buf), which is 0 for a buffer
-       starting with 0x00, silently discarding the character entirely.
-       utf8_encode's own return value is already the exact byte length. */
-    return perl_alloc_string_len((char *)buf, len);
+    PerlValue *r = perl_alloc_string_len((char *)buf, len);
+    if (n > 255) r->flags |= PV_FLAG_UTF8;
+    return r;
 }
 
 PerlValue *perl_ord_val(PerlValue *v) {
+    /* D90: without PV_FLAG_UTF8, ord is the first raw byte (0..255).
+       With the flag, decode the leading UTF-8 character. */
+    if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
+    if (v->tag == PERL_STRING) {
+        if (!v->sval || v->slen <= 0) return perl_alloc_int(0);
+        if (!(v->flags & PV_FLAG_UTF8))
+            return perl_alloc_int((unsigned char)v->sval[0]);
+        long long cp = 0;
+        utf8_decode((const unsigned char *)v->sval, &cp);
+        return perl_alloc_int(cp);
+    }
     char *s = perl_to_string_dup(v);
-    long long cp;
-    utf8_decode((const unsigned char *)s, &cp);
+    long long cp = 0;
+    if (s && s[0]) utf8_decode((const unsigned char *)s, &cp);
     free(s);
     return perl_alloc_int(cp);
 }
@@ -5078,13 +5217,45 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
     return perl_alloc_int(rc > 0 ? 1 : 0);
 }
 
+/* Install $1..$9 and $& from a successful pcre2 match (shared by match/subst). */
+static void install_match_captures(pcre2_match_data *md, const char *s, int rc, pcre2_code *re) {
+    if (rc <= 0) return;
+    populate_named_captures(md, s, re);
+    PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+    if (s_dollar_amp.tag == PERL_STRING && s_dollar_amp.sval) free(s_dollar_amp.sval);
+    { size_t ms = ov[0], me = ov[1];
+      size_t n = (me > ms) ? me - ms : 0;
+      char *ms_str = malloc(n + 1);
+      if (n) memcpy(ms_str, s + ms, n);
+      ms_str[n] = '\0';
+      s_dollar_amp.tag = PERL_STRING; s_dollar_amp.sval = ms_str;
+      s_dollar_amp.slen = (long long)n;
+      s_dollar_amp.flags = 0;
+    }
+    for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
+        if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
+    }
+    for (int i = 1; i < rc && i <= PERL_MAX_CAPTURES; i++) {
+        size_t cstart = ov[2*i], cend = ov[2*i+1];
+        if (cstart == PCRE2_UNSET || cend == PCRE2_UNSET || cend < cstart) continue;
+        size_t n = cend - cstart;
+        char *cap = malloc(n + 1);
+        if (n) memcpy(cap, s + cstart, n);
+        cap[n] = '\0';
+        perl_captures_[i] = perl_alloc_string_len(cap, (long long)n);
+        free(cap);
+    }
+}
+
 long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags) {
-    /* separate /g /e from PCRE options */
-    int global = 0, eval_repl = 0;
+    /* separate /g /e from PCRE options. /e without a compiled eval callback
+       (legacy path) still falls through to literal replacement — codegen
+       routes real /e through perl_regex_subst_e. */
+    int global = 0;
     char clean[64]; int ci = 0;
     for (const char *fp = flags; *fp; fp++) {
         if      (*fp == 'g') global = 1;
-        else if (*fp == 'e') eval_repl = 1;
+        else if (*fp == 'e') { /* stripped; handled by _e variant */ }
         else if (ci < 63)    clean[ci++] = *fp;
     }
     clean[ci] = '\0';
@@ -5096,6 +5267,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
                            pcre_flags(clean), &errcode, &erroffset, NULL);
         if (re) regex_cache_insert(pattern, clean, re);
     }
+    if (!re) return 0;
 
     char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
@@ -5113,7 +5285,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
     while (pos <= slen) {
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
-        if (rc > 0) populate_named_captures(md, s, re);
+        if (rc > 0) install_match_captures(md, s, rc, re);
         if (rc <= 0) {
             size_t rem = slen - pos;
             ENSURE(rem); memcpy(out + out_len, s + pos, rem); out_len += rem; break;
@@ -5126,7 +5298,6 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
         ENSURE(pre); memcpy(out + out_len, s + pos, pre); out_len += pre;
 
         /* expand replacement: handle $0 (whole match), $1..$9 */
-        /* build expanded replacement string */
         char *expanded = NULL; size_t exp_len = 0, exp_cap = 128;
         expanded = malloc(exp_cap);
 #define EXPENSURE(n) do { while(exp_len+(n)+1>exp_cap){exp_cap*=2;expanded=realloc(expanded,exp_cap);} } while(0)
@@ -5137,29 +5308,22 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
                 size_t cend   = (n == 0) ? mend   : (n < rc ? ov[2*n+1] : 0);
                 size_t caplen = (cstart < cend) ? cend - cstart : 0;
                 EXPENSURE(caplen); memcpy(expanded + exp_len, s + cstart, caplen); exp_len += caplen;
+            } else if (*rp == '$' && rp[1] == '&') {
+                /* $& — whole match (same as $0) */
+                rp += 2;
+                size_t caplen = (mstart < mend) ? mend - mstart : 0;
+                EXPENSURE(caplen); memcpy(expanded + exp_len, s + mstart, caplen); exp_len += caplen;
             } else {
                 EXPENSURE(1); expanded[exp_len++] = *rp++;
             }
         }
         expanded[exp_len] = '\0';
-        /* /e: evaluate expanded string as Perl expression — disabled (no JIT) */
-        const char *rep_text = expanded;
-        size_t replen = exp_len;
-        ENSURE(replen); memcpy(out + out_len, rep_text, replen); out_len += replen;
+        ENSURE(exp_len); memcpy(out + out_len, expanded, exp_len); out_len += exp_len;
         free(expanded);
 #undef EXPENSURE
         count++;
 
         if (mend == mstart) {
-            /* Zero-length match: copy the char at the match point (mstart),
-               not the old search-start `pos` — an anchor like $ can match
-               ahead of pos (e.g. at end-of-string), and the "text before
-               match" copy above already flushed s[pos..mstart) into out, so
-               re-copying s[pos] here would duplicate it. Copying the wrong
-               character also let `pos` end up as mstart+1 = slen+1 when the
-               match was exactly at end-of-string, underflowing the `slen -
-               pos` below (size_t wraps to ~SIZE_MAX) and corrupting the
-               heap via the resulting "huge remaining length" memcpy. */
             if (mstart < slen) { ENSURE(1); out[out_len++] = s[mstart]; }
             pos = mstart + 1;
         } else {
@@ -5174,15 +5338,107 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     out[out_len] = '\0';
 #undef ENSURE
 
-    /* update PerlValue in-place */
     if (str->tag == PERL_STRING && str->sval) free(str->sval);
     str->tag  = PERL_STRING;
     str->sval = out;
-    str->slen = (long long)out_len; /* D85: out_len is already correctly tracked above */
+    str->slen = (long long)out_len;
 
     free(s);
     pcre2_match_data_free(md);
-    /* Do NOT free re — it comes from the shared cache. */
+    return count;
+}
+
+/* D38c: s///e — call eval_fn once per match with $1/$& installed. */
+long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *flags,
+                             PerlSubstEvalFn eval_fn, PerlArray *captures) {
+    int global = 0;
+    char clean[64]; int ci = 0;
+    for (const char *fp = flags; *fp; fp++) {
+        if      (*fp == 'g') global = 1;
+        else if (*fp == 'e') { /* stripped */ }
+        else if (ci < 63)    clean[ci++] = *fp;
+    }
+    clean[ci] = '\0';
+
+    pcre2_code *re = regex_cache_lookup(pattern, clean);
+    int errcode; PCRE2_SIZE erroffset;
+    if (!re) {
+        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                           pcre_flags(clean), &errcode, &erroffset, NULL);
+        if (re) regex_cache_insert(pattern, clean, re);
+    }
+    if (!re || !eval_fn) return 0;
+
+    char *s = perl_to_string_dup(str);
+    size_t slen = strlen(s);
+
+#define ENSURE_E(need) do { \
+    while (out_len + (need) + 1 > out_cap) { out_cap *= 2; out = realloc(out, out_cap); } \
+} while(0)
+
+    size_t out_cap = slen * 2 + 64;
+    char *out = malloc(out_cap);
+    size_t out_len = 0;
+    long long count = 0;
+    size_t pos = 0;
+
+    PerlValue **saved_caps = s_current_captures;
+    int saved_n = s_ncaptures;
+    s_current_captures = (captures && captures->len > 0) ? captures->elems : NULL;
+    s_ncaptures = captures ? (int)captures->len : 0;
+
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    while (pos <= slen) {
+        int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
+        if (rc <= 0) {
+            size_t rem = slen - pos;
+            ENSURE_E(rem); memcpy(out + out_len, s + pos, rem); out_len += rem; break;
+        }
+        install_match_captures(md, s, rc, re);
+        PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+        size_t mstart = ov[0], mend = ov[1];
+
+        size_t pre = mstart - pos;
+        ENSURE_E(pre); memcpy(out + out_len, s + pos, pre); out_len += pre;
+
+        /* Evaluate replacement expression in scalar context */
+        perl_push_wantarray(0);
+        PerlValue *rv = eval_fn();
+        perl_pop_wantarray();
+        long long rlen = 0;
+        char *rs = perl_to_string_dup_len(rv, &rlen);
+        ENSURE_E((size_t)rlen);
+        if (rlen > 0) memcpy(out + out_len, rs, (size_t)rlen);
+        out_len += (size_t)rlen;
+        free(rs);
+        perl_free(rv);
+        count++;
+
+        if (mend == mstart) {
+            if (mstart < slen) { ENSURE_E(1); out[out_len++] = s[mstart]; }
+            pos = mstart + 1;
+        } else {
+            pos = mend;
+        }
+
+        if (!global) {
+            size_t rem = (pos < slen) ? slen - pos : 0;
+            ENSURE_E(rem); memcpy(out + out_len, s + pos, rem); out_len += rem; break;
+        }
+    }
+    out[out_len] = '\0';
+#undef ENSURE_E
+
+    s_current_captures = saved_caps;
+    s_ncaptures = saved_n;
+
+    if (str->tag == PERL_STRING && str->sval) free(str->sval);
+    str->tag  = PERL_STRING;
+    str->sval = out;
+    str->slen = (long long)out_len;
+
+    free(s);
+    pcre2_match_data_free(md);
     return count;
 }
 
@@ -5416,12 +5672,47 @@ void perl_env_set(PerlValue *key, PerlValue *val) {
     free(k); free(v);
 }
 
-void perl_warn(PerlValue *msg) {
-    char *s = perl_to_string_dup(msg);
-    size_t len = strlen(s);
-    fputs(s, stderr);
-    if (len == 0 || s[len - 1] != '\n') fputc('\n', stderr);
+/* D49: %SIG — process-wide special hash for $SIG{__WARN__}/$SIG{__DIE__}/… */
+PerlHash *perl_get_sig_hash(void) {
+    if (!s_sig_hash) s_sig_hash = perl_hash_new();
+    return s_sig_hash;
+}
+
+/* Call $SIG{name} if it holds a CODE ref. Returns 1 if a handler ran. */
+static int call_sig_handler(const char *name, PerlValue *msg_pv) {
+    if (!s_sig_hash || !name || !msg_pv) return 0;
+    PerlValue *h = perl_hash_get_str_ref(s_sig_hash, name);
+    if (!h || h->tag != PERL_CODE_REF || !h->pval) return 0;
+    PerlArray *args = perl_array_new();
+    perl_array_push(args, msg_pv);
+    /* void context for the handler */
+    perl_push_wantarray(2);
+    PerlValue *ret = perl_call_code_ref(h, args);
+    perl_pop_wantarray();
+    perl_free(ret);
+    perl_array_free(args);
+    return 1;
+}
+
+void perl_warn(PerlValue *msg, const char *filename, int line) {
+    /* Default message matches real Perl when warn() is called with no args. */
+    char *s = msg ? perl_to_string_dup(msg) : strdup("Warning: something's wrong");
+    char *full = appendDieLocation(s, filename, line);
     free(s);
+
+    /* $SIG{__WARN__}: if set to a coderef, call it instead of printing.
+       Depth guard prevents infinite recursion if the handler itself warns. */
+    if (s_sig_warn_depth == 0) {
+        s_sig_warn_depth++;
+        PerlValue *msg_pv = perl_alloc_string(full);
+        int handled = call_sig_handler("__WARN__", msg_pv);
+        perl_free(msg_pv);
+        s_sig_warn_depth--;
+        if (handled) { free(full); return; }
+    }
+
+    fputs(full, stderr);
+    free(full);
 }
 
 PerlValue *perl_system(PerlValue *cmd) {
@@ -6761,6 +7052,12 @@ void perl_cleanup(void) {
     if (perl_plus_hash) {
         perl_hash_free(perl_plus_hash);
         perl_plus_hash = NULL;
+    }
+
+    /* 2b. D49: %SIG special hash */
+    if (s_sig_hash) {
+        perl_hash_free(s_sig_hash);
+        s_sig_hash = NULL;
     }
 
     /* 3. XS module list (reload of existing cleanup). */

@@ -8,39 +8,31 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18 (`clang-18`/`ll
 
 **⚠ Correctness state (updated 2026-07-14)**: A second comprehensive re-review (4-way parallel: re-test every prior OPEN defect against HEAD `4ce6e88`; a fresh docs-vs-source audit; a broad new probe of string/numeric/list/regex/OOP corners; a full `tests/harness.sh` rerun) found the harness itself has **zero regressions** (same 7 pre-existing failures as 2026-07-13), but surfaced **16 new defects (D67-D82)** not previously tracked, several of them CRITICAL/HIGH silent-wrong-data bugs in extremely common code paths — most notably **`pack`/`unpack` are completely non-functional** (D67: codegen never emits calls to the runtime functions that already exist, despite being documented above as a shipped feature), **`%` (modulo) is wrong for any negative operand** (D71), and **`"$ref->{key}"`/`"$ref->[i]"` arrow-dereference does not interpolate in strings** (D72, one of the most common OOP idioms in real Perl code). Also found: `make test` currently **fails** (not "passes" as previously claimed — see D67's note in TESTS.md), `List::Util::uniq` is broken on its two most common call shapes (D69), `substr` is not actually UTF-8 aware despite the claim two paragraphs below (D68, only `length` is), and `POSIX::fmod` silently returns undef when imported unqualified (D70). Two pieces of good news: **D44 (tie/untie STORE/FETCH interception) is now fixed** (verified working, no dedicated test yet — add one before trusting it stays fixed), and D49 (`%SIG`) no longer hard-parse-errors (though it's still functionally inert). Full details, repro scripts, and severity notes for all 16 new defects are in `TESTS.md`'s "Newly Discovered Defects (2026-07-14 comprehensive re-review)" section. **Top-10 prioritized correctness fixes and top-10 missing features are listed immediately below**, in `## Priority Lists (as of 2026-07-14)`. **Fix-work update (same day)**: D66 and D71 are now both fixed (see `REMEDIATION.md` items 49-50); each uncovered one further, separate, still-open defect while its regression test was being written (D83, D84 respectively).
 
-## Priority Lists (as of 2026-07-14)
+## Priority Lists (as of 2026-07-24)
 
-Ordered by blast radius × silence (a silent-wrong-data bug on a common idiom outranks a loud parse error, which outranks a rare/niche gap). Full repro details for every ID are in `TESTS.md`'s Defect Registry.
+Ordered by blast radius × silence. Full details in `TESTS.md` / `REMEDIATION.md`.
 
-### Top 10 correctness fixes (do these first)
+### 2026-07-24 session (items 73–85 in REMEDIATION.md)
 
-Fixed so far: ~~**D66**~~ (2026-07-14, block-scoped `my $x=$hash{key}` coerced string values to `0`; `REMEDIATION.md` item 49), ~~**D71**~~ (2026-07-14, `%` used C truncating semantics instead of Perl's floored-division convention; item 50), ~~**D72**~~ (2026-07-14, `"$ref->{key}"`/`"$ref->[i]"` didn't interpolate at all; item 51), ~~**D67**~~ (2026-07-14, `pack`/`unpack` completely non-functional plus 7 further latent runtime bugs found while fixing it; item 52), ~~**D73**~~ (2026-07-14, array/hash slice interpolation in strings didn't work at all; item 53), ~~**D34**~~ (2026-07-14, `defined EXPR` without parens was a hard parse error; item 54), ~~**D8a**~~ (2026-07-14, `EXPR or return VALUE` parsed but never actually returned; item 55), ~~**D12**~~ (2026-07-14, `wantarray` context wasn't propagated into `print`/`printf` arguments; item 56), ~~**D74**~~ (2026-07-14, `substr` 4-arg in-place replacement was a silent no-op; item 57), ~~**D69**~~ (2026-07-15, `List::Util::uniq` broken on its two most common call shapes, plus a third scalar-context bug found while fixing it; item 58), ~~**D75**~~ (2026-07-15, multiple-inheritance method resolution picked the wrong parent; item 59), ~~**D53**~~ (2026-07-15, a self-assigned reference lost aliasing inside a block — re-diagnosed as the real, broader bug: `\$x` on ANY block-scoped unboxed-fast-path variable, self-assignment unrelated; item 60), ~~**D52**~~ (2026-07-15, `$@` wasn't wired up as an assignment target at all, plus a related eval-success-clear-timing bug found while fixing it; item 61), ~~**D85**~~ (2026-07-15, `pack`/`unpack`'d binary data with an embedded NUL byte was silently truncated — a full architectural fix adding an explicit `slen` byte-length field to `PerlValue`, threaded through ~30 call sites; item 62), ~~**D77**~~ (2026-07-15, `substr` mishandled negative length and a far-out-of-range negative offset — real Perl's exact boundary algorithm reverse-engineered from an exhaustive reference matrix run against real Perl itself; item 63), and ~~**D88**~~ (2026-07-15, `callCtx_` leaked list context through scalar-forcing operators like `eq`/`+` into a nested call, at every call site *other than* print/printf — fixed at the single shared operand-evaluation spot in `emitBinOp` rather than auditing every individual call site; item 64). Eight of the sixteen uncovered a separate, unrelated, still-open defect while writing their regression test — D83 (`ref()` wrong for FLAT_ARRAY-tagged scalars), D84 (`%`/`%=` by zero isn't eval-catchable), D89 (`die` with no trailing newline never appends `" at FILE line N."`, found while fixing D52), D90 (`length()` undercounts by one for certain raw binary byte sequences that look like a UTF-8 continuation pair, found while fixing D85), D91 (`no PRAGMA;` — any pragma negation, with or without arguments — is a hard parse error rather than the silently-ignored no-op `use PRAGMA` gets, found while fixing D77), and D88 itself uncovered four more (D92: a narrow but real runtime crash from a specific combination of block-nested `sub` declarations; D93: `wantarray() ? (LIST) : SCALAR` ternary-form list return doesn't propagate correctly; D94: `\|\|`'s right-hand operand doesn't inherit the outer list context, the conceptual mirror image of D88 itself; D95: `EXPR x N` in array-assignment position is always wrongly treated as list repetition). D77's own fix reconfirmed the original bug report's guess (that a far-out-of-range negative offset "should clamp to the start") was itself wrong — real Perl actually returns `undef` there, not a clamped result. All folded into the list below.
+Fixed: **D94**, **D95**, **D76**, **D81**, **D80**, **D82**, **D41**, **D87**, **D90**, **D89**, **D49**, **D38c**; **D79** re-verified (fixed 2026-07-18). Also already fixed earlier and re-confirmed: D91, D93, D86, D68, D70, D78, D83, D84.
 
-1. **D84** — `%`/`%=` by zero isn't a catchable Perl exception, and the unboxed-int fast path skips the zero-divisor check entirely. Found while fixing D71.
-2. **D83** — `ref()` returns empty string instead of `"ARRAY"` for a scalar holding a FLAT_ARRAY-tagged value (e.g. `my $y=[4,5,6]; ref($y)`). Found while fixing D66.
-3. **D78** — signed integer overflow wraps around instead of auto-promoting to float, silently producing a negative number instead of the correct large value.
-4. **D68** — `substr` is not actually UTF-8 aware despite the claim elsewhere in this file (only `length` is character-aware; `substr` still does byte-oriented slicing).
-5. **D70** — `POSIX::fmod` silently returns `undef` when imported via `use POSIX qw(fmod)` and called unqualified; only the fully-qualified `POSIX::fmod(...)` form works.
-6. **D76** — nested `DESTROY` doesn't cascade to blessed objects held by another blessed object going out of scope.
-7. **D89** — `die` with a message lacking a trailing newline never appends Perl's standard `" at FILE line N."` suffix, on both the eval-caught and uncaught/top-level paths. Found while fixing D52.
-8. **D90** — `length()` undercounts by one for certain raw binary byte sequences that happen to look like a valid UTF-8 continuation pair (e.g. `pack("N",1234567)`'s own bytes). Byte data itself is correct; only the count is off. Found while fixing D85.
-9. **D91** — `no PRAGMA;` (`no strict;`, `no warnings;`, `no warnings 'CATEGORY';`, etc.) is a hard parse error, unlike `use PRAGMA` which at least parses as a silent no-op. Found while fixing D77.
-10. **D92** — a narrow but real runtime crash (`perl_clone()` on a garbage pointer) from a specific combination of block-nested `sub` declarations, a shared file-scope array, and a `check()`-style helper sub. Found while fixing D88.
+### Top remaining correctness fixes
 
-Next tier worth fixing soon after (not in the top 10 only for space): D87 (`wantarray()` has no void state — always reports scalar/list, never `undef`, for a bare-statement void-context call), D86 (`print {$fh} LIST` brace-block filehandle form misparsed as a hash-literal argument).
+1. **D92** — narrow nested-sub + shared-array runtime crash
+2. **D36** — bareword `foo "x"` silently no-ops (hurts Carp idioms)
+3. **D46** — `$x?$y:"str"` no-space ternary parse fail
+4. **D56** — no `use warnings` / uninitialized diagnostics
+5. **D62** — closure capture reassignment not visible to caller (if still open)
+6. **D60** — bare `q(...)` non-brace delimiter
 
-### Top 10 missing features (completeness, after correctness)
+### Top remaining missing features
 
-1. **No `use warnings` diagnostic system** — no runtime "uninitialized value"/deprecation-style warnings exist at all (D56 and others); affects debuggability of every perlc-compiled program.
-2. **`use overload`** — operator overloading is entirely unimplemented; blocks idiomatic numeric/string-like OOP classes.
-3. **Alternate-delimiter substitution** (D38a) — `s{pat}{repl}`, `s#pat#repl#`, etc. aren't lexed at all; only `s/pat/repl/` works.
-4. **`s///e` doesn't evaluate the replacement as code** (D38c) — silently behaves like `/e`-less substitution instead.
-5. **`local` on individual hash/array elements** (D41) — `local $h{key}` / `local $arr[idx]` is a hard parse error; whole-variable `local` works.
-6. **`%SIG` / signal & warn-handler wiring** (D49) — parses now but `$SIG{__WARN__}` is never actually invoked by `warn()`.
-7. **`delete @hash{...}` / `delete @arr[...]`** (D81) — slice-form `delete` is a hard parse error; single-key `delete` works.
-8. **`sprintf`/`printf` positional args** (D82) — `%N$s`-style explicit argument indices aren't supported.
-9. **String `eval EXPR`** — deliberately cut when the JIT was removed; only `eval { BLOCK }` works. A real, intentional scope gap, not a regression.
-10. **Regex `/x` (extended/whitespace-ignoring) modifier** — documented as unsupported; still a real, commonly-wanted gap for readable patterns.
+1. **No `use warnings` diagnostic system** (D56)
+2. **`use overload`**
+3. **String `eval EXPR`** (deliberate post-JIT scope cut; `eval { BLOCK }` works)
+4. **Regex `/x`** extended modifier
+5. **`syscall()`** builtin (`make test` / xs_ffi gap)
+6. prototypes, typeglobs, full signals beyond `%SIG` handlers
 
 Also notable but outside the top 10: `syscall()` builtin (found missing while investigating the `make test` failure — not previously documented anywhere), prototypes, typeglobs, signals generally.
 

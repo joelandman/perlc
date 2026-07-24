@@ -1,5 +1,7 @@
 #include "codegen.h"
 #include "runtime.h"
+#include "lexer.h"
+#include "parser.h"
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Instructions.h>
@@ -252,6 +254,8 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get",     pv,  av, i64);
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
+    RT("perl_array_delete",       pv,     av, i64);
+    RT("perl_array_lvalue",       pv,     av, i64);
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
     RT("perl_array_is_all_flat", i64, av);  /* used by Stage 23 all-flat pre-check */
      RT("perl_array_len",     pv,  av);
@@ -373,7 +377,8 @@ void CodeGen::declareRuntime() {
     RT("perl_str_spaceship",  pv, pv, pv);
     /* new builtins */
     RT("perl_chop",       pv, pv);
-    RT("perl_warn",       voidTy, pv);
+    RT("perl_warn",       voidTy, pv, i8p, i32);
+    RT("perl_get_sig_hash", av);
     RT("perl_splice",     av, av, pv, pv, av);
     RT("perl_filetest",   pv, Type::getInt32Ty(ctx_), pv);
     RT("perl_env_get",    pv, pv);
@@ -401,6 +406,7 @@ void CodeGen::declareRuntime() {
     RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
     RT("perl_regex_match_all", av,  pv, i8p, i8p);
     RT("perl_regex_subst",     i64, pv, i8p, i8p, i8p);
+    RT("perl_regex_subst_e",   i64, pv, i8p, i8p, i8p, av);
     RT("perl_capture",         pv,  i64);
     RT("perl_split_regex",     av,  i8p, i8p, pv);
     /* OOP */
@@ -632,6 +638,7 @@ void CodeGen::declareArray(const std::string &nm, Value *ptr) {
 }
 
 Value *CodeGen::lookupHash(const std::string &nm) {
+    /* D49: bare %SIG is the process-wide special hash (unless shadowed by my %SIG) */
     for (int i = (int)hashScopes_.size() - 1; i >= 0; i--) {
         auto it = hashScopes_[i].find(nm);
         if (it != hashScopes_[i].end()) return it->second;
@@ -639,6 +646,8 @@ Value *CodeGen::lookupHash(const std::string &nm) {
     auto git = fileHashGlobals_.find(nm);
     if (git != fileHashGlobals_.end())
         return builder_.CreateLoad(perlPtrTy_, git->second, nm);
+    if (nm == "SIG")
+        return callRT("perl_get_sig_hash", {});
     return nullptr;
 }
 
@@ -676,18 +685,35 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *hi = emitExpr(*n.right);
         return callRT("perl_range", {lo, hi});
     }
-    /* (LIST) x N — list repetition in array context */
+    /* x in array/list context (D95):
+       Real Perl only does *list* repetition when the left operand is
+       syntactically a parenthesized list or qw// (both parse as ArrayLit).
+       A bare `f() x 2` / `"ab" x 2` is always *string* repetition, even
+       when the whole expression is the RHS of an array assignment — the
+       result is a single-element list holding the repeated string.
+       Previously every `x` here was treated as list repetition, giving
+       `@a = (f() x 2)` → `("x","x")` instead of real Perl's `("xx")`. */
     if (n.kind == NK::BinOp && n.sval == "x" && n.left) {
-        Value *srcArr = emitArrayPtr(*n.left);
-        if (!srcArr) {
-            /* scalar or single-element expr — wrap in 1-element array */
-            srcArr = callRT("perl_array_new", {});
-            Value *v = emitExpr(*n.left);
-            callRT("perl_array_push", {srcArr, v});
-            freeIfOwned(v);
+        if (n.left->kind == NK::ArrayLit) {
+            Value *srcArr = emitArrayPtr(*n.left);
+            if (!srcArr) srcArr = callRT("perl_array_new", {});
+            Value *nv = emitExpr(*n.right);
+            return callRT("perl_repeat_list", {srcArr, nv});
         }
+        /* String repetition → one-element array of the repeated string.
+           Left operand of string-x is always scalar context. */
+        int savedCallCtx = callCtx_;
+        callCtx_ = 0;
+        Value *lv = emitExpr(*n.left);
+        callCtx_ = savedCallCtx;
         Value *nv = emitExpr(*n.right);
-        return callRT("perl_repeat_list", {srcArr, nv});
+        Value *rep = callRT("perl_repeat_str", {lv, nv});
+        freeIfOwned(lv);
+        freeIfOwned(nv);
+        Value *av = callRT("perl_array_new", {});
+        callRT("perl_array_push", {av, rep});
+        freeIfOwned(rep);
+        return av;
     }
     if (n.kind == NK::ArrayVar) {
         return lookupArray(n.name);
@@ -1258,12 +1284,118 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         for (auto &keyNode : n.args) pushHashKey(*keyNode);
         return res;
     }
+    /* D81: delete @hash{...} / delete @arr[...] in list context */
+    if (n.kind == NK::DeleteFunc &&
+        (n.sval == "hash_slice" || n.sval == "array_slice")) {
+        Value *res = callRT("perl_array_new", {});
+        if (n.sval == "hash_slice") {
+            Value *hv = lookupHash(n.name);
+            auto delKey = [&](const Node &keyNode) {
+                if (!hv) {
+                    callRT("perl_array_push", {res, perlUndef()});
+                    return;
+                }
+                if (keyNode.kind == NK::ArrayLit) {
+                    for (auto &k : keyNode.args) {
+                        Value *old = emitHashDelete(hv, *k);
+                        callRT("perl_array_push", {res, old});
+                        freeIfOwned(old);
+                    }
+                } else if (Value *kav = emitArrayPtr(keyNode)) {
+                    Value *lenV = callRT("perl_array_len", {kav});
+                    Value *len = callRT("perl_to_int", {lenV});
+                    freeIfOwned(lenV);
+                    /* loop over keys at runtime would need a block; expand
+                       common ArrayLit/qw path above — dynamic @keys falls
+                       through one-by-one via a small unrolled helper: */
+                    auto *i64Ty = Type::getInt64Ty(ctx_);
+                    auto *fn = builder_.GetInsertBlock()->getParent();
+                    auto *idxA = builder_.CreateAlloca(i64Ty, nullptr, "del.i");
+                    builder_.CreateStore(ConstantInt::get(i64Ty, 0), idxA);
+                    auto *condBB = BasicBlock::Create(ctx_, "del.cond", fn);
+                    auto *bodyBB = BasicBlock::Create(ctx_, "del.body", fn);
+                    auto *doneBB = BasicBlock::Create(ctx_, "del.done", fn);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    Value *i = builder_.CreateLoad(i64Ty, idxA);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(i, len), bodyBB, doneBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    Value *k = callRT("perl_array_get", {kav, i});
+                    Value *old = callRT("perl_hash_delete_sv", {hv, k});
+                    callRT("perl_array_push", {res, old});
+                    freeIfOwned(k); freeIfOwned(old);
+                    builder_.CreateStore(builder_.CreateAdd(i, ConstantInt::get(i64Ty, 1)), idxA);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(doneBB);
+                } else {
+                    Value *old = emitHashDelete(hv, keyNode);
+                    callRT("perl_array_push", {res, old});
+                    freeIfOwned(old);
+                }
+            };
+            for (auto &k : n.args) delKey(*k);
+        } else {
+            Value *av = lookupArray(n.name);
+            auto delIdx = [&](const Node &idxNode) {
+                if (!av) {
+                    callRT("perl_array_push", {res, perlUndef()});
+                    return;
+                }
+                if (idxNode.kind == NK::ArrayLit) {
+                    for (auto &ix : idxNode.args) {
+                        Value *idx = emitIdx(*ix);
+                        Value *old = callRT("perl_array_delete", {av, idx});
+                        callRT("perl_array_push", {res, old});
+                        freeIfOwned(old);
+                    }
+                } else if (Value *iav = emitArrayPtr(idxNode)) {
+                    auto *i64Ty = Type::getInt64Ty(ctx_);
+                    auto *fn = builder_.GetInsertBlock()->getParent();
+                    Value *lenV = callRT("perl_array_len", {iav});
+                    Value *len = callRT("perl_to_int", {lenV});
+                    freeIfOwned(lenV);
+                    auto *idxA = builder_.CreateAlloca(i64Ty, nullptr, "dela.i");
+                    builder_.CreateStore(ConstantInt::get(i64Ty, 0), idxA);
+                    auto *condBB = BasicBlock::Create(ctx_, "dela.cond", fn);
+                    auto *bodyBB = BasicBlock::Create(ctx_, "dela.body", fn);
+                    auto *doneBB = BasicBlock::Create(ctx_, "dela.done", fn);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    Value *i = builder_.CreateLoad(i64Ty, idxA);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(i, len), bodyBB, doneBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    Value *idxPv = callRT("perl_array_get", {iav, i});
+                    Value *idx = callRT("perl_to_int", {idxPv});
+                    freeIfOwned(idxPv);
+                    Value *old = callRT("perl_array_delete", {av, idx});
+                    callRT("perl_array_push", {res, old});
+                    freeIfOwned(old);
+                    builder_.CreateStore(builder_.CreateAdd(i, ConstantInt::get(i64Ty, 1)), idxA);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(doneBB);
+                } else {
+                    Value *idx = emitIdx(idxNode);
+                    Value *old = callRT("perl_array_delete", {av, idx});
+                    callRT("perl_array_push", {res, old});
+                    freeIfOwned(old);
+                }
+            };
+            for (auto &ix : n.args) delIdx(*ix);
+        }
+        return res;
+    }
     if (n.kind == NK::ArrayLit) {
         Value *res = callRT("perl_array_new", {});
         for (auto &elem : n.args) {
             Value *sub = emitArrayPtr(*elem);
-            if (sub) callRT("perl_array_extend", {res, sub});
-            else     callRT("perl_array_push",   {res, emitExpr(*elem)});
+            if (sub) {
+                callRT("perl_array_extend", {res, sub});
+            } else {
+                /* Flatten LIST_RESULT (e.g. `(0 || listret())` inside parens —
+                   D94 + D95: single-element parens are ArrayLit, not unwrapped). */
+                Value *v = emitExpr(*elem);
+                callRT("perl_array_push_list_or_scalar", {res, v});
+            }
         }
         return res;
     }
@@ -2535,6 +2667,7 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
 
     /* D10: reset per-compilation counters so multi-compile is deterministic */
     sortCmpCounter_ = 0;
+    substEvalCounter_ = 0;
     stateSeq_ = 0;
     endSeq_ = 0;
     lastSqrtInput_ = nullptr;
@@ -3131,7 +3264,8 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                 if (lk == NK::GrepFunc || lk == NK::MapFunc || lk == NK::SortFunc) {
                     auto *i32Ty = Type::getInt32Ty(ctx_);
                     Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                    Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
+                    /* D87: only ctx==1 is list; void(2) and scalar(0) are not */
+                    Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
                     Value *listResult = callRT("perl_array_to_list_return", {av});
                     Value *scalarResult = (lk == NK::SortFunc) ? perlUndef()
                                          : callRT("perl_array_len", {av});
@@ -3140,7 +3274,11 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                     result = callRT("perl_array_to_list_return", {av});
                 }
             } else {
+                /* D87: last expr inherits caller's wantarray (return f()) */
+                int savedCtx = callCtx_;
+                callCtx_ = -1;
                 result = emitExpr(le);
+                callCtx_ = savedCtx;
             }
         } else if (isLast && stmt.kind == NK::Return) {
             /* Capture the return value without emitting a ret instruction.
@@ -3157,7 +3295,7 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                     stmt.left->kind == NK::SortFunc) {
                     auto *i32Ty = Type::getInt32Ty(ctx_);
                     Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                    Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
+                    Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
                     Value *listResult = callRT("perl_array_to_list_return", {av});
                     Value *scalarResult = (stmt.left->kind == NK::SortFunc) ? perlUndef()
                                          : callRT("perl_array_len", {av});
@@ -3166,7 +3304,10 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                     result = callRT("perl_array_to_list_return", {av});
                 }
             } else {
+                int savedCtx = callCtx_;
+                callCtx_ = -1; /* D87: return EXPR inherits caller context */
                 result = stmt.left ? emitExpr(*stmt.left) : perlUndef();
+                callCtx_ = savedCtx;
             }
         } else {
             emitStmt(stmt);
@@ -3216,8 +3357,14 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
-    case NK::ExprStmt:
-        freeIfOwned(emitExpr(*n.left)); break;
+    case NK::ExprStmt: {
+        /* D87: bare statement is void context for any top-level call */
+        int savedCtx = callCtx_;
+        if (n.left && isCallLikeForContext(*n.left)) callCtx_ = 2;
+        freeIfOwned(emitExpr(*n.left));
+        callCtx_ = savedCtx;
+        break;
+    }
 
     case NK::My: {
         if (n.name.empty()) break;
@@ -4231,7 +4378,7 @@ void CodeGen::emitStmt(const Node &n) {
                 n.left->kind == NK::SortFunc) {
                 auto *i32Ty = Type::getInt32Ty(ctx_);
                 Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
+                Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
                 Value *listResult = callRT("perl_array_to_list_return", {av});
                 Value *scalarResult = (n.left->kind == NK::SortFunc) ? perlUndef()
                                      : callRT("perl_array_len", {av});
@@ -4239,9 +4386,12 @@ void CodeGen::emitStmt(const Node &n) {
             } else {
                 v = callRT("perl_array_to_list_return", {av});
             }
-        } else {
-            v = n.left ? emitExpr(*n.left) : perlUndef();
-        }
+            } else {
+                int savedCtx = callCtx_;
+                callCtx_ = -1; /* D87: return EXPR inherits caller context */
+                v = n.left ? emitExpr(*n.left) : perlUndef();
+                callCtx_ = savedCtx;
+            }
         /* `return` inside eval{} exits just that eval block with this value
            (real Perl semantics — NOT die, and NOT a return from any
            enclosing sub even if one exists; execution resumes after the
@@ -4288,9 +4438,25 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::LocalStmt: {
-        /* save current value, optionally assign new one */
-        Value *pv;
-        if (n.name == "/")   pv = callRT("perl_get_input_sep",    {});
+        /* save current value, optionally assign new one.
+           D41: also local $h{key} / local $arr[idx] via element lvalues. */
+        Value *pv = nullptr;
+        if (n.sval == "hash_elem" && n.right) {
+            Value *hv = lookupHash(n.name);
+            if (!hv) break;
+            if (Value *kp = constKeyPtr(*n.right, builder_))
+                pv = callRT("perl_hash_lvalue_str", {hv, kp});
+            else {
+                Value *key = emitExpr(*n.right);
+                pv = callRT("perl_hash_lvalue_sv", {hv, key});
+                freeIfOwned(key);
+            }
+        } else if (n.sval == "array_elem" && n.right) {
+            Value *av = lookupArray(n.name);
+            if (!av) break;
+            Value *idx = emitIdx(*n.right);
+            pv = callRT("perl_array_lvalue", {av, idx});
+        } else if (n.name == "/")   pv = callRT("perl_get_input_sep",    {});
         else if (n.name == "!") pv = callRT("perl_get_dollar_bang",{});
         else if (n.name == ".") pv = callRT("perl_get_dollar_dot",  {});
         else if (n.name == ",") pv = callRT("perl_get_dollar_comma",{});
@@ -4306,10 +4472,14 @@ void CodeGen::emitStmt(const Node &n) {
             }
             pv = builder_.CreateLoad(perlPtrTy_, slot);
         }
+        if (!pv) break;
         callRT("perl_local_save", {pv});
         if (n.left) {
             Value *rhs = emitExpr(*n.left);
             callRT("perl_assign", {pv, rhs});
+        } else if (n.sval == "hash_elem" || n.sval == "array_elem") {
+            /* D41: bare `local $h{k}` / `local $a[i]` temporarily undefs */
+            callRT("perl_assign", {pv, perlUndef()});
         }
         break;
     }
@@ -4532,13 +4702,16 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ArrayLit: {
-        /* build temp PerlArray from the element list */
-        Value *av = callRT("perl_array_new", {});
+        /* Scalar/comma context of a parenthesized list: last element
+           (D95 companion — single-element `(expr)` is now ArrayLit, not
+           unwrapped). List context uses emitArrayPtr, not emitExpr. */
+        if (n.args.empty()) return perlUndef();
+        Value *last = nullptr;
         for (auto &elem : n.args) {
-            Value *v = emitExpr(*elem);
-            callRT("perl_array_push", {av, v});
+            if (last) freeIfOwned(last);
+            last = emitExpr(*elem);
         }
-        return av;
+        return last ? last : perlUndef();
     }
 
     case NK::Range: {
@@ -6105,13 +6278,18 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::DeleteFunc: {
+        /* D81: slice forms return the last deleted value in scalar context
+           (list form goes through emitArrayPtr). */
+        if (n.sval == "array_slice" || n.sval == "hash_slice") {
+            Value *av = emitArrayPtr(n);
+            if (!av) return perlUndef();
+            return callRT("perl_array_last", {av});
+        }
         if (n.sval == "array") {
             Value *av = lookupArray(n.name);
             if (!av) return perlUndef();
             Value *idx = emitIdx(*n.left);
-            Value *old = callRT("perl_array_get", {av, idx});
-            callRT("perl_array_set", {av, idx, perlUndef()});
-            return old;
+            return callRT("perl_array_delete", {av, idx});
         }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
@@ -6489,11 +6667,20 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::AnonHash: {
+        /* D76: must freeIfOwned each pushed element (array_push clones) and
+           free listArr after hash_from_list (which clones again into the
+           hash). Leaking the temps left nested blessed objects at
+           refcount>=2 forever, so their DESTROY never ran when the outer
+           object was freed. AnonArray already freeIfOwned's; mirror that. */
         Value *hv = callRT("perl_anon_hash_new", {});
         Value *listArr = callRT("perl_array_new", {});
-        for (auto &elem : n.args)
-            callRT("perl_array_push", {listArr, emitExpr(*elem)});
+        for (auto &elem : n.args) {
+            Value *pv = emitExpr(*elem);
+            callRT("perl_array_push", {listArr, pv});
+            freeIfOwned(pv);
+        }
         callRT("perl_hash_from_list", {hv, listArr});
+        callRT("perl_array_free", {listArr});
         return callRT("perl_ref_hash", {hv});
     }
 
@@ -6589,8 +6776,142 @@ Value *CodeGen::emitExpr(const Node &n) {
         std::string repl  = n.name.substr(0, sep);
         std::string flags = n.name.substr(sep + 1);
         Value *pat  = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
-        Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
         Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");
+
+        /* D38c: /e — compile replacement as a Perl expression, call once
+           per match with $1/$& already installed by the runtime. */
+        bool hasE = flags.find('e') != std::string::npos;
+        if (hasE) {
+            NodePtr replExpr;
+            try {
+                Lexer lex(repl);
+                auto toks = lex.tokenize();
+                replExpr = Parser::parseExprFromTokens(std::move(toks));
+            } catch (const std::exception &ex) {
+                throw std::runtime_error(std::string("s///e: bad replacement expression: ") + ex.what());
+            }
+            if (!replExpr)
+                throw std::runtime_error("s///e: empty replacement expression");
+
+            /* Capture outer lexicals referenced by the replacement (like sort{}) */
+            std::set<std::string> usedNames;
+            collectAllScalarNames(*replExpr, usedNames);
+            std::vector<std::string> capNames;
+            std::vector<Value*>      capVals;
+            std::vector<char>        capSigils;
+            for (auto &nm : usedNames) {
+                if (nm == "_") continue;
+                if (auto *slot = lookupVar(nm)) {
+                    capNames.push_back(nm);
+                    capVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
+                    capSigils.push_back('$');
+                } else if (Value *ia = lookupIntVar(nm)) {
+                    Value *boxed = boxI64(builder_.CreateLoad(Type::getInt64Ty(ctx_), ia));
+                    auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    builder_.CreateStore(boxed, pvA);
+                    capNames.push_back(nm);
+                    capVals.push_back(builder_.CreateLoad(perlPtrTy_, pvA));
+                    capSigils.push_back('$');
+                } else if (Value *fa = lookupFloatVar(nm)) {
+                    Value *boxed = boxF64(builder_.CreateLoad(Type::getDoubleTy(ctx_), fa));
+                    auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    builder_.CreateStore(boxed, pvA);
+                    capNames.push_back(nm);
+                    capVals.push_back(builder_.CreateLoad(perlPtrTy_, pvA));
+                    capSigils.push_back('$');
+                }
+            }
+            {
+                std::unordered_map<std::string, Value*> visA, visH;
+                for (auto &sc : arrayScopes_) for (auto &kv : sc) visA[kv.first] = kv.second;
+                for (auto &sc : hashScopes_)  for (auto &kv : sc) visH[kv.first] = kv.second;
+                for (auto &kv : visA) {
+                    if (kv.first == "_") continue;
+                    capNames.push_back(kv.first);
+                    capVals.push_back(callRT("perl_ref_array", {kv.second}));
+                    capSigils.push_back('@');
+                }
+                for (auto &kv : visH) {
+                    capNames.push_back(kv.first);
+                    capVals.push_back(callRT("perl_ref_hash", {kv.second}));
+                    capSigils.push_back('%');
+                }
+            }
+
+            std::string fnName = "__subst_e_" + std::to_string(substEvalCounter_++);
+            auto *evalFT = FunctionType::get(perlPtrTy_, {}, false);
+            auto *evalFn = Function::Create(evalFT, Function::InternalLinkage, fnName, mod_.get());
+
+            auto *savedFn   = currentFn_;
+            auto *savedBB   = builder_.GetInsertBlock();
+            auto  savedSc   = scopes_;
+            auto  savedArr  = arrayScopes_;
+            auto  savedHash = hashScopes_;
+            auto  savedPv   = pvScopes_;
+            auto  savedF    = floatScopes_;
+            auto  savedI    = intScopes_;
+            auto *savedLDep = localDepthAlloca_;
+            auto *savedBody = currentSubBody_;
+            bool  savedNeeds = currentSubNeedsWantarray_;
+
+            auto *entry = BasicBlock::Create(ctx_, "entry", evalFn);
+            builder_.SetInsertPoint(entry);
+            currentFn_ = evalFn;
+            scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+            floatScopes_ = {}; intScopes_ = {};
+            pushScope();
+            currentSubNeedsWantarray_ = false;
+
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            auto *i64Ty = Type::getInt64Ty(ctx_);
+            localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+            builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+            for (size_t ci = 0; ci < capNames.size(); ci++) {
+                Value *pv = callRT("perl_get_capture", {ConstantInt::get(i64Ty, (long long)ci)});
+                if (capSigils[ci] == '@') {
+                    declareArray(capNames[ci], callRT("perl_deref_array_ro", {pv}));
+                } else if (capSigils[ci] == '%') {
+                    declareHash(capNames[ci], callRT("perl_deref_hash", {pv}));
+                } else {
+                    auto *a = builder_.CreateAlloca(perlPtrTy_, nullptr, capNames[ci]);
+                    builder_.CreateStore(pv, a);
+                    declareVar(capNames[ci], a);
+                }
+            }
+
+            Value *result = emitExpr(*replExpr);
+            if (!builder_.GetInsertBlock()->getTerminator()) {
+                Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+                callRT("perl_local_restore_to", {depth});
+                /* Clone so the returned PV outlives this frame's temps */
+                Value *cloned = callRT("perl_clone", {result});
+                freeIfOwned(result);
+                builder_.CreateRet(cloned);
+            }
+            popScope();
+
+            currentFn_ = savedFn;
+            builder_.SetInsertPoint(savedBB);
+            scopes_ = std::move(savedSc);
+            arrayScopes_ = std::move(savedArr);
+            hashScopes_ = std::move(savedHash);
+            pvScopes_ = std::move(savedPv);
+            floatScopes_ = std::move(savedF);
+            intScopes_ = std::move(savedI);
+            localDepthAlloca_ = savedLDep;
+            currentSubBody_ = savedBody;
+            currentSubNeedsWantarray_ = savedNeeds;
+
+            Value *fnPtr = builder_.CreateBitCast(evalFn, PointerType::getUnqual(ctx_));
+            Value *capsAv = callRT("perl_array_new", {});
+            for (auto *cv : capVals)
+                callRT("perl_array_push_capture", {capsAv, cv});
+            Value *cnt = callRT("perl_regex_subst_e", {str, pat, flg, fnPtr, capsAv});
+            return callRT("perl_alloc_int", {cnt});
+        }
+
+        Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
         Value *cnt  = callRT("perl_regex_subst", {str, pat, rep, flg});
         return callRT("perl_alloc_int", {cnt});
     }
@@ -6600,8 +6921,12 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::WarnStmt: {
+        /* D49: pass file/line for location suffix + $SIG{__WARN__} */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *msg = n.left ? emitExpr(*n.left) : perlStr("Warning: something's wrong");
-        callRT("perl_warn", {msg});
+        Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "warn.file");
+        Value *lineVal = ConstantInt::get(i32Ty, n.line);
+        callRT("perl_warn", {msg, fileStr, lineVal});
         return perlUndef();
     }
 
@@ -7183,16 +7508,20 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (src) callRT("perl_array_extend", {av, src});
             else     callRT("perl_array_push",   {av, emitExpr(*arg)});
         }
-        /* Set wantarray context for the called sub */
+        /* Set wantarray context (D87: -1 inherit, 0 scalar, 1 list, 2 void) */
         auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *ctxVal;
-        if (callCtx_ == 1) {
+        if (callCtx_ == 1)
             ctxVal = ConstantInt::get(i32Ty, 1);
-        } else if (currentSubNeedsWantarray_) {
-            ctxVal = callRT("perl_current_wantarray_ctx", {});
-        } else {
+        else if (callCtx_ == 2)
+            ctxVal = ConstantInt::get(i32Ty, 2);
+        else if (callCtx_ == 0)
             ctxVal = ConstantInt::get(i32Ty, 0);
-        }
+        else if (currentSubNeedsWantarray_)
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        else
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        callCtx_ = 0;
         callRT("perl_push_wantarray", {ctxVal});
         Value *result = callRT("perl_call_code_ref", {ref, av});
         callRT("perl_pop_wantarray", {});
@@ -7423,19 +7752,31 @@ Value *CodeGen::emitBinOp(const Node &n) {
         if (Value *fv = emitExprF64(n))
             return boxF64(fv);
     }
-    /* short-circuit ops */
+    /* short-circuit ops.
+       D94: Perl evaluates the LEFT operand of ||/&&/or/and/ // in scalar
+       context always (it's only boolean-tested / defined-tested). The RIGHT
+       operand, when reached, inherits the surrounding expression's own
+       context — so `my @a = (0 || listret())` must give listret() list
+       context. callCtx_ is a one-shot flag consumed by the first Call it
+       reaches; without saving/restoring here, a Call on the left would
+       both wrongly see list context AND starve the right of it. */
     if (n.sval == "&&") {
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *rhsBB  = BasicBlock::Create(ctx_, "and.rhs",  fn);
         auto *endBB  = BasicBlock::Create(ctx_, "and.end",  fn);
+        int savedCallCtx = callCtx_;
+        callCtx_ = 0;   /* left always scalar */
         Value *lv  = emitExpr(*n.left);
+        callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
         Value *ltrue = builder_.CreateICmpNE(lb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         auto *lBB  = builder_.GetInsertBlock();
         builder_.CreateCondBr(ltrue, rhsBB, endBB);
 
         builder_.SetInsertPoint(rhsBB);
+        callCtx_ = savedCallCtx;  /* right inherits outer context */
         Value *rv = emitShortCircuitRhs(*n.right);
+        callCtx_ = savedCallCtx;
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);
@@ -7450,14 +7791,19 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *rhsBB  = BasicBlock::Create(ctx_, "or.rhs", fn);
         auto *endBB  = BasicBlock::Create(ctx_, "or.end", fn);
+        int savedCallCtx = callCtx_;
+        callCtx_ = 0;   /* left always scalar */
         Value *lv  = emitExpr(*n.left);
+        callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
         Value *ltrue = builder_.CreateICmpNE(lb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         auto *lBB  = builder_.GetInsertBlock();
         builder_.CreateCondBr(ltrue, endBB, rhsBB);
 
         builder_.SetInsertPoint(rhsBB);
+        callCtx_ = savedCallCtx;  /* right inherits outer context */
         Value *rv = emitShortCircuitRhs(*n.right);
+        callCtx_ = savedCallCtx;
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);
@@ -7473,14 +7819,19 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *rhsBB = BasicBlock::Create(ctx_, "defor.rhs", fn);
         auto *endBB = BasicBlock::Create(ctx_, "defor.end", fn);
+        int savedCallCtx = callCtx_;
+        callCtx_ = 0;   /* left always scalar (defined-test) */
         Value *lv   = emitExpr(*n.left);
+        callCtx_ = savedCallCtx;
         Value *lb   = callRT("perl_defined", {lv});
         Value *ldef = builder_.CreateICmpNE(lb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         auto *lBB   = builder_.GetInsertBlock();
         builder_.CreateCondBr(ldef, endBB, rhsBB);
 
         builder_.SetInsertPoint(rhsBB);
+        callCtx_ = savedCallCtx;  /* right inherits outer context */
         Value *rv = emitExpr(*n.right);
+        callCtx_ = savedCallCtx;
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);
@@ -7502,46 +7853,46 @@ Value *CodeGen::emitBinOp(const Node &n) {
          Value *ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
          builder_.CreateCondBr(ctrue, thenBB, elseBB);
 
-         /* Helper lambda: wrap a list-producing value based on wantarray context */
-         auto wrapListIfNeeded = [&](const Node &branchNode, Value *val) -> Value * {
-             if (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
-                 branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc ||
-                 branchNode.kind == NK::SortFunc || branchNode.kind == NK::DerefArray ||
-                 branchNode.kind == NK::ReverseFunc) {
-                 auto *i32Ty = Type::getInt32Ty(ctx_);
-                 Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                 Value *isList = builder_.CreateICmpNE(ctx, ConstantInt::get(i32Ty, 0));
-                 Value *av = (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
-                              branchNode.kind == NK::DerefArray) ? val : emitArrayPtr(branchNode);
-                 if (!av) av = callRT("perl_array_new", {});
-                 Value *listResult = callRT("perl_array_to_list_return", {av});
-                 Value *scalarResult = perlUndef();
-                 if (branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc)
-                     scalarResult = callRT("perl_array_len", {av});
-                 else if (branchNode.kind == NK::SortFunc)
-                     scalarResult = perlUndef();
-                 else if (branchNode.kind == NK::ReverseFunc)
-                     scalarResult = callRT("perl_array_len", {av});
-                 else if (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
-                          branchNode.kind == NK::DerefArray) {
-                     /* For plain list literals/vars, return last element in scalar context */
-                     scalarResult = callRT("perl_array_last", {av});
-                 }
-                 return builder_.CreateSelect(isList, listResult, scalarResult);
-             }
-             return val;
-         };
+        /* Helper: emit a ternary branch. ArrayLit/list-producers need
+           wantarray-aware wrapping. For ArrayLit/ArrayVar/DerefArray,
+           perl_array_to_list_return already picks list-wrap vs last-elem
+           from the wantarray stack (same as `return (1,2)`). Map/grep/
+           sort need the count/undef scalar special cases. */
+        auto emitBranch = [&](const Node &branchNode) -> Value * {
+            if (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
+                branchNode.kind == NK::DerefArray) {
+                Value *av = emitArrayPtr(branchNode);
+                if (!av) av = callRT("perl_array_new", {});
+                return callRT("perl_array_to_list_return", {av});
+            }
+            if (branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc ||
+                branchNode.kind == NK::SortFunc || branchNode.kind == NK::ReverseFunc) {
+                auto *i32Ty = Type::getInt32Ty(ctx_);
+                Value *ctx = callRT("perl_current_wantarray_ctx", {});
+                Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
+                Value *av = emitArrayPtr(branchNode);
+                if (!av) av = callRT("perl_array_new", {});
+                Value *listResult = callRT("perl_array_to_list_return", {av});
+                Value *scalarResult = perlUndef();
+                if (branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc)
+                    scalarResult = callRT("perl_array_len", {av});
+                else if (branchNode.kind == NK::SortFunc)
+                    scalarResult = perlUndef();
+                else if (branchNode.kind == NK::ReverseFunc)
+                    scalarResult = callRT("perl_array_len", {av});
+                return builder_.CreateSelect(isList, listResult, scalarResult);
+            }
+            return emitExpr(branchNode);
+        };
 
-         builder_.SetInsertPoint(thenBB);
-         Value *tv = emitExpr(*n.left);
-         tv = wrapListIfNeeded(*n.left, tv);
+        builder_.SetInsertPoint(thenBB);
+        Value *tv = emitBranch(*n.left);
          auto *tb  = builder_.GetInsertBlock();
          bool thenTerminated = tb->getTerminator() != nullptr;
          if (!thenTerminated) builder_.CreateBr(endBB);
 
          builder_.SetInsertPoint(elseBB);
-         Value *ev = emitExpr(*n.right);
-         ev = wrapListIfNeeded(*n.right, ev);
+         Value *ev = emitBranch(*n.right);
          auto *eb  = builder_.GetInsertBlock();
          bool elseTerminated = eb->getTerminator() != nullptr;
          if (!elseTerminated) builder_.CreateBr(endBB);
@@ -7576,7 +7927,7 @@ Value *CodeGen::emitBinOp(const Node &n) {
        nested call argument — this is the complementary fix for what
        happens once evaluation descends into a scalar-forcing operator). */
     int savedCallCtx = callCtx_;
-    callCtx_ = 0;
+    callCtx_ = 0; /* D88: force scalar on both operands */
     Value *lv = emitExpr(*n.left);
     callCtx_ = 0;
     Value *rv = emitExpr(*n.right);
@@ -7859,13 +8210,16 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *lineVal = ConstantInt::get(i32Ty, n.line);
         callRT("perl_push_call_frame", {pkgStr, fileStr, lineVal});
         Value *ctxVal;
-        if (callCtx_ == 1) {
+        if (callCtx_ == 1)
             ctxVal = ConstantInt::get(i32Ty, 1);
-        } else if (currentSubNeedsWantarray_) {
-            ctxVal = callRT("perl_current_wantarray_ctx", {});
-        } else {
+        else if (callCtx_ == 2)
+            ctxVal = ConstantInt::get(i32Ty, 2);
+        else if (callCtx_ == 0)
             ctxVal = ConstantInt::get(i32Ty, 0);
-        }
+        else if (currentSubNeedsWantarray_)
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        else
+            ctxVal = ConstantInt::get(i32Ty, 0);
         callCtx_ = 0;
         Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
         callRT("perl_pop_call_frame", {});
@@ -7893,13 +8247,16 @@ Value *CodeGen::emitCall(const Node &n) {
         }
         auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *ctxVal;
-        if (callCtx_ == 1) {
+        if (callCtx_ == 1)
             ctxVal = ConstantInt::get(i32Ty, 1);
-        } else if (currentSubNeedsWantarray_) {
-            ctxVal = callRT("perl_current_wantarray_ctx", {});
-        } else {
+        else if (callCtx_ == 2)
+            ctxVal = ConstantInt::get(i32Ty, 2);
+        else if (callCtx_ == 0)
             ctxVal = ConstantInt::get(i32Ty, 0);
-        }
+        else if (currentSubNeedsWantarray_)
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        else
+            ctxVal = ConstantInt::get(i32Ty, 0);
         callCtx_ = 0;
         Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
         Value *retVal = callRT("perl_call_named_sub", {nameStr, argsArr, ctxVal});

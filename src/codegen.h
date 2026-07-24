@@ -94,6 +94,7 @@ private:
     std::unordered_map<std::string, llvm::Value *> floatSqrtOf_;
     /* D10: per-compilation counters (reset in compile()) */
     int sortCmpCounter_ = 0;
+    int substEvalCounter_ = 0; /* D38c: unique names for s///e eval fns */
     int stateSeq_ = 0;
     int endSeq_ = 0;
     /* Stage 31: flat-double read cache: (outerNm\x01idxNm\x01elemIdx) → f64 Value*.
@@ -170,7 +171,7 @@ private:
        which has no real PerlValue* for a closure to later share) even
        though the fast path would otherwise apply — see D64 in TESTS.md. */
     std::unordered_set<std::string> capturedNamesInCurrentFn_;
-    /* 0=scalar context, 1=list context — set before emitting call, consumed by emitCall */
+    /* D87: -1=inherit caller (last-expr only), 0=scalar (default), 1=list, 2=void */
     int                            callCtx_ = 0;
     /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
     const Node                    *currentSubBody_ = nullptr;

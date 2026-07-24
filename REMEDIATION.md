@@ -510,3 +510,56 @@ Original items (1-14) — all fixed at time of writing:
 72. ~~**Fix D86: `print {EXPR} LIST` / `say {EXPR} LIST` brace-block filehandle form**~~ — FIXED (2026-07-18)
     - Root cause: `parsePrint()` only had detection for bare STDOUT/STDERR (ident) and `$scalar` (SCALAR token) but the `{EXPR}` brace-block form was never recognized as a filehandle indicator. The parser would fall through to treat `{$expr}` as a hash-literal anonymous hash expression, stringifying it to `HASH(0x...)` and printing to STDOUT instead of redirecting to the intended filehandle.
     - **Fix**: Two changes: (1) parser.cpp `parsePrint()` — added an LBRACE detection branch that parses the brace-block expression as a filehandle indicator, stores it in `n->left`, and the remaining arguments in `n->args`; also fixed `isSay` propagation so `say {$fh} ...` correctly produces `SayStmt` instead of `PrintStmt` (the old code had `n->kind = NK::PrintStmt` hardcoded, ignoring the `isSay` parameter); (2) codegen.cpp `PrintStmt`/`SayStmt` handler — added the D86 branch that evaluates `n.left` via `emitExpr()` when present, using the result as the target filehandle. Verified: `print {$fh} LIST` / `say {$fh} LIST` / `print {EXPR} LIST` (arbitrary expr) / `{EXPR}` with multiple args / scalar-variable FH expressions — verified byte-for-byte against real Perl. Tests: `tests/d86_brace_fork_smoke.pl` (2 checks), `tests/d86_brace_fork_deep.pl` (4 checks), `tests/d86_print_brace_fh_smoke.pl` (pre-existing, ~8 checks). Full `tests/harness.sh` regression suite: zero new failures.
+
+73. ~~**Fix D94: `||`/`&&`/`//` right-hand operand inherits outer list context**~~ — FIXED (2026-07-24)
+    - Left operand always scalar; right inherits outer `callCtx_` (save/restore around short-circuit).
+    - Tests: `tests/d94_or_list_context_smoke.pl`, `tests/d94_or_list_context.pl`.
+
+74. ~~**Fix D95: bare `f() x N` is string repetition, not list**~~ — FIXED (2026-07-24)
+    - List-rep `x` only when LHS is ArrayLit/`qw`; bare call → string rep.
+    - Tests: `tests/d95_repeat_list_vs_str_smoke.pl`, `tests/d95_repeat_list_vs_str.pl`.
+
+75. ~~**Fix D76: nested DESTROY cascade**~~ — FIXED (2026-07-24)
+    - AnonHash free of temps after push + free listArr so nested blessed objects fire DESTROY.
+    - Tests: `tests/d76_destroy_cascade_smoke.pl`, `tests/d76_destroy_cascade.pl`.
+
+76. ~~**Fix D81: `delete @h{...}` / `delete @a[...]` slices**~~ — FIXED (2026-07-24)
+    - Parser + codegen; `perl_array_delete` trims trailing undefs.
+    - Tests: `tests/d81_delete_slice_smoke.pl`, `tests/d81_delete_slice.pl`.
+
+77. ~~**Fix D80: `$+{name}` string interpolation**~~ — FIXED (2026-07-24)
+    - Interp scanner recognizes `$+{key}`.
+    - Tests: `tests/d80_plus_hash_interp_smoke.pl`, `tests/d80_plus_hash_interp.pl`.
+
+78. ~~**Fix D82: sprintf/printf `%N$` positional args**~~ — FIXED (2026-07-24)
+    - Runtime sprintf supports `%N$` and `*N$` width/prec.
+    - Tests: `tests/d82_sprintf_positional_smoke.pl`, `tests/d82_sprintf_positional.pl`.
+
+79. ~~**Fix D41: `local $h{key}` / `local $a[i]`**~~ — FIXED (2026-07-24)
+    - Parser element form; lvalue via hash/array lvalue + `perl_local_save`; bare local undefs.
+    - Tests: `tests/d41_local_elem_smoke.pl`, `tests/d41_local_elem.pl`.
+
+80. ~~**Fix D87: three-state wantarray (void/scalar/list)**~~ — FIXED (2026-07-24)
+    - `callCtx_`: -1 inherit (last-expr/return), 0 scalar, 1 list, 2 void; bare ExprStmt → void.
+    - Tests: `tests/d87_void_wantarray_smoke.pl`, `tests/d87_void_wantarray.pl`.
+
+81. ~~**Fix D90: length/ord/substr honor PV_FLAG_UTF8**~~ — FIXED (2026-07-24)
+    - Binary/pack = byte length; `chr(>255)` sets UTF8; length/ord/substr branch on flag.
+    - Tests: `tests/d90_length_binary_smoke.pl`, `tests/d90_length_binary.pl`.
+
+82. ~~**Fix D89: die location suffix unquoted path**~~ — FIXED (2026-07-24)
+    - `appendDieLocation`: `at FILE line N.` (no quotes around path).
+    - Tests: `tests/d89_die_location_smoke.pl`, `tests/d89_die_location.pl`.
+
+83. ~~**Fix D49: `%SIG` / `$SIG{__WARN__}` / `$SIG{__DIE__}`**~~ — FIXED (2026-07-24)
+    - Process-wide `perl_get_sig_hash`; warn/die invoke CODE handlers; recursion guards.
+    - Tests: `tests/d49_sig_warn_smoke.pl`, `tests/d49_sig_warn.pl`.
+
+84. ~~**Fix D38c: `s///e` evaluates replacement as code**~~ — FIXED (2026-07-24)
+    - Compile-time parse of repl expr → `__subst_e_N` callback; `perl_regex_subst_e` per match with `$1`/`$&`.
+    - Bonus: non-`/e` replacements expand `$&`.
+    - Tests: `tests/d38c_subst_e_smoke.pl`, `tests/d38c_subst_e.pl`.
+
+85. ~~**D79 re-verified: decimal-only string→number coercion**~~ — FIXED earlier (2026-07-18, commit b81abed); re-verified 2026-07-24
+    - `perl_atoll_decimal` / `perl_atof_decimal` — no 0x/0b auto-detect.
+    - Tests: `tests/d79_string_coercion*.pl`, `tests/d79_hex_coercion*.pl`.

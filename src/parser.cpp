@@ -191,6 +191,18 @@ NodePtr Parser::parseStmt() {
         else { varName = cur().text; advance(); }
         auto n = std::make_unique<Node>(); n->kind = NK::LocalStmt;
         n->name = varName; n->line = line;
+        /* D41: local $h{key} / local $arr[idx] */
+        if (check(TK::LBRACKET)) {
+            advance();
+            n->sval = "array_elem";
+            n->right = parseExpr();
+            consume(TK::RBRACKET, "]");
+        } else if (check(TK::LBRACE)) {
+            advance();
+            n->sval = "hash_elem";
+            n->right = parseExpr();
+            consume(TK::RBRACE, "}");
+        }
         if (match(TK::ASSIGN))
             n->left = parseLowNot();
         return parseModifier(std::move(n), line);
@@ -2124,9 +2136,37 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* delete $h{key}  or  delete $arr[N] */
+    /* delete $h{key} / delete $arr[N] /
+       delete @h{k1,k2} / delete @arr[i,j] (D81 slice forms) */
     if (check(TK::KW_DELETE)) {
         advance();
+        bool hasParen = match(TK::LPAREN);
+        if (check(TK::ARRAY)) {
+            /* slice-form: delete @name{...} or delete @name[...] */
+            advance();
+            std::string nm = cur().text; advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::DeleteFunc;
+            n->name = nm; n->line = line;
+            if (check(TK::LBRACKET)) {
+                advance();
+                n->sval = "array_slice";
+                while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
+                    n->args.push_back(parseExpr());
+                    if (!match(TK::COMMA)) break;
+                }
+                consume(TK::RBRACKET, "]");
+            } else {
+                consume(TK::LBRACE, "{");
+                n->sval = "hash_slice";
+                while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
+                    n->args.push_back(parseExpr());
+                    if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+                }
+                consume(TK::RBRACE, "}");
+            }
+            if (hasParen) consume(TK::RPAREN, ")");
+            return n;
+        }
         consume(TK::SCALAR, "$");
         std::string nm = cur().text; advance();
         auto n = std::make_unique<Node>(); n->kind = NK::DeleteFunc;
@@ -2141,6 +2181,7 @@ NodePtr Parser::parsePrimary() {
             n->left = parseExpr();
             consume(TK::RBRACE, "}");
         }
+        if (hasParen) consume(TK::RPAREN, ")");
         return n;
     }
 
@@ -3060,24 +3101,24 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* parenthesised expression or list — FATARROW (=>) acts as COMMA */
+    /* parenthesised expression or list — FATARROW (=>) acts as COMMA.
+       D95: a single-element `(expr)` is kept as ArrayLit (not unwrapped)
+       so `(f()) x N` is recognized as list-repetition (left is ArrayLit).
+       Bare `f() x N` stays a Call left-operand and is string-repetition.
+       Scalar context of ArrayLit is handled at assign/use sites (last elem). */
     if (check(TK::LPAREN)) {
         advance();
         if (check(TK::RPAREN)) { advance(); auto n = std::make_unique<Node>(); n->kind = NK::ArrayLit; n->line = line; return n; }
         auto inner = parseExpr();
-        if (check(TK::COMMA) || check(TK::FATARROW)) {
-            NodeList elems; elems.push_back(std::move(inner));
-            while (match(TK::COMMA) || match(TK::FATARROW)) {
-                if (check(TK::RPAREN)) break;
-                elems.push_back(parseExpr());
-            }
-            consume(TK::RPAREN, ")");
-            auto n = std::make_unique<Node>(); n->kind = NK::ArrayLit;
-            n->args = std::move(elems); n->line = line;
-            return n;
+        NodeList elems; elems.push_back(std::move(inner));
+        while (match(TK::COMMA) || match(TK::FATARROW)) {
+            if (check(TK::RPAREN)) break;
+            elems.push_back(parseExpr());
         }
         consume(TK::RPAREN, ")");
-        return inner;
+        auto n = std::make_unique<Node>(); n->kind = NK::ArrayLit;
+        n->args = std::move(elems); n->line = line;
+        return n;
     }
 
     /* function call or bare identifier */
@@ -3164,6 +3205,22 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 flush();
                 parts.push_back(makeScalar("&", line));
                 i += 2; continue;
+            }
+            /* D80: $+{name} — named-capture hash element inside strings.
+               Bare $+{name} already works via token-level parsePrimary;
+               the interp scanner previously treated "$+" as non-alpha and
+               left "$+{y}" as literal text. */
+            if (nc == '+' && i + 2 < raw.size() && raw[i+2] == '{') {
+                flush();
+                i += 3; /* skip $+{ */
+                std::string key;
+                while (i < raw.size() && raw[i] != '}') key += raw[i++];
+                if (i < raw.size()) i++; /* skip } */
+                auto n = std::make_unique<Node>();
+                n->kind = NK::HashElem; n->name = "+";
+                n->left = makeStr(key, line); n->line = line;
+                parts.push_back(std::move(n));
+                continue;
             }
         }
         /* $0 — program name */
