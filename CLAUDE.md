@@ -12,18 +12,16 @@ A Perl compiler targeting LLVM IR, written in C++17 with LLVM 18 (`clang-18`/`ll
 
 Ordered by blast radius × silence. Full details in `TESTS.md` / `REMEDIATION.md`.
 
-### 2026-07-24 session (items 73–85 in REMEDIATION.md)
+### 2026-07-24 session (items 73–87 in REMEDIATION.md)
 
-Fixed: **D94**, **D95**, **D76**, **D81**, **D80**, **D82**, **D41**, **D87**, **D90**, **D89**, **D49**, **D38c**; **D79** re-verified (fixed 2026-07-18). Also already fixed earlier and re-confirmed: D91, D93, D86, D68, D70, D78, D83, D84.
+Fixed: **D94**, **D95**, **D76**, **D81**, **D80**, **D82**, **D41**, **D87**, **D90**, **D89**, **D49**, **D38c**, **D46**, **D36**; **D79** re-verified (fixed 2026-07-18). Also already fixed earlier and re-confirmed: D91, D93, D86, D68, D70, D78, D83, D84.
 
 ### Top remaining correctness fixes
 
-1. **D92** — narrow nested-sub + shared-array runtime crash
-2. **D36** — bareword `foo "x"` silently no-ops (hurts Carp idioms)
-3. **D46** — `$x?$y:"str"` no-space ternary parse fail
-4. **D56** — no `use warnings` / uninitialized diagnostics
-5. **D62** — closure capture reassignment not visible to caller (if still open)
-6. **D60** — bare `q(...)` non-brace delimiter
+1. **D92** — narrow nested-sub + shared-array runtime crash (may be stale)
+2. **D56** — no `use warnings` / uninitialized diagnostics
+3. **D62** — closure capture / list-return edge cases
+4. Docs cleanup: D38a/D48/D60 likely already fixed on HEAD
 
 ### Top remaining missing features
 

@@ -221,22 +221,18 @@ NodePtr Parser::parseStmt() {
     }
     if (check(TK::KW_WHILE))   return parseWhile();
     /* LABEL: for/foreach/while/until
-       The lexer folds `OUTER:` into one IDENT token whose text ends with `:`.
-       Detect that and peek at the next token for a loop keyword. */
-    if (check(TK::IDENT)) {
-        const std::string &txt = cur().text;
-        bool isLabel = txt.size() >= 2 && txt.back() == ':' &&
-                       !(txt.size() >= 2 && txt[txt.size()-2] == ':'); /* not '::' */
-        if (isLabel) {
-            TK nextTok = pos_ + 1 < toks_.size() ? toks_[pos_+1].kind : TK::EOF_TOK;
-            if (nextTok == TK::KW_FOR || nextTok == TK::KW_FOREACH ||
-                nextTok == TK::KW_WHILE || nextTok == TK::KW_UNTIL) {
-                std::string label = txt.substr(0, txt.size() - 1); /* strip trailing : */
-                advance(); /* consume the LABEL: token */
-                NodePtr loop = parseStmt();
-                if (loop) loop->sval = label;
-                return loop;
-            }
+       D46: lexer no longer folds trailing ':' into IDENT — labels are
+       IDENT + COLON (package names still use '::' inside IDENT). */
+    if (check(TK::IDENT) && peek(1).kind == TK::COLON) {
+        TK nextTok = pos_ + 2 < toks_.size() ? toks_[pos_ + 2].kind : TK::EOF_TOK;
+        if (nextTok == TK::KW_FOR || nextTok == TK::KW_FOREACH ||
+            nextTok == TK::KW_WHILE || nextTok == TK::KW_UNTIL) {
+            std::string label = cur().text;
+            advance(); /* IDENT */
+            advance(); /* COLON */
+            NodePtr loop = parseStmt();
+            if (loop) loop->sval = label;
+            return loop;
         }
     }
     if (check(TK::KW_UNTIL)) {
@@ -3135,12 +3131,59 @@ NodePtr Parser::parsePrimary() {
                 return cit->second->clone();  /* pre-parsed AST node (cloned for reuse) */
             }
         }
+        /* D36: bareword call without parens — croak "msg", foo $x, bar 1, 2 */
+        if (looksLikeBareCallArg())
+            return parseBareCall(nm, line);
         /* bareword string */
         return makeStr(nm, line);
     }
 
     throw std::runtime_error("Parse error line " + std::to_string(line) +
         ": unexpected token '" + cur().text + "' (this may be due to advanced Perl syntax in an imported module)");
+}
+
+bool Parser::looksLikeBareCallArg() const {
+    /* Tokens that can start a call argument after a bareword sub name.
+       Deliberately excludes binary operators, SEMI, closers, FATARROW
+       (hash key), and bare IDENT used as string (print FOO style is
+       handled by print's own parser). */
+    TK k = toks_[pos_].kind;
+    switch (k) {
+    case TK::STRING: case TK::INT: case TK::FLOAT:
+    case TK::SCALAR: case TK::ARRAY: case TK::HASH:
+    case TK::LPAREN: case TK::LBRACKET: case TK::LBRACE:
+    case TK::KW_UNDEF: case TK::KW_SUB: case TK::REGEX: case TK::QWORDS:
+    case TK::KW_NOT: case TK::NOT:
+    case TK::PLUS: case TK::MINUS: case TK::PLUS_PLUS: case TK::MINUS_MINUS:
+    case TK::KW_ABS: case TK::KW_INT: case TK::KW_SQRT:
+    case TK::KW_UC: case TK::KW_LC: case TK::KW_UCFIRST: case TK::KW_LCFIRST:
+    case TK::KW_CHR: case TK::KW_ORD: case TK::KW_HEX: case TK::KW_OCT:
+    case TK::KW_LENGTH: case TK::KW_DEFINED: case TK::KW_REF:
+    case TK::KW_SHIFT: case TK::KW_POP: case TK::KW_KEYS: case TK::KW_VALUES:
+    case TK::KW_JOIN: case TK::KW_SPLIT: case TK::KW_SORT:
+    case TK::KW_MAP: case TK::KW_GREP: case TK::KW_REVERSE:
+    case TK::KW_WANTARRAY: case TK::KW_CALLER: case TK::KW_TIME:
+    case TK::KW_RAND: case TK::KW_SRAND: case TK::KW_SLEEP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+NodePtr Parser::parseBareCall(std::string name, int line) {
+    /* D36: foo ARG, ARG2  — list-operator style, no parentheses */
+    auto it = importMap_.find(name);
+    if (it != importMap_.end()) name = it->second;
+    NodeList args;
+    args.push_back(parseExpr());
+    while (match(TK::COMMA) || match(TK::FATARROW)) {
+        if (check(TK::SEMI) || check(TK::EOF_TOK) || isModifier()) break;
+        if (check(TK::RPAREN) || check(TK::RBRACE) || check(TK::RBRACKET)) break;
+        args.push_back(parseExpr());
+    }
+    auto n = std::make_unique<Node>(); n->kind = NK::Call;
+    n->name = name; n->args = std::move(args); n->line = line;
+    return n;
 }
 
 NodePtr Parser::parseCall(std::string name, int line) {

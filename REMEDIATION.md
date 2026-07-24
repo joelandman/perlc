@@ -563,3 +563,14 @@ Original items (1-14) — all fixed at time of writing:
 85. ~~**D79 re-verified: decimal-only string→number coercion**~~ — FIXED earlier (2026-07-18, commit b81abed); re-verified 2026-07-24
     - `perl_atoll_decimal` / `perl_atof_decimal` — no 0x/0b auto-detect.
     - Tests: `tests/d79_string_coercion*.pl`, `tests/d79_hex_coercion*.pl`.
+
+86. ~~**Fix D46: no-space ternary `$x?$y:"str"`**~~ — FIXED (2026-07-24)
+    - Root cause: `Lexer::readIdent()` absorbed lone `:` into the identifier (`y:`), eating the ternary colon.
+    - Fix: only absorb package separators as `::`; labels are now IDENT + COLON.
+    - Tests: `tests/d46_ternary_nospace_smoke.pl`, `tests/d46_ternary_nospace.pl`.
+
+87. ~~**Fix D36: bareword call without parentheses**~~ — FIXED (2026-07-24)
+    - Root cause: bare IDENT without `()` always became a string literal, so `foo "x"` was two discarded strings.
+    - Fix: if next token can start an argument, parse as list-operator-style Call (`parseBareCall`).
+    - Note: names `croak`/`carp`/`confess` still route to built-in Carp runtime (pre-existing).
+    - Tests: `tests/d36_bareword_call_smoke.pl`, `tests/d36_bareword_call.pl`.

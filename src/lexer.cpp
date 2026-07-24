@@ -169,8 +169,16 @@ Token Lexer::readString(char delim, bool interpolates) {
 }
 
 Token Lexer::readIdent() {
+    /* D46: do NOT swallow a lone ':' (ternary / labels). Only absorb
+       package separators as the two-char sequence '::'. Previously
+       `while (... || peek()==':')` turned `$y:"str"` into IDENT "y:"
+       and ate the ternary colon. */
     size_t start = pos_;
-    while (isalnum(peek()) || peek() == '_' || peek() == ':') pos_++;
+    while (isalnum((unsigned char)peek()) || peek() == '_') pos_++;
+    while (peek() == ':' && peek(1) == ':') {
+        pos_ += 2;
+        while (isalnum((unsigned char)peek()) || peek() == '_') pos_++;
+    }
     std::string text = src_.substr(start, pos_ - start);
     auto it = KEYWORDS.find(text);
     if (it != KEYWORDS.end()) return {it->second, text, line_};

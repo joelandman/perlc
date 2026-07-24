@@ -75,6 +75,8 @@ private:
     NodePtr parsePostfix();
     NodePtr parsePrimary();
     NodePtr parseCall(std::string name, int line);
+    bool    looksLikeBareCallArg() const; /* D36 */
+    NodePtr parseBareCall(std::string name, int line); /* D36: foo "arg" without () */
     NodePtr parseStringInterp(const std::string &raw, int line);
     NodePtr parseSubscript(NodePtr base, int line); /* chains ->[]/->{}  */
 
