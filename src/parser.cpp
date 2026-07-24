@@ -3171,7 +3171,8 @@ bool Parser::looksLikeBareCallArg() const {
 }
 
 NodePtr Parser::parseBareCall(std::string name, int line) {
-    /* D36: foo ARG, ARG2  — list-operator style, no parentheses */
+    /* D36: foo ARG, ARG2  — list-operator style, no parentheses.
+       ival=1 marks bareword-style call (unknown name → compile error). */
     auto it = importMap_.find(name);
     if (it != importMap_.end()) name = it->second;
     NodeList args;
@@ -3183,6 +3184,7 @@ NodePtr Parser::parseBareCall(std::string name, int line) {
     }
     auto n = std::make_unique<Node>(); n->kind = NK::Call;
     n->name = name; n->args = std::move(args); n->line = line;
+    n->ival = 1; /* bareword call */
     return n;
 }
 
@@ -3199,6 +3201,7 @@ NodePtr Parser::parseCall(std::string name, int line) {
     consume(TK::RPAREN, ")");
     auto n = std::make_unique<Node>(); n->kind = NK::Call;
     n->name = name; n->args = std::move(args); n->line = line;
+    n->ival = 0; /* parenthesized call */
     return n;
 }
 

@@ -8263,6 +8263,16 @@ Value *CodeGen::emitCall(const Node &n) {
         callRT("perl_array_free", {argsArr});
         return retVal;
     }
+    /* D36 residual: bareword call `foo "arg"` to an unknown name is a
+       compile error in real Perl ("String found where operator expected
+       / Do you need to predeclare"). Parenthesized `foo()` stays soft
+       (returns undef) — real Perl defers those to runtime. */
+    if (n.ival == 1) {
+        throw std::runtime_error(
+            "String found where operator expected (Do you need to predeclare \"" +
+            n.name + "\"?) at " + sourceFile_ + " line " +
+            std::to_string(n.line > 0 ? n.line : 1));
+    }
     return perlUndef();
 }
 

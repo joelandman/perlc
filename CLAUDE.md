@@ -18,10 +18,10 @@ Fixed: **D94**, **D95**, **D76**, **D81**, **D80**, **D82**, **D41**, **D87**, *
 
 ### Top remaining correctness fixes
 
-1. **D92** — narrow nested-sub + shared-array runtime crash (may be stale)
-2. **D56** — no `use warnings` / uninitialized diagnostics
-3. **D62** — closure capture / list-return edge cases
-4. Docs cleanup: D38a/D48/D60 likely already fixed on HEAD
+1. **D56** — no `use warnings` / uninitialized diagnostics
+2. **D36 residual** — unknown bareword `foo "x"` should be a compile error (known subs OK)
+3. **D54** — perlc_tsan tooling hang (not generated-code correctness)
+4. Docs: D38a/D48/D92 marked fixed/stale 2026-07-24
 
 ### Top remaining missing features
 

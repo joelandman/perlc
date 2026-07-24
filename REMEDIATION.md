@@ -574,3 +574,8 @@ Original items (1-14) — all fixed at time of writing:
     - Fix: if next token can start an argument, parse as list-operator-style Call (`parseBareCall`).
     - Note: names `croak`/`carp`/`confess` still route to built-in Carp runtime (pre-existing).
     - Tests: `tests/d36_bareword_call_smoke.pl`, `tests/d36_bareword_call.pl`.
+
+88. ~~**Docs sync: D38a / D48 / D92**~~ — STALE→FIXED (2026-07-24)
+    - D38a: alternate-delimiter `s{}{}` / `s###` / `s!!!` verified working.
+    - D48: `no PRAGMA;` already handled (same fix as D91).
+    - D92: nested block-sub crash repro no longer fails on HEAD.
