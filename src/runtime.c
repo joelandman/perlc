@@ -21,6 +21,7 @@
 #include <semaphore.h>
 #include <dlfcn.h>
 #include <sqlite3.h>
+#include <sys/syscall.h>
 
 /* D24: main.cpp bakes the perlc compiler's own absolute path into every
    compiled executable via -DPERLC_SELF_PATH, so perl_do_file() can
@@ -5727,6 +5728,42 @@ PerlValue *perl_system(PerlValue *cmd) {
        failed to launch a child at all) is returned as-is, matching Perl. */
     if (ret == -1) return perl_alloc_int(-1);
     return perl_alloc_int(ret);
+}
+
+/* D70: syscall() builtin - call system call with arguments */
+PerlValue *perl_syscall(PerlValue *args) {
+    /* args is a PerlArray containing the syscall number and arguments */
+    PerlArray *arg_array = perl_unwrap_list_return(args);
+    if (!arg_array || arg_array->len < 1) {
+        return perl_alloc_undef();
+    }
+    
+    /* First element is the syscall number */
+    long long syscall_num = perl_to_int(arg_array->elems[0]);
+    
+    /* Handle up to 6 arguments (standard syscall convention) */
+    long long arg1 = 0, arg2 = 0, arg3 = 0, arg4 = 0, arg5 = 0, arg6 = 0;
+    if (arg_array->len > 1) arg1 = perl_to_int(arg_array->elems[1]);
+    if (arg_array->len > 2) arg2 = perl_to_int(arg_array->elems[2]);
+    if (arg_array->len > 3) arg3 = perl_to_int(arg_array->elems[3]);
+    if (arg_array->len > 4) arg4 = perl_to_int(arg_array->elems[4]);
+    if (arg_array->len > 5) arg5 = perl_to_int(arg_array->elems[5]);
+    if (arg_array->len > 6) arg6 = perl_to_int(arg_array->elems[6]);
+    
+    /* Call the actual syscall */
+    long long result;
+    errno = 0;
+    
+    /* Use syscall() function which is available on most Unix systems */
+    result = syscall(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6);
+    
+    /* Check for error - if errno is set, return -1 */
+    if (errno != 0) {
+        return perl_alloc_int(-1);
+    }
+    
+    /* Return the result */
+    return perl_alloc_int(result);
 }
 
 PerlValue *perl_backtick(PerlValue *cmd) {

@@ -384,6 +384,7 @@ void CodeGen::declareRuntime() {
     RT("perl_env_get",    pv, pv);
     RT("perl_env_set",    voidTy, pv, pv);
     RT("perl_system",     pv, pv);
+    RT("perl_syscall",    pv, pv);
     RT("perl_backtick",   pv, pv);
     RT("perl_init_argv",   av, Type::getInt32Ty(ctx_), i8p);
     RT("perl_get_dollar0", pv);

@@ -327,6 +327,8 @@ void       perl_warn(PerlValue *msg, const char *filename, int line);
 PerlHash  *perl_get_sig_hash(void);
 PerlValue *perl_system(PerlValue *cmd);
 PerlValue *perl_backtick(PerlValue *cmd);
+/* D70: syscall() builtin */
+PerlValue *perl_syscall(PerlValue *args);
 
 /* ── command-line arguments ─────────────────────────────────────────────── */
 PerlArray *perl_init_argv(int argc, char **argv); /* call at program start; sets $0, returns @ARGV */
