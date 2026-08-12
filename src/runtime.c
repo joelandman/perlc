@@ -5870,8 +5870,8 @@ PerlValue *perl_system(PerlValue *cmd) {
 
 /* D70: syscall() builtin - call system call with arguments */
 PerlValue *perl_syscall(PerlValue *args) {
-    /* args is a PerlArray containing the syscall number and arguments */
-    PerlArray *arg_array = perl_unwrap_list_return(args);
+    /* args is actually a PerlArray* passed as PerlValue* — reinterpret it */
+    PerlArray *arg_array = (PerlArray *)args;
     if (!arg_array || arg_array->len < 1) {
         return perl_alloc_undef();
     }
