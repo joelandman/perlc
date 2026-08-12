@@ -1,10 +1,7 @@
 #include "codegen.h"
 #include "runtime.h"
-#include "lexer.h"
-#include "parser.h"
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/GlobalVariable.h>
-#include <llvm/IR/Instructions.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -17,15 +14,11 @@
 
 using namespace llvm;
 
-/* collect all ScalarVar names referenced in a node (skip nested SubDef —
-   named subs are compiled as standalone top-level functions, unrelated to
-   the enclosing lexical scope).  AnonSub IS recursed into: a nested closure
-   may reference an outer variable that this closure only sees transitively
-   (e.g. `sub { sub { ...$x... } }`), so it must also be captured here in
-   order to relay it to the inner closure. */
+/* collect all ScalarVar names referenced in a node (skip nested AnonSub/SubDef) */
 static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
     switch (n.kind) {
     case NK::ScalarVar: names.insert(n.name); return;
+    case NK::AnonSub:   return;  /* don't recurse — nested closure handles its own captures */
     case NK::SubDef:    return;
     default: break;
     }
@@ -40,55 +33,6 @@ static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
         if (b.body) collectAllScalarNames(*b.body, names);
     }
     for (auto &a : n.args) collectAllScalarNames(*a, names);
-}
-
-/* D64/D53: collect every scalar name referenced anywhere inside ANY
-   closure (AnonSub, or sort{}'s custom comparator) nested within `n`, OR
-   that ever has \$name (RefScalar) taken anywhere in `n` — used to decide
-   whether a `my $var = <literal>` declaration is safe to place on the
-   unboxed int/float fast path (intScopes_/floatScopes_), which has no
-   real, addressable PerlValue* for a closure to later capture/share, or
-   for \$var to point at. Boxing a snapshot on demand instead (the
-   existing lookupIntVar/boxI64 fallback used both at closure-capture time
-   and by plain `\$var` reference-taking) silently disconnects the
-   closure's/reference's view from the real variable: D64 found this for
-   closures (`sub { ...$x... }` capturing a stale copy); D53 found the
-   identical underlying issue for `\$x` (`\$x` boxes a one-off snapshot of
-   $x's current unboxed value, so `$$r = 99` mutates that disposable
-   snapshot while $x's real unboxed storage — and therefore every
-   subsequent plain read of $x — is completely unaffected; confirmed via
-   --emit-ir that a file-scope $x, which never uses this fast path at all,
-   is unaffected, isolating the bug to exactly this fast-path's blind
-   spot). Deliberately over-approximates — a name used only in some
-   unrelated, never-actually-captured/referenced context elsewhere in the
-   same function still loses the fast path — rather than risk
-   misclassifying a genuinely captured/referenced variable as safe (a
-   correctness bug, not just a missed optimization). Computed once per
-   function (named sub, AnonSub, or the top-level program body) at
-   compilation entry; see D64/D53 in TESTS.md and capturedNamesInCurrentFn_
-   in codegen.h. */
-static void collectClosureCapturedNames(const Node &n, std::unordered_set<std::string> &names) {
-    if (n.kind == NK::AnonSub || (n.kind == NK::SortFunc && n.sval == "custom")) {
-        if (n.body) {
-            std::set<std::string> inner;
-            collectAllScalarNames(*n.body, inner);
-            names.insert(inner.begin(), inner.end());
-        }
-    }
-    if (n.kind == NK::RefScalar && n.left && n.left->kind == NK::ScalarVar) {
-        names.insert(n.left->name);
-    }
-    if (n.left)  collectClosureCapturedNames(*n.left,  names);
-    if (n.right) collectClosureCapturedNames(*n.right, names);
-    if (n.cond)  collectClosureCapturedNames(*n.cond,  names);
-    if (n.body)  collectClosureCapturedNames(*n.body,  names);
-    if (n.init)  collectClosureCapturedNames(*n.init,  names);
-    if (n.step)  collectClosureCapturedNames(*n.step,  names);
-    for (auto &b : n.branches) {
-        if (b.cond) collectClosureCapturedNames(*b.cond, names);
-        if (b.body) collectClosureCapturedNames(*b.body, names);
-    }
-    for (auto &a : n.args) collectClosureCapturedNames(*a, names);
 }
 
 /* mangle Foo::bar → perlsub_Foo__bar for valid LLVM identifiers */
@@ -112,22 +56,6 @@ CodeGen::CodeGen(bool debug, int optLevel)
     perlPtrTy_  = PointerType::getUnqual(ctx_);
     arrayPtrTy_ = PointerType::getUnqual(ctx_);
     declareRuntime();
-
-    /* Step 3: parse PERLC_OPT_DISABLE to selectively disable optimization
-       stages for diagnosis (e.g. "flatdouble,allflat,stage31,stage32,stage33").
-       This implements the systematic disable/re-enable plan from REARCHITECTURE.md. */
-    if (const char *env = getenv("PERLC_OPT_DISABLE")) {
-        std::string s(env);
-        std::string cur;
-        for (char c : s) {
-            if (c == ',' || c == ' ' || c == ';') {
-                if (!cur.empty()) { disabledStages_.insert(cur); cur.clear(); }
-            } else {
-                cur.push_back((char)tolower(c));
-            }
-        }
-        if (!cur.empty()) disabledStages_.insert(cur);
-    }
 
     /* Build TBAA type hierarchy so LLVM can prove PerlValue tag/fval stores
        don't alias PerlArray.elems loads — enables CSE of the elems pointer
@@ -213,7 +141,6 @@ void CodeGen::declareRuntime() {
     RT("perl_mul",           pv,  pv, pv);
     RT("perl_div",           pv,  pv, pv);
     RT("perl_mod",           pv,  pv, pv);
-    RT("perl_mod_i64",       i64, i64, i64);
     RT("perl_pow",           pv,  pv, pv);
     RT("perl_negate",        pv,  pv);
     RT("perl_bitand",        pv,  pv, pv);
@@ -254,13 +181,10 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get",     pv,  av, i64);
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
-    RT("perl_array_delete",       pv,     av, i64);
-    RT("perl_array_lvalue",       pv,     av, i64);
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
-    RT("perl_array_is_all_flat", i64, av);  /* used by Stage 23 all-flat pre-check */
-     RT("perl_array_len",     pv,  av);
-     RT("perl_array_last",    pv,  av);
-     RT("perl_array_clear",   voidTy, av);
+    RT("perl_array_is_all_flat", i64, av);  /* Stage 23: 1 if every elem is FLAT_ARRAY */
+    RT("perl_array_len",     pv,  av);
+    RT("perl_array_clear",   voidTy, av);
     RT("perl_array_replace", voidTy, av, av);
     RT("perl_hash_clear",    voidTy, av);
     /* hash */
@@ -294,7 +218,6 @@ void CodeGen::declareRuntime() {
     RT("perl_array_assign_slice",   voidTy, av, av, av);
     RT("perl_array_sort_str",   voidTy, av);
     RT("perl_array_extend",     voidTy, av, av);
-    RT("perl_array_extend_from",voidTy, av, av, i64);
     RT("perl_array_extend_hash",voidTy, av, av);
     RT("perl_array_push_list_or_scalar", voidTy, av, pv);
     RT("perl_array_shift",      pv,  av);
@@ -302,19 +225,15 @@ void CodeGen::declareRuntime() {
     /* string builtins */
     RT("perl_chomp",       i64,  pv);
     RT("perl_chomp_array", i64,  av);
-    RT("perl_chop_array",  pv,   av);
     RT("perl_length",   pv,   pv);
     RT("perl_substr2",  pv,   pv, pv);
     RT("perl_substr3",  pv,   pv, pv, pv);
     RT("perl_join",     pv,   pv, av);
     RT("perl_split",    av,   pv, pv);
-    RT("perl_pack",           pv, pv, av);
-    RT("perl_unpack",         pv, pv, pv);
-    RT("perl_unpack_to_array", av, pv, pv);
     /* references */
-    RT("perl_alloc_flat_array", pv, i64);  /* FLAT_ARRAY (Stage 22/23 path) */
+    RT("perl_alloc_flat_array", pv, i64);
+    RT("perl_alloc_float_array", pv, i64);
     RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
-    RT("perl_alloc_float_array", pv, i64);  /* FLAT_ARRAY n-element (used by FLAT_ARRAY literal path) */
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
     RT("perl_ref_hash",     pv, av);  /* PerlHash* treated as opaque av */
@@ -335,10 +254,7 @@ void CodeGen::declareRuntime() {
     RT("perl_say_fh",           voidTy, pv, pv);
     RT("perl_printf_fh",        voidTy, pv, pv, av);
     RT("perl_eof_fh",           pv,     pv);
-     RT("perl_die",              voidTy, pv, i8p, i32);
-    /* perl_die never returns to its caller — it either longjmp's to an eval
-       catch point (different basic block) or calls exit(1). */
-    rtFuncs_["perl_die"]->addFnAttr(Attribute::NoReturn);
+    RT("perl_die",              voidTy, pv);
     RT("perl_unlink_files",     pv,     av);
     RT("perl_get_stderr",       pv);
     RT("perl_get_stdout",       pv);
@@ -377,14 +293,12 @@ void CodeGen::declareRuntime() {
     RT("perl_str_spaceship",  pv, pv, pv);
     /* new builtins */
     RT("perl_chop",       pv, pv);
-    RT("perl_warn",       voidTy, pv, i8p, i32);
-    RT("perl_get_sig_hash", av);
+    RT("perl_warn",       voidTy, pv);
     RT("perl_splice",     av, av, pv, pv, av);
     RT("perl_filetest",   pv, Type::getInt32Ty(ctx_), pv);
     RT("perl_env_get",    pv, pv);
     RT("perl_env_set",    voidTy, pv, pv);
     RT("perl_system",     pv, pv);
-    RT("perl_syscall",    pv, pv);
     RT("perl_backtick",   pv, pv);
     RT("perl_init_argv",   av, Type::getInt32Ty(ctx_), i8p);
     RT("perl_get_dollar0", pv);
@@ -392,6 +306,7 @@ void CodeGen::declareRuntime() {
     RT("perl_call_code_ref",  pv, pv, av);
     RT("perl_eval_pop",        voidTy);
     RT("perl_get_dollar_at",   pv);
+    RT("perl_eval_string",     pv,  pv);
     RT("perl_eval_push",       voidTy, i8p);
     RT("perl_tr",              i64, pv, i8p, i8p, i8p);
     /* setjmp called directly from generated code — must be returns_twice */
@@ -407,13 +322,11 @@ void CodeGen::declareRuntime() {
     RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
     RT("perl_regex_match_all", av,  pv, i8p, i8p);
     RT("perl_regex_subst",     i64, pv, i8p, i8p, i8p);
-    RT("perl_regex_subst_e",   i64, pv, i8p, i8p, i8p, av);
     RT("perl_capture",         pv,  i64);
     RT("perl_split_regex",     av,  i8p, i8p, pv);
     /* OOP */
     RT("perl_bless",                   pv,     pv, pv);
     RT("perl_register_method",         voidTy, i8p, i8p);
-    RT("perl_get_or_create_global_scalar", pv, i8p);
     RT("perl_dispatch_method",         pv,     pv, i8p, av);
     RT("perl_dispatch_method_super",   pv,     pv, i8p, i8p, av);
     RT("perl_set_isa",                 voidTy, i8p, i8p);
@@ -440,7 +353,10 @@ void CodeGen::declareRuntime() {
     RT("perl_push_wantarray", i32, i32);
 RT("perl_pop_wantarray",  i32);
 RT("perl_wantarray",             pv);
-RT("perl_array_to_list_return",  pv, av);
+    RT("perl_array_to_list_return",  pv, av);
+    RT("perl_grep_list_return",      pv, av);
+    RT("perl_map_list_return",       pv, av);
+    RT("perl_sort_list_return",      pv, av);
 RT("perl_unwrap_list_return",    av, pv);
 RT("perl_threads_join",   voidTy, pv);
     RT("perl_caller",           av,     Type::getInt32Ty(ctx_));
@@ -470,22 +386,13 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_gmtime_val",   av,     pv);
     RT("perl_sleep_val",    pv,     pv);
     RT("perl_alarm_val",    pv,     pv);
-    /* Time::HiRes (D30, built-in) */
-    RT("perl_hires_time",               pv);
-    RT("perl_hires_gettimeofday_list",  av);
-    RT("perl_hires_gettimeofday_scalar",pv);
-    RT("perl_hires_sleep",              pv, pv);
-    RT("perl_hires_usleep",             pv, pv);
-    RT("perl_hires_tv_interval",        pv, pv, pv);
     /* List::Util */
     RT("perl_sum_list",     pv,  av);
     RT("perl_min_list",     pv,  av);
     RT("perl_max_list",     pv,  av);
     RT("perl_uniq_list",    av,  av);
-    /* sort with custom comparator — fn ptr passed as i8p (opaque pointer);
-       third arg is the comparator's closure captures array (D61), may be
-       an empty PerlArray*. */
-    RT("perl_sort_custom",  av,  av, i8p, av);
+    /* sort with custom comparator — fn ptr passed as i8p (opaque pointer) */
+    RT("perl_sort_custom",  av,  av, i8p);
     /* special globals (Tier 2) */
     RT("perl_get_dollar_dot",   pv);
     RT("perl_get_dollar_comma", pv);
@@ -614,6 +521,32 @@ void CodeGen::declareVar(const std::string &nm, Value *a) {
 }
 
 void CodeGen::trackPv(Value *pv) {
+    /* Stage 32: inside a loop, defer free for loop-invariant PVs.
+       undef PVs (perl_alloc_undef) are always loop-invariant since the
+       allocation is loop-invariant.  Deref results from loop-invariant
+       variables are also loop-invariant.  By deferring the free, LLVM's
+       LICM can hoist the alloc_undef out of the loop (no free blocks it). */
+    if (!loopExits_.empty() && pv) {
+        auto *ci = dyn_cast<CallInst>(pv);
+        if (ci) {
+            auto *fn = ci->getCalledFunction();
+            if (fn) {
+                StringRef nm = fn->getName();
+                /* undef PV from perl_alloc_undef — always loop-invariant */
+                if (nm == "perl_alloc_undef") {
+                    trackLoopInvariantPV(pv);
+                    return;
+                }
+                /* Deref result from perl_deref_array on a loop-invariant var —
+                   the PV itself is loop-invariant when cached via emitHoistedDerefs.
+                   Defer the free to let LICM hoist the call. */
+                if (nm == "perl_deref_array") {
+                    trackLoopInvariantPV(pv);
+                    return;
+                }
+            }
+        }
+    }
     if (!pvScopes_.empty()) pvScopes_.back().push_back(pv);
 }
 
@@ -639,7 +572,6 @@ void CodeGen::declareArray(const std::string &nm, Value *ptr) {
 }
 
 Value *CodeGen::lookupHash(const std::string &nm) {
-    /* D49: bare %SIG is the process-wide special hash (unless shadowed by my %SIG) */
     for (int i = (int)hashScopes_.size() - 1; i >= 0; i--) {
         auto it = hashScopes_[i].find(nm);
         if (it != hashScopes_[i].end()) return it->second;
@@ -647,8 +579,6 @@ Value *CodeGen::lookupHash(const std::string &nm) {
     auto git = fileHashGlobals_.find(nm);
     if (git != fileHashGlobals_.end())
         return builder_.CreateLoad(perlPtrTy_, git->second, nm);
-    if (nm == "SIG")
-        return callRT("perl_get_sig_hash", {});
     return nullptr;
 }
 
@@ -686,35 +616,18 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *hi = emitExpr(*n.right);
         return callRT("perl_range", {lo, hi});
     }
-    /* x in array/list context (D95):
-       Real Perl only does *list* repetition when the left operand is
-       syntactically a parenthesized list or qw// (both parse as ArrayLit).
-       A bare `f() x 2` / `"ab" x 2` is always *string* repetition, even
-       when the whole expression is the RHS of an array assignment — the
-       result is a single-element list holding the repeated string.
-       Previously every `x` here was treated as list repetition, giving
-       `@a = (f() x 2)` → `("x","x")` instead of real Perl's `("xx")`. */
+    /* (LIST) x N — list repetition in array context */
     if (n.kind == NK::BinOp && n.sval == "x" && n.left) {
-        if (n.left->kind == NK::ArrayLit) {
-            Value *srcArr = emitArrayPtr(*n.left);
-            if (!srcArr) srcArr = callRT("perl_array_new", {});
-            Value *nv = emitExpr(*n.right);
-            return callRT("perl_repeat_list", {srcArr, nv});
+        Value *srcArr = emitArrayPtr(*n.left);
+        if (!srcArr) {
+            /* scalar or single-element expr — wrap in 1-element array */
+            srcArr = callRT("perl_array_new", {});
+            Value *v = emitExpr(*n.left);
+            callRT("perl_array_push", {srcArr, v});
+            freeIfOwned(v);
         }
-        /* String repetition → one-element array of the repeated string.
-           Left operand of string-x is always scalar context. */
-        int savedCallCtx = callCtx_;
-        callCtx_ = 0;
-        Value *lv = emitExpr(*n.left);
-        callCtx_ = savedCallCtx;
         Value *nv = emitExpr(*n.right);
-        Value *rep = callRT("perl_repeat_str", {lv, nv});
-        freeIfOwned(lv);
-        freeIfOwned(nv);
-        Value *av = callRT("perl_array_new", {});
-        callRT("perl_array_push", {av, rep});
-        freeIfOwned(rep);
-        return av;
+        return callRT("perl_repeat_list", {srcArr, nv});
     }
     if (n.kind == NK::ArrayVar) {
         return lookupArray(n.name);
@@ -755,12 +668,6 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         }
         Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
         return callRT("perl_split", {sep, str});
-    }
-    /* unpack(FORMAT, EXPR) in list context — D67 */
-    if (n.kind == NK::UnpackFunc) {
-        Value *str = emitExpr(*n.left);
-        Value *fmt = emitExpr(*n.args[0]);
-        return callRT("perl_unpack_to_array", {fmt, str});
     }
     /* stat / lstat in list context → 13-element array */
     if (n.kind == NK::StatFunc) {
@@ -831,69 +738,8 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         else if (mode == "str_desc") return callRT("perl_sort_str_desc", {av});
         else if (mode == "custom" && n.body) {
             /* Generate a comparison function: long long cmp(PerlValue* a, PerlValue* b) */
-            std::string cmpName = "__sort_cmp_" + std::to_string(sortCmpCounter_++);
-
-            /* D61: closure-capture support for the comparator, mirroring
-               AnonSub's Phase 1 (collectAllScalarNames + "capture every
-               visible array/hash") — done here, in the *caller's* scope,
-               before cmpFn's own scope reset below wipes it out. Without
-               this, the comparator (compiled as a genuinely separate LLVM
-               function so it can be passed as a real C function pointer to
-               qsort()) previously had no way to see or modify ANY outer
-               block-scoped variable at all (only a true file-scope one,
-               via fileScalarGlobals_) — e.g. `push @observed, $a` inside
-               the comparator silently no-opped when @observed was merely
-               block-scoped. $a/$b themselves are excluded here since
-               they're bound separately below (as the function's own
-               parameters, or via the D28 file-scope-shadow check). */
-            std::set<std::string> sortUsedNames;
-            collectAllScalarNames(*n.body, sortUsedNames);
-            std::vector<std::string> sortCaptureNames;
-            std::vector<Value*>      sortCaptureVals;
-            std::vector<char>        sortCaptureSigils;
-            for (auto &nm : sortUsedNames) {
-                if (nm == "_" || nm == "a" || nm == "b") continue;
-                if (auto *slot = lookupVar(nm)) {
-                    sortCaptureNames.push_back(nm);
-                    sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
-                    sortCaptureSigils.push_back('$');
-                } else if (Value *ia = lookupIntVar(nm)) {
-                    Value *ival = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
-                    Value *boxed = boxI64(ival);
-                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
-                    builder_.CreateStore(boxed, pvAlloca);
-                    sortCaptureNames.push_back(nm);
-                    sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
-                    sortCaptureSigils.push_back('$');
-                } else if (Value *fa = lookupFloatVar(nm)) {
-                    Value *fval = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
-                    Value *boxed = boxF64(fval);
-                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
-                    builder_.CreateStore(boxed, pvAlloca);
-                    sortCaptureNames.push_back(nm);
-                    sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
-                    sortCaptureSigils.push_back('$');
-                }
-            }
-            {
-                std::unordered_map<std::string, Value*> visibleArrays;
-                for (auto &scope : arrayScopes_)
-                    for (auto &kv : scope) visibleArrays[kv.first] = kv.second;
-                for (auto &kv : visibleArrays) {
-                    if (kv.first == "_") continue;
-                    sortCaptureNames.push_back(kv.first);
-                    sortCaptureVals.push_back(callRT("perl_ref_array", {kv.second}));
-                    sortCaptureSigils.push_back('@');
-                }
-                std::unordered_map<std::string, Value*> visibleHashes;
-                for (auto &scope : hashScopes_)
-                    for (auto &kv : scope) visibleHashes[kv.first] = kv.second;
-                for (auto &kv : visibleHashes) {
-                    sortCaptureNames.push_back(kv.first);
-                    sortCaptureVals.push_back(callRT("perl_ref_hash", {kv.second}));
-                    sortCaptureSigils.push_back('%');
-                }
-            }
+            static int sortCmpCounter = 0;
+            std::string cmpName = "__sort_cmp_" + std::to_string(sortCmpCounter++);
 
             auto *i64Ty = Type::getInt64Ty(ctx_);
             auto *cmpFT = FunctionType::get(i64Ty, {perlPtrTy_, perlPtrTy_}, false);
@@ -922,54 +768,15 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
-            /* D61: re-materialize the captures collected above via
-               perl_get_capture(idx) — same pattern AnonSub bodies use. */
-            for (size_t ci = 0; ci < sortCaptureNames.size(); ci++) {
-                Value *pv = callRT("perl_get_capture",
-                                   {ConstantInt::get(i64Ty, (long long)ci)});
-                if (sortCaptureSigils[ci] == '@') {
-                    declareArray(sortCaptureNames[ci], callRT("perl_deref_array_ro", {pv}));
-                } else if (sortCaptureSigils[ci] == '%') {
-                    declareHash(sortCaptureNames[ci], callRT("perl_deref_hash", {pv}));
-                } else {
-                    auto *capAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, sortCaptureNames[ci]);
-                    builder_.CreateStore(pv, capAlloca);
-                    declareVar(sortCaptureNames[ci], capAlloca);
-                }
-            }
-
-            /* bind $a and $b to the function parameters — UNLESS an
-               outer, file-scope `my $a`/`my $b` already exists (D28:
-               matches real Perl's well-known "my $a used in sort
-               comparison" footgun). sort's/reduce's $a/$b are
-               dynamically-aliased *package* variables in real Perl; an
-               earlier lexical `my $a` in an enclosing scope permanently
-               shadows the package variable's name for all later code in
-               that scope, including a comparator block compiled after
-               it — the block ends up reading whatever the outer lexical
-               holds (unchanging across comparisons) instead of the pair
-               actually being compared, producing a broken/non-monotonic
-               sort. This comparator body is compiled as its own,
-               separate LLVM function with a full scope reset just above,
-               so this check can only reach as far as a *file-scope*
-               shadow (via fileScalarGlobals_, untouched by that reset,
-               checked here before it would otherwise be re-declared) —
-               an outer *sub-scoped* my $a would need closure-capture
-               machinery this comparator doesn't have, and remains a
-               narrower, separate, open gap (TESTS.md's D28 entry). The
-               function still receives its two arguments unconditionally
-               either way — the sort algorithm needs them regardless of
-               whether the block's own code ends up referencing them. */
-            bool aShadowed = fileScalarGlobals_.count("a") != 0;
-            bool bShadowed = fileScalarGlobals_.count("b") != 0;
+            /* bind $a and $b to the function parameters */
             Value *argA = cmpFn->getArg(0); argA->setName("a");
             Value *argB = cmpFn->getArg(1); argB->setName("b");
             auto *aAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "a");
             auto *bAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "b");
             builder_.CreateStore(argA, aAlloca);
             builder_.CreateStore(argB, bAlloca);
-            if (!aShadowed) declareVar("a", aAlloca);
-            if (!bShadowed) declareVar("b", bAlloca);
+            declareVar("a", aAlloca);
+            declareVar("b", bAlloca);
 
             currentSubBody_ = n.body.get();
             Value *cmpResult = emitBlockLast(*n.body);
@@ -995,80 +802,10 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             localDepthAlloca_ = savedLDep;
             currentSubBody_   = savedBody;
 
-            /* call perl_sort_custom(av, cmpFn, capsAv) — capsAv built from
-               the sortCaptureVals collected in the caller's own scope
-               above (D61), now that we're back in that scope. */
+            /* call perl_sort_custom(av, cmpFn) */
             Value *fnPtr = builder_.CreateBitCast(cmpFn,
                               PointerType::getUnqual(ctx_));
-            Value *capsAv = callRT("perl_array_new", {});
-            for (auto *cv : sortCaptureVals)
-                callRT("perl_array_push_capture", {capsAv, cv});
-            return callRT("perl_sort_custom", {av, fnPtr, capsAv});
-        }
-        else if (mode == "subname" && !n.name.empty()) {
-            /* sort SUBNAME LIST — named comparator sub, no braces. Unlike
-               the `custom` block above (whose body is inlined directly
-               into the wrapper comparator function, so $a/$b can just be
-               local allocas in that same function), SUBNAME is a
-               separately-compiled top-level function with its own fresh
-               scope — it can only see $a/$b if they're file-scope globals,
-               matching Perl's actual semantics ($a/$b are package globals
-               for the duration of a sort). */
-            auto *fn = mod_->getFunction(subLLVMName(n.name));
-            if (!fn) { /* sub not found (e.g. forward reference) — fall back */
-                Value *copy = callRT("perl_sort_str_asc", {av}); return copy;
-            }
-            auto ensureGlobalScalar = [&](const std::string &nm) -> Value * {
-                auto it = fileScalarGlobals_.find(nm);
-                if (it != fileScalarGlobals_.end()) return it->second;
-                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                    GlobalValue::InternalLinkage, Constant::getNullValue(perlPtrTy_), "g." + nm);
-                builder_.CreateStore(perlUndef(), gv);
-                fileScalarGlobals_[nm] = gv;
-                return gv;
-            };
-            Value *gA = ensureGlobalScalar("a");
-            Value *gB = ensureGlobalScalar("b");
-
-            static int sortCmpSubCounter = 0;
-            std::string cmpName = "__sort_cmp_sub_" + std::to_string(sortCmpSubCounter++);
-            auto *i64TySn = Type::getInt64Ty(ctx_);
-            auto *cmpFTsn = FunctionType::get(i64TySn, {perlPtrTy_, perlPtrTy_}, false);
-            auto *cmpFnSn = Function::Create(cmpFTsn, Function::InternalLinkage,
-                                             cmpName, mod_.get());
-
-            auto *savedFnSn = currentFn_;
-            auto *savedBBsn = builder_.GetInsertBlock();
-
-            auto *cmpEntrySn = BasicBlock::Create(ctx_, "entry", cmpFnSn);
-            builder_.SetInsertPoint(cmpEntrySn);
-            currentFn_ = cmpFnSn;
-
-            Value *argASn = cmpFnSn->getArg(0);
-            Value *argBSn = cmpFnSn->getArg(1);
-            Value *aCell = builder_.CreateLoad(perlPtrTy_, gA, "a.cell");
-            Value *bCell = builder_.CreateLoad(perlPtrTy_, gB, "b.cell");
-            callRT("perl_assign", {aCell, argASn});
-            callRT("perl_assign", {bCell, argBSn});
-
-            /* SUBNAME() is called with no args (real Perl: $a/$b are read
-               as package globals inside the sub, not passed via @_), in
-               scalar context (a comparator returns one number). */
-            Value *emptyArgsSn = callRT("perl_array_new", {});
-            auto *i32TySn = Type::getInt32Ty(ctx_);
-            Value *scalarCtxSn = ConstantInt::get(i32TySn, 0);
-            Value *cmpCallResult = builder_.CreateCall(fn, {emptyArgsSn, scalarCtxSn});
-            callRT("perl_array_free", {emptyArgsSn});
-            Value *rvSn = callRT("perl_to_int", {cmpCallResult});
-            freeIfOwned(cmpCallResult);
-            builder_.CreateRet(rvSn);
-
-            currentFn_ = savedFnSn;
-            builder_.SetInsertPoint(savedBBsn);
-
-            Value *fnPtrSn = builder_.CreateBitCast(cmpFnSn, PointerType::getUnqual(ctx_));
-            Value *noCapsSn = callRT("perl_array_new", {});
-            return callRT("perl_sort_custom", {av, fnPtrSn, noCapsSn});
+            return callRT("perl_sort_custom", {av, fnPtr});
         }
         else { /* default: sort a copy lexicographically */
             Value *copy = callRT("perl_sort_str_asc", {av}); return copy;
@@ -1285,118 +1022,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         for (auto &keyNode : n.args) pushHashKey(*keyNode);
         return res;
     }
-    /* D81: delete @hash{...} / delete @arr[...] in list context */
-    if (n.kind == NK::DeleteFunc &&
-        (n.sval == "hash_slice" || n.sval == "array_slice")) {
-        Value *res = callRT("perl_array_new", {});
-        if (n.sval == "hash_slice") {
-            Value *hv = lookupHash(n.name);
-            auto delKey = [&](const Node &keyNode) {
-                if (!hv) {
-                    callRT("perl_array_push", {res, perlUndef()});
-                    return;
-                }
-                if (keyNode.kind == NK::ArrayLit) {
-                    for (auto &k : keyNode.args) {
-                        Value *old = emitHashDelete(hv, *k);
-                        callRT("perl_array_push", {res, old});
-                        freeIfOwned(old);
-                    }
-                } else if (Value *kav = emitArrayPtr(keyNode)) {
-                    Value *lenV = callRT("perl_array_len", {kav});
-                    Value *len = callRT("perl_to_int", {lenV});
-                    freeIfOwned(lenV);
-                    /* loop over keys at runtime would need a block; expand
-                       common ArrayLit/qw path above — dynamic @keys falls
-                       through one-by-one via a small unrolled helper: */
-                    auto *i64Ty = Type::getInt64Ty(ctx_);
-                    auto *fn = builder_.GetInsertBlock()->getParent();
-                    auto *idxA = builder_.CreateAlloca(i64Ty, nullptr, "del.i");
-                    builder_.CreateStore(ConstantInt::get(i64Ty, 0), idxA);
-                    auto *condBB = BasicBlock::Create(ctx_, "del.cond", fn);
-                    auto *bodyBB = BasicBlock::Create(ctx_, "del.body", fn);
-                    auto *doneBB = BasicBlock::Create(ctx_, "del.done", fn);
-                    builder_.CreateBr(condBB);
-                    builder_.SetInsertPoint(condBB);
-                    Value *i = builder_.CreateLoad(i64Ty, idxA);
-                    builder_.CreateCondBr(builder_.CreateICmpSLT(i, len), bodyBB, doneBB);
-                    builder_.SetInsertPoint(bodyBB);
-                    Value *k = callRT("perl_array_get", {kav, i});
-                    Value *old = callRT("perl_hash_delete_sv", {hv, k});
-                    callRT("perl_array_push", {res, old});
-                    freeIfOwned(k); freeIfOwned(old);
-                    builder_.CreateStore(builder_.CreateAdd(i, ConstantInt::get(i64Ty, 1)), idxA);
-                    builder_.CreateBr(condBB);
-                    builder_.SetInsertPoint(doneBB);
-                } else {
-                    Value *old = emitHashDelete(hv, keyNode);
-                    callRT("perl_array_push", {res, old});
-                    freeIfOwned(old);
-                }
-            };
-            for (auto &k : n.args) delKey(*k);
-        } else {
-            Value *av = lookupArray(n.name);
-            auto delIdx = [&](const Node &idxNode) {
-                if (!av) {
-                    callRT("perl_array_push", {res, perlUndef()});
-                    return;
-                }
-                if (idxNode.kind == NK::ArrayLit) {
-                    for (auto &ix : idxNode.args) {
-                        Value *idx = emitIdx(*ix);
-                        Value *old = callRT("perl_array_delete", {av, idx});
-                        callRT("perl_array_push", {res, old});
-                        freeIfOwned(old);
-                    }
-                } else if (Value *iav = emitArrayPtr(idxNode)) {
-                    auto *i64Ty = Type::getInt64Ty(ctx_);
-                    auto *fn = builder_.GetInsertBlock()->getParent();
-                    Value *lenV = callRT("perl_array_len", {iav});
-                    Value *len = callRT("perl_to_int", {lenV});
-                    freeIfOwned(lenV);
-                    auto *idxA = builder_.CreateAlloca(i64Ty, nullptr, "dela.i");
-                    builder_.CreateStore(ConstantInt::get(i64Ty, 0), idxA);
-                    auto *condBB = BasicBlock::Create(ctx_, "dela.cond", fn);
-                    auto *bodyBB = BasicBlock::Create(ctx_, "dela.body", fn);
-                    auto *doneBB = BasicBlock::Create(ctx_, "dela.done", fn);
-                    builder_.CreateBr(condBB);
-                    builder_.SetInsertPoint(condBB);
-                    Value *i = builder_.CreateLoad(i64Ty, idxA);
-                    builder_.CreateCondBr(builder_.CreateICmpSLT(i, len), bodyBB, doneBB);
-                    builder_.SetInsertPoint(bodyBB);
-                    Value *idxPv = callRT("perl_array_get", {iav, i});
-                    Value *idx = callRT("perl_to_int", {idxPv});
-                    freeIfOwned(idxPv);
-                    Value *old = callRT("perl_array_delete", {av, idx});
-                    callRT("perl_array_push", {res, old});
-                    freeIfOwned(old);
-                    builder_.CreateStore(builder_.CreateAdd(i, ConstantInt::get(i64Ty, 1)), idxA);
-                    builder_.CreateBr(condBB);
-                    builder_.SetInsertPoint(doneBB);
-                } else {
-                    Value *idx = emitIdx(idxNode);
-                    Value *old = callRT("perl_array_delete", {av, idx});
-                    callRT("perl_array_push", {res, old});
-                    freeIfOwned(old);
-                }
-            };
-            for (auto &ix : n.args) delIdx(*ix);
-        }
-        return res;
-    }
     if (n.kind == NK::ArrayLit) {
         Value *res = callRT("perl_array_new", {});
         for (auto &elem : n.args) {
             Value *sub = emitArrayPtr(*elem);
-            if (sub) {
-                callRT("perl_array_extend", {res, sub});
-            } else {
-                /* Flatten LIST_RESULT (e.g. `(0 || listret())` inside parens —
-                   D94 + D95: single-element parens are ArrayLit, not unwrapped). */
-                Value *v = emitExpr(*elem);
-                callRT("perl_array_push_list_or_scalar", {res, v});
-            }
+            if (sub) callRT("perl_array_extend", {res, sub});
+            else     callRT("perl_array_push",   {res, emitExpr(*elem)});
         }
         return res;
     }
@@ -1416,37 +1047,6 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         if (!slot) return callRT("perl_array_new", {});
         Value *dh = builder_.CreateLoad(perlPtrTy_, slot);
         return callRT("perl_readdir_all", {dh});
-    }
-    /* Time::HiRes::gettimeofday in list context: (seconds, microseconds).
-       Must be checked before the generic user-sub Call handling below,
-       since it's a builtin name-dispatch (see emitExpr), not a real
-       LLVM-declared sub — mod_->getFunction() would never find it. */
-    if (n.kind == NK::Call &&
-        (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday")) {
-        return callRT("perl_hires_gettimeofday_list", {});
-    }
-    /* D69: List::Util::uniq in list context. Same reasoning as
-       Time::HiRes::gettimeofday just above — "List::Util::uniq" only
-       reaches here as a qualified NK::Call (the bare "uniq" keyword form
-       is its own dedicated NK::UniqFunc node, handled elsewhere in this
-       function), and it's a builtin name-dispatch, not a real
-       LLVM-declared sub, so it must be intercepted before the generic
-       user-sub Call handling below (which previously let it fall through
-       to mod_->getFunction() finding nothing and silently returning an
-       empty list). sum/min/max don't need a list-context case here — they
-       always return a single scalar, even when called in list context. */
-    if (n.kind == NK::Call && n.name == "List::Util::uniq") {
-        Value *av = nullptr;
-        if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
-        if (!av) {
-            av = callRT("perl_array_new", {});
-            for (auto &a : n.args) {
-                Value *sub = emitArrayPtr(*a);
-                if (sub) callRT("perl_array_extend", {av, sub});
-                else     callRT("perl_array_push",   {av, emitExpr(*a)});
-            }
-        }
-        return callRT("perl_uniq_list", {av});
     }
     /* user-defined sub call in list context: call with ctx=1, unwrap result */
     if (n.kind == NK::Call) {
@@ -1475,23 +1075,6 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             return callRT("perl_unwrap_list_return", {pv});
         }
     }
-    /* code ref call in list context: unwrap LIST_RESULT */
-    if (n.kind == NK::CallCodeRef) {
-        Value *ref = emitExpr(*n.left);
-        Value *av  = callRT("perl_array_new", {});
-        for (auto &arg : n.args) {
-            Value *src = emitArrayPtr(*arg);
-            if (src) callRT("perl_array_extend", {av, src});
-            else     callRT("perl_array_push",   {av, emitExpr(*arg)});
-        }
-        auto *i32Ty = Type::getInt32Ty(ctx_);
-        Value *one = ConstantInt::get(i32Ty, 1);
-        callRT("perl_push_wantarray", {one});
-        Value *result = callRT("perl_call_code_ref", {ref, av});
-        callRT("perl_pop_wantarray", {});
-        callRT("perl_array_free", {av});
-        return callRT("perl_unwrap_list_return", {result});
-    }
     return nullptr;
 }
 
@@ -1507,39 +1090,6 @@ static llvm::Value *constKeyPtr(const Node &n, llvm::IRBuilder<> &builder) {
         return builder.CreateGlobalStringPtr(
             n.kind == NK::IntLit ? std::to_string(n.ival) : n.sval, ".hk");
     return nullptr;
-}
-
-/* True iff an ArrowDeref chain is rooted in a %hash/@array element
- * (e.g. $h{a}{b}{c}, $a[0]{x}[1]) rather than a bare scalar/ref expression
- * (e.g. $ref->[0][1]). Distinguishes "needs recursive autoviv through
- * perl_(hash|array)_autoviv_*" (the only path that knows how to create a
- * missing intermediate level) from "chain already bottoms out at a real
- * ref/FLAT_ARRAY value that just needs a normal, non-autovivifying deref"
- * (which must keep using the FLAT_ARRAY-aware fallback — the autoviv_*
- * runtime helpers only recognize the PERL_REF_ARRAY/PERL_REF_HASH tags and
- * would silently blow away an existing FLAT_ARRAY-tagged inner array). */
-static bool isElemRootedChain(const Node &n) {
-    if (n.kind == NK::HashElem || n.kind == NK::ArrayElem) return true;
-    if (n.kind == NK::ArrowDeref) return isElemRootedChain(*n.left);
-    return false;
-}
-
-/* D50: is `n` a chain rooted in a bare scalar variable holding a ref
- * (e.g. `$ref->{a}{b}`), where *every* level is a hash-key ArrowDeref?
- * Safe to autovivify all the way down via emitAutovivContainer() iff so
- * — an array-index level anywhere in the chain is deliberately excluded
- * (conservatively kept on the older, non-autovivifying fallback path),
- * since perl_array_autoviv_array()/perl_array_autoviv_hash() only
- * recognize the PERL_REF_ARRAY/PERL_REF_HASH tags and would silently
- * destroy an existing FLAT_ARRAY-tagged element if one were present at
- * that array level — exactly the regression already identified and
- * avoided for the element-rooted case (isElemRootedChain, D40). A hash
- * has no FLAT_ARRAY-equivalent optimization, so an all-hash-key chain
- * carries none of that risk regardless of how deep it goes. */
-static bool isScalarRootedAllHashChain(const Node &n) {
-    if (n.kind == NK::ScalarVar) return true;
-    if (n.kind == NK::ArrowDeref) return n.sval == "hash" && isScalarRootedAllHashChain(*n.left);
-    return false;
 }
 
 Value *CodeGen::emitHashGetRef(Value *hv, const Node &keyNode) {
@@ -1719,19 +1269,6 @@ Value *CodeGen::boxI64(Value *iv) {
     return callRT("perl_alloc_int", {iv});
 }
 
-Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
-    /* Perl's %, unlike C's, uses floored-division semantics: the result
-       always has the same sign as the right operand (or is zero) — e.g.
-       -7 % 3 == 2, 7 % -3 == -2. LLVM's SRem (like C's %) truncates toward
-       zero instead, so a nonzero result with a sign mismatch against rv
-       needs rv added back to floor it. Branchless via select, mirroring
-       perl_mod's boxed-value equivalent in runtime.c.
-
-       D84: Zero-divisor check is handled by a runtime helper that calls
-       perl_die (eval-catchable) instead of exit(1). */
-    return callRT("perl_mod_i64", {lv, rv});
-}
-
 bool CodeGen::canEmitI64(const Node &n) {
     switch (n.kind) {
     case NK::IntLit: return true;
@@ -1775,7 +1312,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
         if (n.sval == "+") return builder_.CreateAdd(lv, rv, "iadd");
         if (n.sval == "-") return builder_.CreateSub(lv, rv, "isub");
         if (n.sval == "*") return builder_.CreateMul(lv, rv, "imul");
-        return emitFlooredMod(lv, rv);
+        return builder_.CreateSRem(lv, rv, "irem");
     }
     case NK::UnaryOp:
         if (n.sval == "-" && n.left && canEmitI64(*n.left)) {
@@ -1860,6 +1397,202 @@ Value *CodeGen::emitIdx(const Node &n) {
     freeIfOwned(pv);
     return i;
 }
+
+/* ── Stage 32: loop-invariant PV tracking and deref hoisting ─────────────── */
+
+void CodeGen::pushLoopInvariantTracking() {
+    if (!loopInvariantPVs_.empty() || !loopExits_.empty())
+        loopInvariantPVs_.emplace_back();
+}
+
+void CodeGen::popLoopInvariantTracking() {
+    if (!loopInvariantPVs_.empty())
+        loopInvariantPVs_.pop_back();
+}
+
+void CodeGen::freeLoopInvariantPVs() {
+    if (loopInvariantPVs_.empty()) return;
+    auto *bb = builder_.GetInsertBlock();
+    if (bb && !bb->getTerminator()) {
+        for (Value *pv : loopInvariantPVs_.back())
+            callRT("perl_free", {pv});
+    }
+    loopInvariantPVs_.pop_back();
+}
+
+void CodeGen::trackLoopInvariantPV(Value *pv) {
+    if (loopInvariantPVs_.empty()) return;
+    loopInvariantPVs_.back().push_back(pv);
+}
+
+void CodeGen::pushDerefCache() {
+    if (!loopDerefCache_.empty() || !loopExits_.empty())
+        loopDerefCache_.emplace_back();
+}
+
+void CodeGen::popDerefCache() {
+    if (!loopDerefCache_.empty())
+        loopDerefCache_.pop_back();
+}
+
+Value *CodeGen::lookupLoopDerefCache(const std::string &varName) {
+    for (int i = (int)loopDerefCache_.size() - 1; i >= 0; i--) {
+        auto it = loopDerefCache_[i].find(varName);
+        if (it != loopDerefCache_[i].end()) return it->second;
+    }
+    return nullptr;
+}
+
+void CodeGen::declareLoopDerefCache(const std::string &varName, Value *cachedPtr) {
+    if (!loopDerefCache_.empty())
+        loopDerefCache_.back()[varName] = cachedPtr;
+}
+
+/* Collect all ScalarVar names that are the direct argument of a
+   perl_deref_array call (ArrowDeref with sval=="array" whose left is
+   a ScalarVar).  Used to identify candidates for hoisting. */
+static void collectDerefTargets(const Node &n, std::set<std::string> &targets) {
+    if (n.kind == NK::ArrowDeref && n.sval == "array" &&
+        n.left && n.left->kind == NK::ScalarVar) {
+        std::string nm = n.left->name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        targets.insert(nm);
+    }
+    if (n.left)  collectDerefTargets(*n.left,  targets);
+    if (n.right) collectDerefTargets(*n.right, targets);
+    for (auto &a : n.args) collectDerefTargets(*a, targets);
+    if (n.body)  collectDerefTargets(*n.body,  targets);
+}
+
+/* Check if a ScalarVar named 'nm' is assigned (written to) anywhere in 'n'.
+   Returns true if the variable is modified, false if it's only read. */
+static bool isVarModified(const Node &n, const std::string &nm) {
+    if (n.kind == NK::ScalarVar && n.name == nm) {
+        /* Check if this is a write target (LHS of assign, etc.) */
+        return false; /* bare read — not modified at this node */
+    }
+    /* Check for assignments where nm is the LHS */
+    if (n.kind == NK::Assign && n.left &&
+        n.left->kind == NK::ScalarVar && n.left->name == nm)
+        return true;
+    /* Check for compound assigns */
+    if (n.kind == NK::CompoundAssign && n.left &&
+        n.left->kind == NK::ScalarVar && n.left->name == nm)
+        return true;
+    /* Check for increments/decrements */
+    if (n.kind == NK::UnaryOp && n.left &&
+        n.left->kind == NK::ScalarVar && n.left->name == nm) {
+        if (n.sval == "pre++" || n.sval == "post++" ||
+            n.sval == "pre--" || n.sval == "post--")
+            return true;
+    }
+    bool r = false;
+    if (n.left)  r = r || isVarModified(*n.left,  nm);
+    if (n.right) r = r || isVarModified(*n.right, nm);
+    for (auto &a : n.args) { if (!r) r = r || isVarModified(*a, nm); }
+    if (n.body)  r = r || isVarModified(*n.body,  nm);
+    for (auto &b : n.branches) {
+        if (!r && b.body) r = r || isVarModified(*b.body, nm);
+    }
+    return r;
+}
+
+/* Emit hoisted perl_deref_array calls for loop-invariant variables.
+   For each variable in 'derefTargets' that is not modified in 'body',
+   emit perl_deref_array(lookupVar(nm)) before the loop and cache the
+   PerlArray* in loopDerefCache_. */
+void CodeGen::emitHoistedDerefs(const Node &loopBody,
+                                const std::set<std::string> &derefTargets) {
+    auto *i64Ty = Type::getInt64Ty(ctx_);
+    for (const auto &nm : derefTargets) {
+        /* Skip if already cached */
+        if (lookupLoopDerefCache(nm)) continue;
+        /* Skip if variable doesn't exist in current scope */
+        if (!lookupVar(nm)) continue;
+        /* Skip if variable is modified inside the loop body */
+        if (isVarModified(loopBody, nm)) continue;
+
+        /* Emit perl_deref_array(lookupVar(nm)) */
+        Value *slot = lookupVar(nm);
+        Value *pv = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
+        Value *arr = callRT("perl_deref_array", {pv});
+
+        /* Cache in an alloca */
+        auto *cacheAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".deref");
+        builder_.CreateStore(arr, cacheAlloca);
+        declareLoopDerefCache(nm, cacheAlloca);
+    }
+}
+
+/* Emit perl_deref_array(ref), checking the loop-invariant deref cache first.
+   If 'cachedVarName' is provided and the variable is in the cache, load from
+   the cached alloca instead of calling perl_deref_array. */
+Value *CodeGen::emitDerefArray(Value *ref, const std::string *cachedVarName) {
+    if (cachedVarName) {
+        if (Value *cacheAlloca = lookupLoopDerefCache(*cachedVarName)) {
+            return builder_.CreateLoad(perlPtrTy_, cacheAlloca, (*cachedVarName) + ".deref.load");
+        }
+    }
+    return callRT("perl_deref_array", {ref});
+}
+
+/* ── Stage 33: known tag type tracking ───────────────────────────────────── */
+
+void CodeGen::pushKnownTypes() {
+    knownTagTypes_.emplace_back();
+}
+
+void CodeGen::popKnownTypes() {
+    if (!knownTagTypes_.empty())
+        knownTagTypes_.pop_back();
+}
+
+void CodeGen::setKnownTagType(const std::string &varName, int tag) {
+    if (!knownTagTypes_.empty())
+        knownTagTypes_.back()[varName] = tag;
+}
+
+int CodeGen::lookupKnownTagType(const std::string &varName) {
+    for (int i = (int)knownTagTypes_.size() - 1; i >= 0; i--) {
+        auto it = knownTagTypes_[i].find(varName);
+        if (it != knownTagTypes_[i].end()) return it->second;
+    }
+    return 0;
+}
+
+void CodeGen::pushArrayElemTypes() {
+    arrayElemTypes_.emplace_back();
+}
+
+void CodeGen::popArrayElemTypes() {
+    if (!arrayElemTypes_.empty())
+        arrayElemTypes_.pop_back();
+}
+
+void CodeGen::setArrayElemType(const std::string &arrName, int elemTag) {
+    if (!arrayElemTypes_.empty())
+        arrayElemTypes_.back()[arrName] = elemTag;
+}
+
+int CodeGen::lookupArrayElemType(const std::string &arrName) {
+    for (int i = (int)arrayElemTypes_.size() - 1; i >= 0; i--) {
+        auto it = arrayElemTypes_[i].find(arrName);
+        if (it != arrayElemTypes_[i].end()) return it->second;
+    }
+    return 0;
+}
+
+void CodeGen::setFuncArgElemType(int argIdx, int elemTag) {
+    funcArgElemTypes_[argIdx] = elemTag;
+}
+
+int CodeGen::lookupFuncArgElemType(int argIdx) {
+    auto it = funcArgElemTypes_.find(argIdx);
+    if (it != funcArgElemTypes_.end()) return it->second;
+    return 0;
+}
+
+/* ── cached PerlArray* for array-ref @_ args (Stage 15) ─────────────────── */
 
 /* Returns true if 'nm' only ever appears in numeric-safe contexts within 'n'.
    Used to decide whether a @_ scalar arg can be promoted to a float alloca.
@@ -2056,21 +1789,14 @@ static bool needsFloatPrec(const Node &n, const std::string &nm) {
 /* Pure predicate — can this expression be computed as a bare LLVM double?
    Never emits any IR. Returns true iff emitExprF64 will succeed. */
 bool CodeGen::canEmitF64(const Node &n) {
-     switch (n.kind) {
-     case NK::FloatLit:
-         return true;
-     case NK::IntLit:
-         /* D78: Integers larger than 2^53 lose precision when converted to
-            double. Don't use the F64 fast path for such values — fall back
-            to the runtime's integer arithmetic which preserves exact values. */
-         return n.ival >= -9007199254740992LL && n.ival <= 9007199254740992LL;
+    switch (n.kind) {
+    case NK::FloatLit:
+    case NK::IntLit:
+        return true;
     case NK::ScalarVar: {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
         if (lookupFloatVar(nm)) return true;
-        /* D78: Don't use F64 fast path for file-scope vars initialized with
-           large integer literals (> 2^53) — converting to double loses precision. */
-        if (fileScalarLargeInt_.count(nm)) return false;
         /* Only treat file-scope globals as numeric if they have no special runtime accessor */
         static const std::unordered_set<std::string> specialVars =
             {"AUTOLOAD","!","/",".","\\",",","&","0","_"};
@@ -2127,11 +1853,7 @@ bool CodeGen::canEmitF64(const Node &n) {
         }
         return false;
     case NK::HashElem:
-        /* Hash values can be any type (string, ref, etc.) — unlike an array,
-           there's no per-hash type tracking (D66: this used to return true
-           whenever the hash was merely in scope, silently coercing string
-           values to 0.0 via perl_to_float). Not safely float-promotable. */
-        return false;
+        return lookupHash(n.name) != nullptr;
     case NK::Call: {
         /* Inlineable subs whose body is purely numeric can be emitted as F64. */
         auto it = inlineSubs_.find(n.name);
@@ -2296,8 +2018,8 @@ Value *CodeGen::emitExprF64(const Node &n) {
 
                     /* Stage 22: flat row cache — direct double[] read via phi dispatch */
                     if (Value *fra = lookupFlatRow(n.left->left->name, idxNm)) {
-        /* Stage 31: return cached f64 if this exact element was already loaded (gated). */
-        if (isOptStageEnabled("stage31") && isOptStageEnabled("flatdouble") && n.right->kind == NK::IntLit) {
+                        /* Stage 31: return cached f64 if this exact element was already loaded */
+                        if (n.right->kind == NK::IntLit) {
                             std::string ckey = n.left->left->name + "\x01" + idxNm + "\x01" + std::to_string(n.right->ival);
                             auto cit = flatDoubleCache_.find(ckey);
                             if (cit != flatDoubleCache_.end()) return cit->second;
@@ -2347,8 +2069,8 @@ Value *CodeGen::emitExprF64(const Node &n) {
                         auto *phi17 = builder_.CreatePHI(f64Ty17, 2, "fv");
                         phi17->addIncoming(fvf17, fBB17p);
                         phi17->addIncoming(fvn17, nBB17p);
-                        /* Stage 31: cache the loaded value for repeated reads of same element (gated). */
-                        if (isOptStageEnabled("stage31") && isOptStageEnabled("flatdouble") && n.right->kind == NK::IntLit) {
+                        /* Stage 31: cache the loaded value for repeated reads of same element */
+                        if (n.right->kind == NK::IntLit) {
                             std::string ckey = n.left->left->name + "\x01" + idxNm + "\x01" + std::to_string(n.right->ival);
                             flatDoubleCache_[ckey] = phi17;
                         }
@@ -2434,28 +2156,82 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     return callRT("perl_to_float", {elem});
                 }
       /* FLOAT_PAIR / FLAT_ARRAY fast path: $z->[idx] where tag may be
-               FLOAT_PAIR (13), FLAT_ARRAY (10), or REF_ARRAY.
-               Emits runtime tag checks; branches are perfectly predicted once type is fixed. */
-                  if (n.right && lookupVar(nm)) {
-                      if (Value *slot = lookupVar(nm)) {
-                          auto *i32Ty = Type::getInt32Ty(ctx_);
-                          auto *i64Ty = Type::getInt64Ty(ctx_);
-                          auto *f64Ty = Type::getDoubleTy(ctx_);
-                          auto *i8Ty  = Type::getInt8Ty(ctx_);
-                          Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
-                          Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
-                          Value *isPair = builder_.CreateICmpEQ(tag,
-                              ConstantInt::get(i32Ty, 13), "ispair");
-                          Value *isFlat = builder_.CreateICmpEQ(tag,
-                              ConstantInt::get(i32Ty, 10), "isflat");
-                          auto *curFn = builder_.GetInsertBlock()->getParent();
-                          auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
-                          auto *flBB = BasicBlock::Create(ctx_, "fl.f",  curFn);
-                          auto *flatBB = BasicBlock::Create(ctx_, "fa.f",  curFn);
-                          auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
-                          auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
-                          /* Branch: isPair ? pBB : flBB */
-                          builder_.CreateCondBr(isPair, pBB, flBB);
+                FLOAT_PAIR (13), FLAT_ARRAY (10), or REF_ARRAY.
+                Stage 33: if knownTagTypes_ has a known type, skip the tag dispatch. */
+                   if (n.right && lookupVar(nm)) {
+                       if (Value *slot = lookupVar(nm)) {
+                           auto knownTag = lookupKnownTagType(nm);
+                           auto *i32Ty = Type::getInt32Ty(ctx_);
+                           auto *i64Ty = Type::getInt64Ty(ctx_);
+                           auto *f64Ty = Type::getDoubleTy(ctx_);
+                           auto *i8Ty  = Type::getInt8Ty(ctx_);
+                           Value *pv   = builder_.CreateLoad(perlPtrTy_, slot, nm + ".pv");
+                           auto *curFn = builder_.GetInsertBlock()->getParent();
+                           /* Stage 33: use known type to skip tag dispatch */
+                           if (knownTag == 13) {
+                               /* Known FLOAT_PAIR: direct field load, no tag check */
+                               Value *pairFv;
+                               if (n.right->kind == NK::IntLit &&
+                                   (n.right->ival == 0 || n.right->ival == 1)) {
+                                   if (n.right->ival == 0) {
+                                       Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                           i8Ty, pv, 8, "fp.re.ptr");
+                                       pairFv = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                                   } else {
+                                       Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                           i8Ty, pv, 16, "fp.im.ptr");
+                                       Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                                       pairFv = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                                   }
+                               } else {
+                                   auto *idxV = emitIdx(*n.right);
+                                   Value *idx0 = builder_.CreateICmpEQ(idxV,
+                                       ConstantInt::get(i64Ty, 0), "idx0");
+                                   auto *idxBB = BasicBlock::Create(ctx_, "fp.idx", curFn);
+                                   auto *reBB = BasicBlock::Create(ctx_, "fp.re", curFn);
+                                   auto *imBB = BasicBlock::Create(ctx_, "fp.im", curFn);
+                                   auto *idxM = BasicBlock::Create(ctx_, "fp.idm", curFn);
+                                   builder_.CreateCondBr(idx0, reBB, imBB);
+                                   builder_.SetInsertPoint(reBB);
+                                   Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
+                                       i8Ty, pv, 8, "fp.re.ptr");
+                                   Value *reV = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
+                                   builder_.CreateBr(idxM);
+                                   builder_.SetInsertPoint(imBB);
+                                   Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
+                                       i8Ty, pv, 16, "fp.im.ptr");
+                                   Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
+                                   Value *imV = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
+                                   builder_.CreateBr(idxM);
+                                   builder_.SetInsertPoint(idxM);
+                                   auto *phiIdx = builder_.CreatePHI(f64Ty, 2, "fp.idx");
+                                   phiIdx->addIncoming(reV, reBB);
+                                   phiIdx->addIncoming(imV, imBB);
+                                   pairFv = phiIdx;
+                               }
+                               return pairFv;
+                           } else if (knownTag == 10) {
+                               /* Known FLAT_ARRAY: direct double[] load, no tag check */
+                               Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fa.dp");
+                               Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "fa.dpp");
+                               dblPtr = builder_.CreateBitCast(dblPtr, f64Ty->getPointerTo());
+                               Value *idx = emitIdx(*n.right);
+                               dblPtr = builder_.CreateGEP(f64Ty, dblPtr, idx, "fa.gep");
+                               return builder_.CreateLoad(f64Ty, dblPtr, "fa.val");
+                           }
+                           /* Unknown type: emit runtime tag dispatch */
+                           Value *tag  = builder_.CreateLoad(i32Ty, pv, nm + ".tag");
+                           Value *isPair = builder_.CreateICmpEQ(tag,
+                               ConstantInt::get(i32Ty, 13), "ispair");
+                           Value *isFlat = builder_.CreateICmpEQ(tag,
+                               ConstantInt::get(i32Ty, 10), "isflat");
+                           auto *pBB = BasicBlock::Create(ctx_, "fp.p",  curFn);
+                           auto *flBB = BasicBlock::Create(ctx_, "fl.f",  curFn);
+                           auto *flatBB = BasicBlock::Create(ctx_, "fa.f",  curFn);
+                           auto *nBB = BasicBlock::Create(ctx_, "fp.n",  curFn);
+                           auto *mBB = BasicBlock::Create(ctx_, "fp.m",  curFn);
+                           /* Branch: isPair ? pBB : flBB */
+                           builder_.CreateCondBr(isPair, pBB, flBB);
                           /* FLOAT_PAIR path: direct field load.
                                For fixed 0/1: compile-time select.
                                For variable index: runtime PHI between re (offset 8) and im (offset 16). */
@@ -2534,18 +2310,19 @@ Value *CodeGen::emitExprF64(const Node &n) {
               }
              return nullptr;
         } else {
-            /* Hash ArrowDeref ($ref->{key}) — values can be any type (string, ref, etc.).
-               Cannot safely emit as F64. Fall through to regular emitExpr path. */
-            return nullptr;
+            Value *base = emitExpr(*n.left);
+            Value *hv = callRT("perl_deref_hash", {base});
+            freeIfOwned(base);
+            Value *elem = emitHashGetRef(hv, *n.right);
+            return callRT("perl_to_float", {elem});
         }
     }
-    case NK::HashElem:
-        /* D66: hash values can be any type (string, ref, etc.), and unlike
-           ArrayElem there's no per-hash element-type tracking to prove this
-           read is safe. Bail out to the general (correct, tag-checking) path
-           instead of blindly calling perl_to_float on a possibly-non-numeric
-           value. Mirrors the hash-ArrowDeref case just above. */
-        return nullptr;
+    case NK::HashElem: {
+        Value *hv = lookupHash(n.name);
+        if (!hv) return nullptr;
+        Value *elem = emitHashGetRef(hv, *n.left);
+        return callRT("perl_to_float", {elem});
+    }
     case NK::Call: {
         /* Inlineable sub with a float body — emit the body directly in F64 context,
            skipping boxing entirely (e.g. cabs2($zp) in a comparison). */
@@ -2577,116 +2354,20 @@ Value *CodeGen::emitExprF64(const Node &n) {
 
 /* ── top-level compile ───────────────────────────────────────────────────── */
 
-/* D45: named subs are always compile-time-hoisted to package scope in real
-   Perl, no matter how deeply nested in bare `{ }` blocks, if/while/for
-   bodies, or eval blocks — `{ sub f {...} }` defines a perfectly normal,
-   globally-callable `f`, not something scoped to the block. Recurse
-   through every child field a Node can hold (mirroring
-   hasWantarrayOrUserCall's traversal) so subs_ ends up with every
-   NK::SubDef in the program, regardless of nesting depth. Deliberately
-   still recurses into a found SubDef's own body (a named sub nested
-   inside another named sub is unusual but also hoisted in real Perl) and
-   into NK::AnonSub bodies (a named sub could be declared inside a
-   closure) — both fall out naturally from the generic walk with no
-   special-casing needed. */
-static void collectSubDefs(const Node &n, std::vector<const Node*> &out) {
-    if (n.kind == NK::SubDef) out.push_back(&n);
-    if (n.left)  collectSubDefs(*n.left,  out);
-    if (n.right) collectSubDefs(*n.right, out);
-    if (n.cond)  collectSubDefs(*n.cond,  out);
-    if (n.body)  collectSubDefs(*n.body,  out);
-    if (n.init)  collectSubDefs(*n.init,  out);
-    if (n.step)  collectSubDefs(*n.step,  out);
-    for (auto &a : n.args) collectSubDefs(*a, out);
-    for (auto &b : n.branches) {
-        if (b.cond) collectSubDefs(*b.cond, out);
-        if (b.body) collectSubDefs(*b.body, out);
-    }
-}
-
-/* D57: collect the names of every NK::Call found anywhere in an
-   expression subtree — used to detect recursion cycles among candidate
-   AST-inline subs (see below). */
-static void collectCalls(const Node &n, std::vector<std::string> &out) {
-    if (n.kind == NK::Call) out.push_back(n.name);
-    if (n.left)  collectCalls(*n.left,  out);
-    if (n.right) collectCalls(*n.right, out);
-    if (n.cond)  collectCalls(*n.cond,  out);
-    if (n.body)  collectCalls(*n.body,  out);
-    if (n.init)  collectCalls(*n.init,  out);
-    if (n.step)  collectCalls(*n.step,  out);
-    for (auto &a : n.args) collectCalls(*a, out);
-    for (auto &b : n.branches) {
-        if (b.cond) collectCalls(*b.cond, out);
-        if (b.body) collectCalls(*b.body, out);
-    }
-}
-
-/* D57: tryEmitInline() has no recursion guard — inlining a call whose
-   body (transitively, through other inlined subs) calls back to itself
-   would recurse the *compiler* forever on the same, unchanging AST node
-   (a self-recursive sub matching the inlinable shape crashed/hung the
-   compiler at compile time, confirmed even at plain file scope with no
-   block nesting involved). Standard 3-color DFS cycle detection over the
-   call graph restricted to candidate-inlineable subs (a call to a
-   non-candidate sub just becomes an ordinary, bounded function call and
-   can't participate in a cycle): 0=unvisited, 1=on the current DFS
-   stack, 2=fully explored. Finding an edge back to a node still marked
-   "on stack" means everything from that node to the top of the stack
-   forms a cycle (this also covers the direct self-recursion case, where
-   the back-edge points at the node currently being visited itself). */
-static void dfsFindCycles(const std::string &node,
-                           const std::unordered_map<std::string, std::vector<std::string>> &callGraph,
-                           std::unordered_map<std::string, int> &state,
-                           std::vector<std::string> &stack,
-                           std::set<std::string> &inCycle) {
-    state[node] = 1;
-    stack.push_back(node);
-    auto it = callGraph.find(node);
-    if (it != callGraph.end()) {
-        for (const auto &callee : it->second) {
-            int calleeState = state.count(callee) ? state[callee] : 0;
-            if (calleeState == 1) {
-                for (auto rit = stack.rbegin(); rit != stack.rend(); ++rit) {
-                    inCycle.insert(*rit);
-                    if (*rit == callee) break;
-                }
-            } else if (calleeState == 0) {
-                dfsFindCycles(callee, callGraph, state, stack, inCycle);
-            }
-        }
-    }
-    stack.pop_back();
-    state[node] = 2;
-}
-
-void CodeGen::compile(const Node &program, const std::string &modName, bool asDoLib) {
+void CodeGen::compile(const Node &program, const std::string &modName) {
     mod_->setModuleIdentifier(modName);
     sourceFile_ = modName;
-    asDoLib_ = asDoLib;
     if (debug_) initializeDebugInfo(modName);
 
-    /* D10: reset per-compilation counters so multi-compile is deterministic */
-    sortCmpCounter_ = 0;
-    substEvalCounter_ = 0;
-    stateSeq_ = 0;
-    endSeq_ = 0;
-    lastSqrtInput_ = nullptr;
-    floatSqrtOf_.clear();
-
-    /* collect sub definitions first so forward calls work — recurse into
-       every block/statement, not just program's direct top-level
-       children (D45: a sub nested in a bare block is still global). */
+    /* collect sub definitions first so forward calls work */
     subs_.clear();
     subCaptures_.clear();
-    collectSubDefs(program, subs_);
+    for (auto &stmt : program.args)
+        if (stmt->kind == NK::SubDef)
+            subs_.push_back(stmt.get());
 
     /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
-       These are expanded at call sites without @_ construction. Collected
-       into `candidates` first (not inlineSubs_ directly) so the D57
-       cycle check below can see the whole candidate set before any of
-       them become "live" for tryEmitInline(). */
-    std::unordered_map<std::string, InlineSub> candidates;
+       These are expanded at call sites without @_ construction. */
     for (auto *s : subs_) {
         if (!s->body) continue;
         const Node &body = *s->body;
@@ -2714,30 +2395,7 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
             } else { allScalar = false; break; }
         }
         if (!allScalar || params.empty()) continue;
-        candidates[s->name] = {params, ret.left.get()};
-    }
-
-    /* D57: exclude any candidate that's part of a recursion cycle (direct
-       self-recursion, or mutual recursion through other candidates) —
-       see dfsFindCycles()'s comment for why inlining one would hang the
-       compiler. Everything else becomes "live" in inlineSubs_. */
-    {
-        std::unordered_map<std::string, std::vector<std::string>> callGraph;
-        for (auto &kv : candidates) {
-            std::vector<std::string> calls;
-            collectCalls(*kv.second.bodyExpr, calls);
-            for (auto &callee : calls)
-                if (candidates.count(callee)) callGraph[kv.first].push_back(callee);
-        }
-        std::set<std::string> inCycle;
-        std::unordered_map<std::string, int> dfsState;
-        for (auto &kv : candidates) {
-            if (dfsState.count(kv.first)) continue;
-            std::vector<std::string> stack;
-            dfsFindCycles(kv.first, callGraph, dfsState, stack, inCycle);
-        }
-        for (auto &kv : candidates)
-            if (!inCycle.count(kv.first)) inlineSubs_[kv.first] = kv.second;
+        inlineSubs_[s->name] = {params, ret.left.get()};
     }
 
     /* pre-declare all subs as Functions */
@@ -2750,150 +2408,87 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
         fn->addFnAttr(Attribute::AlwaysInline);
     }
 
-    auto *i32Ty = Type::getInt32Ty(ctx_);
-    if (!asDoLib) {
-        /* emit main(int argc, char **argv) */
-        auto *i8p  = PointerType::getUnqual(ctx_);
-        auto *mainFT = FunctionType::get(i32Ty, {i32Ty, i8p}, false);
-        auto *mainFn = Function::Create(mainFT, Function::ExternalLinkage,
-                                        "main", mod_.get());
-        mainFn->getArg(0)->setName("argc");
-        mainFn->getArg(1)->setName("argv");
-        auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
-        builder_.SetInsertPoint(entry);
+    /* emit main(int argc, char **argv) */
+    auto *i32  = Type::getInt32Ty(ctx_);
+    auto *i8p  = PointerType::getUnqual(ctx_);
+    auto *mainFT = FunctionType::get(i32, {i32, i8p}, false);
+    auto *mainFn = Function::Create(mainFT, Function::ExternalLinkage,
+                                    "main", mod_.get());
+    mainFn->getArg(0)->setName("argc");
+    mainFn->getArg(1)->setName("argv");
+    auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
+    builder_.SetInsertPoint(entry);
 
-        if (debug_) {
-            mainFn->setSubprogram(currentSP_);
-            builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
-        }
+    if (debug_) {
+        mainFn->setSubprogram(currentSP_);
+        builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
+    }
 
-        currentFn_ = mainFn;
-        pushScope();
-        /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
-        fileScopeDepth_ = (int)scopes_.size() + 1;
-        inMainBody_ = true;
+    currentFn_ = mainFn;
+    pushScope();
+    /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
+    fileScopeDepth_ = (int)scopes_.size() + 1;
+    inMainBody_ = true;
 
-        /* register all subs in the method dispatch table (before user code runs) */
-        for (auto *s : subs_) {
-            if (s->name.find("::") != std::string::npos) {
-                Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
-                auto *fn = mod_->getFunction(subLLVMName(s->name));
-                callRT("perl_register_method", {keyStr, fn});
-            }
-        }
-
-        /* set up @ARGV and $0 from command-line arguments */
-        {
-            Value *argc_v = mainFn->getArg(0);
-            Value *argv_v = mainFn->getArg(1);
-            Value *argvArr = callRT("perl_init_argv", {argc_v, argv_v});
-            {
-                auto *gvArgv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                    GlobalValue::InternalLinkage,
-                    Constant::getNullValue(perlPtrTy_), "g.arr.ARGV");
-                builder_.CreateStore(argvArr, gvArgv);
-                fileArrayGlobals_["ARGV"] = gvArgv;
-            }
-
-            Value *dollar0 = callRT("perl_get_dollar0", {});
-            auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
-            builder_.CreateStore(dollar0, slot0);
-            declareVar("0", slot0);
-
-            Value *underscoreVal = callRT("perl_alloc_undef", {});
-            auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
-            builder_.CreateStore(underscoreVal, slotUs);
-            declareVar("_", slotUs);
-        }
-
-        /* capture local() save depth at function entry */
-        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
-        builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
-
-        /* D64: same pre-scan as emitSub/AnonSub, for the top-level program body */
-        collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
-
-        emitBlock(program);
-        popScope();
-
-        callRT("perl_pop_wantarray", {});
-        /* restore any local()s before returning */
-        {
-            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-            callRT("perl_local_restore_to", {depth});
-        }
-
-        /* Register perl_cleanup via atexit so valgrind reports zero leaks. */
-        {
-            auto *atexitFnTy = FunctionType::get(Type::getInt32Ty(ctx_),
-                                                 {PointerType::getUnqual(ctx_)}, false);
-            auto atexitFn = mod_->getOrInsertFunction("atexit", atexitFnTy);
-            auto *perlCleanupFn = mod_->getFunction("perl_cleanup");
-            if (perlCleanupFn)
-                builder_.CreateCall(cast<Function>(atexitFn.getCallee()), {perlCleanupFn});
-        }
-
-        builder_.CreateRet(ConstantInt::get(i32Ty, 0));
-    } else {
-        /* D24: emit `PerlValue *__perlc_do_run(PerlArray *args, int ctx)` —
-           a `do FILE`-loadable entry point instead of `main`. No @ARGV/$0
-           setup (a do'd file doesn't get its own process argv) and no
-           atexit(perl_cleanup) registration (only the single top-level
-           program that eventually dlopen()s this .so should register
-           process-exit cleanup — this library's own runtime.c symbols
-           are never even linked in; see main.cpp's --do-lib link step).
-           The file's top-level statements are compiled exactly like a
-           sub body via emitBlockLast(), so the entry point returns the
-           value of the last statement evaluated — matching real Perl's
-           documented `do FILE` return-value contract (and the common
-           `1;` idiom at end-of-file, matching require's convention). */
-        auto *entryFT = FunctionType::get(perlPtrTy_, {arrayPtrTy_, i32Ty}, false);
-        auto *entryFn = Function::Create(entryFT, Function::ExternalLinkage,
-                                         "__perlc_do_run", mod_.get());
-        entryFn->getArg(0)->setName("args");
-        entryFn->getArg(1)->setName("ctx");
-        auto *entry = BasicBlock::Create(ctx_, "entry", entryFn);
-        builder_.SetInsertPoint(entry);
-
-        if (debug_) {
-            entryFn->setSubprogram(currentSP_);
-            builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
-        }
-
-        currentFn_ = entryFn;
-        pushScope();
-        fileScopeDepth_ = (int)scopes_.size() + 1;
-        inMainBody_ = true;
-
-        /* register all subs in the method dispatch table (before user code
-           runs) — this is what makes a do'd file's own package-qualified
-           subs (e.g. Foo::bar) callable from the *loading* process after
-           perl_do_file() returns, since the loader looks them up in this
-           same runtime-wide table via perl_call_named_sub(). */
-        for (auto *s : subs_) {
-            if (s->name.find("::") != std::string::npos) {
-                Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
-                auto *fn = mod_->getFunction(subLLVMName(s->name));
-                callRT("perl_register_method", {keyStr, fn});
-            }
-        }
-
-        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
-        builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
-
-        /* D64: same pre-scan as the normal-main path above */
-        collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
-
-        Value *lastVal = emitBlockLast(program);
-        if (!builder_.GetInsertBlock()->getTerminator()) {
-            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-            callRT("perl_local_restore_to", {depth});
-            popScope();
-            builder_.CreateRet(lastVal ? lastVal : perlUndef());
-        } else {
-            popScope();  /* explicit return: already terminated this block */
+    /* register all subs in the method dispatch table (before user code runs) */
+    for (auto *s : subs_) {
+        if (s->name.find("::") != std::string::npos) {
+            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+            auto *fn = mod_->getFunction(subLLVMName(s->name));
+            callRT("perl_register_method", {keyStr, fn});
         }
     }
+
+    /* set up @ARGV and $0 from command-line arguments */
+    {
+        Value *argc_v = mainFn->getArg(0);
+        Value *argv_v = mainFn->getArg(1);
+        Value *argvArr = callRT("perl_init_argv", {argc_v, argv_v});
+        {
+            auto *gvArgv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                Constant::getNullValue(perlPtrTy_), "g.arr.ARGV");
+            builder_.CreateStore(argvArr, gvArgv);
+            fileArrayGlobals_["ARGV"] = gvArgv;
+        }
+
+        Value *dollar0 = callRT("perl_get_dollar0", {});
+        auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
+        builder_.CreateStore(dollar0, slot0);
+        declareVar("0", slot0);
+
+        Value *underscoreVal = callRT("perl_alloc_undef", {});
+        auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        builder_.CreateStore(underscoreVal, slotUs);
+        declareVar("_", slotUs);
+    }
+
+    /* capture local() save depth at function entry */
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+    emitBlock(program);
+    popScope();
+
+    callRT("perl_pop_wantarray", {});
+    /* restore any local()s before returning */
+    {
+        Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+        callRT("perl_local_restore_to", {depth});
+    }
+
+    /* Register perl_cleanup via atexit so valgrind reports zero leaks. */
+    {
+        auto *atexitFnTy = FunctionType::get(Type::getInt32Ty(ctx_),
+                                             {PointerType::getUnqual(ctx_)}, false);
+        auto atexitFn = mod_->getOrInsertFunction("atexit", atexitFnTy);
+        auto *perlCleanupFn = mod_->getFunction("perl_cleanup");
+        if (perlCleanupFn)
+            builder_.CreateCall(cast<Function>(atexitFn.getCallee()), {perlCleanupFn});
+    }
+
+    builder_.CreateRet(ConstantInt::get(Type::getInt32Ty(ctx_), 0));
 
     inMainBody_ = false;
     /* emit sub bodies */
@@ -2934,13 +2529,6 @@ void CodeGen::emitSub(const Node &n) {
         auto sc = n.name.rfind("::");
         currentPackage_ = (sc != std::string::npos) ? n.name.substr(0, sc) : "main";
     }
-
-    /* D64: pre-scan this sub's body once for names captured by any
-       closure nested within it, so `case NK::My:`'s fast-path check can
-       skip the unboxed int/float optimization for those specific names. */
-    auto savedCapturedNames = capturedNamesInCurrentFn_;
-    capturedNamesInCurrentFn_.clear();
-    if (n.body) collectClosureCapturedNames(*n.body, capturedNamesInCurrentFn_);
 
     auto *savedFn = currentFn_;
     currentFn_ = fn;
@@ -3092,7 +2680,6 @@ void CodeGen::emitSub(const Node &n) {
     currentSubNeedsWantarray_ = savedNeedsWantarray;
     currentFn_ = savedFn;
     currentPackage_ = savedPackage;
-    capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
 
     /* restore insert point to end of main (for any remaining stmts) */
     /* caller will set insert point back */
@@ -3196,7 +2783,7 @@ static bool hasDefaultVarUse(const Node &n) {
 
 /* Stage 17: skip local save/restore for blocks that contain no local() */
 static bool hasLocalStmt(const Node &n) {
-    if (n.kind == NK::LocalStmt || n.kind == NK::LocalArray || n.kind == NK::LocalHash) return true;
+    if (n.kind == NK::LocalStmt) return true;
     bool r = false;
     if (n.left)  r = r || hasLocalStmt(*n.left);
     if (n.right) r = r || hasLocalStmt(*n.right);
@@ -3251,7 +2838,9 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         bool isLast = (i + 1 == n.args.size());
         if (isLast && stmt.kind == NK::ExprStmt && stmt.left) {
             /* If the last expr produces a list (grep/map/sort/etc.) and we're in
-               a wantarray-aware sub, wrap it for list/scalar context propagation. */
+               a wantarray-aware sub, wrap it for list/scalar context propagation.
+               Dispatch by producer kind so scalar-context semantics are correct:
+               grep → count, sort → undef, map → last element, others → last elem. */
             const Node &le = *stmt.left;
             NK lk = le.kind;
             bool isListProducer = (lk == NK::MapFunc || lk == NK::GrepFunc ||
@@ -3260,60 +2849,30 @@ Value *CodeGen::emitBlockLast(const Node &n) {
             if (isListProducer && currentSubNeedsWantarray_) {
                 Value *av = emitArrayPtr(le);
                 if (!av) av = callRT("perl_array_new", {});
-                /* grep/map return COUNT in scalar context (not last element);
-                   sort returns undef in scalar context (D29). */
-                if (lk == NK::GrepFunc || lk == NK::MapFunc || lk == NK::SortFunc) {
-                    auto *i32Ty = Type::getInt32Ty(ctx_);
-                    Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                    /* D87: only ctx==1 is list; void(2) and scalar(0) are not */
-                    Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
-                    Value *listResult = callRT("perl_array_to_list_return", {av});
-                    Value *scalarResult = (lk == NK::SortFunc) ? perlUndef()
-                                         : callRT("perl_array_len", {av});
-                    result = builder_.CreateSelect(isList, listResult, scalarResult);
-                } else {
-                    result = callRT("perl_array_to_list_return", {av});
-                }
+                const char *helper = "perl_array_to_list_return";
+                if (lk == NK::GrepFunc)      helper = "perl_grep_list_return";
+                else if (lk == NK::MapFunc)   helper = "perl_map_list_return";
+                else if (lk == NK::SortFunc)  helper = "perl_sort_list_return";
+                result = callRT(helper, {av});
             } else {
-                /* D87: last expr inherits caller's wantarray (return f()) */
-                int savedCtx = callCtx_;
-                callCtx_ = -1;
                 result = emitExpr(le);
-                callCtx_ = savedCtx;
-            }
-        } else if (isLast && stmt.kind == NK::Return) {
-            /* Capture the return value without emitting a ret instruction.
-                The caller will handle the actual return. */
-            if (stmt.left && (stmt.left->kind == NK::ArrayLit || stmt.left->kind == NK::ArrayVar ||
-                                stmt.left->kind == NK::MapFunc  || stmt.left->kind == NK::GrepFunc ||
-                                stmt.left->kind == NK::SortFunc || stmt.left->kind == NK::DerefArray ||
-                                stmt.left->kind == NK::ReverseFunc)) {
-                Value *av = emitArrayPtr(*stmt.left);
-                if (!av) av = callRT("perl_array_new", {});
-                /* grep/map return COUNT in scalar context (not last element);
-                   sort returns undef in scalar context (D29). */
-                if (stmt.left->kind == NK::GrepFunc || stmt.left->kind == NK::MapFunc ||
-                    stmt.left->kind == NK::SortFunc) {
-                    auto *i32Ty = Type::getInt32Ty(ctx_);
-                    Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                    Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
-                    Value *listResult = callRT("perl_array_to_list_return", {av});
-                    Value *scalarResult = (stmt.left->kind == NK::SortFunc) ? perlUndef()
-                                         : callRT("perl_array_len", {av});
-                    result = builder_.CreateSelect(isList, listResult, scalarResult);
-                } else {
-                    result = callRT("perl_array_to_list_return", {av});
-                }
-            } else {
-                int savedCtx = callCtx_;
-                callCtx_ = -1; /* D87: return EXPR inherits caller context */
-                result = stmt.left ? emitExpr(*stmt.left) : perlUndef();
-                callCtx_ = savedCtx;
             }
         } else {
             emitStmt(stmt);
         }
         if (builder_.GetInsertBlock()->getTerminator()) { break; }
+    }
+    /* If the last statement emitted a terminator (e.g. `return` branched
+       to an enclosing eval's endBB or sub's exit), the block already has
+       control-flow resolved — skip post-block cleanup (clone/free/popScope/
+       local_restore) which would otherwise be emitted into a terminated
+       block, producing "Terminator found in the middle of a basic block!". */
+    if (builder_.GetInsertBlock()->getTerminator()) {
+        /* still pop the scope stack so destructors run for any my-vars
+           captured by the inner expression; popScope emits no IR when the
+           current block is terminated. */
+        popScope();
+        return nullptr;
     }
     /* Clone result before popScope() frees variables it may reference.
        Also free the original if it was an owned temp (mirrors NK::Return logic). */
@@ -3332,8 +2891,6 @@ Value *CodeGen::emitBlockLast(const Node &n) {
 
 void CodeGen::emitStmt(const Node &n) {
     if (builder_.GetInsertBlock()->getTerminator()) return;
-    /* D9: sqrt input tracking is per-statement; don't leak across stmts */
-    lastSqrtInput_ = nullptr;
     if (debug_ && n.line > 0) {
         builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
     }
@@ -3349,49 +2906,35 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
-    case NK::FlatBlock: {
+    case NK::FlatBlock:
         /* emit contents in the current scope, no new scope push */
         for (auto &stmt : n.args) {
             emitStmt(*stmt);
             if (builder_.GetInsertBlock()->getTerminator()) break;
         }
         break;
-    }
 
-    case NK::ExprStmt: {
-        /* D87: bare statement is void context for any top-level call */
-        int savedCtx = callCtx_;
-        if (n.left && isCallLikeForContext(*n.left)) callCtx_ = 2;
-        freeIfOwned(emitExpr(*n.left));
-        callCtx_ = savedCtx;
-        break;
-    }
+    case NK::ExprStmt:
+        freeIfOwned(emitExpr(*n.left)); break;
 
     case NK::My: {
         if (n.name.empty()) break;
         bool isArr  = n.name[0] == '@';
         bool isHash = n.name[0] == '%';
         bool atFileScope = inMainBody_ && (int)scopes_.size() == fileScopeDepth_;
-        bool isOur = (n.ival & 2) != 0; /* package global even inside a sub */
-        bool asGlobal = atFileScope || isOur;
 
         if (isHash) {
             std::string nm = n.name.substr(1);
             Value *hv = callRT("perl_hash_new", {});
-            if (asGlobal) {
-                GlobalVariable *gv = nullptr;
-                auto git = fileHashGlobals_.find(nm);
-                if (git != fileHashGlobals_.end())
-                    gv = git->second;
-                else {
-                    gv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                        GlobalValue::InternalLinkage,
-                        Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
-                    fileHashGlobals_[nm] = gv;
-                    if (currentPackage_ != "main")
-                        fileHashGlobals_[currentPackage_ + "::" + nm] = gv;
-                }
+            if (atFileScope) {
+                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    GlobalValue::InternalLinkage,
+                    Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
                 builder_.CreateStore(hv, gv);
+                fileHashGlobals_[nm] = gv;
+                /* also register as Package::name for cross-package access */
+                if (currentPackage_ != "main") fileHashGlobals_[currentPackage_ + "::" + nm] = gv;
+                /* do NOT declareHash — lookupHash loads fresh from GlobalVariable */
             } else {
                 declareHash(nm, hv);
             }
@@ -3407,8 +2950,13 @@ void CodeGen::emitStmt(const Node &n) {
         } else if (isArr) {
             std::string nm = n.name.substr(1);
             Value *av = nullptr;
-            if (n.right) { callCtx_ = 1; av = emitArrayPtr(*n.right); callCtx_ = 0; }
-           if (!av) {
+            /* Save the outer callCtx_ before forcing list context for the
+               RHS — the surrounding call site (e.g. a CallCodeRef inside
+               `my @arr = (sub{...})->(args)`) depends on callCtx_ still
+               being 1 after we return. */
+            int savedCallCtx = callCtx_;
+            if (n.right) { callCtx_ = 1; av = emitArrayPtr(*n.right); }
+            if (!av) {
                   av = callRT("perl_array_new", {});
                   /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
                      push the value as a single element */
@@ -3416,22 +2964,18 @@ void CodeGen::emitStmt(const Node &n) {
                       callCtx_ = 1;
                       Value *rhsVal = emitExpr(*n.right);
                       callRT("perl_array_push_list_or_scalar", {av, rhsVal});
-                      callCtx_ = 0;
                   }
               }
-            if (asGlobal) {
-                auto git = fileArrayGlobals_.find(nm);
-                if (git != fileArrayGlobals_.end()) {
-                    builder_.CreateStore(av, git->second);
-                } else {
-                    auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                        GlobalValue::InternalLinkage,
-                        Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
-                    builder_.CreateStore(av, gv);
-                    fileArrayGlobals_[nm] = gv;
-                    if (currentPackage_ != "main")
-                        fileArrayGlobals_[currentPackage_ + "::" + nm] = gv;
-                }
+            callCtx_ = savedCallCtx;
+            if (atFileScope) {
+                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    GlobalValue::InternalLinkage,
+                    Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
+                builder_.CreateStore(av, gv);
+                fileArrayGlobals_[nm] = gv;
+                /* also register as Package::name for cross-package access */
+                if (currentPackage_ != "main") fileArrayGlobals_[currentPackage_ + "::" + nm] = gv;
+                /* do NOT declareArray — lookupArray loads fresh from GlobalVariable */
             } else {
                 declareArray(nm, av);
             }
@@ -3505,78 +3049,30 @@ void CodeGen::emitStmt(const Node &n) {
                 sharedScalarNames_.insert(nm);  /* Phase 3: route through perl_atomic_* */
                 break;
             }
-            if (atFileScope && asDoLib_) {
-                /* D58: in a --do-lib build, route file-scope scalars through
-                   the process-wide global-scalar registry instead of an
-                   ordinary per-compilation-unit GlobalVariable — each
-                   separate `do` call compiles and dlopen()s an independent
-                   shared library, so a plain GlobalVariable would give
-                   every call its own disconnected storage instead of the
-                   single persistent package-variable slot real Perl's
-                   `our`/package-scalars imply. The registry lookup runs
-                   every time this declaration executes (matching a normal
-                   GlobalVariable's "already initialized, just referenced
-                   again" behavior on repeat execution within one process);
-                   an explicit initializer (`our $x = 5`) still re-assigns
-                   every time this statement runs, exactly like the
-                   GlobalVariable path below and matching real Perl (an
-                   initializer is a normal assignment, not run-once magic —
-                   only a bare `our $x;` leaves an existing value alone). */
-                std::string qualKey = (currentPackage_.empty() || currentPackage_ == "main")
-                    ? ("main::" + nm) : (currentPackage_ + "::" + nm);
-                Value *keyStr = builder_.CreateGlobalStringPtr(qualKey);
-                Value *pv = callRT("perl_get_or_create_global_scalar", {keyStr});
-                auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "g." + nm);
-                builder_.CreateStore(pv, slot);
-                 if (n.right) {
-                     Value *init = emitExpr(*n.right);
-                     callRT("perl_assign", {pv, init});
-                     freeIfOwned(init);
-                 }
-                 /* D78: track file-scope vars initialized with large int literals */
-                 if (n.right && n.right->kind == NK::IntLit &&
-                     (n.right->ival > 9007199254740992LL || n.right->ival < -9007199254740992LL))
-                     fileScalarLargeInt_.insert(nm);
-                 fileScalarGlobals_[nm] = slot;
-                declareVar(nm, slot);
-                if (currentPackage_ != "main")
-                    fileScalarGlobals_[currentPackage_ + "::" + nm] = slot;
-            } else if (atFileScope) {
+            if (atFileScope) {
                 /* use a global variable so subroutines can access this file-scope var */
                 auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
                     GlobalValue::InternalLinkage,
                     Constant::getNullValue(perlPtrTy_), "g." + nm);
                 Value *pv = perlUndef();
                 builder_.CreateStore(pv, gv);
-                 if (n.right) {
-                     Value *init = emitExpr(*n.right);
-                     callRT("perl_assign", {pv, init});
-                     freeIfOwned(init);
-                 }
-                 /* D78: track file-scope vars initialized with large int literals */
-                 if (n.right && n.right->kind == NK::IntLit &&
-                     (n.right->ival > 9007199254740992LL || n.right->ival < -9007199254740992LL))
-                     fileScalarLargeInt_.insert(nm);
-                 fileScalarGlobals_[nm] = gv;
+                if (n.right) {
+                    Value *init = emitExpr(*n.right);
+                    callRT("perl_assign", {pv, init});
+                    freeIfOwned(init);
+                }
+                fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
                 /* also register as Package::name for cross-package access */
                 if (currentPackage_ != "main")
                     fileScalarGlobals_[currentPackage_ + "::" + nm] = gv;
             } else {
                 /* Unbox numeric scalars: skip PerlValue* alloca entirely.
-                   Guard: 1D ArrowDeref may return an array/hash ref, not a scalar.
-                   D64: also skip this fast path when `nm` is captured by some
-                   closure/sort-comparator anywhere in the current function —
-                   the fast path has no real PerlValue* for a closure to later
-                   share, so the existing capture-collection fallback
-                   (lookupIntVar/boxI64) would box a disconnected snapshot
-                   instead, silently breaking mutation visibility in either
-                   direction across the closure boundary. */
+                   Guard: 1D ArrowDeref may return an array/hash ref, not a scalar. */
                 bool rhsMayBeRef = n.right &&
                     n.right->kind == NK::ArrowDeref && n.right->sval == "array" &&
                     n.right->left && n.right->left->kind != NK::ArrowDeref;
-                bool mayBeCaptured = capturedNamesInCurrentFn_.count(nm) != 0;
-                if (n.right && !atFileScope && !rhsMayBeRef && !mayBeCaptured) {
+                if (n.right && !atFileScope && !rhsMayBeRef) {
                     if (Value *ival = emitExprI64(*n.right)) {
                         auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
                         builder_.CreateStore(ival, ialloca);
@@ -3588,17 +3084,7 @@ void CodeGen::emitStmt(const Node &n) {
                         builder_.CreateStore(fval, falloca);
                         declareFloatVar(nm, falloca);
                         /* Stage 30: if this var was assigned sqrt(x), remember x.
-                           Enables v*v → x and v*v*v → x*v (shorter sqrt critical path).
-                           D9: always clear any stale association for this name
-                           first — a new `my $var = ...` declaration is a brand-new
-                           binding with no relation to a previous sqrt-tracked value
-                           of the same name, whether that previous one came from an
-                           earlier declaration in this same function or (worse) a
-                           completely unrelated sub that happened to reuse the same
-                           variable name. Leaving the old entry in place made
-                           `$a*$a` silently return the *other* sub's sqrt input
-                           instead of this variable's actual squared value. */
-                        floatSqrtOf_.erase(nm);
+                           Enables v*v → x and v*v*v → x*v (shorter sqrt critical path). */
                         if (lastSqrtInput_) { floatSqrtOf_[nm] = lastSqrtInput_; lastSqrtInput_ = nullptr; }
                         break;
                     }
@@ -3654,17 +3140,12 @@ void CodeGen::emitStmt(const Node &n) {
     case NK::SayStmt: {
         bool isSay = (n.kind == NK::SayStmt);
         /* resolve filehandle (n.name: "", "STDOUT", "STDERR", or scalar varname) */
-        /* n.left: brace-block filehandle expression (print {$fh} LIST) */
         Value *fh = nullptr;
         if (n.name == "STDERR")       fh = callRT("perl_get_stderr", {});
         else if (n.name == "STDOUT")  fh = callRT("perl_get_stdout", {});
         else if (!n.name.empty()) {
             if (auto *slot = lookupVar(n.name))
                 fh = builder_.CreateLoad(perlPtrTy_, slot);
-        }
-        /* D86: brace-block filehandle form — evaluate n.left as the fh expression */
-        if (!fh && n.left) {
-            fh = emitExpr(*n.left);
         }
         if (fh) {
             /* print/say to filehandle */
@@ -3674,24 +3155,11 @@ void CodeGen::emitStmt(const Node &n) {
                     callRT(isSay ? "perl_say_fh" : "perl_print_fh", {fh, v});
                 }
             } else {
-                /* D12: print's arguments are always evaluated in list
-                   context in real Perl, regardless of print's own
-                   (always-scalar/void) context — a sub called *directly*
-                   as a print argument must see wantarray()==true. callCtx_
-                   is a one-shot flag consumed (reset to 0) by the first
-                   Call node's own codegen, so it must be set fresh before
-                   each argument, not once before the whole loop — and only
-                   when the argument is itself call-like (see
-                   isCallLikeForContext), or it would leak list context
-                   through an enclosing operator like `eq`/`==` into a call
-                   nested inside it, which must see scalar context instead. */
                 for (size_t i = 0; i < n.args.size(); i++) {
                     if (i > 0) callRT("perl_print_sep_fh", {fh});
                     bool lastArg = (i + 1 == n.args.size());
-                    if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
-                    Value *v = emitExpr(*n.args[i]);
-                    callCtx_ = 0;
-                    callRT(isSay && lastArg ? "perl_say_fh" : "perl_print_fh", {fh, v});
+                    callRT(isSay && lastArg ? "perl_say_fh" : "perl_print_fh",
+                           {fh, emitExpr(*n.args[i])});
                 }
             }
             if (!isSay) callRT("perl_print_ors_fh", {fh});
@@ -3709,41 +3177,27 @@ void CodeGen::emitStmt(const Node &n) {
                 bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
                                         ak == NK::ArraySlice || ak == NK::HashSlice ||
                                         (ak == NK::PostfixDeref && n.args[0]->sval == "all_array"));
-                /* D12: list context for the (possibly sole) print argument
-                   — only when it's itself call-like, see
-                   isCallLikeForContext. */
-                if (isCallLikeForContext(*n.args[0])) callCtx_ = 1;
                 Value *av = isExplicitArray ? emitArrayPtr(*n.args[0]) : nullptr;
                 if (av) {
-                    callCtx_ = 0;
                     callRT("perl_print_array", {av});
                     if (isSay) callRT("perl_print_string",
                                      {builder_.CreateGlobalString("\n", ".nl")});
                 } else {
                     Value *v = emitExpr(*n.args[0]);
-                    callCtx_ = 0;
                     callRT(isSay ? "perl_say" : "perl_print", {v});
                 }
             } else {
-                /* D12: see the filehandle-print loop above — callCtx_ must
-                   be set fresh per argument, not once before the loop, and
-                   only when the argument is itself call-like. */
                 for (size_t i = 0; i < n.args.size(); i++) {
                     if (i > 0) callRT("perl_print_sep", {});
                     NK ak = n.args[i]->kind;
                     bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
                                             ak == NK::ArraySlice || ak == NK::HashSlice ||
                                             (ak == NK::PostfixDeref && n.args[i]->sval == "all_array"));
-                    if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
                     Value *av = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
-                    if (av) {
-                        callCtx_ = 0;
+                    if (av)
                         callRT("perl_print_array", {av});
-                    } else {
-                        Value *v = emitExpr(*n.args[i]);
-                        callCtx_ = 0;
-                        callRT("perl_print", {v});
-                    }
+                    else
+                        callRT("perl_print", {emitExpr(*n.args[i])});
                 }
                 if (isSay) {
                     auto *nl = builder_.CreateGlobalString("\n", ".nl");
@@ -3756,23 +3210,9 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::PrintfStmt: {
-        /* D12: printf's format and args are all evaluated in list context
-           in real Perl. callCtx_ is a one-shot flag consumed by the first
-           Call node's own codegen, so it must be set fresh before each
-           sub-expression, not once before the whole sequence — and only
-           when that sub-expression is itself call-like, or list context
-           would leak through an enclosing scalar-forcing operator (like
-           `eq`/`==`) into a call nested inside it. */
-        if (isCallLikeForContext(*n.left)) callCtx_ = 1;
         Value *fmt = emitExpr(*n.left);
-        callCtx_ = 0;
         Value *av  = callRT("perl_array_new", {});
-        for (auto &a : n.args) {
-            if (isCallLikeForContext(*a)) callCtx_ = 1;
-            Value *v = emitExpr(*a);
-            callCtx_ = 0;
-            callRT("perl_array_push", {av, v});
-        }
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
         if (n.name == "STDERR") {
             callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
         } else if (!n.name.empty() && n.name != "STDOUT") {
@@ -3927,7 +3367,6 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.push_back(exit);
         loopContinues_.push_back(stepBB);
         loopRedos_.push_back(bodyBB);
-        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, stepBB, bodyBB});
 
         pushScope();
         if (n.init) emitStmt(*n.init);
@@ -3994,17 +3433,23 @@ void CodeGen::emitStmt(const Node &n) {
                 {hoistedArgs, ConstantInt::get(i32Ty, 0)});
             freeIfOwned(ret);
         } else {
+            /* Stage 32: hoist perl_deref_array calls for loop-invariant variables.
+               Collect deref targets (ScalarVars that are direct args of ArrowDeref),
+               then for each target that is not modified in this loop body, emit
+               perl_deref_array(lookupVar(nm)) before the loop and cache it.
+               Inside the loop, ArrowDeref emission checks the cache first. */
+            if (n.body) {
+                std::set<std::string> derefTargets;
+                collectDerefTargets(*n.body, derefTargets);
+                emitHoistedDerefs(*n.body, derefTargets);
+            }
             emitBlock(*n.body);
         }
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(stepBB);
 
         builder_.SetInsertPoint(stepBB);
-        if (n.step && n.step->kind == NK::FlatBlock) {
-            /* comma-separated step (e.g. $i++, $j--) — run each item for its
-               side effect only, in the loop's own scope. */
-            for (auto &item : n.step->args) emitStmt(*item);
-        } else if (n.step) {
+        if (n.step) {
             /* Stage 26b: post/pre ++/-- on an unboxed int var — increment
                directly, skipping the dead alloc_int(old_val)+free round-trip. */
             bool handledStep = false;
@@ -4033,7 +3478,6 @@ void CodeGen::emitStmt(const Node &n) {
         loopExits_.pop_back();
         loopContinues_.pop_back();
         loopRedos_.pop_back();
-        if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
         if (hoistedArgs) callRT("perl_array_free", {hoistedArgs});
         popScope();  /* free for-init pvs (e.g. my $i) at loop exit */
@@ -4108,8 +3552,6 @@ void CodeGen::emitStmt(const Node &n) {
                     for (auto &[outerNm, idxNm] : prePairs) {
                         if (!avChecked.insert(outerNm).second) continue;
                         if (avAllflatSlots_.count(outerNm)) continue; /* outer loop handles it */
-                        /* Stage 23 (allflat pre-check) gated. */
-                        if (!isOptStageEnabled("stage23") || !isOptStageEnabled("allflat")) continue;
                         Value *outerPA = lookupDerefAV(outerNm);
                         if (!outerPA) continue;
                         Value *outerArr = builder_.CreateLoad(arrayPtrTy_, outerPA,
@@ -4291,11 +3733,10 @@ void CodeGen::emitStmt(const Node &n) {
             }
         }
 
-        /* loop variable — Perl foreach aliases $_/the loop var to each element
-           in turn, so mutating it (or $_) writes back to the source array.
-           The alloca's *contents* (which PerlValue* it points at) change every
-           iteration to the array's own element cell — never a private copy. */
+        /* loop variable — stable PerlValue* in alloca */
         auto *loopVar = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+        Value *loopPv = perlUndef();
+        builder_.CreateStore(loopPv, loopVar);
 
         /* index counter */
         auto *idxAlloca = builder_.CreateAlloca(i64, nullptr, "foreach.idx");
@@ -4321,11 +3762,9 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.SetInsertPoint(bodyBB);
         pushScope();
         declareVar(n.name, loopVar);
-        /* Borrow (no clone) the array's own element cell — this IS the
-           aliasing: any perl_assign / ++ / etc. on the loop var mutates
-           the array in place. Never free the result (borrow contract). */
-        Value *elemRef = callRT("perl_array_get_ref", {tmpArr, idx});
-        builder_.CreateStore(elemRef, loopVar);
+        Value *elem = callRT("perl_array_get", {tmpArr, idx});
+        callRT("perl_assign", {loopPv, elem});
+        callRT("perl_free", {elem});
 
         emitBlock(*n.body);
         popScope();
@@ -4342,6 +3781,7 @@ void CodeGen::emitStmt(const Node &n) {
         loopRedos_.pop_back();
         if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
+        callRT("perl_free", {loopPv});
         if (ownsTmpArr) callRT("perl_array_free", {tmpArr});
         break;
     }
@@ -4368,50 +3808,29 @@ void CodeGen::emitStmt(const Node &n) {
         Value *v;
         if (n.left && (n.left->kind == NK::ArrayLit || n.left->kind == NK::ArrayVar ||
                        n.left->kind == NK::MapFunc  || n.left->kind == NK::GrepFunc ||
-                        n.left->kind == NK::SortFunc || n.left->kind == NK::DerefArray ||
-                        n.left->kind == NK::ReverseFunc)) {
-            /* return list-producing expr — wrap for list/scalar context at runtime */
+                       n.left->kind == NK::SortFunc || n.left->kind == NK::DerefArray ||
+                       n.left->kind == NK::ReverseFunc)) {
+            /* return list-producing expr — wrap for list/scalar context at
+               runtime.  Dispatch by producer kind so scalar-context semantics
+               match Perl: grep → count, sort → undef, map → last element,
+               other lists (anon-array/array-var/deref/reverse) → last element. */
             Value *av = emitArrayPtr(*n.left);
             if (!av) av = callRT("perl_array_new", {});
-            /* grep/map return COUNT in scalar context (not last element);
-               sort returns undef in scalar context (D29). */
-            if (n.left->kind == NK::GrepFunc || n.left->kind == NK::MapFunc ||
-                n.left->kind == NK::SortFunc) {
-                auto *i32Ty = Type::getInt32Ty(ctx_);
-                Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
-                Value *listResult = callRT("perl_array_to_list_return", {av});
-                Value *scalarResult = (n.left->kind == NK::SortFunc) ? perlUndef()
-                                     : callRT("perl_array_len", {av});
-                v = builder_.CreateSelect(isList, listResult, scalarResult);
-            } else {
-                v = callRT("perl_array_to_list_return", {av});
-            }
-            } else {
-                int savedCtx = callCtx_;
-                callCtx_ = -1; /* D87: return EXPR inherits caller context */
-                v = n.left ? emitExpr(*n.left) : perlUndef();
-                callCtx_ = savedCtx;
-            }
-        /* `return` inside eval{} exits just that eval block with this value
-           (real Perl semantics — NOT die, and NOT a return from any
-           enclosing sub even if one exists; execution resumes after the
-           eval). Check this BEFORE the sub/main-level return handling
-           below, which is for when there's no enclosing eval at all. No
-           local()-restore-to-sub-depth or scope cleanup here: those are
-           calibrated for exiting the whole function, which this doesn't do
-           — matching the existing last/next precedent of no cleanup at the
-           branch site for an early exit that stays within the same
-           function. */
-        if (!evalReturnTargets_.empty()) {
-            auto &target = evalReturnTargets_.back();
-            builder_.CreateStore(v, target.resultAlloca);
-            builder_.CreateBr(target.endBB);
-            break;
+            const char *helper = "perl_array_to_list_return";
+            NK lk = n.left->kind;
+            if      (lk == NK::GrepFunc) helper = "perl_grep_list_return";
+            else if (lk == NK::MapFunc)  helper = "perl_map_list_return";
+            else if (lk == NK::SortFunc) helper = "perl_sort_list_return";
+            v = callRT(helper, {av});
+        } else {
+            v = n.left ? emitExpr(*n.left) : perlUndef();
         }
         /* restore any local()s before returning; clone retval first so
-           restore doesn't clobber the in-place PerlValue we're returning */
-        if (localDepthAlloca_) {
+           restore doesn't clobber the in-place PerlValue we're returning.
+           Skip sub-cleanup when inside an eval — the eval's endBB handles
+           its own cleanup, and we're just exiting the eval block (not a
+           real sub return). */
+        if (localDepthAlloca_ && inEval_ == 0) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             Value *cloned = callRT("perl_clone", {v});
@@ -4419,19 +3838,25 @@ void CodeGen::emitStmt(const Node &n) {
             if (currentSubNeedsWantarray_) callRT("perl_pop_wantarray", {});
             callRT("perl_local_restore_to", {depth});
             v = cloned;
+            emitScopeCleanup();  /* free tracked my-var pvs in all active scopes */
         }
-        emitScopeCleanup();  /* free tracked my-var pvs in all active scopes */
+        /* `return` inside an eval { BLOCK } stores v in the eval's bodyRes
+           slot and branches to the eval's endBB.  This matches Perl
+           semantics: `return EXPR` inside eval sets the eval's value
+           (and `die` jumps to the closest eval via longjmp). */
+        if (inEval_ > 0 && evalBodyRes_ && evalEndBB_) {
+            Value *cloned = callRT("perl_clone", {v});
+            freeIfOwned(v);
+            builder_.CreateStore(cloned, evalBodyRes_);
+            builder_.CreateBr(evalEndBB_);
+        }
         /* In the main function (which returns i32), we can't emit `ret ptr`.
-           With no enclosing eval (checked above) and no enclosing sub,
-           `return` at the top level is equivalent to `die` in Perl
-           semantics. Call perl_die to longjmp back to the nearest eval's
-           catch point (or terminate the process if there is none). */
-         if (currentFn_ && currentFn_->getReturnType()->isIntegerTy() &&
-             currentFn_->getName() == "main") {
-             auto *i32Ty = Type::getInt32Ty(ctx_);
-             Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "die.file");
-             Value *lineVal = ConstantInt::get(i32Ty, n.line);
-             callRT("perl_die", {v, fileStr, lineVal});
+           Inside an eval block, `return` is equivalent to `die` in Perl
+           semantics (no enclosing sub to return from). Call perl_die to
+           longjmp back to the eval's catch point. */
+        else if (currentFn_ && currentFn_->getReturnType()->isIntegerTy() &&
+            currentFn_->getName() == "main") {
+            callRT("perl_die", {v});
         } else {
             builder_.CreateRet(v);
         }
@@ -4439,25 +3864,9 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::LocalStmt: {
-        /* save current value, optionally assign new one.
-           D41: also local $h{key} / local $arr[idx] via element lvalues. */
-        Value *pv = nullptr;
-        if (n.sval == "hash_elem" && n.right) {
-            Value *hv = lookupHash(n.name);
-            if (!hv) break;
-            if (Value *kp = constKeyPtr(*n.right, builder_))
-                pv = callRT("perl_hash_lvalue_str", {hv, kp});
-            else {
-                Value *key = emitExpr(*n.right);
-                pv = callRT("perl_hash_lvalue_sv", {hv, key});
-                freeIfOwned(key);
-            }
-        } else if (n.sval == "array_elem" && n.right) {
-            Value *av = lookupArray(n.name);
-            if (!av) break;
-            Value *idx = emitIdx(*n.right);
-            pv = callRT("perl_array_lvalue", {av, idx});
-        } else if (n.name == "/")   pv = callRT("perl_get_input_sep",    {});
+        /* save current value, optionally assign new one */
+        Value *pv;
+        if (n.name == "/")   pv = callRT("perl_get_input_sep",    {});
         else if (n.name == "!") pv = callRT("perl_get_dollar_bang",{});
         else if (n.name == ".") pv = callRT("perl_get_dollar_dot",  {});
         else if (n.name == ",") pv = callRT("perl_get_dollar_comma",{});
@@ -4473,14 +3882,10 @@ void CodeGen::emitStmt(const Node &n) {
             }
             pv = builder_.CreateLoad(perlPtrTy_, slot);
         }
-        if (!pv) break;
         callRT("perl_local_save", {pv});
         if (n.left) {
             Value *rhs = emitExpr(*n.left);
             callRT("perl_assign", {pv, rhs});
-        } else if (n.sval == "hash_elem" || n.sval == "array_elem") {
-            /* D41: bare `local $h{k}` / `local $a[i]` temporarily undefs */
-            callRT("perl_assign", {pv, perlUndef()});
         }
         break;
     }
@@ -4490,8 +3895,9 @@ void CodeGen::emitStmt(const Node &n) {
         auto *ptrTy = perlPtrTy_;
         auto *i8Ty  = Type::getInt8Ty(ctx_);
         /* module-level globals: the PerlValue* and an init flag */
-        std::string gname = "state.ptr." + std::to_string(stateSeq_);
-        std::string gflag = "state.init." + std::to_string(stateSeq_++);
+        static int stateSeq = 0;
+        std::string gname = "state.ptr." + std::to_string(stateSeq);
+        std::string gflag = "state.init." + std::to_string(stateSeq++);
         auto *gptr = new GlobalVariable(*mod_, ptrTy, false,
             GlobalValue::InternalLinkage, ConstantPointerNull::get(ptrTy), gname);
         auto *ginit = new GlobalVariable(*mod_, i8Ty, false,
@@ -4525,7 +3931,8 @@ void CodeGen::emitStmt(const Node &n) {
         /* compile END body as a function and register via atexit */
         auto *fn = builder_.GetInsertBlock()->getParent();
         auto *savedBB = builder_.GetInsertBlock();
-        std::string endName = "perl_end_" + std::to_string(endSeq_++);
+        static int endSeq = 0;
+        std::string endName = "perl_end_" + std::to_string(endSeq++);
         auto *endFnTy = FunctionType::get(Type::getVoidTy(ctx_), false);
         auto *endFn = Function::Create(endFnTy, Function::InternalLinkage, endName, mod_.get());
         auto *entryBB = BasicBlock::Create(ctx_, "entry", endFn);
@@ -4703,16 +4110,13 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ArrayLit: {
-        /* Scalar/comma context of a parenthesized list: last element
-           (D95 companion — single-element `(expr)` is now ArrayLit, not
-           unwrapped). List context uses emitArrayPtr, not emitExpr. */
-        if (n.args.empty()) return perlUndef();
-        Value *last = nullptr;
+        /* build temp PerlArray from the element list */
+        Value *av = callRT("perl_array_new", {});
         for (auto &elem : n.args) {
-            if (last) freeIfOwned(last);
-            last = emitExpr(*elem);
+            Value *v = emitExpr(*elem);
+            callRT("perl_array_push", {av, v});
         }
-        return last ? last : perlUndef();
+        return av;
     }
 
     case NK::Range: {
@@ -4894,21 +4298,23 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RequireStmt: {
+        hasStringEval_ = true;
         Value *modStr = builder_.CreateGlobalStringPtr(n.sval);
         return callRT("perl_runtime_require", {modStr});
     }
 
     case NK::DoFile:
+        hasStringEval_ = true;
         return callRT("perl_do_file", {emitExpr(*n.left)});
 
     case NK::Redo: {
         if (!loopRedos_.empty()) {
             builder_.CreateBr(loopRedos_.back());
+            auto *fn   = builder_.GetInsertBlock()->getParent();
+            auto *dead = BasicBlock::Create(ctx_, "redo.dead", fn);
+            builder_.SetInsertPoint(dead);
         }
-        /* Block is already terminated by the branch — return a null constant
-           instead of calling perl_alloc_undef() to avoid emitting code after
-           the terminator. */
-        return ConstantPointerNull::get(perlPtrTy_);
+        return perlUndef();
     }
 
     case NK::LockStmt: {
@@ -4934,14 +4340,15 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::CondBcast:     { callRT("perl_cond_broadcast", {emitExpr(*n.left)}); return perlUndef(); }
 
     case NK::DieStmt: {
-         auto *i32Ty = Type::getInt32Ty(ctx_);
-         Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
-         Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "die.file");
-         Value *lineVal = ConstantInt::get(i32Ty, n.line);
-         callRT("perl_die", {msg, fileStr, lineVal});
-         /* perl_die is NoReturn — no code reachable after it */
-         return perlUndef();
-     }
+        Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
+        callRT("perl_die", {msg});
+        builder_.CreateUnreachable();
+        /* move to a dead block so surrounding codegen stays well-formed */
+        auto *fn     = builder_.GetInsertBlock()->getParent();
+        auto *deadBB = BasicBlock::Create(ctx_, "die.dead", fn);
+        builder_.SetInsertPoint(deadBB);
+        return perlUndef();
+    }
 
     case NK::UnlinkFunc: {
         Value *av = callRT("perl_array_new", {});
@@ -5000,7 +4407,8 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *cur = builder_.CreateLoad(i64, ia);
                     bool isInc = (n.sval == "pre++" || n.sval == "post++");
                     Value *delta = ConstantInt::get(i64, isInc ? 1 : -1);
-                    Value *next = builder_.CreateAdd(cur, delta, isInc ? "preinc" : "predec");
+                    Value *next = isInc ? builder_.CreateAdd(cur, delta, "preinc")
+                                       : builder_.CreateSub(cur, delta, "predec");
                     builder_.CreateStore(next, ia);
                     bool isPre = (n.sval == "pre++" || n.sval == "pre--");
                     return boxI64(isPre ? next : cur);
@@ -5101,45 +4509,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         /* ($a,$b,...) = list */
         if (n.left->kind == NK::ArrayLit) {
+            int savedCallCtx = callCtx_;
             callCtx_ = 1;
             Value *rhsArr = emitArrayPtr(*n.right);
-            if (!rhsArr) {
-                /* RHS collapsed to a bare scalar expression — e.g. `(10)` with
-                   no comma parses as just the inner IntLit, not an ArrayLit —
-                   but list-assignment context still treats it as a one-element
-                   list. Wrap it in a real PerlArray instead of passing a
-                   PerlValue* where perl_array_get_ref expects a PerlArray*
-                   (silent type confusion / OOB read otherwise). Matches the
-                   pattern already used for @arr=RHS and lvalue slices below. */
-                rhsArr = callRT("perl_array_new", {});
-                Value *v = emitExpr(*n.right);
-                callRT("perl_array_push", {rhsArr, v});
-                freeIfOwned(v);
-            }
-            callCtx_ = 0;
+            if (!rhsArr) rhsArr = emitExpr(*n.right);
+            callCtx_ = savedCallCtx;
             bool fromUnderbar = (n.right->kind == NK::ArrayVar && n.right->name == "_");
             for (size_t i = 0; i < n.left->args.size(); i++) {
-                /* Trailing @rest / %rest — slurps every remaining RHS element
-                   (Perl list-assignment semantics: an array/hash in the LHS
-                   list consumes the rest of the list, not just one item). */
-                if (n.left->args[i]->kind == NK::ArrayVar) {
-                    if (Value *targetAv = lookupArray(n.left->args[i]->name)) {
-                        callRT("perl_array_clear", {targetAv});
-                        Value *startIdx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
-                        callRT("perl_array_extend_from", {targetAv, rhsArr, startIdx});
-                    }
-                    continue;
-                }
-                if (n.left->args[i]->kind == NK::HashVar) {
-                    if (Value *targetHv = lookupHash(n.left->args[i]->name)) {
-                        Value *tmpArr = callRT("perl_array_new", {});
-                        Value *startIdx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
-                        callRT("perl_array_extend_from", {tmpArr, rhsArr, startIdx});
-                        callRT("perl_hash_from_list", {targetHv, tmpArr});
-                        callRT("perl_array_free", {tmpArr});
-                    }
-                    continue;
-                }
                 /* Stage 25: pre-promoted @_ arg — check BEFORE emitLValue to prevent
                    auto-vivification of a PV for a variable that has only an unboxed alloca. */
                 if (fromUnderbar && n.left->args[i]->kind == NK::ScalarVar) {
@@ -5231,24 +4607,26 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ArrayVar) {
             Value *av_lhs = lookupArray(n.left->name);
             if (av_lhs) {
+                int savedCallCtx = callCtx_;
                 callCtx_ = 1;
                 Value *av_rhs = emitArrayPtr(*n.right);
-                callCtx_ = 0;
+                callCtx_ = savedCallCtx;
                 if (av_rhs) {
                     callRT("perl_array_replace", {av_lhs, av_rhs});
                 } else if (n.right->kind == NK::ArrayLit && n.right->args.empty()) {
                     callRT("perl_array_clear", {av_lhs});
-           } else {
+            } else {
                       callRT("perl_array_clear", {av_lhs});
                       Value *tmp = callRT("perl_array_new", {});
                       if (n.right->kind == NK::ArrayLit) {
                           for (auto &e : n.right->args)
                               callRT("perl_array_push", {tmp, emitExpr(*e)});
                       } else {
+                          int savedCallCtx2 = callCtx_;
                           callCtx_ = 1;
                           Value *rhsVal = emitExpr(*n.right);
+                          callCtx_ = savedCallCtx2;
                           callRT("perl_array_push_list_or_scalar", {tmp, rhsVal});
-                          callCtx_ = 0;
                       }
                       callRT("perl_array_replace", {av_lhs, tmp});
                   }
@@ -5306,26 +4684,6 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (!outerAv) return perlUndef();
                     Value *outerIdx = emitIdx(*n.left->left->left);
                     Value *innerAv  = callRT("perl_array_autoviv_array", {outerAv, outerIdx});
-                    callRT("perl_array_set", {innerAv, idx, rhs});
-                    return rhs;
-                }
-                /* autovivify $h{a}{b}[i] = val or deeper chains — base is
-                   itself another ArrowDeref rooted in a hash/array element
-                   (2+ levels before this one), OR (D50) a chain rooted in
-                   a bare scalar variable where every level up to here is
-                   a hash-key access, e.g. $ref->{a}[i] — safe, since that
-                   only ever calls perl_hash_autoviv_array (hash-key
-                   based), never perl_array_autoviv_array (the one with
-                   the FLAT_ARRAY-destruction risk, D40). A scalar-ref-
-                   rooted chain with an array-index level anywhere, like
-                   $ref->[0][1], is NOT routed here — it must keep using
-                   the FLAT_ARRAY-aware fallback below (TESTS.md's D50
-                   entry). */
-                if (n.left->left->kind == NK::ArrowDeref &&
-                    (isElemRootedChain(*n.left->left) ||
-                     isScalarRootedAllHashChain(*n.left->left))) {
-                    Value *innerAv = emitAutovivContainer(*n.left->left, false);
-                    if (!innerAv) return perlUndef();
                     callRT("perl_array_set", {innerAv, idx, rhs});
                     return rhs;
                 }
@@ -5398,24 +4756,6 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (!av) return perlUndef();
                     Value *outerIdx = emitIdx(*n.left->left->left);
                     hv = callRT("perl_array_autoviv_hash", {av, outerIdx});
-                } else if (n.left->left->kind == NK::ArrowDeref &&
-                           (isElemRootedChain(*n.left->left) ||
-                            isScalarRootedAllHashChain(*n.left->left))) {
-                    /* $h{a}{b}{c} = val or deeper chains — base is itself
-                       another ArrowDeref rooted in a hash/array element
-                       (2+ levels before this one), OR (D50) a chain
-                       rooted in a bare scalar variable holding a ref
-                       where every level is a hash-key access, e.g.
-                       $ref->{a}{b} — safe to autoviv all the way down
-                       since a hash has no FLAT_ARRAY-equivalent
-                       optimization to accidentally destroy (see
-                       isScalarRootedAllHashChain's comment). A chain
-                       with an array-index level anywhere still falls to
-                       the plain-deref branch below, unchanged — that
-                       case keeps the D40-established FLAT_ARRAY safety
-                       margin (TESTS.md's D50 entry). */
-                    hv = emitAutovivContainer(*n.left->left, true);
-                    if (!hv) return perlUndef();
                 } else {
                     Value *base = emitExpr(*n.left->left);
                     hv = callRT("perl_deref_hash", {base});
@@ -5427,6 +4767,25 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         /* $arr[i] = val */
         if (n.left->kind == NK::ArrayElem) {
+            std::string arrNm = n.left->name;
+            if (!arrNm.empty() && arrNm[0] == '@') arrNm = arrNm.substr(1);
+            /* Stage 33: track array element type from RHS */
+            if (n.right->kind == NK::AnonArray) {
+                if (n.right->args.size() == 2 &&
+                    canEmitF64(*n.right->args[0]) && canEmitF64(*n.right->args[1])) {
+                    /* [float, float] → element is FLOAT_PAIR (tag=13) */
+                    setArrayElemType(arrNm, 13);
+                } else if (n.right->args.size() >= 2) {
+                    bool allF64 = true;
+                    for (auto &e : n.right->args) {
+                        if (!canEmitF64(*e)) { allF64 = false; break; }
+                    }
+                    if (allF64) {
+                        /* [float, float, ...] → element is FLAT_ARRAY (tag=10) */
+                        setArrayElemType(arrNm, 10);
+                    }
+                }
+            }
             Value *av = lookupArray(n.left->name);
             if (!av) return perlUndef();
             Value *rhs = emitExpr(*n.right);
@@ -5440,9 +4799,10 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *idxArr = callRT("perl_array_new", {});
             for (auto &idxNode : n.left->args)
                 callRT("perl_array_push", {idxArr, emitExpr(*idxNode)});
+            int savedCallCtx = callCtx_;
             callCtx_ = 1;
             Value *rhsArr = emitArrayPtr(*n.right);
-            callCtx_ = 0;
+            callCtx_ = savedCallCtx;
             if (!rhsArr) {
                 rhsArr = callRT("perl_array_new", {});
                 if (n.right->kind == NK::ArrayLit)
@@ -5468,9 +4828,10 @@ Value *CodeGen::emitExpr(const Node &n) {
                 else
                     callRT("perl_array_push", {keyArr, emitExpr(*keyNode)});
             }
+            int savedCallCtx = callCtx_;
             callCtx_ = 1;
             Value *rhsArr = emitArrayPtr(*n.right);
-            callCtx_ = 0;
+            callCtx_ = savedCallCtx;
             if (!rhsArr) {
                 rhsArr = callRT("perl_array_new", {});
                 if (n.right->kind == NK::ArrayLit)
@@ -5498,19 +4859,40 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_assign", {pv, rhs});
             return rhs;
         }
-        /* D52: $@ = "..." — $@ parses to its own NK::DollarAt node (not
-           NK::ScalarVar with name "@" like $/ and $! above), so it fell
-           through emitLValue's default case (returns nullptr for anything
-           it doesn't recognize) and the assignment silently did nothing. */
-        if (n.left->kind == NK::DollarAt) {
-            Value *rhs = emitExpr(*n.right);
-            callRT("perl_assign", {callRT("perl_get_dollar_at", {}), rhs});
-            return rhs;
-        }
         /* int/float var assignment */
-        if (n.left->kind == NK::ScalarVar) {
+         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+            /* Stage 33: track known tag type from AnonArray RHS */
+            if (n.right->kind == NK::AnonArray) {
+                if (n.right->args.size() == 2 &&
+                    canEmitF64(*n.right->args[0]) && canEmitF64(*n.right->args[1])) {
+                    /* [float, float] → FLOAT_PAIR (tag=13) */
+                    setKnownTagType(nm, 13);
+                } else if (n.right->args.size() >= 2) {
+                    bool allF64 = true;
+                    for (auto &e : n.right->args) {
+                        if (!canEmitF64(*e)) { allF64 = false; break; }
+                    }
+                    if (allF64) {
+                        /* [float, float, ...] → FLAT_ARRAY (tag=10) */
+                        setKnownTagType(nm, 10);
+                    }
+                }
+            }
+            /* Stage 33: track known tag type from ArrowDeref RHS (array element load) */
+            if (n.right->kind == NK::ArrowDeref && n.right->sval == "array") {
+                /* $var = $arr->[idx] — check if $arr has known element type */
+                if (n.right->left->kind == NK::ScalarVar) {
+                    std::string arrNm = n.right->left->name;
+                    if (!arrNm.empty() && arrNm[0] == '$') arrNm = arrNm.substr(1);
+                    int elemTag = lookupArrayElemType(arrNm);
+                    if (elemTag) {
+                        /* Array has known element type — propagate to $var */
+                        setKnownTagType(nm, elemTag);
+                    }
+                }
+            }
             if (Value *ia = lookupIntVar(nm)) {
                 Value *rhs = emitExprI64(*n.right);
                 if (rhs) {
@@ -5705,7 +5087,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (n.sval == "+") return builder_.CreateAdd(lv, rv);
                     if (n.sval == "-") return builder_.CreateSub(lv, rv);
                     if (n.sval == "*") return builder_.CreateMul(lv, rv);
-                    if (n.sval == "%") return emitFlooredMod(lv, rv);
+                    if (n.sval == "%") return builder_.CreateSRem(lv, rv);
                     return nullptr;
                 };
                 Value *lv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
@@ -6113,9 +5495,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *av = lookupArray(n.left->name);
             if (av) {
                 if (isChop) { /* chop each element, return last removed char */
-                    return callRT("perl_chop_array", {av});
+                    Value *lastChar = perlStr("");
+                    Value *len = callRT("perl_to_int", {callRT("perl_array_len", {av})});
+                    /* simple loop would need LLVM loop; for now just chop each element */
+                    /* Actually call a helper — same as chomp_array for simplicity */
+                    callRT("perl_chomp_array", {av}); return perlInt(0);
                 }
-                return callRT("perl_alloc_int", {callRT("perl_chomp_array", {av})});
+                callRT("perl_chomp_array", {av}); return perlInt(0);
             }
         }
         /* chomp/chop on scalar */
@@ -6132,29 +5518,6 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.args.size() < 2) return perlUndef();
         Value *str = emitExpr(*n.args[0]);
         Value *off = emitExpr(*n.args[1]);
-        if (n.args.size() >= 4) {
-            /* D74: 4-arg substr($str,$off,$len,$repl) — real Perl replaces
-               the substring in $str in place AND returns the OLD (pre-
-               replacement) substring value. Previously this 4th arg was
-               parsed but silently ignored — codegen had no case for
-               args.size()>=4 at all, so the call behaved exactly like the
-               3-arg read-only form. `str` here is the stable PerlValue*
-               the original scalar variable's slot holds (emitExpr on a
-               plain ScalarVar returns that pointer itself, not a clone),
-               so perl_substr_replace's in-place mutation of it correctly
-               reaches back into the variable — the same stable-pointer
-               reliance the existing 3-arg lvalue-assignment form
-               (`substr(...) = val`, case NK::Assign above) already uses.
-               Neither perl_substr3 nor perl_substr_replace frees/mutates
-               their off/len args, so reusing the same off/len Values for
-               both calls below is safe. */
-            Value *len = emitExpr(*n.args[2]);
-            Value *oldVal = callRT("perl_substr3", {str, off, len});
-            Value *repl = emitExpr(*n.args[3]);
-            callRT("perl_substr_replace", {str, off, len, repl});
-            freeIfOwned(repl);
-            return oldVal;
-        }
         if (n.args.size() >= 3) {
             Value *len = emitExpr(*n.args[2]);
             return callRT("perl_substr3", {str, off, len});
@@ -6167,33 +5530,6 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *av  = callRT("perl_array_new", {});
         for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
         return callRT("perl_sprintf", {fmt, av});
-    }
-
-    case NK::PackFunc: {
-        /* D67: parser already built this node and runtime.c already
-           implements perl_pack, but codegen had no case at all — pack()
-           silently compiled to nothing. Args must be flattened like
-           JoinFunc's list-building does (pack("C4", @arr) needs @arr's
-           4 elements individually, not scalar(@arr) — an array argument
-           passed through plain emitExpr() would give just the count). */
-        Value *fmt = emitExpr(*n.left);
-        Value *av  = callRT("perl_array_new", {});
-        for (auto &a : n.args) {
-            Value *src = emitArrayPtr(*a);
-            if (src) callRT("perl_array_extend", {av, src});
-            else     callRT("perl_array_push",   {av, emitExpr(*a)});
-        }
-        return callRT("perl_pack", {fmt, av});
-    }
-
-    case NK::UnpackFunc: {
-        /* D67: same gap as PackFunc. Scalar context returns just the first
-           unpacked value; list context is handled separately in
-           emitArrayPtr via perl_unpack_to_array. Node layout (parser.cpp):
-           n.left = the string being unpacked, n.args[0] = the format. */
-        Value *str = emitExpr(*n.left);
-        Value *fmt = emitExpr(*n.args[0]);
-        return callRT("perl_unpack", {fmt, str});
     }
 
     case NK::JoinFunc: {
@@ -6279,24 +5615,20 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::DeleteFunc: {
-        /* D81: slice forms return the last deleted value in scalar context
-           (list form goes through emitArrayPtr). */
-        if (n.sval == "array_slice" || n.sval == "hash_slice") {
-            Value *av = emitArrayPtr(n);
-            if (!av) return perlUndef();
-            return callRT("perl_array_last", {av});
-        }
         if (n.sval == "array") {
             Value *av = lookupArray(n.name);
             if (!av) return perlUndef();
             Value *idx = emitIdx(*n.left);
-            return callRT("perl_array_delete", {av, idx});
+            Value *old = callRT("perl_array_get", {av, idx});
+            callRT("perl_array_set", {av, idx, perlUndef()});
+            return old;
         }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
         return emitHashDelete(hv, *n.left);
     }
 
+    case NK::SortFunc:
     case NK::MapFunc:
     case NK::GrepFunc:
         /* array-producing: scalar context returns element count */
@@ -6305,13 +5637,6 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (!av) return perlUndef();
             return callRT("perl_array_len", {av});
         }
-    case NK::SortFunc:
-        /* D29: real Perl's sort() in scalar context returns undef (not the
-           element count like grep/map) — and doesn't even evaluate its
-           list argument or comparator block. emitExpr's contract here IS
-           scalar context (unconditionally, no runtime wantarray check
-           needed), so just return undef without touching the list. */
-        return perlUndef();
     case NK::ReverseFunc: {
         /* scalar EXPR or single scalar arg → reverse string */
         bool hasScalarCtx = (n.sval == "scalar_ctx");
@@ -6400,12 +5725,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.kind == NK::SumFunc)  return callRT("perl_sum_list", {av});
         if (n.kind == NK::MinFunc)  return callRT("perl_min_list", {av});
         if (n.kind == NK::MaxFunc)  return callRT("perl_max_list", {av});
-        /* D69: uniq in scalar context returns the COUNT of unique
-           elements (real List::Util's documented behavior) — this
-           previously returned the *first* unique element's value instead,
-           a second, separate bug from the consecutive-only dedup fixed in
-           perl_uniq_list() itself (runtime.c). */
-        return callRT("perl_array_len", {callRT("perl_uniq_list", {av})});
+        /* UniqFunc: scalar context returns first element of unique list */
+        return callRT("perl_array_get", {callRT("perl_uniq_list", {av}),
+                                         ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
     }
 
     /* ── first / any / all / none ────────────────────────────────────────── */
@@ -6533,9 +5855,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* accumulator starts as first element */
         auto *accAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "red.acc");
         Value *first    = callRT("perl_array_get_ref", {inputArr, ConstantInt::get(i64, 0)});
-        Value *accCell  = callRT("perl_alloc_undef", {});
-        callRT("perl_assign", {accCell, first});
-        builder_.CreateStore(accCell, accAlloca);
+        Value *accPv    = perlUndef();
+        callRT("perl_assign", {accPv, first});
+        builder_.CreateStore(accPv, accAlloca);
 
         auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "red.i");
         builder_.CreateStore(ConstantInt::get(i64, 1), iAlloca); /* start from index 1 */
@@ -6557,22 +5879,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         callRT("perl_assign", {bPv, cur});
 
         pushScope();
-        /* D28: don't shadow $a/$b if an outer `my $a`/`my $b` is already
-           visible — matches real Perl's "my $a used in sort comparison"
-           footgun (see the identical check for sort's comparator, a few
-           hundred lines up, for the full explanation). reduce's block is
-           compiled inline in the same function/scope stack (no separate
-           LLVM function the way sort's comparator needs), so lookupVar()
-           here correctly sees both file-scope *and* enclosing-sub-scope
-           shadows — a strictly more general check than sort's, which can
-           only reach a file-scope shadow. */
-        if (!lookupVar("a")) declareVar("a", aAlloca);
-        if (!lookupVar("b")) declareVar("b", bAlloca);
+        declareVar("a", aAlloca);
+        declareVar("b", bAlloca);
         Value *blockResult = n.body ? emitBlockLast(*n.body) : perlUndef();
         popScope();
 
         /* update accumulator */
-        callRT("perl_assign", {builder_.CreateLoad(perlPtrTy_, accAlloca), blockResult});
+        callRT("perl_assign", {accPv, blockResult});
 
         Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
         builder_.CreateStore(i2, iAlloca);
@@ -6668,20 +5981,11 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::AnonHash: {
-        /* D76: must freeIfOwned each pushed element (array_push clones) and
-           free listArr after hash_from_list (which clones again into the
-           hash). Leaking the temps left nested blessed objects at
-           refcount>=2 forever, so their DESTROY never ran when the outer
-           object was freed. AnonArray already freeIfOwned's; mirror that. */
         Value *hv = callRT("perl_anon_hash_new", {});
         Value *listArr = callRT("perl_array_new", {});
-        for (auto &elem : n.args) {
-            Value *pv = emitExpr(*elem);
-            callRT("perl_array_push", {listArr, pv});
-            freeIfOwned(pv);
-        }
+        for (auto &elem : n.args)
+            callRT("perl_array_push", {listArr, emitExpr(*elem)});
         callRT("perl_hash_from_list", {hv, listArr});
-        callRT("perl_array_free", {listArr});
         return callRT("perl_ref_hash", {hv});
     }
 
@@ -6747,7 +6051,19 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
-            Value *av = callRT("perl_deref_array", {base});
+            /* Stage 32: check loop-invariant deref cache */
+            Value *av;
+            if (n.left->kind == NK::ScalarVar) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (Value *cacheAlloca = lookupLoopDerefCache(nm)) {
+                    av = builder_.CreateLoad(perlPtrTy_, cacheAlloca, nm + ".deref.load");
+                } else {
+                    av = callRT("perl_deref_array", {base});
+                }
+            } else {
+                av = callRT("perl_deref_array", {base});
+            }
             freeIfOwned(base);
             return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
         } else {
@@ -6776,143 +6092,10 @@ Value *CodeGen::emitExpr(const Node &n) {
         size_t sep = n.name.find('\x01');
         std::string repl  = n.name.substr(0, sep);
         std::string flags = n.name.substr(sep + 1);
+        if (flags.find('e') != std::string::npos) hasStringEval_ = true;
         Value *pat  = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
-        Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");
-
-        /* D38c: /e — compile replacement as a Perl expression, call once
-           per match with $1/$& already installed by the runtime. */
-        bool hasE = flags.find('e') != std::string::npos;
-        if (hasE) {
-            NodePtr replExpr;
-            try {
-                Lexer lex(repl);
-                auto toks = lex.tokenize();
-                replExpr = Parser::parseExprFromTokens(std::move(toks));
-            } catch (const std::exception &ex) {
-                throw std::runtime_error(std::string("s///e: bad replacement expression: ") + ex.what());
-            }
-            if (!replExpr)
-                throw std::runtime_error("s///e: empty replacement expression");
-
-            /* Capture outer lexicals referenced by the replacement (like sort{}) */
-            std::set<std::string> usedNames;
-            collectAllScalarNames(*replExpr, usedNames);
-            std::vector<std::string> capNames;
-            std::vector<Value*>      capVals;
-            std::vector<char>        capSigils;
-            for (auto &nm : usedNames) {
-                if (nm == "_") continue;
-                if (auto *slot = lookupVar(nm)) {
-                    capNames.push_back(nm);
-                    capVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
-                    capSigils.push_back('$');
-                } else if (Value *ia = lookupIntVar(nm)) {
-                    Value *boxed = boxI64(builder_.CreateLoad(Type::getInt64Ty(ctx_), ia));
-                    auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
-                    builder_.CreateStore(boxed, pvA);
-                    capNames.push_back(nm);
-                    capVals.push_back(builder_.CreateLoad(perlPtrTy_, pvA));
-                    capSigils.push_back('$');
-                } else if (Value *fa = lookupFloatVar(nm)) {
-                    Value *boxed = boxF64(builder_.CreateLoad(Type::getDoubleTy(ctx_), fa));
-                    auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
-                    builder_.CreateStore(boxed, pvA);
-                    capNames.push_back(nm);
-                    capVals.push_back(builder_.CreateLoad(perlPtrTy_, pvA));
-                    capSigils.push_back('$');
-                }
-            }
-            {
-                std::unordered_map<std::string, Value*> visA, visH;
-                for (auto &sc : arrayScopes_) for (auto &kv : sc) visA[kv.first] = kv.second;
-                for (auto &sc : hashScopes_)  for (auto &kv : sc) visH[kv.first] = kv.second;
-                for (auto &kv : visA) {
-                    if (kv.first == "_") continue;
-                    capNames.push_back(kv.first);
-                    capVals.push_back(callRT("perl_ref_array", {kv.second}));
-                    capSigils.push_back('@');
-                }
-                for (auto &kv : visH) {
-                    capNames.push_back(kv.first);
-                    capVals.push_back(callRT("perl_ref_hash", {kv.second}));
-                    capSigils.push_back('%');
-                }
-            }
-
-            std::string fnName = "__subst_e_" + std::to_string(substEvalCounter_++);
-            auto *evalFT = FunctionType::get(perlPtrTy_, {}, false);
-            auto *evalFn = Function::Create(evalFT, Function::InternalLinkage, fnName, mod_.get());
-
-            auto *savedFn   = currentFn_;
-            auto *savedBB   = builder_.GetInsertBlock();
-            auto  savedSc   = scopes_;
-            auto  savedArr  = arrayScopes_;
-            auto  savedHash = hashScopes_;
-            auto  savedPv   = pvScopes_;
-            auto  savedF    = floatScopes_;
-            auto  savedI    = intScopes_;
-            auto *savedLDep = localDepthAlloca_;
-            auto *savedBody = currentSubBody_;
-            bool  savedNeeds = currentSubNeedsWantarray_;
-
-            auto *entry = BasicBlock::Create(ctx_, "entry", evalFn);
-            builder_.SetInsertPoint(entry);
-            currentFn_ = evalFn;
-            scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
-            floatScopes_ = {}; intScopes_ = {};
-            pushScope();
-            currentSubNeedsWantarray_ = false;
-
-            auto *i32Ty = Type::getInt32Ty(ctx_);
-            auto *i64Ty = Type::getInt64Ty(ctx_);
-            localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
-            builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
-
-            for (size_t ci = 0; ci < capNames.size(); ci++) {
-                Value *pv = callRT("perl_get_capture", {ConstantInt::get(i64Ty, (long long)ci)});
-                if (capSigils[ci] == '@') {
-                    declareArray(capNames[ci], callRT("perl_deref_array_ro", {pv}));
-                } else if (capSigils[ci] == '%') {
-                    declareHash(capNames[ci], callRT("perl_deref_hash", {pv}));
-                } else {
-                    auto *a = builder_.CreateAlloca(perlPtrTy_, nullptr, capNames[ci]);
-                    builder_.CreateStore(pv, a);
-                    declareVar(capNames[ci], a);
-                }
-            }
-
-            Value *result = emitExpr(*replExpr);
-            if (!builder_.GetInsertBlock()->getTerminator()) {
-                Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-                callRT("perl_local_restore_to", {depth});
-                /* Clone so the returned PV outlives this frame's temps */
-                Value *cloned = callRT("perl_clone", {result});
-                freeIfOwned(result);
-                builder_.CreateRet(cloned);
-            }
-            popScope();
-
-            currentFn_ = savedFn;
-            builder_.SetInsertPoint(savedBB);
-            scopes_ = std::move(savedSc);
-            arrayScopes_ = std::move(savedArr);
-            hashScopes_ = std::move(savedHash);
-            pvScopes_ = std::move(savedPv);
-            floatScopes_ = std::move(savedF);
-            intScopes_ = std::move(savedI);
-            localDepthAlloca_ = savedLDep;
-            currentSubBody_ = savedBody;
-            currentSubNeedsWantarray_ = savedNeeds;
-
-            Value *fnPtr = builder_.CreateBitCast(evalFn, PointerType::getUnqual(ctx_));
-            Value *capsAv = callRT("perl_array_new", {});
-            for (auto *cv : capVals)
-                callRT("perl_array_push_capture", {capsAv, cv});
-            Value *cnt = callRT("perl_regex_subst_e", {str, pat, flg, fnPtr, capsAv});
-            return callRT("perl_alloc_int", {cnt});
-        }
-
         Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
+        Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");
         Value *cnt  = callRT("perl_regex_subst", {str, pat, rep, flg});
         return callRT("perl_alloc_int", {cnt});
     }
@@ -6922,12 +6105,8 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::WarnStmt: {
-        /* D49: pass file/line for location suffix + $SIG{__WARN__} */
-        auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *msg = n.left ? emitExpr(*n.left) : perlStr("Warning: something's wrong");
-        Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "warn.file");
-        Value *lineVal = ConstantInt::get(i32Ty, n.line);
-        callRT("perl_warn", {msg, fileStr, lineVal});
+        callRT("perl_warn", {msg});
         return perlUndef();
     }
 
@@ -7097,22 +6276,31 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::EvalBlock: {
+        /* $@ = "" before eval */
+        Value *emptyAt = perlStr("");
+        callRT("perl_assign", {callRT("perl_get_dollar_at", {}), emptyAt});
+
+        /* Save the caller's insert block — we may need to redirect to a
+           continuation block when emitBlockLast's body emission leaves
+           the insert point in a sub-context (e.g. a nested eval's endBB
+           or a sub's exit block). */
+        BasicBlock *callerBB = builder_.GetInsertBlock();
+
+        /* alloca to hold the body's last-expression value (PerlValue*).
+           Pre-allocated at the eval site so the body and endBB can both
+           reference it.  Initialized to undef so a die/longjmp path that
+           skips the body still yields a defined PerlValue* to clone. */
+        auto *i8pTy  = PointerType::getUnqual(ctx_);
+        auto *bodyRes = builder_.CreateAlloca(perlPtrTy_, nullptr, "eval.bodyres");
+        builder_.CreateStore(perlUndef(), bodyRes);
+
         /* allocate jmp_buf on stack (256 bytes, enough for any platform) */
         auto *i8Arr  = ArrayType::get(Type::getInt8Ty(ctx_), 256);
         auto *jbAlloca = builder_.CreateAlloca(i8Arr, nullptr, "jmp_buf");
         /* cast to ptr for setjmp/perl_eval_push */
-        Value *jbPtr = builder_.CreateBitCast(jbAlloca, PointerType::getUnqual(ctx_));
+        Value *jbPtr = builder_.CreateBitCast(jbAlloca, i8pTy);
         /* perl_eval_push(jbPtr) — register this jmp_buf */
         callRT("perl_eval_push", {jbPtr});
-
-        /* result alloca — must be BEFORE setjmp so it survives longjmp
-           (longjmp restores stack pointer to setjmp's frame; alloca after
-           setjmp would be outside the saved frame). */
-        auto *resultAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "eval.result");
-        /* Initialize with null so that if the body terminates early (die),
-           the load returns a known value (not LLVM undef), allowing the
-           longjmpMissed check to work correctly. */
-        builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), resultAlloca);
 
         /* int caught = setjmp(jbPtr) */
         auto *i32     = Type::getInt32Ty(ctx_);
@@ -7121,70 +6309,53 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *isCaught = builder_.CreateICmpNE(caught, ConstantInt::get(i32, 0));
         auto *bodyBB  = BasicBlock::Create(ctx_, "eval.body", fn);
         auto *endBB   = BasicBlock::Create(ctx_, "eval.end",  fn);
-
-        /* setjmp==0 → normal entry → bodyBB; setjmp!=0 → longjmp → endBB */
         builder_.CreateCondBr(isCaught, endBB, bodyBB);
 
-        /* ── body: execute eval block, capture return value ── */
         builder_.SetInsertPoint(bodyBB);
-        auto savedIP = builder_.saveIP();
-        evalReturnTargets_.push_back({resultAlloca, endBB});
-        Value *bodyResult = perlUndef();
+        /* Stash the bodyRes alloca and endBB so a `return` inside the
+           eval body stores its value and jumps to endBB instead of die. */
+        int  savedInEval = inEval_;
+        Value *savedBodyRes = evalBodyRes_;
+        BasicBlock *savedEndBB = evalEndBB_;
+        inEval_ = savedInEval + 1;
+        evalBodyRes_ = bodyRes;
+        evalEndBB_   = endBB;
         if (n.body) {
-            bodyResult = emitBlockLast(*n.body);
+            /* emit body and capture last expression's value.  emitBlockLast
+               already clones before popScope() frees captured variables and
+               returns null when the block has no expression value (e.g.
+               last stmt is a declaration). */
+            Value *lastVal = emitBlockLast(*n.body);
+            if (lastVal) {
+                builder_.CreateStore(lastVal, bodyRes);
+            }
         }
-        evalReturnTargets_.pop_back();
-        /* save insert point after emitBlockLast (may be on nested eval's block) */
-        auto *afterBodyBB = builder_.GetInsertBlock();
-        /* restore insert point — emitBlockLast may have moved it */
-        builder_.restoreIP(savedIP);
-        /* store result so endBB can load it (survives longjmp via saved frame) */
-        /* only emit if bodyBB doesn't already have a terminator (e.g., from die/return) */
-        if (!builder_.GetInsertBlock()->getTerminator()) {
-            /* D52: real Perl always resets $@="" when eval completes
-               *successfully* (reaching here, as opposed to via the
-               longjmp/die path straight to endBB below) — even
-               overriding an explicit `$@ = ...` made inside the block
-               itself. Previously this reset ran unconditionally
-               *before* the body executed, which (now that $@ is a real
-               assignment target, see D52's other fix) let an in-block
-               assignment wrongly "stick" instead of being clobbered by
-               eval's own success-clear, diverging from real Perl. */
-            callRT("perl_assign", {callRT("perl_get_dollar_at", {}), perlStr("")});
-            builder_.CreateStore(bodyResult, resultAlloca);
+        inEval_ = savedInEval;
+        evalBodyRes_ = savedBodyRes;
+        evalEndBB_   = savedEndBB;
+        if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(endBB);
-        }
 
-        /* If emitBlockLast left us on a different block (e.g., a nested
-           eval's own endBB, reached when that nested eval was a non-last
-           statement in this eval's body — the trailing statements after it
-           get emitted into that block), terminate that block by storing
-           the actual computed body result — NOT just branching with
-           nothing stored, which silently lost bodyResult and made endBB's
-           load always see the initial null (routed through the
-           longjmpMissed check into undef, discarding the real value). */
-        if (afterBodyBB != endBB && !afterBodyBB->getTerminator()) {
-            builder_.SetInsertPoint(afterBodyBB);
-            callRT("perl_assign", {callRT("perl_get_dollar_at", {}), perlStr("")});
-            builder_.CreateStore(bodyResult, resultAlloca);
-            builder_.CreateBr(endBB);
-        }
         builder_.SetInsertPoint(endBB);
-
-        /* ── end: load result (or undef if longjmp-ed before store) ── */
-        builder_.SetInsertPoint(endBB);
-        Value *finalResult = builder_.CreateLoad(perlPtrTy_, resultAlloca);
-
-        /* ensure we return a valid pointer (longjmp may have skipped the store) */
-        auto *longjmpMissed = builder_.CreateICmpEQ(
-            builder_.CreateLoad(perlPtrTy_, resultAlloca),
-            ConstantPointerNull::get(perlPtrTy_));
-        finalResult = builder_.CreateSelect(longjmpMissed, perlUndef(), finalResult);
-
-        /* pop eval stack — must happen in endBB for both normal and longjmp paths */
         callRT("perl_eval_pop", {});
+        /* Load the body's last-expression value (or undef if die/longjmp
+           skipped the body, or the block was non-expression). */
+        Value *result = builder_.CreateLoad(perlPtrTy_, bodyRes);
 
-        return finalResult;
+        /* If the caller's saved block isn't endBB (meaning emitBlockLast or
+           some inner statement moved us to a sub-context — typically a
+           nested eval's endBB), branch endBB to a fresh continuation
+           block and resume there so subsequent statements in the outer
+           eval's body are emitted in the continuation, not the inner
+           eval's endBB.  Without this, code following the inner eval is
+           inserted into the inner eval's endBB, producing the
+           "Terminator found in the middle of a basic block!" verify error. */
+        if (callerBB != endBB) {
+            auto *contBB = BasicBlock::Create(ctx_, "eval.cont", fn);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
+        return result;
     }
 
     case NK::AnonSub: {
@@ -7193,13 +6364,11 @@ Value *CodeGen::emitExpr(const Node &n) {
         collectAllScalarNames(*n.body, usedNames);
         std::vector<std::string> captureNames;
         std::vector<Value*>      captureVals;   /* PerlValue* loaded from outer alloca */
-        std::vector<char>        captureSigils; /* '$'/'@'/'%' — how to re-declare on the other side */
         for (auto &nm : usedNames) {
             if (nm == "_") continue;
             if (auto *slot = lookupVar(nm)) {
                 captureNames.push_back(nm);
                 captureVals.push_back(builder_.CreateLoad(perlPtrTy_, slot));
-                captureSigils.push_back('$');
             } else {
                 /* Check int/float unboxed scopes — unboxed vars are stored
                    in intScopes_/floatScopes_, not in scopes_.  We need to
@@ -7213,7 +6382,6 @@ Value *CodeGen::emitExpr(const Node &n) {
                     builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
                     captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
-                    captureSigils.push_back('$');
                 } else if (Value *fa = lookupFloatVar(nm)) {
                     Value *fval = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
                     Value *boxed = boxF64(fval);
@@ -7221,37 +6389,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
                     captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
-                    captureSigils.push_back('$');
                 }
-            }
-        }
-        /* Arrays/hashes referenced inside a closure aren't reachable through
-           collectAllScalarNames (they're @/%  sigil, and many builtins like
-           push/keys/splice reference the array/hash purely by n.name rather
-           than a nested ArrayVar/HashVar child, so a used-name AST walk would
-           be an incomplete allowlist and risk silently dropping a capture).
-           Instead, capture every block-scoped array/hash currently visible —
-           file-scope @arr/%h don't need capturing (already reachable via
-           fileArrayGlobals_/fileHashGlobals_ globals). Over-capturing here is
-           just a few extra cheap pointer boxes; under-capturing silently
-           detaches the closure's view of the array from the caller's. */
-        {
-            std::unordered_map<std::string, Value*> visibleArrays;
-            for (auto &scope : arrayScopes_)
-                for (auto &kv : scope) visibleArrays[kv.first] = kv.second;
-            for (auto &kv : visibleArrays) {
-                if (kv.first == "_") continue;
-                captureNames.push_back(kv.first);
-                captureVals.push_back(callRT("perl_ref_array", {kv.second}));
-                captureSigils.push_back('@');
-            }
-            std::unordered_map<std::string, Value*> visibleHashes;
-            for (auto &scope : hashScopes_)
-                for (auto &kv : scope) visibleHashes[kv.first] = kv.second;
-            for (auto &kv : visibleHashes) {
-                captureNames.push_back(kv.first);
-                captureVals.push_back(callRT("perl_ref_hash", {kv.second}));
-                captureSigils.push_back('%');
             }
         }
 
@@ -7271,18 +6409,6 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto  savedIntScopes   = intScopes_;
         auto *savedLocalDepth  = localDepthAlloca_;
         auto *savedSubBody     = currentSubBody_;
-        /* A `return` inside this anon sub's body must target the anon sub
-           itself, never an enclosing eval{} — clear (and restore after)
-           so the new-sub body starts with no active eval-return target,
-           the same isolation already given to scopes_/arrayScopes_/etc. */
-        auto  savedEvalReturnTargets = evalReturnTargets_;
-        evalReturnTargets_.clear();
-        /* D64: pre-scan this closure's own body for names captured by any
-           FURTHER-nested closure, so its own `my $var = <literal>`
-           declarations get the same fast-path guard. */
-        auto savedCapturedNames = capturedNamesInCurrentFn_;
-        capturedNamesInCurrentFn_.clear();
-        if (n.body) collectClosureCapturedNames(*n.body, capturedNamesInCurrentFn_);
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
@@ -7293,7 +6419,6 @@ Value *CodeGen::emitExpr(const Node &n) {
     argsArr->setName("args");
     Value *ctxArg = subFn->getArg(1);
     callRT("perl_push_wantarray", {ctxArg});
-    currentSubNeedsWantarray_ = true;
     declareArray("_", argsArr);
         /* fresh local() depth for this closure */
         {
@@ -7301,96 +6426,24 @@ Value *CodeGen::emitExpr(const Node &n) {
             localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
         }
-        /* Phase 3: initialise captured variables in the closure's own scope */
+        /* Phase 3: initialise captured variables as local allocas */
         auto i64Ty = Type::getInt64Ty(ctx_);
         for (size_t i = 0; i < captureNames.size(); i++) {
             Value *pv = callRT("perl_get_capture",
                                {ConstantInt::get(i64Ty, (long long)i)});
-            if (captureSigils[i] == '@') {
-                declareArray(captureNames[i], callRT("perl_deref_array_ro", {pv}));
-            } else if (captureSigils[i] == '%') {
-                declareHash(captureNames[i], callRT("perl_deref_hash", {pv}));
-            } else {
-                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, captureNames[i]);
-                builder_.CreateStore(pv, alloca);
-                declareVar(captureNames[i], alloca);
-            }
+            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, captureNames[i]);
+            builder_.CreateStore(pv, alloca);
+            declareVar(captureNames[i], alloca);
         }
         currentSubBody_ = n.body.get();
-        /* Always emit cleanup + return so that perl_local_restore_to fires on
-           ALL exit paths.  This fixes the bug where the restore was skipped
-           when the body ended with a loop (which has a terminator).
-           Strategy: create a cleanup block, then ensure every exit path from
-           the body reaches it.  We do NOT patch loop back-edges — only
-           terminators that exit the sub (i.e. don't branch to an earlier
-           block in the same function). */
-        {
+        Value *lastVal = emitBlockLast(*n.body);   /* capture last expr for implicit return */
+        currentSubBody_ = savedSubBody;
+        if (!builder_.GetInsertBlock()->getTerminator()) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
-            auto *cleanupBB = BasicBlock::Create(ctx_, "anon_sub_cleanup", subFn);
-            BasicBlock *savedInsertBB = builder_.GetInsertBlock();
-            builder_.SetInsertPoint(cleanupBB);
             callRT("perl_pop_wantarray", {});
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_local_restore_to", {depth});
-            auto *placeholderRet = builder_.CreateRet(perlUndef());
-            currentSubBody_ = savedSubBody;
-
-            builder_.SetInsertPoint(savedInsertBB);
-            pushScope();
-            Value *lastVal = emitBlockLast(*n.body);
-            popScope();
-
-            /* Connect body exit to cleanupBB. */
-            BasicBlock *bodyEndBB = builder_.GetInsertBlock();
-            Instruction *termInst = bodyEndBB->getTerminator();
-
-            if (!termInst) {
-                /* Body fell through — branch to cleanup */
-                builder_.SetInsertPoint(bodyEndBB);
-                builder_.CreateBr(cleanupBB);
-            } else if (termInst->getNumSuccessors() == 1) {
-                /* Unconditional branch — patch to target cleanup */
-                cast<BranchInst>(termInst)->setSuccessor(0, cleanupBB);
-            } else {
-                /* Multiple successors (e.g. loop exit): only redirect successors
-                   that are NOT loop back-edges (i.e. not an earlier block in
-                   the function).  Back-edges must stay as-is to preserve the
-                   loop.  Non-back-edge successors are redirected to a landing
-                   pad that then goes to cleanup. */
-                auto *landingBB = BasicBlock::Create(ctx_, "anon_sub_landing", subFn);
-                builder_.SetInsertPoint(landingBB);
-                builder_.CreateBr(cleanupBB);
-
-                /* For every block in the sub, check its terminator's successors.
-                   If a successor is NOT an earlier block (i.e. it's an exit),
-                   redirect it to the landing pad. */
-                unsigned idx = 0;
-                for (auto &BB : *subFn) {
-                    if (&BB == cleanupBB || &BB == landingBB) { idx++; continue; }
-                    Instruction *t = BB.getTerminator();
-                    if (!t) { idx++; continue; }
-                    for (unsigned i = 0; i < t->getNumSuccessors(); i++) {
-                        BasicBlock *succ = t->getSuccessor(i);
-                        if (succ == cleanupBB || succ == landingBB) continue;
-                        /* Check if succ is an earlier block (loop back-edge).
-                           A back-edge goes from a later block to an earlier one. */
-                        unsigned succIdx = 0;
-                        for (auto &otherBB : *subFn) {
-                            if (&otherBB == succ) break;
-                            succIdx++;
-                        }
-                        if (succIdx < idx) {
-                            /* succ is before BB — this is a back-edge, leave it */
-                        } else {
-                            /* succ is after BB or equal — redirect to landing */
-                            cast<BranchInst>(t)->setSuccessor(i, landingBB);
-                        }
-                    }
-                    idx++;
-                }
-            }
-
-            placeholderRet->setOperand(0, lastVal ? lastVal : perlUndef());
+            builder_.CreateRet(lastVal ? lastVal : perlUndef());
         }
         popScope();
         /* restore state */
@@ -7404,8 +6457,6 @@ Value *CodeGen::emitExpr(const Node &n) {
         intScopes_        = std::move(savedIntScopes);
         localDepthAlloca_ = savedLocalDepth;
         currentSubBody_   = savedSubBody;
-        evalReturnTargets_ = std::move(savedEvalReturnTargets);
-        capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
@@ -7509,20 +6560,16 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (src) callRT("perl_array_extend", {av, src});
             else     callRT("perl_array_push",   {av, emitExpr(*arg)});
         }
-        /* Set wantarray context (D87: -1 inherit, 0 scalar, 1 list, 2 void) */
+        /* Set wantarray context for the called sub */
         auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *ctxVal;
-        if (callCtx_ == 1)
+        if (callCtx_ == 1) {
             ctxVal = ConstantInt::get(i32Ty, 1);
-        else if (callCtx_ == 2)
-            ctxVal = ConstantInt::get(i32Ty, 2);
-        else if (callCtx_ == 0)
-            ctxVal = ConstantInt::get(i32Ty, 0);
-        else if (currentSubNeedsWantarray_)
+        } else if (currentSubNeedsWantarray_) {
             ctxVal = callRT("perl_current_wantarray_ctx", {});
-        else
+        } else {
             ctxVal = ConstantInt::get(i32Ty, 0);
-        callCtx_ = 0;
+        }
         callRT("perl_push_wantarray", {ctxVal});
         Value *result = callRT("perl_call_code_ref", {ref, av});
         callRT("perl_pop_wantarray", {});
@@ -7604,55 +6651,6 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 }
 
-Value *CodeGen::emitAutovivContainer(const Node &node, bool wantHash) {
-    if (node.kind == NK::HashElem) {
-        Value *outerHv = lookupHash(node.name);
-        if (!outerHv) return nullptr;
-        const char *hashFn  = wantHash ? "perl_hash_autoviv_hash"    : "perl_hash_autoviv_array";
-        const char *hashFnSv= wantHash ? "perl_hash_autoviv_hash_sv" : "perl_hash_autoviv_array_sv";
-        if (Value *kp = constKeyPtr(*node.left, builder_))
-            return callRT(hashFn, {outerHv, kp});
-        Value *key = emitExpr(*node.left);
-        Value *result = callRT(hashFnSv, {outerHv, key});
-        freeIfOwned(key);
-        return result;
-    }
-    if (node.kind == NK::ArrayElem) {
-        Value *outerAv = lookupArray(node.name);
-        if (!outerAv) return nullptr;
-        Value *idx = emitIdx(*node.left);
-        return callRT(wantHash ? "perl_array_autoviv_hash" : "perl_array_autoviv_array",
-                       {outerAv, idx});
-    }
-    if (node.kind == NK::ArrowDeref) {
-        bool innerWantHash = (node.sval == "hash");
-        Value *container = emitAutovivContainer(*node.left, innerWantHash);
-        if (!container) return nullptr;
-        if (innerWantHash) {
-            const char *hashFn   = wantHash ? "perl_hash_autoviv_hash"    : "perl_hash_autoviv_array";
-            const char *hashFnSv = wantHash ? "perl_hash_autoviv_hash_sv" : "perl_hash_autoviv_array_sv";
-            if (Value *kp = constKeyPtr(*node.right, builder_))
-                return callRT(hashFn, {container, kp});
-            Value *key = emitExpr(*node.right);
-            Value *result = callRT(hashFnSv, {container, key});
-            freeIfOwned(key);
-            return result;
-        }
-        Value *idx = emitIdx(*node.right);
-        return callRT(wantHash ? "perl_array_autoviv_hash" : "perl_array_autoviv_array",
-                       {container, idx});
-    }
-    /* Base case: a plain ref-producing expression (e.g. a $scalar variable
-       holding a ref already). Matches the pre-existing fallback behavior
-       used elsewhere for `$ref->{k} = val` / `$ref->[i] = val` on a bare
-       scalar base — NOT full autoviv-from-undef-scalar (a separate, deeper
-       gap: TESTS.md D50), just a normal deref of whatever's there. */
-    Value *base = emitExpr(node);
-    Value *result = callRT(wantHash ? "perl_deref_hash" : "perl_deref_array", {base});
-    freeIfOwned(base);
-    return result;
-}
-
 Value *CodeGen::emitLValue(const Node &n) {
     switch (n.kind) {
     case NK::ScalarVar: {
@@ -7670,76 +6668,8 @@ Value *CodeGen::emitLValue(const Node &n) {
         /* returns nullptr — array element assignment handled separately */
         return nullptr;
     }
-    case NK::DollarAt: {
-        /* D52: $@'s underlying storage (s_dollar_at) is a stable
-           thread-local PerlValue, not a PerlValue* alloca slot like
-           ordinary scalars — wrap its address in a slot so compound
-           assignment forms ($@ .= "x", $@ ||= "y") work via the same
-           generic path as everything else. Plain `$@ = ...` is handled
-           earlier in NK::Assign directly (this covers the rest). */
-        Value *dollarAt = callRT("perl_get_dollar_at", {});
-        auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "dollarat.slot");
-        builder_.CreateStore(dollarAt, slot);
-        return slot;
-    }
     default: return nullptr;
     }
-}
-
-bool CodeGen::isCallLikeForContext(const Node &n) {
-    /* D12: print/printf's arguments are evaluated in list context in real
-       Perl, so a sub called *directly* as an argument must see
-       wantarray()==true. But callCtx_ is a blunt, unscoped one-shot flag
-       (set here, consumed by the next Call/MethodCall/CallCodeRef node's
-       own codegen) with no awareness of intervening operators — if the
-       argument is a compound expression like `ctx() eq "x"`, blindly
-       setting callCtx_=1 before evaluating the whole BinOp leaks list
-       context through "eq" into ctx(), even though real Perl's comparison
-       operators always force scalar context on their own operands
-       regardless of the outer context their *result* is used in. This
-       exact same leak already existed for `my @a = (ctx() eq "x")` before
-       this fix (a separate, pre-existing gap in callCtx_'s design, not
-       something introduced here) — confirmed directly, not fixed as part
-       of this narrower change. Restricting list-context propagation to
-       only the case where the argument's own top-level node is itself a
-       call avoids extending that leak into print/printf without needing
-       to fix callCtx_'s general design. */
-    return n.kind == NK::Call || n.kind == NK::MethodCall || n.kind == NK::CallCodeRef;
-}
-
-Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
-    /* D8a: `EXPR or return VALUE` / `EXPR and return VALUE` parse into a
-       BinOp("||"/"&&") whose RHS is a Block wrapping a single Return
-       statement (Parser::parseOrRhs). Routing that through the ordinary
-       emitExpr()->emitBlockLast() path is wrong here: emitBlockLast treats
-       a trailing Return specially by only *capturing its value* without
-       emitting a real return, on the assumption that some outer caller (a
-       sub body's own emission code, e.g. the code right after
-       emitBlockLast(program) for a sub/do-file body) will perform the
-       actual return afterward — true for that use case, but there is no
-       such outer caller here. The captured value just silently flowed into
-       the "or"/"and" result and execution fell through to the next
-       statement — confirmed exactly matching the reported bug: `f() or
-       return "X";` compiled but never actually returned "X". Detecting
-       this exact shape and dispatching straight to emitStmt() (the real
-       Return handling — eval-target check, local-restore, scope cleanup,
-       and the actual ret/branch) fixes it without touching emitBlockLast's
-       shared logic, which many other callers (sub bodies, do-file bodies,
-       ternary/if branches) correctly rely on behaving the way it already
-       does. */
-    if (rhsNode.kind == NK::Block && rhsNode.args.size() == 1 &&
-        rhsNode.args[0]->kind == NK::Return) {
-        emitStmt(*rhsNode.args[0]);
-        if (builder_.GetInsertBlock()->getTerminator()) return nullptr;
-        /* Extremely rare edge case: `return` with no enclosing sub or eval
-           ("or return X" at true top level) compiles to a bare perl_die()
-           call, which is NoReturn but not itself an LLVM terminator
-           instruction — execution never truly continues past it at
-           runtime, but the caller's PHI node still needs a well-typed
-           value here to keep the IR valid. */
-        return perlUndef();
-    }
-    return emitExpr(rhsNode);
 }
 
 Value *CodeGen::emitBinOp(const Node &n) {
@@ -7753,31 +6683,19 @@ Value *CodeGen::emitBinOp(const Node &n) {
         if (Value *fv = emitExprF64(n))
             return boxF64(fv);
     }
-    /* short-circuit ops.
-       D94: Perl evaluates the LEFT operand of ||/&&/or/and/ // in scalar
-       context always (it's only boolean-tested / defined-tested). The RIGHT
-       operand, when reached, inherits the surrounding expression's own
-       context — so `my @a = (0 || listret())` must give listret() list
-       context. callCtx_ is a one-shot flag consumed by the first Call it
-       reaches; without saving/restoring here, a Call on the left would
-       both wrongly see list context AND starve the right of it. */
+    /* short-circuit ops */
     if (n.sval == "&&") {
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *rhsBB  = BasicBlock::Create(ctx_, "and.rhs",  fn);
         auto *endBB  = BasicBlock::Create(ctx_, "and.end",  fn);
-        int savedCallCtx = callCtx_;
-        callCtx_ = 0;   /* left always scalar */
         Value *lv  = emitExpr(*n.left);
-        callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
         Value *ltrue = builder_.CreateICmpNE(lb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         auto *lBB  = builder_.GetInsertBlock();
         builder_.CreateCondBr(ltrue, rhsBB, endBB);
 
         builder_.SetInsertPoint(rhsBB);
-        callCtx_ = savedCallCtx;  /* right inherits outer context */
-        Value *rv = emitShortCircuitRhs(*n.right);
-        callCtx_ = savedCallCtx;
+        Value *rv = emitExpr(*n.right);
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);
@@ -7792,19 +6710,14 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *rhsBB  = BasicBlock::Create(ctx_, "or.rhs", fn);
         auto *endBB  = BasicBlock::Create(ctx_, "or.end", fn);
-        int savedCallCtx = callCtx_;
-        callCtx_ = 0;   /* left always scalar */
         Value *lv  = emitExpr(*n.left);
-        callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
         Value *ltrue = builder_.CreateICmpNE(lb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         auto *lBB  = builder_.GetInsertBlock();
         builder_.CreateCondBr(ltrue, endBB, rhsBB);
 
         builder_.SetInsertPoint(rhsBB);
-        callCtx_ = savedCallCtx;  /* right inherits outer context */
-        Value *rv = emitShortCircuitRhs(*n.right);
-        callCtx_ = savedCallCtx;
+        Value *rv = emitExpr(*n.right);
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);
@@ -7820,19 +6733,14 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *rhsBB = BasicBlock::Create(ctx_, "defor.rhs", fn);
         auto *endBB = BasicBlock::Create(ctx_, "defor.end", fn);
-        int savedCallCtx = callCtx_;
-        callCtx_ = 0;   /* left always scalar (defined-test) */
         Value *lv   = emitExpr(*n.left);
-        callCtx_ = savedCallCtx;
         Value *lb   = callRT("perl_defined", {lv});
         Value *ldef = builder_.CreateICmpNE(lb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         auto *lBB   = builder_.GetInsertBlock();
         builder_.CreateCondBr(ldef, endBB, rhsBB);
 
         builder_.SetInsertPoint(rhsBB);
-        callCtx_ = savedCallCtx;  /* right inherits outer context */
         Value *rv = emitExpr(*n.right);
-        callCtx_ = savedCallCtx;
         auto *rBB = builder_.GetInsertBlock();
         bool rhsTerminated = rBB->getTerminator() != nullptr;
         if (!rhsTerminated) builder_.CreateBr(endBB);
@@ -7843,96 +6751,38 @@ Value *CodeGen::emitBinOp(const Node &n) {
         if (!rhsTerminated) phi->addIncoming(rv, rBB);
         return phi;
     }
-     /* ternary */
-     if (n.sval == "?:") {
-         auto *fn    = builder_.GetInsertBlock()->getParent();
-         auto *thenBB = BasicBlock::Create(ctx_, "tern.then", fn);
-         auto *elseBB = BasicBlock::Create(ctx_, "tern.else", fn);
-         auto *endBB  = BasicBlock::Create(ctx_, "tern.end",  fn);
-         Value *cv   = emitExpr(*n.cond);
-         Value *cb   = callRT("perl_is_true", {cv});
-         Value *ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
-         builder_.CreateCondBr(ctrue, thenBB, elseBB);
-
-        /* Helper: emit a ternary branch. ArrayLit/list-producers need
-           wantarray-aware wrapping. For ArrayLit/ArrayVar/DerefArray,
-           perl_array_to_list_return already picks list-wrap vs last-elem
-           from the wantarray stack (same as `return (1,2)`). Map/grep/
-           sort need the count/undef scalar special cases. */
-        auto emitBranch = [&](const Node &branchNode) -> Value * {
-            if (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
-                branchNode.kind == NK::DerefArray) {
-                Value *av = emitArrayPtr(branchNode);
-                if (!av) av = callRT("perl_array_new", {});
-                return callRT("perl_array_to_list_return", {av});
-            }
-            if (branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc ||
-                branchNode.kind == NK::SortFunc || branchNode.kind == NK::ReverseFunc) {
-                auto *i32Ty = Type::getInt32Ty(ctx_);
-                Value *ctx = callRT("perl_current_wantarray_ctx", {});
-                Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
-                Value *av = emitArrayPtr(branchNode);
-                if (!av) av = callRT("perl_array_new", {});
-                Value *listResult = callRT("perl_array_to_list_return", {av});
-                Value *scalarResult = perlUndef();
-                if (branchNode.kind == NK::MapFunc || branchNode.kind == NK::GrepFunc)
-                    scalarResult = callRT("perl_array_len", {av});
-                else if (branchNode.kind == NK::SortFunc)
-                    scalarResult = perlUndef();
-                else if (branchNode.kind == NK::ReverseFunc)
-                    scalarResult = callRT("perl_array_len", {av});
-                return builder_.CreateSelect(isList, listResult, scalarResult);
-            }
-            return emitExpr(branchNode);
-        };
+    /* ternary */
+    if (n.sval == "?:") {
+        auto *fn    = builder_.GetInsertBlock()->getParent();
+        auto *thenBB = BasicBlock::Create(ctx_, "tern.then", fn);
+        auto *elseBB = BasicBlock::Create(ctx_, "tern.else", fn);
+        auto *endBB  = BasicBlock::Create(ctx_, "tern.end",  fn);
+        Value *cv   = emitExpr(*n.cond);
+        Value *cb   = callRT("perl_is_true", {cv});
+        Value *ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+        builder_.CreateCondBr(ctrue, thenBB, elseBB);
 
         builder_.SetInsertPoint(thenBB);
-        Value *tv = emitBranch(*n.left);
-         auto *tb  = builder_.GetInsertBlock();
-         bool thenTerminated = tb->getTerminator() != nullptr;
-         if (!thenTerminated) builder_.CreateBr(endBB);
+        Value *tv = emitExpr(*n.left);
+        auto *tb  = builder_.GetInsertBlock();
+        bool thenTerminated = tb->getTerminator() != nullptr;
+        if (!thenTerminated) builder_.CreateBr(endBB);
 
-         builder_.SetInsertPoint(elseBB);
-         Value *ev = emitBranch(*n.right);
-         auto *eb  = builder_.GetInsertBlock();
-         bool elseTerminated = eb->getTerminator() != nullptr;
-         if (!elseTerminated) builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(elseBB);
+        Value *ev = emitExpr(*n.right);
+        auto *eb  = builder_.GetInsertBlock();
+        bool elseTerminated = eb->getTerminator() != nullptr;
+        if (!elseTerminated) builder_.CreateBr(endBB);
 
-         builder_.SetInsertPoint(endBB);
-         auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "tern.result");
-         phi->addIncoming(tv, tb);
-         if (!elseTerminated) phi->addIncoming(ev, eb);
-         return phi;
-     }
+        builder_.SetInsertPoint(endBB);
+        auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "tern.result");
+        phi->addIncoming(tv, tb);
+        if (!elseTerminated) phi->addIncoming(ev, eb);
+        return phi;
+    }
 
-    /* D88: every operator reaching this point (arithmetic, string,
-       comparison, bitwise, `x`, `<=>`/`cmp`) always evaluates BOTH
-       operands in scalar context in real Perl, regardless of the
-       surrounding expression's own context — but callCtx_ is a blunt,
-       unscoped one-shot flag consumed by whichever Call/MethodCall/
-       CallCodeRef node happens to be evaluated next. Several call sites
-       elsewhere in this file set callCtx_=1 before evaluating an entire
-       RHS/argument expression tree without knowing (or caring) whether
-       that tree's root is itself a call or, as here, a BinOp with a call
-       buried in one of its operands — e.g. `my @a = (ctx() eq "x")`
-       previously leaked the list-context RHS's callCtx_=1 straight
-       through `eq` into `ctx()`, reporting list context even though `eq`
-       always forces scalar context on its own operands. Since every
-       non-short-circuit binary operator funnels through this single
-       spot, clearing callCtx_ here (and restoring it after) fixes the
-       leak for this whole operator class in one place, without needing
-       to audit or special-case every individual call site that sets
-       callCtx_ elsewhere in the file (D12's print/printf-specific
-       isCallLikeForContext guard remains the right, narrower fix for
-       print/printf's own list-context *propagation* into a directly-
-       nested call argument — this is the complementary fix for what
-       happens once evaluation descends into a scalar-forcing operator). */
-    int savedCallCtx = callCtx_;
-    callCtx_ = 0; /* D88: force scalar on both operands */
     Value *lv = emitExpr(*n.left);
-    callCtx_ = 0;
     Value *rv = emitExpr(*n.right);
-    callCtx_ = savedCallCtx;
 
     static const struct { const char *op; const char *rt; } OPS[] = {
         {"+",  "perl_add"   }, {"-",  "perl_sub"   }, {"*",  "perl_mul"   },
@@ -7967,16 +6817,41 @@ Value *CodeGen::emitBinOp(const Node &n) {
    Returns nullptr if not inlineable; otherwise returns the expanded result.
    Safety: args are stored directly (no clone). FLOAT_PAIR fast path avoids
    deref_array mutation; _ro norm path is pure and LLVM-hoistable. */
- Value *CodeGen::tryEmitInline(const Node &n) {
-     auto it = inlineSubs_.find(n.name);
-     if (it == inlineSubs_.end()) return nullptr;
-     const auto &is = it->second;
-     if (n.args.size() != is.params.size()) return nullptr;
+Value *CodeGen::tryEmitInline(const Node &n) {
+    auto it = inlineSubs_.find(n.name);
+    if (it == inlineSubs_.end()) return nullptr;
+    const auto &is = it->second;
+    if (n.args.size() != is.params.size()) return nullptr;
 
-     /* Don't inline subs that use wantarray() or call other subs — inlining
-        would break wantarray context propagation (the inlined body would see
-        the caller's wantarray context instead of the sub's own). */
-     if (hasWantarrayOrUserCall(*is.bodyExpr)) return nullptr;
+    /* If the body is F64-capable, emit it directly in F64 context.
+       This eliminates perl_clone + boxing for inlineable subs with float bodies.
+       The returned Value* is a bare double (not a PV*) — callers must handle both cases. */
+    if (canEmitF64(*is.bodyExpr)) {
+        pushScope();
+        std::vector<Value *> ownedArgs;
+        auto *f64Ty = Type::getDoubleTy(ctx_);
+        for (size_t i = 0; i < is.params.size(); i++) {
+            Value *argVal = nullptr;
+            if (n.args[i]->kind == NK::Call) argVal = tryEmitInline(*n.args[i]);
+            if (!argVal) argVal = emitExpr(*n.args[i]);
+            auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+            builder_.CreateStore(argVal, slot);
+            declareVar(is.params[i], slot);
+            if (isOwnedTemp(argVal)) ownedArgs.push_back(argVal);
+            /* Also expose F64 arg as float var for body */
+            if (canEmitF64(*n.args[i])) {
+                if (Value *fv = emitExprF64(*n.args[i])) {
+                    auto *fslot = builder_.CreateAlloca(f64Ty, nullptr, "f$" + is.params[i]);
+                    builder_.CreateStore(fv, fslot);
+                    if (!floatScopes_.empty()) floatScopes_.back()[is.params[i]] = fslot;
+                }
+            }
+        }
+        Value *f64val = emitExprF64(*is.bodyExpr);
+        popScope();
+        for (Value *v : ownedArgs) callRT("perl_free", {v});
+        return f64val;
+    }
 
     /* Evaluate each argument, trying recursive inline for nested sub calls.
        Bail out if any arg is a list-producing expression (can't bind directly). */
@@ -8030,14 +6905,26 @@ Value *CodeGen::emitBinOp(const Node &n) {
 }
 
 Value *CodeGen::emitCall(const Node &n) {
-    /* Try AST-level inline first: eliminates @_ construction for simple subs. */
-    if (Value *v = tryEmitInline(n)) return v;
+    /* Try AST-level inline first: eliminates @_ construction for simple subs.
+       If the inlined sub returns F64, box it into a PV* before returning. */
+    if (Value *v = tryEmitInline(n)) {
+        /* Check if this is an F64 value (not a PV*). We detect this by checking
+           if the value is a ConstantFP, a PHI node of f64 type, or a binary
+           operation on f64 types. If so, box it. */
+        auto *ty = v->getType();
+        if (ty->isFloatingPointTy() && ty->getPrimitiveSizeInBits() == 64) {
+            /* Box F64 result into a PV* using perl_alloc_float */
+            Value *pv = callRT("perl_alloc_float", {v});
+            return pv;
+        }
+        return v;
+    }
 
-    /* eval EXPR — string-eval removed; set $@ and return undef */
+    /* eval EXPR — JIT-based string eval */
     if (n.name == "eval") {
-        Value *msg = perlStr("eval: string eval not available");
-        callRT("perl_assign", {callRT("perl_get_dollar_at", {}), msg});
-        return perlUndef();
+        hasStringEval_ = true;
+        Value *strVal = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_eval_string", {strVal});
     }
     /* ── Qualified / imported function interceptions ──────────────────────── */
     /* POSIX */
@@ -8054,70 +6941,13 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
         return callRT("perl_posix_ceil", {v});
     }
-    if (n.name == "POSIX::fmod" || n.name == "fmod") {
+    if (n.name == "POSIX::fmod") {
         Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
         Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
         return callRT("perl_posix_fmod", {a, b});
     }
     if (n.name == "POSIX::strftime" || n.name == "strftime") {
         return callRT("perl_posix_strftime", {buildArgArray()});
-    }
-    /* D69: List::Util::sum/min/max/uniq, scalar context. These only reach
-       emitCall as a qualified NK::Call — the bare "sum"/"min"/"max"/"uniq"
-       keyword forms are their own dedicated node kinds (NK::SumFunc etc.,
-       handled in emitExpr's own switch) and never reach here at all.
-       Previously the qualified names matched none of these checks and
-       fell through to the generic "::"-qualified-call fallback further
-       below, which only knows how to call a real, separately-compiled
-       LLVM sub — since none of these are that, it silently produced an
-       empty/undef result. buildArgArray() (defined above) doesn't flatten
-       an array-variable argument's elements, so it can't be reused here;
-       this mirrors the correct flattening NK::SumFunc/MinFunc/MaxFunc/
-       UniqFunc's own emitExpr case already does. */
-    if (n.name == "List::Util::sum" || n.name == "List::Util::min" ||
-        n.name == "List::Util::max" || n.name == "List::Util::uniq") {
-        Value *av = nullptr;
-        if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
-        if (!av) {
-            av = callRT("perl_array_new", {});
-            for (auto &a : n.args) {
-                Value *sub = emitArrayPtr(*a);
-                if (sub) callRT("perl_array_extend", {av, sub});
-                else     callRT("perl_array_push",   {av, emitExpr(*a)});
-            }
-        }
-        if (n.name == "List::Util::sum") return callRT("perl_sum_list", {av});
-        if (n.name == "List::Util::min") return callRT("perl_min_list", {av});
-        if (n.name == "List::Util::max") return callRT("perl_max_list", {av});
-        /* uniq: scalar context returns the COUNT of unique elements
-           (matching the identical fix in the bare-keyword NK::UniqFunc
-           case above). */
-        return callRT("perl_array_len", {callRT("perl_uniq_list", {av})});
-    }
-    /* Time::HiRes (D30, built-in) — scalar-context path. "Time::HiRes::time"
-       and "Time::HiRes::sleep" only reach here when explicitly imported
-       (parser.cpp gates them); gettimeofday/usleep/tv_interval have no
-       pre-existing keyword meaning so are always available unqualified,
-       matching the POSIX::floor precedent above. gettimeofday's list-
-       context form is handled separately in emitArrayPtr. */
-    if (n.name == "Time::HiRes::time") {
-        return callRT("perl_hires_time", {});
-    }
-    if (n.name == "Time::HiRes::sleep") {
-        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
-        return callRT("perl_hires_sleep", {v});
-    }
-    if (n.name == "Time::HiRes::usleep" || n.name == "usleep") {
-        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
-        return callRT("perl_hires_usleep", {v});
-    }
-    if (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday") {
-        return callRT("perl_hires_gettimeofday_scalar", {});
-    }
-    if (n.name == "Time::HiRes::tv_interval" || n.name == "tv_interval") {
-        Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
-        Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
-        return callRT("perl_hires_tv_interval", {a, b});
     }
     /* Scalar::Util */
     if (n.name == "Scalar::Util::blessed" || n.name == "blessed") {
@@ -8136,7 +6966,9 @@ Value *CodeGen::emitCall(const Node &n) {
     if (n.name == "Carp::croak" || n.name == "croak" ||
         n.name == "Carp::confess" || n.name == "confess") {
         callRT("perl_carp_croak", {buildArgArray()});
-        /* perl_carp_croak never returns — it calls die/exit */
+        builder_.CreateUnreachable();
+        auto *dead = BasicBlock::Create(ctx_, "croak.dead", builder_.GetInsertBlock()->getParent());
+        builder_.SetInsertPoint(dead);
         return perlUndef();
     }
     if (n.name == "Carp::carp" || n.name == "carp" ||
@@ -8211,16 +7043,13 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *lineVal = ConstantInt::get(i32Ty, n.line);
         callRT("perl_push_call_frame", {pkgStr, fileStr, lineVal});
         Value *ctxVal;
-        if (callCtx_ == 1)
+        if (callCtx_ == 1) {
             ctxVal = ConstantInt::get(i32Ty, 1);
-        else if (callCtx_ == 2)
-            ctxVal = ConstantInt::get(i32Ty, 2);
-        else if (callCtx_ == 0)
-            ctxVal = ConstantInt::get(i32Ty, 0);
-        else if (currentSubNeedsWantarray_)
+        } else if (currentSubNeedsWantarray_) {
             ctxVal = callRT("perl_current_wantarray_ctx", {});
-        else
+        } else {
             ctxVal = ConstantInt::get(i32Ty, 0);
+        }
         callCtx_ = 0;
         Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
         callRT("perl_pop_call_frame", {});
@@ -8248,31 +7077,18 @@ Value *CodeGen::emitCall(const Node &n) {
         }
         auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *ctxVal;
-        if (callCtx_ == 1)
+        if (callCtx_ == 1) {
             ctxVal = ConstantInt::get(i32Ty, 1);
-        else if (callCtx_ == 2)
-            ctxVal = ConstantInt::get(i32Ty, 2);
-        else if (callCtx_ == 0)
-            ctxVal = ConstantInt::get(i32Ty, 0);
-        else if (currentSubNeedsWantarray_)
+        } else if (currentSubNeedsWantarray_) {
             ctxVal = callRT("perl_current_wantarray_ctx", {});
-        else
+        } else {
             ctxVal = ConstantInt::get(i32Ty, 0);
+        }
         callCtx_ = 0;
         Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
         Value *retVal = callRT("perl_call_named_sub", {nameStr, argsArr, ctxVal});
         callRT("perl_array_free", {argsArr});
         return retVal;
-    }
-    /* D36 residual: bareword call `foo "arg"` to an unknown name is a
-       compile error in real Perl ("String found where operator expected
-       / Do you need to predeclare"). Parenthesized `foo()` stays soft
-       (returns undef) — real Perl defers those to runtime. */
-    if (n.ival == 1) {
-        throw std::runtime_error(
-            "String found where operator expected (Do you need to predeclare \"" +
-            n.name + "\"?) at " + sourceFile_ + " line " +
-            std::to_string(n.line > 0 ? n.line : 1));
     }
     return perlUndef();
 }
@@ -8307,7 +7123,83 @@ void CodeGen::runOptimization() {
     MPM.run(*mod_, MAM);
 }
 
+/* ── string eval compilation ─────────────────────────────────────────────── */
+
+void CodeGen::compileForEval(const Node &program, const std::string &funcName) {
+    auto *pv    = perlPtrTy_;
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+
+    /* Pre-declare any subs so forward calls work (mirrors compile()) */
+    subs_.clear();
+    subCaptures_.clear();
+    for (auto &stmt : program.args)
+        if (stmt->kind == NK::SubDef) subs_.push_back(stmt.get());
+    for (auto *s : subs_) {
+        auto *ft = FunctionType::get(pv, {arrayPtrTy_, Type::getInt32Ty(ctx_)}, false);
+        auto *fn = Function::Create(ft, Function::ExternalLinkage, subLLVMName(s->name), mod_.get());
+        fn->addFnAttr(Attribute::AlwaysInline);
+    }
+
+    /* emit: PerlValue *funcName() */
+    auto *evalFT = FunctionType::get(pv, {}, false);
+    auto *evalFn = Function::Create(evalFT, Function::ExternalLinkage,
+                                    funcName, mod_.get());
+    auto *entry = BasicBlock::Create(ctx_, "entry", evalFn);
+    builder_.SetInsertPoint(entry);
+
+    currentFn_ = evalFn;
+    pushScope();
+    fileScopeDepth_ = (int)scopes_.size() + 1;
+    inMainBody_ = true;
+
+    /* register package-qualified subs before eval code runs */
+    for (auto *s : subs_) {
+        if (s->name.find("::") != std::string::npos) {
+            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+            auto *fn = mod_->getFunction(subLLVMName(s->name));
+            callRT("perl_register_method", {keyStr, fn});
+        }
+    }
+
+    /* $_ available inside eval */
+    Value *underscoreVal = callRT("perl_alloc_undef", {});
+    auto *slotUs = builder_.CreateAlloca(pv, nullptr, "$_");
+    builder_.CreateStore(underscoreVal, slotUs);
+    declareVar("_", slotUs);
+
+    /* local() depth tracking */
+    localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+    builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+    /* emit body, capture last value */
+    Value *lastVal = emitBlockLast(program);
+    if (!lastVal) lastVal = perlUndef();
+
+    popScope();
+
+    /* restore any local()s */
+    Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+    callRT("perl_local_restore_to", {depth});
+
+    inMainBody_ = false;
+    localDepthAlloca_ = nullptr;
+
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateRet(lastVal);
+
+    /* emit sub bodies (mirrors compile()) */
+    for (auto *s : subs_) emitSub(*s);
+}
+
 /* ── output ──────────────────────────────────────────────────────────────── */
+
+std::unique_ptr<Module> CodeGen::releaseModule() {
+    return std::move(mod_);
+}
+
+std::unique_ptr<LLVMContext> CodeGen::releaseContext() {
+    return std::move(ctx_owned_);
+}
 
 void CodeGen::dumpIR() {
     mod_->print(outs(), nullptr);

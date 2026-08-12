@@ -171,9 +171,12 @@ private:
        which has no real PerlValue* for a closure to later share) even
        though the fast path would otherwise apply — see D64 in TESTS.md. */
     std::unordered_set<std::string> capturedNamesInCurrentFn_;
-    /* D87: -1=inherit caller (last-expr only), 0=scalar (default), 1=list, 2=void */
-    int                            callCtx_ = 0;
-    /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
+     /* D56: warnings pragma state (set from parser at compile() entry) */
+     bool warningsEnabled_     = false;
+     bool warningsUninitialized_ = false;
+     /* D87: -1=inherit caller (last-expr only), 0=scalar (default), 1=list, 2=void */
+     int                            callCtx_ = 0;
+     /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
     const Node                    *currentSubBody_ = nullptr;
     /* Stage 25: promotion kind for @_ args identified before sub body emission */
     enum class PPKind { Int, Float, DerefAV };
@@ -297,6 +300,9 @@ private:
     llvm::Value *emitFlooredMod(llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem */
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons, else nullptr */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
+
+    /* D56: emit a warn call for use of an undef value at this location */
+    void emitWarnUninitialized(const char *context, llvm::Value *pv, int line);
 
     /* Hash key dispatch: use _str variant for literal keys, _sv for dynamic */
     llvm::Value *emitHashGetRef(llvm::Value *hv, const Node &keyNode);

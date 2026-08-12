@@ -149,7 +149,7 @@ my $grep_count = count_grep();
 print "grep_scalar_ctx=$grep_count\n";  # 3
 
 my $map_count = count_map();
-print "map_scalar_ctx=$map_count\n";  # 6 (3*2)
+print "map_scalar_ctx=$map_count\n";  # 3 (count of input list — Perl returns input count for map in scalar ctx)
 
 my $sort_count = count_sort();
 print "sort_scalar_ctx=", (defined($sort_count) ? $sort_count : ""), "\n";  # undef in scalar

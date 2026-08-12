@@ -158,6 +158,8 @@ enum class NK {
     /* pack/unpack */
     PackFunc,     /* pack FORMAT, args...   – sval=format, args=data               */
     UnpackFunc,   /* unpack FORMAT, string  – sval=format, left=string expr         */
+    /* D56: warnings pragma */
+    WarningsStmt, /* use warnings / no warnings – sval="enable" or "disable", name="uninitialized" or "" */
 };
 
 struct Node;

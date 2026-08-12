@@ -14,6 +14,9 @@ public:
     static NodePtr parseExprFromTokens(std::vector<Token> tokens);  /* pre-parse const value expr */
     static NodeList parseExprListFromTokens(std::vector<Token> tokens);  /* comma-separated list, e.g. slice indices/keys */
     NodePtr parseProgram();   /* returns a Block */
+    /* D56: warnings state accessors for codegen */
+    bool getWarningsEnabled() const      { return warningsEnabled_; }
+    bool getWarningsUninitialized() const { return warningsUninitialized_; }
 
 private:
     std::vector<Token>              toks_;
@@ -23,6 +26,11 @@ private:
     int                             anonCount_       = 0; /* D10: per-parse anon sub ids */
     std::map<std::string,std::string> importMap_;  /* short → qualified call names */
     std::map<std::string,NodePtr>     constMap_;   /* constant name → parsed AST */
+    bool inKeyContext_ = false;  /* true when parsing hash keys — barewords are strings */
+
+    /* D56: warnings pragma state */
+    bool warningsEnabled_     = false;
+    bool warningsUninitialized_ = false;
 
     Token &cur();
     Token &peek(int offset = 1);

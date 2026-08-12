@@ -486,6 +486,68 @@ PerlValue *perl_array_to_list_return(PerlArray *av) {
     }
 }
 
+/* grep BLOCK LIST — in list context returns the matched elements; in
+   scalar context returns the count of matching elements (Perl semantics:
+   `scalar(grep ...)` is by definition the count). */
+PerlValue *perl_grep_list_return(PerlArray *av) {
+    int ctx = (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
+    if (ctx) {
+        PerlValue *r = pv_alloc();
+        r->tag = PERL_LIST_RESULT;
+        r->flags = 0; r->matchpos = 0; r->blessed_class = NULL;
+        r->pval = av;
+        av->refcount = 1;
+        return r;
+    }
+    /* scalar: count of matching elements */
+    long long n = av->len;
+    perl_array_free(av);
+    return perl_alloc_int(n);
+}
+
+/* map BLOCK LIST — in list context returns the mapped elements; in
+   scalar context returns the count of the input list (Perl's actual
+   implementation behavior; the spec says it's "unspecified" but real
+   Perl returns the count of input elements when map is evaluated in
+   scalar context). */
+PerlValue *perl_map_list_return(PerlArray *av) {
+    int ctx = (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
+    if (ctx) {
+        PerlValue *r = pv_alloc();
+        r->tag = PERL_LIST_RESULT;
+        r->flags = 0; r->matchpos = 0; r->blessed_class = NULL;
+        r->pval = av;
+        av->refcount = 1;
+        return r;
+    }
+    /* scalar: count of input elements (matches Perl's runtime behavior,
+       which is what callers actually observe).  av is the mapped array,
+       whose length equals the input list length for an input list of
+       valid elements. */
+    long long n = av->len;
+    perl_array_free(av);
+    return perl_alloc_int(n);
+}
+
+/* sort LIST — in list context returns the sorted elements; in scalar
+   context returns undef (Perl emits a "Useless use of sort in scalar
+   context" warning and the result is undef — not the count, not the
+   last element). */
+PerlValue *perl_sort_list_return(PerlArray *av) {
+    int ctx = (s_wantarray_depth > 0) ? s_wantarray_stack[s_wantarray_depth - 1] : 0;
+    if (ctx) {
+        PerlValue *r = pv_alloc();
+        r->tag = PERL_LIST_RESULT;
+        r->flags = 0; r->matchpos = 0; r->blessed_class = NULL;
+        r->pval = av;
+        av->refcount = 1;
+        return r;
+    }
+    /* scalar: undef */
+    perl_array_free(av);
+    return perl_alloc_undef();
+}
+
 /* caller-side unwrap: extract PerlArray* from list-context function result.
    Only PERL_LIST_RESULT (from perl_array_to_list_return) is spread; plain
    PERL_REF_ARRAY scalar refs are passed as a single element so that e.g.
@@ -1307,6 +1369,33 @@ const char *perl_to_string(const PerlValue *v) {
             return strdup("DBI::db");
         case PERL_DBI_STH:
             return strdup("DBI::st");
+        case PERL_FLAT_ARRAY: {
+            /* format pval as double[] of length matchpos, space-separated */
+            long long n = v->matchpos;
+            double *d = (double *)v->pval;
+            /* worst case: "1.7e308 " is ~10 chars per element, plus NUL */
+            size_t cap = 16 + (size_t)n * 14;
+            char *buf = (char *)malloc(cap);
+            if (!buf) return strdup("");
+            size_t off = 0;
+            for (long long i = 0; i < n; i++) {
+                int w = snprintf(buf + off, cap - off, "%s%g",
+                                 i == 0 ? "" : " ", d ? d[i] : 0.0);
+                if (w < 0 || (size_t)w >= cap - off) break;
+                off += (size_t)w;
+            }
+            if (off < cap) buf[off] = '\0'; else buf[cap - 1] = '\0';
+            return buf;
+        }
+        case PERL_FLOAT_PAIR: {
+            /* fval = re, matchpos holds the bits of im (see perl_alloc_float_pair) */
+            double re = v->fval;
+            double im;
+            memcpy(&im, &v->matchpos, sizeof(double));
+            char buf[80];
+            snprintf(buf, sizeof buf, "%g %g", re, im);
+            return strdup(buf);
+        }
         default:
             return strdup("");
     }
@@ -1371,6 +1460,32 @@ char *perl_to_string_dup(const PerlValue *v) {
             return strdup("DBI::db");
         case PERL_DBI_STH:
             return strdup("DBI::st");
+        case PERL_FLAT_ARRAY: {
+            /* format pval as double[] of length matchpos, space-separated */
+            long long n = v->matchpos;
+            double *d = (double *)v->pval;
+            size_t cap = 16 + (size_t)n * 14;
+            char *buf = (char *)malloc(cap);
+            if (!buf) return strdup("");
+            size_t off = 0;
+            for (long long i = 0; i < n; i++) {
+                int w = snprintf(buf + off, cap - off, "%s%g",
+                                 i == 0 ? "" : " ", d ? d[i] : 0.0);
+                if (w < 0 || (size_t)w >= cap - off) break;
+                off += (size_t)w;
+            }
+            if (off < cap) buf[off] = '\0'; else buf[cap - 1] = '\0';
+            return buf;
+        }
+        case PERL_FLOAT_PAIR: {
+            /* fval = re, matchpos holds the bits of im (see perl_alloc_float_pair) */
+            double re = v->fval;
+            double im;
+            memcpy(&im, &v->matchpos, sizeof(double));
+            char buf[80];
+            snprintf(buf, sizeof buf, "%g %g", re, im);
+            return strdup(buf);
+        }
         default:
             return strdup("");
     }
@@ -3554,10 +3669,13 @@ PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
     int         saved_n    = s_ncaptures;
     s_current_captures = cl->captures;
     s_ncaptures        = cl->ncaptures;
-    /* Use caller's wantarray context (set by codegen via perl_push_wantarray) */
+    /* The codegen for CallCodeRef (and the named-sub call sites in main)
+       already calls perl_push_wantarray(ctx) before perl_call_code_ref
+       and perl_pop_wantarray() after.  Pass the current ctx directly to
+       the closure without re-pushing, otherwise the wantarray stack
+       grows by one per call and the sub sees the wrong context. */
     int ctx = perl_current_wantarray_ctx();
-    PerlValue *result = ((PerlSubFnCtx)cl->fn)(args, perl_push_wantarray(ctx));
-    perl_pop_wantarray();
+    PerlValue *result = ((PerlSubFnCtx)cl->fn)(args, ctx);
     s_current_captures = saved_caps;
     s_ncaptures        = saved_n;
     return result;
@@ -5714,6 +5832,26 @@ void perl_warn(PerlValue *msg, const char *filename, int line) {
 
     fputs(full, stderr);
     free(full);
+}
+
+/* D56: uninitialized-value warning — prints
+   "Use of uninitialized value in <context> at <file> line <line>.\n" */
+void perl_warn_uninitialized(const char *context, const char *filename, int line) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "Use of uninitialized value in %s at %s line %d.\n",
+             context ? context : "", filename ? filename : "", line);
+
+    /* $SIG{__WARN__}: if set to a coderef, call it instead of printing. */
+    if (s_sig_warn_depth == 0) {
+        s_sig_warn_depth++;
+        PerlValue *msg_pv = perl_alloc_string(buf);
+        int handled = call_sig_handler("__WARN__", msg_pv);
+        perl_free(msg_pv);
+        s_sig_warn_depth--;
+        if (handled) return;
+    }
+
+    fputs(buf, stderr);
 }
 
 PerlValue *perl_system(PerlValue *cmd) {

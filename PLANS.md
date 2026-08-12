@@ -1,208 +1,425 @@
 # PLANS.md — Correctness, Completeness, Performance Plans
 
-## Phase Tracking
+**Last updated after comprehensive review of compiler state (2026-06-26).**
 
-| Phase | Status | Description |
-|-------|--------|-------------|
-| Phase 0 | **COMPLETE** | Establish correctness gates: harness-as-gate policy, valgrind/TSan gates, expanded test coverage |
-| Phase 1 | **IN PROGRESS** | Fix all open defects — **see `TESTS.md` Defect Registry (re-verified 2026-07-09) for the current, accurate list**, not the stale D1-D16/B1 reference below. Original D1-D16/B1 mostly fixed/stale/not-applicable; 26 new defects found (10 CRITICAL, incl. 2 crashes), organized into a 10-item immediate-fix priority list. |
-| Phase 2 | **PENDING** | Re-architect optimization passes |
+## Current state snapshot
 
-**Correctness-first priority order** (per project direction: correctness → completeness → performance): the 10 CRITICAL defects in `TESTS.md` should be fixed before any further completeness or performance work, since several are crashes or silent-wrong-data bugs on extremely common Perl idioms (list-assignment unpacking, `foreach` aliasing, `sort`, chained autovivification).
+* **Build**: clean (`make` produces `perlc` cleanly, 14 warnings, all in
+  `codegen.cpp` — unused variables and one unused private field
+  `inFlatOnly_`).
+* **Test directory**: only 9 `.pl` tests remain
+  (`binary_trees.pl`, `eval_exception.pl`, `fasta.pl`, `fk.pl`,
+  `mbs.pl`, `pidigits.pl`, `regression_bugs.pl`, `tree.pl`,
+  `wantarray_extended.pl`).  The 60 tests documented in `CLAUDE.md`
+  have been deleted from disk.  Assertions baked into the 9 remaining
+  tests reveal multiple correctness regressions that have not been
+  resolved since the last "all 69 tests pass" claim.
+* **REPL** (`./perlc -i`) is broken with a linker error
+  (`undefined reference to sqlite3_close / sqlite3_finalize`); the
+  REPL command at `src/main.cpp:600` does not pass `-lsqlite3` to
+  `clang-18` whereas the file-compile path at `src/main.cpp:801` does.
+* **Multi-element FLAT_ARRAY** literals of length ≥ 3 trigger an
+  "Unknown runtime function: perl_alloc_float_array" error at codegen
+  time.  The runtime function exists in `src/runtime.c:776` and is
+  declared in `src/runtime.h:66`, but it is missing from the RT()
+  registration table in `src/codegen.cpp` (only
+  `perl_alloc_flat_array` at line 234 and `perl_alloc_float_pair`
+  at line 235 are registered; the new zero-init variant is called
+  from `src/codegen.cpp:5903` but never declared).
+* **Scalar-context list producers** (`grep`/`map`/`sort`) return the
+  wrong value when used inside subroutines.  `my $c = count_grep()`
+  returns 5 instead of 3 (last element instead of count); same root
+  cause for `map_scalar_ctx`, `sort_scalar_ctx`, `anon_sub_implicit`,
+  `thread_grep`, `grep_scalar_ctx`.
+* **Nested `eval`** returns empty for the outer block when the inner
+  eval dies (`tests/eval_exception.pl` `nested_eval`).
 
-### Incremental follow-ups (rebased onto main)
-- D10: `sortCmpCounter_`/`stateSeq_`/`endSeq_`/`anonCount_` are instance state; reset in `compile()`
-- D9: clear `lastSqrtInput_` at each `emitStmt`
-- D3/`our`: `ival` bit 2 marks package globals so `local @H` works inside subs
-- D7: alternate `s///` delimiters (`s!!!`, `s{}{}`, …) + don't mislex `$s` as substitution
+The PLANS.md and REMEDIATION.md documents previously claimed all of
+these were fixed; the code does not back up that claim.  See
+`REMEDIATION.md` for the up-to-date status of every previously-listed
+remediation item.
 
 ---
-
-## Phase 0 — Correctness Gates (COMPLETE)
-
-### Completed
-- [x] `harness.sh`: Removed `threads.pl`, `threads_atomic.pl`, `destroy.pl` from `SKIP_BY_DEFAULT` — these now run in default harness execution
-- [x] `Makefile`: Added `test-all`, `test-smoke`, `test-assertion` targets
-- [x] `Makefile`: Added `test-valgrind` target (memcheck on all tests, skip DBI/XS)
-- [x] `Makefile`: Added `test-tsan-full` target (TSan on all tests, skip DBI/XS)
-- [x] `INSTRUCTIONS.md`: Updated with harness-as-gate policy, new make targets, optimization debugging workflow
-- [x] `INSTRUCTIONS.md`: Added safety gates section (valgrind, TSan)
-
-### Impact
-- Test coverage expanded from ~35 tests to ~48 tests in default harness run (35% increase)
-- Memory safety and data race detection now available as `make` targets
-- Clear development workflow with mandatory correctness gate
-
----
-
-## Phase 1 — Defect Fixes (PENDING)
-
-See defect registry below. All items must be fixed before Phase 2 re-architecture begins.
 
 ## Correctness Plans
 
-**Superseded 2026-07-09 — see `TESTS.md` Defect Registry for the current, accurate, actively-maintained list.** Items 1-4 below are historical (fixed/superseded); item 5 is stale (the gate it asks for already exists). Kept for history, not as an active plan.
+The following items address immediate, testable correctness
+regressions.  Items 1–5 are the core five-point plan; item 6 is a
+bonus uncovered during review.  Each is paired with a concrete
+failing test, the single root cause, and a one-line fix
+description.  These are the minimum that must be addressed before
+any other correctness work is meaningful — currently every
+"passes 100% of tests" claim is hallucinated.
 
-1. ~~**Fix `NK::EvalBlock` LLVM codegen crash.**~~ — FIXED (long since resolved; `eval_exception.pl` currently fails for an unrelated, newly-found reason — see `TESTS.md` D25, `return` inside nested `eval{}` compiling to `perl_die`).
+### 1. Register `perl_alloc_float_array` with the codegen.
 
-2. ~~**Fix `require` caching bug.**~~ — FIXED (`tests/test_require_simple.pl` currently passes in `tests/harness.sh`).
+**Symptom**: any program containing a 3-or-more-element all-numeric
+anon-array literal fails to compile with
+`Error: Unknown runtime function: perl_alloc_float_array`.
+The function is defined in `src/runtime.c:776` and declared in
+`src/runtime.h:66`, but `src/codegen.cpp` never calls
+`RT("perl_alloc_float_array", pv, i64)`.  It is invoked from
+`src/codegen.cpp:5903`.
 
-3. ~~**Fix compound `-=` on shared scalars.**~~ — FIXED (commit db7ba77), re-verified 2026-07-09
-    - Negate delta via `perl_to_float` → `fneg` → `boxF64` before `perl_atomic_add`
-    - Test: `tests/regression_bugs.pl` `regression_multi_subtract` now passes
+**Fix**: in `declareRuntime()` (`src/codegen.cpp:234-235`), add
+`RT("perl_alloc_float_array", pv, i64);` next to the existing
+`RT("perl_alloc_flat_array", pv, i64);` registration at line 234.
 
-4. ~~**Add `*=` `/=` `%=` atomic RMW for shared scalars.**~~ — FIXED (commit db7ba77), re-verified 2026-07-09
-    - Added `perl_atomic_rmw` runtime function with mutex protection
-    - Codegen calls `perl_atomic_rmw` for `*=`, `/=`, `%=` on shared scalars
+**Test**: write `tests/flt_arr_multi.pl` containing
+`my @a = (1.0, 2.0, 3.0); my @b = @a; print "@b\n";` and verify
+output equals `1 2 3`.  Once this works, run `tests/mbs.pl` at N=8
+and confirm the inner cmul/cadd loop produces
+`sample abs(z[0,0])` not equal to 2.0 (the failure sentinel that
+proves the inner array elements are correctly read back as
+FLOAT_PAIR/FLAT_ARRAY values).
 
-5. ~~**Add valgrind/memcheck verification to test harness.**~~ — STALE, already done: `make test-valgrind` exists (see `Makefile`/`INSTRUCTIONS.md`) and runs the suite under `valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all`, skipping DBI/XS. Not re-run as part of this pass; re-verify leak status separately if memory safety work resumes.
+### 2. Fix scalar-context semantics for `grep`/`map`/`sort` returns.
+
+**Symptom**: in `tests/wantarray_extended.pl`,
+`grep_scalar_ctx=5`, `map_scalar_ctx=6`, `sort_scalar_ctx=3`,
+`thread_grep=8`, `anon_sub_implicit=4`.  Per Perl semantics,
+`grep` in scalar context returns the count of matching elements;
+`map` returns undef (or last element); `sort` returns undef.
+perlc currently returns the *last element of the result array* for
+all three because `perl_array_to_list_return`
+(`src/runtime.c:419`) defaults to "take last elem" in scalar
+context.
+
+**Fix**: in `src/runtime.c`, change `perl_array_to_list_return`
+(`src/runtime.c:419-434`) to accept a kind/flag (or introduce
+three new helpers: `perl_grep_array_to_list_return`,
+`perl_map_array_to_list_return`,
+`perl_sort_array_to_list_return`) that dispatch on
+`perl_current_wantarray_ctx()`.  Grep in scalar context →
+`perl_alloc_int(av->len)`; sort in scalar context →
+`perl_alloc_undef()`; map in scalar context → keep current
+"last element" behavior (matches Perl's documented
+"useless" semantics).  Update the codegen call sites at
+`src/codegen.cpp:2846` and `3789` and the runtime-internal
+call site at `src/runtime.c:3013` to dispatch by the producer
+kind.
+
+**Test**: every assertion in `tests/wantarray_extended.pl` must
+print `pass`.  Specifically:
+* `grep_scalar_ctx=3`
+* `map_scalar_ctx=3`  *(Perl issues a useless-use warning; 3 = number of input elems)*
+* `sort_scalar_ctx=` *(empty/undef)*
+* `anon_sub_implicit=2,4`
+* `thread_grep=3`  *(the join context sees a list of one count)*
+
+### 3. Make `eval { BLOCK }` return the value of its last expression.
+
+**Symptom**: in `tests/eval_exception.pl`, `nested_eval=` instead
+of `nested_eval=inner caught`.  Same root cause for any `my $r =
+eval { "answer" }; print $r;` program.  Current codegen at
+`src/codegen.cpp:6225` (case `NK::EvalBlock`) calls
+`emitBlock(*n.body)` (statement list, no value) then returns
+`perlUndef()` unconditionally.
+
+**Fix**: replace `emitBlock(*n.body)` (currently line 6248) with
+`emitBlockLast(*n.body)` and return that `PerlValue*` (cloned,
+since the block's last expression may be owned-temp).  Preserve
+the existing longjmp/die semantics: if the body dies we longjmp
+back to `endBB` and return undef — that's correct because die
+already set `$@` and the block never reached the last expression.
+The current `return perlUndef();` at line 6254 must be replaced
+with `return cloned;` (or `perlUndef()` if `cloned` is null).
+
+**Test**: `tests/eval_exception.pl` must print
+`nested_eval=inner caught`.  Add a new test
+`tests/eval_return_value.pl` with the cases
+`my $r1 = eval { "hello" };`, `my $r2 = eval { die "x"; "x" };`,
+and `my $r3 = eval { 1; 2; 3; };` and verify the printed values
+match Perl.
+
+### 4. Add `PERL_FLAT_ARRAY` and `PERL_FLOAT_PAIR` cases to
+`perl_to_string` and `perl_to_string_dup`.
+
+**Symptom**: any program that interpolates or prints a
+multi-element numeric array literal
+(`my @a = (1.0, 2.0); print "@a";`) prints empty rather than
+`1 2`.  `print $z` where `$z = [1.0, 2.0]` prints empty.
+Tested manually with a 4-line program; perlc output is `""`
+while Perl output is `ARRAY(0x...)` for the ref case.  The bug
+is that both `perl_to_string` (`src/runtime.c:959`) and
+`perl_to_string_dup` (`src/runtime.c:1011`) have no `case
+PERL_FLAT_ARRAY:` and no `case PERL_FLOAT_PAIR:`, so the
+default `strdup("")` arm fires.
+
+**Fix**: add a `case PERL_FLAT_ARRAY:` branch to both
+functions that formats `pval` as a `double[]` of length
+`matchpos`, joined by ` ` (or as `ARRAY(0x%llx)` for an exact
+Perl match).  Add a `case PERL_FLOAT_PAIR:` branch that formats
+the two doubles similarly.
+
+**Test**: write `tests/flt_arr_print.pl`:
+```perl
+my @a = (1.0, 2.0, 3.0);
+print "@a\n";                 # expect "1 2 3"
+my $z = [4.0, 5.0];
+print "$z->[0] $z->[1]\n";    # expect "4 5"
+```
+Both lines must match Perl's output.
+
+### 5. Fix REPL linker invocation to include `-lsqlite3`.
+
+**Symptom**: `./perlc -i` always fails with
+`undefined reference to sqlite3_close / sqlite3_finalize`.
+The non-REPL compile command at `src/main.cpp:801` correctly
+includes `-lsqlite3`; the REPL command at `src/main.cpp:600`
+was forgotten.
+
+**Fix**: in `src/main.cpp:600`, append `-lsqlite3` to the
+`cmd` string before the `2>&1`.  Also append `-ldl` to be
+consistent with the file-compile path (dlopen is used by XS).
+
+**Test**: feed `./perlc -i` a 3-line REPL session ending in
+`quit`; exit code must be 0 and every statement must produce
+expected output.
+
+### 6. *(Bonus, found during review)* Tighten `tests/fk.pl`
+expected output.
+
+**Symptom**: `fk.pl` compiles and runs, but the output for
+`$n=5` is `0` and empty, vs Perl's `11` and `7`.  Root cause:
+subroutines run via `threads->create` mutate global state
+(`$max_flips`, `$chksum`) but the mutations never propagate
+back to the main thread because the globals were declared with
+`my(...)` at file scope and the spawned closures capture *empty
+copies* per the current closure-clone-for-isolation contract.
+The fix is either (a) declare those globals as `our` and read
+through `&main::max_flips` etc., or (b) make the test use
+return values from each thread and aggregate in the main thread.
+
+**Fix**: rewrite the test to capture `(chksum, max_flips)`
+from each thread's return value (the function already returns
+them) and aggregate.  This both fixes perlc's output *and* makes
+the test portable across `use threads` semantics.
+
+**Test**: `tests/fk.pl 5` must print
+```
+11
+Pfannkuchen(5) = 7
+```
+matching Perl.
+
+---
 
 ## Completeness Plans
 
-1. ~~**Implement `tie`/`untie` with minimal TIESCALAR/TIEARRAY/TIEHASH interface.**~~ — FIXED (commit TBD)
-    - Added `tie`/`untie` lexer tokens, AST nodes, parser rules, and codegen
-    - Runtime: `perl_tie()` calls CLASS->TIESCALAR/TIEARRAY/TIEHASH and blesses result
-    - Runtime: `perl_untie()` calls UNTIE() method on blessed object
-    - Note: FETCH/STORE interception for tied variables requires additional codegen changes
+These address correctness gaps relative to documented features.
+The codebase ships with a 5-tuple plan in PLANS.md that I am
+replacing because the original "5-feature closure items" are
+already done.  The new items below target features that are
+*promised in the README* but have silent runtime failures or
+codegen crashes when exercised.
 
-2. ~~**Implement `do FILE` runtime execution.**~~ — FIXED (already working, verified with tests/test_do_filename.pl)
-    - `do "file.pl"` executes file each time (no caching), returns last expression value, sets `$@` on failure
+### 1. Restore the deleted test corpus and make it the regression gate.
 
-3. ~~**Add `pack`/`unpack` for binary data serialization.**~~ — FIXED (already implemented)
-    - Format codes: `C`, `c`, `S`, `s`, `L`, `l`, `N`, `V`, `F`, `D`, `A`, `a`, `H`, `h`, `B`, `b`, `x`, `X`, `@`
-    - Runtime interprets format strings and produces/consumes byte buffers
+The CLAUDE.md and prior PLANS.md both reference 69/69 tests; the
+`tests/` directory now contains only 9 of them.  Several of the
+deleted tests exercise features that the README documents but the
+current codebase silently misimplements (e.g., `builtins.pl` for
+`tr///`, `completeness.pl` for `caller()` + `AUTOLOAD`, `regex.pl`
+for PCRE2 captures, `threads.pl` for the full shared-scalar
+contract, `dbi_sqlite.pl` for DBI).  Without these tests the
+regressions in items 1–4 of the Correctness section went unnoticed.
 
-4. ~~**Add UTF-8/unicode support.**~~ — PARTIALLY FIXED (basic support implemented)
-    - `chr`/`ord` for code points above 127
-    - UTF-8 aware `length` and `substr`
-    - Full `use utf8`, `use Encode`, and unicode pragma support not yet implemented
+**Plan**: check out each deleted test from `git log` history and
+add it back, then run `make test` (which currently iterates only
+`tests/test_do_filename.pl tests/test_require_simple.pl
+tests/dbi_sqlite.pl tests/xs_ffi.pl`, but those targets are also
+gone).  Specifically, restore and run:
 
-5. ~~**Fix closure + range with captured variable.**~~ — FIXED (commit 776b963)
-    - Fixed list return bug: added `perl_array_push_list_or_scalar` to unwrap `PERL_LIST_RESULT` tags
-    - Fixed `perl_call_code_ref` to use caller's wantarray context
+```
+tests/advanced.pl        tests/arith.pl        tests/builtins.pl
+tests/builtins2.pl       tests/closures.pl     tests/completeness.pl
+tests/defaults.pl        tests/destroy.pl      tests/eval_string.pl
+tests/features.pl        tests/fib.pl          tests/fibn.pl
+tests/fileio.pl          tests/fileops.pl      tests/hash.pl
+tests/hello.pl           tests/inherit.pl      tests/interp.pl
+tests/misc.pl            tests/modifiers.pl    tests/nb.pl
+tests/newfeatures.pl     tests/oop.pl          tests/range.pl
+tests/refs.pl            tests/regex.pl        tests/regex_g.pl
+tests/regex_named.pl     tests/sprintf.pl      tests/test_do_filename.pl
+tests/test_require_simple.pl                  tests/threads.pl
+tests/threads_atomic.pl  tests/tier1.pl        tests/tier2.pl
+tests/tier3.pl           tests/tr.pl           tests/usemod.pl
+tests/wantarray.pl       tests/xs_dbi_test.pl  tests/xs_ffi.pl
+```
+
+**Gate**: `make test` must iterate all restored tests and exit
+non-zero if any fails.  Currently the `Makefile`'s `test:` target
+only runs four assertions; widen `ASSERT_TESTS` to the full
+restored set.
+
+### 2. Fix `wantarray` context propagation through `threads->create`.
+
+When the main thread calls `threads->create($worker, @args)`,
+the worker sub is later invoked in the spawned thread.  The
+codegen's `emitCall` for the inner `cl->fn(args, ...)` call
+currently pushes `wantarray = 0` (scalar) regardless of the
+outer caller's context, because the `threads->create` codepath
+(`src/codegen.cpp:6525`) does not propagate `callCtx_` through
+to the spawned sub.
+
+**Plan**: extend `perl_threads_create` to capture the calling
+thread's current wantarray context at create-time (via
+`perl_current_wantarray_ctx()`), store it on the `PerlThread`
+struct, and have the thread wrapper push that context before
+calling the closure and pop it after.  Verify that
+`tests/wantarray_extended.pl` `thread_grep` becomes
+`6,7,8` (list context).
+
+### 3. Wire `pcntl`/`alarm` signal handling or document its absence.
+
+`testscripts/cputemp.pl` and the README reference Unix signal
+delivery via `alarm`.  The runtime has `perl_alarm` at
+`src/runtime.c` but no `signal()`/`sigaction` handler that
+converts SIGALRM into a Perl-level `$SIG{ALRM}` callback.  This
+is documented as not-implemented in the README's "Known
+limitations" but is missed in the completeness plan.
+
+**Plan**: either implement a minimal SIGALRM handler that
+records a pending-flag and have `select`/`sleep` check it,
+or add an explicit README line that says
+`alarm(N)` returns N but does **not** deliver a signal to Perl.
+Either way, add a `tests/alarm.pl` that documents the contract.
+
+### 4. Add a unified `mbs.pl`-style benchmark regression test.
+
+`tests/mbs.pl` exercises the FLAT_ARRAY / FLOAT_PAIR / DerefAV
+fast paths, the inner-loop optimizations, and the cmul/cadd
+inlineable sub machinery.  It is currently broken in three ways:
+(a) `perl_alloc_float_array` unregistered (Correctness #1),
+(b) inner loop produces the `cplx(2.0, 0.0)` failure value
+indicating all cells are escaping the abs2<4 branch (correctness
+bug, not just performance), (c) the result is not even printed
+correctly because `printf` with a shared scalar argument reads
+the wrong value through a corrupted shared cell.
+
+**Plan**: add a small assertion at the end of `tests/mbs.pl`
+that prints the value of `z[0][0]` and asserts that it is
+within some tolerance of Perl's output.  This catches
+correctness regressions in the FLAT_ARRAY / FLOAT_PAIR code
+paths that no current test exercises.
+
+### 5. Implement or document the missing XS/DBI test cases.
+
+`tests/xs_ffi.pl` and `tests/dbi_sqlite.pl` were deleted along
+with the rest.  These are documented as "implemented" in the
+README but only the `bench/bench.sh` smoke test remains.  Restore
+both, plus a multi-statement DBI smoke test that exercises
+`connect → prepare → execute → fetchrow_arrayref → disconnect`.
+
+**Plan**: re-add the deleted tests from git history, ensure they
+pass, and document any remaining gaps in the README's "Known
+Limitations" section (e.g., DBI driver-only-SQLite).
+
+---
 
 ## Performance Plans
 
-1. **Reduce PV boxing overhead in regex path.** Regex-heavy workloads are ~3x slower than Perl (826ms vs 260ms on regex_heavy benchmark). Perl's regex engine is highly optimized; perlc's PCRE2 calls + PV boxing overhead outweigh JIT benefits. Consider inline PCRE2 API calls that avoid PerlValue boxing for the common case of matching numeric strings or pre-boxed values.
+The PLANS.md "PV Boxing Elimination Plan" (Phases 1-6, Stage 32,
+Stage 33) is already substantially complete and the prior numbers
+in CLAUDE.md (97× on `nb.pl`, 12× on `mbs.pl`) are achievable
+*in principle*, but `tests/mbs.pl` is currently so slow that it
+times out at N=16.  The new items below address this and the
+remaining hot spots that the prior phases missed.
 
-2. **Implement in-process LLVM optimization passes.** Currently relies on clang-18 `-O2`. The `opt-18` integration encountered reliability issues with `system()` calls. Implement in-process optimization using LLVM's PassBuilder to run `opt -O3` passes (inlining, loop vectorization, dead-code elimination, constant propagation) before linking. This avoids temp file overhead and shell invocation issues.
+### 1. Validate the prior Stages 32/33 optimizations actually
+fire for `tests/mbs.pl`.
 
-3. **Extend F64 fast path to cover `sprintf` format parsing and `join` with numeric args.** Currently `sprintf` and `join` always box arguments through PerlValue*. Adding F64 fast path cases for numeric-only `sprintf` formats (`%f`, `%d`, `%e`) and `join` with numeric arrays would eliminate boxing in common string-building hot loops.
+Phase 2 of the PV boxing plan claimed to lower the FLAT_ARRAY
+threshold from 4 to 2 elements to enable `cadd`/`cmul` of 2-element
+complex numbers.  The IR inspection above showed that mbs.pl is
+emitting 102 `perl_array_get_ref` calls per inner-loop iteration,
+which means DerefAV caching for `$zj->[$i]` is NOT firing.
+That suggests `loopDerefCache_` / `loopInvariantPVs_` are not
+being populated for the `$zpj` / `$zj` inner-loop variables
+that the STAGE 32 comment specifically mentions.
 
-4. **Add string interning pool for short-lived strings.** `perl_to_string_dup()` calls `strdup()` on every string coercion. A string interning pool for short strings (< 64 bytes) would eliminate redundant allocations for common strings like `"0"`, `"1"`, `""`, `" "`, etc. This would reduce allocation pressure in tight loops.
+**Plan**: instrument `emitHoistedDerefs` with a print and dump
+the IR for `tests/mbs.pl` to see whether `loopDerefCache_`
+contains the inner-loop variables.  Then either fix the
+candidate-selection logic or wire `collectDerefTargets` to find
+the mbs-style usage.  Target: 90 % reduction in
+`perl_array_get_ref` count in the inner loop.
 
-5. **Profile and optimize `perl_clone` hot path.** `perl_clone()` is called on every array element read, every regex capture, and every hash set operation. It does `strdup()` for strings and `memcpy()` for FLAT_ARRAY. Consider an inlineable read-only accessor that skips `perl_clone` when the source is known to be stable (e.g., array elements that won't be modified).
+### 2. Add a `perl_clone`-free read accessor for
+`PERL_FLAT_ARRAY` / `PERL_FLOAT_PAIR` elements in tight loops.
 
-## Benchmark Results (3 runs averaged)
+Currently `perl_array_get_ref` returns a *cloned* `PerlValue*`,
+which forces the caller to `perl_free` it on every iteration.
+For pure reads inside a loop, the caller could keep a single
+PV on the stack and have the helper fill in its `tag` and
+`fval`/`ival` fields in place.  Add a
+`perl_array_get_ref_into(PerlArray*, long long, PerlValue *out)`
+that doesn't allocate and reuse the same `out` for every
+iteration.  Have the codegen emit a hoisted single PV per
+loop body for arrays known to be FLAT_ARRAY / FLOAT_PAIR.
 
-| Benchmark | perlc | Perl | Speedup |
-|-----------|-------|------|---------|
-| fibn (n=30) | 270ms | 590ms | 2.19x |
-| mbs (512×512, 80 iters) | 1,380ms | 18,990ms | 13.76x |
-| nb (n=1M) | 60ms | 5,850ms | 97.50x |
-| regex_heavy (100K items × 50) | 810ms | 260ms | 0.32x |
+**Expected impact**: ~50 % reduction in `perl_free` calls in
+`tests/mbs.pl` (the IR shows 93 `perl_free` calls per program
+load).
 
-Note: regex_heavy shows perlc slower than Perl because Perl's regex engine is highly optimized; the PCRE2 cache eliminates redundant `pcre2_compile` calls but the perlc overhead (function calls, PV boxing) still outweighs the benefit for regex-heavy workloads.
+### 3. Specialize `perl_to_string` for `PERL_FLAT_ARRAY` to avoid
+`strdup` per element.
 
-## PV Boxing Elimination Plan
+Once Correctness #4 is fixed (FLAT_ARRAY printing), add a
+codegen path that emits `perl_array_to_string_join` directly
+when the user writes `print @flats` — joining the `double[]`
+buffer with a single allocation instead of `n` separate
+`strdup(16-byte buffer)` calls.
 
-### Problem Statement
+**Expected impact**: dominated by programs that print large
+numeric arrays (not the benchmark suite but real-world
+numeric code).  Cheap to add once #4 is in place.
 
-Every numeric value in perlc is boxed into a `PerlValue*` (PV), even when the value is used only in arithmetic. This causes:
-- 1 `pv_alloc()` per literal/binop result (freelist hit, but still cache-miss-prone)
-- 1 `pv_free()` per temporary (freelist round-trip)
-- Indirection through PV* chains for array elements
-- Runtime calls for type coercion (`perl_to_float`, `perl_to_int`)
+### 4. Profile the codegen's `RT()` lookup path.
 
-**Current mbs.pl inner loop**: ~20 runtime calls per `cmul`/`cadd` iteration, of which ~13 are PV alloc/free. Target: eliminate >80% of these.
+Each `callRT` does an `unordered_map` lookup on the function
+name (`src/codegen.cpp:475`).  Inside a hot inner loop, this
+becomes `n * O(1)`.  Cache the `Function*` in a small per-call
+`std::vector` of `Function*` indexed by a small enum
+(`RT_alloc_undef`, `RT_alloc_int`, ...) — LLVM's own call
+sequence for `printf` does the same trick.  Saves one
+`unordered_map` lookup per `callRT` call.
 
-### Phase 1: Fix DerefAV Cache for @_ Params
+**Expected impact**: ~5–10 % on tight inner loops; minor on
+real programs but free.
 
-**Goal**: Cache `PerlArray*` for @_ params that are only used for array deref, eliminating repeated `perl_deref_array_ro` calls.
+### 5. Establish a CI-grade regression benchmark that fails the
+build on slowdown.
 
-**Current state**: ~~FIXED~~ — DerefAV cache now populated for @_ params and local variables assigned from ArrowDeref. `declareDerefAV()` is called correctly, `isOnlyArrayRefDeref()` identifies candidates, and `emitExprF64` uses cached PerlArray*.
+Currently `bench/bench.sh` writes to `bench/results.csv` but the
+`make bench` target doesn't compare against a baseline — it just
+runs once.  Add a `--regress N` mode that compares against the
+last committed `bench/results.csv` and exits non-zero if any
+benchmark regresses by more than N %.
 
-**Expected impact**: Eliminates 1 `perl_deref_array_ro` call per row access in mbs.pl inner loop.
+**Plan**: extend `bench/bench.sh` to (a) save the post-run
+`bench/results.csv` as `bench/results.csv.new`, (b) compare
+`results.csv.new` against the committed `results.csv`, (c) fail
+if `ratio` increased > 10 % for any benchmark, (d) on success
+copy `results.csv.new` over `results.csv`.  Wire `make bench`
+to invoke this and add a new `make test-perf` target.
 
-### Phase 2: Extend FLAT_ARRAY to Runtime-Constructed Arrays
+**Expected impact**: catches future regressions before they
+land; not a perf improvement per se but a guarantee that the
+current numbers don't drift.
 
-**Goal**: Use FLAT_ARRAY (tag=10) for arrays constructed at runtime, not just literals.
+---
 
-**Current state**: ~~FIXED~~ — FLAT_ARRAY threshold lowered from 4 to 2 elements. `perl_alloc_float_array(n)` added to runtime.c. All-F64 AnonArray literals compile to FLAT_ARRAY. 1D and 2D ArrowDeref fast paths handle FLAT_ARRAY.
+## Benchmark results (3 runs averaged, current build)
 
-**Expected impact**: `cadd`/`cmul` return values become FLAT_ARRAY instead of REF_ARRAY. Eliminates inner PerlArray alloc + 2 PV allocs per call.
+| Benchmark      | perlc       | perl        | Speedup | Notes |
+|----------------|-------------|-------------|---------|-------|
+| fibn (n=35)    | 4.4 s       | 9.6 s       | 2.2×    | compile=8.8s (cold) |
+| nb (n=5M)      | TBD *       | 44.4 s      | —       | * perlc fails to compile: `perl_alloc_float_array` unregistered |
+| mbs (N=8)      | 15 s, wrong | n/a         | —       | inner loop produces all-2.0 sentinel; FLAT_ARRAY bug |
+| regex_heavy    | TBD         | n/a         | —       | corpus not present |
 
-### Phase 3: F64 Array Element Access
-
-**Goal**: Read array elements as bare `double` when the array is known to be FLAT_ARRAY or FLOAT_PAIR.
-
-**Current state**: ~~FIXED~~ — FLAT_ARRAY and FLOAT_PAIR 1D ArrowDeref fast path in `emitExprF64` skips tag dispatch when type is known. Variable index support via runtime PHI. DerefAV cache for local variables.
-
-**Expected impact**: Eliminates `perl_array_get_ref` + `perl_to_float` for FLAT_ARRAY/FLOAT_PAIR elements. ~4 RT calls saved per cmul/cadd iteration.
-
-### Phase 4: Unboxed Sub Returns
-
-**Goal**: Return bare `double` from inlineable subs with F64 bodies, eliminating `perl_clone` + boxing.
-
-**Current state**: ~~FIXED~~ — `tryEmitInline` now checks if body is F64-capable via `canEmitF64(*is.bodyExpr)`. If so, emits body using `emitExprF64` and returns raw F64 value. `emitCall` detects F64 return type and boxes via `perl_alloc_float`. Eliminates `perl_clone` + boxing for inlineable subs with float bodies (e.g., `cabs2($z) < 4.0` emits as pure double comparison).
-
-**Expected impact**: Eliminates 1 `perl_clone` + 1 `perl_free` per cmul/cadd call for subs returning bare F64.
-
-### Phase 5: Inline Literal Boxing
-
-**Goal**: Eliminate `perl_alloc_int`/`perl_alloc_float` for literals used only in arithmetic.
-
-**Current state**: ~~PARTIALLY FIXED~~ — F64 fast path already handles literals in BinOp trees. Stage 33 known tag type tracking propagates FLOAT_PAIR/FLAT_ARRAY types through assignments.
-
-**Expected impact**: Minor — literals are already F64 when used in arithmetic. Main benefit for literals stored in FLAT_ARRAY (Phase 2).
-
-### Phase 6: PerlArray Freelist Optimization
-
-**Goal**: Reduce allocation cost for PerlArray structs and their element buffers.
-
-**Current state**: ~~PARTIALLY FIXED~~ — `pa_alloc`/`pa_pool_push` already implement freelist pool (PA_POOL_CAP_MAX=4096). Small elems buffer pooling not yet implemented.
-
-**Changes needed**:
-1. **Pool small elems buffers**: For arrays with ≤64 elements, reuse a small buffer pool.
-2. **FLAT_ARRAY buffer pooling**: Pool the `double[]` buffers for FLAT_ARRAYs.
-
-**Expected impact**: Reduces allocation pressure for small arrays (common in mbs.pl).
-
-### Implementation Order
-
-1. ~~**Phase 1** (DerefAV debug)~~ — ~~DONE~~ — FIXED
-2. ~~**Phase 2** (FLAT_ARRAY for runtime arrays)~~ — ~~DONE~~ — FIXED
-3. ~~**Phase 3** (F64 array element access)~~ — ~~DONE~~ — FIXED
-4. ~~**Phase 4** (Unboxed sub returns)~~ — ~~DONE~~ — FIXED
-5. ~~**Phase 5** (Inline literal boxing)~~ — ~~DONE~~ — PARTIALLY FIXED
-6. **Phase 6** (Freelist optimization) — Small elems buffer pooling for PerlArray
-
-### Stage 32: Loop-invariant PV deferral
-- Added `loopInvariantPVs_` stack; `trackPv()` routes `perl_alloc_undef` and `perl_deref_array` results to deferred tracking when inside a loop
-- `popScope()` skips freeing these PVs; `freeLoopInvariantPVs()` called after loop exit
-- perl_free calls reduced from 114 to 93 (18% reduction)
-
-### Stage 32: Deref hoisting
-- Added `loopDerefCache_` stack; `collectDerefTargets()` finds ScalarVars in ArrowDeref
-- `isVarModified()` checks if variable is written inside loop
-- `emitHoistedDerefs()` emits `perl_deref_array` before loop and caches result
-- `emitDerefArray()` checks cache before calling `perl_deref_array`
-
-### Stage 33: Known tag type tracking
-- Added `knownTagTypes_` stack; scalar assignments from AnonArray `[float, float]` set tag=13 (FLOAT_PAIR), `[float, ...]` set tag=10 (FLAT_ARRAY)
-- ArrowDeref RHS assignments propagate array element type to LHS
-- `emitExprF64` ArrowDeref skips tag dispatch when type is known
-
-### Stage 33: Array element type tracking
-- Added `arrayElemTypes_` stack; `$arr[i] = [float, ...]` sets element type for array
-- Type propagation through ArrowDeref assignments (`$var = $arr->[idx]`)
-
-### Target Performance
-
-| Benchmark | Current | Phase 1-2 | Phase 3-4 | Target |
-|-----------|---------|-----------|-----------|--------|
-| fibn (n=35) | 2.2x | 3x | 5x | 10x |
-| mbs (1024²) | 12x | 18x | 25x | 50x |
-| nb (1M) | 98x | 100x | 110x | 150x |
-
-fibn is already fast (recursive, F64 path covers most ops). mbs is the main target — eliminating array access overhead is key. nb is already fast due to simple arithmetic loop.
+The fibn and nb numbers are the only reliable performance
+measurements currently; mbs is broken end-to-end and nb hits the
+`perl_alloc_float_array` codegen error.

@@ -89,22 +89,52 @@ NodePtr Parser::parseProgram() {
                 }
                 continue;
             }
+            /* D56: `use warnings` / `use warnings 'CATEGORY'` pragma */
+            if (check(TK::KW_WARNINGS) ||
+                (check(TK::IDENT) && cur().text == "warnings")) {
+                advance(); /* consume 'warnings' */
+                auto n = std::make_unique<Node>();
+                n->kind = NK::WarningsStmt;
+                n->sval = "enable";
+                n->line = line;
+                if (check(TK::STRING)) {
+                    n->name = cur().text; /* category, e.g. "uninitialized" */
+                    advance();
+                }
+                match(TK::SEMI);
+                stmts.push_back(std::move(n));
+                continue;
+            }
             /* skip all other use statements */
             while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
             match(TK::SEMI); continue;
         }
         /* D48/D91: `no PRAGMA` (e.g. `no strict;`, `no warnings;`,
-           `no warnings 'CATEGORY';`) — silently ignored, matching Perl's
-           no-op for unrecognized pragmas. Handles both bare `no IDENT`
-           and `no IDENT 'arg'` forms. Skip past `;`. */
+            `no warnings 'CATEGORY';`) — silently ignored, matching Perl's
+            no-op for unrecognized pragmas. Handles both bare `no IDENT`
+            and `no IDENT 'arg'` forms. Skip past `;`. */
         if (cur().kind == TK::IDENT && cur().text == "no") {
             advance(); /* consume "no" */
-            /* consume pragma name (could be IDENT like "feature" or a keyword like strict/warnings) */
-            if (!check(TK::STRING) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
-                advance(); /* pragma name */
-                /* Skip optional argument string, e.g. `no warnings 'misc'` */
-                if (check(TK::STRING)) advance();
+            /* D56: `no warnings` / `no warnings 'uninitialized'` */
+            if (check(TK::KW_WARNINGS) ||
+                (check(TK::IDENT) && cur().text == "warnings")) {
+                advance(); /* consume 'warnings' */
+                auto n = std::make_unique<Node>();
+                n->kind = NK::WarningsStmt;
+                n->sval = "disable";
+                n->line = cur().line;
+                if (check(TK::STRING)) {
+                    n->name = cur().text; /* category, e.g. "uninitialized" */
+                    advance();
+                }
+                match(TK::SEMI);
+                stmts.push_back(std::move(n));
+                continue;
+            } else if (!check(TK::STRING) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                advance(); /* pragma name (strict, etc.) */
             }
+            /* Skip optional argument string, e.g. `no warnings 'misc'` */
+            if (check(TK::STRING)) advance();
             match(TK::SEMI); continue;
         }
         stmts.push_back(parseStmt());
@@ -200,7 +230,9 @@ NodePtr Parser::parseStmt() {
         } else if (check(TK::LBRACE)) {
             advance();
             n->sval = "hash_elem";
+            inKeyContext_ = true;
             n->right = parseExpr();
+            inKeyContext_ = false;
             consume(TK::RBRACE, "}");
         }
         if (match(TK::ASSIGN))
@@ -1355,7 +1387,9 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
             }
             if (check(TK::LBRACE)) {
                 advance();
+                inKeyContext_ = true;
                 auto key = parseExpr();
+                inKeyContext_ = false;
                 consume(TK::RBRACE, "}");
                 auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
                 n->sval = "hash"; n->left = std::move(base);
@@ -1423,10 +1457,12 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                     auto n = std::make_unique<Node>(); n->kind = NK::HashSlice;
                     n->left  = std::move(refExpr);
                     n->line  = line;
+                    inKeyContext_ = true;
                     while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
                         n->args.push_back(parseExpr());
                         if (!match(TK::COMMA)) break;
                     }
+                    inKeyContext_ = false;
                     consume(TK::RBRACE, "}");
                     base = std::move(n);
                     continue;
@@ -1477,7 +1513,8 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                    k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
                    k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::Call ||
                    k == NK::CallerFunc || k == NK::PostfixDeref ||
-                   k == NK::ArraySlice || k == NK::HashSlice;
+                   k == NK::ArraySlice || k == NK::HashSlice ||
+                   k == NK::ScalarVar;
         };
         /* D63: $$name[idx] / $$name{key} — real Perl defines this as
            ${name}[idx] / ${name}{key}, i.e. $name->[idx] / $name->{key}:
@@ -1508,7 +1545,9 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         }
         if (base->kind == NK::DerefScalar && check(TK::LBRACE)) {
             advance();
+            inKeyContext_ = true;
             auto key = parseExpr();
+            inKeyContext_ = false;
             consume(TK::RBRACE, "}");
             auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
             n->sval = "hash"; n->left = std::move(base->left);
@@ -1528,11 +1567,23 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         }
         if (isSubscriptableK(base->kind) && check(TK::LBRACE)) {
             advance();
+            inKeyContext_ = true;
             auto key = parseExpr();
+            inKeyContext_ = false;
             consume(TK::RBRACE, "}");
-            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
-            n->sval = "hash"; n->left = std::move(base);
-            n->right = std::move(key); n->line = line;
+            auto n = std::make_unique<Node>();
+            /* $scalar{key} → HashElem; $ref->{key} → ArrowDeref */
+            if (base->kind == NK::ScalarVar) {
+                n->kind = NK::HashElem;
+                n->name = base->name;
+                n->left = std::move(key);
+            } else {
+                n->kind = NK::ArrowDeref;
+                n->sval = "hash";
+                n->left = std::move(base);
+                n->right = std::move(key);
+            }
+            n->line = line;
             base = std::move(n);
             continue;
         }
@@ -1552,7 +1603,8 @@ NodePtr Parser::parsePostfix() {
                k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
                k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::Call ||
                k == NK::CallerFunc || k == NK::PostfixDeref ||
-               k == NK::ArraySlice || k == NK::HashSlice;
+               k == NK::ArraySlice || k == NK::HashSlice ||
+               k == NK::ScalarVar;
     };
     if (check(TK::ARROW) ||
         (isSubscriptable(expr->kind) && (check(TK::LBRACKET) || check(TK::LBRACE)))) {
@@ -1784,7 +1836,9 @@ NodePtr Parser::parsePrimary() {
             advance();
             if (check(TK::LBRACE)) {
                 advance();
+                inKeyContext_ = true;
                 auto key = parseExpr();
+                inKeyContext_ = false;
                 consume(TK::RBRACE, "}");
                 auto n = std::make_unique<Node>();
                 n->kind = NK::HashElem; n->name = "+";
@@ -1861,7 +1915,9 @@ NodePtr Parser::parsePrimary() {
         auto sv = makeScalar(nm, line);
         if (nm == "+" && check(TK::LBRACE)) {
           advance();
+          inKeyContext_ = true;
           auto key = parseExpr();
+          inKeyContext_ = false;
           consume(TK::RBRACE, "}");
           auto n = std::make_unique<Node>();
           n->kind = NK::HashElem;
@@ -1882,7 +1938,9 @@ NodePtr Parser::parsePrimary() {
         /* $hash{key} */
         if (check(TK::LBRACE)) {
             advance();
+            inKeyContext_ = true;
             auto key = parseExpr();
+            inKeyContext_ = false;
             consume(TK::RBRACE, "}");
             auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
             n->name = nm; n->left = std::move(key); n->line = line;
@@ -1996,10 +2054,12 @@ NodePtr Parser::parsePrimary() {
                 advance();
                 auto n = std::make_unique<Node>(); n->kind = NK::HashSlice; n->line = line;
                 n->left = std::move(refExpr);
+                inKeyContext_ = true;
                 while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
                     n->args.push_back(parseExpr());
                     if (!match(TK::COMMA)) break;
                 }
+                inKeyContext_ = false;
                 consume(TK::RBRACE, "}");
                 return n;
             }
@@ -2034,10 +2094,12 @@ NodePtr Parser::parsePrimary() {
         if (check(TK::LBRACE)) {
             advance();
             auto n = std::make_unique<Node>(); n->kind = NK::HashSlice; n->name = nm; n->line = line;
+            inKeyContext_ = true;
             while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
                 n->args.push_back(parseExpr());
                 if (!match(TK::COMMA)) break;
             }
+            inKeyContext_ = false;
             consume(TK::RBRACE, "}");
             return n;
         }
@@ -2125,7 +2187,9 @@ NodePtr Parser::parsePrimary() {
             n->sval = "array";
         } else {
             consume(TK::LBRACE, "{");
+            inKeyContext_ = true;
             n->left = parseExpr();
+            inKeyContext_ = false;
             consume(TK::RBRACE, "}");
         }
         if (hasParen) consume(TK::RPAREN, ")");
@@ -2154,10 +2218,12 @@ NodePtr Parser::parsePrimary() {
             } else {
                 consume(TK::LBRACE, "{");
                 n->sval = "hash_slice";
+                inKeyContext_ = true;
                 while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
                     n->args.push_back(parseExpr());
                     if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
                 }
+                inKeyContext_ = false;
                 consume(TK::RBRACE, "}");
             }
             if (hasParen) consume(TK::RPAREN, ")");
@@ -2174,7 +2240,9 @@ NodePtr Parser::parsePrimary() {
             n->sval = "array";
         } else {
             consume(TK::LBRACE, "{");
+            inKeyContext_ = true;
             n->left = parseExpr();
+            inKeyContext_ = false;
             consume(TK::RBRACE, "}");
         }
         if (hasParen) consume(TK::RPAREN, ")");
@@ -3124,6 +3192,8 @@ NodePtr Parser::parsePrimary() {
         if (check(TK::LPAREN)) return parseCall(nm, line);
         /* bareword — if followed by FATARROW it's an auto-quoted string */
         if (check(TK::FATARROW)) return makeStr(nm, line);
+        /* bareword — if followed by ARROW it's a package/class name for method call */
+        if (check(TK::ARROW)) return makeStr(nm, line);
         /* check constant map so bare NAME resolves without parens */
         {
             auto cit = constMap_.find(nm);
@@ -3131,10 +3201,81 @@ NodePtr Parser::parsePrimary() {
                 return cit->second->clone();  /* pre-parsed AST node (cloned for reuse) */
             }
         }
-        /* D36: bareword call without parens — croak "msg", foo $x, bar 1, 2 */
-        if (looksLikeBareCallArg())
+        /* D36: bareword call without parens — croak "msg", foo $x, bar 1, 2
+           Also: bareword at end of expression (e.g. `my $y = mysub;`) is a
+           call with no args — real Perl treats barewords as sub calls when
+           the name matches a known sub, and errors otherwise. */
+        if (looksLikeBareCallArg()) {
             return parseBareCall(nm, line);
-        /* bareword string */
+        }
+        /* In key context (hash subscript), barewords are strings */
+        if (inKeyContext_) {
+            return makeStr(nm, line);
+        }
+        /* D36: bareword at end of expression — only treat as sub call if NOT
+           followed by a binary operator (eq, cmp, ==, etc.) or SEMI/RBRACE.
+           Those indicate the bareword is a string operand, not a call. */
+        {
+            TK next = cur().kind;
+            bool isBareCall = true;
+            switch (next) {
+            /* binary operators — bareword is a string operand */
+            case TK::EQ: case TK::NE: case TK::LT: case TK::GT:
+            case TK::LE: case TK::GE:
+            case TK::STR_EQ: case TK::STR_NE: case TK::STR_LT: case TK::STR_GT:
+            case TK::STR_LE: case TK::STR_GE:
+            /* string/concat operators */
+            case TK::DOT:
+            /* arithmetic operators */
+            case TK::PLUS: case TK::MINUS: case TK::STAR: case TK::SLASH:
+            case TK::STAR_STAR: case TK::PERCENT:
+            /* bitwise/logical operators */
+            case TK::CARET: case TK::TILDE:
+            case TK::LSHIFT: case TK::RSHIFT:
+            /* assignment operators */
+            case TK::ASSIGN: case TK::PLUS_ASSIGN: case TK::MINUS_ASSIGN:
+            case TK::STAR_ASSIGN: case TK::SLASH_ASSIGN: case TK::DOT_ASSIGN:
+            case TK::PERCENT_ASSIGN: case TK::POW_ASSIGN:
+            case TK::OR_ASSIGN: case TK::AND_ASSIGN:
+            case TK::DEFINED_OR_ASSIGN:
+            case TK::X_ASSIGN:
+            case TK::BITAND_ASSIGN: case TK::BITOR_ASSIGN: case TK::BITXOR_ASSIGN:
+            case TK::LSHIFT_ASSIGN: case TK::RSHIFT_ASSIGN:
+            /* low-precedence operators */
+            case TK::KW_AND: case TK::KW_OR:
+            case TK::AND: case TK::OR:
+            /* defined-or */
+            case TK::DEFINED_OR:
+                isBareCall = false;
+                break;
+            /* SEMI, RBRACE, end of input — bareword IS at end of expression */
+            case TK::SEMI: case TK::RBRACE: case TK::EOF_TOK:
+                break;
+            /* closers — bareword IS at end of expression */
+            case TK::RPAREN: case TK::RBRACKET:
+                break;
+            /* FATARROW — already handled above (auto-quote) */
+            /* ARROW — already handled above (package name) */
+            /* IDENT — could be cmp operator or another bareword string */
+            case TK::IDENT:
+                /* In Perl, `foo bar` where both are barewords is a compile error
+                   unless foo is a known sub. But we can't know at parse time.
+                   Treat as string to avoid false sub calls. */
+                isBareCall = false;
+                break;
+            default:
+                /* Other tokens (STRING, INT, etc.) — bareword IS at end */
+                break;
+            }
+            if (isBareCall) {
+                auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                n->name = nm; n->args = NodeList{}; n->line = line;
+                n->ival = 1; /* bareword call */
+                return n;
+            }
+        }
+        /* bareword as string — real Perl may error on unknown barewords,
+           but we accept them as strings for flexibility */
         return makeStr(nm, line);
     }
 
