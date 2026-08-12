@@ -29,17 +29,56 @@ typedef enum {
 /* PV_FLAG_SHARED: cell is a threads::shared variable (see SharedMutex below). */
 #define PV_FLAG_SHARED 1u
 
+/* D62: closure-capture reference counting, packed into spare `flags` bits
+   (no PerlValue struct growth — see the size/alignment note on `flags`
+   below). A PV captured by a closure/sort-comparator is no longer cloned;
+   instead its capture count is bumped, and perl_free() defers the real
+   free until every capturing closure AND the declaring scope have both
+   released their share. PV_FLAG_CAPTURE_RELEASED records that the
+   declaring scope's own perl_free() call already happened while captures
+   were still outstanding, so the capture-side release that brings the
+   count to 0 knows it's safe to actually free. See perl_array_push_capture/
+   perl_free/perl_release_capture/perl_closure_release in runtime.c. */
+#define PV_FLAG_CAPTURE_RELEASED  2u
+#define PV_CAPTURE_SHIFT          2
+#define PV_CAPTURE_BITS           20
+#define PV_CAPTURE_MASK   (((1u << PV_CAPTURE_BITS) - 1) << PV_CAPTURE_SHIFT)
+#define PV_CAPTURE_MAX     ((1u << PV_CAPTURE_BITS) - 1)   /* pin-forever sentinel on overflow */
+/* D90: string holds Unicode characters (UTF-8 encoded). length()/substr
+   count code points when set; otherwise they count raw bytes (binary /
+   pack output, byte strings). Bits 0-21 used by shared/capture above. */
+#define PV_FLAG_UTF8              (1u << 22)
+
 typedef struct PerlValue {
     PerlTag      tag;
     unsigned int flags;       /* PV_FLAG_SHARED etc.; fits existing padding slot */
     union {
         long long ival;
         double    fval;
-        char     *sval;   /* heap-allocated, NUL-terminated */
+        char     *sval;   /* heap-allocated; NUL-terminated for legacy/strlen()-
+                              based consumers, but may contain embedded NUL
+                              bytes before that terminator — `slen` below is
+                              the authoritative byte length (see D85). */
         void     *pval;   /* for reference types */
     };
     long long matchpos;      /* current /g match offset; 0 = start of string */
     char     *blessed_class; /* NULL unless bless'd */
+    /* D85: PerlValue previously had no explicit length field, so any string
+       containing an embedded NUL byte (e.g. pack("N", 1234567), a common
+       4-byte network-order pack) was silently truncated wherever the
+       runtime derived a string's length via strlen() instead of tracking
+       it explicitly — which was nearly everywhere. `slen` is the
+       authoritative byte length of `sval` for PERL_STRING-tagged values
+       (meaningless for other tags); `sval[slen]` is still always a NUL
+       terminator for backward compatibility with any remaining
+       strlen()-based consumer, but bytes *before* that position may
+       legitimately include 0x00. `_pad_reserved` exists solely to keep
+       sizeof(PerlValue) a multiple of 16 — the lock-free 16-byte CAS
+       (cmpxchg16b/ldxp+stxp, see perl_atomic_* and PerlValueAtomic16)
+       requires every slab-allocated PerlValue to stay 16-byte aligned,
+       which only holds if the struct's own size is a 16-byte multiple. */
+    long long slen;
+    long long _pad_reserved;
 } PerlValue;
 
 /* PV_FLAG_SHARED: variable is a threads::shared variable.  With the new
@@ -62,6 +101,8 @@ PerlValue *perl_alloc_int(long long v);
 PerlValue *perl_alloc_float(double v);
 
 PerlValue *perl_alloc_string(const char *s);
+PerlValue *perl_alloc_string_len(const char *s, long long len); /* D85: NUL-safe — s may contain embedded NUL bytes within the first len */
+char      *perl_to_string_dup_len(const PerlValue *v, long long *out_len); /* D85: NUL-safe perl_to_string_dup, also reports true byte length */
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_alloc_float_array(long long n); /* alloc FLAT_ARRAY with n zero doubles */
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
@@ -109,6 +150,8 @@ PerlValue *perl_sub(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mul(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_div(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b);
+/* D84: i64 fast-path modulo with eval-catchable zero-divisor check */
+long long perl_mod_i64(long long a, long long b);
 PerlValue *perl_pow(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_negate(const PerlValue *a);
 PerlValue *perl_bitand(const PerlValue *a, const PerlValue *b);
@@ -161,13 +204,10 @@ typedef struct PerlArray {
     pthread_mutex_t *mu;       /* non-NULL when declared : shared */
 } PerlArray;
 
-/* list-context return helpers for wantarray.
-   Each helper knows the Perl-level semantics of a particular list-producing
-   operation so it can return the correct value in scalar context. */
-PerlValue *perl_array_to_list_return(PerlArray *av);   /* generic: last elem in scalar ctx */
-PerlValue *perl_grep_list_return(PerlArray *av);       /* scalar ctx: count of matching elems */
-PerlValue *perl_map_list_return(PerlArray *av);        /* scalar ctx: last elem (matches Perl) */
-PerlValue *perl_sort_list_return(PerlArray *av);       /* scalar ctx: undef */
+/* list-context return helpers for wantarray */
+PerlValue *perl_array_to_list_return(PerlArray *av); /* list ctx→LIST_RESULT; scalar→last elem */
+PerlValue *perl_array_to_count_or_list(PerlArray *av); /* map/grep: list→LIST_RESULT; scalar→count */
+PerlValue *perl_array_to_sort_return(PerlArray *av);   /* sort: list→LIST_RESULT; scalar→undef */
 PerlArray *perl_unwrap_list_return(PerlValue *pv);   /* caller side: extract array from return */
 
 PerlArray *perl_array_new(void);
@@ -184,6 +224,11 @@ PerlValue *perl_array_pop(PerlArray *a);
 PerlValue *perl_array_get(PerlArray *a, long long idx);
 PerlValue *perl_array_get_ref(PerlArray *a, long long idx); /* borrow: no clone, never free result */
 void       perl_array_set(PerlArray *a, long long idx, PerlValue *v);
+/* D81: delete $a[i] / element of delete @a[...] — returns prior value,
+   sets slot to undef, then trims trailing undefs (Perl's delete-on-array). */
+PerlValue *perl_array_delete(PerlArray *a, long long idx);
+/* D41: writable slot for $a[i], extending with undef if needed (local lvalue). */
+PerlValue *perl_array_lvalue(PerlArray *a, long long idx);
 PerlValue *perl_array_len(PerlArray *a);
 double perl_array_len_f64(PerlArray *a);
 void perl_array_clear(PerlArray *a);
@@ -191,6 +236,7 @@ void perl_array_replace(PerlArray *dst, PerlArray *src);
 PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n);
 void       perl_array_sort_str(PerlArray *a);
 void       perl_array_extend(PerlArray *dst, PerlArray *src);
+void       perl_array_extend_from(PerlArray *dst, PerlArray *src, long long start); /* dst += src[start..] */
 PerlValue *perl_array_shift(PerlArray *a);
 void       perl_array_unshift(PerlArray *a, PerlValue *v);
 void       perl_print_array(PerlArray *a); /* print all elements with $, between them */
@@ -199,6 +245,7 @@ void       perl_print_array(PerlArray *a); /* print all elements with $, between
 long long  perl_chomp(PerlValue *v);       /* remove trailing \n in-place, returns removed count */
 long long  perl_chomp_array(PerlArray *a); /* chomp every element; returns total removed count */
 PerlValue *perl_chop(PerlValue *v);        /* remove and return last character */
+PerlValue *perl_chop_array(PerlArray *a);  /* chop every element; returns last removed char */
 PerlValue *perl_length(PerlValue *v);
 PerlValue *perl_substr2(PerlValue *str, PerlValue *off);
 void perl_substr_replace(PerlValue *str, PerlValue *off, PerlValue *len, PerlValue *repl);
@@ -274,9 +321,14 @@ PerlArray *perl_splice(PerlArray *arr, PerlValue *off_pv, PerlValue *len_pv, Per
 /* ── environment / system ───────────────────────────────────────────────── */
 PerlValue *perl_env_get(PerlValue *key);
 void       perl_env_set(PerlValue *key, PerlValue *val);
-void       perl_warn(PerlValue *msg);
+/* D49: warn with optional file/line (for " at FILE line N." + $SIG{__WARN__}) */
+void       perl_warn(PerlValue *msg, const char *filename, int line);
+/* D49: process-wide %SIG hash ($SIG{__WARN__}, $SIG{__DIE__}, …) */
+PerlHash  *perl_get_sig_hash(void);
 PerlValue *perl_system(PerlValue *cmd);
 PerlValue *perl_backtick(PerlValue *cmd);
+/* D70: syscall() builtin */
+PerlValue *perl_syscall(PerlValue *args);
 
 /* ── command-line arguments ─────────────────────────────────────────────── */
 PerlArray *perl_init_argv(int argc, char **argv); /* call at program start; sets $0, returns @ARGV */
@@ -298,7 +350,7 @@ void       perl_print_fh(PerlValue *fh, PerlValue *v);
 void       perl_say_fh(PerlValue *fh, PerlValue *v);
 void       perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args);
 PerlValue *perl_eof_fh(PerlValue *fh);
-void       perl_die(PerlValue *msg);
+void       perl_die(PerlValue *msg, const char *filename, int line);
 PerlValue *perl_unlink_files(PerlArray *files);
 PerlValue *perl_get_stdin(void);    /* returns stable STDIN PerlValue*  */
 PerlValue *perl_get_stderr(void);   /* returns stable STDERR PerlValue* */
@@ -350,6 +402,12 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
 PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags);
 PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char *flags);
 long long  perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags);
+/* D38c: s///e — eval_fn is called once per match with $1/$& already set;
+   returns a PerlValue* whose stringification becomes the replacement.
+   captures may be NULL (no outer lexical capture). */
+typedef PerlValue *(*PerlSubstEvalFn)(void);
+long long  perl_regex_subst_e(PerlValue *str, const char *pattern, const char *flags,
+                              PerlSubstEvalFn eval_fn, PerlArray *captures);
 PerlValue *perl_capture(long long n);
 PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str);
 
@@ -369,8 +427,11 @@ typedef PerlValue *(*PerlSubFnCtx)(PerlArray *, int ctx);
 /* PerlClosure is the heap object stored in PERL_CODE_REF pval */
 typedef struct PerlClosure {
     PerlSubFnCtx   fn;
-    PerlValue **captures;  /* borrowed PerlValue* — not owned */
+    PerlValue **captures;  /* D62: refcounted PerlValue* — see PV_CAPTURE_MASK */
     int         ncaptures;
+    int         refcount;  /* # of live PerlValue wrappers whose pval points
+                               here (mirrors PerlArray/PerlHash's refcount
+                               pattern); always >=1 while reachable */
 } PerlClosure;
 
 PerlValue *perl_make_code_ref(PerlSubFnCtx fp);                     /* no captures */
@@ -382,6 +443,7 @@ PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a cl
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
 void       perl_register_method(const char *key, PerlSubFnCtx fn);
 PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx);
+PerlValue *perl_get_or_create_global_scalar(const char *key); /* D58: process-wide package-scalar registry for --do-lib builds */
 /* ── threads ─────────────────────────────────────────────────────────────── */
 #include <pthread.h>
 typedef struct PerlThread {
@@ -473,15 +535,27 @@ PerlArray *perl_gmtime_val(PerlValue *t);       /* gmtime — 9-element list */
 PerlValue *perl_sleep_val(PerlValue *secs);     /* sleep — returns actual secs slept */
 PerlValue *perl_alarm_val(PerlValue *secs);     /* alarm — returns prev alarm value */
 
+/* ── Time::HiRes (D30, built-in) ──────────────────────────────────────────── */
+PerlValue *perl_hires_time(void);                       /* time() — fractional epoch seconds */
+PerlArray *perl_hires_gettimeofday_list(void);           /* list ctx: (sec, usec) */
+PerlValue *perl_hires_gettimeofday_scalar(void);         /* scalar ctx: fractional seconds */
+PerlValue *perl_hires_sleep(PerlValue *secs);            /* fractional seconds; returns actual secs slept */
+PerlValue *perl_hires_usleep(PerlValue *usecs);          /* microseconds; returns actual usecs slept */
+PerlValue *perl_hires_tv_interval(PerlValue *t0ref, PerlValue *t1ref); /* elapsed seconds between two gettimeofday refs */
+
 /* ── List::Util ───────────────────────────────────────────────────────────── */
 PerlValue *perl_sum_list(PerlArray *a);         /* sum LIST — undef if empty */
 PerlValue *perl_min_list(PerlArray *a);         /* min LIST — undef if empty */
 PerlValue *perl_max_list(PerlArray *a);         /* max LIST — undef if empty */
-PerlArray *perl_uniq_list(PerlArray *a);        /* uniq LIST — remove consecutive dups */
+PerlArray *perl_uniq_list(PerlArray *a);        /* uniq LIST — keeps first occurrence of each distinct value, anywhere in the list (D69: NOT consecutive-only, that was the bug) */
 
 /* ── sort with custom comparator ─────────────────────────────────────────── */
 typedef long long (*PerlSortCmpFn)(PerlValue *, PerlValue *);
-PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp); /* sort copy of a */
+/* captures: outer-scope variables the comparator body closes over (D61),
+   installed via the same s_current_captures/perl_get_capture mechanism a
+   closure's body already uses — may be NULL/empty for a comparator that
+   captures nothing. */
+PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures); /* sort copy of a */
 
 /* ── directory I/O ───────────────────────────────────────────────────────── */
 PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path);
@@ -536,6 +610,7 @@ void perl_set_pos_str(PerlValue *pv, PerlValue *pos);
 /* ── runtime require ─────────────────────────────────────────────────────── */
 PerlValue *perl_runtime_require(const char *modname);
 PerlValue *perl_do_file(PerlValue *path_pv);
+void       perl_do_lib_cleanup(void);  /* D24: dlclose() do'd shared libraries */
 
 /* ── XS / FFI ────────────────────────────────────────────────────────────── */
 PerlValue *perl_xs_load_library(PerlValue *libname_pv);
@@ -576,12 +651,12 @@ PerlValue *perl_dbi_error(PerlValue *dbh);
 /* ── program cleanup (free shared-mutex side-table, named-captures hash, etc.) */
 void perl_cleanup(void);
 
-/* ── string eval hook ────────────────────────────────────────────────────── */
-/* Set by eval_jit.cpp (linked only when program uses eval EXPR).
-   NULL → perl_eval_string sets $@ and returns undef. */
-typedef PerlValue *(*PerlEvalStringFn)(const char *code);
-extern PerlEvalStringFn perl_eval_string_fn;
-PerlValue *perl_eval_string(PerlValue *code_pv);  /* called from JIT'd code */
+/* ── string eval removed (no JIT) ────────────────────────────────────────── */
+/* perl_eval_string sets $@ and returns undef. No runtime compilation. */
+PerlValue *perl_eval_string(PerlValue *code_pv);
+
+/* Note: runtime require/do of dynamic files now also set $@ + return undef.
+   Compile-time 'use' and static 'require' are still inlined by the driver. */
 
 #ifdef __cplusplus
 }
