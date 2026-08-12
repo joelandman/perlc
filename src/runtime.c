@@ -5880,13 +5880,38 @@ PerlValue *perl_syscall(PerlValue *args) {
     long long syscall_num = perl_to_int(arg_array->elems[0]);
     
     /* Handle up to 6 arguments (standard syscall convention) */
-    long long arg1 = 0, arg2 = 0, arg3 = 0, arg4 = 0, arg5 = 0, arg6 = 0;
-    if (arg_array->len > 1) arg1 = perl_to_int(arg_array->elems[1]);
-    if (arg_array->len > 2) arg2 = perl_to_int(arg_array->elems[2]);
-    if (arg_array->len > 3) arg3 = perl_to_int(arg_array->elems[3]);
-    if (arg_array->len > 4) arg4 = perl_to_int(arg_array->elems[4]);
-    if (arg_array->len > 5) arg5 = perl_to_int(arg_array->elems[5]);
-    if (arg_array->len > 6) arg6 = perl_to_int(arg_array->elems[6]);
+    /* Use uintptr_t to properly handle pointer arguments */
+    uintptr_t arg1 = 0, arg2 = 0, arg3 = 0, arg4 = 0, arg5 = 0, arg6 = 0;
+    if (arg_array->len > 1) {
+        PerlValue *v = arg_array->elems[1];
+        if (v->tag == PERL_STRING && v->sval) arg1 = (uintptr_t)v->sval;
+        else arg1 = (uintptr_t)perl_to_int(v);
+    }
+    if (arg_array->len > 2) {
+        PerlValue *v = arg_array->elems[2];
+        if (v->tag == PERL_STRING && v->sval) arg2 = (uintptr_t)v->sval;
+        else arg2 = (uintptr_t)perl_to_int(v);
+    }
+    if (arg_array->len > 3) {
+        PerlValue *v = arg_array->elems[3];
+        if (v->tag == PERL_STRING && v->sval) arg3 = (uintptr_t)v->sval;
+        else arg3 = (uintptr_t)perl_to_int(v);
+    }
+    if (arg_array->len > 4) {
+        PerlValue *v = arg_array->elems[4];
+        if (v->tag == PERL_STRING && v->sval) arg4 = (uintptr_t)v->sval;
+        else arg4 = (uintptr_t)perl_to_int(v);
+    }
+    if (arg_array->len > 5) {
+        PerlValue *v = arg_array->elems[5];
+        if (v->tag == PERL_STRING && v->sval) arg5 = (uintptr_t)v->sval;
+        else arg5 = (uintptr_t)perl_to_int(v);
+    }
+    if (arg_array->len > 6) {
+        PerlValue *v = arg_array->elems[6];
+        if (v->tag == PERL_STRING && v->sval) arg6 = (uintptr_t)v->sval;
+        else arg6 = (uintptr_t)perl_to_int(v);
+    }
     
     /* Call the actual syscall */
     long long result;
