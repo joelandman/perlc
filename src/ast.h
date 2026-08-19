@@ -160,6 +160,9 @@ enum class NK {
     UnpackFunc,   /* unpack FORMAT, string  – sval=format, left=string expr         */
     /* D56: warnings pragma */
     WarningsStmt, /* use warnings / no warnings – sval="enable" or "disable", name="uninitialized" or "" */
+    /* D97: use overload — args = flat list of (op_str, method_name) pairs;
+       name = current package (where the overload is being declared) */
+    OverloadStmt,
 };
 
 struct Node;

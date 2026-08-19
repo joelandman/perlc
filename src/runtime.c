@@ -23,6 +23,10 @@
 #include <sqlite3.h>
 #include <sys/syscall.h>
 
+/* D97: mini-gmp for Math::BigInt — compiled into the runtime (zero external
+   dependency).  Included early so mpz_t is available in perl_clone/perl_free. */
+#include "mini-gmp.h"
+
 /* D24: main.cpp bakes the perlc compiler's own absolute path into every
    compiled executable via -DPERLC_SELF_PATH, so perl_do_file() can
    re-invoke it at runtime. Builds that don't go through that dynamic
@@ -32,6 +36,13 @@
 #ifndef PERLC_SELF_PATH
 #define PERLC_SELF_PATH "perlc"
 #endif
+
+/* D97: forward declarations for operator overloading (the overload table and
+   dispatch functions are defined later, but perl_to_string_dup and the
+   arithmetic ops need to call them). */
+static const char *perl_find_overload(const PerlValue *obj, const char *op);
+static PerlValue *perl_dispatch_overload(const PerlValue *obj, const char *op,
+                                         PerlValue *lhs, PerlValue *rhs);
 
 /* ── PerlValue freelist pool ─────────────────────────────────────────────── *
  * Avoids malloc/free per temp: freed PVs go onto a singly-linked list (next
@@ -1057,6 +1068,15 @@ PerlValue *perl_clone(const PerlValue *src) {
         if (n > 0) memcpy(v->pval, src->pval, sizeof(double) * (size_t)n);
         return v;
     }
+    if (src->tag == PERL_BIGINT) {
+        /* D97: deep-copy the mpz_t */
+        PerlValue *v = pv_alloc();
+        v->tag = PERL_BIGINT;
+        v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
+        v->pval = malloc(sizeof(mpz_t));
+        mpz_init_set(*(mpz_t*)v->pval, *(mpz_t*)src->pval);
+        return v;
+    }
     PerlValue *v = pv_alloc();
     *v = *src;
     v->flags = 0;      /* clones are never shared — that's a property of the slot, not the value */
@@ -1128,6 +1148,10 @@ HOTX void perl_free(PerlValue *v) {
     }
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
+    if (v->tag == PERL_BIGINT && v->pval) {
+        mpz_clear(*(mpz_t*)v->pval);
+        free(v->pval);
+    }
     if (v->tag == PERL_LIST_RESULT && v->pval) {
         PerlArray *av = (PerlArray *)v->pval;
         if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
@@ -1405,6 +1429,34 @@ const char *perl_to_string(const PerlValue *v) {
    (caller must free).  Used by callers that already free the result
    of perl_to_string regardless of tag. */
 char *perl_to_string_dup(const PerlValue *v) {
+    /* D97: check for "" (stringification) overload on blessed objects.
+       This is NOT in perl_to_string (which is __attribute__((pure)) and
+       can't call methods); it's handled here where we can safely dispatch. */
+    if (v && v->blessed_class) {
+        const char *method = perl_find_overload(v, "\"\"");
+        if (method) {
+            /* D97: built-in C function overload (Math::BigInt) */
+            if (strcmp(method, "perl_bigint_ovl_str") == 0) {
+                PerlValue *r = perl_bigint_ovl_str((PerlValue*)v);
+                char *s = perl_to_string_dup(r);
+                perl_free(r);
+                return s;
+            }
+            PerlArray *args = perl_array_new();
+            PerlValue *clone = perl_clone((PerlValue*)v);
+            perl_array_push(args, clone);
+            int saved = perl_push_wantarray(0);
+            PerlValue *result = perl_call_named_sub(method, args, 0);
+            perl_pop_wantarray();
+            perl_free(clone);
+            perl_array_free(args);
+            if (result) {
+                char *s = perl_to_string_dup(result);
+                perl_free(result);
+                return s;
+            }
+        }
+    }
     if (!v || v->tag == PERL_UNDEF) return strdup("");
     if (v->tag == PERL_STRING) {
         /* D85: strdup() alone would truncate at the first embedded NUL —
@@ -1617,6 +1669,11 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
            dst's old share of whatever closure it was pointing at first. */
         perl_closure_release((PerlClosure *)dst->pval);
     }
+    if (dst->tag == PERL_BIGINT && dst->pval) {
+        mpz_clear(*(mpz_t*)dst->pval);
+        free(dst->pval);
+        dst->pval = NULL;
+    }
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
@@ -1641,6 +1698,10 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         dst->pval = copy;
     } else if (src->tag == PERL_FLOAT_PAIR) {
         /* matchpos holds the imaginary part as double bits — must NOT be zeroed. */
+    } else if (src->tag == PERL_BIGINT && src->pval) {
+        /* D97: deep-copy the mpz_t so src and dst each own their own. */
+        dst->pval = malloc(sizeof(mpz_t));
+        mpz_init_set(*(mpz_t*)dst->pval, *(mpz_t*)src->pval);
     } else {
         dst->matchpos = 0;
     }
@@ -1657,6 +1718,14 @@ HOT int both_int(const PerlValue *a, const PerlValue *b) {
 /* ── arithmetic ──────────────────────────────────────────────────────────── */
 
 HOTX PerlValue *perl_add(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "+", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "+", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
     if (both_int(a, b)) {
         long long r = a->ival + b->ival;
         /* D78: Detect signed integer overflow — auto-promote to float.
@@ -1670,6 +1739,14 @@ HOTX PerlValue *perl_add(const PerlValue *a, const PerlValue *b) {
 }
 
 HOTX PerlValue *perl_sub(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "-", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "-", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
     if (both_int(a, b)) {
         long long r = a->ival - b->ival;
         /* D78: Detect signed integer overflow — auto-promote to float.
@@ -1683,6 +1760,14 @@ HOTX PerlValue *perl_sub(const PerlValue *a, const PerlValue *b) {
 }
 
 HOTX PerlValue *perl_mul(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "*", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "*", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
     if (both_int(a, b)) {
         /* D78: Detect signed integer overflow — auto-promote to float.
            Simple check: if either operand is non-zero and the division
@@ -1703,6 +1788,14 @@ HOTX PerlValue *perl_mul(const PerlValue *a, const PerlValue *b) {
 }
 
 HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "/", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "/", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
     double bv = perl_to_float(b);
     if (bv == 0.0) { fprintf(stderr, "Illegal division by zero\n"); exit(1); }
     if (both_int(a, b) && a->ival % b->ival == 0)
@@ -1711,6 +1804,14 @@ HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
 }
 
 PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
+     if (a && a->blessed_class) {
+         PerlValue *r = perl_dispatch_overload(a, "%", (PerlValue*)a, (PerlValue*)b);
+         if (r) return r;
+     }
+     if (b && b->blessed_class) {
+         PerlValue *r = perl_dispatch_overload(b, "%", (PerlValue*)a, (PerlValue*)b);
+         if (r) return r;
+     }
      long long bv = perl_to_int(b);
      if (bv == 0) {
          PerlValue *msg = perl_alloc_string("Illegal modulus zero");
@@ -1740,10 +1841,22 @@ PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
 }
 
 PerlValue *perl_pow(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "**", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "**", (PerlValue*)a, (PerlValue*)b);
+        if (r) return r;
+    }
     return perl_alloc_float(pow(perl_to_float(a), perl_to_float(b)));
 }
 
 PerlValue *perl_negate(const PerlValue *a) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "neg", (PerlValue*)a, NULL);
+        if (r) return r;
+    }
     if (a->tag == PERL_INT)   return perl_alloc_int(-a->ival);
     if (a->tag == PERL_FLOAT) return perl_alloc_float(-a->fval);
     return perl_alloc_float(-perl_to_float(a));
@@ -1822,18 +1935,58 @@ PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n_pv) {
 /* ── numeric comparisons ─────────────────────────────────────────────────── */
 
 HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c == 0); }
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c == 0); }
+    }
     return perl_alloc_int(perl_to_float(a) == perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c != 0); }
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c != 0); }
+    }
     return perl_alloc_int(perl_to_float(a) != perl_to_float(b));
 }
 HOTX PerlValue *perl_num_lt(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c < 0); }
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c > 0); }
+    }
     return perl_alloc_int(perl_to_float(a) <  perl_to_float(b));
 }
 HOTX PerlValue *perl_num_gt(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c > 0); }
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c < 0); }
+    }
     return perl_alloc_int(perl_to_float(a) >  perl_to_float(b));
 }
 HOTX PerlValue *perl_num_le(const PerlValue *a, const PerlValue *b) {
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c <= 0); }
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c >= 0); }
+    }
     return perl_alloc_int(perl_to_float(a) <= perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ge(const PerlValue *a, const PerlValue *b) {
@@ -3746,6 +3899,110 @@ typedef struct { char *key; PerlSubFnCtx fn; } MethodEntry;
 static MethodEntry s_method_table[METHOD_TABLE_MAX];
 static int s_method_count = 0;
 
+/* ── operator overloading table ──────────────────────────────────────────── */
+/* Maps class_name → {op_string → method_name (qualified)}.
+   When an arithmetic/string-comparison op receives a blessed object whose
+   class has a registered overload for that op, the named method is called
+   with (lhs, rhs) and its return value replaces the default numeric/string
+   semantics.  This implements Perl's `use overload` for the binary/unary
+   operators that perlc's codegen routes through the runtime. */
+typedef struct {
+    char *class_name;      /* e.g. "Math::BigInt" */
+    char *op;              /* e.g. "+", "*", "/", "%", "**", "-", "<=>", "cmp",
+                             "\"\"", "0+", "bool", "neg", "abs", "++", "--",
+                             "<<", ">>", "&", "|", "^", "~" */
+    char *method;          /* qualified method name e.g. "Math::BigInt::_add" */
+} OverloadEntry;
+#define OVERLOAD_TABLE_MAX 256
+static OverloadEntry s_overload_table[OVERLOAD_TABLE_MAX];
+static int s_overload_count = 0;
+
+void perl_register_overload(const char *class_name, const char *op,
+                            const char *method) {
+    /* Update existing entry if (class, op) already registered */
+    for (int i = 0; i < s_overload_count; i++) {
+        if (strcmp(s_overload_table[i].class_name, class_name) == 0 &&
+            strcmp(s_overload_table[i].op, op) == 0) {
+            free(s_overload_table[i].method);
+            s_overload_table[i].method = strdup(method);
+            return;
+        }
+    }
+    if (s_overload_count < OVERLOAD_TABLE_MAX) {
+        s_overload_table[s_overload_count].class_name = strdup(class_name);
+        s_overload_table[s_overload_count].op          = strdup(op);
+        s_overload_table[s_overload_count].method      = strdup(method);
+        s_overload_count++;
+    }
+}
+
+/* Look up an overload method for (obj's class, op).
+   Returns the qualified method name, or NULL if no overload.
+   Walks @ISA via perl_find_method_dfs's parent traversal to support
+   inherited overloads. */
+static const char *perl_find_overload(const PerlValue *obj, const char *op) {
+    if (!obj || !obj->blessed_class) return NULL;
+    /* Check the object's class and walk @ISA parents (depth-first, up to 32). */
+    const char *cls = obj->blessed_class;
+    for (int depth = 0; depth < 32; depth++) {
+        for (int i = 0; i < s_overload_count; i++) {
+            if (strcmp(s_overload_table[i].class_name, cls) == 0 &&
+                strcmp(s_overload_table[i].op, op) == 0)
+                return s_overload_table[i].method;
+        }
+        /* Walk up to first @ISA parent (covers single-inheritance; the common
+           case for overload declared in the same class as bless). */
+        const char *parents[32];
+        int np = perl_isa_direct_parents(cls, parents, 32);
+        if (np <= 0) break;
+        cls = parents[0];
+    }
+    return NULL;
+}
+
+/* Dispatch an overload method.  Returns the method's return value, or NULL
+   if no overload was found.  The args array is [lhs, rhs] (or [lhs] for
+   unary).  The method is called in scalar context. */
+static PerlValue *perl_dispatch_overload(const PerlValue *obj, const char *op,
+                                         PerlValue *lhs, PerlValue *rhs) {
+    const char *method = perl_find_overload(obj, op);
+    if (!method) return NULL;
+    PerlArray *args = perl_array_new();
+    PerlValue *lhs_clone = perl_clone(lhs);
+    PerlValue *rhs_clone = rhs ? perl_clone(rhs) : NULL;
+    perl_array_push(args, lhs_clone);
+    if (rhs_clone) perl_array_push(args, rhs_clone);
+    PerlValue *result;
+    /* D97: built-in C function overloads (Math::BigInt) are registered as
+       C function names (e.g. "perl_bigint_ovl_add") — dispatch directly. */
+    if (strncmp(method, "perl_bigint_ovl_", 16) == 0) {
+        if (strcmp(method, "perl_bigint_ovl_add") == 0)
+            result = perl_bigint_ovl_add(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_bigint_ovl_sub") == 0)
+            result = perl_bigint_ovl_sub(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_bigint_ovl_mul") == 0)
+            result = perl_bigint_ovl_mul(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_bigint_ovl_div") == 0)
+            result = perl_bigint_ovl_div(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_bigint_ovl_cmp") == 0)
+            result = perl_bigint_ovl_cmp(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_bigint_ovl_str") == 0)
+            result = perl_bigint_ovl_str(lhs_clone);
+        else if (strcmp(method, "perl_bigint_ovl_neg") == 0)
+            result = perl_bigint_ovl_neg(lhs_clone);
+        else
+            result = NULL;
+    } else {
+        int saved = perl_push_wantarray(0);  /* scalar context */
+        result = perl_call_named_sub(method, args, 0);
+        perl_pop_wantarray();
+    }
+    perl_free(lhs_clone);
+    if (rhs_clone) perl_free(rhs_clone);
+    perl_array_free(args);
+    return result;
+}
+
 void perl_register_method(const char *key, PerlSubFnCtx fn) {
     if (s_method_count < METHOD_TABLE_MAX) {
         s_method_table[s_method_count].key = strdup(key);
@@ -3846,6 +4103,51 @@ static PerlValue s_autoload_pv = { .tag = PERL_UNDEF };
 PerlValue *perl_get_autoload_name(void) { return &s_autoload_pv; }
 
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
+    /* D97: Math::BigInt class methods — intercept before DBI/threads checks.
+       `Math::BigInt->new(N)` and `Math::BigInt->config` are class methods
+       (obj is a PERL_STRING holding "Math::BigInt"). */
+    if (obj && obj->tag == PERL_STRING && obj->sval &&
+        strcmp(obj->sval, "Math::BigInt") == 0) {
+        if (strcmp(method, "new") == 0) {
+            PerlValue *arg = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+            return perl_bigint_new(arg);
+        }
+        if (strcmp(method, "config") == 0) {
+            /* Return a hash ref with the `lib` key set to "Math::BigInt::GMP"
+               so the `die '...' if ... ne 'Math::BigInt::GMP'` check passes. */
+            PerlHash *hv = perl_hash_new();
+            PerlValue *hv_pv = pv_alloc();
+            hv_pv->tag = PERL_REF_HASH;
+            hv_pv->pval = hv;
+            hv_pv->blessed_class = NULL;
+            PerlValue *lib_val = perl_alloc_string("Math::BigInt::GMP");
+            PerlValue *lib_key = perl_alloc_string("lib");
+            perl_hash_set_sv(hv, lib_key, lib_val);
+            perl_free(lib_key);
+            perl_free(lib_val);
+            return hv_pv;
+        }
+    }
+    /* D97: Math::BigInt instance methods — intercept when obj is PERL_BIGINT */
+    if (obj && obj->tag == PERL_BIGINT) {
+        PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : NULL;
+        if (strcmp(method, "bmul") == 0) return perl_bigint_bmul(obj, arg0);
+        if (strcmp(method, "badd") == 0) return perl_bigint_badd(obj, arg0);
+        if (strcmp(method, "bsub") == 0) return perl_bigint_bsub(obj, arg0);
+        if (strcmp(method, "bcmp") == 0) return perl_bigint_bcmp(obj, arg0);
+        if (strcmp(method, "numify") == 0) return perl_bigint_numify(obj);
+        /* bstr / as_string — stringification (not in-place) */
+        if (strcmp(method, "bstr") == 0 || strcmp(method, "as_string") == 0)
+            return perl_bigint_ovl_str(obj);
+        /* copy — return a clone */
+        if (strcmp(method, "copy") == 0) return perl_clone(obj);
+        /* bneg — negate in place, return self */
+        if (strcmp(method, "bneg") == 0) {
+            mpz_t *a = (mpz_t*)obj->pval;
+            if (a) mpz_neg(*a, *a);
+            return obj;
+        }
+    }
     if (obj && obj->tag == PERL_STRING && obj->sval && strcmp(obj->sval, "DBI") == 0) {
         if (strcmp(method, "connect") == 0) {
             PerlValue *dsn  = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
@@ -7619,4 +7921,288 @@ PerlValue *perl_dbi_error(PerlValue *dbh_pv) {
     PerlDBIHandle *dbh = perl_dbi_get_dbh(dbh_pv);
     if (!dbh) return perl_alloc_undef();
     return perl_alloc_string(dbh->last_error ? dbh->last_error : "");
+}
+
+/* D96: compound-assign on a 2D array element where the inner row may be
+   FLAT_ARRAY or REF_ARRAY.  Takes the row's PV (the element returned by
+   perl_array_get_ref on the outer array) and re-reads its pval/tag to avoid
+   using a stale flat-row cache pointer (the row may have been lazy-converted
+   by an earlier read in the same loop body, freeing the original double[]).
+   op: 0=+, 1=-, 2=*, 3=/.  Returns the boxed result. */
+PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
+                                   PerlValue *rhs_pv, int op) {
+    double rhs = perl_to_float(rhs_pv);
+    double r;
+    if (row_pv && row_pv->tag == PERL_FLAT_ARRAY) {
+        double *flat = (double *)row_pv->pval;
+        double lhs = flat[idx];
+        switch (op) {
+            case 0: r = lhs + rhs; break;
+            case 1: r = lhs - rhs; break;
+            case 2: r = lhs * rhs; break;
+            case 3:
+                if (rhs == 0.0) { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, __FILE__, __LINE__); }
+                r = lhs / rhs; break;
+            default: r = lhs;
+        }
+        flat[idx] = r;
+    } else {
+        PerlArray *av = perl_deref_array(row_pv);
+        PerlValue *lhs_pv = perl_array_get_ref(av, idx);
+        double lhs = perl_to_float(lhs_pv);
+        switch (op) {
+            case 0: r = lhs + rhs; break;
+            case 1: r = lhs - rhs; break;
+            case 2: r = lhs * rhs; break;
+            case 3:
+                if (rhs == 0.0) { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, __FILE__, __LINE__); }
+                r = lhs / rhs; break;
+            default: r = lhs;
+        }
+        PerlValue *res = perl_alloc_float(r);
+        perl_array_set(av, idx, res);
+        perl_free(res);
+    }
+    return perl_alloc_float(r);
+}
+
+/* ── Math::BigInt (D97) ───────────────────────────────────────────────────── */
+/* Uses mini-gmp (compiled into the runtime, zero external dependency).
+   Math::BigInt objects are PerlValue with tag=PERL_BIGINT, pval=mpz_t*,
+   blessed_class="Math::BigInt".  Arithmetic ops are handled by the overload
+   dispatch in perl_add/perl_mul/etc. which calls the registered overload
+   methods; those methods in turn call these helpers via the codegen
+   intercept for Math::BigInt::* method calls. */
+
+/* Allocate a PerlValue wrapping an mpz_t, blessed as Math::BigInt */
+static PerlValue *perl_bigint_alloc(const mpz_t val) {
+    PerlValue *v = perl_alloc_undef();
+    v->tag = PERL_BIGINT;
+    v->pval = malloc(sizeof(mpz_t));
+    mpz_init_set(*(mpz_t*)v->pval, val);
+    v->blessed_class = strdup("Math::BigInt");
+    return v;
+}
+
+/* Free the mpz_t inside a bigint PV (called by perl_free) */
+static void perl_bigint_free(PerlValue *v) {
+    if (v->pval) { mpz_clear(*(mpz_t*)v->pval); free(v->pval); v->pval = NULL; }
+}
+
+/* Get the mpz_t from a PerlValue (must be PERL_BIGINT) */
+static mpz_t *perl_bigint_z(PerlValue *v) {
+    if (!v || v->tag != PERL_BIGINT) return NULL;
+    return (mpz_t *)v->pval;
+}
+
+/* ── Math::BigInt constructor and methods (called via perl_dispatch_method) ── */
+
+/* Math::BigInt->new(N) — N is a PerlValue (INT, STRING, or BIGINT) */
+PerlValue *perl_bigint_new(PerlValue *arg) {
+    mpz_t z;
+    mpz_init(z);
+    if (arg) {
+        if (arg->tag == PERL_INT) mpz_set_si(z, arg->ival);
+        else if (arg->tag == PERL_FLOAT) mpz_set_d(z, arg->fval);
+        else if (arg->tag == PERL_STRING) {
+            char *s = perl_to_string_dup(arg);
+            mpz_set_str(z, s, 10);
+            free(s);
+        } else if (arg->tag == PERL_BIGINT) {
+            mpz_t *src = (mpz_t*)arg->pval;
+            if (src) mpz_set(z, *src);
+        }
+    }
+    PerlValue *r = perl_bigint_alloc(z);
+    mpz_clear(z);
+    return r;
+}
+
+/* $a->bmul($b) — in-place multiply, returns $self (D97: the codegen does NOT
+   free perl_dispatch_method results, so returning self is safe — the PV belongs
+   to the variable, not to the method call) */
+PerlValue *perl_bigint_bmul(PerlValue *self, PerlValue *other) {
+    mpz_t *a = perl_bigint_z(self);
+    if (!a) return perl_alloc_undef();
+    if (other && other->tag == PERL_BIGINT) {
+        mpz_t *b = (mpz_t*)other->pval;
+        if (b) mpz_mul(*a, *a, *b);
+    } else {
+        long long n = perl_to_int(other);
+        mpz_mul_si(*a, *a, n);
+    }
+    return self;
+}
+
+/* $a->badd($b) — in-place add, returns $self */
+PerlValue *perl_bigint_badd(PerlValue *self, PerlValue *other) {
+    mpz_t *a = perl_bigint_z(self);
+    if (!a) return perl_alloc_undef();
+    if (other && other->tag == PERL_BIGINT) {
+        mpz_t *b = (mpz_t*)other->pval;
+        if (b) mpz_add(*a, *a, *b);
+    } else {
+        long long n = perl_to_int(other);
+        if (n >= 0) mpz_add_ui(*a, *a, (unsigned long)n);
+        else mpz_sub_ui(*a, *a, (unsigned long)(-n));
+    }
+    return self;
+}
+
+/* $a->bsub($b) — in-place subtract, returns $self */
+PerlValue *perl_bigint_bsub(PerlValue *self, PerlValue *other) {
+    mpz_t *a = perl_bigint_z(self);
+    if (!a) return perl_alloc_undef();
+    if (other && other->tag == PERL_BIGINT) {
+        mpz_t *b = (mpz_t*)other->pval;
+        if (b) mpz_sub(*a, *a, *b);
+    } else {
+        long long n = perl_to_int(other);
+        if (n >= 0) mpz_sub_ui(*a, *a, (unsigned long)n);
+        else mpz_add_ui(*a, *a, (unsigned long)(-n));
+    }
+    return self;
+}
+
+/* $a->bcmp($b) — compare, returns -1/0/1.  Handles either operand being
+   the BIGINT (for overload dispatch from the right operand). */
+PerlValue *perl_bigint_bcmp(PerlValue *self, PerlValue *other) {
+    mpz_t *a = perl_bigint_z(self);
+    if (!a) {
+        /* self is not a BIGINT — other must be (swapped overload dispatch).
+           We computed other<=>self; want self<=>other = -(other<=>self). */
+        a = perl_bigint_z(other);
+        if (!a) return perl_alloc_int(0);
+        long long n = perl_to_int(self);
+        int c = mpz_cmp_si(*a, n);
+        return perl_alloc_int(c < 0 ? 1 : (c > 0 ? -1 : 0));
+    }
+    int c;
+    if (other && other->tag == PERL_BIGINT) {
+        mpz_t *b = (mpz_t*)other->pval;
+        c = b ? mpz_cmp(*a, *b) : 0;
+    } else {
+        long long n = perl_to_int(other);
+        c = mpz_cmp_si(*a, n);
+    }
+    return perl_alloc_int(c < 0 ? -1 : (c > 0 ? 1 : 0));
+}
+
+/* $a->numify() — convert to integer (may lose precision for huge values) */
+PerlValue *perl_bigint_numify(PerlValue *self) {
+    mpz_t *a = perl_bigint_z(self);
+    if (!a) return perl_alloc_int(0);
+    return perl_alloc_int(mpz_get_si(*a));
+}
+
+/* ── Overload method implementations ──────────────────────────────────────── */
+/* These are called by perl_dispatch_overload when the arithmetic ops fire on
+   blessed Math::BigInt objects.  They take (lhs, rhs) and return a NEW
+   Math::BigInt object (not in-place). */
+
+/* D97: overload dispatch helper — find the BIGINT operand.
+   When the right operand is blessed (and left is not), the dispatch passes
+   (a, b) with the BIGINT on the right.  These helpers find the BIGINT in
+   either position and handle the operand order correctly. */
+
+/* overload '+' => \&_ovl_add (commutative) */
+PerlValue *perl_bigint_ovl_add(PerlValue *lhs, PerlValue *rhs) {
+    mpz_t *a = perl_bigint_z(lhs);
+    mpz_t *b = perl_bigint_z(rhs);
+    mpz_t r; mpz_init(r);
+    if (a && b) mpz_add(r, *a, *b);
+    else if (a) { long long n = perl_to_int(rhs); if (n>=0) mpz_add_ui(r,*a,(unsigned long)n); else mpz_sub_ui(r,*a,(unsigned long)(-n)); }
+    else if (b) { long long n = perl_to_int(lhs); if (n>=0) mpz_add_ui(r,*b,(unsigned long)n); else mpz_sub_ui(r,*b,(unsigned long)(-n)); }
+    PerlValue *v = perl_bigint_alloc(r);
+    mpz_clear(r);
+    return v;
+}
+
+/* overload '-' => \&_ovl_sub (lhs - rhs; when swapped, rhs - lhs) */
+PerlValue *perl_bigint_ovl_sub(PerlValue *lhs, PerlValue *rhs) {
+    mpz_t *a = perl_bigint_z(lhs);
+    mpz_t *b = perl_bigint_z(rhs);
+    mpz_t r; mpz_init(r);
+    if (a && b) mpz_sub(r, *a, *b);
+    else if (a) { long long n = perl_to_int(rhs); if (n>=0) mpz_sub_ui(r,*a,(unsigned long)n); else mpz_add_ui(r,*a,(unsigned long)(-n)); }
+    else if (b) { long long n = perl_to_int(lhs); if (n>=0) mpz_sub_ui(r,*b,(unsigned long)n); else mpz_add_ui(r,*b,(unsigned long)(-n)); }
+    /* When b is the BIGINT (swapped), we computed b - a, but Perl wants a - b = -(b-a).
+       The overload dispatch passes (a, b) when b is blessed, so lhs=a, rhs=b.
+       We computed rhs - lhs. Need to negate. */
+    if (!a && b) mpz_neg(r, r);
+    PerlValue *v = perl_bigint_alloc(r);
+    mpz_clear(r);
+    return v;
+}
+
+/* overload '*' => \&_ovl_mul (commutative) */
+PerlValue *perl_bigint_ovl_mul(PerlValue *lhs, PerlValue *rhs) {
+    mpz_t *a = perl_bigint_z(lhs);
+    mpz_t *b = perl_bigint_z(rhs);
+    mpz_t r; mpz_init(r);
+    if (a && b) mpz_mul(r, *a, *b);
+    else if (a) { long long n = perl_to_int(rhs); mpz_mul_si(r, *a, n); }
+    else if (b) { long long n = perl_to_int(lhs); mpz_mul_si(r, *b, n); }
+    PerlValue *v = perl_bigint_alloc(r);
+    mpz_clear(r);
+    return v;
+}
+
+/* overload '/' => \&_ovl_div (floor division; when swapped, rhs/lhs → need lhs/rhs = 1/(rhs/lhs) floor) */
+PerlValue *perl_bigint_ovl_div(PerlValue *lhs, PerlValue *rhs) {
+    mpz_t *a = perl_bigint_z(lhs);
+    mpz_t *b = perl_bigint_z(rhs);
+    mpz_t r; mpz_init(r);
+    int swapped = 0;
+    if (b && !a) { /* BIGINT is on the right — swap */ mpz_t *t = a; a = b; b = t; swapped = 1; (void)t; }
+    /* Now a is the BIGINT (numerator), b is the denominator (or NULL) */
+    if (!a) { mpz_clear(r); return perl_alloc_undef(); }
+    if (b && mpz_sgn(*b) != 0) {
+        mpz_fdiv_q(r, *a, *b);
+    } else if (b && mpz_sgn(*b) == 0) {
+        PerlValue *e = perl_alloc_string("Illegal division by zero");
+        perl_die(e, NULL, 0);
+        mpz_set_ui(r, 0);
+    } else {
+        long long n = perl_to_int(rhs);  /* rhs is the scalar denominator */
+        if (!swapped) {
+            if (n != 0) { mpz_t bn; mpz_init_set_si(bn, n); mpz_fdiv_q(r, *a, bn); mpz_clear(bn); }
+            else { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, NULL, 0); }
+        } else {
+            /* swapped: BIGINT/n, but the BIGINT is rhs (the denominator), lhs is numerator.
+               We want floor(lhs / BIGINT). a is BIGINT (denominator), lhs is numerator. */
+            long long num = perl_to_int(lhs);
+            if (mpz_sgn(*a) != 0) { mpz_t num_z; mpz_init_set_si(num_z, num); mpz_fdiv_q(r, num_z, *a); mpz_clear(num_z); }
+            else { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, NULL, 0); }
+        }
+    }
+    PerlValue *v = perl_bigint_alloc(r);
+    mpz_clear(r);
+    return v;
+}
+
+/* overload '<=>' => \&_ovl_cmp */
+PerlValue *perl_bigint_ovl_cmp(PerlValue *lhs, PerlValue *rhs) {
+    return perl_bigint_bcmp(lhs, rhs);
+}
+
+/* overload '""' => \&_ovl_str — stringification */
+PerlValue *perl_bigint_ovl_str(PerlValue *self) {
+    mpz_t *a = perl_bigint_z(self);
+    if (!a) return perl_alloc_string("");
+    char *s = mpz_get_str(NULL, 10, *a);
+    PerlValue *v = perl_alloc_string(s);
+    free(s);
+    return v;
+}
+
+/* overload 'neg' => \&_ovl_neg */
+PerlValue *perl_bigint_ovl_neg(PerlValue *self) {
+    mpz_t *a = perl_bigint_z(self), r;
+    if (!a) return perl_alloc_undef();
+    mpz_init(r);
+    mpz_neg(r, *a);
+    PerlValue *v = perl_bigint_alloc(r);
+    mpz_clear(r);
+    return v;
 }

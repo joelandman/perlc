@@ -24,6 +24,7 @@ typedef enum {
     PERL_DBI_DBH      = 14, /* DBI database handle — pval=PerlDBIHandle* */
     PERL_DBI_STH      = 15, /* DBI statement handle — pval=PerlDBIStatement* */
     PERL_XS_PTR       = 16, /* opaque native pointer — pval=void* */
+    PERL_BIGINT       = 17, /* Math::BigInt — pval=mpz_t* (GMP or mini-gmp), blessed_class="Math::BigInt" */
 } PerlTag;
 
 /* PV_FLAG_SHARED: cell is a threads::shared variable (see SharedMutex below). */
@@ -654,6 +655,35 @@ void perl_cleanup(void);
 /* ── string eval removed (no JIT) ────────────────────────────────────────── */
 /* perl_eval_string sets $@ and returns undef. No runtime compilation. */
 PerlValue *perl_eval_string(PerlValue *code_pv);
+
+/* D96: compound-assign on a 2D array element where the inner row may be
+   FLAT_ARRAY or REF_ARRAY.  Re-reads the row PV's tag/pval to avoid using a
+   stale flat-row cache (the row may have been lazy-converted by an earlier read
+   in the same loop body).  op: 0=+,1=-,2=*,3=/.  Returns the boxed result. */
+PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
+                                   PerlValue *rhs_pv, int op);
+
+/* ── operator overloading (use overload) ─────────────────────────────────── */
+/* Register an overload for a class.  op is the Perl overload key (e.g. "+",
+   "*", "/", "%", "**", "-", "<=>", "cmp", "\"\"", "0+", "bool", "neg").
+   method is the fully-qualified method name to call. */
+void perl_register_overload(const char *class_name, const char *op,
+                            const char *method);
+
+/* ── Math::BigInt (D97) — built-in using mini-gmp, zero external dependency */
+PerlValue *perl_bigint_new(PerlValue *arg);
+PerlValue *perl_bigint_bmul(PerlValue *self, PerlValue *other);
+PerlValue *perl_bigint_badd(PerlValue *self, PerlValue *other);
+PerlValue *perl_bigint_bsub(PerlValue *self, PerlValue *other);
+PerlValue *perl_bigint_bcmp(PerlValue *self, PerlValue *other);
+PerlValue *perl_bigint_numify(PerlValue *self);
+PerlValue *perl_bigint_ovl_add(PerlValue *lhs, PerlValue *rhs);
+PerlValue *perl_bigint_ovl_sub(PerlValue *lhs, PerlValue *rhs);
+PerlValue *perl_bigint_ovl_mul(PerlValue *lhs, PerlValue *rhs);
+PerlValue *perl_bigint_ovl_div(PerlValue *lhs, PerlValue *rhs);
+PerlValue *perl_bigint_ovl_cmp(PerlValue *lhs, PerlValue *rhs);
+PerlValue *perl_bigint_ovl_str(PerlValue *self);
+PerlValue *perl_bigint_ovl_neg(PerlValue *self);
 
 /* Note: runtime require/do of dynamic files now also set $@ + return undef.
    Compile-time 'use' and static 'require' are still inlined by the driver. */

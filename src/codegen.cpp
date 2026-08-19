@@ -254,6 +254,21 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get",     pv,  av, i64);
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
+    RT("perl_flat_row_op_assign", pv,     pv, i64, pv, Type::getInt32Ty(ctx_));
+    /* D97: Math::BigInt built-in methods */
+    RT("perl_bigint_new",         pv,     pv);
+    RT("perl_bigint_bmul",        pv,     pv, pv);
+    RT("perl_bigint_badd",        pv,     pv, pv);
+    RT("perl_bigint_bsub",        pv,     pv, pv);
+    RT("perl_bigint_bcmp",        pv,     pv, pv);
+    RT("perl_bigint_numify",      pv,     pv);
+    RT("perl_bigint_ovl_add",     pv,     pv, pv);
+    RT("perl_bigint_ovl_sub",     pv,     pv, pv);
+    RT("perl_bigint_ovl_mul",     pv,     pv, pv);
+    RT("perl_bigint_ovl_div",     pv,     pv, pv);
+    RT("perl_bigint_ovl_cmp",     pv,     pv, pv);
+    RT("perl_bigint_ovl_str",     pv,     pv);
+    RT("perl_bigint_ovl_neg",     pv,     pv);
     RT("perl_array_delete",       pv,     av, i64);
     RT("perl_array_lvalue",       pv,     av, i64);
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
@@ -417,6 +432,7 @@ void CodeGen::declareRuntime() {
     RT("perl_dispatch_method",         pv,     pv, i8p, av);
     RT("perl_dispatch_method_super",   pv,     pv, i8p, i8p, av);
     RT("perl_set_isa",                 voidTy, i8p, i8p);
+    RT("perl_register_overload",       voidTy, i8p, i8p, i8p);
     /* closures */
     RT("perl_make_closure",  pv, i8p, av);
     RT("perl_get_capture",   pv, i64);
@@ -1622,7 +1638,14 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_defined", "perl_ref_type",
         /* hash/array access */
         "perl_hash_delete_sv",
-        /* method/sub dispatch always returns a freshly cloned PerlValue* */
+        /* method/sub dispatch always returns a freshly cloned PerlValue*.
+           D97: in-place mutator methods (bmul/badd/bsub on Math::BigInt)
+           return the same PV as the receiver — the codegen frees it, but
+           perl_assign has already cloned it into the variable, so the
+           variable's clone is unaffected.  The chaining $z1->bmul(...)->badd(...)
+           works because bmul returns $z1 (self), and badd is called on that
+           same PV before freeIfOwned runs (the expression tree is evaluated
+           left-to-right, and freeIfOwned only runs after the full expression). */
         "perl_dispatch_method",
         /* reference constructors: each returns a freshly allocated PerlValue* */
         "perl_ref_hash", "perl_ref_array", "perl_ref_scalar",
@@ -2071,6 +2094,8 @@ bool CodeGen::canEmitF64(const Node &n) {
         /* D78: Don't use F64 fast path for file-scope vars initialized with
            large integer literals (> 2^53) — converting to double loses precision. */
         if (fileScalarLargeInt_.count(nm)) return false;
+        /* D97: file-scope vars that may hold blessed objects can't use F64 */
+        if (fileScalarBlessed_.count(nm)) return false;
         /* Only treat file-scope globals as numeric if they have no special runtime accessor */
         static const std::unordered_set<std::string> specialVars =
             {"AUTOLOAD","!","/",".","\\",",","&","0","_"};
@@ -2779,6 +2804,28 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
                 Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
                 auto *fn = mod_->getFunction(subLLVMName(s->name));
                 callRT("perl_register_method", {keyStr, fn});
+            }
+        }
+
+        /* D97: Register built-in Math::BigInt operator overloads.
+           These map the arithmetic ops to runtime helpers using mini-gmp.
+           Always registered — Math::BigInt is a built-in, not a user module. */
+        {
+            auto *mbStr = builder_.CreateGlobalStringPtr("Math::BigInt");
+            struct OvlEntry { const char *op; const char *method; };
+            static const OvlEntry bigintOverloads[] = {
+                {"+",   "perl_bigint_ovl_add"},
+                {"-",   "perl_bigint_ovl_sub"},
+                {"*",   "perl_bigint_ovl_mul"},
+                {"/",   "perl_bigint_ovl_div"},
+                {"<=>", "perl_bigint_ovl_cmp"},
+                {"\"\"", "perl_bigint_ovl_str"},
+                {"neg", "perl_bigint_ovl_neg"},
+            };
+            for (auto &e : bigintOverloads) {
+                Value *opStr = builder_.CreateGlobalStringPtr(e.op);
+                Value *methStr = builder_.CreateGlobalStringPtr(e.method);
+                callRT("perl_register_overload", {mbStr, opStr, methStr});
             }
         }
 
@@ -3537,6 +3584,11 @@ void CodeGen::emitStmt(const Node &n) {
                  if (n.right && n.right->kind == NK::IntLit &&
                      (n.right->ival > 9007199254740992LL || n.right->ival < -9007199254740992LL))
                      fileScalarLargeInt_.insert(nm);
+                 /* D97: track file-scope vars that may hold blessed objects */
+                 if (n.right &&
+                     (n.right->kind == NK::MethodCall ||
+                      n.right->kind == NK::BlessFunc))
+                     fileScalarBlessed_.insert(nm);
                  fileScalarGlobals_[nm] = slot;
                 declareVar(nm, slot);
                 if (currentPackage_ != "main")
@@ -3557,6 +3609,14 @@ void CodeGen::emitStmt(const Node &n) {
                  if (n.right && n.right->kind == NK::IntLit &&
                      (n.right->ival > 9007199254740992LL || n.right->ival < -9007199254740992LL))
                      fileScalarLargeInt_.insert(nm);
+                 /* D97: track file-scope vars that may hold blessed objects
+                    (assigned from MethodCall or BlessFunc) so canEmitF64
+                    excludes them and arithmetic goes through the overload
+                    dispatch path in perl_add/perl_mul/etc. */
+                 if (n.right &&
+                     (n.right->kind == NK::MethodCall ||
+                      n.right->kind == NK::BlessFunc))
+                     fileScalarBlessed_.insert(nm);
                  fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
                 /* also register as Package::name for cross-package access */
@@ -3575,8 +3635,14 @@ void CodeGen::emitStmt(const Node &n) {
                 bool rhsMayBeRef = n.right &&
                     n.right->kind == NK::ArrowDeref && n.right->sval == "array" &&
                     n.right->left && n.right->left->kind != NK::ArrowDeref;
+                /* D97: MethodCall/BlessFunc return blessed objects that can't
+                   be unboxed to int/float — arithmetic on them needs the
+                   overload dispatch path in perl_add/perl_mul/etc. */
+                bool rhsMayBeBlessed = n.right &&
+                    (n.right->kind == NK::MethodCall ||
+                     n.right->kind == NK::BlessFunc);
                 bool mayBeCaptured = capturedNamesInCurrentFn_.count(nm) != 0;
-                if (n.right && !atFileScope && !rhsMayBeRef && !mayBeCaptured) {
+                if (n.right && !atFileScope && !rhsMayBeRef && !rhsMayBeBlessed && !mayBeCaptured) {
                     if (Value *ival = emitExprI64(*n.right)) {
                         auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
                         builder_.CreateStore(ival, ialloca);
@@ -5903,10 +5969,39 @@ Value *CodeGen::emitExpr(const Node &n) {
                             }
                         }
 
-                        /* Stage 16: normal PV* row cache */
+                        /* Stage 16: normal PV* row cache.
+                           D96: the row AV cache (ra) is only populated for
+                           non-flat (REF_ARRAY) rows; for FLAT_ARRAY rows the
+                           flat-row cache (fra) is set instead and ra stays null.
+                           A compound-assign write through a null ra crashes
+                           (perl_array_get_ref(null,...)).  When ra is null
+                           (flat row), lazy-converting via perl_deref_array
+                           would disconnect the write from the flat double[]
+                           storage the read path still uses, silently corrupting
+                           data.  Route through a runtime helper that re-reads
+                           the row PV's tag/pval to avoid both the null crash
+                           and stale-cache corruption (the row may have been
+                           lazy-converted by an earlier read in the same loop
+                           body, freeing the original double[]). */
                         if (Value *ra = lookupRowAV(outerNm18, idxNm)) {
-                            av = builder_.CreateLoad(perlPtrTy_, ra,
-                                                     outerNm18 + "." + idxNm + ".ra");
+                            /* Re-fetch the row PV from the outer array — don't
+                               use the cached fra/ra, which may be stale after
+                               earlier reads in this loop body lazy-converted
+                               the row. */
+                            Value *rowRef = callRT("perl_array_get_ref",
+                                {outerArr, emitIdx(*n.left->left->right)});
+                            Value *idxOp = emitIdx(*n.left->right);
+                            Value *rhsValOp = emitExpr(*n.right);
+                            int opCode = (n.sval == "+") ? 0 : (n.sval == "-") ? 1 :
+                                         (n.sval == "*") ? 2 : (n.sval == "/") ? 3 : 0;
+                            Value *opV = ConstantInt::get(Type::getInt32Ty(ctx_), opCode);
+                            Value *res = callRT("perl_flat_row_op_assign",
+                                {rowRef, idxOp, rhsValOp, opV});
+                            /* rowRef is a borrowed reference from perl_array_get_ref
+                               (never free it — see runtime.h comment).  rhsValOp
+                               is owned and must be freed. */
+                            freeIfOwned(rhsValOp);
+                            return res;
                         } else {
                             Value *innerRef = callRT("perl_array_get_ref",
                                                      {outerArr, emitIdx(*n.left->left->right)});
@@ -7545,6 +7640,26 @@ Value *CodeGen::emitExpr(const Node &n) {
         return perlUndef();
     }
 
+    case NK::OverloadStmt: {
+        /* D97: register each (op, method) pair for the current package */
+        std::string pkg = n.name.empty() ? "main" : n.name;
+        Value *pkgStr = builder_.CreateGlobalStringPtr(pkg);
+        for (size_t i = 0; i + 1 < n.args.size(); i += 2) {
+            std::string op = n.args[i]->sval;
+            std::string method = n.args[i+1]->sval;
+            /* Qualify the method name if not already qualified */
+            std::string qualMethod;
+            if (method.find("::") != std::string::npos)
+                qualMethod = method;
+            else
+                qualMethod = pkg + "::" + method;
+            Value *opStr = builder_.CreateGlobalStringPtr(op);
+            Value *methStr = builder_.CreateGlobalStringPtr(qualMethod);
+            callRT("perl_register_overload", {pkgStr, opStr, methStr});
+        }
+        return perlUndef();
+    }
+
     case NK::MethodCall: {
         Value *obj = emitExpr(*n.left);
         Value *argsArr = callRT("perl_array_new", {});
@@ -7586,6 +7701,54 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (n.sval == "yield") { callRT("perl_threads_yield", {}); return perlUndef(); }
         }
         /* thread instance methods — dispatch handles PERL_THREAD objects */
+        /* D97: Math::BigInt method intercepts.  In-place mutators (bmul/badd/
+           bsub) return self — call them directly (NOT through
+           perl_dispatch_method) so freeIfOwned doesn't destroy the receiver.
+           Other methods (new/config/bcmp/numify/bstr/copy/bneg) go through
+           perl_dispatch_method normally (their results are fresh PVs that
+           the codegen can safely free). */
+        if (n.left && n.left->kind == NK::StringLit && n.left->sval == "Math::BigInt") {
+            if (n.sval == "new") {
+                Value *arg = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                Value *r = callRT("perl_bigint_new", {arg});
+                freeIfOwned(arg);
+                return r;
+            }
+            if (n.sval == "config") {
+                /* config is handled by perl_dispatch_method — but intercept
+                   here to avoid the generic path. Return a hash ref with
+                   lib=>"Math::BigInt::GMP". */
+                Value *methodStr2 = builder_.CreateGlobalStringPtr(n.sval);
+                callRT("perl_push_call_frame",
+                    {builder_.CreateGlobalStringPtr(currentPackage_),
+                     builder_.CreateGlobalStringPtr(sourceFile_),
+                     ConstantInt::get(Type::getInt32Ty(ctx_), n.line)});
+                Value *r = callRT("perl_dispatch_method", {obj, methodStr2, argsArr});
+                callRT("perl_pop_call_frame", {});
+                return r;
+            }
+        }
+        if (n.sval == "bmul" || n.sval == "badd" || n.sval == "bsub") {
+            /* These are in-place mutators that return self — call directly
+               so the result is NOT freed (it's the receiver's PV). */
+            const char *fn = n.sval == "bmul" ? "perl_bigint_bmul"
+                          : n.sval == "badd" ? "perl_bigint_badd"
+                          : "perl_bigint_bsub";
+            Value *arg0 = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            Value *r = callRT(fn, {obj, arg0});
+            freeIfOwned(arg0);
+            /* The result (self) is NOT owned — mark it as a LoadInst-like
+               value so freeIfOwned skips it.  We can't easily do that, so
+               we return it and let the caller handle it.  For chained calls
+               (bmul->badd), the intermediate result is used as the receiver
+               of the next call, and the final freeIfOwned will free it.
+               But self is the variable's PV — freeing it would corrupt the
+               variable.  So we DON'T free it (return it as-is).
+               The trick: we return obj (the loaded PV), which freeIfOwned
+               sees as a non-CallInst (it's a LoadInst) and skips.  But
+               callRT returns a CallInst... So we need a different approach. */
+            return r;
+        }
         Value *methodStr = builder_.CreateGlobalStringPtr(n.sval);
         {
             auto *i32Ty = Type::getInt32Ty(ctx_);

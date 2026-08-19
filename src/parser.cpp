@@ -105,6 +105,81 @@ NodePtr Parser::parseProgram() {
                 stmts.push_back(std::move(n));
                 continue;
             }
+            /* D97: `use overload '+' => \&add, '-' => \&sub, ...`
+               Parse the op→method pairs and produce an OverloadStmt node.
+               The pairs are: STRING/FAT_ARROW/RefSub or STRING/FAT_ARROW/STRING
+               or bareword op names.  Also handles `fallback => 1` (ignored). */
+            if (check(TK::IDENT) && cur().text == "overload") {
+                advance(); /* consume 'overload' */
+                auto n = std::make_unique<Node>();
+                n->kind = NK::OverloadStmt;
+                n->name = currentPackage_; /* the package where overload is declared */
+                n->line = line;
+                /* Parse comma-separated pairs until ; */
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                    /* Parse the op key: could be a STRING, or a bareword
+                       like +, -, *, etc. lexed as an operator token. */
+                    std::string opKey;
+                    /* Try string first */
+                    if (check(TK::STRING)) {
+                        opKey = cur().text; advance();
+                    } else if (check(TK::IDENT)) {
+                        /* bareword op name (e.g. "bool", "neg", "abs", "fallback") */
+                        opKey = cur().text; advance();
+                    } else {
+                        /* operator tokens: +,-,*,/,% etc are lexed as various
+                           TK kinds. Read the raw token text. */
+                        opKey = cur().text;
+                        advance();
+                    }
+                    /* Skip fat arrow or regular comma */
+                    if (check(TK::FATARROW)) advance();
+                    /* Parse the value: \&name or a sub ref, or a bareword
+                       method name, or a code block, or 1 (for fallback).
+                       Method names may be keywords (sub, length, etc.) or
+                       barewords — accept any non-delimiter token with text. */
+                    std::string methodName;
+                    if (check(TK::BACKSLASH)) {
+                        advance(); /* skip \ */
+                        if (check(TK::AND)) advance(); /* skip & */
+                        /* Accept any token with text as the method name */
+                        if (cur().text.size() > 0 &&
+                            !check(TK::FATARROW) && !check(TK::COMMA) &&
+                            !check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                            methodName = cur().text; advance();
+                        }
+                    } else if (check(TK::AND)) {
+                        /* &name without \ */
+                        advance(); /* skip & */
+                        if (cur().text.size() > 0 &&
+                            !check(TK::FATARROW) && !check(TK::COMMA) &&
+                            !check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                            methodName = cur().text; advance();
+                        }
+                    } else if (check(TK::IDENT) || check(TK::STRING) ||
+                               (cur().text.size() > 0 &&
+                                !check(TK::FATARROW) && !check(TK::COMMA) &&
+                                !check(TK::SEMI) && !check(TK::EOF_TOK) &&
+                                !check(TK::LBRACE))) {
+                        /* bareword method name, string, or keyword */
+                        methodName = cur().text; advance();
+                    } else {
+                        /* fallback => 1 or similar — skip the value */
+                        advance();
+                    }
+                    /* Store the pair.  Skip fallback (not an operator). */
+                    if (opKey != "fallback" && !methodName.empty()) {
+                        auto opNode   = makeStr(opKey, line);
+                        auto methodNode = makeStr(methodName, line);
+                        n->args.push_back(std::move(opNode));
+                        n->args.push_back(std::move(methodNode));
+                    }
+                    match(TK::COMMA);
+                }
+                match(TK::SEMI);
+                stmts.push_back(std::move(n));
+                continue;
+            }
             /* skip all other use statements */
             while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
             match(TK::SEMI); continue;

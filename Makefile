@@ -19,9 +19,9 @@ CFLAGS   := -g -O2 -mcx16 -Wno-atomic-alignment
 
 SRCDIR   := src
 OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/ast.o $(SRCDIR)/llvm_early_init.o
-RT_OBJ   := $(SRCDIR)/runtime.o
+RT_OBJ   := $(SRCDIR)/runtime.o $(SRCDIR)/mini-gmp.o
 TSAN_OBJS := $(SRCDIR)/main_tsan.o $(SRCDIR)/lexer_tsan.o $(SRCDIR)/parser_tsan.o $(SRCDIR)/codegen_tsan.o $(SRCDIR)/ast_tsan.o $(SRCDIR)/llvm_early_init_tsan.o
-TSAN_RT_OBJ := $(SRCDIR)/runtime_tsan.o
+TSAN_RT_OBJ := $(SRCDIR)/runtime_tsan.o $(SRCDIR)/mini-gmp_tsan.o
 TSAN_TARGET := perlc_tsan
 
 TARGET   := perlc
@@ -38,10 +38,16 @@ $(TARGET): $(OBJS) $(RT_OBJ)
 $(TSAN_TARGET): $(TSAN_OBJS) $(TSAN_RT_OBJ)
 	$(CXX) $(TSAN_CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h
+$(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(SRCDIR)/runtime_tsan.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h
+$(SRCDIR)/runtime_tsan.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h
+	$(CC) $(TSAN_CFLAGS) -c -o $@ $<
+
+$(SRCDIR)/mini-gmp.o: $(SRCDIR)/mini-gmp.c $(SRCDIR)/mini-gmp.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(SRCDIR)/mini-gmp_tsan.o: $(SRCDIR)/mini-gmp.c $(SRCDIR)/mini-gmp.h
 	$(CC) $(TSAN_CFLAGS) -c -o $@ $<
 
 $(SRCDIR)/%.o: $(SRCDIR)/%.cpp

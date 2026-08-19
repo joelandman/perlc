@@ -150,6 +150,11 @@ private:
         These cannot safely use the F64 fast path because converting to double
         would lose precision. Excluded from canEmitF64 for ScalarVar. */
      std::unordered_set<std::string> fileScalarLargeInt_;
+     /* D97: file-scope variables that may hold blessed objects (assigned from
+        MethodCall or BlessFunc). These cannot use the F64 fast path because
+        arithmetic on blessed objects must go through the overload dispatch
+        in perl_add/perl_mul/etc.  Excluded from canEmitF64 for ScalarVar. */
+     std::unordered_set<std::string> fileScalarBlessed_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileArrayGlobals_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileHashGlobals_;
     int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */

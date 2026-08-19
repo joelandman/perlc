@@ -106,7 +106,9 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "strict","warnings","feature","parent","base",
         "Exporter","Carp","POSIX","Scalar::Util",
         "List::Util","Data::Dumper","Storable","overload",
-        "constant"
+        "constant",
+        "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
+        "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
     };
 
     std::set<std::string> modulesToInstall;
@@ -220,6 +222,8 @@ static std::vector<Token> inlineModules(
         "strict","warnings","feature","parent","base",
         "Exporter","Carp","POSIX","Scalar::Util",
         "List::Util","Data::Dumper","Storable","overload",
+        "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
+        "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -628,7 +632,8 @@ static void usage(const char *prog) {
               << "  -O[level]   Optimization level 0-5 (default: 1)\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
-              << "  -g          Generate debugging symbols\n";
+              << "  -g          Generate debugging symbols\n"
+              << "  --mini-gmp  Confirm mini-gmp is used for Math::BigInt (default; no external GMP)\n";
 }
 
 int main(int argc, char **argv) {
@@ -648,6 +653,13 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
         else if (!strcmp(argv[i], "--do-lib"))  doLib = true;
+        else if (!strcmp(argv[i], "--mini-gmp")) {
+            /* D97: mini-gmp is always compiled into the runtime — this flag
+               is a no-op (mini-gmp is the only backend), accepted for
+               compatibility and to document the choice.  System GMP is not
+               linked, so Math::BigInt always uses mini-gmp. */
+            verbose = true;
+        }
         else if (!strcmp(argv[i], "-v"))        verbose = true;
         else if (!strcmp(argv[i], "-pm"))       installPM = true;
         else if (!strcmp(argv[i], "-g"))         debugSymbols = true;
@@ -759,6 +771,16 @@ int main(int argc, char **argv) {
         }
         if (rtSrc.empty() || access(rtSrc.c_str(), R_OK) != 0)
             rtSrc = "src/runtime.c";  /* fallback: CWD */
+        /* D97: mini-gmp source — compiled alongside runtime.c for Math::BigInt.
+           Look for it in the same directory as runtime.c. */
+        std::string mgmpSrc;
+        {
+            auto sl = rtSrc.rfind('/');
+            std::string dir = (sl != std::string::npos) ? rtSrc.substr(0, sl) : ".";
+            mgmpSrc = dir + "/mini-gmp.c";
+        }
+        if (mgmpSrc.empty() || access(mgmpSrc.c_str(), R_OK) != 0)
+            mgmpSrc = "src/mini-gmp.c";  /* fallback: CWD */
         if (selfPath.empty()) selfPath = "perlc";  /* fallback: hope it's on $PATH */
 
         if (doLib) {
@@ -789,7 +811,7 @@ int main(int argc, char **argv) {
                             " -Wno-atomic-alignment -rdynamic"
                             " -DPERLC_SELF_PATH=\"\\\"" + selfPath + "\\\"\"";
          if (debugSymbols) cmd += " -g";
-         cmd += " " + tmpIR + " " + rtSrc;
+         cmd += " " + tmpIR + " " + rtSrc + " " + mgmpSrc;
          cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic -ldl 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
