@@ -3023,6 +3023,265 @@ PerlArray *perl_array_autoviv_array(PerlArray *a, long long idx) {
     return inner;
 }
 
+/* Ensure $a[idx] holds an array ref; create one if missing/undef.
+ * Variant that takes a PerlValue* (not a slot pointer) — the caller
+ * is responsible for storing the result back into the container.
+ * Handles FLAT_ARRAY: extracts inline doubles into a proper REF_ARRAY
+ * before setting (preserving the data, unlike perl_array_autoviv_array
+ * which would silently destroy a FLAT_ARRAY element). */
+PerlArray *perl_array_autoviv_array_from_scalar(PerlValue **slot, long long idx) {
+    long long i = idx < 0 ? idx + 1 : idx;
+    /* If slot points to an existing element, use it; otherwise create undef */
+    PerlValue *pv = *slot;
+    if (pv && pv->tag == PERL_REF_ARRAY)
+        return (PerlArray *)pv->pval;
+    /* FLAT_ARRAY: extract inline doubles into a proper array */
+    if (pv && pv->tag == PERL_FLAT_ARRAY && pv->matchpos > 0) {
+        PerlArray *inner = perl_anon_array_new();
+        double *dptr = (double *)pv->pval;
+        long long n = pv->matchpos;
+        for (long long j = 0; j < n; j++)
+            perl_array_push(inner, perl_alloc_float(dptr[j]));
+        PerlValue *ref = perl_ref_array(inner);
+        *slot = ref;
+        return inner;
+    }
+    /* FLOAT_PAIR: extract two doubles */
+    if (pv && pv->tag == PERL_FLOAT_PAIR) {
+        PerlArray *inner = perl_anon_array_new();
+        double elem[2]; elem[0] = pv->fval; elem[1] = (double)(long long)pv->matchpos;
+        perl_array_push(inner, perl_alloc_float(elem[0]));
+        perl_array_push(inner, perl_alloc_float(elem[1]));
+        PerlValue *ref = perl_ref_array(inner);
+        *slot = ref;
+        return inner;
+    }
+    /* undef or other: create new array */
+    PerlArray *inner = perl_anon_array_new();
+    PerlValue *ref   = perl_ref_array(inner);
+    *slot = ref;
+    return inner;
+}
+
+/* Convenience: same as perl_array_autoviv_array_from_scalar but for
+ * hash-key access where the caller provides the parent hash and key,
+ * and wants an ARRAY ref (not hash). */
+PerlArray *perl_hash_autoviv_array_idx(PerlHash *parent, const char *key) {
+    PerlHashEntry *e = hash_find(parent, key);
+    if (e) {
+        PerlValue **slot = &e->val;
+        PerlValue *pv = *slot;
+        if (pv && pv->tag == PERL_REF_ARRAY)
+            return (PerlArray *)pv->pval;
+        /* FLAT_ARRAY: extract into proper array */
+        if (pv && pv->tag == PERL_FLAT_ARRAY && pv->matchpos > 0) {
+            PerlArray *inner = perl_anon_array_new();
+            double *dptr = (double *)pv->pval;
+            long long n = pv->matchpos;
+            for (long long j = 0; j < n; j++)
+                perl_array_push(inner, perl_alloc_float(dptr[j]));
+            PerlValue *ref = perl_ref_array(inner);
+            *slot = ref;
+            return inner;
+        }
+        /* FLOAT_PAIR: extract two doubles */
+        if (pv && pv->tag == PERL_FLOAT_PAIR) {
+            PerlArray *inner = perl_anon_array_new();
+            double elem2[2]; elem2[0] = pv->fval; elem2[1] = (double)(long long)pv->matchpos;
+            perl_array_push(inner, perl_alloc_float(elem2[0]));
+            perl_array_push(inner, perl_alloc_float(elem2[1]));
+            PerlValue *ref = perl_ref_array(inner);
+            *slot = ref;
+            return inner;
+        }
+    }
+    PerlArray *inner = perl_anon_array_new();
+    PerlValue *ref   = perl_ref_array(inner);
+    if (e) {
+        perl_free(e->val);
+        e->val = ref;
+    } else {
+        unsigned int b = hash_str(key);
+        PerlHashEntry *ne = malloc(sizeof *ne);
+        ne->key  = strdup(key); ne->val = ref;
+        ne->next = parent->buckets[b]; parent->buckets[b] = ne;
+        parent->size++;
+    }
+    return inner;
+}
+
+/* PerlValue*-key variant: stringifies the key before delegating. */
+PerlArray *perl_hash_autoviv_array_idx_sv(PerlHash *parent, PerlValue *key_pv) {
+    char *ks = perl_to_string_dup(key_pv);
+    PerlArray *ret = perl_hash_autoviv_array_idx(parent, ks);
+    free(ks);
+    return ret;
+}
+
+/* Convenience: same as perl_array_autoviv_array_from_scalar but for
+ * array-index access where the caller provides the parent array and
+ * index, and wants a HASH ref (not array). */
+PerlHash *perl_array_autoviv_hash_idx(PerlArray *parent, long long idx) {
+    long long i = idx < 0 ? idx + parent->len : idx;
+    if (i < 0 || i >= parent->len) {
+        while ((long long)parent->len <= i)
+            perl_array_push(parent, perl_alloc_undef());
+    }
+    PerlValue **elem = &parent->elems[i];
+    PerlValue *pv = *elem;
+    if (pv && pv->tag == PERL_REF_HASH)
+        return (PerlHash *)pv->pval;
+    /* FLAT_ARRAY: extract into proper array, then create hash */
+    if (pv && pv->tag == PERL_FLAT_ARRAY && pv->matchpos > 0) {
+        PerlArray *tmp = perl_anon_array_new();
+        double *dptr = (double *)pv->pval;
+        long long n = pv->matchpos;
+        for (long long j = 0; j < n; j++)
+            perl_array_push(tmp, perl_alloc_float(dptr[j]));
+        PerlValue *ref = perl_ref_array(tmp);
+        *elem = ref;
+        pv = ref;
+    }
+    if (pv && pv->tag == PERL_FLOAT_PAIR) {
+        PerlArray *tmp = perl_anon_array_new();
+        double elem2[2]; elem2[0] = pv->fval; elem2[1] = (double)(long long)pv->matchpos;
+        perl_array_push(tmp, perl_alloc_float(elem2[0]));
+        perl_array_push(tmp, perl_alloc_float(elem2[1]));
+        PerlValue *ref = perl_ref_array(tmp);
+        *elem = ref;
+        pv = ref;
+    }
+    if (pv && pv->tag == PERL_REF_HASH)
+        return (PerlHash *)pv->pval;
+    PerlHash *inner = perl_anon_hash_new();
+    PerlValue *ref  = perl_ref_hash(inner);
+    *elem = ref;
+    return inner;
+}
+
+/* Convenience: same as perl_array_autoviv_array_from_scalar but for
+ * array-index access where the caller provides the parent array and
+ * index.  Returns the inner array ref.  The caller must store the
+ * result back into the parent array if a new container was created. */
+PerlArray *perl_array_autoviv_array_idx(PerlArray *parent, long long idx) {
+    long long i = idx < 0 ? idx + parent->len : idx;
+    if (i < 0 || i >= parent->len) {
+        /* Index out of bounds — create undef slot, then autoviv */
+        while ((long long)parent->len <= i)
+            perl_array_push(parent, perl_alloc_undef());
+    }
+    PerlValue **elem = &parent->elems[i];
+    return perl_array_autoviv_array_from_scalar(elem, idx);
+}
+
+/* Convenience: same as perl_array_autoviv_array_from_scalar but for
+ * hash-key access where the caller provides the parent hash and key. */
+PerlHash *perl_hash_autoviv_hash_idx(PerlHash *parent, const char *key) {
+    PerlHashEntry *e = hash_find(parent, key);
+    if (e) {
+        PerlValue **slot = &e->val;
+        PerlValue *pv = *slot;
+        if (pv && pv->tag == PERL_REF_HASH)
+            return (PerlHash *)pv->pval;
+        /* FLAT_ARRAY: extract into proper array, then create hash */
+        if (pv && pv->tag == PERL_FLAT_ARRAY && pv->matchpos > 0) {
+            PerlArray *tmp = perl_anon_array_new();
+            double *dptr = (double *)pv->pval;
+            long long n = pv->matchpos;
+            for (long long j = 0; j < n; j++)
+                perl_array_push(tmp, perl_alloc_float(dptr[j]));
+            PerlValue *ref = perl_ref_array(tmp);
+            *slot = ref;
+            pv = ref;
+        }
+        if (pv && pv->tag == PERL_FLOAT_PAIR) {
+            PerlArray *tmp = perl_anon_array_new();
+            double elem2[2]; elem2[0] = pv->fval; elem2[1] = (double)(long long)pv->matchpos;
+            perl_array_push(tmp, perl_alloc_float(elem2[0]));
+            perl_array_push(tmp, perl_alloc_float(elem2[1]));
+            PerlValue *ref = perl_ref_array(tmp);
+            *slot = ref;
+            pv = ref;
+        }
+        if (pv && pv->tag == PERL_REF_HASH)
+            return (PerlHash *)pv->pval;
+    }
+    PerlHash *inner = perl_anon_hash_new();
+    PerlValue *ref  = perl_ref_hash(inner);
+    if (e) {
+        perl_free(e->val);
+        e->val = ref;
+    } else {
+        unsigned int b = hash_str(key);
+        PerlHashEntry *ne = malloc(sizeof *ne);
+        ne->key  = strdup(key); ne->val = ref;
+        ne->next = parent->buckets[b]; parent->buckets[b] = ne;
+        parent->size++;
+    }
+    return inner;
+}
+
+/* Ensure $a[idx] holds a hash ref; create one if missing/undef.
+ * Handles FLAT_ARRAY and FLOAT_PAIR the same way as the array version. */
+PerlHash *perl_array_autoviv_hash_from_scalar(PerlValue **slot, long long idx) {
+    PerlValue *pv = *slot;
+    if (pv && pv->tag == PERL_REF_HASH)
+        return (PerlHash *)pv->pval;
+    /* FLAT_ARRAY: extract into proper array, then autoviv hash from that */
+    if (pv && pv->tag == PERL_FLAT_ARRAY && pv->matchpos > 0) {
+        PerlArray *tmp = perl_anon_array_new();
+        double *dptr = (double *)pv->pval;
+        long long n = pv->matchpos;
+        for (long long j = 0; j < n; j++)
+            perl_array_push(tmp, perl_alloc_float(dptr[j]));
+        PerlValue *ref = perl_ref_array(tmp);
+        *slot = ref;
+        pv = ref;
+    }
+    /* FLOAT_PAIR: same treatment */
+    if (pv && pv->tag == PERL_FLOAT_PAIR) {
+        PerlArray *tmp = perl_anon_array_new();
+        double elem[2]; elem[0] = pv->fval; elem[1] = (double)(long long)pv->matchpos;
+        perl_array_push(tmp, perl_alloc_float(elem[0]));
+        perl_array_push(tmp, perl_alloc_float(elem[1]));
+        PerlValue *ref = perl_ref_array(tmp);
+        *slot = ref;
+        pv = ref;
+    }
+    if (pv && pv->tag == PERL_REF_HASH)
+        return (PerlHash *)pv->pval;
+    PerlHash *inner = perl_anon_hash_new();
+    PerlValue *ref  = perl_ref_hash(inner);
+    *slot = ref;
+    return inner;
+}
+
+/* Read-only: get element at $ref->[idx], autovivifying if needed.
+ * Returns the element's value (cloned) or undef if the slot is empty.
+ * Unlike perl_array_get, this handles FLAT_ARRAY rows by creating
+ * a temporary REF_ARRAY wrapper on first access. */
+PerlValue *perl_deref_array_auto(PerlValue *ref_pv, long long idx) {
+    if (!ref_pv || ref_pv->tag != PERL_REF_ARRAY)
+        return perl_alloc_undef();
+    PerlArray *a = (PerlArray *)ref_pv->pval;
+    long long i = idx < 0 ? idx + a->len : idx;
+    if (i < 0 || i >= a->len)
+        return perl_alloc_undef();
+    PerlValue *elem = a->elems[i];
+    if (!elem || elem->tag == PERL_UNDEF)
+        return perl_alloc_undef();
+    /* FLAT_ARRAY row: return a cloned copy of each element */
+    if (elem->tag == PERL_FLAT_ARRAY && elem->matchpos > 0) {
+        /* Return the first element as a proxy (caller should use [0] explicitly) */
+        double *dptr = (double *)elem->pval;
+        return perl_alloc_float(dptr[0]);
+    }
+    if (elem->tag == PERL_FLOAT_PAIR) {
+        return perl_alloc_float(elem->fval);
+    }
+    return perl_clone(elem);
+}
+
 /* Lvalue hash-slice assignment: @h{@keys} = @vals  (zip keys→vals) */
 void perl_hash_assign_slice(PerlHash *h, PerlArray *keys, PerlArray *vals) {
     long long n = keys->len < vals->len ? keys->len : vals->len;

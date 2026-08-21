@@ -262,18 +262,23 @@ private:
     bool isCallLikeForContext(const Node &n); /* D12: safe to propagate outer list context into this node's own call */
     llvm::Value *emitCall(const Node &n);
     llvm::Value *emitLValue(const Node &n); /* returns alloca */
-    /* Recursively resolve (autovivifying every missing intermediate level)
-       the container that `node` — a chain of HashElem/ArrayElem/ArrowDeref
-       subscripts — refers to. `wantHash` says whether the container at
-       node's own level should end up a PerlHash* (true) or PerlArray*
-       (false), i.e. what the *next* outer subscript needs. Returns nullptr
-       if the root variable isn't found. Used for $h{a}{b}{c}=val chains of
-       arbitrary depth (2-level chains happened to work before because they
-       bottom out directly at a HashElem/ArrayElem; 3+ levels didn't, because
-       the base of the outer ArrowDeref is itself another ArrowDeref, which
-       wasn't recursed into). */
-    llvm::Value *emitAutovivContainer(const Node &node, bool wantHash);
-    void   emitSub(const Node &n);
+     /* Recursively resolve (autovivifying every missing intermediate level)
+        the container that `node` — a chain of HashElem/ArrayElem/ArrowDeref
+        subscripts — refers to. `wantHash` says whether the container at
+        node's own level should end up a PerlHash* (true) or PerlArray*
+        (false), i.e. what the *next* outer subscript needs. Returns nullptr
+        if the root variable isn't found. Used for $h{a}{b}{c}=val chains of
+        arbitrary depth (2-level chains happened to work before because they
+        bottom out directly at a HashElem/ArrayElem; 3+ levels didn't, because
+        the base of the outer ArrowDeref is itself another ArrowDeref, which
+        wasn't recursed into). */
+     llvm::Value *emitAutovivContainer(const Node &node, bool wantHash);
+     /* D50: emit `$ref->[i] = val` or `$ref->{k} = val` for scalar-ref-rooted
+        chains with at least one array-index level.  Uses _from_scalar helpers
+        that safely handle FLAT_ARRAY/FLOAT_PAIR.  `targetIsHash` says whether
+        the final ArrowDeref is a hash-key (true) or array-index (false). */
+     llvm::Value *emitScalarRootedAutovivAssign(const Node &chain, bool targetIsHash, llvm::Value *rhs);
+     void   emitSub(const Node &n);
 
     llvm::Value *callRT(const std::string &name,
                         std::initializer_list<llvm::Value *> args);

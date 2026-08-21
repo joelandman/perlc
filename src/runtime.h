@@ -305,6 +305,21 @@ PerlArray *perl_hash_autoviv_array(PerlHash *h, const char *key);
 PerlArray *perl_hash_autoviv_array_sv(PerlHash *h, PerlValue *key);
 PerlHash  *perl_array_autoviv_hash(PerlArray *a, long long idx);
 PerlArray *perl_array_autoviv_array(PerlArray *a, long long idx);
+/* D50: scalar-ref-rooted autoviv — handle FLAT_ARRAY/FLOAT_PAIR safely.
+ * slot points to the element pointer inside the parent container (or a
+ * temporary slot the caller owns).  idx is the array index. */
+PerlArray *perl_array_autoviv_array_from_scalar(PerlValue **slot, long long idx);
+PerlHash  *perl_array_autoviv_hash_from_scalar(PerlValue **slot, long long idx);
+/* D50: convenience helpers for intermediate chain levels. */
+PerlArray *perl_array_autoviv_array_idx(PerlArray *parent, long long idx);
+ PerlHash  *perl_hash_autoviv_hash_idx(PerlHash *parent, const char *key);
+ /* D50: cross-type autoviv — array-index wanting hash, hash-key wanting array. */
+ PerlHash  *perl_array_autoviv_hash_idx(PerlArray *parent, long long idx);
+ PerlArray *perl_hash_autoviv_array_idx(PerlHash *parent, const char *key);
+ /* PerlValue*-key variant. */
+ PerlArray *perl_hash_autoviv_array_idx_sv(PerlHash *parent, PerlValue *key_pv);
+ /* D50: read with autoviv — returns cloned element or undef. */
+ PerlValue *perl_deref_array_auto(PerlValue *ref_pv, long long idx);
 
 /* lvalue slice assignment */
 void perl_hash_assign_slice(PerlHash *h, PerlArray *keys, PerlArray *vals);

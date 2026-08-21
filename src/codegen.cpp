@@ -305,6 +305,15 @@ void CodeGen::declareRuntime() {
     RT("perl_hash_autoviv_array_sv",av, av, pv);
     RT("perl_array_autoviv_hash",   av, av, i64);
     RT("perl_array_autoviv_array",  av, av, i64);
+    /* D50: scalar-ref-rooted autoviv (handles FLAT_ARRAY/FLOAT_PAIR safely) */
+    RT("perl_array_autoviv_array_from_scalar", av, perlPtrTy_, i64);
+    RT("perl_array_autoviv_hash_from_scalar",  av, perlPtrTy_, i64);
+    RT("perl_array_autoviv_array_idx",         av, av, i64);
+    RT("perl_hash_autoviv_hash_idx",           av, av, pv);
+    RT("perl_array_autoviv_hash_idx",          av, av, i64);
+    RT("perl_hash_autoviv_array_idx",          av, pv, av);
+    RT("perl_hash_autoviv_array_idx_sv",       av, av, pv);
+    RT("perl_deref_array_auto",                pv, pv, i64);
     RT("perl_hash_assign_slice",    voidTy, av, av, av);
     RT("perl_array_assign_slice",   voidTy, av, av, av);
     RT("perl_array_sort_str",   voidTy, av);
@@ -1556,6 +1565,44 @@ static bool isScalarRootedAllHashChain(const Node &n) {
     if (n.kind == NK::ScalarVar) return true;
     if (n.kind == NK::ArrowDeref) return n.sval == "hash" && isScalarRootedAllHashChain(*n.left);
     return false;
+}
+
+/* D50: is `n` a chain rooted in a bare scalar variable that contains
+ * at least one array-index ArrowDeref level?  Unlike
+ * isScalarRootedAllHashChain (which requires *all* levels to be
+ * hash-key), this accepts chains like `$ref->[0][1]`, `$ref->[0]{k}`,
+ * `$ref->{a}[0]`, etc.  The caller must use the new _from_scalar
+ * runtime helpers (which handle FLAT_ARRAY safely) instead of the
+ * plain perl_array_autoviv_* functions. */
+static bool isScalarRootedChainWithArrayIndex(const Node &n) {
+    if (n.kind == NK::ScalarVar) return false;
+    if (n.kind == NK::ArrowDeref) {
+        bool hasArray = (n.sval == "array");
+        return hasArray || isScalarRootedChainWithArrayIndex(*n.left);
+    }
+    return false;
+}
+
+/* D50: is `n` a chain that contains at least one array-index ArrowDeref
+ * level and is NOT purely element-rooted (HashElem/ArrayElem base)?
+ * This catches chains like `$ref->{a}[0]`, `$ref->[0][1]`, etc.
+ * that need the _from_scalar autoviv helpers. */
+static bool needsScalarRootedAutoviv(const Node &n) {
+    /* Check if chain has any array-index level */
+    bool hasArrayIndex = false;
+    const Node *cur = &n;
+    while (cur->kind == NK::ArrowDeref) {
+        if (cur->sval == "array") hasArrayIndex = true;
+        cur = cur->left.get();
+    }
+    if (!hasArrayIndex) return false;
+    /* Check if chain is NOT purely element-rooted (HashElem/ArrayElem base) */
+    if (cur->kind == NK::HashElem || cur->kind == NK::ArrayElem) {
+        /* Element-rooted chains are handled by existing isElemRootedChain */
+        return false;
+    }
+    /* Scalar-var rooted or other: needs our special handling */
+    return true;
 }
 
 Value *CodeGen::emitHashGetRef(Value *hv, const Node &keyNode) {
@@ -3640,7 +3687,8 @@ void CodeGen::emitStmt(const Node &n) {
                    overload dispatch path in perl_add/perl_mul/etc. */
                 bool rhsMayBeBlessed = n.right &&
                     (n.right->kind == NK::MethodCall ||
-                     n.right->kind == NK::BlessFunc);
+                     n.right->kind == NK::BlessFunc ||
+                     n.right->kind == NK::Call);
                 bool mayBeCaptured = capturedNamesInCurrentFn_.count(nm) != 0;
                 if (n.right && !atFileScope && !rhsMayBeRef && !rhsMayBeBlessed && !mayBeCaptured) {
                     if (Value *ival = emitExprI64(*n.right)) {
@@ -5376,17 +5424,15 @@ Value *CodeGen::emitExpr(const Node &n) {
                     return rhs;
                 }
                 /* autovivify $h{a}{b}[i] = val or deeper chains — base is
-                   itself another ArrowDeref rooted in a hash/array element
-                   (2+ levels before this one), OR (D50) a chain rooted in
-                   a bare scalar variable where every level up to here is
-                   a hash-key access, e.g. $ref->{a}[i] — safe, since that
-                   only ever calls perl_hash_autoviv_array (hash-key
-                   based), never perl_array_autoviv_array (the one with
-                   the FLAT_ARRAY-destruction risk, D40). A scalar-ref-
-                   rooted chain with an array-index level anywhere, like
-                   $ref->[0][1], is NOT routed here — it must keep using
-                   the FLAT_ARRAY-aware fallback below (TESTS.md's D50
-                   entry). */
+                    itself another ArrowDeref rooted in a hash/array element
+                    (2+ levels before this one), OR (D50) a chain rooted in
+                    a bare scalar variable where every level up to here is
+                    a hash-key access, e.g. $ref->{a}[i] — safe, since that
+                    only ever calls perl_hash_autoviv_array (hash-key
+                    based), never perl_array_autoviv_array (the one with
+                    the FLAT_ARRAY-destruction risk, D40). A scalar-ref-
+                    rooted chain with an array-index level anywhere, like
+                    $ref->[0][1], is NOT routed here — handled below. */
                 if (n.left->left->kind == NK::ArrowDeref &&
                     (isElemRootedChain(*n.left->left) ||
                      isScalarRootedAllHashChain(*n.left->left))) {
@@ -5394,6 +5440,12 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (!innerAv) return perlUndef();
                     callRT("perl_array_set", {innerAv, idx, rhs});
                     return rhs;
+                }
+                /* D50: chains with array-index levels that need special handling.
+                    This includes scalar-ref-rooted chains like $ref->[0][1],
+                    and mixed chains like $ref->{a}[0][1]. */
+                if (needsScalarRootedAutoviv(*n.left)) {
+                    return emitScalarRootedAutovivAssign(*n.left, false, rhs);
                 }
                 /* regular $ref->[i] = val */
                 Value *base = emitExpr(*n.left->left);
@@ -5465,23 +5517,27 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *outerIdx = emitIdx(*n.left->left->left);
                     hv = callRT("perl_array_autoviv_hash", {av, outerIdx});
                 } else if (n.left->left->kind == NK::ArrowDeref &&
-                           (isElemRootedChain(*n.left->left) ||
-                            isScalarRootedAllHashChain(*n.left->left))) {
+                            (isElemRootedChain(*n.left->left) ||
+                             isScalarRootedAllHashChain(*n.left->left))) {
                     /* $h{a}{b}{c} = val or deeper chains — base is itself
-                       another ArrowDeref rooted in a hash/array element
-                       (2+ levels before this one), OR (D50) a chain
-                       rooted in a bare scalar variable holding a ref
-                       where every level is a hash-key access, e.g.
-                       $ref->{a}{b} — safe to autoviv all the way down
-                       since a hash has no FLAT_ARRAY-equivalent
-                       optimization to accidentally destroy (see
-                       isScalarRootedAllHashChain's comment). A chain
-                       with an array-index level anywhere still falls to
-                       the plain-deref branch below, unchanged — that
-                       case keeps the D40-established FLAT_ARRAY safety
-                       margin (TESTS.md's D50 entry). */
+                        another ArrowDeref rooted in a hash/array element
+                        (2+ levels before this one), OR (D50) a chain
+                        rooted in a bare scalar variable holding a ref
+                        where every level is a hash-key access, e.g.
+                        $ref->{a}{b} — safe to autoviv all the way down
+                        since a hash has no FLAT_ARRAY-equivalent
+                        optimization to accidentally destroy (see
+                        isScalarRootedAllHashChain's comment). A chain
+                        with an array-index level anywhere still falls to
+                        the plain-deref branch below, unchanged — that
+                        case keeps the D40-established FLAT_ARRAY safety
+                        margin (TESTS.md's D50 entry). */
                     hv = emitAutovivContainer(*n.left->left, true);
                     if (!hv) return perlUndef();
+                } else if (needsScalarRootedAutoviv(*n.left)) {
+                    /* D50: chain with array-index level, hash-key target:
+                        e.g. $ref->[0]{k} = val or $ref->{a}[0]{k} = val. */
+                    return emitScalarRootedAutovivAssign(*n.left, true, rhs);
                 } else {
                     Value *base = emitExpr(*n.left->left);
                     hv = callRT("perl_deref_hash", {base});
@@ -7805,34 +7861,121 @@ Value *CodeGen::emitAutovivContainer(const Node &node, bool wantHash) {
         return callRT(wantHash ? "perl_array_autoviv_hash" : "perl_array_autoviv_array",
                        {container, idx});
     }
-    /* Base case: a plain ref-producing expression (e.g. a $scalar variable
-       holding a ref already). Matches the pre-existing fallback behavior
-       used elsewhere for `$ref->{k} = val` / `$ref->[i] = val` on a bare
-       scalar base — NOT full autoviv-from-undef-scalar (a separate, deeper
-       gap: TESTS.md D50), just a normal deref of whatever's there. */
+     /* Base case: a plain ref-producing expression (e.g. a $scalar variable
+        holding a ref already). Matches the pre-existing fallback behavior
+        used elsewhere for `$ref->{k} = val` / `$ref->[i] = val` on a bare
+        scalar base — NOT full autoviv-from-undef-scalar (a separate, deeper
+        gap: TESTS.md D50), just a normal deref of whatever's there. */
     Value *base = emitExpr(node);
     Value *result = callRT(wantHash ? "perl_deref_hash" : "perl_deref_array", {base});
     freeIfOwned(base);
     return result;
 }
 
+/* D50: emit code for `$ref->[i] = val` or `$ref->{k} = val` where the
+ * chain contains at least one array-index level and is not purely
+ * element-rooted with all-hash-key access.  Walks the chain from the
+ * base, using _from_scalar autoviv helpers that safely handle
+ * FLAT_ARRAY/FLOAT_PAIR.  `targetIsHash` indicates whether the final
+ * ArrowDeref is a hash-key. */
+Value *CodeGen::emitScalarRootedAutovivAssign(const Node &chain, bool targetIsHash, Value *rhs) {
+    /* Collect steps from base outward.  Each step is either a hash-key
+     * or an array-index.  The last step is the target. */
+    struct Step {
+        bool isHash;
+        const Node *key;
+        Step(bool h, const Node *k) : isHash(h), key(k) {}
+    };
+    std::vector<Step> steps;
+    const Node *cur = &chain;
+    while (cur->kind == NK::ArrowDeref) {
+        steps.push_back(Step((cur->sval == "hash"), cur->right.get()));
+        cur = cur->left.get();
+    }
+    std::reverse(steps.begin(), steps.end());
+    /* cur now points to the base (ScalarVar, HashElem, or ArrayElem). */
+
+    /* Evaluate the base and get the initial container PV*. */
+    Value *base;
+    if (cur->kind == NK::ScalarVar) {
+        base = emitExpr(*cur);
+        freeIfOwned(base);
+    } else if (cur->kind == NK::HashElem) {
+        /* HashElem base: get hash from named variable, then get slot. */
+        Value *hv = lookupHash(cur->name);
+        if (!hv) return perlUndef();
+        Value *key = emitExpr(*cur->left);
+        base = callRT("perl_hash_get_sv", {hv, key});
+        freeIfOwned(key);
+    } else if (cur->kind == NK::ArrayElem) {
+        /* ArrayElem base: get array from named variable, then get element. */
+        Value *av = lookupArray(cur->name);
+        if (!av) return perlUndef();
+        Value *idx = emitIdx(*cur->left);
+        base = callRT("perl_array_get", {av, idx});
+    } else {
+        return perlUndef();
+    }
+
+    /* Walk intermediate steps (all but the last). */
+    for (size_t i = 0; i + 1 < steps.size(); i++) {
+        auto &step = steps[i];
+        /* Check what the NEXT step needs: if next is array-index, we need
+         * an array ref; if next is hash-key, we need a hash ref. */
+        bool nextIsHash = steps[i + 1].isHash;
+        if (step.isHash) {
+            /* Hash-key level: deref current PV* as hash, autoviv appropriate
+             * container type based on what the next step needs. */
+            Value *key = emitExpr(*step.key);
+            Value *hv = callRT("perl_deref_hash", {base});
+            if (nextIsHash) {
+                /* Next step needs hash: autoviv hash */
+                callRT("perl_hash_autoviv_hash_idx", {hv, key});
+            } else {
+                /* Next step needs array: autoviv array */
+                callRT("perl_hash_autoviv_array_idx_sv", {hv, key});
+            }
+            /* Read back the PV* at that slot for the next iteration. */
+            base = callRT("perl_hash_get_sv", {hv, key});
+            freeIfOwned(key);
+        } else {
+            /* Array-index level: deref current PV* as array, autoviv element.
+             * The element type is determined by the next step. */
+            Value *av = callRT("perl_deref_array", {base});
+            Value *idx = emitIdx(*step.key);
+            if (nextIsHash) {
+                /* Next step needs hash: autoviv hash at this array index */
+                callRT("perl_array_autoviv_hash_idx", {av, idx});
+            } else {
+                /* Next step needs array: autoviv array at this array index */
+                callRT("perl_array_autoviv_array_idx", {av, idx});
+            }
+            /* Read back the PV* at that slot for the next iteration. */
+            base = callRT("perl_array_get", {av, idx});
+        }
+    }
+
+    /* Final step: the target ArrowDeref. */
+    auto &target = steps.back();
+    if (target.isHash) {
+        /* Hash-key target: $ref->...->{key} = val */
+        Value *key = emitExpr(*target.key);
+        Value *hv = callRT("perl_deref_hash", {base});
+        callRT("perl_hash_set_sv", {hv, key, rhs});
+        freeIfOwned(key);
+    } else {
+        /* Array-index target: $ref->...->[idx] = val
+         * For array-index target, we set the value DIRECTLY at the index.
+         * No autoviv needed for the target itself — the value IS the target. */
+        Value *av = callRT("perl_deref_array", {base});
+        Value *idx = emitIdx(*target.key);
+        callRT("perl_array_set", {av, idx, rhs});
+    }
+    return rhs;
+}
+
 Value *CodeGen::emitLValue(const Node &n) {
     switch (n.kind) {
-    case NK::ScalarVar: {
-        auto *slot = lookupVar(n.name);
-        if (!slot) {
-            /* auto-vivify global-ish variable in current scope */
-            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
-            builder_.CreateStore(perlUndef(), alloca);
-            declareVar(n.name, alloca);
-            return alloca;
-        }
-        return slot;
-    }
-    case NK::ArrayElem: {
-        /* returns nullptr — array element assignment handled separately */
-        return nullptr;
-    }
     case NK::DollarAt: {
         /* D52: $@'s underlying storage (s_dollar_at) is a stable
            thread-local PerlValue, not a PerlValue* alloca slot like
@@ -7843,6 +7986,40 @@ Value *CodeGen::emitLValue(const Node &n) {
         Value *dollarAt = callRT("perl_get_dollar_at", {});
         auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "dollarat.slot");
         builder_.CreateStore(dollarAt, slot);
+        return slot;
+    }
+    case NK::ScalarVar: {
+        /* D97: special global variables ($,, $\, $!, $/, $., $&, $0,
+           $AUTOLOAD) have stable thread-local storage in the runtime,
+           not alloca slots.  Wrap their stable pointer in a temporary
+           alloca so the generic assign/compound-assign path writes to
+           the real global, not a disconnected fresh alloca. */
+        static const std::unordered_map<std::string, const char*> specialGlobals = {
+            {",",   "perl_get_dollar_comma"},
+            {"\\",  "perl_get_dollar_bsl"},
+            {"!",   "perl_get_dollar_bang"},
+            {"/",   "perl_get_input_sep"},
+            {".",   "perl_get_dollar_dot"},
+            {"&",   "perl_get_dollar_amp"},
+            {"AUTOLOAD", "perl_get_autoload_name"},
+            {"0",   "perl_get_dollar0"},
+        };
+        auto it = specialGlobals.find(n.name);
+        if (it != specialGlobals.end()) {
+            Value *gv = callRT(it->second, {});
+            auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr,
+                                                std::string("spec.") + n.name);
+            builder_.CreateStore(gv, slot);
+            return slot;
+        }
+        auto *slot = lookupVar(n.name);
+        if (!slot) {
+            /* auto-vivify global-ish variable in current scope */
+            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+            builder_.CreateStore(perlUndef(), alloca);
+            declareVar(n.name, alloca);
+            return alloca;
+        }
         return slot;
     }
     default: return nullptr;
