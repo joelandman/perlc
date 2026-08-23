@@ -675,8 +675,18 @@ PerlValue *perl_eval_string(PerlValue *code_pv);
    FLAT_ARRAY or REF_ARRAY.  Re-reads the row PV's tag/pval to avoid using a
    stale flat-row cache (the row may have been lazy-converted by an earlier read
    in the same loop body).  op: 0=+,1=-,2=*,3=/.  Returns the boxed result. */
-PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
-                                   PerlValue *rhs_pv, int op);
+ PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
+                                    PerlValue *rhs_pv, int op);
+ /* D98: set one element in a 2D row that may be FLAT_ARRAY or REF_ARRAY.
+    Keeps FLAT_ARRAY rows flat (writes the numified value into the backing
+    double[] in bounds) so the "all rows flat" read fast-path assumption stays
+    valid; otherwise falls back to the normal converting set.  Clones v. */
+ PerlValue *perl_array_set_row(PerlValue *row_pv, long long idx, PerlValue *v);
+ /* D98: ensure parent[idx] holds an array ref, creating one only if missing/
+    undef — but (unlike perl_array_autoviv_array_idx) it does NOT convert an
+    existing FLAT_ARRAY/FLOAT_PAIR row to a REF_ARRAY, preserving the "all rows
+    flat" invariant the 2D read fast-path relies on.  Returns void. */
+ void perl_array_ensure_slot(PerlArray *parent, long long idx);
 
 /* ── operator overloading (use overload) ─────────────────────────────────── */
 /* Register an overload for a class.  op is the Perl overload key (e.g. "+",

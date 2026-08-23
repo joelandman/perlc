@@ -8225,6 +8225,52 @@ PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
     return perl_alloc_float(r);
 }
 
+/* D98: set a single element in a 2D array row that may be FLAT_ARRAY or
+   REF_ARRAY.  For FLAT_ARRAY rows that still have the slot in bounds, write
+   the numified value directly into the backing double[] so the row STAYS
+   FLAT_ARRAY.  Lazy-converting it here (as the old perl_deref_array did) would
+   flip its tag to REF_ARRAY, invalidating the "all rows flat" assumption the
+   flat read fast-paths bake in via llvm.assume — a later read would then load
+   pval (now a PerlArray*) as a double* and segfault.  Out-of-bounds (grow) or
+   non-flat rows fall back to the normal converting path.  Mirrors
+   perl_array_set's ownership convention (clones v; caller retains v). */
+PerlValue *perl_array_set_row(PerlValue *row_pv, long long idx, PerlValue *v) {
+    if (row_pv && row_pv->tag == PERL_FLAT_ARRAY &&
+        idx >= 0 && idx < row_pv->matchpos) {
+        double *flat = (double *)row_pv->pval;
+        flat[idx] = perl_to_float(v);
+        return v;
+    }
+    PerlArray *av = perl_deref_array(row_pv);
+    perl_array_set(av, idx, v);
+    return v;
+}
+
+/* D98: ensure parent[idx] holds an array ref, creating one ONLY if the slot is
+   missing/undef.  Unlike perl_array_autoviv_array_idx (which routes through
+   perl_array_autoviv_array_from_scalar), this does NOT convert an existing
+   FLAT_ARRAY/FLOAT_PAIR row into a REF_ARRAY.  That conversion was what broke
+   the "all rows flat" invariant: the 2D read fast-path bakes in
+   llvm.assume(tag==FLAT_ARRAY) — sound only if rows never convert — so a write
+   that flipped a row to REF_ARRAY left a later read loading pval (now a
+   PerlArray*) as a double*, segfaulting.  Leaving the row untouched keeps the
+   invariant intact.  Returns void. */
+void perl_array_ensure_slot(PerlArray *parent, long long idx) {
+    long long i = idx < 0 ? idx + parent->len : idx;
+    if (i < 0 || i >= parent->len) {
+        while ((long long)parent->len <= i)
+            perl_array_push(parent, perl_alloc_undef());
+    }
+    PerlValue *pv = parent->elems[i];
+    if (!pv || pv->tag == PERL_UNDEF) {
+        PerlArray *inner = perl_anon_array_new();
+        PerlValue *ref = perl_ref_array(inner);
+        perl_array_set(parent, i, ref);
+        perl_free(ref);
+    }
+    /* FLAT_ARRAY / REF_ARRAY / FLOAT_PAIR / other: leave untouched (no convert). */
+}
+
 /* ── Math::BigInt (D97) ───────────────────────────────────────────────────── */
 /* Uses mini-gmp (compiled into the runtime, zero external dependency).
    Math::BigInt objects are PerlValue with tag=PERL_BIGINT, pval=mpz_t*,

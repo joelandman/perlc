@@ -255,6 +255,8 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
     RT("perl_flat_row_op_assign", pv,     pv, i64, pv, Type::getInt32Ty(ctx_));
+    RT("perl_array_set_row",      pv,     pv, i64, pv);
+    RT("perl_array_ensure_slot",  voidTy, av, i64);
     /* D97: Math::BigInt built-in methods */
     RT("perl_bigint_new",         pv,     pv);
     RT("perl_bigint_bmul",        pv,     pv, pv);
@@ -6069,8 +6071,16 @@ Value *CodeGen::emitExpr(const Node &n) {
                         av = callRT("perl_deref_array", {innerRef});
                     }
                 } else {
+                    /* D98: base is a row/ref that may be a FLAT_ARRAY (e.g. the
+                       adjacent form $P[$i][k] op=, whose inner $P[$i] parses to an
+                       ArrayElem, so the 2D fast-path above doesn't apply).
+                       emitExpr returns a BORROWED row ref here, so the safe
+                       perl_deref_array (which lazy-converts FLAT_ARRAY in place)
+                       is correct; the old perl_deref_array_ro returned pval
+                       (a double*) as a PerlArray* and the inline GEP then
+                       dereferenced a double as a pointer → segfault. */
                     Value *base = emitExpr(*n.left->left);
-                    av = callRT("perl_deref_array_ro", {base});
+                    av = callRT("perl_deref_array", {base});
                     freeIfOwned(base);
                 }
                 Value *idx = emitIdx(*n.left->right);
@@ -7947,11 +7957,26 @@ Value *CodeGen::emitScalarRootedAutovivAssign(const Node &chain, bool targetIsHa
                 /* Next step needs hash: autoviv hash at this array index */
                 callRT("perl_array_autoviv_hash_idx", {av, idx});
             } else {
-                /* Next step needs array: autoviv array at this array index */
-                callRT("perl_array_autoviv_array_idx", {av, idx});
+                /* D98: ensure the row exists WITHOUT converting an existing
+                   FLAT_ARRAY.  The old perl_array_autoviv_array_idx flipped a
+                   flat row to REF_ARRAY (perl_array_autoviv_array_from_scalar),
+                   breaking the "all rows flat" invariant the 2D read fast-path
+                   bakes in as llvm.assume(tag==FLAT) → a later read loaded pval
+                   (now a PerlArray*) as a double* and segfaulted (nb.pl/nbody.pl). */
+                callRT("perl_array_ensure_slot", {av, idx});
             }
-            /* Read back the PV* at that slot for the next iteration. */
-            base = callRT("perl_array_get", {av, idx});
+            /* Read back the PV* for the next iteration.
+               D98: for the LAST array intermediate (the row the final
+               array-target writes into) and the target is an array index, borrow
+               the actual row (perl_array_get_ref, no clone) so the final
+               perl_array_set_row writes into the real slot — persists AND keeps
+               it FLAT_ARRAY.  A non-last intermediate's row is dereffed again by
+               perl_deref_array next iteration, so clone it there: the deref then
+               converts a throwaway copy, never the real slot. */
+            if (!nextIsHash && i + 2 == steps.size())
+                base = callRT("perl_array_get_ref", {av, idx});
+            else
+                base = callRT("perl_array_get", {av, idx});
         }
     }
 
@@ -7965,11 +7990,15 @@ Value *CodeGen::emitScalarRootedAutovivAssign(const Node &chain, bool targetIsHa
         freeIfOwned(key);
     } else {
         /* Array-index target: $ref->...->[idx] = val
-         * For array-index target, we set the value DIRECTLY at the index.
-         * No autoviv needed for the target itself — the value IS the target. */
-        Value *av = callRT("perl_deref_array", {base});
+         * D98: `base` here is a row that may be a FLAT_ARRAY.  Use
+         * perl_array_set_row so a flat row is written in place (into its
+         * backing double[]) and STAYS FLAT_ARRAY.  The old perl_deref_array
+         * here lazy-converted the row — and because base is a shallow clone
+         * sharing the row's double[], that conversion free()'d the shared
+         * double[], leaving the original row with a dangling pval that a later
+         * flat read fast-path (baked with llvm.assume(tag==FLAT)) would read. */
         Value *idx = emitIdx(*target.key);
-        callRT("perl_array_set", {av, idx, rhs});
+        callRT("perl_array_set_row", {base, idx, rhs});
     }
     return rhs;
 }
