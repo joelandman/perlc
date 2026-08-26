@@ -964,6 +964,14 @@ HOTX PerlValue *perl_alloc_int(long long n) {
     return v;
 }
 
+/* W1: comparison operators return "1" (IV) or the empty string — real Perl's
+   false comparison value is "", not IV 0: `print ($a < $b)` prints nothing,
+   and `defined ($a < $b)` is true. IV 0 would print "0" (byte-wrong). */
+PerlValue *perl_alloc_bool(long long b) {
+    if (b) return perl_alloc_int(1);
+    return perl_alloc_string_len("", 0);
+}
+
 HOTX PerlValue *perl_alloc_float(double f) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLOAT;
@@ -1335,12 +1343,19 @@ static void perl_format_float(char *buf, size_t bufsz, double d) {
        format as integer to match Perl's default stringification.
        Perl tracks an "integer-ness" flag when integers overflow to float;
        we approximate this by checking if the value is a whole number
-       within i64 range. */
+       within i64 range.
+       W1: but real Perl's %.15g prints an integer NV exactly only within
+       15 significant digits — larger whole-number NVs print scientific
+       (2000000000000000.0 -> "2e+15", not "2000000000000000"). That is
+       exactly what happens in pp_pow for power-of-2 bases (2^50 and up)
+       and for NV pow() fallbacks. */
     if (d > -9223372036854775807.0 && d < 9223372036854775807.0) {
         long long iv = (long long)d;
         if ((double)iv == d) {
-            snprintf(buf, bufsz, "%lld", iv);
-            return;
+            if (iv > -1000000000000000LL && iv < 1000000000000000LL) {
+                snprintf(buf, bufsz, "%lld", iv);
+                return;
+            }
         }
     }
     snprintf(buf, bufsz, "%.15g", d);
@@ -1849,6 +1864,50 @@ PerlValue *perl_pow(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "**", (PerlValue*)a, (PerlValue*)b);
         if (r) return r;
     }
+    /* W1: mirror perl's pp_pow integer path (perl 5.44 pp.c) so the result
+       storage class — and thus stringification — matches real Perl:
+       integer base, integer exponent e >= 0:
+         - |base| a power of 2 (incl. 0/1): exact NV (Perl computes the
+           power in a double); prints integer only while |b^e| < 1e15,
+           scientific (15 sig digits) beyond — same %.15g we use.
+         - e * bitlen(|base|) <= 64: exact UV math; IV when < 2^63.
+         - otherwise: NV pow().
+       Non-integer operands: NV pow(). */
+    if (a && b && a->tag == PERL_INT && b->tag == PERL_INT && b->ival >= 0) {
+        long long av = a->ival, ev = b->ival;
+        unsigned long long ab = av < 0 ? (unsigned long long)(-av)
+                                       : (unsigned long long)av;
+        if (ab == 0) return perl_alloc_float(ev == 0 ? 1.0 : 0.0);
+        int m = 0; { unsigned long long t = ab; while (t >>= 1) m++; }
+        if (ab == 1 || (ab & (ab - 1)) == 0) {
+            /* power-of-2 (or 1) base: Perl keeps an IV only while
+               2^(m*e) < 2^50 (m*e <= 49); beyond that it is an NV. Return the
+               exact integer when in range, else the exact double (a pow() of a
+               power of 2 is exact in a double). */
+            if ((long long)m * (long long)ev <= 49) {
+                unsigned long long r = 1ULL << (m * ev);
+                long long rv = (long long)r;
+                if (av < 0 && (ev & 1)) rv = -rv;
+                return perl_alloc_int(rv);
+            }
+            return perl_alloc_float(pow((double)av, (double)ev));
+        }
+        if ((long long)ev * (long long)(m + 1) <= 64) {
+            /* non-pow-of-2: Perl keeps IV/UV only while e*bitlen(|a|) <= 64
+               (bitlen = m+1); the exact UV is computed below. */
+            unsigned __int128 res = 1, base = ab;
+            for (unsigned long long ee = ev; ee; ee >>= 1) {
+                if (ee & 1) res *= base;
+                if (ee > 1) base *= base;
+            }
+            if (res < ((unsigned __int128)1) << 63) {
+                long long rv = (long long)res;
+                if (av < 0 && (ev & 1)) rv = -rv;
+                return perl_alloc_int(rv);
+            }
+            /* UV >= 2^63: no UV storage in perlc — keep the exact double. */
+        }
+    }
     return perl_alloc_float(pow(perl_to_float(a), perl_to_float(b)));
 }
 
@@ -1877,10 +1936,19 @@ PerlValue *perl_bitnot(const PerlValue *a) {
     return perl_alloc_int(~perl_to_int(a));
 }
 PerlValue *perl_lshift(const PerlValue *a, const PerlValue *b) {
-    return perl_alloc_int(perl_to_int(a) << perl_to_int(b));
+    /* Perl: negative or >= 64 shift counts yield 0 (C shift of >= width
+       is UB; hardware masking silently produced wrong results). */
+    long long cnt = perl_to_int(b);
+    if (cnt < 0 || cnt >= 64) return perl_alloc_int(0);
+    return perl_alloc_int(perl_to_int(a) << cnt);
 }
 PerlValue *perl_rshift(const PerlValue *a, const PerlValue *b) {
-    return perl_alloc_int((unsigned long long)perl_to_int(a) >> perl_to_int(b));
+    /* Perl: >> n for n >= 64 yields 0; >> n for n < 0 is equivalent to
+       << (-n). Logical (unsigned) right shift of the bit pattern. */
+    long long cnt = perl_to_int(b);
+    if (cnt >= 64) return perl_alloc_int(0);
+    if (cnt < 0) return perl_lshift(a, perl_alloc_int(-cnt));
+    return perl_alloc_int((long long)((unsigned long long)perl_to_int(a) >> cnt));
 }
 
 /* ── string ops ──────────────────────────────────────────────────────────── */
@@ -1937,60 +2005,60 @@ PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n_pv) {
 HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c == 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
     }
     if (b && b->blessed_class) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c == 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
     }
-    return perl_alloc_int(perl_to_float(a) == perl_to_float(b));
+    return perl_alloc_bool(perl_to_float(a) == perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c != 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
     }
     if (b && b->blessed_class) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c != 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
     }
-    return perl_alloc_int(perl_to_float(a) != perl_to_float(b));
+    return perl_alloc_bool(perl_to_float(a) != perl_to_float(b));
 }
 HOTX PerlValue *perl_num_lt(const PerlValue *a, const PerlValue *b) {
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c < 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c < 0); }
     }
     if (b && b->blessed_class) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c > 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c > 0); }
     }
-    return perl_alloc_int(perl_to_float(a) <  perl_to_float(b));
+    return perl_alloc_bool(perl_to_float(a) <  perl_to_float(b));
 }
 HOTX PerlValue *perl_num_gt(const PerlValue *a, const PerlValue *b) {
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c > 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c > 0); }
     }
     if (b && b->blessed_class) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c < 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c < 0); }
     }
-    return perl_alloc_int(perl_to_float(a) >  perl_to_float(b));
+    return perl_alloc_bool(perl_to_float(a) >  perl_to_float(b));
 }
 HOTX PerlValue *perl_num_le(const PerlValue *a, const PerlValue *b) {
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c <= 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c <= 0); }
     }
     if (b && b->blessed_class) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_int(c >= 0); }
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c >= 0); }
     }
-    return perl_alloc_int(perl_to_float(a) <= perl_to_float(b));
+    return perl_alloc_bool(perl_to_float(a) <= perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ge(const PerlValue *a, const PerlValue *b) {
-    return perl_alloc_int(perl_to_float(a) >= perl_to_float(b));
+    return perl_alloc_bool(perl_to_float(a) >= perl_to_float(b));
 }
 
 /* ── string comparisons ──────────────────────────────────────────────────── */
@@ -2011,37 +2079,37 @@ static int perl_strcmp_len(const char *a, long long la, const char *b, long long
 PerlValue *perl_str_eq(const PerlValue *a, const PerlValue *b) {
     long long la, lb;
     char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
-    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) == 0);
+    PerlValue *r = perl_alloc_bool(perl_strcmp_len(sa, la, sb, lb) == 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_ne(const PerlValue *a, const PerlValue *b) {
     long long la, lb;
     char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
-    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) != 0);
+    PerlValue *r = perl_alloc_bool(perl_strcmp_len(sa, la, sb, lb) != 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_lt(const PerlValue *a, const PerlValue *b) {
     long long la, lb;
     char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
-    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) < 0);
+    PerlValue *r = perl_alloc_bool(perl_strcmp_len(sa, la, sb, lb) < 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_gt(const PerlValue *a, const PerlValue *b) {
     long long la, lb;
     char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
-    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) > 0);
+    PerlValue *r = perl_alloc_bool(perl_strcmp_len(sa, la, sb, lb) > 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_le(const PerlValue *a, const PerlValue *b) {
     long long la, lb;
     char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
-    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) <= 0);
+    PerlValue *r = perl_alloc_bool(perl_strcmp_len(sa, la, sb, lb) <= 0);
     free(sa); free(sb); return r;
 }
 PerlValue *perl_str_ge(const PerlValue *a, const PerlValue *b) {
     long long la, lb;
     char *sa = perl_to_string_dup_len(a, &la), *sb = perl_to_string_dup_len(b, &lb);
-    PerlValue *r = perl_alloc_int(perl_strcmp_len(sa, la, sb, lb) >= 0);
+    PerlValue *r = perl_alloc_bool(perl_strcmp_len(sa, la, sb, lb) >= 0);
     free(sa); free(sb); return r;
 }
 

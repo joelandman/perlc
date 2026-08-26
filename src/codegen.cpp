@@ -195,6 +195,7 @@ void CodeGen::declareRuntime() {
 
     RT("perl_alloc_undef",   pv);
     RT("perl_alloc_int",     pv,  i64);
+    RT("perl_alloc_bool",    pv,  i64);
     RT("perl_alloc_float",   pv,  Type::getDoubleTy(ctx_));
     RT("perl_alloc_string",  pv,  i8p);
     RT("perl_clone",         pv,  pv);
@@ -1665,6 +1666,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
     if (nm.starts_with("perlsub_")) return true;
     static const std::unordered_set<std::string> owned = {
         "perl_alloc_int", "perl_alloc_float", "perl_alloc_string", "perl_alloc_undef",
+        "perl_alloc_bool",
         "perl_add",    "perl_sub",    "perl_mul",    "perl_div",    "perl_mod",
         "perl_pow",    "perl_negate", "perl_not",    "perl_concat", "perl_repeat_str",
         "perl_num_eq", "perl_num_ne", "perl_num_lt", "perl_num_gt",
@@ -1813,13 +1815,73 @@ bool CodeGen::canEmitI64(const Node &n) {
         return lookupIntVar(nm) != nullptr;
     }
     case NK::BinOp: {
-        static const char *intOps[] = {"+", "-", "*", "%", nullptr};
-        for (auto *p = intOps; *p; p++) if (n.sval == *p)
-            return n.left && n.right && canEmitI64(*n.left) && canEmitI64(*n.right);
+        /* W1: bitwise ops. Real Perl prints any result with bit 63 set as an
+           UNSIGNED value (e.g. ~12 → 18446744073709551603); the runtime has
+           no UV storage, so variable-operand bitwise ops stay on the boxed
+           path (pre-existing gap). Constant operands are exact-foldable:
+           emitExprI64 checks the result and returns nullptr when bit 63 is
+           set. */
+        if ((n.sval == "&" || n.sval == "|" || n.sval == "^") &&
+            n.left && n.left->kind == NK::IntLit &&
+            n.right && n.right->kind == NK::IntLit)
+            return true;
+        /* W1: `>>` with a constant count in [1,63] is a logical shift of the
+           bit pattern; bit 63 is always cleared, so the i64 result is
+           always non-negative and matches Perl's UV semantics exactly.
+           Count 0 keeps bit 63 (UV territory); variable/negative counts can
+           set bit 63 (via Perl's `>> -n == << n` rule) — boxed path. */
+        if (n.sval == ">>" &&
+            n.right && n.right->kind == NK::IntLit &&
+            n.right->ival >= 1 && n.right->ival <= 63 &&
+            n.left && canEmitI64(*n.left))
+            return true;
+        /* W1: `<<` is constant-foldable only. Variable bases can
+           produce UV results (bit 63 set: `1 << 63` prints 9223372036854775808,
+           not -9223372036854775808) — emitExprI64
+           returns nullptr in those cases and callers fall back. */
+        if (n.sval == "<<" &&
+            n.left && n.left->kind == NK::IntLit &&
+            n.right && n.right->kind == NK::IntLit)
+            return true;
+        /* W1: `**` constant folding — must mirror real Perl's pp_pow storage
+           class (perl 5.44 pp.c): the result prints as an integer only when
+           Perl stores it as IV/UV:
+             - |a| a power of 2 (incl. 0, 1): Perl computes an exact NV; it
+               prints as integer only while |a^b| < 1e15 (15 sig digits) —
+               for powers of 2 that is 2^(m*b) with m*b <= 49.
+             - else: exact UV math only when b*bitlen(|a|) <= 64; printing as
+               i64 additionally needs result < 2^63 (no UV storage in perlc).
+           All other cases are NV (pow()) — must NOT fold to i64. */
+        if (n.sval == "**" &&
+            n.left && n.left->kind == NK::IntLit &&
+            n.right && n.right->kind == NK::IntLit) {
+            long long av = n.left->ival, bv = n.right->ival;
+            if (bv < 0) return false; /* NV: 1/a^b */
+            unsigned long long ab = av < 0 ? (unsigned long long)(-av)
+                                           : (unsigned long long)av;
+            if (ab == 0 || ab == 1) return true; /* 0/1 -> 0 or 1 */
+            int m = 0; { unsigned long long t = ab; while (t >>= 1) m++; }
+            if ((ab & (ab - 1)) == 0)
+                return (long long)m * bv <= 49; /* pow-of-2: 2^(m*b) < 2^50 */
+            /* non-pow-of-2: Perl keeps IV/UV only while e*bitlen(|a|) <= 64
+               (bitlen = m+1); beyond that it is an NV pow(). */
+            if ((long long)bv * (long long)(m + 1) > 64) return false; /* NV pow */
+            return true; /* emit checks result < 2^63 */
+        }
         return false;
     }
     case NK::UnaryOp:
-        return n.sval == "-" && n.left && canEmitI64(*n.left);
+        /* W1: `~` constant-fold only (variable result can set bit 63 → UV). */
+        return (n.sval == "~" && n.left && n.left->kind == NK::IntLit) ||
+               (n.sval == "-" && n.left && canEmitI64(*n.left));
+    case NK::AbsFunc:
+        /* W1: constant-fold only — abs(INT64_MIN) is UV 2^63 in real Perl,
+           and the branchless negate would wrap. */
+        return n.left && n.left->kind == NK::IntLit;
+    case NK::IntFunc:
+        /* W1: int() on an integer is the identity — no representation change,
+           safe with variable operands. */
+        return n.left && canEmitI64(*n.left);
     default: return false;
     }
 }
@@ -1837,6 +1899,72 @@ Value *CodeGen::emitExprI64(const Node &n) {
         return nullptr;
     }
     case NK::BinOp: {
+        /* W1: `& | ^` constant folding — exact in i64; results with bit 63
+           set are UV in real Perl (no UV storage in the runtime) → nullptr. */
+        if ((n.sval == "&" || n.sval == "|" || n.sval == "^") &&
+            n.left && n.left->kind == NK::IntLit &&
+            n.right && n.right->kind == NK::IntLit) {
+            unsigned long long lb = (unsigned long long)n.left->ival;
+            unsigned long long rb = (unsigned long long)n.right->ival;
+            unsigned long long r = (n.sval == "&") ? (lb & rb)
+                                : (n.sval == "|") ? (lb | rb) : (lb ^ rb);
+            if (r >> 63) return nullptr; /* UV result */
+            return ConstantInt::get(i64, (long long)r);
+        }
+        /* W1: `>>` with constant count [1,63] — logical shift of the bit
+           pattern; bit 63 is cleared, result always matches Perl's UV form. */
+        if (n.sval == ">>" &&
+            n.right && n.right->kind == NK::IntLit &&
+            n.right->ival >= 1 && n.right->ival <= 63 &&
+            canEmitI64(*n.left)) {
+            Value *lv = emitExprI64(*n.left);
+            if (!lv) return nullptr;
+            return builder_.CreateLShr(lv, ConstantInt::get(i64, n.right->ival), "bshr");
+        }
+        /* W1: `<<` / `**` constant folding with real Perl's exact semantics:
+           << : count clamped to [0,63] (else 0); result with bit 63 set is a
+               UV — not representable as i64, return nullptr → boxed fallback.
+           ** : mirror pp_pow's storage class (see canEmitI64) — fold to i64
+               only where real Perl prints an integer; exact UV result via
+               128-bit squaring, nullptr when NV (pow) or UV >= 2^63. */
+        if ((n.sval == "<<" || n.sval == "**") &&
+            n.left && n.left->kind == NK::IntLit &&
+            n.right && n.right->kind == NK::IntLit) {
+            long long b = n.left->ival, e = n.right->ival;
+            if (n.sval == "<<") {
+                if (e < 0 || e > 63) return ConstantInt::get(i64, 0);
+                __uint128_t r = (__uint128_t)(unsigned long long)b << e;
+                if (r >= ((__uint128_t)1) << 63) return nullptr; /* UV result */
+                return ConstantInt::get(i64, (long long)r);
+            }
+            if (e < 0) return nullptr; /* NV: 1/b^e */
+            unsigned long long ab = b < 0 ? (unsigned long long)(-b)
+                                          : (unsigned long long)b;
+            if (ab == 0) return ConstantInt::get(i64, e == 0 ? 1 : 0);
+            int m = 0; { unsigned long long t = ab; while (t >>= 1) m++; }
+            if (ab == 1)
+                return ConstantInt::get(i64, (b < 0 && (e & 1)) ? -1 : 1);
+            if ((ab & (ab - 1)) == 0) {
+                /* power-of-2 base: Perl stores NV; integer print only while
+                   2^(m*e) < 1e15, i.e. m*e <= 49. */
+                if ((long long)m * e > 49) return nullptr;
+                unsigned long long r = 1ULL << (m * e);
+                return ConstantInt::get(i64,
+                    (b < 0 && (e & 1)) ? -(long long)r : (long long)r);
+            }
+            /* non-pow-of-2: Perl keeps IV/UV only while e*bitlen(|b|) <= 64
+               (bitlen = m+1); beyond that it is an NV pow(). */
+            if ((long long)e * (long long)(m + 1) > 64) return nullptr; /* NV pow */
+            unsigned __int128 res = 1, base = ab;
+            for (unsigned long long ee = e; ee; ee >>= 1) {
+                if (ee & 1) res *= base;
+                if (ee > 1) base *= base;
+            }
+            if (res >= ((unsigned __int128)1) << 63) return nullptr; /* UV */
+            unsigned long long rv = (unsigned long long)res;
+            return ConstantInt::get(i64,
+                (b < 0 && (e & 1)) ? -(long long)rv : (long long)rv);
+        }
         static const char *intOps[] = {"+", "-", "*", "%", nullptr};
         bool isInt = false;
         for (auto *p = intOps; *p; p++) if (n.sval == *p) { isInt = true; break; }
@@ -1854,7 +1982,25 @@ Value *CodeGen::emitExprI64(const Node &n) {
             Value *v = emitExprI64(*n.left);
             return v ? builder_.CreateNeg(v, "ineg") : nullptr;
         }
+        /* W1: `~` constant folding (variable result can set bit 63 → UV). */
+        if (n.sval == "~" && n.left && n.left->kind == NK::IntLit) {
+            long long r = ~(long long)n.left->ival;
+            if (r < 0) return nullptr; /* UV result */
+            return ConstantInt::get(i64, r);
+        }
         return nullptr;
+    case NK::AbsFunc: {
+        /* W1: constant folding (abs(INT64_MIN) is UV 2^63 in real Perl). */
+        if (!n.left || n.left->kind != NK::IntLit) return nullptr;
+        long long v = n.left->ival;
+        if (v == INT64_MIN) return nullptr;
+        return ConstantInt::get(i64, v < 0 ? -v : v);
+    }
+    case NK::IntFunc: {
+        /* W1: int() on an integer is the identity. */
+        if (!n.left || !canEmitI64(*n.left)) return nullptr;
+        return emitExprI64(*n.left);
+    }
     default: return nullptr;
     }
 }
@@ -5830,6 +5976,8 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (n.sval == "-") return builder_.CreateSub(lv, rv);
                     if (n.sval == "*") return builder_.CreateMul(lv, rv);
                     if (n.sval == "%") return emitFlooredMod(lv, rv);
+                    /* W1 note: `&=`/`|=`/`^=` stay boxed — a bit-63 result is
+                       UV in real Perl and the runtime has no UV storage. */
                     return nullptr;
                 };
                 Value *lv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
@@ -6488,8 +6636,8 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     /* ── math builtins ───────────────────────────────────────────────────── */
-    case NK::AbsFunc:  { Value *a=emitExpr(*n.left); Value *r=callRT("perl_abs_val",  {a}); freeIfOwned(a); return r; }
-    case NK::IntFunc:  { Value *a=emitExpr(*n.left); Value *r=callRT("perl_int_trunc",{a}); freeIfOwned(a); return r; }
+    case NK::AbsFunc:  { if (Value *iv = emitExprI64(n)) return boxI64(iv); Value *a=emitExpr(*n.left); Value *r=callRT("perl_abs_val",  {a}); freeIfOwned(a); return r; }
+    case NK::IntFunc:  { if (Value *iv = emitExprI64(n)) return boxI64(iv); Value *a=emitExpr(*n.left); Value *r=callRT("perl_int_trunc",{a}); freeIfOwned(a); return r; }
     case NK::SqrtFunc: { Value *a=emitExpr(*n.left); Value *r=callRT("perl_sqrt_val", {a}); freeIfOwned(a); return r; }
 
     /* ── string case ─────────────────────────────────────────────────────── */
@@ -8112,10 +8260,50 @@ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
 }
 
 Value *CodeGen::emitBinOp(const Node &n) {
-    /* Fast path: stay unboxed for integer arithmetic */
-    if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%") {
+    /* Fast path: stay unboxed for integer arithmetic.
+       W1: extended to constant-foldable `& | ^ <<` (bit-63/UV results return
+       nullptr from emitExprI64), `>>` with constant count [1,63], and
+       constant `**` (integer-power range exp 0..30, i64 fit). */
+    if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%" ||
+        n.sval == "&" || n.sval == "|" || n.sval == "^" ||
+        n.sval == "<<" || n.sval == ">>" || n.sval == "**") {
         if (Value *iv = emitExprI64(n))
             return boxI64(iv);
+    }
+    /* W1: comparisons and spaceship as VALUES on exact i64 operands.
+       - The false value of a Perl comparison is the empty string, not IV 0
+         (perl_alloc_bool) — this also fixes the latent box-path bug where
+         `print ($a < $b)` printed "0" on false.
+       - i64 compare is exact for magnitudes > 2^53, where the boxed
+         perl_to_float comparison loses precision (latent bug #2 fixed).
+       - `<=>` yields IV -1/0/1 (boxI64). */
+    if (n.sval == "<" || n.sval == "<=" || n.sval == ">" || n.sval == ">=" ||
+        n.sval == "==" || n.sval == "!=" || n.sval == "<=>") {
+        if (n.left && n.right && canEmitI64(*n.left) && canEmitI64(*n.right)) {
+            Value *lv = emitExprI64(*n.left), *rv = emitExprI64(*n.right);
+            if (lv && rv) {
+                auto *i64 = Type::getInt64Ty(ctx_);
+                if (n.sval == "<=>") {
+                    Value *lt = builder_.CreateICmpSLT(lv, rv, "ss.lt");
+                    Value *gt = builder_.CreateICmpSGT(lv, rv, "ss.gt");
+                    Value *r = builder_.CreateSelect(
+                        lt, ConstantInt::get(i64, -1),
+                        builder_.CreateSelect(gt, ConstantInt::get(i64, 1),
+                                               ConstantInt::get(i64, 0), "ss.mid"),
+                        "spaceship");
+                    return boxI64(r);
+                }
+                llvm::CmpInst::Predicate pred;
+                if      (n.sval == "<")  pred = llvm::CmpInst::Predicate::ICMP_SLT;
+                else if (n.sval == "<=") pred = llvm::CmpInst::Predicate::ICMP_SLE;
+                else if (n.sval == ">")  pred = llvm::CmpInst::Predicate::ICMP_SGT;
+                else if (n.sval == ">=") pred = llvm::CmpInst::Predicate::ICMP_SGE;
+                else if (n.sval == "==") pred = llvm::CmpInst::Predicate::ICMP_EQ;
+                else                    pred = llvm::CmpInst::Predicate::ICMP_NE;
+                Value *c = builder_.CreateICmp(pred, lv, rv, "icmpv");
+                return callRT("perl_alloc_bool", {builder_.CreateZExt(c, i64)});
+            }
+        }
     }
     /* Fast path: if both operands can be expressed as doubles, stay unboxed */
     if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") {

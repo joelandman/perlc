@@ -103,6 +103,7 @@ PerlValue *perl_alloc_float(double v);
 
 PerlValue *perl_alloc_string(const char *s);
 PerlValue *perl_alloc_string_len(const char *s, long long len); /* D85: NUL-safe — s may contain embedded NUL bytes within the first len */
+PerlValue *perl_alloc_bool(long long b); /* W1: "1" (IV) or "" — real Perl comparison-true/false values */
 char      *perl_to_string_dup_len(const PerlValue *v, long long *out_len); /* D85: NUL-safe perl_to_string_dup, also reports true byte length */
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_alloc_float_array(long long n); /* alloc FLAT_ARRAY with n zero doubles */
