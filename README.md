@@ -12,8 +12,9 @@ A Perl compiler that translates Perl source to LLVM IR and links a C runtime to 
 ## Build
 
 ```bash
-make        # produces ./perlc
-make test   # runs assertion-based MVP contract tests
+make           # produces ./perlc
+make test      # 4 assertion-based contract tests
+make test-all  # full suite vs real perl (the correctness gate)
 make clean
 ```
 
@@ -50,7 +51,7 @@ make clean
 
 **References**: `\$x`, `\@arr`, `\%h`, `\&sub`, `[...]` (anon array), `{...}` (anon hash), `$$ref`, `@$ref`, `%$ref`, `$r->[i]`, `$r->{k}`, `ref($x)`
 
-**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m/e), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`, named captures `(?<name>...)` → `$+{name}` / `keys %+`; `/e` evaluates replacement as Perl expression
+**Regex (PCRE2)**: `=~`, `!~`, flags (i/g/s/m/e/x), capture variables `$1`–`$9`, `s/pat/repl/flags`, `/g` iterator, `/g` list context, `split(/pat/, $str)`, named captures `(?<name>...)` → `$+{name}` / `keys %+`; `/e` evaluates replacement as Perl expression; `/x` ignores unescaped whitespace and `#` comments (PCRE2_EXTENDED); `m{pat}x` / `m(pat)x` delimiters
 
 **tr///**: `$s =~ tr/SEARCH/REPLACE/flags` — character translation; flags: `d` (delete), `s` (squeeze), `c` (complement); ranges `a-z`; returns count
 
@@ -70,7 +71,7 @@ make clean
 
 **Slices**: `@arr[0,1,2]` (array slice), `@hash{'a','b'}` (hash slice); qw() and list args auto-flattened
 
-**System/env**: `system("cmd")` (exit code), `` `cmd` `` (output capture, interpolated), `$ENV{KEY}` / `$ENV{KEY}=val`
+**System/env**: `system("cmd")` (exit code), `` `cmd` `` (output capture, interpolated), `$ENV{KEY}` / `$ENV{KEY}=val`, `syscall`, `fork`/`wait`/`waitpid`/`kill`/`exec`/`exit`/`pipe`, `getppid`/`getpgrp`/`umask`, sockets (`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`), `sysopen`/`sysread`/`syswrite`/`flock`, `vec`, `select` (1-arg default FH and 4-arg bitmasks), `fcntl`, `ioctl`, `POSIX::dup`/`dup2`, live `%SIG`, `$?`
 
 **File tests**: `-e` (exists), `-f` (file), `-d` (dir), `-r` (readable), `-w` (writable), `-x` (executable), `-z` (empty), `-s` (size), `-l` (symlink), `-p` (pipe)
 
@@ -92,7 +93,13 @@ make clean
 
 **Note**: Many simple CPAN modules work, but complex modules with advanced OO patterns, `our` variables, or POD documentation may cause parser errors due to incomplete Perl 5 language coverage.
 
-**eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime
+**eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime. String `eval EXPR`: constant strings without new subs are inlined (outer `my` visible); dynamic strings and strings that define subs compile via `--do-lib`/`dlopen` (no outer lexicals).
+
+**Prototypes**: `sub f ($$)`, `(@)`, `()`, `(&@)` (block form), `($;$)`, `(_)`. `&name()` bypasses the prototype. Arity is checked at parse time.
+
+**goto**: `goto LABEL` (including labeled loops) and `goto &NAME` (tail-call, current `@_`).
+
+**Typeglobs**: `*NAME` stringifies as `*main::NAME`; `*alias = \&sub` registers a callable alias.
 
 ### Advanced Features
 
@@ -120,25 +127,21 @@ make clean
 
 ## Known Limitations
 
-- `wantarray`: context propagation implemented for list vs. scalar at most call sites, but NOT propagated into `print`/`printf` sub-call arguments (see `TESTS.md` D12); returns `0` instead of `undef` at top level (D43)
-- `tie` / `untie`: `TIESCALAR`/`TIEARRAY`/`TIEHASH` run at `tie` time, but **FETCH/STORE interception is not implemented** — tied variables behave as plain scalars on every subsequent read/write (see `TESTS.md` D44; use `opendir`/`readdir` for directories)
-- Regex modifier `x` (extended/whitespace-ignoring): not supported; `/e` (eval replacement) is supported
+- Typeglob scalar/array/hash slot aliasing (`*a = \$x`) is not implemented (`*alias = \&sub` and `*NAME` stringify work)
+- String `eval EXPR` of a dynamic / sub-defining string does not see the caller's `my` variables (compiled as a separate `--do-lib` unit)
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
-- `exists $h{a}{b}` chained subscript without arrow: use `$h{a}->{b}` instead
-- `or`/`and`/`not` precedence in `my` declaration initializer: `my $x = 0 or 1` gives `$x=1` (not `$x=0`); wrap in parens if needed
-- Complex CPAN modules (advanced OO, `our` vars, POD): may trigger parser errors; some scripts may need simplification (see `testscripts/cputemp.pl` for example rewrite using supported builtins)
-- string `eval` (EXPR form): not available (removed with JIT); `eval { BLOCK }` still works for exceptions
-- XS is an MVP FFI-style interface, not full Perl XS bootstrap/module compatibility
-- DBI support is currently the SQLite subset exercised by the contract tests
+- `exists $h{a}{b}` without arrow: use `$h{a}->{b}`
+- XS is an MVP FFI (≤4 scalar args), not full Perl XS
+- DBI is the SQLite subset in the contract tests
+- Complex CPAN (advanced OO / `our` / POD) may fail to parse
 
 **Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
 
 ## New Features Implemented
 
 ### Runtime Loading
-- Runtime `require "path.pm"` support
-- `do "path.pl"` support with return value propagation and `$@` on load/parse/runtime failure
-- Runtime `require`/`do FILE` of dynamic files now stubbed (set $@, return undef) after JIT removal; compile-time `use` and static inlining still supported
+- Runtime `require "path.pm"` and `do "path.pl"` (`perl_do_file` re-invokes `perlc --do-lib` and `dlopen`s the result into the host runtime)
+- Compile-time `use` inlines `.pm` files
 
 ### XS / FFI Interface
 - `XS::load_library("libname")` loads and caches shared libraries with `dlopen`
@@ -162,21 +165,24 @@ make clean
 ## Architecture
 
 ```
-source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  g++-15  →  binary
-                                                                           ↑
-                                                                     runtime.c (linked in)
+source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  clang-18  →  binary
+                                                                            ↑
+                                                                      runtime.c (linked in)
 ```
 
 ### Runtime Value Model
 
-All Perl values are heap-allocated `PerlValue` structs (tagged union):
+All Perl values are heap-allocated `PerlValue` structs (tagged union, 48 bytes):
 
 ```c
 typedef struct PerlValue {
-    PerlTag tag;        // UNDEF, INT, FLOAT, STRING, REF_SCALAR, REF_ARRAY, REF_HASH, FILEHANDLE, CODE_REF
+    PerlTag tag;         /* UNDEF, INT, FLOAT, STRING, refs, FILEHANDLE, ... */
+    unsigned int flags;  /* shared / UTF-8 / capture */
     union { long long ival; double fval; char *sval; void *pval; };
-    long long matchpos; // /g iterator position
-    char *blessed_class; // for objects
+    long long matchpos;  /* /g iterator position */
+    char *blessed_class;
+    long long slen;      /* authoritative byte length of sval (embedded NULs) */
+    long long _pad_reserved;
 } PerlValue;
 ```
 
@@ -187,4 +193,5 @@ typedef struct PerlValue {
 - `src/parser.h/cpp`: Recursive-descent parser → AST
 - `src/codegen.h/cpp`: AST → LLVM IR via IRBuilder
 - `src/runtime.h/c`: C runtime: `PerlValue` tagged union and all operations
-- `src/main.cpp`: Driver: lex → parse → codegen → g++-15 link
+- `src/main.cpp`: Driver: lex → parse → codegen → clang-18 link
+- `src/mini-gmp.c`: Math::BigInt backend

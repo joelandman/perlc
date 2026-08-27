@@ -327,20 +327,41 @@ NodePtr Parser::parseStmt() {
         return n;
     }
     if (check(TK::KW_WHILE))   return parseWhile();
-    /* LABEL: for/foreach/while/until
-       D46: lexer no longer folds trailing ':' into IDENT — labels are
-       IDENT + COLON (package names still use '::' inside IDENT). */
+    /* LABEL: stmt — loops keep sval=label (last/next/redo); other
+       statements wrap as LabelStmt so goto LABEL can find them. */
     if (check(TK::IDENT) && peek(1).kind == TK::COLON) {
-        TK nextTok = pos_ + 2 < toks_.size() ? toks_[pos_ + 2].kind : TK::EOF_TOK;
-        if (nextTok == TK::KW_FOR || nextTok == TK::KW_FOREACH ||
-            nextTok == TK::KW_WHILE || nextTok == TK::KW_UNTIL) {
-            std::string label = cur().text;
-            advance(); /* IDENT */
-            advance(); /* COLON */
-            NodePtr loop = parseStmt();
-            if (loop) loop->sval = label;
-            return loop;
+        std::string label = cur().text;
+        advance(); /* IDENT */
+        advance(); /* COLON */
+        NodePtr stmt = parseStmt();
+        if (!stmt) {
+            auto n = std::make_unique<Node>(); n->kind = NK::LabelStmt;
+            n->name = label; n->line = line; return n;
         }
+        if (stmt->kind == NK::For || stmt->kind == NK::Foreach ||
+            stmt->kind == NK::While || stmt->kind == NK::DoWhile) {
+            stmt->sval = label;
+            return stmt;
+        }
+        auto n = std::make_unique<Node>(); n->kind = NK::LabelStmt;
+        n->name = label; n->body = std::move(stmt); n->line = line;
+        return n;
+    }
+    if (check(TK::KW_GOTO)) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Goto; n->line = line;
+        if (check(TK::AND)) {
+            advance();
+            n->sval = "sub";
+            n->name = cur().text; advance();
+        } else if (check(TK::IDENT) && peek(1).kind != TK::LPAREN) {
+            n->sval = "label";
+            n->name = cur().text; advance();
+        } else {
+            n->sval = "expr";
+            n->left = parseExpr();
+        }
+        return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_UNTIL)) {
         advance();
@@ -636,6 +657,115 @@ NodePtr Parser::parseForeachBody(int line) {
     return n;
 }
 
+std::string Parser::parsePrototype() {
+    consume(TK::LPAREN, "(");
+    std::string p;
+    while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+        TK k = cur().kind;
+        if (k == TK::SCALAR) p += '$';
+        else if (k == TK::ARRAY) p += '@';
+        else if (k == TK::HASH || k == TK::PERCENT) p += '%';
+        else if (k == TK::AND) p += '&';
+        else if (k == TK::STAR) p += '*';
+        else if (k == TK::SEMI) p += ';';
+        else if (k == TK::PLUS) p += '+';
+        else if (k == TK::BACKSLASH) p += '\\';
+        else if (k == TK::LBRACKET) p += '[';
+        else if (k == TK::RBRACKET) p += ']';
+        else if (k == TK::IDENT && cur().text == "_") p += '_';
+        /* ignore spaces/other noise inside the prototype */
+        advance();
+    }
+    consume(TK::RPAREN, ")");
+    return p;
+}
+
+void Parser::rememberProto(const std::string &name, const std::string &proto) {
+    protoMap_[name] = proto;
+    auto sc = name.rfind("::");
+    if (sc != std::string::npos)
+        protoMap_[name.substr(sc + 2)] = proto;
+    else if (currentPackage_ != "main")
+        protoMap_[currentPackage_ + "::" + name] = proto;
+    else
+        protoMap_["main::" + name] = proto;
+}
+
+const std::string *Parser::lookupProto(const std::string &name) const {
+    auto it = protoMap_.find(name);
+    if (it != protoMap_.end()) return &it->second;
+    auto iit = importMap_.find(name);
+    if (iit != importMap_.end()) {
+        it = protoMap_.find(iit->second);
+        if (it != protoMap_.end()) return &it->second;
+    }
+    return nullptr;
+}
+
+static int protoMinArgs(const std::string &pr) {
+    int n = 0;
+    for (char c : pr) {
+        if (c == ';') break;
+        if (c == '@' || c == '%') break;
+        if (c == '_') break; /* optional $_ */
+        if (c == '$' || c == '&' || c == '*' || c == '+') n++;
+    }
+    return n;
+}
+
+static int protoMaxArgs(const std::string &pr) {
+    for (char c : pr)
+        if (c == '@' || c == '%') return 1000000;
+    int n = 0;
+    for (char c : pr)
+        if (c == '$' || c == '&' || c == '*' || c == '_' || c == '+') n++;
+    return n;
+}
+
+void Parser::checkProtoArity(const std::string &name, const std::string &proto,
+                             int nargs, int line) {
+    int mn = protoMinArgs(proto);
+    int mx = protoMaxArgs(proto);
+    if (nargs < mn)
+        throw std::runtime_error("Not enough arguments for " + name +
+            " at " + std::to_string(line));
+    if (nargs > mx)
+        throw std::runtime_error("Too many arguments for " + name +
+            " at " + std::to_string(line));
+}
+
+NodePtr Parser::parseAnonSubBody(int line, const std::string &proto) {
+    consume(TK::LBRACE, "{");
+    ++subDepth_;
+    NodeList stmts;
+    while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
+        stmts.push_back(parseStmt());
+    --subDepth_;
+    consume(TK::RBRACE, "}");
+    auto n = std::make_unique<Node>(); n->kind = NK::AnonSub; n->line = line;
+    n->name = "__anon_" + std::to_string(++anonCount_);
+    n->sval = proto;
+    n->body = makeBlock(std::move(stmts), line);
+    return n;
+}
+
+NodePtr Parser::parseAmpBlockCall(std::string name, const std::string &proto, int line) {
+    NodeList args;
+    args.push_back(parseAnonSubBody(line, ""));
+    match(TK::COMMA);
+    while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier() &&
+           !check(TK::RPAREN) && !check(TK::RBRACE) && !check(TK::RBRACKET)) {
+        args.push_back(parseExpr());
+        if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+    }
+    checkProtoArity(name, proto, (int)args.size(), line);
+    auto n = std::make_unique<Node>(); n->kind = NK::Call;
+    n->name = name; n->args = std::move(args); n->line = line;
+    n->sval = proto;
+    n->ival = 0;
+    return n;
+}
+
 NodePtr Parser::parseSub() {
     int line = cur().line;
     consume(TK::KW_SUB);
@@ -643,9 +773,22 @@ NodePtr Parser::parseSub() {
     /* qualify with current package when not already qualified and not in main */
     if (name.find("::") == std::string::npos && currentPackage_ != "main")
         name = currentPackage_ + "::" + name;
+
+    std::string proto;
+    bool hasProto = false;
+    if (check(TK::LPAREN)) {
+        proto = parsePrototype();
+        hasProto = true;
+        rememberProto(name, proto);
+    }
+
     /* forward declaration: sub name; or sub name(PROTOTYPE); */
-    if (check(TK::SEMI)) { advance(); match(TK::RBRACE); auto n = std::make_unique<Node>(); n->kind = NK::SubDef; n->name = name; n->line = line; return n; }
-    if (check(TK::LPAREN)) { advance(); while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) advance(); consume(TK::RPAREN, ")"); if (check(TK::SEMI)) { advance(); match(TK::RBRACE); auto n = std::make_unique<Node>(); n->kind = NK::SubDef; n->name = name; n->line = line; return n; } }
+    if (check(TK::SEMI)) {
+        advance(); match(TK::RBRACE);
+        auto n = std::make_unique<Node>(); n->kind = NK::SubDef;
+        n->name = name; n->sval = hasProto ? proto : std::string(); n->line = line;
+        return n;
+    }
     consume(TK::LBRACE, "{");
 
     ++subDepth_;
@@ -656,6 +799,7 @@ NodePtr Parser::parseSub() {
     consume(TK::RBRACE, "}");
 
     auto n = std::make_unique<Node>(); n->kind = NK::SubDef; n->name = name; n->line = line;
+    if (hasProto) n->sval = proto;
     n->body = makeBlock(std::move(stmts), line);
     return n;
 }
@@ -1180,6 +1324,11 @@ NodePtr Parser::parseAssign() {
     if (check(TK::ASSIGN)) {
         advance();
         auto rhs = parseAssign();
+        /* *alias = \&sub copies the prototype so later `alias(...)` sees it. */
+        if (lhs && lhs->kind == NK::Typeglob && rhs && rhs->kind == NK::RefSub) {
+            if (const std::string *pr = lookupProto(rhs->name))
+                rememberProto(lhs->name, *pr);
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::Assign;
         n->left = std::move(lhs); n->right = std::move(rhs); n->line = line;
         return n;
@@ -1797,6 +1946,33 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
+    /* typeglob: *NAME at expression start */
+    if (check(TK::STAR) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::IDENT) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Typeglob;
+        n->name = cur().text; n->line = line; advance();
+        return n;
+    }
+
+    /* &NAME / &NAME() — sub call that bypasses prototype */
+    if (check(TK::AND) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::IDENT) {
+        advance();
+        std::string nm = cur().text; advance();
+        auto it = importMap_.find(nm);
+        if (it != importMap_.end()) nm = it->second;
+        auto n = std::make_unique<Node>(); n->kind = NK::Call;
+        n->name = nm; n->line = line; n->ival = 2; /* bypass prototype */
+        if (check(TK::LPAREN)) {
+            advance();
+            while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                n->args.push_back(parseExpr());
+                if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+            }
+            consume(TK::RPAREN, ")");
+        }
+        return n;
+    }
+
     /* backslash: reference-taking  \$x  \@arr  \%h  \&sub */
     if (check(TK::BACKSLASH)) {
         advance();
@@ -1848,28 +2024,28 @@ NodePtr Parser::parsePrimary() {
             n->body = makeBlock(std::move(stmts), line);
             return n;
         }
-        /* eval EXPR — string eval (runtime compilation) */
-        NodePtr expr = parseExpr();
+        /* eval EXPR — named unary (same precedence as defined): tighter
+           than ==/eq/?:, so `eval("1+2")==3` is `(eval "1+2") == 3`. */
+        bool hp = match(TK::LPAREN);
+        NodePtr expr;
+        if (hp) {
+            expr = parseExpr();
+            consume(TK::RPAREN, ")");
+        } else {
+            expr = parseShift();
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::Call;
         n->name = "eval"; n->args.push_back(std::move(expr)); n->line = line;
         return n;
     }
 
-    /* anonymous sub: sub { BLOCK } */
-    if (check(TK::KW_SUB) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
+    /* anonymous sub: sub { BLOCK } or sub (PROTO) { BLOCK } */
+    if (check(TK::KW_SUB) && pos_ + 1 < toks_.size() &&
+        (toks_[pos_+1].kind == TK::LBRACE || toks_[pos_+1].kind == TK::LPAREN)) {
         advance(); /* consume 'sub' */
-        consume(TK::LBRACE, "{");
-        ++subDepth_;
-        NodeList stmts;
-        while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
-            stmts.push_back(parseStmt());
-        --subDepth_;
-        consume(TK::RBRACE, "}");
-        auto n = std::make_unique<Node>(); n->kind = NK::AnonSub; n->line = line;
-        /* generate unique name for this anonymous sub */
-        n->name = "__anon_" + std::to_string(++anonCount_);
-        n->body = makeBlock(std::move(stmts), line);
-        return n;
+        std::string proto;
+        if (check(TK::LPAREN)) proto = parsePrototype();
+        return parseAnonSubBody(line, proto);
     }
 
     /* anonymous array ref:  [list] */
@@ -1953,6 +2129,11 @@ NodePtr Parser::parsePrimary() {
         if (check(TK::BACKSLASH)) {
             advance();
             return makeScalar("\\", line);
+        }
+        /* $? — last wait/system status word */
+        if (check(TK::QUESTION)) {
+            advance();
+            return makeScalar("?", line);
         }
         /* $& — last match string */
         if (check(TK::AND)) {
@@ -3264,11 +3445,21 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::IDENT)) {
         std::string nm = cur().text; advance();
         /* bare word string comparison ops handled in parseCmp */
-        if (check(TK::LPAREN)) return parseCall(nm, line);
-        /* bareword — if followed by FATARROW it's an auto-quoted string */
         if (check(TK::FATARROW)) return makeStr(nm, line);
-        /* bareword — if followed by ARROW it's a package/class name for method call */
         if (check(TK::ARROW)) return makeStr(nm, line);
+        /* Prototype-aware call: () constant-like, &@ block form. */
+        if (const std::string *pr = lookupProto(nm)) {
+            if (pr->empty()) {
+                /* sub foo () — bare foo is a call, foo() too. */
+                if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
+                auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                n->name = nm; n->line = line; n->sval = *pr; n->ival = 0;
+                return n;
+            }
+            if ((*pr)[0] == '&' && check(TK::LBRACE))
+                return parseAmpBlockCall(nm, *pr, line);
+        }
+        if (check(TK::LPAREN)) return parseCall(nm, line);
         /* check constant map so bare NAME resolves without parens */
         {
             auto cit = constMap_.find(nm);
@@ -3391,6 +3582,7 @@ NodePtr Parser::parseBareCall(std::string name, int line) {
        ival=1 marks bareword-style call (unknown name → compile error). */
     auto it = importMap_.find(name);
     if (it != importMap_.end()) name = it->second;
+    const std::string *pr = lookupProto(name);
     NodeList args;
     args.push_back(parseExpr());
     while (match(TK::COMMA) || match(TK::FATARROW)) {
@@ -3398,9 +3590,11 @@ NodePtr Parser::parseBareCall(std::string name, int line) {
         if (check(TK::RPAREN) || check(TK::RBRACE) || check(TK::RBRACKET)) break;
         args.push_back(parseExpr());
     }
+    if (pr) checkProtoArity(name, *pr, (int)args.size(), line);
     auto n = std::make_unique<Node>(); n->kind = NK::Call;
     n->name = name; n->args = std::move(args); n->line = line;
     n->ival = 1; /* bareword call */
+    if (pr) n->sval = *pr;
     return n;
 }
 
@@ -3408,6 +3602,7 @@ NodePtr Parser::parseCall(std::string name, int line) {
     /* remap imported short names to their qualified Module::name */
     auto it = importMap_.find(name);
     if (it != importMap_.end()) name = it->second;
+    const std::string *pr = lookupProto(name);
     consume(TK::LPAREN, "(");
     NodeList args;
     while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
@@ -3415,9 +3610,11 @@ NodePtr Parser::parseCall(std::string name, int line) {
         if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
     }
     consume(TK::RPAREN, ")");
+    if (pr) checkProtoArity(name, *pr, (int)args.size(), line);
     auto n = std::make_unique<Node>(); n->kind = NK::Call;
     n->name = name; n->args = std::move(args); n->line = line;
     n->ival = 0; /* parenthesized call */
+    if (pr) n->sval = *pr;
     return n;
 }
 

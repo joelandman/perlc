@@ -192,6 +192,7 @@ private:
     std::vector<llvm::BasicBlock *> loopContinues_;
     std::vector<llvm::BasicBlock *> loopRedos_;  /* redo target = body start */
     std::vector<LoopLabel>          loopLabels_; /* labeled loop support */
+    std::unordered_map<std::string, llvm::BasicBlock *> stmtLabels_; /* goto LABEL */
     /* `return` inside eval{} targets the nearest enclosing eval block (its
        value becomes the eval's result; execution resumes after the eval,
        NOT the enclosing sub) — real Perl semantics, distinct from die.
@@ -261,6 +262,10 @@ private:
     llvm::Value *emitShortCircuitRhs(const Node &rhsNode); /* ||/&& RHS: real control-flow for `or return`/`and return` (D8a) */
     bool isCallLikeForContext(const Node &n); /* D12: safe to propagate outer list context into this node's own call */
     llvm::Value *emitCall(const Node &n);
+    void fillCallArgs(llvm::Value *argsArr, const Node &n);
+    void flattenArgInto(llvm::Value *argsArr, const Node &arg);
+    void collectGotoLabels(const Node &n);
+    llvm::BasicBlock *labelBB(const std::string &name);
     llvm::Value *emitLValue(const Node &n); /* returns alloca */
      /* Recursively resolve (autovivifying every missing intermediate level)
         the container that `node` — a chain of HashElem/ArrayElem/ArrowDeref

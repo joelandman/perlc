@@ -347,6 +347,47 @@ PerlValue *perl_backtick(PerlValue *cmd);
 /* D70: syscall() builtin */
 PerlValue *perl_syscall(PerlValue *args);
 
+/* W2: process / IPC / sockets */
+PerlValue *perl_fork(void);
+PerlValue *perl_wait_pid(void);
+PerlValue *perl_waitpid(PerlValue *pid, PerlValue *flags);
+PerlValue *perl_kill(PerlArray *args);
+PerlValue *perl_exec(PerlArray *args);
+void       perl_exit_n(PerlValue *code);
+PerlValue *perl_getppid_val(void);
+PerlValue *perl_getuid_val(void);
+PerlValue *perl_getgid_val(void);
+PerlValue *perl_geteuid_val(void);
+PerlValue *perl_getegid_val(void);
+PerlValue *perl_setsid_val(void);
+PerlValue *perl_getpgrp_val(PerlValue *pid);
+PerlValue *perl_setpgrp_val(PerlValue *pid, PerlValue *pgid);
+PerlValue *perl_umask_val(PerlValue *mode);
+PerlValue *perl_pipe_fh(PerlValue *r, PerlValue *w);
+PerlValue *perl_socket_fh(PerlValue *fh, PerlValue *domain, PerlValue *type, PerlValue *proto);
+PerlValue *perl_bind_fh(PerlValue *fh, PerlValue *addr);
+PerlValue *perl_listen_fh(PerlValue *fh, PerlValue *backlog);
+PerlValue *perl_connect_fh(PerlValue *fh, PerlValue *addr);
+PerlValue *perl_accept_fh(PerlValue *new_fh, PerlValue *listen_fh);
+PerlValue *perl_send_fh(PerlValue *fh, PerlValue *msg, PerlValue *flags);
+PerlValue *perl_recv_fh(PerlValue *fh, PerlValue *buf, PerlValue *len, PerlValue *flags);
+PerlValue *perl_shutdown_fh(PerlValue *fh, PerlValue *how);
+PerlValue *perl_getsockname_fh(PerlValue *fh);
+PerlValue *perl_getpeername_fh(PerlValue *fh);
+PerlValue *perl_sysopen_fh(PerlValue *fh, PerlValue *path, PerlValue *mode, PerlValue *perms);
+PerlValue *perl_sysread_fh(PerlValue *fh, PerlValue *buf, PerlValue *len, PerlValue *off);
+PerlValue *perl_syswrite_fh(PerlValue *fh, PerlValue *buf, PerlValue *len, PerlValue *off);
+PerlValue *perl_flock_fh(PerlValue *fh, PerlValue *op);
+PerlValue *perl_vec_get(PerlValue *str, PerlValue *off, PerlValue *bits);
+PerlValue *perl_vec_set(PerlValue *str, PerlValue *off, PerlValue *bits, PerlValue *val);
+PerlValue *perl_select4(PerlValue *r, PerlValue *w, PerlValue *e, PerlValue *timeout);
+PerlValue *perl_select_fh(PerlValue *newfh);
+PerlValue *perl_fcntl_fh(PerlValue *fh, PerlValue *cmd, PerlValue *arg);
+PerlValue *perl_ioctl_fh(PerlValue *fh, PerlValue *cmd, PerlValue *arg);
+PerlValue *perl_dup_fd(PerlValue *fd);
+PerlValue *perl_dup2_fd(PerlValue *oldfd, PerlValue *newfd);
+void       perl_sig_poll(void);
+
 /* ── command-line arguments ─────────────────────────────────────────────── */
 PerlArray *perl_init_argv(int argc, char **argv); /* call at program start; sets $0, returns @ARGV */
 PerlValue *perl_get_dollar0(void);               /* returns stable $0 PerlValue* */
@@ -500,6 +541,7 @@ PerlValue *perl_get_dollar_dot(void);      /* $.  — current input line number 
 PerlValue *perl_get_dollar_comma(void);    /* $,  — output field separator     */
 PerlValue *perl_get_dollar_bsl(void);      /* $\  — output record separator    */
 PerlValue *perl_get_dollar_amp(void);      /* $&  — last successful regex match */
+PerlValue *perl_get_dollar_question(void); /* $?  — last wait/system status    */
 void       perl_print_sep(void);           /* print $, if defined              */
 void       perl_print_sep_fh(PerlValue *fh);
 void       perl_print_ors(void);           /* print $\ if defined              */
@@ -668,8 +710,8 @@ PerlValue *perl_dbi_error(PerlValue *dbh);
 /* ── program cleanup (free shared-mutex side-table, named-captures hash, etc.) */
 void perl_cleanup(void);
 
-/* ── string eval removed (no JIT) ────────────────────────────────────────── */
-/* perl_eval_string sets $@ and returns undef. No runtime compilation. */
+/* string eval EXPR — compile via --do-lib (no outer lexicals for dynamic
+   strings; constant strings are inlined by codegen into EvalBlock). */
 PerlValue *perl_eval_string(PerlValue *code_pv);
 
 /* D96: compound-assign on a 2D array element where the inner row may be

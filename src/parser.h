@@ -26,6 +26,7 @@ private:
     int                             anonCount_       = 0; /* D10: per-parse anon sub ids */
     std::map<std::string,std::string> importMap_;  /* short → qualified call names */
     std::map<std::string,NodePtr>     constMap_;   /* constant name → parsed AST */
+    std::map<std::string,std::string> protoMap_;   /* sub name → prototype string */
     bool inKeyContext_ = false;  /* true when parsing hash keys — barewords are strings */
 
     /* D56: warnings pragma state */
@@ -85,6 +86,13 @@ private:
     NodePtr parseCall(std::string name, int line);
     bool    looksLikeBareCallArg() const; /* D36 */
     NodePtr parseBareCall(std::string name, int line); /* D36: foo "arg" without () */
+    std::string parsePrototype();
+    void        rememberProto(const std::string &name, const std::string &proto);
+    const std::string *lookupProto(const std::string &name) const;
+    void        checkProtoArity(const std::string &name, const std::string &proto,
+                                int nargs, int line);
+    NodePtr     parseAmpBlockCall(std::string name, const std::string &proto, int line);
+    NodePtr     parseAnonSubBody(int line, const std::string &proto);
     NodePtr parseStringInterp(const std::string &raw, int line);
     NodePtr parseSubscript(NodePtr base, int line); /* chains ->[]/->{}  */
 

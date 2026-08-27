@@ -15,6 +15,12 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/file.h>
+#include <sys/select.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <dirent.h>
 #include <setjmp.h>
 #include <pthread.h>
@@ -366,6 +372,10 @@ static __thread int      s_eval_depth = 0;
    the definition (perl_mod, div-by-zero, substr) see the correct signature. */
 static char *appendDieLocation(char *msg, const char *filename, int line);
 static int call_sig_handler(const char *name, PerlValue *msg_pv);
+static int perl_parse_signal(PerlValue *v);
+static void perl_sig_install(const char *key, PerlValue *val);
+static void perl_sig_sync_if_slot(PerlValue *dst);
+void perl_sig_poll(void);
 void perl_die(PerlValue *msg, const char *filename, int line);
 
 /* D49: %SIG special hash + recursion guards (used by perl_die/perl_warn) */
@@ -400,11 +410,19 @@ static PerlValue s_dollar_comma = { .tag = PERL_UNDEF };
 static PerlValue s_dollar_bsl   = { .tag = PERL_UNDEF };
 /* $& — last successful regex match string */
 static PerlValue s_dollar_amp   = { .tag = PERL_UNDEF };
+/* $? — last wait(2)/system status word */
+static PerlValue s_dollar_question = { .tag = PERL_INT, .ival = 0 };
 
 PerlValue *perl_get_dollar_dot(void)   { return &s_dollar_dot;   }
 PerlValue *perl_get_dollar_comma(void) { return &s_dollar_comma; }
 PerlValue *perl_get_dollar_bsl(void)   { return &s_dollar_bsl;   }
 PerlValue *perl_get_dollar_amp(void)   { return &s_dollar_amp;   }
+PerlValue *perl_get_dollar_question(void) { return &s_dollar_question; }
+
+static void perl_set_dollar_question(int status) {
+    s_dollar_question.tag = PERL_INT;
+    s_dollar_question.ival = status;
+}
 
 void perl_print_sep(void) {
     if (s_dollar_comma.tag == PERL_UNDEF) return;
@@ -929,18 +947,104 @@ void perl_untie(PerlValue *var_pv) {
     perl_dispatch_method(obj, "UNTIE", NULL);
 }
 
-/* ── string eval (disabled — no JIT) ────────────────────────────────────── */
+/* ── string eval EXPR ─────────────────────────────────────────────────────
+   Dynamic strings are compiled the same way as `do FILE`: re-invoke perlc
+   --do-lib, dlopen the .so, run __perlc_do_run. Outer `my` lexicals are
+   NOT visible (the string is a separate compilation unit). Constant
+   strings are inlined by codegen as EvalBlock and DO see outer lexicals. */
 PerlValue *perl_eval_string(PerlValue *code_pv) {
-    PerlValue empty = { .tag = PERL_STRING, .sval = "" };
-    perl_assign(&s_dollar_at, &empty);
-    static const char evalmsg[] = "eval: string eval not available (JIT removed)";
-    /* D85: .slen must be set explicitly on this literal — perl_assign now
-       copies exactly src->slen bytes, and a designated initializer
-       zero-inits any field not listed, silently truncating to "". */
-    PerlValue msg = { .tag = PERL_STRING,
-        .sval = (char *)evalmsg, .slen = (long long)(sizeof(evalmsg) - 1) };
-    perl_assign(&s_dollar_at, &msg);
-    return perl_alloc_undef();
+    long long n = 0;
+    char *code = perl_to_string_dup_len(code_pv, &n);
+    if (!code || n == 0) {
+        free(code);
+        PerlValue empty = { .tag = PERL_STRING, .sval = "", .slen = 0 };
+        perl_assign(&s_dollar_at, &empty);
+        return perl_alloc_undef();
+    }
+
+    static long long s_eval_counter = 0;
+    long long id = __atomic_fetch_add(&s_eval_counter, 1, __ATOMIC_RELAXED);
+    char plPath[256], soPath[256], errPath[256];
+    int pid = (int)getpid();
+    snprintf(plPath,  sizeof(plPath),  "/tmp/_perlc_eval_%d_%lld.pl",  pid, id);
+    snprintf(soPath,  sizeof(soPath),  "/tmp/_perlc_eval_%d_%lld.so",  pid, id);
+    snprintf(errPath, sizeof(errPath), "/tmp/_perlc_eval_%d_%lld.err", pid, id);
+
+    FILE *fp = fopen(plPath, "wb");
+    if (!fp) {
+        free(code);
+        perl_set_dollar_at_cstr("eval: cannot write temp file");
+        return perl_alloc_undef();
+    }
+    fwrite(code, 1, (size_t)n, fp);
+    if (n > 0 && code[n-1] != '\n') fputc('\n', fp);
+    fclose(fp);
+    free(code);
+
+    char cmd[2560];
+    snprintf(cmd, sizeof(cmd), "%s --do-lib \"%s\" -o \"%s\" >\"%s\" 2>&1",
+             PERLC_SELF_PATH, plPath, soPath, errPath);
+    int rc = system(cmd);
+    unlink(plPath);
+
+    if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+        char *errtext = perl_read_runtime_file(errPath);
+        char msg[1200];
+        if (errtext && errtext[0]) {
+            /* strip "Error: " prefix if present */
+            const char *e = errtext;
+            if (strncmp(e, "Error: ", 7) == 0) e += 7;
+            snprintf(msg, sizeof(msg), "%s at (eval %lld) line 1.", e, id + 1);
+        } else {
+            snprintf(msg, sizeof(msg), "syntax error at (eval %lld) line 1.", id + 1);
+        }
+        perl_set_dollar_at_cstr(msg);
+        free(errtext);
+        unlink(soPath);
+        unlink(errPath);
+        return perl_alloc_undef();
+    }
+    unlink(errPath);
+
+    void *handle = dlopen(soPath, RTLD_NOW);
+    unlink(soPath);
+    if (!handle) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "eval failed to load: %s", dlerror());
+        perl_set_dollar_at_cstr(msg);
+        return perl_alloc_undef();
+    }
+
+    PerlSubFnCtx entry = (PerlSubFnCtx)dlsym(handle, "__perlc_do_run");
+    if (!entry) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "eval: internal error (%s)", dlerror());
+        perl_set_dollar_at_cstr(msg);
+        dlclose(handle);
+        return perl_alloc_undef();
+    }
+
+    PerlDoLibInfo *info = malloc(sizeof(*info));
+    info->handle = handle;
+    info->next = s_do_lib_list;
+    s_do_lib_list = info;
+
+    int ctx = perl_current_wantarray_ctx();
+    jmp_buf jb;
+    PerlValue *result;
+    PerlArray *emptyArgs = perl_array_new();
+    if (setjmp(jb) == 0) {
+        perl_eval_push(&jb);
+        result = entry(emptyArgs, ctx);
+        perl_eval_pop();
+        PerlValue empty = { .tag = PERL_STRING, .sval = "", .slen = 0 };
+        perl_assign(&s_dollar_at, &empty);
+    } else {
+        perl_eval_pop();
+        result = perl_alloc_undef();
+    }
+    perl_array_free(emptyArgs);
+    return result ? result : perl_alloc_undef();
 }
 
 /* ── allocation ──────────────────────────────────────────────────────────── */
@@ -1722,6 +1826,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     }
     dst->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     /* Note: the refcount increment above already accounts for dst's ownership of pval */
+    perl_sig_sync_if_slot(dst);
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -2127,14 +2232,24 @@ PerlValue *perl_or(const PerlValue *a, const PerlValue *b) {
 
 /* ── I/O ─────────────────────────────────────────────────────────────────── */
 
+static PerlValue s_selected_fh;
+static int s_selected_inited = 0;
+
+static FILE *perl_selected_fp(void) {
+    if (s_selected_inited && s_selected_fh.tag == PERL_FILEHANDLE && s_selected_fh.pval)
+        return (FILE *)s_selected_fh.pval;
+    return stdout;
+}
+
 void perl_print(const PerlValue *v) {
     /* D85: fwrite the true byte length instead of fputs — fputs stops at
        the first embedded NUL, silently truncating output for e.g. a
        pack()'d value being printed/written out (the direct binary-
        protocol use case that motivated this fix). */
+    perl_sig_poll();
     long long n;
     char *s = perl_to_string_dup_len(v, &n);
-    fwrite(s, 1, (size_t)n, stdout);
+    fwrite(s, 1, (size_t)n, perl_selected_fp());
     free(s);
 }
 
@@ -2144,7 +2259,7 @@ void perl_say(const PerlValue *v) {
 }
 
 void perl_print_string(const char *s) {
-    fputs(s, stdout);
+    fputs(s, perl_selected_fp());
 }
 
 /* ── inc/dec ─────────────────────────────────────────────────────────────── */
@@ -2937,6 +3052,12 @@ void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
         h->buckets[b] = ne;
         h->size++;
     }
+    if (h == s_sig_hash) {
+        char *k2 = perl_to_string_dup(key);
+        PerlHashEntry *got = hash_find(h, k2);
+        if (got) perl_sig_install(got->key, got->val);
+        free(k2);
+    }
 }
 
 HOTX void perl_hash_set_str(PerlHash *h, const char *key, PerlValue *val) {
@@ -2957,6 +3078,7 @@ HOTX void perl_hash_set_str(PerlHash *h, const char *key, PerlValue *val) {
         h->buckets[b] = ne;
         h->size++;
     }
+    if (h == s_sig_hash) perl_sig_install(key, hash_find(h, key)->val);
 }
 
 int perl_hash_exists_sv(PerlHash *h, PerlValue *key) {
@@ -6558,6 +6680,672 @@ PerlValue *perl_syscall(PerlValue *args) {
     return perl_alloc_int(result);
 }
 
+/* ── W2: process / IPC / sockets ─────────────────────────────────────────── */
+
+static void pv_attach_fh(PerlValue *pv, FILE *fp) {
+    if (!pv) return;
+    if (pv->tag == PERL_FILEHANDLE && pv->pval) fclose((FILE *)pv->pval);
+    if (fp) {
+        pv->tag = PERL_FILEHANDLE;
+        pv->pval = fp;
+    } else {
+        pv->tag = PERL_UNDEF;
+        pv->pval = NULL;
+    }
+    pv->matchpos = 0;
+}
+
+static FILE *pv_as_fp(PerlValue *pv) {
+    if (!pv || pv->tag != PERL_FILEHANDLE) return NULL;
+    return (FILE *)pv->pval;
+}
+
+static int pv_as_fd(PerlValue *pv) {
+    FILE *fp = pv_as_fp(pv);
+    return fp ? fileno(fp) : -1;
+}
+
+static PerlValue *perl_bool_sys(int ok) {
+    return ok ? perl_alloc_int(1) : perl_alloc_undef();
+}
+
+static int perl_parse_signal(PerlValue *v) {
+    if (!v || v->tag == PERL_UNDEF) return -1;
+    if (v->tag == PERL_INT) return (int)v->ival;
+    char *s = perl_to_string_dup(v);
+    const char *p = s;
+    if (*p == '-') p++;
+    if (p[0] == 'S' && p[1] == 'I' && p[2] == 'G') p += 3;
+    static const struct { const char *n; int s; } tab[] = {
+        {"HUP", SIGHUP}, {"INT", SIGINT}, {"QUIT", SIGQUIT}, {"ILL", SIGILL},
+        {"ABRT", SIGABRT}, {"FPE", SIGFPE}, {"KILL", SIGKILL}, {"SEGV", SIGSEGV},
+        {"PIPE", SIGPIPE}, {"ALRM", SIGALRM}, {"TERM", SIGTERM},
+        {"USR1", SIGUSR1}, {"USR2", SIGUSR2}, {"CHLD", SIGCHLD},
+        {"CONT", SIGCONT}, {"STOP", SIGSTOP}, {"TSTP", SIGTSTP},
+        {"TTIN", SIGTTIN}, {"TTOU", SIGTTOU}, {"0", 0},
+        {NULL, 0}
+    };
+    int sig = -1;
+    if (isdigit((unsigned char)*p)) sig = atoi(p);
+    else {
+        for (int i = 0; tab[i].n; i++) {
+            if (strcmp(p, tab[i].n) == 0) { sig = tab[i].s; break; }
+        }
+    }
+    free(s);
+    return sig;
+}
+
+PerlValue *perl_fork(void) {
+    /* Flush stdio before fork so the child does not duplicate pending
+       stdout/stderr and reprint already-printed lines. */
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) return perl_alloc_undef();
+    return perl_alloc_int((long long)pid);
+}
+
+PerlValue *perl_wait_pid(void) {
+    int status = 0;
+    pid_t pid = wait(&status);
+    if (pid < 0) {
+        perl_set_dollar_question(-1);
+        return perl_alloc_int(-1);
+    }
+    perl_set_dollar_question(status);
+    perl_sig_poll();
+    return perl_alloc_int((long long)pid);
+}
+
+PerlValue *perl_waitpid(PerlValue *pid_pv, PerlValue *flags_pv) {
+    int status = 0;
+    pid_t want = (pid_t)perl_to_int(pid_pv);
+    int flags = flags_pv ? (int)perl_to_int(flags_pv) : 0;
+    pid_t pid = waitpid(want, &status, flags);
+    if (pid < 0) {
+        perl_set_dollar_question(-1);
+        return perl_alloc_int(-1);
+    }
+    if (pid == 0) {
+        /* WNOHANG: no child ready */
+        return perl_alloc_int(0);
+    }
+    perl_set_dollar_question(status);
+    perl_sig_poll();
+    return perl_alloc_int((long long)pid);
+}
+
+PerlValue *perl_kill(PerlArray *args) {
+    if (!args || args->len < 2) return perl_alloc_int(0);
+    int sig = perl_parse_signal(args->elems[0]);
+    if (sig < 0 && !(args->elems[0] && args->elems[0]->tag == PERL_INT &&
+                     perl_to_int(args->elems[0]) == 0)) {
+        /* signal 0 is valid (existence check) */
+        if (!(args->elems[0] && perl_to_int(args->elems[0]) == 0) && sig < 0)
+            return perl_alloc_int(0);
+        sig = 0;
+    }
+    long long n = 0;
+    for (long long i = 1; i < args->len; i++) {
+        pid_t pid = (pid_t)perl_to_int(args->elems[i]);
+        if (kill(pid, sig) == 0) n++;
+    }
+    perl_sig_poll(); /* deliver handlers for signals sent to self */
+    return perl_alloc_int(n);
+}
+
+PerlValue *perl_exec(PerlArray *args) {
+    if (!args || args->len < 1) return perl_alloc_undef();
+    if (args->len == 1) {
+        char *cmd = perl_to_string_dup(args->elems[0]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        free(cmd);
+        return perl_alloc_undef();
+    }
+    char **argv = (char **)calloc((size_t)args->len + 1, sizeof(char *));
+    if (!argv) return perl_alloc_undef();
+    for (long long i = 0; i < args->len; i++)
+        argv[i] = perl_to_string_dup(args->elems[i]);
+    execvp(argv[0], argv);
+    for (long long i = 0; i < args->len; i++) free(argv[i]);
+    free(argv);
+    return perl_alloc_undef();
+}
+
+void perl_exit_n(PerlValue *code) {
+    int n = code ? (int)perl_to_int(code) : 0;
+    exit(n);
+}
+
+PerlValue *perl_getppid_val(void) { return perl_alloc_int((long long)getppid()); }
+PerlValue *perl_getuid_val(void)  { return perl_alloc_int((long long)getuid()); }
+PerlValue *perl_getgid_val(void)  { return perl_alloc_int((long long)getgid()); }
+PerlValue *perl_geteuid_val(void) { return perl_alloc_int((long long)geteuid()); }
+PerlValue *perl_getegid_val(void) { return perl_alloc_int((long long)getegid()); }
+PerlValue *perl_setsid_val(void) {
+    pid_t s = setsid();
+    return s < 0 ? perl_alloc_undef() : perl_alloc_int((long long)s);
+}
+
+PerlValue *perl_getpgrp_val(PerlValue *pid_pv) {
+    pid_t pid = (pid_pv && pid_pv->tag != PERL_UNDEF) ? (pid_t)perl_to_int(pid_pv) : 0;
+    pid_t g = pid ? getpgid(pid) : getpgrp();
+    return g < 0 ? perl_alloc_undef() : perl_alloc_int((long long)g);
+}
+
+PerlValue *perl_setpgrp_val(PerlValue *pid_pv, PerlValue *pgid_pv) {
+    pid_t pid  = (pid_pv && pid_pv->tag != PERL_UNDEF) ? (pid_t)perl_to_int(pid_pv) : 0;
+    pid_t pgid = (pgid_pv && pgid_pv->tag != PERL_UNDEF) ? (pid_t)perl_to_int(pgid_pv) : 0;
+    return perl_bool_sys(setpgid(pid, pgid) == 0);
+}
+
+PerlValue *perl_umask_val(PerlValue *mode_pv) {
+    if (!mode_pv || mode_pv->tag == PERL_UNDEF) {
+        mode_t old = umask(0);
+        umask(old);
+        return perl_alloc_int((long long)old);
+    }
+    mode_t old = umask((mode_t)perl_to_int(mode_pv));
+    return perl_alloc_int((long long)old);
+}
+
+PerlValue *perl_pipe_fh(PerlValue *r, PerlValue *w) {
+    int fds[2];
+    if (!r || !w || pipe(fds) != 0) return perl_alloc_undef();
+    FILE *rf = fdopen(fds[0], "r");
+    FILE *wf = fdopen(fds[1], "w");
+    if (!rf || !wf) {
+        if (rf) fclose(rf); else close(fds[0]);
+        if (wf) fclose(wf); else close(fds[1]);
+        return perl_alloc_undef();
+    }
+    setvbuf(rf, NULL, _IOLBF, 0);
+    setvbuf(wf, NULL, _IOLBF, 0);
+    pv_attach_fh(r, rf);
+    pv_attach_fh(w, wf);
+    return perl_alloc_int(1);
+}
+
+PerlValue *perl_socket_fh(PerlValue *fh, PerlValue *domain, PerlValue *type, PerlValue *proto) {
+    if (!fh) return perl_alloc_undef();
+    int fd = socket((int)perl_to_int(domain), (int)perl_to_int(type),
+                    proto ? (int)perl_to_int(proto) : 0);
+    if (fd < 0) return perl_alloc_undef();
+    FILE *fp = fdopen(fd, "r+");
+    if (!fp) { close(fd); return perl_alloc_undef(); }
+    setvbuf(fp, NULL, _IONBF, 0);
+    pv_attach_fh(fh, fp);
+    return perl_alloc_int(1);
+}
+
+static int perl_sockaddr_from_pv(PerlValue *addr, struct sockaddr_storage *ss, socklen_t *len) {
+    if (!addr || addr->tag != PERL_STRING || !addr->sval) return -1;
+    long long n = addr->slen > 0 ? addr->slen : (long long)strlen(addr->sval);
+    if (n <= 0 || n > (long long)sizeof(*ss)) return -1;
+    memset(ss, 0, sizeof(*ss));
+    memcpy(ss, addr->sval, (size_t)n);
+    *len = (socklen_t)n;
+    return 0;
+}
+
+PerlValue *perl_bind_fh(PerlValue *fh, PerlValue *addr) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    struct sockaddr_storage ss;
+    socklen_t len = 0;
+    if (perl_sockaddr_from_pv(addr, &ss, &len) != 0) return perl_alloc_undef();
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    return perl_bool_sys(bind(fd, (struct sockaddr *)&ss, len) == 0);
+}
+
+PerlValue *perl_listen_fh(PerlValue *fh, PerlValue *backlog) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    int n = backlog ? (int)perl_to_int(backlog) : 5;
+    return perl_bool_sys(listen(fd, n) == 0);
+}
+
+PerlValue *perl_connect_fh(PerlValue *fh, PerlValue *addr) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    struct sockaddr_storage ss;
+    socklen_t len = 0;
+    if (perl_sockaddr_from_pv(addr, &ss, &len) != 0) return perl_alloc_undef();
+    return perl_bool_sys(connect(fd, (struct sockaddr *)&ss, len) == 0);
+}
+
+PerlValue *perl_accept_fh(PerlValue *new_fh, PerlValue *listen_fh) {
+    int fd = pv_as_fd(listen_fh);
+    if (fd < 0 || !new_fh) return perl_alloc_undef();
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    int nfd = accept(fd, (struct sockaddr *)&ss, &len);
+    if (nfd < 0) return perl_alloc_undef();
+    FILE *fp = fdopen(nfd, "r+");
+    if (!fp) { close(nfd); return perl_alloc_undef(); }
+    setvbuf(fp, NULL, _IONBF, 0);
+    pv_attach_fh(new_fh, fp);
+    return perl_alloc_int(1);
+}
+
+PerlValue *perl_send_fh(PerlValue *fh, PerlValue *msg, PerlValue *flags) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0 || !msg) return perl_alloc_undef();
+    long long n = 0;
+    char *s = perl_to_string_dup_len(msg, &n);
+    ssize_t sent = send(fd, s, (size_t)n, flags ? (int)perl_to_int(flags) : 0);
+    free(s);
+    if (sent < 0) return perl_alloc_undef();
+    return perl_alloc_int((long long)sent);
+}
+
+PerlValue *perl_recv_fh(PerlValue *fh, PerlValue *buf, PerlValue *len_pv, PerlValue *flags) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0 || !buf) return perl_alloc_undef();
+    long long n = perl_to_int(len_pv);
+    if (n <= 0) return perl_alloc_int(0);
+    char *tmp = (char *)malloc((size_t)n);
+    if (!tmp) return perl_alloc_undef();
+    ssize_t got = recv(fd, tmp, (size_t)n, flags ? (int)perl_to_int(flags) : 0);
+    if (got < 0) { free(tmp); return perl_alloc_undef(); }
+    if (buf->tag == PERL_STRING && buf->sval) free(buf->sval);
+    buf->tag = PERL_STRING;
+    buf->sval = (char *)malloc((size_t)got + 1);
+    memcpy(buf->sval, tmp, (size_t)got);
+    buf->sval[got] = '\0';
+    buf->slen = got;
+    free(tmp);
+    /* Perl's recv returns the sender address, not the byte count.
+       Connected TCP sockets typically yield an empty string. */
+    return perl_alloc_string("");
+}
+
+PerlValue *perl_shutdown_fh(PerlValue *fh, PerlValue *how) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    return perl_bool_sys(shutdown(fd, how ? (int)perl_to_int(how) : 2) == 0);
+}
+
+static PerlValue *perl_sockname(PerlValue *fh, int peer) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    int rc = peer ? getpeername(fd, (struct sockaddr *)&ss, &len)
+                  : getsockname(fd, (struct sockaddr *)&ss, &len);
+    if (rc != 0) return perl_alloc_undef();
+    return perl_alloc_string_len((const char *)&ss, (long long)len);
+}
+
+PerlValue *perl_getsockname_fh(PerlValue *fh) { return perl_sockname(fh, 0); }
+PerlValue *perl_getpeername_fh(PerlValue *fh) { return perl_sockname(fh, 1); }
+
+PerlValue *perl_sysopen_fh(PerlValue *fh, PerlValue *path, PerlValue *mode, PerlValue *perms) {
+    if (!fh || !path) return perl_alloc_undef();
+    char *p = perl_to_string_dup(path);
+    int flags = (int)perl_to_int(mode);
+    mode_t perm = perms && perms->tag != PERL_UNDEF ? (mode_t)perl_to_int(perms) : 0666;
+    int fd = open(p, flags, perm);
+    free(p);
+    if (fd < 0) return perl_alloc_undef();
+    const char *fm = (flags & O_RDWR) ? "r+" : (flags & O_WRONLY) ? "w" : "r";
+    FILE *fp = fdopen(fd, fm);
+    if (!fp) { close(fd); return perl_alloc_undef(); }
+    pv_attach_fh(fh, fp);
+    return perl_alloc_int(1);
+}
+
+PerlValue *perl_sysread_fh(PerlValue *fh, PerlValue *buf, PerlValue *len_pv, PerlValue *off_pv) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0 || !buf) return perl_alloc_undef();
+    long long n = perl_to_int(len_pv);
+    if (n <= 0) return perl_alloc_int(0);
+    long long off = off_pv ? perl_to_int(off_pv) : 0;
+    char *tmp = (char *)malloc((size_t)n);
+    if (!tmp) return perl_alloc_undef();
+    ssize_t got = read(fd, tmp, (size_t)n);
+    if (got < 0) { free(tmp); return perl_alloc_undef(); }
+    long long oldn = (buf->tag == PERL_STRING) ? buf->slen : 0;
+    char *old = (buf->tag == PERL_STRING) ? buf->sval : NULL;
+    if (off < 0) off = 0;
+    long long newn = off + got;
+    if (oldn > newn) newn = oldn;
+    char *out = (char *)malloc((size_t)newn + 1);
+    memset(out, 0, (size_t)newn + 1);
+    if (old && oldn > 0) memcpy(out, old, (size_t)oldn);
+    memcpy(out + off, tmp, (size_t)got);
+    out[newn] = '\0';
+    if (old) free(old);
+    buf->tag = PERL_STRING;
+    buf->sval = out;
+    buf->slen = newn;
+    free(tmp);
+    return perl_alloc_int((long long)got);
+}
+
+PerlValue *perl_syswrite_fh(PerlValue *fh, PerlValue *buf, PerlValue *len_pv, PerlValue *off_pv) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0 || !buf) return perl_alloc_undef();
+    long long blen = 0;
+    char *s = perl_to_string_dup_len(buf, &blen);
+    long long off = off_pv ? perl_to_int(off_pv) : 0;
+    if (off < 0) off = 0;
+    if (off > blen) off = blen;
+    long long n = len_pv && len_pv->tag != PERL_UNDEF ? perl_to_int(len_pv) : (blen - off);
+    if (n < 0) n = 0;
+    if (off + n > blen) n = blen - off;
+    ssize_t w = write(fd, s + off, (size_t)n);
+    free(s);
+    if (w < 0) return perl_alloc_undef();
+    return perl_alloc_int((long long)w);
+}
+
+PerlValue *perl_flock_fh(PerlValue *fh, PerlValue *op) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    return perl_bool_sys(flock(fd, op ? (int)perl_to_int(op) : LOCK_EX) == 0);
+}
+
+/* ── vec / select / fcntl / ioctl / dup / live %SIG ──────────────────────── */
+
+#ifndef NSIG
+#define NSIG 65
+#endif
+
+static volatile sig_atomic_t s_sig_pend[NSIG];
+
+static const char *perl_signame(int sig) {
+    switch (sig) {
+    case SIGHUP: return "HUP"; case SIGINT: return "INT";
+    case SIGQUIT: return "QUIT"; case SIGILL: return "ILL";
+    case SIGABRT: return "ABRT"; case SIGFPE: return "FPE";
+    case SIGKILL: return "KILL"; case SIGSEGV: return "SEGV";
+    case SIGPIPE: return "PIPE"; case SIGALRM: return "ALRM";
+    case SIGTERM: return "TERM"; case SIGUSR1: return "USR1";
+    case SIGUSR2: return "USR2"; case SIGCHLD: return "CHLD";
+    case SIGCONT: return "CONT"; case SIGSTOP: return "STOP";
+    case SIGTSTP: return "TSTP"; case SIGTTIN: return "TTIN";
+    case SIGTTOU: return "TTOU";
+    default: return NULL;
+    }
+}
+
+static void perl_sighandler(int sig) {
+    if (sig >= 0 && sig < NSIG) s_sig_pend[sig] = 1;
+}
+
+static void perl_sig_install(const char *key, PerlValue *val) {
+    if (!key || key[0] == '\0') return;
+    if (strcmp(key, "__WARN__") == 0 || strcmp(key, "__DIE__") == 0) return;
+    PerlValue tmp = { .tag = PERL_STRING, .sval = (char *)key,
+                      .slen = (long long)strlen(key) };
+    int sig = perl_parse_signal(&tmp);
+    if (sig <= 0 || sig == SIGKILL || sig == SIGSTOP || sig >= NSIG) return;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = 0; /* interrupt sleep/select — no SA_RESTART */
+
+    if (!val || val->tag == PERL_UNDEF) {
+        sa.sa_handler = SIG_DFL;
+    } else if (val->tag == PERL_CODE_REF) {
+        sa.sa_handler = perl_sighandler;
+    } else {
+        char *s = perl_to_string_dup(val);
+        if (strcmp(s, "IGNORE") == 0 || strcmp(s, "IGN") == 0)
+            sa.sa_handler = SIG_IGN;
+        else if (strcmp(s, "DEFAULT") == 0 || strcmp(s, "DFL") == 0 || s[0] == '\0')
+            sa.sa_handler = SIG_DFL;
+        else
+            sa.sa_handler = perl_sighandler; /* named sub / other true value */
+        free(s);
+    }
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+}
+
+static void perl_sig_sync_if_slot(PerlValue *dst) {
+    if (!s_sig_hash || !dst) return;
+    for (int b = 0; b < PERL_HASH_BUCKETS; b++) {
+        for (PerlHashEntry *e = s_sig_hash->buckets[b]; e; e = e->next) {
+            if (e->val == dst) { perl_sig_install(e->key, dst); return; }
+        }
+    }
+}
+
+void perl_sig_poll(void) {
+    for (int i = 1; i < NSIG; i++) {
+        if (!s_sig_pend[i]) continue;
+        s_sig_pend[i] = 0;
+        const char *nm = perl_signame(i);
+        if (!nm) continue;
+        PerlValue *msg = perl_alloc_string(nm);
+        if (!call_sig_handler(nm, msg)) {
+            char longn[16];
+            snprintf(longn, sizeof(longn), "SIG%s", nm);
+            call_sig_handler(longn, msg);
+        }
+        perl_free(msg);
+    }
+}
+
+static unsigned long perl_vec_get_bytes(const char *s, long long slen,
+                                        long long offset, int bits) {
+    if (bits < 1) return 0;
+    if (bits <= 8) {
+        long long bit = offset * bits;
+        long long byte = bit / 8;
+        int sh = (int)(bit % 8);
+        if (byte < 0 || byte >= slen || !s) return 0;
+        unsigned mask = (1u << bits) - 1;
+        return ((unsigned char)s[byte] >> sh) & mask;
+    }
+    int nbytes = bits / 8;
+    long long byte = offset * nbytes;
+    unsigned long v = 0;
+    for (int i = 0; i < nbytes; i++) {
+        unsigned char b = (byte + i >= 0 && byte + i < slen && s)
+                          ? (unsigned char)s[byte + i] : 0;
+        v = (v << 8) | b; /* big-endian, matches real Perl on this host */
+    }
+    return v;
+}
+
+static void perl_vec_ensure(PerlValue *str, long long nbytes) {
+    if (!str) return;
+    if (str->tag != PERL_STRING) {
+        if (str->tag == PERL_UNDEF) {
+            str->tag = PERL_STRING;
+            str->sval = calloc(1, 1);
+            str->slen = 0;
+        } else {
+            long long n;
+            char *s = perl_to_string_dup_len(str, &n);
+            if (str->tag == PERL_STRING && str->sval) free(str->sval);
+            str->tag = PERL_STRING;
+            str->sval = s;
+            str->slen = n;
+        }
+    }
+    if (nbytes < 0) nbytes = 0;
+    if (str->slen >= nbytes) return;
+    char *p = realloc(str->sval, (size_t)nbytes + 1);
+    if (!p) return;
+    memset(p + str->slen, 0, (size_t)(nbytes - str->slen) + 1);
+    str->sval = p;
+    str->slen = nbytes;
+    str->sval[nbytes] = '\0';
+}
+
+static void perl_vec_set_bytes(PerlValue *str, long long offset, int bits,
+                               unsigned long val) {
+    if (!str || bits < 1) return;
+    if (bits <= 8) {
+        long long bit = offset * bits;
+        long long byte = bit / 8;
+        int sh = (int)(bit % 8);
+        perl_vec_ensure(str, byte + 1);
+        if (!str->sval || byte < 0) return;
+        unsigned mask = (1u << bits) - 1;
+        unsigned char *p = (unsigned char *)str->sval + byte;
+        *p = (unsigned char)((*p & ~(mask << sh)) | ((val & mask) << sh));
+        return;
+    }
+    int nbytes = bits / 8;
+    long long byte = offset * nbytes;
+    perl_vec_ensure(str, byte + nbytes);
+    if (!str->sval || byte < 0) return;
+    for (int i = nbytes - 1; i >= 0; i--) {
+        str->sval[byte + i] = (char)(val & 0xff);
+        val >>= 8;
+    }
+}
+
+PerlValue *perl_vec_get(PerlValue *str, PerlValue *off, PerlValue *bits_pv) {
+    int bits = bits_pv ? (int)perl_to_int(bits_pv) : 1;
+    long long offset = off ? perl_to_int(off) : 0;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16 && bits != 32)
+        bits = 1;
+    long long slen = 0;
+    const char *s = NULL;
+    if (str && str->tag == PERL_STRING) { s = str->sval; slen = str->slen; }
+    return perl_alloc_int((long long)perl_vec_get_bytes(s, slen, offset, bits));
+}
+
+PerlValue *perl_vec_set(PerlValue *str, PerlValue *off, PerlValue *bits_pv,
+                        PerlValue *val) {
+    int bits = bits_pv ? (int)perl_to_int(bits_pv) : 1;
+    long long offset = off ? perl_to_int(off) : 0;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16 && bits != 32)
+        bits = 1;
+    unsigned long v = val ? (unsigned long)perl_to_int(val) : 0;
+    perl_vec_set_bytes(str, offset, bits, v);
+    return perl_alloc_int((long long)v);
+}
+
+static int perl_bits_fill_fdset(PerlValue *bits, fd_set *set, int *nfds) {
+    if (!bits || bits->tag != PERL_STRING || !bits->sval) return 0;
+    FD_ZERO(set);
+    long long nbits = bits->slen * 8;
+    int used = 0;
+    for (long long i = 0; i < nbits && i < FD_SETSIZE; i++) {
+        if (perl_vec_get_bytes(bits->sval, bits->slen, i, 1)) {
+            FD_SET((int)i, set);
+            if ((int)i + 1 > *nfds) *nfds = (int)i + 1;
+            used = 1;
+        }
+    }
+    return used;
+}
+
+static void perl_bits_from_fdset(PerlValue *bits, fd_set *set) {
+    if (!bits || bits->tag != PERL_STRING) return;
+    long long nbits = bits->slen * 8;
+    for (long long i = 0; i < nbits && i < FD_SETSIZE; i++) {
+        perl_vec_set_bytes(bits, i, 1, FD_ISSET((int)i, set) ? 1 : 0);
+    }
+}
+
+PerlValue *perl_select4(PerlValue *r, PerlValue *w, PerlValue *e, PerlValue *timeout) {
+    perl_sig_poll();
+    fd_set rfds, wfds, efds;
+    int nfds = 0;
+    int use_r = perl_bits_fill_fdset(r, &rfds, &nfds);
+    int use_w = perl_bits_fill_fdset(w, &wfds, &nfds);
+    int use_e = perl_bits_fill_fdset(e, &efds, &nfds);
+    struct timeval tv, *tvp = NULL;
+    if (timeout && timeout->tag != PERL_UNDEF) {
+        double t = perl_to_float(timeout);
+        if (t < 0) t = 0;
+        tv.tv_sec = (time_t)t;
+        tv.tv_usec = (suseconds_t)((t - (double)tv.tv_sec) * 1000000.0);
+        if (tv.tv_usec < 0) tv.tv_usec = 0;
+        tvp = &tv;
+    }
+    int n = select(nfds, use_r ? &rfds : NULL, use_w ? &wfds : NULL,
+                   use_e ? &efds : NULL, tvp);
+    if (n < 0) return perl_alloc_undef();
+    if (use_r) perl_bits_from_fdset(r, &rfds);
+    if (use_w) perl_bits_from_fdset(w, &wfds);
+    if (use_e) perl_bits_from_fdset(e, &efds);
+    perl_sig_poll();
+    return perl_alloc_int((long long)n);
+}
+
+PerlValue *perl_select_fh(PerlValue *newfh) {
+    if (!s_selected_inited) {
+        s_selected_fh.tag = PERL_FILEHANDLE;
+        s_selected_fh.pval = stdout;
+        s_selected_inited = 1;
+    }
+    PerlValue *old = perl_alloc_undef();
+    old->tag = PERL_FILEHANDLE;
+    old->pval = s_selected_fh.pval;
+    if (newfh && newfh->tag == PERL_FILEHANDLE && newfh->pval) {
+        s_selected_fh.tag = PERL_FILEHANDLE;
+        s_selected_fh.pval = newfh->pval;
+    }
+    return old;
+}
+
+static PerlValue *perl_zero_but_true(int rc) {
+    if (rc < 0) return perl_alloc_undef();
+    if (rc == 0) return perl_alloc_string("0 but true");
+    return perl_alloc_int((long long)rc);
+}
+
+PerlValue *perl_fcntl_fh(PerlValue *fh, PerlValue *cmd, PerlValue *arg) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    int c = cmd ? (int)perl_to_int(cmd) : 0;
+    int rc;
+    if (c == F_GETFL || c == F_GETFD) {
+        rc = fcntl(fd, c);
+        return rc < 0 ? perl_alloc_undef() : perl_alloc_int((long long)rc);
+    }
+    if (arg && arg->tag == PERL_STRING && arg->sval)
+        rc = fcntl(fd, c, arg->sval);
+    else
+        rc = fcntl(fd, c, arg ? (long)perl_to_int(arg) : 0L);
+    return perl_zero_but_true(rc);
+}
+
+PerlValue *perl_ioctl_fh(PerlValue *fh, PerlValue *cmd, PerlValue *arg) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    unsigned long c = cmd ? (unsigned long)perl_to_int(cmd) : 0;
+    int rc;
+    if (arg && arg->tag == PERL_STRING && arg->sval)
+        rc = ioctl(fd, c, arg->sval);
+    else {
+        long v = arg ? perl_to_int(arg) : 0;
+        rc = ioctl(fd, c, v);
+    }
+    return perl_zero_but_true(rc);
+}
+
+static int perl_fd_from_pv(PerlValue *v) {
+    if (!v) return -1;
+    if (v->tag == PERL_FILEHANDLE) return pv_as_fd(v);
+    return (int)perl_to_int(v);
+}
+
+PerlValue *perl_dup_fd(PerlValue *fd_pv) {
+    int fd = perl_fd_from_pv(fd_pv);
+    if (fd < 0) return perl_alloc_undef();
+    int n = dup(fd);
+    return n < 0 ? perl_alloc_undef() : perl_alloc_int((long long)n);
+}
+
+PerlValue *perl_dup2_fd(PerlValue *old_pv, PerlValue *new_pv) {
+    int o = perl_fd_from_pv(old_pv), n = perl_fd_from_pv(new_pv);
+    if (o < 0 || n < 0) return perl_alloc_undef();
+    int r = dup2(o, n);
+    return r < 0 ? perl_alloc_undef() : perl_alloc_int((long long)r);
+}
+
 PerlValue *perl_backtick(PerlValue *cmd) {
     char *s = perl_to_string_dup(cmd);
     FILE *fp = popen(s, "r");
@@ -6804,7 +7592,9 @@ PerlArray *perl_gmtime_val(PerlValue *t) {
 
 PerlValue *perl_sleep_val(PerlValue *secs) {
     unsigned s = secs ? (unsigned)perl_to_int(secs) : 0;
-    return perl_alloc_int((long long)sleep(s));
+    unsigned left = sleep(s);
+    perl_sig_poll();
+    return perl_alloc_int((long long)left);
 }
 
 PerlValue *perl_alarm_val(PerlValue *secs) {

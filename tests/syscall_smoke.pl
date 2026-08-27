@@ -6,10 +6,12 @@ use warnings;
 
 print "Testing syscall implementation...\n";
 
-# Test basic getpid syscall
+# Test basic getpid syscall. Do not print the pid itself — harness
+# compares against a separately-launched perl, so the numbers differ.
 my $SYS_getpid = 39;
 my $pid = syscall($SYS_getpid);
-print "getpid result: $pid (defined: " . (defined $pid ? "yes" : "no") . ")\n";
+print "getpid defined: " . (defined $pid ? "yes" : "no") . "\n";
+print "getpid positive: " . (($pid && $pid > 0) ? "yes" : "no") . "\n";
 exit(1) unless defined $pid;
 exit(1) unless $pid > 0;
 

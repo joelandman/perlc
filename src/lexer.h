@@ -10,7 +10,7 @@ enum class TK {
     KW_MY, KW_OUR, KW_LOCAL,
     KW_IF, KW_ELSIF, KW_ELSE, KW_UNLESS,
     KW_WHILE, KW_UNTIL, KW_FOR, KW_FOREACH, KW_DO,
-    KW_LAST, KW_NEXT, KW_REDO, KW_RETURN,
+    KW_LAST, KW_NEXT, KW_REDO, KW_RETURN, KW_GOTO,
     KW_SUB, KW_USE, KW_STRICT, KW_WARNINGS,
     KW_PRINT, KW_SAY, KW_PRINTF, KW_SPRINTF,
     KW_OPEN, KW_CLOSE, KW_EOF, KW_DIE, KW_UNLINK,
@@ -115,5 +115,6 @@ private:
     Token readHeredoc();
     Token readIdent();
     Token readRegex();
+    Token readRegexDelim(char open, char close, bool paired);
     Token readSubst();
 };

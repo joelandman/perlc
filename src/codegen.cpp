@@ -198,6 +198,7 @@ void CodeGen::declareRuntime() {
     RT("perl_alloc_bool",    pv,  i64);
     RT("perl_alloc_float",   pv,  Type::getDoubleTy(ctx_));
     RT("perl_alloc_string",  pv,  i8p);
+    RT("perl_alloc_string_len", pv, i8p, i64);
     RT("perl_clone",         pv,  pv);
     RT("perl_free",          voidTy, pv);
     RT("perl_assign",        voidTy, pv, pv);
@@ -412,6 +413,45 @@ void CodeGen::declareRuntime() {
     RT("perl_env_set",    voidTy, pv, pv);
     RT("perl_system",     pv, pv);
     RT("perl_syscall",    pv, pv);
+    RT("perl_fork",              pv);
+    RT("perl_wait_pid",          pv);
+    RT("perl_waitpid",           pv, pv, pv);
+    RT("perl_kill",              pv, av);
+    RT("perl_exec",              pv, av);
+    RT("perl_exit_n",            voidTy, pv);
+    rtFuncs_["perl_exit_n"]->addFnAttr(Attribute::NoReturn);
+    RT("perl_getppid_val",       pv);
+    RT("perl_getuid_val",        pv);
+    RT("perl_getgid_val",        pv);
+    RT("perl_geteuid_val",       pv);
+    RT("perl_getegid_val",       pv);
+    RT("perl_setsid_val",        pv);
+    RT("perl_getpgrp_val",       pv, pv);
+    RT("perl_setpgrp_val",       pv, pv, pv);
+    RT("perl_umask_val",         pv, pv);
+    RT("perl_pipe_fh",           pv, pv, pv);
+    RT("perl_socket_fh",         pv, pv, pv, pv, pv);
+    RT("perl_bind_fh",           pv, pv, pv);
+    RT("perl_listen_fh",         pv, pv, pv);
+    RT("perl_connect_fh",        pv, pv, pv);
+    RT("perl_accept_fh",         pv, pv, pv);
+    RT("perl_send_fh",           pv, pv, pv, pv);
+    RT("perl_recv_fh",           pv, pv, pv, pv, pv);
+    RT("perl_shutdown_fh",       pv, pv, pv);
+    RT("perl_getsockname_fh",    pv, pv);
+    RT("perl_getpeername_fh",    pv, pv);
+    RT("perl_sysopen_fh",        pv, pv, pv, pv, pv);
+    RT("perl_sysread_fh",        pv, pv, pv, pv, pv);
+    RT("perl_syswrite_fh",       pv, pv, pv, pv, pv);
+    RT("perl_flock_fh",          pv, pv, pv);
+    RT("perl_vec_get",           pv, pv, pv, pv);
+    RT("perl_vec_set",           pv, pv, pv, pv, pv);
+    RT("perl_select4",           pv, pv, pv, pv, pv);
+    RT("perl_select_fh",         pv, pv);
+    RT("perl_fcntl_fh",          pv, pv, pv, pv);
+    RT("perl_ioctl_fh",          pv, pv, pv, pv);
+    RT("perl_dup_fd",            pv, pv);
+    RT("perl_dup2_fd",           pv, pv, pv);
     RT("perl_backtick",   pv, pv);
     RT("perl_init_argv",   av, Type::getInt32Ty(ctx_), i8p);
     RT("perl_get_dollar0", pv);
@@ -420,6 +460,7 @@ void CodeGen::declareRuntime() {
     RT("perl_eval_pop",        voidTy);
     RT("perl_get_dollar_at",   pv);
     RT("perl_eval_push",       voidTy, i8p);
+    RT("perl_eval_string",     pv, pv);
     RT("perl_tr",              i64, pv, i8p, i8p, i8p);
     /* setjmp called directly from generated code — must be returns_twice */
     {
@@ -519,6 +560,7 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_get_dollar_comma", pv);
     RT("perl_get_dollar_bsl",   pv);
     RT("perl_get_dollar_amp",   pv);
+    RT("perl_get_dollar_question", pv);
     RT("perl_print_sep",        voidTy);
     RT("perl_print_sep_fh",     voidTy, pv);
     RT("perl_print_ors",        voidTy);
@@ -1476,26 +1518,19 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         }
         return callRT("perl_uniq_list", {av});
     }
+    /* eval EXPR / eval { BLOCK } in list context: force wantarray, unwrap. */
+    if (n.kind == NK::EvalBlock || (n.kind == NK::Call && n.name == "eval")) {
+        int saved = callCtx_;
+        callCtx_ = 1;
+        Value *pv = emitExpr(n);
+        callCtx_ = saved;
+        return callRT("perl_unwrap_list_return", {pv});
+    }
     /* user-defined sub call in list context: call with ctx=1, unwrap result */
     if (n.kind == NK::Call) {
         if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
             Value *argsArr = callRT("perl_array_new", {});
-            for (auto &arg : n.args) {
-                if (arg->kind == NK::ArrayVar) {
-                    Value *av = lookupArray(arg->name);
-                    if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
-                }
-                if (arg->kind == NK::HashVar) {
-                    Value *hv = lookupHash(arg->name);
-                    if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
-                }
-                if (Value *av = emitArrayPtr(*arg)) {
-                    callRT("perl_array_extend", {argsArr, av}); continue;
-                }
-                Value *v = emitExpr(*arg);
-                callRT("perl_array_push", {argsArr, v});
-                freeIfOwned(v);
-            }
+            fillCallArgs(argsArr, n);
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *one = ConstantInt::get(i32Ty, 1);
             Value *pv = builder_.CreateCall(fn, {argsArr, one});
@@ -1525,7 +1560,9 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
 
 Value *CodeGen::perlStr(const std::string &s) {
     auto *gv = builder_.CreateGlobalString(s, ".str");
-    return callRT("perl_alloc_string", {gv});
+    /* D85: interior NULs (pack, "\0", "\x00") must keep their byte length. */
+    return callRT("perl_alloc_string_len",
+                  {gv, ConstantInt::get(Type::getInt64Ty(ctx_), (long long)s.size())});
 }
 
 /* Returns an i8* global string constant if n is a compile-time string literal,
@@ -2909,6 +2946,7 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
     std::unordered_map<std::string, InlineSub> candidates;
     for (auto *s : subs_) {
         if (!s->body) continue;
+        if (!s->sval.empty()) continue; /* prototype: args are not a plain flatten */
         const Node &body = *s->body;
         /* Need exactly: FlatBlock(my $p1; my $p2; ...; assign-from-@_) + Return */
         if (body.args.size() != 2) continue;
@@ -2988,6 +3026,8 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
         }
 
         currentFn_ = mainFn;
+        stmtLabels_.clear();
+        collectGotoLabels(program);
         pushScope();
         /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
         fileScopeDepth_ = (int)scopes_.size() + 1;
@@ -3103,20 +3143,25 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
         }
 
         currentFn_ = entryFn;
+        stmtLabels_.clear();
+        collectGotoLabels(program);
         pushScope();
         fileScopeDepth_ = (int)scopes_.size() + 1;
         inMainBody_ = true;
 
-        /* register all subs in the method dispatch table (before user code
-           runs) — this is what makes a do'd file's own package-qualified
-           subs (e.g. Foo::bar) callable from the *loading* process after
-           perl_do_file() returns, since the loader looks them up in this
-           same runtime-wide table via perl_call_named_sub(). */
+        /* Register every sub — including unqualified names — so a string
+           eval / do FILE that defines `sub foo {}` is callable afterwards
+           via perl_call_named_sub("foo") from the loading process. Package-
+           qualified names stay registered as before; bare names also get a
+           main:: alias matching Perl's default package. */
         for (auto *s : subs_) {
-            if (s->name.find("::") != std::string::npos) {
-                Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
-                auto *fn = mod_->getFunction(subLLVMName(s->name));
-                callRT("perl_register_method", {keyStr, fn});
+            auto *fn = mod_->getFunction(subLLVMName(s->name));
+            if (!fn) continue;
+            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+            callRT("perl_register_method", {keyStr, fn});
+            if (s->name.find("::") == std::string::npos) {
+                Value *mainKey = builder_.CreateGlobalStringPtr("main::" + s->name);
+                callRT("perl_register_method", {mainKey, fn});
             }
         }
 
@@ -3126,8 +3171,16 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
         /* D64: same pre-scan as the normal-main path above */
         collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
 
+        /* do FILE / string eval inherit the caller's wantarray (ctx arg).
+           Needed so a last-expr ArrayLit like `(1,2,3)` becomes LIST_RESULT
+           in list context rather than the scalar last element. */
+        bool savedDoLibWA = currentSubNeedsWantarray_;
+        currentSubNeedsWantarray_ = true;
+        callRT("perl_push_wantarray", {entryFn->getArg(1)});
+
         Value *lastVal = emitBlockLast(program);
         if (!builder_.GetInsertBlock()->getTerminator()) {
+            callRT("perl_pop_wantarray", {});
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_local_restore_to", {depth});
             popScope();
@@ -3135,6 +3188,7 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
         } else {
             popScope();  /* explicit return: already terminated this block */
         }
+        currentSubNeedsWantarray_ = savedDoLibWA;
     }
 
     inMainBody_ = false;
@@ -3156,6 +3210,98 @@ static bool hasLocalStmt(const Node &n);
 static bool hasWantarrayOrUserCall(const Node &n);
 static bool hasReturnStmt(const Node &n);
 static bool hasDefaultVarUse(const Node &n);
+
+/* ── goto LABEL support ─────────────────────────────────────────────────── */
+
+void CodeGen::collectGotoLabels(const Node &n) {
+    /* Nested subs have their own functions — don't plant their labels here. */
+    if (n.kind == NK::SubDef || n.kind == NK::AnonSub) return;
+    if (n.kind == NK::LabelStmt && !n.name.empty())
+        (void)labelBB(n.name);
+    if (!n.sval.empty() &&
+        (n.kind == NK::While || n.kind == NK::For ||
+         n.kind == NK::Foreach || n.kind == NK::DoWhile))
+        (void)labelBB(n.sval);
+    if (n.left)  collectGotoLabels(*n.left);
+    if (n.right) collectGotoLabels(*n.right);
+    if (n.cond)  collectGotoLabels(*n.cond);
+    if (n.body)  collectGotoLabels(*n.body);
+    if (n.init)  collectGotoLabels(*n.init);
+    if (n.step)  collectGotoLabels(*n.step);
+    for (auto &a : n.args) collectGotoLabels(*a);
+    for (auto &b : n.branches) {
+        if (b.cond) collectGotoLabels(*b.cond);
+        if (b.body) collectGotoLabels(*b.body);
+    }
+}
+
+llvm::BasicBlock *CodeGen::labelBB(const std::string &name) {
+    auto it = stmtLabels_.find(name);
+    if (it != stmtLabels_.end()) return it->second;
+    auto *fn = currentFn_;
+    auto *bb = BasicBlock::Create(ctx_, "lbl." + name, fn);
+    stmtLabels_[name] = bb;
+    return bb;
+}
+
+void CodeGen::flattenArgInto(Value *argsArr, const Node &arg) {
+    if (arg.kind == NK::ArrayVar) {
+        Value *av = lookupArray(arg.name);
+        if (av) { callRT("perl_array_extend", {argsArr, av}); return; }
+    }
+    if (arg.kind == NK::HashVar) {
+        Value *hv = lookupHash(arg.name);
+        if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); return; }
+    }
+    if (Value *av = emitArrayPtr(arg)) {
+        callRT("perl_array_extend", {argsArr, av});
+        return;
+    }
+    Value *v = emitExpr(arg);
+    callRT("perl_array_push", {argsArr, v});
+    freeIfOwned(v);
+}
+
+void CodeGen::fillCallArgs(Value *argsArr, const Node &n) {
+    /* ival==2 is &name() — bypass prototype. Empty sval = no prototype. */
+    if (n.ival == 2 || n.sval.empty()) {
+        for (auto &arg : n.args) flattenArgInto(argsArr, *arg);
+        return;
+    }
+    const std::string &proto = n.sval;
+    size_t ai = 0;
+    bool slurp = false;
+    for (char c : proto) {
+        if (c == '\\' || c == '[' || c == ']') continue;
+        if (c == ';') continue;
+        if (c == '@' || c == '%') { slurp = true; break; }
+        int saved = callCtx_;
+        callCtx_ = 0;
+        if (ai >= n.args.size()) {
+            if (c == '_') {
+                if (auto *slot = lookupVar("_")) {
+                    Value *v = builder_.CreateLoad(perlPtrTy_, slot);
+                    callRT("perl_array_push", {argsArr, v});
+                } else {
+                    callRT("perl_array_push", {argsArr, perlUndef()});
+                }
+            }
+            callCtx_ = saved;
+            continue;
+        }
+        /* $ * + & _ : one argument, scalar context (no list flatten) */
+        Value *v = emitExpr(*n.args[ai++]);
+        callRT("perl_array_push", {argsArr, v});
+        freeIfOwned(v);
+        callCtx_ = saved;
+    }
+    if (slurp) {
+        int saved = callCtx_;
+        callCtx_ = 1;
+        while (ai < n.args.size()) flattenArgInto(argsArr, *n.args[ai++]);
+        callCtx_ = saved;
+    }
+}
 
 /* ── sub definition ──────────────────────────────────────────────────────── */
 
@@ -3186,6 +3332,9 @@ void CodeGen::emitSub(const Node &n) {
 
     auto *savedFn = currentFn_;
     currentFn_ = fn;
+    auto savedLabels = std::move(stmtLabels_);
+    stmtLabels_.clear();
+    if (n.body) collectGotoLabels(*n.body);
     flatDoubleCache_.clear();  /* Stage 31: SSA Values from outer fn are invalid here */
     pushScope();
 
@@ -3268,6 +3417,7 @@ void CodeGen::emitSub(const Node &n) {
         localDepthAlloca_ = savedLocalDepth;
         currentSubNeedsWantarray_ = savedNeedsWantarray;
         currentFn_ = savedFn;
+        stmtLabels_ = std::move(savedLabels);
         return;
     }
 
@@ -3335,6 +3485,7 @@ void CodeGen::emitSub(const Node &n) {
     currentFn_ = savedFn;
     currentPackage_ = savedPackage;
     capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
+    stmtLabels_ = std::move(savedLabels);
 
     /* restore insert point to end of main (for any remaining stmts) */
     /* caller will set insert point back */
@@ -3358,6 +3509,8 @@ static bool hasWantarrayOrUserCall(const Node &n) {
     /* implicit list return from grep/map/sort also reads wantarray stack */
     if (n.kind == NK::MapFunc || n.kind == NK::GrepFunc ||
         n.kind == NK::SortFunc) return true;
+    /* implicit last-expr `(1,2,3)` / `@arr` — string eval and `sub f{(1,2)}` */
+    if (n.kind == NK::ArrayLit || n.kind == NK::ArrayVar) return true;
     bool r = false;
     if (n.left)  r = r || hasWantarrayOrUserCall(*n.left);
     if (n.right) r = r || hasWantarrayOrUserCall(*n.right);
@@ -3465,7 +3618,8 @@ Value *CodeGen::emitBlock(const Node &n) {
     pushScope();
     for (auto &stmt : n.args) {
         emitStmt(*stmt);
-        if (builder_.GetInsertBlock()->getTerminator()) break;
+        /* Don't stop on a terminator: goto leaves a dead BB, but a later
+           LabelStmt still needs to be emitted into its own block. */
     }
     popScope();
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
@@ -3491,14 +3645,25 @@ Value *CodeGen::emitBlockLast(const Node &n) {
     for (size_t i = 0; i < n.args.size(); i++) {
         const Node &stmt = *n.args[i];
         bool isLast = (i + 1 == n.args.size());
-        if (isLast && stmt.kind == NK::ExprStmt && stmt.left) {
+        const Node *work = &stmt;
+        if (isLast) {
+            while (work->kind == NK::LabelStmt && work->body) {
+                auto *bb = labelBB(work->name);
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateBr(bb);
+                builder_.SetInsertPoint(bb);
+                work = work->body.get();
+            }
+        }
+        if (isLast && work->kind == NK::ExprStmt && work->left) {
             /* If the last expr produces a list (grep/map/sort/etc.) and we're in
                a wantarray-aware sub, wrap it for list/scalar context propagation. */
-            const Node &le = *stmt.left;
+            const Node &le = *work->left;
             NK lk = le.kind;
             bool isListProducer = (lk == NK::MapFunc || lk == NK::GrepFunc ||
                                    lk == NK::SortFunc || lk == NK::DerefArray ||
-                                   lk == NK::ReverseFunc);
+                                   lk == NK::ReverseFunc || lk == NK::ArrayLit ||
+                                   lk == NK::ArrayVar);
             if (isListProducer && currentSubNeedsWantarray_) {
                 Value *av = emitArrayPtr(le);
                 if (!av) av = callRT("perl_array_new", {});
@@ -3523,24 +3688,24 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                 result = emitExpr(le);
                 callCtx_ = savedCtx;
             }
-        } else if (isLast && stmt.kind == NK::Return) {
+        } else if (isLast && work->kind == NK::Return) {
             /* Capture the return value without emitting a ret instruction.
                 The caller will handle the actual return. */
-            if (stmt.left && (stmt.left->kind == NK::ArrayLit || stmt.left->kind == NK::ArrayVar ||
-                                stmt.left->kind == NK::MapFunc  || stmt.left->kind == NK::GrepFunc ||
-                                stmt.left->kind == NK::SortFunc || stmt.left->kind == NK::DerefArray ||
-                                stmt.left->kind == NK::ReverseFunc)) {
-                Value *av = emitArrayPtr(*stmt.left);
+            if (work->left && (work->left->kind == NK::ArrayLit || work->left->kind == NK::ArrayVar ||
+                                work->left->kind == NK::MapFunc  || work->left->kind == NK::GrepFunc ||
+                                work->left->kind == NK::SortFunc || work->left->kind == NK::DerefArray ||
+                                work->left->kind == NK::ReverseFunc)) {
+                Value *av = emitArrayPtr(*work->left);
                 if (!av) av = callRT("perl_array_new", {});
                 /* grep/map return COUNT in scalar context (not last element);
                    sort returns undef in scalar context (D29). */
-                if (stmt.left->kind == NK::GrepFunc || stmt.left->kind == NK::MapFunc ||
-                    stmt.left->kind == NK::SortFunc) {
+                if (work->left->kind == NK::GrepFunc || work->left->kind == NK::MapFunc ||
+                    work->left->kind == NK::SortFunc) {
                     auto *i32Ty = Type::getInt32Ty(ctx_);
                     Value *ctx = callRT("perl_current_wantarray_ctx", {});
                     Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
                     Value *listResult = callRT("perl_array_to_list_return", {av});
-                    Value *scalarResult = (stmt.left->kind == NK::SortFunc) ? perlUndef()
+                    Value *scalarResult = (work->left->kind == NK::SortFunc) ? perlUndef()
                                          : callRT("perl_array_len", {av});
                     result = builder_.CreateSelect(isList, listResult, scalarResult);
                 } else {
@@ -3549,13 +3714,12 @@ Value *CodeGen::emitBlockLast(const Node &n) {
             } else {
                 int savedCtx = callCtx_;
                 callCtx_ = -1; /* D87: return EXPR inherits caller context */
-                result = stmt.left ? emitExpr(*stmt.left) : perlUndef();
+                result = work->left ? emitExpr(*work->left) : perlUndef();
                 callCtx_ = savedCtx;
             }
         } else {
-            emitStmt(stmt);
+            emitStmt(*work);
         }
-        if (builder_.GetInsertBlock()->getTerminator()) { break; }
     }
     /* Clone result before popScope() frees variables it may reference.
        Also free the original if it was an owned temp (mirrors NK::Return logic). */
@@ -3573,7 +3737,10 @@ Value *CodeGen::emitBlockLast(const Node &n) {
 }
 
 void CodeGen::emitStmt(const Node &n) {
-    if (builder_.GetInsertBlock()->getTerminator()) return;
+    bool labelish = (n.kind == NK::LabelStmt) ||
+        (!n.sval.empty() && (n.kind == NK::While || n.kind == NK::For ||
+                             n.kind == NK::Foreach || n.kind == NK::DoWhile));
+    if (builder_.GetInsertBlock()->getTerminator() && !labelish) return;
     /* D9: sqrt input tracking is per-statement; don't leak across stmts */
     lastSqrtInput_ = nullptr;
     if (debug_ && n.line > 0) {
@@ -3595,7 +3762,6 @@ void CodeGen::emitStmt(const Node &n) {
         /* emit contents in the current scope, no new scope push */
         for (auto &stmt : n.args) {
             emitStmt(*stmt);
-            if (builder_.GetInsertBlock()->getTerminator()) break;
         }
         break;
     }
@@ -4087,6 +4253,12 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::While: {
+        if (!n.sval.empty()) {
+            auto *lbb = labelBB(n.sval);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(lbb);
+            builder_.SetInsertPoint(lbb);
+        }
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *cond  = BasicBlock::Create(ctx_, "while.cond", fn);
         auto *body  = BasicBlock::Create(ctx_, "while.body", fn);
@@ -4149,6 +4321,12 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::DoWhile: {
+        if (!n.sval.empty()) {
+            auto *lbb = labelBB(n.sval);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(lbb);
+            builder_.SetInsertPoint(lbb);
+        }
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *body = BasicBlock::Create(ctx_, "dowhile.body", fn);
         auto *cond = BasicBlock::Create(ctx_, "dowhile.cond", fn);
@@ -4180,6 +4358,12 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::For: {
+        if (!n.sval.empty()) {
+            auto *lbb = labelBB(n.sval);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(lbb);
+            builder_.SetInsertPoint(lbb);
+        }
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *condBB = BasicBlock::Create(ctx_, "for.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "for.body", fn);
@@ -4303,6 +4487,12 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::Foreach: {
+        if (!n.sval.empty()) {
+            auto *lbb = labelBB(n.sval);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(lbb);
+            builder_.SetInsertPoint(lbb);
+        }
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *exit  = BasicBlock::Create(ctx_, "foreach.end",  fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "foreach.body", fn);
@@ -4608,6 +4798,62 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
+    case NK::LabelStmt: {
+        auto *bb = labelBB(n.name);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(bb);
+        builder_.SetInsertPoint(bb);
+        if (n.body) emitStmt(*n.body);
+        break;
+    }
+
+    case NK::Goto: {
+        if (n.sval == "label" || (n.sval == "expr" && n.left && n.left->kind == NK::StringLit)) {
+            std::string lab = (n.sval == "label") ? n.name : n.left->sval;
+            auto *bb = labelBB(lab);
+            builder_.CreateBr(bb);
+            auto *dead = BasicBlock::Create(ctx_, "goto.dead",
+                                            builder_.GetInsertBlock()->getParent());
+            builder_.SetInsertPoint(dead);
+            break;
+        }
+        if (n.sval == "sub") {
+            /* goto &NAME — replace current frame: call NAME with current @_ */
+            Value *argsArr = lookupArray("_");
+            if (!argsArr) argsArr = callRT("perl_array_new", {});
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *ctxVal = currentSubNeedsWantarray_
+                ? callRT("perl_current_wantarray_ctx", {})
+                : ConstantInt::get(i32Ty, 0);
+            Value *retVal;
+            if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+                retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
+            } else {
+                Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
+                retVal = callRT("perl_call_named_sub", {nameStr, argsArr, ctxVal});
+            }
+            if (currentSubNeedsWantarray_) callRT("perl_pop_wantarray", {});
+            if (localDepthAlloca_) {
+                Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+                callRT("perl_local_restore_to", {depth});
+            }
+            builder_.CreateRet(retVal);
+            auto *dead = BasicBlock::Create(ctx_, "goto.sub.dead",
+                                            builder_.GetInsertBlock()->getParent());
+            builder_.SetInsertPoint(dead);
+            break;
+        }
+        if (n.sval == "expr" && n.left) {
+            /* computed label: only string literals handled above; runtime
+               string → look up is not wired; jump to undef path. */
+            Value *lv = emitExpr(*n.left);
+            freeIfOwned(lv);
+            builder_.CreateRet(perlUndef());
+            break;
+        }
+        break;
+    }
+
     case NK::Last:
         if (!n.sval.empty()) {
             for (auto it = loopLabels_.rbegin(); it != loopLabels_.rend(); ++it)
@@ -4725,6 +4971,7 @@ void CodeGen::emitStmt(const Node &n) {
         else if (n.name == ",") pv = callRT("perl_get_dollar_comma",{});
         else if (n.name == "\\") pv = callRT("perl_get_dollar_bsl", {});
         else if (n.name == "&") pv = callRT("perl_get_dollar_amp",  {});
+        else if (n.name == "?") pv = callRT("perl_get_dollar_question", {});
         else {
             Value *slot = lookupVar(n.name);
             if (!slot) {
@@ -4917,6 +5164,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.name == ",")  return callRT("perl_get_dollar_comma", {});
         if (n.name == "\\") return callRT("perl_get_dollar_bsl",   {});
         if (n.name == "&")  return callRT("perl_get_dollar_amp",   {});
+        if (n.name == "?")  return callRT("perl_get_dollar_question", {});
         /* $AUTOLOAD — set by dispatch when AUTOLOAD is called */
         if (n.name == "AUTOLOAD") return callRT("perl_get_autoload_name", {});
         {
@@ -5343,6 +5591,36 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Assign: {
+        /* *alias = \&sub — register alias in the method table */
+        if (n.left && n.left->kind == NK::Typeglob &&
+            n.right && n.right->kind == NK::RefSub) {
+            auto *fn = mod_->getFunction(subLLVMName(n.right->name));
+            if (fn) {
+                Value *key = builder_.CreateGlobalStringPtr(n.left->name);
+                callRT("perl_register_method", {key, fn});
+                Value *mainKey = builder_.CreateGlobalStringPtr("main::" + n.left->name);
+                callRT("perl_register_method", {mainKey, fn});
+            }
+            return perlStr("*" + currentPackage_ + "::" + n.left->name);
+        }
+        if (n.left && n.left->kind == NK::Typeglob) {
+            Value *rhs = emitExpr(*n.right);
+            /* Best-effort: if RHS is a code ref, perl_call_named_sub won't
+               see it; stringify the glob and still return it. */
+            freeIfOwned(rhs);
+            return perlStr("*" + currentPackage_ + "::" + n.left->name);
+        }
+        /* vec($str, off, bits) = val — lvalue bit-vector store */
+        if (n.left->kind == NK::Call && n.left->name == "vec" &&
+            n.left->args.size() >= 3) {
+            Value *str = emitExpr(*n.left->args[0]);
+            Value *off = emitExpr(*n.left->args[1]);
+            Value *bits = emitExpr(*n.left->args[2]);
+            Value *val = emitExpr(*n.right);
+            Value *r = callRT("perl_vec_set", {str, off, bits, val});
+            freeIfOwned(val);
+            return r;
+        }
         /* substr($str, off, len) = val — 4-arg substr as lvalue */
         if (n.left->kind == NK::SubstrFunc && n.left->args.size() >= 3) {
             Value *str = emitExpr(*n.left->args[0]);
@@ -6343,6 +6621,9 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Call: return emitCall(n);
+
+    case NK::Typeglob:
+        return perlStr("*" + currentPackage_ + "::" + n.name);
 
     case NK::ScalarFunc: {
         if (n.left) {
@@ -7406,6 +7687,18 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::EvalBlock: {
+        /* eval STRING/BLOCK sees the caller's wantarray. Push a frame unless
+           callCtx_==-1 (inherit — last expr of a wantarray-aware sub). */
+        bool savedNeedWA = currentSubNeedsWantarray_;
+        currentSubNeedsWantarray_ = true;
+        int evalCtxPush = -1;
+        if (callCtx_ == 1)      evalCtxPush = 1;
+        else if (callCtx_ == 2) evalCtxPush = 2;
+        else if (callCtx_ != -1) evalCtxPush = 0;
+        if (evalCtxPush >= 0)
+            callRT("perl_push_wantarray",
+                   {ConstantInt::get(Type::getInt32Ty(ctx_), evalCtxPush)});
+
         /* allocate jmp_buf on stack (256 bytes, enough for any platform) */
         auto *i8Arr  = ArrayType::get(Type::getInt8Ty(ctx_), 256);
         auto *jbAlloca = builder_.CreateAlloca(i8Arr, nullptr, "jmp_buf");
@@ -7489,9 +7782,17 @@ Value *CodeGen::emitExpr(const Node &n) {
             builder_.CreateLoad(perlPtrTy_, resultAlloca),
             ConstantPointerNull::get(perlPtrTy_));
         finalResult = builder_.CreateSelect(longjmpMissed, perlUndef(), finalResult);
+        /* Clone into the caller scope — the eval body's temps were already
+           freed, and LLVM may not keep a post-setjmp value live across
+           the comparison/ternary that uses this result. */
+        finalResult = callRT("perl_clone", {finalResult});
 
         /* pop eval stack — must happen in endBB for both normal and longjmp paths */
         callRT("perl_eval_pop", {});
+
+        if (evalCtxPush >= 0)
+            callRT("perl_pop_wantarray", {});
+        currentSubNeedsWantarray_ = savedNeedWA;
 
         return finalResult;
     }
@@ -8178,6 +8479,7 @@ Value *CodeGen::emitLValue(const Node &n) {
             {"/",   "perl_get_input_sep"},
             {".",   "perl_get_dollar_dot"},
             {"&",   "perl_get_dollar_amp"},
+            {"?",   "perl_get_dollar_question"},
             {"AUTOLOAD", "perl_get_autoload_name"},
             {"0",   "perl_get_dollar0"},
         };
@@ -8590,11 +8892,72 @@ Value *CodeGen::emitCall(const Node &n) {
     /* Try AST-level inline first: eliminates @_ construction for simple subs. */
     if (Value *v = tryEmitInline(n)) return v;
 
-    /* eval EXPR — string-eval removed; set $@ and return undef */
+    /* eval EXPR — constant strings without new subs compile as EvalBlock
+       (outer lexicals visible). Dynamic strings and strings that define
+       subs go through perl_eval_string (--do-lib). */
     if (n.name == "eval") {
-        Value *msg = perlStr("eval: string eval not available");
-        callRT("perl_assign", {callRT("perl_get_dollar_at", {}), msg});
-        return perlUndef();
+        int savedCallCtx = callCtx_;
+        callCtx_ = 0;
+        auto nodeHasSub = [&](auto &&self, const Node *nd) -> bool {
+            if (!nd) return false;
+            if (nd->kind == NK::SubDef || nd->kind == NK::AnonSub ||
+                nd->kind == NK::PackageStmt || nd->kind == NK::BeginBlock ||
+                nd->kind == NK::EndBlock)
+                return true;
+            if (self(self, nd->left.get()) || self(self, nd->right.get()) ||
+                self(self, nd->cond.get()) || self(self, nd->body.get()) ||
+                self(self, nd->init.get()) || self(self, nd->step.get()))
+                return true;
+            for (auto &a : nd->args) if (self(self, a.get())) return true;
+            for (auto &br : nd->branches)
+                if (self(self, br.cond.get()) || self(self, br.body.get())) return true;
+            return false;
+        };
+        const Node *src = n.args.empty() ? nullptr : n.args[0].get();
+        /* eval("str") parses as a 1-element ArrayLit because (LIST) is a list. */
+        if (src && src->kind == NK::ArrayLit && src->args.size() == 1)
+            src = src->args[0].get();
+        if (src && src->kind == NK::StringLit) {
+            try {
+                Lexer lex(src->sval);
+                auto toks = lex.tokenize();
+                Parser p(std::move(toks));
+                NodePtr body = p.parseProgram();
+                if (body && !nodeHasSub(nodeHasSub, body.get())) {
+                    Node ev;
+                    ev.kind = NK::EvalBlock;
+                    ev.line = n.line;
+                    ev.body = std::move(body);
+                    callCtx_ = savedCallCtx;
+                    Value *r = emitExpr(ev);
+                    callCtx_ = 0;
+                    /* Materialize through an alloca so the result is a
+                       stable load after setjmp (needed when eval STRING
+                       is a Call used as a comparison operand). */
+                    auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "eval.hold");
+                    builder_.CreateStore(r, hold);
+                    return builder_.CreateLoad(perlPtrTy_, hold, "eval.val");
+                }
+            } catch (const std::exception &ex) {
+                std::string msg = std::string(ex.what()) + " at (eval 1) line 1.";
+                callRT("perl_assign", {callRT("perl_get_dollar_at", {}), perlStr(msg)});
+                return perlUndef();
+            }
+            /* SubDef in the string: fall through to runtime compile so the
+               sub is actually emitted and registered. */
+        }
+        Value *code = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        bool pushedWA = false;
+        if (savedCallCtx != -1) {
+            int ctxInt = (savedCallCtx == 1) ? 1 : (savedCallCtx == 2) ? 2 : 0;
+            callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
+            pushedWA = true;
+        }
+        Value *r = callRT("perl_eval_string", {code});
+        if (pushedWA) callRT("perl_pop_wantarray", {});
+        freeIfOwned(code);
+        return r;
     }
     /* ── Qualified / imported function interceptions ──────────────────────── */
     /* POSIX */
@@ -8726,6 +9089,162 @@ Value *CodeGen::emitCall(const Node &n) {
         }
         return callRT("perl_syscall", {av});
     }
+    /* W2: process / IPC / sockets — generic Call → perl_* helpers, no new AST */
+    if (n.name == "fork")     return callRT("perl_fork", {});
+    if (n.name == "wait")     return callRT("perl_wait_pid", {});
+    if (n.name == "waitpid") {
+        Value *pid = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *fl  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        return callRT("perl_waitpid", {pid, fl});
+    }
+    if (n.name == "kill")     return callRT("perl_kill", {buildArgArray()});
+    if (n.name == "exec")     return callRT("perl_exec", {buildArgArray()});
+    if (n.name == "exit") {
+        Value *c = n.args.empty() ? perlInt(0) : emitExpr(*n.args[0]);
+        callRT("perl_exit_n", {c});
+        return perlUndef();
+    }
+    if (n.name == "getppid")  return callRT("perl_getppid_val", {});
+    if (n.name == "getuid")   return callRT("perl_getuid_val", {});
+    if (n.name == "getgid")   return callRT("perl_getgid_val", {});
+    if (n.name == "geteuid")  return callRT("perl_geteuid_val", {});
+    if (n.name == "getegid")  return callRT("perl_getegid_val", {});
+    if (n.name == "setsid")   return callRT("perl_setsid_val", {});
+    if (n.name == "getpgrp") {
+        Value *p = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_getpgrp_val", {p});
+    }
+    if (n.name == "setpgrp") {
+        Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlInt(0);
+        Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        return callRT("perl_setpgrp_val", {a, b});
+    }
+    if (n.name == "umask") {
+        Value *m = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_umask_val", {m});
+    }
+    if (n.name == "pipe") {
+        Value *r = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *w = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_pipe_fh", {r, w});
+    }
+    if (n.name == "socket") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *d  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        Value *t  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(0);
+        Value *p  = n.args.size() > 3 ? emitExpr(*n.args[3]) : perlInt(0);
+        return callRT("perl_socket_fh", {fh, d, t, p});
+    }
+    if (n.name == "bind") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *a  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_bind_fh", {fh, a});
+    }
+    if (n.name == "listen") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(5);
+        return callRT("perl_listen_fh", {fh, b});
+    }
+    if (n.name == "connect") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *a  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_connect_fh", {fh, a});
+    }
+    if (n.name == "accept") {
+        Value *nw = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *ls = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_accept_fh", {nw, ls});
+    }
+    if (n.name == "send") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *m  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *f  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(0);
+        return callRT("perl_send_fh", {fh, m, f});
+    }
+    if (n.name == "recv") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *l  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(0);
+        Value *f  = n.args.size() > 3 ? emitExpr(*n.args[3]) : perlInt(0);
+        return callRT("perl_recv_fh", {fh, b, l, f});
+    }
+    if (n.name == "shutdown") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *h  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(2);
+        return callRT("perl_shutdown_fh", {fh, h});
+    }
+    if (n.name == "getsockname") {
+        Value *fh = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_getsockname_fh", {fh});
+    }
+    if (n.name == "getpeername") {
+        Value *fh = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_getpeername_fh", {fh});
+    }
+    if (n.name == "sysopen") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *p  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *m  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(0);
+        Value *pe = n.args.size() > 3 ? emitExpr(*n.args[3]) : perlInt(0666);
+        return callRT("perl_sysopen_fh", {fh, p, m, pe});
+    }
+    if (n.name == "sysread") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *l  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(0);
+        Value *o  = n.args.size() > 3 ? emitExpr(*n.args[3]) : perlInt(0);
+        return callRT("perl_sysread_fh", {fh, b, l, o});
+    }
+    if (n.name == "syswrite") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *l  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+        Value *o  = n.args.size() > 3 ? emitExpr(*n.args[3]) : perlInt(0);
+        return callRT("perl_syswrite_fh", {fh, b, l, o});
+    }
+    if (n.name == "flock") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *op = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(2); /* LOCK_EX */
+        return callRT("perl_flock_fh", {fh, op});
+    }
+    if (n.name == "vec") {
+        Value *str = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *off = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        Value *bits = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(1);
+        return callRT("perl_vec_get", {str, off, bits});
+    }
+    if (n.name == "select") {
+        if (n.args.size() >= 4) {
+            Value *r = emitExpr(*n.args[0]);
+            Value *w = emitExpr(*n.args[1]);
+            Value *e = emitExpr(*n.args[2]);
+            Value *t = emitExpr(*n.args[3]);
+            return callRT("perl_select4", {r, w, e, t});
+        }
+        Value *fh = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_select_fh", {fh});
+    }
+    if (n.name == "fcntl") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *c  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        Value *a  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(0);
+        return callRT("perl_fcntl_fh", {fh, c, a});
+    }
+    if (n.name == "ioctl") {
+        Value *fh = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *c  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        Value *a  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlInt(0);
+        return callRT("perl_ioctl_fh", {fh, c, a});
+    }
+    if (n.name == "dup" || n.name == "POSIX::dup") {
+        Value *fd = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_dup_fd", {fd});
+    }
+    if (n.name == "dup2" || n.name == "POSIX::dup2") {
+        Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_dup2_fd", {a, b});
+    }
     if (n.name == "XS::load_library") {
         Value *lib = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
         Value *ret = callRT("perl_xs_load_library", {lib});
@@ -8754,23 +9273,7 @@ Value *CodeGen::emitCall(const Node &n) {
            mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
            after the call; non-owned (ScalarVar, borrow) need no action. */
         Value *argsArr = callRT("perl_array_new", {});
-        for (auto &arg : n.args) {
-            if (arg->kind == NK::ArrayVar) {
-                Value *av = lookupArray(arg->name);
-                if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
-            }
-            if (arg->kind == NK::HashVar) {
-                Value *hv = lookupHash(arg->name);
-                if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
-            }
-            if (Value *av = emitArrayPtr(*arg)) {
-                callRT("perl_array_extend", {argsArr, av});
-                continue;
-            }
-            Value *v = emitExpr(*arg);
-            callRT("perl_array_push", {argsArr, v});
-            freeIfOwned(v);
-        }
+        fillCallArgs(argsArr, n);
         auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *pkgStr  = builder_.CreateGlobalStringPtr(currentPackage_, "caller.pkg");
         Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_,     "caller.file");
@@ -8795,23 +9298,7 @@ Value *CodeGen::emitCall(const Node &n) {
     }
     if (n.name.find("::") != std::string::npos) {
         Value *argsArr = callRT("perl_array_new", {});
-        for (auto &arg : n.args) {
-            if (arg->kind == NK::ArrayVar) {
-                Value *av = lookupArray(arg->name);
-                if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
-            }
-            if (arg->kind == NK::HashVar) {
-                Value *hv = lookupHash(arg->name);
-                if (hv) { callRT("perl_array_extend_hash", {argsArr, hv}); continue; }
-            }
-            if (Value *av = emitArrayPtr(*arg)) {
-                callRT("perl_array_extend", {argsArr, av});
-                continue;
-            }
-            Value *v = emitExpr(*arg);
-            callRT("perl_array_push", {argsArr, v});
-            freeIfOwned(v);
-        }
+        fillCallArgs(argsArr, n);
         auto *i32Ty = Type::getInt32Ty(ctx_);
         Value *ctxVal;
         if (callCtx_ == 1)
@@ -8840,7 +9327,29 @@ Value *CodeGen::emitCall(const Node &n) {
             n.name + "\"?) at " + sourceFile_ + " line " +
             std::to_string(n.line > 0 ? n.line : 1));
     }
-    return perlUndef();
+    /* Parenthesized call to a name not known at compile time — e.g. a sub
+       defined later via eval STRING. Dispatch through the runtime table. */
+    {
+        Value *argsArr = callRT("perl_array_new", {});
+        fillCallArgs(argsArr, n);
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *ctxVal;
+        if (callCtx_ == 1)
+            ctxVal = ConstantInt::get(i32Ty, 1);
+        else if (callCtx_ == 2)
+            ctxVal = ConstantInt::get(i32Ty, 2);
+        else if (callCtx_ == 0)
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        else if (currentSubNeedsWantarray_)
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        else
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        callCtx_ = 0;
+        Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
+        Value *retVal = callRT("perl_call_named_sub", {nameStr, argsArr, ctxVal});
+        callRT("perl_array_free", {argsArr});
+        return retVal;
+    }
 }
 
 /* ── optimization ────────────────────────────────────────────────────────── */

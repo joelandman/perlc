@@ -11,6 +11,7 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"foreach",  TK::KW_FOREACH},{"do",      TK::KW_DO},
     {"last",     TK::KW_LAST},  {"next",     TK::KW_NEXT},
     {"redo",     TK::KW_REDO},  {"return",   TK::KW_RETURN},
+    {"goto",     TK::KW_GOTO},
     {"sub",      TK::KW_SUB},   {"use",      TK::KW_USE},   {"require",  TK::KW_REQUIRE},
     {"strict",   TK::KW_STRICT},{"warnings", TK::KW_WARNINGS},
     {"print",    TK::KW_PRINT},  {"say",      TK::KW_SAY},
@@ -134,6 +135,23 @@ Token Lexer::readString(char delim, bool interpolates) {
                 case 'n':  raw += '\n'; break;
                 case 't':  raw += '\t'; break;
                 case 'r':  raw += '\r'; break;
+                case '0':  raw += '\0'; break;
+                case 'x': {
+                    auto hexv = [](char h) -> int {
+                        if (h >= '0' && h <= '9') return h - '0';
+                        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+                        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+                        return -1;
+                    };
+                    int h1 = hexv(peek()), h2 = hexv(peek(1));
+                    if (h1 >= 0 && h2 >= 0) {
+                        raw += (char)((h1 << 4) | h2);
+                        pos_ += 2;
+                    } else {
+                        raw += '\\'; raw += 'x';
+                    }
+                    break;
+                }
                 case '\\': raw += '\\'; break;
                 case '\'': raw += '\''; break;
                 case '"':  raw += '"';  break;
@@ -186,30 +204,36 @@ Token Lexer::readIdent() {
 }
 
 Token Lexer::readRegex() {
-    /* pos_ is just past the opening '/' */
+    return readRegexDelim('/', '/', false);
+}
+
+Token Lexer::readRegexDelim(char open, char close, bool paired) {
+    /* pos_ is just past the opening delimiter. */
     std::string pattern;
+    int depth = 1;
     while (pos_ < src_.size()) {
         char c = src_[pos_];
-        if (c == '/') { pos_++; break; }
         if (c == '\\' && pos_ + 1 < src_.size()) {
             /* Pass every backslash-escaped sequence through to PCRE2
                unchanged (both characters) — \\ (literal backslash), \d
                (digit class), \s, \/ (escaped delimiter — redundant but
                harmless for PCRE2, which allows backslash-escaping any
-               non-alphanumeric character), etc. PCRE2 does its own escape
-               interpretation; the lexer must not pre-collapse \\ to a
-               single \, or a pattern like /a\\d/ (literal backslash then
-               "d") silently becomes /a\d/ (digit metaclass) instead. */
+               non-alphanumeric character), etc. */
             pattern += c;
             pattern += src_[++pos_];
             pos_++;
             continue;
         }
+        if (paired) {
+            if (c == open) depth++;
+            else if (c == close) {
+                if (--depth == 0) { pos_++; break; }
+            }
+        } else if (c == close) { pos_++; break; }
         if (c == '\n') line_++;
         pattern += c;
         pos_++;
     }
-    /* capture trailing flags */
     std::string flags;
     while (pos_ < src_.size() && isalpha(src_[pos_])) flags += src_[pos_++];
     return {TK::REGEX, pattern + "\x01" + flags, line_};
@@ -490,15 +514,46 @@ std::vector<Token> Lexer::tokenize() {
             toks.push_back(t); continue;
         }
 
+        /* m/pattern/flags or m{pat}x — any non-word delimiter.
+           Not after a bare sigil ($m) or `->` (method named m).
+           Closers collide with `$h{m}`. Optional space: `m {pat}`. */
+        if (c == 'm' && pos_ + 1 < src_.size()) {
+            bool afterBareSigil = !toks.empty() &&
+                (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
+                 toks.back().kind == TK::HASH) &&
+                toks.back().text.size() <= 1;
+            bool afterArrow = !toks.empty() && toks.back().kind == TK::ARROW;
+            size_t look = 1;
+            while (peek(look) == ' ' || peek(look) == '\t') look++;
+            char d = peek(look);
+            bool closerDelim = (d == '}' || d == ']' || d == ')');
+            /* `m =>` / `m=>` is a fat-comma-quoted bareword hash key, not
+               m=pattern=. d76: `bless { m => ... }`. */
+            bool fatComma = (d == '=' && peek(look + 1) == '>');
+            if (!afterBareSigil && !afterArrow && !closerDelim && !fatComma &&
+                d != '\0' && !isalnum((unsigned char)d) && d != '_') {
+                pos_ += look; /* skip 'm' and optional whitespace */
+                pos_++;       /* skip opening delimiter */
+                char close = (d == '{') ? '}' : (d == '(') ? ')' :
+                             (d == '[') ? ']' : (d == '<') ? '>' : d;
+                bool paired = (close != d);
+                toks.push_back(readRegexDelim(d, close, paired));
+                continue;
+            }
+        }
+
         /* s/pattern/replacement/flags — any non-word delimiter.
-           Not after a bare sigil ($s / @s / %s are variable names). */
+           Not after a bare sigil ($s / @s / %s are variable names).
+           Closers `}` `]` `)` are legal-but-vanishingly-rare s/// openers
+           and collide with the common hash-key form `$h{s}` (D66 remainder). */
         if (c == 's' && pos_ + 1 < src_.size()) {
             char d = peek(1);
             bool afterBareSigil = !toks.empty() &&
                 (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
                  toks.back().kind == TK::HASH) &&
                 toks.back().text.size() <= 1;
-            if (!afterBareSigil &&
+            bool closerDelim = (d == '}' || d == ']' || d == ')');
+            if (!afterBareSigil && !closerDelim &&
                 !isalnum((unsigned char)d) && d != '_' && d != '\0' &&
                 d != ' ' && d != '\t' && d != '\n' && d != '\r') {
                 pos_ += 2; /* skip 's' and opening delim */

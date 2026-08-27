@@ -25,7 +25,7 @@ enum class NK {
     DoWhile,        /* do { body } while/until (cond) – body runs first */
     For,            /* C-style for */
     Foreach,
-    Last, Next, Return,
+    Last, Next, Return, Goto, LabelStmt,
     PrintStmt, SayStmt, PrintfStmt, SprintfFunc,
     /* file I/O */
     Readline,   /* <$fh>  – sval = var name ("" or "STDIN"/"STDERR") */
@@ -163,6 +163,8 @@ enum class NK {
     /* D97: use overload — args = flat list of (op_str, method_name) pairs;
        name = current package (where the overload is being declared) */
     OverloadStmt,
+    /* typeglob */
+    Typeglob,     /* *name            – name=glob name                          */
 };
 
 struct Node;

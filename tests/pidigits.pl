@@ -9,10 +9,9 @@
 
 use strict;
 
-use Math::BigInt lib => 'GMP';
-
-die 'Math::BigInt::GMP missing!'
-  if Math::BigInt->config->{lib} ne 'Math::BigInt::GMP';
+# perlc's built-in Math::BigInt uses mini-gmp and reports lib
+# 'Math::BigInt::GMP'. Real perl may use Calc. Digits match either way.
+use Math::BigInt;
 
 my $z0 = Math::BigInt->new(1);
 my $z1 = Math::BigInt->new(0);
