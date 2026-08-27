@@ -30,7 +30,7 @@ workaround `TSAN_OPTIONS=die_after_fork=0`.
 | Gap | Notes |
 |-----|-------|
 | String `eval EXPR` outer `my` | Constant strings without new subs are inlined (outer lexicals visible). Dynamic strings and strings that define subs compile via `--do-lib` and do **not** see the caller's `my` variables. |
-| Typeglob slots | `*alias = \&sub` and `*NAME` stringify work. Scalar/array/hash slot aliasing (`*a = \$x`) is not implemented. |
+| Typeglob IO/FORMAT | `*alias = \&sub`, stringify, and `*a = \$x`/`\@a`/`\%h` slot sharing work. IO/FORMAT slots are not implemented. |
 | Full XS | MVP FFI, ≤4 scalar args |
 | `pidigits.pl` vs perl | Skipped in harness: mini-gmp spigot `extract_digit` still diverges from Calc. `$,`/`$\` work. |
 | Complex CPAN | Parser may fail on advanced `our`/POD/OO |

@@ -99,7 +99,7 @@ make clean
 
 **goto**: `goto LABEL` (including labeled loops) and `goto &NAME` (tail-call, current `@_`).
 
-**Typeglobs**: `*NAME` stringifies as `*main::NAME`; `*alias = \&sub` registers a callable alias.
+**Typeglobs**: `*NAME` stringifies as `*main::NAME`; `*alias = \&sub` registers a callable alias; `*a = \$x` / `\@arr` / `\%h` share the pointed-to scalar/array/hash cell (`*a = *b` copies slots).
 
 ### Advanced Features
 
@@ -127,7 +127,7 @@ make clean
 
 ## Known Limitations
 
-- Typeglob scalar/array/hash slot aliasing (`*a = \$x`) is not implemented (`*alias = \&sub` and `*NAME` stringify work)
+- Typeglob IO/FORMAT slots are not implemented (`*alias = \&sub`, stringify, and `*a = \$x`/`\@a`/`\%h` work)
 - String `eval EXPR` of a dynamic / sub-defining string does not see the caller's `my` variables (compiled as a separate `--do-lib` unit)
 - `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
 - `exists $h{a}{b}` without arrow: use `$h{a}->{b}`

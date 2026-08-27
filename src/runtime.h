@@ -714,6 +714,16 @@ void perl_cleanup(void);
    strings; constant strings are inlined by codegen into EvalBlock). */
 PerlValue *perl_eval_string(PerlValue *code_pv);
 
+/* typeglob slots — *foo = \$x / \@a / \%h share the pointed-to cell */
+void       perl_glob_assign(const char *name, PerlValue *rhs);
+void       perl_glob_set_scalar(const char *name, PerlValue *cell);
+void       perl_glob_set_array(const char *name, PerlArray *av);
+void       perl_glob_set_hash(const char *name, PerlHash *hv);
+PerlValue *perl_glob_get_scalar(const char *name);
+PerlArray *perl_glob_get_array(const char *name);
+PerlHash  *perl_glob_get_hash(const char *name);
+void       perl_glob_copy(const char *dst, const char *src);
+
 /* D96: compound-assign on a 2D array element where the inner row may be
    FLAT_ARRAY or REF_ARRAY.  Re-reads the row PV's tag/pval to avoid using a
    stale flat-row cache (the row may have been lazy-converted by an earlier read

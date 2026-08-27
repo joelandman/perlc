@@ -482,6 +482,14 @@ void CodeGen::declareRuntime() {
     RT("perl_bless",                   pv,     pv, pv);
     RT("perl_register_method",         voidTy, i8p, i8p);
     RT("perl_get_or_create_global_scalar", pv, i8p);
+    RT("perl_glob_assign",     voidTy, i8p, pv);
+    RT("perl_glob_set_scalar", voidTy, i8p, pv);
+    RT("perl_glob_set_array",  voidTy, i8p, av);
+    RT("perl_glob_set_hash",   voidTy, i8p, av); /* PerlHash* is also a ptr */
+    RT("perl_glob_get_scalar", pv, i8p);
+    RT("perl_glob_get_array",  av, i8p);
+    RT("perl_glob_get_hash",   av, i8p); /* returns PerlHash* as ptr */
+    RT("perl_glob_copy",       voidTy, i8p, i8p);
     RT("perl_dispatch_method",         pv,     pv, i8p, av);
     RT("perl_dispatch_method_super",   pv,     pv, i8p, i8p, av);
     RT("perl_set_isa",                 voidTy, i8p, i8p);
@@ -679,6 +687,23 @@ Value *CodeGen::lookupVar(const std::string &nm) {
     return nullptr;
 }
 
+static std::string globBareName(const std::string &nm) {
+    std::string n = nm;
+    if (!n.empty() && (n[0] == '$' || n[0] == '@' || n[0] == '%')) n = n.substr(1);
+    return n;
+}
+
+bool CodeGen::isGlobName(const std::string &nm) const {
+    std::string n = globBareName(nm);
+    if (globNames_.count(n) || globNames_.count("main::" + n)) return true;
+    auto pos = n.rfind("::");
+    if (pos != std::string::npos) {
+        std::string bare = n.substr(pos + 2);
+        if (globNames_.count(bare) || globNames_.count("main::" + bare)) return true;
+    }
+    return false;
+}
+
 void CodeGen::declareVar(const std::string &nm, Value *a) {
     scopes_.back()[nm] = a;
 }
@@ -701,6 +726,10 @@ Value *CodeGen::lookupArray(const std::string &nm) {
     auto git = fileArrayGlobals_.find(nm);
     if (git != fileArrayGlobals_.end())
         return builder_.CreateLoad(perlPtrTy_, git->second, nm);
+    if (isGlobName(nm)) {
+        Value *key = builder_.CreateGlobalStringPtr(globBareName(nm));
+        return callRT("perl_glob_get_array", {key});
+    }
     return nullptr;
 }
 
@@ -719,6 +748,10 @@ Value *CodeGen::lookupHash(const std::string &nm) {
         return builder_.CreateLoad(perlPtrTy_, git->second, nm);
     if (nm == "SIG")
         return callRT("perl_get_sig_hash", {});
+    if (isGlobName(nm)) {
+        Value *key = builder_.CreateGlobalStringPtr(globBareName(nm));
+        return callRT("perl_glob_get_hash", {key});
+    }
     return nullptr;
 }
 
@@ -2846,6 +2879,23 @@ Value *CodeGen::emitExprF64(const Node &n) {
    into NK::AnonSub bodies (a named sub could be declared inside a
    closure) — both fall out naturally from the generic walk with no
    special-casing needed. */
+static void collectGlobNames(const Node &n, std::unordered_set<std::string> &out) {
+    if (n.kind == NK::Assign && n.left && n.left->kind == NK::Typeglob &&
+        !n.left->name.empty())
+        out.insert(n.left->name);
+    if (n.left)  collectGlobNames(*n.left,  out);
+    if (n.right) collectGlobNames(*n.right, out);
+    if (n.cond)  collectGlobNames(*n.cond,  out);
+    if (n.body)  collectGlobNames(*n.body,  out);
+    if (n.init)  collectGlobNames(*n.init,  out);
+    if (n.step)  collectGlobNames(*n.step,  out);
+    for (auto &a : n.args) collectGlobNames(*a, out);
+    for (auto &b : n.branches) {
+        if (b.cond) collectGlobNames(*b.cond, out);
+        if (b.body) collectGlobNames(*b.body, out);
+    }
+}
+
 static void collectSubDefs(const Node &n, std::vector<const Node*> &out) {
     if (n.kind == NK::SubDef) out.push_back(&n);
     if (n.left)  collectSubDefs(*n.left,  out);
@@ -2936,7 +2986,9 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
        children (D45: a sub nested in a bare block is still global). */
     subs_.clear();
     subCaptures_.clear();
+    globNames_.clear();
     collectSubDefs(program, subs_);
+    collectGlobNames(program, globNames_);
 
     /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
        These are expanded at call sites without @_ construction. Collected
@@ -5182,7 +5234,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
         }
         auto *slot = lookupVar(n.name);
-        if (!slot) return perlUndef();
+        if (!slot) {
+            if (isGlobName(n.name)) {
+                Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
+                return callRT("perl_glob_get_scalar", {key});
+            }
+            return perlUndef();
+        }
         /* Phase 3: shared scalars are routed through perl_atomic_load so
            the acquire fence pairs with the writer's release fence in
            perl_atomic_store / perl_atomic_inc / perl_atomic_add.  On x86
@@ -5591,23 +5649,37 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Assign: {
-        /* *alias = \&sub — register alias in the method table */
-        if (n.left && n.left->kind == NK::Typeglob &&
-            n.right && n.right->kind == NK::RefSub) {
-            auto *fn = mod_->getFunction(subLLVMName(n.right->name));
-            if (fn) {
-                Value *key = builder_.CreateGlobalStringPtr(n.left->name);
-                callRT("perl_register_method", {key, fn});
-                Value *mainKey = builder_.CreateGlobalStringPtr("main::" + n.left->name);
-                callRT("perl_register_method", {mainKey, fn});
-            }
-            return perlStr("*" + currentPackage_ + "::" + n.left->name);
-        }
+        /* *NAME = ... — glob slot assignment */
         if (n.left && n.left->kind == NK::Typeglob) {
-            Value *rhs = emitExpr(*n.right);
-            /* Best-effort: if RHS is a code ref, perl_call_named_sub won't
-               see it; stringify the glob and still return it. */
-            freeIfOwned(rhs);
+            Value *key = builder_.CreateGlobalStringPtr(n.left->name);
+            if (n.right && n.right->kind == NK::RefSub) {
+                auto *fn = mod_->getFunction(subLLVMName(n.right->name));
+                if (fn) {
+                    callRT("perl_register_method", {key, fn});
+                    Value *mainKey = builder_.CreateGlobalStringPtr("main::" + n.left->name);
+                    callRT("perl_register_method", {mainKey, fn});
+                }
+            } else if (n.right && n.right->kind == NK::RefScalar && n.right->left) {
+                Value *slot = emitLValue(*n.right->left);
+                Value *cell = slot ? builder_.CreateLoad(perlPtrTy_, slot)
+                                   : emitExpr(*n.right->left);
+                callRT("perl_glob_set_scalar", {key, cell});
+            } else if (n.right && n.right->kind == NK::RefArray) {
+                Value *av = lookupArray(n.right->name);
+                if (!av) av = callRT("perl_array_new", {});
+                callRT("perl_glob_set_array", {key, av});
+            } else if (n.right && n.right->kind == NK::RefHash) {
+                Value *hv = lookupHash(n.right->name);
+                if (!hv) hv = callRT("perl_hash_new", {});
+                callRT("perl_glob_set_hash", {key, hv});
+            } else if (n.right && n.right->kind == NK::Typeglob) {
+                Value *src = builder_.CreateGlobalStringPtr(n.right->name);
+                callRT("perl_glob_copy", {key, src});
+            } else if (n.right) {
+                Value *rhs = emitExpr(*n.right);
+                callRT("perl_glob_assign", {key, rhs});
+                freeIfOwned(rhs);
+            }
             return perlStr("*" + currentPackage_ + "::" + n.left->name);
         }
         /* vec($str, off, bits) = val — lvalue bit-vector store */
@@ -8493,6 +8565,13 @@ Value *CodeGen::emitLValue(const Node &n) {
         }
         auto *slot = lookupVar(n.name);
         if (!slot) {
+            if (isGlobName(n.name)) {
+                Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
+                Value *cell = callRT("perl_glob_get_scalar", {key});
+                auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "glob." + globBareName(n.name));
+                builder_.CreateStore(cell, hold);
+                return hold;
+            }
             /* auto-vivify global-ish variable in current scope */
             auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
             builder_.CreateStore(perlUndef(), alloca);

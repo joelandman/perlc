@@ -4493,6 +4493,111 @@ typedef struct { char *key; PerlValue *pv; } GlobalScalarEntry;
 static GlobalScalarEntry s_global_scalar_table[GLOBAL_SCALAR_TABLE_MAX];
 static int s_global_scalar_count = 0;
 
+/* ── typeglob slot table ───────────────────────────────────────────────────
+   *foo = \$x shares the scalar cell; *foo = \@a / \%h share the array/hash.
+   Package $foo/@foo/%foo (no lexical) read these slots. */
+typedef struct PerlGlob {
+    char      *name;
+    PerlValue *scalar;
+    PerlArray *array;
+    PerlHash  *hash;
+} PerlGlob;
+#define GLOB_TABLE_MAX 1024
+static PerlGlob s_glob_table[GLOB_TABLE_MAX];
+static int s_glob_count = 0;
+
+static PerlGlob *glob_get_or_create(const char *name) {
+    if (!name) name = "";
+    for (int i = 0; i < s_glob_count; i++)
+        if (strcmp(s_glob_table[i].name, name) == 0)
+            return &s_glob_table[i];
+    /* also match bare vs main::bare */
+    const char *bare = name;
+    const char *p = strstr(name, "::");
+    if (p) bare = p + 2;
+    for (int i = 0; i < s_glob_count; i++) {
+        const char *g = s_glob_table[i].name;
+        const char *gb = g;
+        const char *gp = strstr(g, "::");
+        if (gp) gb = gp + 2;
+        if (strcmp(gb, bare) == 0)
+            return &s_glob_table[i];
+    }
+    if (s_glob_count >= GLOB_TABLE_MAX) {
+        static PerlGlob dummy;
+        return &dummy;
+    }
+    PerlGlob *g = &s_glob_table[s_glob_count++];
+    g->name = strdup(name);
+    g->scalar = NULL;
+    g->array = NULL;
+    g->hash = NULL;
+    return g;
+}
+
+void perl_glob_set_scalar(const char *name, PerlValue *cell) {
+    glob_get_or_create(name)->scalar = cell;
+}
+
+void perl_glob_set_array(const char *name, PerlArray *av) {
+    PerlGlob *g = glob_get_or_create(name);
+    g->array = av;
+    if (av && av->refcount > 0) av->refcount++;
+}
+
+void perl_glob_set_hash(const char *name, PerlHash *hv) {
+    PerlGlob *g = glob_get_or_create(name);
+    g->hash = hv;
+    if (hv && hv->refcount > 0) hv->refcount++;
+}
+
+PerlValue *perl_glob_get_scalar(const char *name) {
+    PerlGlob *g = glob_get_or_create(name);
+    if (!g->scalar) g->scalar = perl_alloc_undef();
+    return g->scalar;
+}
+
+PerlArray *perl_glob_get_array(const char *name) {
+    PerlGlob *g = glob_get_or_create(name);
+    if (!g->array) g->array = perl_array_new();
+    return g->array;
+}
+
+PerlHash *perl_glob_get_hash(const char *name) {
+    PerlGlob *g = glob_get_or_create(name);
+    if (!g->hash) g->hash = perl_hash_new();
+    return g->hash;
+}
+
+void perl_glob_copy(const char *dst, const char *src) {
+    PerlGlob *s = glob_get_or_create(src);
+    PerlGlob *d = glob_get_or_create(dst);
+    d->scalar = s->scalar;
+    d->array = s->array;
+    d->hash = s->hash;
+    if (d->array && d->array->refcount > 0) d->array->refcount++;
+    if (d->hash && d->hash->refcount > 0) d->hash->refcount++;
+}
+
+void perl_glob_assign(const char *name, PerlValue *rhs) {
+    if (!rhs) return;
+    if (rhs->tag == PERL_REF_SCALAR)
+        perl_glob_set_scalar(name, (PerlValue *)rhs->pval);
+    else if (rhs->tag == PERL_REF_ARRAY)
+        perl_glob_set_array(name, (PerlArray *)rhs->pval);
+    else if (rhs->tag == PERL_REF_HASH)
+        perl_glob_set_hash(name, (PerlHash *)rhs->pval);
+    else if (rhs->tag == PERL_CODE_REF && rhs->pval) {
+        PerlClosure *cl = (PerlClosure *)rhs->pval;
+        if (cl->fn) {
+            perl_register_method(name, cl->fn);
+            char buf[512];
+            snprintf(buf, sizeof buf, "main::%s", name);
+            perl_register_method(buf, cl->fn);
+        }
+    }
+}
+
 PerlValue *perl_get_or_create_global_scalar(const char *key) {
     if (!key) return perl_alloc_undef();
     for (int i = 0; i < s_global_scalar_count; i++) {
@@ -8684,6 +8789,11 @@ void perl_cleanup(void) {
 
     /* 3b. do-lib list (D24: dlopen()ed `do FILE` shared libraries). */
     perl_do_lib_cleanup();
+
+    /* 3c. typeglob table (names only — cells belong to lexicals/package). */
+    for (int i = 0; i < s_glob_count; i++)
+        free(s_glob_table[i].name);
+    s_glob_count = 0;
 
     /* 4. PV slabs: free all allocated slabs so valgrind reports zero leaks.
      * The PVs inside the slabs are either in the freelist or in use, but

@@ -47,7 +47,8 @@ subs defined in eval, list/wantarray).
 
 New language tests (2026-08-27, later): `proto_{smoke,deep}.pl` (`$$`, `@`, `()`,
 `&@` block, `_`, `;$`, `&name` bypass), `goto_{smoke,deep}.pl` (`goto LABEL`,
-`goto &NAME`, labeled loops), `glob_{smoke,deep}.pl` (`*alias = \&sub`, stringify).
+`goto &NAME`, labeled loops), `glob_{smoke,deep}.pl` (`*alias = \&sub`, stringify),
+`glob_slot_{smoke,deep}.pl` (`*a = \$x`/`\@a`/`\%h` cell sharing, `*a = *b`).
 
 ## Open
 
@@ -61,8 +62,8 @@ root causes is in git history (`TESTS.md` prior to 2026-08-26).
 ## Remaining product gaps (not logged as D-numbers)
 
 Full XS; complex CPAN. String `eval EXPR` does not see outer `my` for
-dynamic / sub-defining strings (`--do-lib`). Typeglob scalar/array/hash
-slot aliasing (`*a = \$x`) is not implemented.
+dynamic / sub-defining strings (`--do-lib`). Typeglob IO/FORMAT slots
+are not implemented.
 
 ## Source layout
 

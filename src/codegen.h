@@ -224,6 +224,9 @@ private:
        which captures to load with `perl_get_capture(i)`. */
     std::vector<const Node *> subs_;
     std::unordered_map<std::string, std::vector<std::string>> subCaptures_;
+    /* names that appear as *NAME = ... in this compilation — package
+       $NAME/@NAME/%NAME (when not a lexical) route through the glob table */
+    std::unordered_set<std::string> globNames_;
 
     /* AST-level inline subs: subs with (my (@params)=@_; return expr) body.
        At call sites these are expanded directly, bypassing @_ construction. */
@@ -244,6 +247,7 @@ private:
     void pushScope();
     void popScope();
     llvm::Value *lookupVar(const std::string &name);
+    bool isGlobName(const std::string &name) const;
     void declareVar(const std::string &name, llvm::Value *alloca);
     llvm::Value *lookupArray(const std::string &name);
     void declareArray(const std::string &name, llvm::Value *ptr);
