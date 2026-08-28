@@ -4622,6 +4622,8 @@ typedef struct PerlGlob {
     PerlValue *scalar;
     PerlArray *array;
     PerlHash  *hash;
+    PerlValue *io;       /* FILEHANDLE cell for *NAME{IO} */
+    PerlValue *format;   /* FORMAT slot — undef unless set */
 } PerlGlob;
 #define GLOB_TABLE_MAX 1024
 static PerlGlob s_glob_table[GLOB_TABLE_MAX];
@@ -4653,6 +4655,8 @@ static PerlGlob *glob_get_or_create(const char *name) {
     g->scalar = NULL;
     g->array = NULL;
     g->hash = NULL;
+    g->io = NULL;
+    g->format = NULL;
     return g;
 }
 
@@ -4696,8 +4700,78 @@ void perl_glob_copy(const char *dst, const char *src) {
     d->scalar = s->scalar;
     d->array = s->array;
     d->hash = s->hash;
+    d->io = s->io;
+    d->format = s->format;
     if (d->array && d->array->refcount > 0) d->array->refcount++;
     if (d->hash && d->hash->refcount > 0) d->hash->refcount++;
+}
+
+void perl_glob_set_io(const char *name, PerlValue *cell) {
+    glob_get_or_create(name)->io = cell;
+}
+
+PerlValue *perl_glob_get_io(const char *name) {
+    if (name && (strcmp(name, "STDOUT") == 0 || strcmp(name, "main::STDOUT") == 0))
+        return perl_get_stdout();
+    if (name && (strcmp(name, "STDERR") == 0 || strcmp(name, "main::STDERR") == 0))
+        return perl_get_stderr();
+    if (name && (strcmp(name, "STDIN") == 0 || strcmp(name, "main::STDIN") == 0))
+        return perl_get_stdin();
+    PerlGlob *g = glob_get_or_create(name);
+    if (g->io) return g->io;
+    if (g->scalar && g->scalar->tag == PERL_FILEHANDLE) return g->scalar;
+    return perl_alloc_undef();
+}
+
+static const char *glob_bare(const char *name) {
+    const char *p;
+    if (!name) return "";
+    p = strstr(name, "::");
+    return p ? p + 2 : name;
+}
+
+PerlValue *perl_glob_slot(const char *name, const char *slot) {
+    char buf[64];
+    size_t i;
+    if (!slot) slot = "";
+    for (i = 0; i < sizeof(buf) - 1 && slot[i]; i++)
+        buf[i] = (char)toupper((unsigned char)slot[i]);
+    buf[i] = '\0';
+    slot = buf;
+    if (strcmp(slot, "SCALAR") == 0)
+        return perl_ref_scalar(perl_glob_get_scalar(name));
+    if (strcmp(slot, "ARRAY") == 0)
+        return perl_ref_array(perl_glob_get_array(name));
+    if (strcmp(slot, "HASH") == 0)
+        return perl_ref_hash(perl_glob_get_hash(name));
+    if (strcmp(slot, "IO") == 0)
+        return perl_glob_get_io(name);
+    if (strcmp(slot, "FORMAT") == 0) {
+        PerlGlob *g = glob_get_or_create(name);
+        return g->format ? g->format : perl_alloc_undef();
+    }
+    if (strcmp(slot, "NAME") == 0)
+        return perl_alloc_string(glob_bare(name));
+    if (strcmp(slot, "PACKAGE") == 0)
+        return perl_alloc_string("main");
+    if (strcmp(slot, "GLOB") == 0) {
+        char gs[512];
+        snprintf(gs, sizeof(gs), "*main::%s", glob_bare(name));
+        return perl_alloc_string(gs);
+    }
+    if (strcmp(slot, "CODE") == 0) {
+        const char *bare = glob_bare(name);
+        char q[512];
+        snprintf(q, sizeof(q), "main::%s", bare);
+        for (int i = 0; i < s_method_count; i++) {
+            if (strcmp(s_method_table[i].key, name) == 0 ||
+                strcmp(s_method_table[i].key, bare) == 0 ||
+                strcmp(s_method_table[i].key, q) == 0)
+                return perl_make_code_ref(s_method_table[i].fn);
+        }
+        return perl_alloc_undef();
+    }
+    return perl_alloc_undef();
 }
 
 void perl_glob_assign(const char *name, PerlValue *rhs) {

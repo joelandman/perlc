@@ -746,6 +746,9 @@ PerlValue *perl_glob_get_scalar(const char *name);
 PerlArray *perl_glob_get_array(const char *name);
 PerlHash  *perl_glob_get_hash(const char *name);
 void       perl_glob_copy(const char *dst, const char *src);
+void       perl_glob_set_io(const char *name, PerlValue *cell);
+PerlValue *perl_glob_get_io(const char *name);
+PerlValue *perl_glob_slot(const char *name, const char *slot);
 
 /* D96: compound-assign on a 2D array element where the inner row may be
    FLAT_ARRAY or REF_ARRAY.  Re-reads the row PV's tag/pval to avoid using a
