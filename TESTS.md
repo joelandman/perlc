@@ -22,7 +22,7 @@ test, verified byte-for-byte against real Perl.
 
 ## Scoreboard
 
-**2026-08-27: 233 compared, 233 PASS, 0 FAIL.**
+**2026-08-28: 251 compared, 251 PASS, 0 FAIL.**
 
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
@@ -50,6 +50,13 @@ New language tests (2026-08-27, later): `proto_{smoke,deep}.pl` (`$$`, `@`, `()`
 `goto &NAME`, labeled loops), `glob_{smoke,deep}.pl` (`*alias = \&sub`, stringify),
 `glob_slot_{smoke,deep}.pl` (`*a = \$x`/`\@a`/`\%h` cell sharing, `*a = *b`).
 
+MVP follow-ups (2026-08-27): `use_version_smoke.pl` (`use v5.36` / signatures
+bundle), `signatures_deep.pl` (`sub f($x, $y=0, @rest)`), `utf8_open_smoke.pl`
+(`:utf8` / `:encoding(UTF-8)`), `bare_fh_smoke.pl` (`open LOG`, `print LOG`,
+`<IN>`), `pod_skip_smoke.pl` (`=pod`…`=cut`), `closure_int_capture_smoke.pl`
+(unboxed-int capture shares the cell), `eval_lex_{smoke,deep}.pl` (dynamic
+eval STRING and eval-defined subs see outer `my`).
+
 ## Open
 
 | ID | Status | Notes |
@@ -61,9 +68,14 @@ root causes is in git history (`TESTS.md` prior to 2026-08-26).
 
 ## Remaining product gaps (not logged as D-numbers)
 
-Full XS; complex CPAN. String `eval EXPR` does not see outer `my` for
-dynamic / sub-defining strings (`--do-lib`). Typeglob IO/FORMAT slots
-are not implemented.
+Full XS (FFI is not DynaLoader); complex CPAN (advanced `our`/OO — POD is
+skipped). Typeglob `{IO}`/`{FORMAT}` slots are not implemented. String
+`eval EXPR` sees outer `my`. Runtime `eval`/`do` still needs clang+perlc
+on the target.
+
+Diamond `<>` / `<ARGV>`, `__DATA__`/`<DATA>`, `use utf8`, `unshift @{EXPR}`,
+and `exists $h{a}{b}`: `diamond_{smoke,deep}.pl`, `data_section_{smoke,deep}.pl`,
+`utf8_source_{smoke,deep}.pl`, `unshift_exists_{smoke,deep}.pl`.
 
 ## Source layout
 

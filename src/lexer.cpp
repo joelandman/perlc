@@ -357,6 +357,26 @@ std::vector<Token> Lexer::tokenize() {
             continue;
         }
 
+        /* POD: =pod / =head1 / … at column 0 until =cut */
+        if (c == '=' && (pos_ == 0 || src_[pos_ - 1] == '\n') &&
+            isalpha((unsigned char)peek(1))) {
+            while (pos_ < src_.size()) {
+                if (src_[pos_] == '\n') line_++;
+                /* look for =cut at start of a line */
+                if ((pos_ == 0 || src_[pos_ - 1] == '\n') &&
+                    pos_ + 4 <= src_.size() &&
+                    src_[pos_] == '=' && src_[pos_+1] == 'c' &&
+                    src_[pos_+2] == 'u' && src_[pos_+3] == 't' &&
+                    (pos_ + 4 == src_.size() ||
+                     !isalnum((unsigned char)src_[pos_+4]))) {
+                    skipLineComment(); /* rest of =cut line */
+                    break;
+                }
+                pos_++;
+            }
+            continue;
+        }
+
         /* shebang line */
         if (c == '#' && line_ == 1 && pos_ == 0) {
             skipLineComment(); continue;
@@ -588,8 +608,16 @@ std::vector<Token> Lexer::tokenize() {
         /* identifiers and keywords */
         if (isalpha(c) || c == '_') {
             Token t = readIdent();
-            /* handle __END__ - stop parsing at __END__ (POD follows) */
-            if (t.text == "__END__") {
+            /* __END__ / __DATA__: stop the program; remaining text is <DATA>.
+               In the main file both tokens create the DATA handle (perlmod). */
+            if (t.text == "__END__" || t.text == "__DATA__") {
+                skipLineComment(); /* rest of this line */
+                if (pos_ < src_.size() && src_[pos_] == '\n') {
+                    pos_++;
+                    line_++;
+                }
+                dataSection_ = src_.substr(pos_);
+                hasDataSection_ = true;
                 toks.push_back({TK::EOF_TOK, "", line_});
                 return toks;
             }
@@ -772,19 +800,14 @@ std::vector<Token> Lexer::tokenize() {
                 /* readline: <$ident>, <STDIN>, <STDERR>, <STDOUT>, <> */
                 {
                     size_t save = pos_;
-                    bool hasSigil = false;
                     std::string rl;
-                    if (pos_ < src_.size() && src_[pos_] == '$') { hasSigil = true; pos_++; }
+                    if (pos_ < src_.size() && src_[pos_] == '$') { pos_++; }
                     while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
                         rl += src_[pos_++];
                     if (pos_ < src_.size() && src_[pos_] == '>') {
-                        bool ok = hasSigil || rl.empty()
-                               || rl == "STDIN" || rl == "STDOUT" || rl == "STDERR";
-                        if (ok) {
-                            pos_++;  /* consume '>' */
-                            toks.push_back({TK::READLINE, rl, line_});
-                            break;
-                        }
+                        pos_++;  /* consume '>' */
+                        toks.push_back({TK::READLINE, rl, line_});
+                        break;
                     }
                     pos_ = save;
                 }

@@ -21,8 +21,11 @@ public:
 
     /* asDoLib: emit a `PerlValue *__perlc_do_run(PerlArray*, int)` entry
        point (for a `do FILE`-loadable shared library, D24) instead of a
-       normal `main(int,char**)`. See compile()'s definition for details. */
-    void compile(const Node &program, const std::string &moduleName, bool asDoLib = false);
+       normal `main(int,char**)`. asEvalPad: same entry point, but bind
+       free names from the eval pad (string `eval EXPR` via --eval-lib). */
+    void compile(const Node &program, const std::string &moduleName,
+                 bool asDoLib = false, bool asEvalPad = false);
+    void setDataSection(std::string s) { dataSection_ = std::move(s); hasDataSection_ = true; }
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
@@ -160,6 +163,13 @@ private:
     int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */
     bool inMainBody_ = false;   /* true only while emitting the top-level program body */
     bool asDoLib_ = false;      /* D24/D58: compiling in --do-lib mode (see compile()) */
+    bool asEvalPad_ = false;    /* --eval-lib: bind outer `my` cells from the eval pad */
+    bool hasDataSection_ = false;
+    std::string dataSection_;   /* text after __DATA__/__END__ */
+    bool allNamesCaptured_ = false; /* function contains eval EXPR: skip int/float unbox */
+    std::vector<std::string> evalPadScalars_;
+    std::vector<std::string> evalPadArrays_;
+    std::vector<std::string> evalPadHashes_;
     /* Stage 23: when true, all 2D-array rows are known FLAT_ARRAY — skip flat/norm condBrs */
     bool inFlatOnly_ = false;
 
@@ -255,6 +265,8 @@ private:
     void declareHash(const std::string &name, llvm::Value *ptr);
     void trackPv(llvm::Value *pv);
     void emitScopeCleanup();  /* free all tracked pvs in all active scopes */
+    void emitEvalPadFill();   /* dump in-scope my cells into the eval pad */
+    void emitEvalPadBind();   /* --eval-lib: load pad cells into file-scope GVs */
     /* returns a PerlArray* Value for things that produce arrays */
     llvm::Value *emitArrayPtr(const Node &n);
 

@@ -3,6 +3,7 @@
 #include "ast.h"
 #include <vector>
 #include <map>
+#include <set>
 #include <string>
 
 class Parser {
@@ -32,6 +33,10 @@ private:
     /* D56: warnings pragma state */
     bool warningsEnabled_     = false;
     bool warningsUninitialized_ = false;
+    bool signaturesEnabled_   = false; /* use v5.20+ / use feature 'signatures' */
+    bool utf8Enabled_         = false; /* use utf8 — string lits are characters */
+    std::set<std::string>    knownBareFH_; /* open LOG, ... → print LOG */
+    NodePtr litStr(std::string s, int line); /* StringLit; UTF-8 flag if use utf8 */
 
     Token &cur();
     Token &peek(int offset = 1);
@@ -87,12 +92,15 @@ private:
     bool    looksLikeBareCallArg() const; /* D36 */
     NodePtr parseBareCall(std::string name, int line); /* D36: foo "arg" without () */
     std::string parsePrototype();
+    bool        looksLikeSignature() const;
+    NodePtr     parseSignaturePrefix(int line); /* my ($x,$y)=@_; defaults */
     void        rememberProto(const std::string &name, const std::string &proto);
     const std::string *lookupProto(const std::string &name) const;
     void        checkProtoArity(const std::string &name, const std::string &proto,
                                 int nargs, int line);
     NodePtr     parseAmpBlockCall(std::string name, const std::string &proto, int line);
-    NodePtr     parseAnonSubBody(int line, const std::string &proto);
+    NodePtr     parseAnonSubBody(int line, const std::string &proto,
+                                 NodePtr sigPrefix = nullptr);
     NodePtr parseStringInterp(const std::string &raw, int line);
     NodePtr parseSubscript(NodePtr base, int line); /* chains ->[]/->{}  */
 

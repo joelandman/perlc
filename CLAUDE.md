@@ -3,7 +3,7 @@
 AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
 `llvm-config-18`). Host Perl is 5.42. All operations lower to a C runtime
 (`src/runtime.c`). **No JIT, no REPL.** String `eval EXPR` and
-`eval { BLOCK }` both work (see gaps table for eval STRING limits).
+`eval { BLOCK }` both work (outer `my` is visible to eval STRING).
 
 ```
 .pl → lexer → parser → AST (128 NK) → LLVM IR → clang-18 link → binary
@@ -18,7 +18,7 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-08-27):** **233/233 PASS**, 0 FAIL. Skipped by default:
+**Harness (2026-08-28):** **251/251 PASS**, 0 FAIL. Skipped by default:
 `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **Open generated-code defects:** none in the registry. **D54** (tooling):
@@ -29,11 +29,11 @@ workaround `TSAN_OPTIONS=die_after_fork=0`.
 
 | Gap | Notes |
 |-----|-------|
-| String `eval EXPR` outer `my` | Constant strings without new subs are inlined (outer lexicals visible). Dynamic strings and strings that define subs compile via `--do-lib` and do **not** see the caller's `my` variables. |
-| Typeglob IO/FORMAT | `*alias = \&sub`, stringify, and `*a = \$x`/`\@a`/`\%h` slot sharing work. IO/FORMAT slots are not implemented. |
-| Full XS | MVP FFI, ≤4 scalar args |
+| Typeglob `{IO}`/`{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, and bare `open LOG` / `print LOG` work. `*FH{IO}` / FORMAT slots are not implemented. |
+| Full XS | MVP FFI, ≤4 scalar args — not DynaLoader / `boot_` XSUBs |
 | `pidigits.pl` vs perl | Skipped in harness: mini-gmp spigot `extract_digit` still diverges from Calc. `$,`/`$\` work. |
-| Complex CPAN | Parser may fail on advanced `our`/POD/OO |
+| Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |
+| eval/`do` at runtime | Needs `perlc` + `clang-18` on the target (`--eval-lib` / `--do-lib`). |
 
 ## Build & test
 
@@ -62,6 +62,9 @@ Every fix ships a **smoke + deep** test compared against real Perl.
 - **threads::shared:** acquire/release + lock-free 16-byte CAS on int/float
   RMW. See `THREADS_SHARED_ATOMIC.md`.
 - **`do FILE`:** re-invoke `perlc --do-lib`, `dlopen` into the host runtime.
+- **string `eval EXPR`:** constant strings without new subs are inlined.
+  Dynamic / sub-defining strings compile via `--eval-lib`; the caller dumps
+  in-scope `my` cells into an eval pad so the compiled string aliases them.
 
 Source: `lexer.cpp` (785), `parser.cpp` (3.8k), `codegen.cpp` (~9k),
 `runtime.c` (~8.8k), `mini-gmp.c`, `main.cpp`.
@@ -71,8 +74,13 @@ Source: `lexer.cpp` (785), `parser.cpp` (3.8k), `codegen.cpp` (~9k),
 Scalars/arrays/hashes, slices, autoviv, refs, postfix deref; operators
 including `and`/`or`/`xor`, bitwise, compounds; subs, closures, `wantarray`;
 regex `i/g/s/m/e/x`, `s///`, `tr///`, named captures; `eval { BLOCK }` and
-string `eval EXPR`; prototypes (`$ @ % & _ ; ()`), `goto LABEL` /
-`goto &NAME`; typeglob `*name` stringify and `*alias = \&sub`; OOP (`bless`, `SUPER::`,
+string `eval EXPR` (outer `my` via eval pad); `use v5.xx` / `use feature
+'signatures'`; sub signatures (`sub f($x, $y=0, @rest)`); prototypes
+(`$ @ % & _ ; ()`), `goto LABEL` / `goto &NAME`; typeglob `*name` stringify
+and `*alias = \&sub`; bare filehandles (`open LOG`, `print LOG`, `<IN>`);
+UTF-8 `:utf8`/`:encoding(UTF-8)` open/binmode layers and `use utf8` source
+encoding; diamond `<>` / `<ARGV>` / `$ARGV`; `__DATA__`/`__END__` + `<DATA>`;
+`unshift @{EXPR}`; `exists $h{a}{b}`; POD skip; OOP (`bless`, `SUPER::`,
 `AUTOLOAD`, `DESTROY`, `use overload`); `local`/`state`/`our`; `tie`/`untie`
 with FETCH/STORE; file I/O, file tests, `stat`/`glob`; List::Util, POSIX
 floor/ceil/fmod/strftime, Scalar::Util, Carp, Time::HiRes, `pack`/`unpack`;

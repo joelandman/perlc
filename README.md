@@ -91,15 +91,23 @@ make clean
 
 **Module installation**: `-pm` flag automatically detects missing `use Module` dependencies (excluding pragmas), installs them via `cpanm --local-lib lib` into `lib/lib/perl5/`, and updates search paths.
 
-**Note**: Many simple CPAN modules work, but complex modules with advanced OO patterns, `our` variables, or POD documentation may cause parser errors due to incomplete Perl 5 language coverage.
+**Note**: Many simple CPAN modules work, but complex modules with advanced OO patterns or `our` variables may cause parser errors. POD (`=pod`/`=head1`…`=cut`) is skipped by the lexer.
 
-**eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime. String `eval EXPR`: constant strings without new subs are inlined (outer `my` visible); dynamic strings and strings that define subs compile via `--do-lib`/`dlopen` (no outer lexicals).
+**eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime. String `eval EXPR`: constant strings without new subs are inlined (outer `my` visible); dynamic strings and strings that define subs compile via `--eval-lib`/`dlopen` with an eval pad so the caller's `my` cells are aliased.
+
+**`use v5.xx` / signatures**: `use v5.36` (and `use 5.036`) enables the feature bundle — signatures at ≥5.20, warnings at ≥5.36. `use feature 'signatures'` / `qw(signatures)` also works. `sub f($x, $y = 0, @rest)` desugars to `my (...) = @_` plus default-arity `if`s. Without the feature, `sub f($$)` remains a prototype.
 
 **Prototypes**: `sub f ($$)`, `(@)`, `()`, `(&@)` (block form), `($;$)`, `(_)`. `&name()` bypasses the prototype. Arity is checked at parse time.
 
 **goto**: `goto LABEL` (including labeled loops) and `goto &NAME` (tail-call, current `@_`).
 
-**Typeglobs**: `*NAME` stringifies as `*main::NAME`; `*alias = \&sub` registers a callable alias; `*a = \$x` / `\@arr` / `\%h` share the pointed-to scalar/array/hash cell (`*a = *b` copies slots).
+**Typeglobs**: `*NAME` stringifies as `*main::NAME`; `*alias = \&sub` registers a callable alias; `*a = \$x` / `\@arr` / `\%h` share the pointed-to scalar/array/hash cell (`*a = *b` copies slots). Bare filehandles: `open LOG, ">", $path`, `print LOG ...`, `<IN>` store/use the glob scalar slot as a FILEHANDLE.
+
+**UTF-8 layers**: `open`/`binmode` with `:utf8` or `:encoding(UTF-8)` mark the handle; readline sets `PV_FLAG_UTF8` on the string; writes latin-1-upgrade when the FH is UTF-8 and the string is not. `use utf8` marks source string literals as characters (`length("é") == 1`).
+
+**Diamond / DATA**: `<>` and `<ARGV>` walk `@ARGV` (or STDIN if empty), set `$ARGV`, and skip missing files with a warning. `__DATA__` / `__END__` in the main file feed `<DATA>`.
+
+**unshift / exists**: `unshift @$ref, LIST` and `unshift @{EXPR}, LIST`; `exists $h{a}{b}` (intermediates autovivify, last key does not).
 
 ### Advanced Features
 
@@ -127,13 +135,11 @@ make clean
 
 ## Known Limitations
 
-- Typeglob IO/FORMAT slots are not implemented (`*alias = \&sub`, stringify, and `*a = \$x`/`\@a`/`\%h` work)
-- String `eval EXPR` of a dynamic / sub-defining string does not see the caller's `my` variables (compiled as a separate `--do-lib` unit)
-- `unshift @{EXPR}, val`: not supported (`push @{EXPR}` works)
-- `exists $h{a}{b}` without arrow: use `$h{a}->{b}`
-- XS is an MVP FFI (≤4 scalar args), not full Perl XS
+- Typeglob `{IO}`/`{FORMAT}` slots are not implemented (`*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, and bare `open LOG`/`print LOG` work)
+- XS is an MVP FFI (≤4 scalar args), not DynaLoader / CPAN `.so` XSUBs
 - DBI is the SQLite subset in the contract tests
-- Complex CPAN (advanced OO / `our` / POD) may fail to parse
+- Complex CPAN (advanced OO / `our`) may fail to parse; POD is skipped
+- String `eval` / `do FILE` at runtime re-invoke `perlc` + `clang-18`
 
 **Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
 

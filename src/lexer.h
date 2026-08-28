@@ -98,9 +98,14 @@ class Lexer {
 public:
     explicit Lexer(std::string src);
     std::vector<Token> tokenize();
+    /* Text after __DATA__ / __END__ (the DATA filehandle). Empty if none. */
+    const std::string &dataSection() const { return dataSection_; }
+    bool hasDataSection() const { return hasDataSection_; }
 
 private:
     std::string src_;
+    std::string dataSection_;
+    bool        hasDataSection_ = false;
     size_t      pos_  = 0;
     int         line_ = 1;
     size_t      pendingHeredocPos_   = 0; /* if set, jump here after consuming the next \n */

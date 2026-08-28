@@ -948,10 +948,10 @@ void perl_untie(PerlValue *var_pv) {
 }
 
 /* ── string eval EXPR ─────────────────────────────────────────────────────
-   Dynamic strings are compiled the same way as `do FILE`: re-invoke perlc
-   --do-lib, dlopen the .so, run __perlc_do_run. Outer `my` lexicals are
-   NOT visible (the string is a separate compilation unit). Constant
-   strings are inlined by codegen as EvalBlock and DO see outer lexicals. */
+   Dynamic strings (and constant strings that define subs) are compiled the
+   same way as `do FILE`, but with `--eval-lib` so the eval pad of outer
+   `my` cells is bound into the compilation. Constant strings without new
+   subs are inlined by codegen as EvalBlock and see outer lexicals directly. */
 PerlValue *perl_eval_string(PerlValue *code_pv) {
     long long n = 0;
     char *code = perl_to_string_dup_len(code_pv, &n);
@@ -982,7 +982,7 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
     free(code);
 
     char cmd[2560];
-    snprintf(cmd, sizeof(cmd), "%s --do-lib \"%s\" -o \"%s\" >\"%s\" 2>&1",
+    snprintf(cmd, sizeof(cmd), "%s --eval-lib \"%s\" -o \"%s\" >\"%s\" 2>&1",
              PERLC_SELF_PATH, plPath, soPath, errPath);
     int rc = system(cmd);
     unlink(plPath);
@@ -1337,6 +1337,127 @@ static void perl_release_capture(PerlValue *v) {
     n--;
     pv_capture_count_set(v, n);
     if (n == 0 && (v->flags & PV_FLAG_CAPTURE_RELEASED)) perl_free(v);
+}
+
+/* ── eval pad (outer lexicals for string eval / --eval-lib) ─────────────── */
+typedef struct EvalPadEnt {
+    char *name;
+    int   kind;   /* 0=scalar, 1=array, 2=hash */
+    void *ptr;
+    int   pinned; /* extra capture bump; skip release on clear */
+} EvalPadEnt;
+
+static __thread EvalPadEnt *s_epad;
+static __thread int s_epad_n, s_epad_cap;
+
+static void epad_bump_scalar(PerlValue *v) {
+    if (!v || (v->flags & PV_FLAG_SHARED)) return;
+    unsigned n = pv_capture_count(v);
+    if (n < PV_CAPTURE_MAX) pv_capture_count_set(v, n + 1);
+}
+
+static void epad_grow(void) {
+    int cap = s_epad_cap ? s_epad_cap * 2 : 16;
+    EvalPadEnt *n = realloc(s_epad, (size_t)cap * sizeof(*n));
+    if (!n) return;
+    s_epad = n;
+    s_epad_cap = cap;
+}
+
+static EvalPadEnt *epad_find(const char *name, int kind) {
+    int i;
+    if (!name) return NULL;
+    for (i = 0; i < s_epad_n; i++)
+        if (s_epad[i].kind == kind && s_epad[i].name && strcmp(s_epad[i].name, name) == 0)
+            return &s_epad[i];
+    return NULL;
+}
+
+static void epad_store(const char *name, int kind, void *ptr) {
+    EvalPadEnt *e;
+    if (!name || !name[0]) return;
+    e = epad_find(name, kind);
+    if (e) {
+        if (kind == 0 && e->ptr && e->ptr != ptr && !e->pinned)
+            perl_release_capture((PerlValue *)e->ptr);
+        e->ptr = ptr;
+        if (kind == 0) epad_bump_scalar((PerlValue *)ptr);
+        return;
+    }
+    if (s_epad_n >= s_epad_cap) epad_grow();
+    if (s_epad_n >= s_epad_cap) return;
+    e = &s_epad[s_epad_n++];
+    e->name = strdup(name);
+    e->kind = kind;
+    e->ptr = ptr;
+    e->pinned = 0;
+    if (kind == 0) epad_bump_scalar((PerlValue *)ptr);
+}
+
+void perl_eval_pad_begin(void) {
+    perl_eval_pad_clear();
+}
+
+void perl_eval_pad_add_scalar(const char *name, PerlValue *cell) {
+    epad_store(name, 0, cell);
+}
+
+void perl_eval_pad_add_array(const char *name, PerlArray *av) {
+    epad_store(name, 1, av);
+}
+
+void perl_eval_pad_add_hash(const char *name, PerlHash *hv) {
+    epad_store(name, 2, hv);
+}
+
+void perl_eval_pad_clear(void) {
+    int i;
+    for (i = 0; i < s_epad_n; i++) {
+        if (s_epad[i].kind == 0 && s_epad[i].ptr && !s_epad[i].pinned)
+            perl_release_capture((PerlValue *)s_epad[i].ptr);
+        free(s_epad[i].name);
+    }
+    s_epad_n = 0;
+}
+
+void perl_eval_pad_pin(void) {
+    int i;
+    for (i = 0; i < s_epad_n; i++) {
+        if (s_epad[i].kind == 0 && s_epad[i].ptr && !s_epad[i].pinned) {
+            epad_bump_scalar((PerlValue *)s_epad[i].ptr);
+            s_epad[i].pinned = 1;
+        }
+    }
+}
+
+PerlValue *perl_eval_pad_get_scalar(const char *name) {
+    EvalPadEnt *e = epad_find(name, 0);
+    return e ? (PerlValue *)e->ptr : NULL;
+}
+
+PerlArray *perl_eval_pad_get_array(const char *name) {
+    EvalPadEnt *e = epad_find(name, 1);
+    return e ? (PerlArray *)e->ptr : NULL;
+}
+
+PerlHash *perl_eval_pad_get_hash(const char *name) {
+    EvalPadEnt *e = epad_find(name, 2);
+    return e ? (PerlHash *)e->ptr : NULL;
+}
+
+PerlValue *perl_eval_pad_get_scalar_or_undef(const char *name) {
+    PerlValue *c = perl_eval_pad_get_scalar(name);
+    return c ? c : perl_alloc_undef();
+}
+
+PerlArray *perl_eval_pad_get_array_or_new(const char *name) {
+    PerlArray *a = perl_eval_pad_get_array(name);
+    return a ? a : perl_array_new();
+}
+
+PerlHash *perl_eval_pad_get_hash_or_new(const char *name) {
+    PerlHash *h = perl_eval_pad_get_hash(name);
+    return h ? h : perl_hash_new();
 }
 
 /* D62: release this PerlValue wrapper's share of the closure; tears the
@@ -4869,12 +4990,23 @@ PerlValue *perl_get_stderr(void) {
     return &s_stderr_pv;
 }
 
+static int mode_wants_utf8(const char *m) {
+    if (!m) return 0;
+    return strstr(m, "utf8") || strstr(m, "UTF-8") || strstr(m, "utf-8") ||
+           strstr(m, "encoding(");
+}
+
 static const char *mode_to_cmode(const char *m) {
-    if (strcmp(m, "<")  == 0) return "r";
-    if (strcmp(m, ">")  == 0) return "w";
-    if (strcmp(m, ">>") == 0) return "a";
-    if (strcmp(m, "+<") == 0) return "r+";
-    if (strcmp(m, "+>") == 0) return "w+";
+    if (!m) return "r";
+    /* Strip Perl IO layers (`<:encoding(UTF-8)`) — only the direction
+       prefix matters for fopen. */
+    if (m[0] == '>' && m[1] == '>') return "a";
+    if (m[0] == '>' ) return "w";
+    if (m[0] == '+' && m[1] == '<') return "r+";
+    if (m[0] == '+' && m[1] == '>') return "w+";
+    if (m[0] == '<' ) return "r";
+    if (strcmp(m, "r") == 0 || strcmp(m, "w") == 0 || strcmp(m, "a") == 0 ||
+        strcmp(m, "r+") == 0 || strcmp(m, "w+") == 0) return m;
     return "r";
 }
 
@@ -4882,10 +5014,16 @@ PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filena
     char *ms = perl_to_string_dup(mode_pv);
     char *fs = perl_to_string_dup(filename_pv);
     if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
+    int utf8 = mode_wants_utf8(ms);
     FILE *fp = fopen(fs, mode_to_cmode(ms));
     free(ms); free(fs);
-    if (fp) { target->tag = PERL_FILEHANDLE; target->pval = fp; }
-    else    { target->tag = PERL_UNDEF;      target->pval = NULL; }
+    if (fp) {
+        target->tag = PERL_FILEHANDLE; target->pval = fp;
+        if (utf8) target->flags |= PV_FLAG_UTF8;
+        else      target->flags &= ~PV_FLAG_UTF8;
+    } else {
+        target->tag = PERL_UNDEF; target->pval = NULL; target->flags = 0;
+    }
     target->matchpos = 0;
     return target;
 }
@@ -4901,10 +5039,16 @@ PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
     else if (s[0]=='+' && s[1]=='>')  { strcpy(mode,"+>"); filename=s+2; }
     while (*filename==' '||*filename=='\t') filename++;
     if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
+    int utf8 = mode_wants_utf8(s);
     FILE *fp = fopen(filename, mode_to_cmode(mode));
     free(s);
-    if (fp) { target->tag = PERL_FILEHANDLE; target->pval = fp; }
-    else    { target->tag = PERL_UNDEF;      target->pval = NULL; }
+    if (fp) {
+        target->tag = PERL_FILEHANDLE; target->pval = fp;
+        if (utf8) target->flags |= PV_FLAG_UTF8;
+        else      target->flags &= ~PV_FLAG_UTF8;
+    } else {
+        target->tag = PERL_UNDEF; target->pval = NULL; target->flags = 0;
+    }
     target->matchpos = 0;
     return target;
 }
@@ -4940,6 +5084,7 @@ PerlValue *perl_readline(PerlValue *fh) {
            binary file wrote past its first NUL byte. `len` is already the
            exact tracked byte count. */
         PerlValue *pv = perl_alloc_string_len(buf, (long long)len);
+        if (fh->flags & PV_FLAG_UTF8) pv->flags |= PV_FLAG_UTF8;
         free(buf);
         return pv;
     }
@@ -4964,6 +5109,7 @@ PerlValue *perl_readline(PerlValue *fh) {
        separator may itself contain embedded NUL bytes before that
        separator; `len` is already the exact tracked byte count. */
     PerlValue *pv = perl_alloc_string_len(buf, (long long)len);
+    if (fh->flags & PV_FLAG_UTF8) pv->flags |= PV_FLAG_UTF8;
     free(buf);
     return pv;
 }
@@ -4988,24 +5134,151 @@ PerlArray *perl_readline_all_stdin(void) {
     return perl_readline_all(&tmp);
 }
 
-void perl_print_fh(PerlValue *fh, PerlValue *v) {
-    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
-    /* D85: fwrite the true byte length — see perl_print's comment. This
-       is the write half of the pack -> file -> unpack binary round trip. */
+/* ── diamond <> / <ARGV> and $ARGV / DATA ──────────────────────────────── */
+static PerlArray *perl_argv_arr = NULL; /* also used by perl_init_argv */
+static FILE *s_argv_fp = NULL;
+static int   s_argv_opened_any = 0;
+static int   s_argv_is_stdin = 0;
+static PerlValue s_dollar_argv = { .tag = PERL_STRING, .sval = NULL, .slen = 0 };
+static PerlValue s_data_fh = { .tag = PERL_UNDEF, .pval = NULL };
+
+PerlValue *perl_get_dollar_argv(void) {
+    if (!s_dollar_argv.sval) {
+        s_dollar_argv.sval = strdup("");
+        s_dollar_argv.slen = 0;
+    }
+    return &s_dollar_argv;
+}
+
+static void argv_set_name(const char *name) {
+    if (s_dollar_argv.sval) free(s_dollar_argv.sval);
+    s_dollar_argv.tag = PERL_STRING;
+    s_dollar_argv.sval = strdup(name ? name : "");
+    s_dollar_argv.slen = (long long)strlen(s_dollar_argv.sval);
+    s_dollar_argv.flags = 0;
+}
+
+static int argv_open_next(void) {
+    if (s_argv_fp) {
+        if (!s_argv_is_stdin) fclose(s_argv_fp);
+        s_argv_fp = NULL;
+        s_argv_is_stdin = 0;
+    }
+    if (!perl_argv_arr) perl_argv_arr = perl_array_new();
+    if (perl_argv_arr->len == 0) {
+        if (!s_argv_opened_any) {
+            s_argv_fp = stdin;
+            s_argv_is_stdin = 1;
+            argv_set_name("-");
+            s_argv_opened_any = 1;
+            return 1;
+        }
+        return 0;
+    }
+    PerlValue *namepv = perl_array_shift(perl_argv_arr);
+    char *name = perl_to_string_dup(namepv);
+    perl_free(namepv);
+    argv_set_name(name);
+    s_argv_opened_any = 1;
+    if (!name || strcmp(name, "-") == 0) {
+        s_argv_fp = stdin;
+        s_argv_is_stdin = 1;
+        free(name);
+        return 1;
+    }
+    s_argv_fp = fopen(name, "r");
+    if (!s_argv_fp) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "Can't open %s: %s", name, strerror(errno));
+        PerlValue *mp = perl_alloc_string(msg);
+        perl_warn(mp, "-", 0);
+        perl_free(mp);
+        free(name);
+        return argv_open_next();
+    }
+    s_argv_is_stdin = 0;
+    free(name);
+    return 1;
+}
+
+PerlValue *perl_readline_argv(void) {
+    for (;;) {
+        if (!s_argv_fp) {
+            if (!argv_open_next()) return perl_alloc_undef();
+        }
+        PerlValue tmp = { .tag = PERL_FILEHANDLE, .pval = s_argv_fp };
+        PerlValue *line = perl_readline(&tmp);
+        if (line->tag != PERL_UNDEF) return line;
+        perl_free(line);
+        if (!s_argv_is_stdin && s_argv_fp) fclose(s_argv_fp);
+        s_argv_fp = NULL;
+        s_argv_is_stdin = 0;
+    }
+}
+
+PerlArray *perl_readline_all_argv(void) {
+    PerlArray *a = perl_array_new();
+    for (;;) {
+        PerlValue *line = perl_readline_argv();
+        if (line->tag == PERL_UNDEF) { perl_free(line); break; }
+        perl_array_push(a, line);
+    }
+    return a;
+}
+
+void perl_set_data_section(const char *s, long long n) {
+    if (s_data_fh.tag == PERL_FILEHANDLE && s_data_fh.pval) {
+        fclose((FILE *)s_data_fh.pval);
+        s_data_fh.pval = NULL;
+        s_data_fh.tag = PERL_UNDEF;
+    }
+    FILE *fp = tmpfile();
+    if (!fp) return;
+    if (s && n > 0) {
+        fwrite(s, 1, (size_t)n, fp);
+        rewind(fp);
+    }
+    s_data_fh.tag = PERL_FILEHANDLE;
+    s_data_fh.pval = fp;
+    s_data_fh.flags = 0;
+}
+
+PerlValue *perl_get_data_fh(void) {
+    return &s_data_fh;
+}
+
+void perl_pv_flag_utf8(PerlValue *v) {
+    if (v) v->flags |= PV_FLAG_UTF8;
+}
+
+static void fwrite_fh_bytes(PerlValue *fh, const PerlValue *v, FILE *fp) {
     long long n;
     char *s = perl_to_string_dup_len(v, &n);
-    fwrite(s, 1, (size_t)n, (FILE*)fh->pval);
+    int fh_utf = fh && (fh->flags & PV_FLAG_UTF8);
+    int s_utf = v && (v->flags & PV_FLAG_UTF8);
+    if (fh_utf && !s_utf) {
+        /* Latin-1 byte string on a UTF-8 handle → encode */
+        for (long long i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)s[i];
+            if (c < 0x80) fputc(c, fp);
+            else { fputc(0xC0 | (c >> 6), fp); fputc(0x80 | (c & 0x3F), fp); }
+        }
+    } else {
+        fwrite(s, 1, (size_t)n, fp);
+    }
     free(s);
+}
+
+void perl_print_fh(PerlValue *fh, PerlValue *v) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
+    fwrite_fh_bytes(fh, v, (FILE*)fh->pval);
 }
 
 void perl_say_fh(PerlValue *fh, PerlValue *v) {
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
-    long long n;
-    char *s = perl_to_string_dup_len(v, &n);
     FILE *fp = (FILE*)fh->pval;
-    fwrite(s, 1, (size_t)n, fp);
+    fwrite_fh_bytes(fh, v, fp);
     fputc('\n', fp);
-    free(s);
 }
 
 void perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
@@ -7590,7 +7863,6 @@ long long perl_tr(PerlValue *str, const char *search, const char *replace, const
 
 /* ── command-line arguments ─────────────────────────────────────────────── */
 
-static PerlArray *perl_argv_arr = NULL;
 static PerlValue  perl_dollar0_val = { .tag = PERL_STRING };
 
 PerlArray *perl_init_argv(int argc, char **argv) {
@@ -8033,7 +8305,16 @@ PerlValue *perl_tell_fh(PerlValue *fh) {
 }
 
 PerlValue *perl_binmode_fh(PerlValue *fh, PerlValue *layer) {
-    (void)fh; (void)layer;
+    if (!fh || fh->tag != PERL_FILEHANDLE) return perl_alloc_int(0);
+    if (!layer || layer->tag == PERL_UNDEF) {
+        fh->flags &= ~PV_FLAG_UTF8;
+        return perl_alloc_int(1);
+    }
+    char *s = perl_to_string_dup(layer);
+    int utf8 = mode_wants_utf8(s);
+    free(s);
+    if (utf8) fh->flags |= PV_FLAG_UTF8;
+    else      fh->flags &= ~PV_FLAG_UTF8;
     return perl_alloc_int(1);
 }
 

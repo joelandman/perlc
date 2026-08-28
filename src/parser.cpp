@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <cstdlib>
+#include <cctype>
 
 /* Named low-precedence/word operators that, following a `$fh IDENT`
    sequence in print/say/printf's filehandle-detection heuristic, indicate
@@ -32,6 +33,12 @@ NodeList Parser::parseExprListFromTokens(std::vector<Token> tokens) {
         if (!p.match(TK::COMMA)) break;
     }
     return args;
+}
+
+NodePtr Parser::litStr(std::string s, int line) {
+    auto n = makeStr(std::move(s), line);
+    if (utf8Enabled_) n->ival = 1;
+    return n;
 }
 
 Token &Parser::cur()                { return toks_[pos_]; }
@@ -87,6 +94,87 @@ NodePtr Parser::parseProgram() {
                     n->line = line;
                     stmts.push_back(std::move(n));
                 }
+                continue;
+            }
+            /* use v5.36 / use 5.036 — feature bundle. ≥5.12 ~ strict;
+               ≥5.20 signatures; ≥5.36 warnings. Unknown features ignored. */
+            auto applyVersion = [&](int major, int minor) {
+                if (major > 5 || (major == 5 && minor >= 12)) {
+                    /* strict is a no-op parser-wise (we already require my/our) */
+                }
+                if (major > 5 || (major == 5 && minor >= 20))
+                    signaturesEnabled_ = true;
+                if (major > 5 || (major == 5 && minor >= 36)) {
+                    auto w = std::make_unique<Node>();
+                    w->kind = NK::WarningsStmt; w->sval = "enable"; w->line = line;
+                    stmts.push_back(std::move(w));
+                }
+            };
+            if (check(TK::IDENT) && cur().text.size() >= 2 &&
+                cur().text[0] == 'v' && isdigit((unsigned char)cur().text[1])) {
+                std::string vs = cur().text; advance(); /* v5 */
+                int major = 0, minor = 0;
+                try { major = std::stoi(vs.substr(1)); } catch (...) { major = 5; }
+                if (match(TK::DOT) && check(TK::INT)) {
+                    try { minor = std::stoi(cur().text); } catch (...) {}
+                    advance();
+                } else if (check(TK::FLOAT)) {
+                    /* v5 then .36 as float token ".36" — unlikely; handle 5.36 */
+                    advance();
+                }
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
+                match(TK::SEMI);
+                applyVersion(major, minor);
+                continue;
+            }
+            if (check(TK::FLOAT) || (check(TK::INT) && peek(1).kind == TK::DOT)) {
+                /* use 5.036;  or  use 5.36; */
+                int major = 5, minor = 0;
+                if (check(TK::FLOAT)) {
+                    double v = 0;
+                    try { v = std::stod(cur().text); } catch (...) {}
+                    advance();
+                    major = (int)v;
+                    /* 5.036 → minor 36; 5.36 → minor 36 */
+                    double frac = v - major;
+                    minor = (int)(frac * 1000 + 0.5);
+                    if (minor >= 100 && minor % 10 == 0) minor /= 10;
+                    if (minor >= 100) minor /= 10; /* 5.036 → 36 */
+                } else {
+                    try { major = std::stoi(cur().text); } catch (...) {}
+                    advance();
+                    if (match(TK::DOT) && check(TK::INT)) {
+                        try { minor = std::stoi(cur().text); } catch (...) {}
+                        advance();
+                    }
+                }
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
+                match(TK::SEMI);
+                applyVersion(major, minor);
+                continue;
+            }
+            /* use feature 'signatures' / qw(signatures say) */
+            if (check(TK::IDENT) && cur().text == "feature") {
+                advance();
+                auto enableFeat = [&](const std::string &f) {
+                    if (f == "signatures") signaturesEnabled_ = true;
+                };
+                if (check(TK::QWORDS)) {
+                    std::istringstream iss(cur().text); advance();
+                    std::string w;
+                    while (iss >> w) enableFeat(w);
+                } else if (check(TK::STRING)) {
+                    enableFeat(cur().text); advance();
+                } else if (match(TK::LPAREN)) {
+                    while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                        if (check(TK::STRING) || check(TK::IDENT)) {
+                            enableFeat(cur().text); advance();
+                        } else advance();
+                        match(TK::COMMA);
+                    }
+                    match(TK::RPAREN);
+                }
+                match(TK::SEMI);
                 continue;
             }
             /* D56: `use warnings` / `use warnings 'CATEGORY'` pragma */
@@ -180,6 +268,14 @@ NodePtr Parser::parseProgram() {
                 stmts.push_back(std::move(n));
                 continue;
             }
+            /* use utf8 — subsequent string literals are character strings */
+            if (check(TK::IDENT) && cur().text == "utf8") {
+                advance();
+                utf8Enabled_ = true;
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
+                match(TK::SEMI);
+                continue;
+            }
             /* skip all other use statements */
             while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
             match(TK::SEMI); continue;
@@ -204,6 +300,11 @@ NodePtr Parser::parseProgram() {
                 }
                 match(TK::SEMI);
                 stmts.push_back(std::move(n));
+                continue;
+            } else if (check(TK::IDENT) && cur().text == "utf8") {
+                advance();
+                utf8Enabled_ = false;
+                match(TK::SEMI);
                 continue;
             } else if (!check(TK::STRING) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
                 advance(); /* pragma name (strict, etc.) */
@@ -401,7 +502,9 @@ NodePtr Parser::parseStmt() {
         advance();
         /* filehandle detection (same heuristic as parsePrint) */
         std::string fhname;
-        if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
+        if (check(TK::IDENT) &&
+            (cur().text == "STDOUT" || cur().text == "STDERR" || cur().text == "STDIN" ||
+             knownBareFH_.count(cur().text))) {
             fhname = cur().text; advance();
         } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
             TK t2 = peek(2).kind;
@@ -734,10 +837,11 @@ void Parser::checkProtoArity(const std::string &name, const std::string &proto,
             " at " + std::to_string(line));
 }
 
-NodePtr Parser::parseAnonSubBody(int line, const std::string &proto) {
+NodePtr Parser::parseAnonSubBody(int line, const std::string &proto, NodePtr sigPrefix) {
     consume(TK::LBRACE, "{");
     ++subDepth_;
     NodeList stmts;
+    if (sigPrefix) stmts.push_back(std::move(sigPrefix));
     while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
         stmts.push_back(parseStmt());
     --subDepth_;
@@ -747,6 +851,108 @@ NodePtr Parser::parseAnonSubBody(int line, const std::string &proto) {
     n->sval = proto;
     n->body = makeBlock(std::move(stmts), line);
     return n;
+}
+
+bool Parser::looksLikeSignature() const {
+    /* Called when cur() is LPAREN. Signature if a named sigil param
+       ($x / @rest / %h) or, with feature signatures, nameless $. */
+    if (pos_ + 1 >= toks_.size()) return false;
+    size_t i = pos_ + 1;
+    auto k = [&](size_t j) { return j < toks_.size() ? toks_[j].kind : TK::EOF_TOK; };
+    if (k(i) == TK::RPAREN) return signaturesEnabled_; /* sub f() */
+    if (k(i) == TK::SCALAR) {
+        if (k(i + 1) == TK::IDENT) return true;          /* $x */
+        if (signaturesEnabled_) return true;              /* nameless $ */
+        return false;                                     /* prototype $ */
+    }
+    if ((k(i) == TK::ARRAY || k(i) == TK::HASH) && k(i + 1) == TK::IDENT)
+        return true;
+    return false;
+}
+
+NodePtr Parser::parseSignaturePrefix(int line) {
+    consume(TK::LPAREN, "(");
+    struct P {
+        char sigil;          /* $ @ % */
+        std::string name;    /* empty = nameless */
+        NodePtr def;         /* default expr */
+    };
+    std::vector<P> ps;
+    while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+        P p{};
+        p.sigil = '$';
+        if (check(TK::SCALAR)) { advance(); p.sigil = '$'; }
+        else if (check(TK::ARRAY)) { advance(); p.sigil = '@'; }
+        else if (check(TK::HASH)) { advance(); p.sigil = '%'; }
+        else { advance(); continue; }
+        if (check(TK::IDENT)) { p.name = cur().text; advance(); }
+        if (match(TK::ASSIGN)) p.def = parseExpr();
+        ps.push_back(std::move(p));
+        if (!match(TK::COMMA)) break;
+    }
+    consume(TK::RPAREN, ")");
+
+    NodeList stmts;
+    /* my ($a, $b, @rest) = @_; */
+    {
+        NodeList lhs;
+        for (auto &p : ps) {
+            if (p.name.empty()) continue;
+            if (p.sigil == '@') {
+                auto av = std::make_unique<Node>(); av->kind = NK::ArrayVar;
+                av->name = p.name; av->line = line;
+                lhs.push_back(std::move(av));
+            } else if (p.sigil == '%') {
+                auto hv = std::make_unique<Node>(); hv->kind = NK::HashVar;
+                hv->name = p.name; hv->line = line;
+                lhs.push_back(std::move(hv));
+            } else {
+                lhs.push_back(makeScalar(p.name, line));
+            }
+        }
+        if (!lhs.empty()) {
+            auto rhs = std::make_unique<Node>(); rhs->kind = NK::ArrayVar;
+            rhs->name = "_"; rhs->line = line;
+            auto list = std::make_unique<Node>(); list->kind = NK::ArrayLit;
+            list->args = std::move(lhs); list->line = line;
+            auto asg = std::make_unique<Node>(); asg->kind = NK::Assign;
+            asg->left = std::move(list); asg->right = std::move(rhs); asg->line = line;
+            auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt;
+            es->left = std::move(asg); es->line = line;
+            /* Declarations: My nodes so codegen allocates slots. */
+            NodeList decls;
+            for (auto &p : ps) {
+                if (p.name.empty()) continue;
+                auto d = std::make_unique<Node>(); d->kind = NK::My; d->line = line;
+                d->name = std::string(1, p.sigil) + p.name;
+                decls.push_back(std::move(d));
+            }
+            decls.push_back(std::move(es));
+            auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock;
+            fb->args = std::move(decls); fb->line = line;
+            stmts.push_back(std::move(fb));
+        }
+    }
+    /* Defaults: $y = expr if @_ < N  (N = 1-based index of this param). */
+    for (size_t i = 0; i < ps.size(); i++) {
+        if (!ps[i].def || ps[i].name.empty() || ps[i].sigil != '$') continue;
+        auto av = std::make_unique<Node>(); av->kind = NK::ArrayVar;
+        av->name = "_"; av->line = line;
+        auto nlit = makeInt((long long)i + 1, line);
+        auto cmp = makeBin("<", std::move(av), std::move(nlit), line);
+        auto asg = std::make_unique<Node>(); asg->kind = NK::Assign;
+        asg->left = makeScalar(ps[i].name, line);
+        asg->right = std::move(ps[i].def); asg->line = line;
+        auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt;
+        es->left = std::move(asg); es->line = line;
+        NodeList body; body.push_back(std::move(es));
+        auto iff = std::make_unique<Node>(); iff->kind = NK::If; iff->line = line;
+        iff->branches.push_back({std::move(cmp), makeBlock(std::move(body), line)});
+        stmts.push_back(std::move(iff));
+    }
+    auto blk = std::make_unique<Node>(); blk->kind = NK::FlatBlock;
+    blk->args = std::move(stmts); blk->line = line;
+    return blk;
 }
 
 NodePtr Parser::parseAmpBlockCall(std::string name, const std::string &proto, int line) {
@@ -776,10 +982,15 @@ NodePtr Parser::parseSub() {
 
     std::string proto;
     bool hasProto = false;
+    NodePtr sigPrefix;
     if (check(TK::LPAREN)) {
-        proto = parsePrototype();
-        hasProto = true;
-        rememberProto(name, proto);
+        if (looksLikeSignature()) {
+            sigPrefix = parseSignaturePrefix(line);
+        } else {
+            proto = parsePrototype();
+            hasProto = true;
+            rememberProto(name, proto);
+        }
     }
 
     /* forward declaration: sub name; or sub name(PROTOTYPE); */
@@ -793,6 +1004,7 @@ NodePtr Parser::parseSub() {
 
     ++subDepth_;
     NodeList stmts;
+    if (sigPrefix) stmts.push_back(std::move(sigPrefix));
     while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
         stmts.push_back(parseStmt());
     --subDepth_;
@@ -978,7 +1190,12 @@ NodePtr Parser::parsePrint(bool isSay) {
         - $fh without a following comma → it's a filehandle, not a value
         - {EXPR} brace-block → it's a filehandle expression */
      std::string fhname;
-     if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
+     auto isBareFhName = [&](const std::string &s) {
+         if (s == "STDOUT" || s == "STDERR" || s == "STDIN") return true;
+         if (knownBareFH_.count(s)) return true;
+         return false;
+     };
+     if (check(TK::IDENT) && isBareFhName(cur().text)) {
          fhname = cur().text; advance();
       } else if (check(TK::LBRACE)) {
           /* {EXPR} brace-block filehandle form — parse the expression inside braces */
@@ -1274,7 +1491,9 @@ NodePtr Parser::parseOrRhs() {
            the trailing modifier, so we leave the ; for the caller). */
         advance(); /* consume printf */
         std::string fhname;
-        if (check(TK::IDENT) && (cur().text == "STDOUT" || cur().text == "STDERR")) {
+        if (check(TK::IDENT) &&
+            (cur().text == "STDOUT" || cur().text == "STDERR" || cur().text == "STDIN" ||
+             knownBareFH_.count(cur().text))) {
             fhname = cur().text; advance();
         } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
             TK t2 = peek(2).kind;
@@ -1908,7 +2127,7 @@ NodePtr Parser::parsePrimary() {
             raw = raw.substr(1);
             return parseStringInterp(raw, line);
         }
-        return makeStr(raw, line);
+        return litStr(raw, line);
     }
 
     /* qw(word list) — returns ArrayLit of string literals */
@@ -1917,7 +2136,7 @@ NodePtr Parser::parsePrimary() {
         auto n = std::make_unique<Node>(); n->kind = NK::ArrayLit; n->line = line;
         std::istringstream iss(text);
         std::string word;
-        while (iss >> word) n->args.push_back(makeStr(word, line));
+        while (iss >> word) n->args.push_back(litStr(word, line));
         return n;
     }
 
@@ -2039,13 +2258,17 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* anonymous sub: sub { BLOCK } or sub (PROTO) { BLOCK } */
+    /* anonymous sub: sub { BLOCK } or sub (PROTO|SIG) { BLOCK } */
     if (check(TK::KW_SUB) && pos_ + 1 < toks_.size() &&
         (toks_[pos_+1].kind == TK::LBRACE || toks_[pos_+1].kind == TK::LPAREN)) {
         advance(); /* consume 'sub' */
         std::string proto;
-        if (check(TK::LPAREN)) proto = parsePrototype();
-        return parseAnonSubBody(line, proto);
+        NodePtr sigPrefix;
+        if (check(TK::LPAREN)) {
+            if (looksLikeSignature()) sigPrefix = parseSignaturePrefix(line);
+            else proto = parsePrototype();
+        }
+        return parseAnonSubBody(line, proto, std::move(sigPrefix));
     }
 
     /* anonymous array ref:  [list] */
@@ -2448,6 +2671,24 @@ NodePtr Parser::parsePrimary() {
             inKeyContext_ = false;
             consume(TK::RBRACE, "}");
         }
+        /* exists $h{a}{b} / $h{a}[0] — extra subscripts in args */
+        while (check(TK::LBRACE) || check(TK::LBRACKET)) {
+            auto sub = std::make_unique<Node>();
+            sub->line = n->line;
+            if (match(TK::LBRACKET)) {
+                sub->sval = "array";
+                sub->left = parseExpr();
+                consume(TK::RBRACKET, "]");
+            } else {
+                advance(); /* { */
+                sub->sval = "hash";
+                inKeyContext_ = true;
+                sub->left = parseExpr();
+                inKeyContext_ = false;
+                consume(TK::RBRACE, "}");
+            }
+            n->args.push_back(std::move(sub));
+        }
         if (hasParen) consume(TK::RPAREN, ")");
         return n;
     }
@@ -2712,13 +2953,24 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* open([my] $fh, mode, filename) or open([my] $fh, "mode_file") */
+    /* open([my] $fh, mode, filename) or open(FH, ...) bare typeglob */
     if (check(TK::KW_OPEN)) {
         advance();
         bool hasParen = match(TK::LPAREN);
         bool isMy = match(TK::KW_MY);
-        consume(TK::SCALAR, "$");
-        std::string fhname = consume(TK::IDENT, "filehandle name").text;
+        std::string fhname;
+        std::string tag;
+        if (check(TK::SCALAR)) {
+            advance();
+            fhname = consume(TK::IDENT, "filehandle name").text;
+            tag = isMy ? "my" : "";
+        } else if (check(TK::IDENT)) {
+            fhname = cur().text; advance();
+            tag = "bare";
+            knownBareFH_.insert(fhname);
+        } else {
+            consume(TK::SCALAR, "$");
+        }
         match(TK::COMMA);
         NodeList args;
         while (true) {
@@ -2729,7 +2981,7 @@ NodePtr Parser::parsePrimary() {
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::OpenFunc; n->line = line;
-        n->name = fhname; n->sval = isMy ? "my" : ""; n->args = std::move(args);
+        n->name = fhname; n->sval = tag; n->args = std::move(args);
         return n;
     }
 
@@ -3389,22 +3641,10 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* unshift as expression (returns new count) */
+    /* unshift as expression (returns new count) — same parse as statement,
+       including @$ref / @{EXPR} */
     if (check(TK::KW_UNSHIFT)) {
-        advance();
-        bool hasParen = match(TK::LPAREN);
-        consume(TK::ARRAY, "@");
-        std::string nm = cur().text; advance();
-        match(TK::COMMA);
-        NodeList vals;
-        while (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
-            vals.push_back(parseExpr());
-            if (!match(TK::COMMA)) break;
-        }
-        if (hasParen) consume(TK::RPAREN, ")");
-        auto n = std::make_unique<Node>(); n->kind = NK::UnshiftStmt2;
-        n->name = nm; n->args = std::move(vals); n->line = line;
-        return n;
+        return parseUnshift();
     }
 
     /* anonymous hash ref:  { key => val, ... } */
@@ -3466,6 +3706,13 @@ NodePtr Parser::parsePrimary() {
             if (cit != constMap_.end()) {
                 return cit->second->clone();  /* pre-parsed AST node (cloned for reuse) */
             }
+        }
+        /* Bare filehandle (open LOG; print {LOG}) — not a sub call. */
+        if (knownBareFH_.count(nm) ||
+            nm == "STDOUT" || nm == "STDERR" || nm == "STDIN") {
+            auto t = std::make_unique<Node>(); t->kind = NK::Typeglob;
+            t->name = nm; t->line = line;
+            return t;
         }
         /* D36: bareword call without parens — croak "msg", foo $x, bar 1, 2
            Also: bareword at end of expression (e.g. `my $y = mysub;`) is a
@@ -3626,7 +3873,7 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
     std::vector<NodePtr> parts;
     std::string cur_s;
 
-    auto flush = [&]{ if (!cur_s.empty()) { parts.push_back(makeStr(cur_s, line)); cur_s.clear(); } };
+    auto flush = [&]{ if (!cur_s.empty()) { parts.push_back(litStr(cur_s, line)); cur_s.clear(); } };
 
     size_t i = 0;
     while (i < raw.size()) {

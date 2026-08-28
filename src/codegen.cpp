@@ -25,7 +25,12 @@ using namespace llvm;
    order to relay it to the inner closure. */
 static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
     switch (n.kind) {
-    case NK::ScalarVar: names.insert(n.name); return;
+    case NK::ScalarVar: {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        names.insert(nm);
+        return;
+    }
     case NK::SubDef:    return;
     default: break;
     }
@@ -89,6 +94,76 @@ static void collectClosureCapturedNames(const Node &n, std::unordered_set<std::s
         if (b.body) collectClosureCapturedNames(*b.body, names);
     }
     for (auto &a : n.args) collectClosureCapturedNames(*a, names);
+}
+
+/* True if this subtree contains `eval EXPR` (NK::Call named eval). Named
+   SubDef bodies are skipped — they compile as their own functions. AnonSub
+   is recursed into so an outer `my` that a nested closure eval's is boxed. */
+static bool hasEvalCall(const Node &n) {
+    if (n.kind == NK::SubDef) return false;
+    if (n.kind == NK::Call && n.name == "eval") return true;
+    if (n.left && hasEvalCall(*n.left)) return true;
+    if (n.right && hasEvalCall(*n.right)) return true;
+    if (n.cond && hasEvalCall(*n.cond)) return true;
+    if (n.body && hasEvalCall(*n.body)) return true;
+    if (n.init && hasEvalCall(*n.init)) return true;
+    if (n.step && hasEvalCall(*n.step)) return true;
+    for (auto &b : n.branches) {
+        if (b.cond && hasEvalCall(*b.cond)) return true;
+        if (b.body && hasEvalCall(*b.body)) return true;
+    }
+    for (auto &a : n.args) if (hasEvalCall(*a)) return true;
+    return false;
+}
+
+static bool evalPadSkipName(const std::string &nm) {
+    if (nm.empty() || nm == "_" || nm == "AUTOLOAD") return true;
+    bool allDigit = true;
+    for (char c : nm) {
+        if (c < '0' || c > '9') { allDigit = false; break; }
+    }
+    if (allDigit) return true; /* $0, $1..$n */
+    if (nm.size() == 1 && !((nm[0] >= 'A' && nm[0] <= 'Z') ||
+                            (nm[0] >= 'a' && nm[0] <= 'z')))
+        return true; /* $! $/ $. $, etc. */
+    return false;
+}
+
+static void collectEvalPadNames(const Node &n,
+                                std::set<std::string> &scalars,
+                                std::set<std::string> &arrays,
+                                std::set<std::string> &hashes) {
+    auto addS = [&](std::string nm) {
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        if (!evalPadSkipName(nm)) scalars.insert(nm);
+    };
+    auto addA = [&](std::string nm) {
+        if (!nm.empty() && nm[0] == '@') nm = nm.substr(1);
+        if (nm.empty() || nm == "_") return;
+        arrays.insert(nm);
+    };
+    auto addH = [&](std::string nm) {
+        if (!nm.empty() && nm[0] == '%') nm = nm.substr(1);
+        if (nm.empty()) return;
+        hashes.insert(nm);
+    };
+    switch (n.kind) {
+    case NK::ScalarVar: addS(n.name); break;
+    case NK::ArrayVar: case NK::ArrayElem: addA(n.name); break;
+    case NK::HashVar: case NK::HashElem: addH(n.name); break;
+    default: break;
+    }
+    if (n.left)  collectEvalPadNames(*n.left,  scalars, arrays, hashes);
+    if (n.right) collectEvalPadNames(*n.right, scalars, arrays, hashes);
+    if (n.cond)  collectEvalPadNames(*n.cond,  scalars, arrays, hashes);
+    if (n.body)  collectEvalPadNames(*n.body,  scalars, arrays, hashes);
+    if (n.init)  collectEvalPadNames(*n.init,  scalars, arrays, hashes);
+    if (n.step)  collectEvalPadNames(*n.step,  scalars, arrays, hashes);
+    for (auto &b : n.branches) {
+        if (b.cond) collectEvalPadNames(*b.cond, scalars, arrays, hashes);
+        if (b.body) collectEvalPadNames(*b.body, scalars, arrays, hashes);
+    }
+    for (auto &a : n.args) collectEvalPadNames(*a, scalars, arrays, hashes);
 }
 
 /* mangle Foo::bar → perlsub_Foo__bar for valid LLVM identifiers */
@@ -359,6 +434,12 @@ void CodeGen::declareRuntime() {
     RT("perl_readline_all",     av,     pv);
     RT("perl_readline_stdin",   pv);
     RT("perl_readline_all_stdin", av);
+    RT("perl_readline_argv",    pv);
+    RT("perl_readline_all_argv", av);
+    RT("perl_get_dollar_argv",  pv);
+    RT("perl_set_data_section", voidTy, i8p, i64);
+    RT("perl_get_data_fh",      pv);
+    RT("perl_pv_flag_utf8",     voidTy, pv);
     RT("perl_print_fh",         voidTy, pv, pv);
     RT("perl_say_fh",           voidTy, pv, pv);
     RT("perl_printf_fh",        voidTy, pv, pv, av);
@@ -461,6 +542,18 @@ void CodeGen::declareRuntime() {
     RT("perl_get_dollar_at",   pv);
     RT("perl_eval_push",       voidTy, i8p);
     RT("perl_eval_string",     pv, pv);
+    RT("perl_eval_pad_begin",              voidTy);
+    RT("perl_eval_pad_add_scalar",         voidTy, i8p, pv);
+    RT("perl_eval_pad_add_array",          voidTy, i8p, av);
+    RT("perl_eval_pad_add_hash",           voidTy, i8p, av);
+    RT("perl_eval_pad_clear",              voidTy);
+    RT("perl_eval_pad_pin",                voidTy);
+    RT("perl_eval_pad_get_scalar",         pv, i8p);
+    RT("perl_eval_pad_get_array",          av, i8p);
+    RT("perl_eval_pad_get_hash",           av, i8p);
+    RT("perl_eval_pad_get_scalar_or_undef", pv, i8p);
+    RT("perl_eval_pad_get_array_or_new",   av, i8p);
+    RT("perl_eval_pad_get_hash_or_new",    av, i8p);
     RT("perl_tr",              i64, pv, i8p, i8p, i8p);
     /* setjmp called directly from generated code — must be returns_twice */
     {
@@ -706,6 +799,95 @@ bool CodeGen::isGlobName(const std::string &nm) const {
 
 void CodeGen::declareVar(const std::string &nm, Value *a) {
     scopes_.back()[nm] = a;
+}
+
+void CodeGen::emitEvalPadFill() {
+    callRT("perl_eval_pad_begin", {});
+    std::unordered_set<std::string> addedS, addedA, addedH;
+    auto addScalar = [&](const std::string &nm, Value *slot) {
+        if (!slot || evalPadSkipName(nm) || addedS.count(nm)) return;
+        Value *cell = builder_.CreateLoad(perlPtrTy_, slot, nm + ".epad");
+        Value *key = builder_.CreateGlobalStringPtr(nm);
+        callRT("perl_eval_pad_add_scalar", {key, cell});
+        addedS.insert(nm);
+    };
+    auto addArray = [&](const std::string &nm, Value *av) {
+        if (!av || nm.empty() || nm == "_" || addedA.count(nm)) return;
+        Value *key = builder_.CreateGlobalStringPtr(nm);
+        callRT("perl_eval_pad_add_array", {key, av});
+        addedA.insert(nm);
+    };
+    auto addHash = [&](const std::string &nm, Value *hv) {
+        if (!hv || nm.empty() || addedH.count(nm)) return;
+        Value *key = builder_.CreateGlobalStringPtr(nm);
+        callRT("perl_eval_pad_add_hash", {key, hv});
+        addedH.insert(nm);
+    };
+    /* Inner scopes overwrite outer (addedS blocks a second add; walk inner first). */
+    for (int i = (int)scopes_.size() - 1; i >= 0; i--)
+        for (auto &kv : scopes_[i]) addScalar(kv.first, kv.second);
+    for (auto &kv : fileScalarGlobals_) addScalar(kv.first, kv.second);
+    for (int i = (int)arrayScopes_.size() - 1; i >= 0; i--)
+        for (auto &kv : arrayScopes_[i]) addArray(kv.first, kv.second);
+    for (auto &kv : fileArrayGlobals_) {
+        Value *av = builder_.CreateLoad(perlPtrTy_, kv.second, kv.first + ".epad.av");
+        addArray(kv.first, av);
+    }
+    for (int i = (int)hashScopes_.size() - 1; i >= 0; i--)
+        for (auto &kv : hashScopes_[i]) addHash(kv.first, kv.second);
+    for (auto &kv : fileHashGlobals_) {
+        Value *hv = builder_.CreateLoad(perlPtrTy_, kv.second, kv.first + ".epad.hv");
+        addHash(kv.first, hv);
+    }
+    /* Unboxed int/float: box a cell so the eval can read (and, with
+       allNamesCaptured_, these scopes should be empty at eval sites). */
+    for (int i = (int)intScopes_.size() - 1; i >= 0; i--) {
+        for (auto &kv : intScopes_[i]) {
+            if (evalPadSkipName(kv.first) || addedS.count(kv.first)) continue;
+            Value *iv = builder_.CreateLoad(Type::getInt64Ty(ctx_), kv.second);
+            Value *boxed = boxI64(iv);
+            Value *key = builder_.CreateGlobalStringPtr(kv.first);
+            callRT("perl_eval_pad_add_scalar", {key, boxed});
+            addedS.insert(kv.first);
+        }
+    }
+    for (int i = (int)floatScopes_.size() - 1; i >= 0; i--) {
+        for (auto &kv : floatScopes_[i]) {
+            if (evalPadSkipName(kv.first) || addedS.count(kv.first)) continue;
+            Value *fv = builder_.CreateLoad(Type::getDoubleTy(ctx_), kv.second);
+            Value *boxed = boxF64(fv);
+            Value *key = builder_.CreateGlobalStringPtr(kv.first);
+            callRT("perl_eval_pad_add_scalar", {key, boxed});
+            addedS.insert(kv.first);
+        }
+    }
+}
+
+void CodeGen::emitEvalPadBind() {
+    for (auto &nm : evalPadScalars_) {
+        auto git = fileScalarGlobals_.find(nm);
+        if (git == fileScalarGlobals_.end()) continue;
+        Value *key = builder_.CreateGlobalStringPtr(nm);
+        Value *cell = callRT("perl_eval_pad_get_scalar_or_undef", {key});
+        builder_.CreateStore(cell, git->second);
+        declareVar(nm, git->second);
+    }
+    for (auto &nm : evalPadArrays_) {
+        auto git = fileArrayGlobals_.find(nm);
+        if (git == fileArrayGlobals_.end()) continue;
+        Value *key = builder_.CreateGlobalStringPtr(nm);
+        Value *av = callRT("perl_eval_pad_get_array_or_new", {key});
+        builder_.CreateStore(av, git->second);
+    }
+    for (auto &nm : evalPadHashes_) {
+        auto git = fileHashGlobals_.find(nm);
+        if (git == fileHashGlobals_.end()) continue;
+        Value *key = builder_.CreateGlobalStringPtr(nm);
+        Value *hv = callRT("perl_eval_pad_get_hash_or_new", {key});
+        builder_.CreateStore(hv, git->second);
+    }
+    if (!subs_.empty())
+        callRT("perl_eval_pad_pin", {});
 }
 
 void CodeGen::trackPv(Value *pv) {
@@ -1188,10 +1370,22 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     /* NK::AnonArray is a scalar (array ref) — do not flatten it as a list.
        Callers that get nullptr will use emitExpr() which returns perl_ref_array(). */
     if (n.kind == NK::Readline) {
-        if (n.sval == "STDIN" || n.sval.empty())
+        if (n.sval.empty() || n.sval == "ARGV")
+            return callRT("perl_readline_all_argv", {});
+        if (n.sval == "STDIN")
             return callRT("perl_readline_all_stdin", {});
+        if (n.sval == "DATA") {
+            Value *fh = callRT("perl_get_data_fh", {});
+            return callRT("perl_readline_all", {fh});
+        }
         if (auto *slot = lookupVar(n.sval)) {
             Value *fh = builder_.CreateLoad(perlPtrTy_, slot);
+            return callRT("perl_readline_all", {fh});
+        }
+        if (isGlobName(n.sval) || !n.sval.empty()) {
+            globNames_.insert(n.sval);
+            Value *key = builder_.CreateGlobalStringPtr(n.sval);
+            Value *fh = callRT("perl_glob_get_scalar", {key});
             return callRT("perl_readline_all", {fh});
         }
         return callRT("perl_array_new", {});
@@ -2883,6 +3077,8 @@ static void collectGlobNames(const Node &n, std::unordered_set<std::string> &out
     if (n.kind == NK::Assign && n.left && n.left->kind == NK::Typeglob &&
         !n.left->name.empty())
         out.insert(n.left->name);
+    if (n.kind == NK::OpenFunc && n.sval == "bare" && !n.name.empty())
+        out.insert(n.name);
     if (n.left)  collectGlobNames(*n.left,  out);
     if (n.right) collectGlobNames(*n.right, out);
     if (n.cond)  collectGlobNames(*n.cond,  out);
@@ -2967,10 +3163,12 @@ static void dfsFindCycles(const std::string &node,
     state[node] = 2;
 }
 
-void CodeGen::compile(const Node &program, const std::string &modName, bool asDoLib) {
+void CodeGen::compile(const Node &program, const std::string &modName,
+                      bool asDoLib, bool asEvalPad) {
     mod_->setModuleIdentifier(modName);
     sourceFile_ = modName;
-    asDoLib_ = asDoLib;
+    asDoLib_ = asDoLib || asEvalPad;
+    asEvalPad_ = asEvalPad;
     if (debug_) initializeDebugInfo(modName);
 
     /* D10: reset per-compilation counters so multi-compile is deterministic */
@@ -2989,6 +3187,38 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
     globNames_.clear();
     collectSubDefs(program, subs_);
     collectGlobNames(program, globNames_);
+
+    evalPadScalars_.clear();
+    evalPadArrays_.clear();
+    evalPadHashes_.clear();
+    if (asEvalPad_) {
+        std::set<std::string> sc, ar, hs;
+        collectEvalPadNames(program, sc, ar, hs);
+        evalPadScalars_.assign(sc.begin(), sc.end());
+        evalPadArrays_.assign(ar.begin(), ar.end());
+        evalPadHashes_.assign(hs.begin(), hs.end());
+        for (auto &nm : evalPadScalars_) {
+            if (fileScalarGlobals_.count(nm)) continue;
+            auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                Constant::getNullValue(perlPtrTy_), "epad.s." + nm);
+            fileScalarGlobals_[nm] = gv;
+        }
+        for (auto &nm : evalPadArrays_) {
+            if (fileArrayGlobals_.count(nm)) continue;
+            auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                Constant::getNullValue(perlPtrTy_), "epad.a." + nm);
+            fileArrayGlobals_[nm] = gv;
+        }
+        for (auto &nm : evalPadHashes_) {
+            if (fileHashGlobals_.count(nm)) continue;
+            auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                Constant::getNullValue(perlPtrTy_), "epad.h." + nm);
+            fileHashGlobals_[nm] = gv;
+        }
+    }
 
     /* Detect inlineable subs: body = "my ($p1,..) = @_; return expr".
        These are expanded at call sites without @_ construction. Collected
@@ -3134,6 +3364,13 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
             builder_.CreateStore(dollar0, slot0);
             declareVar("0", slot0);
 
+            if (hasDataSection_) {
+                Value *ds = builder_.CreateGlobalStringPtr(dataSection_, ".data");
+                Value *ln = ConstantInt::get(Type::getInt64Ty(ctx_),
+                                             (long long)dataSection_.size());
+                callRT("perl_set_data_section", {ds, ln});
+            }
+
             Value *underscoreVal = callRT("perl_alloc_undef", {});
             auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
             builder_.CreateStore(underscoreVal, slotUs);
@@ -3146,6 +3383,7 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
 
         /* D64: same pre-scan as emitSub/AnonSub, for the top-level program body */
         collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
+        allNamesCaptured_ = hasEvalCall(program);
 
         emitBlock(program);
         popScope();
@@ -3222,6 +3460,16 @@ void CodeGen::compile(const Node &program, const std::string &modName, bool asDo
 
         /* D64: same pre-scan as the normal-main path above */
         collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
+        allNamesCaptured_ = hasEvalCall(program);
+
+        if (hasDataSection_) {
+            Value *ds = builder_.CreateGlobalStringPtr(dataSection_, ".data");
+            Value *ln = ConstantInt::get(Type::getInt64Ty(ctx_),
+                                         (long long)dataSection_.size());
+            callRT("perl_set_data_section", {ds, ln});
+        }
+
+        if (asEvalPad_) emitEvalPadBind();
 
         /* do FILE / string eval inherit the caller's wantarray (ctx arg).
            Needed so a last-expr ArrayLit like `(1,2,3)` becomes LIST_RESULT
@@ -3381,6 +3629,8 @@ void CodeGen::emitSub(const Node &n) {
     auto savedCapturedNames = capturedNamesInCurrentFn_;
     capturedNamesInCurrentFn_.clear();
     if (n.body) collectClosureCapturedNames(*n.body, capturedNamesInCurrentFn_);
+    bool savedAllCap = allNamesCaptured_;
+    allNamesCaptured_ = n.body && hasEvalCall(*n.body);
 
     auto *savedFn = currentFn_;
     currentFn_ = fn;
@@ -3537,6 +3787,7 @@ void CodeGen::emitSub(const Node &n) {
     currentFn_ = savedFn;
     currentPackage_ = savedPackage;
     capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
+    allNamesCaptured_ = savedAllCap;
     stmtLabels_ = std::move(savedLabels);
 
     /* restore insert point to end of main (for any remaining stmts) */
@@ -4055,7 +4306,9 @@ void CodeGen::emitStmt(const Node &n) {
                     (n.right->kind == NK::MethodCall ||
                      n.right->kind == NK::BlessFunc ||
                      n.right->kind == NK::Call);
-                bool mayBeCaptured = capturedNamesInCurrentFn_.count(nm) != 0;
+                bool mayBeCaptured = allNamesCaptured_ ||
+                    capturedNamesInCurrentFn_.count(nm) != 0 ||
+                    capturedNamesInCurrentFn_.count("$" + nm) != 0;
                 if (n.right && !atFileScope && !rhsMayBeRef && !rhsMayBeBlessed && !mayBeCaptured) {
                     if (Value *ival = emitExprI64(*n.right)) {
                         auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
@@ -4138,9 +4391,14 @@ void CodeGen::emitStmt(const Node &n) {
         Value *fh = nullptr;
         if (n.name == "STDERR")       fh = callRT("perl_get_stderr", {});
         else if (n.name == "STDOUT")  fh = callRT("perl_get_stdout", {});
+        else if (n.name == "STDIN")   fh = callRT("perl_get_stdin", {});
         else if (!n.name.empty()) {
             if (auto *slot = lookupVar(n.name))
                 fh = builder_.CreateLoad(perlPtrTy_, slot);
+            else if (isGlobName(n.name)) {
+                Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
+                fh = callRT("perl_glob_get_scalar", {key});
+            }
         }
         /* D86: brace-block filehandle form — evaluate n.left as the fh expression */
         if (!fh && n.left) {
@@ -5207,7 +5465,11 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::UndefLit:  return perlUndef();
     case NK::IntLit:    return perlInt(n.ival);
     case NK::FloatLit:  return perlFloat(n.fval);
-    case NK::StringLit: return perlStr(n.sval);
+    case NK::StringLit: {
+        Value *s = perlStr(n.sval);
+        if (n.ival) callRT("perl_pv_flag_utf8", {s});
+        return s;
+    }
 
     case NK::ScalarVar: {
         if (n.name == "!")  return callRT("perl_get_dollar_bang",  {});
@@ -5219,6 +5481,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.name == "?")  return callRT("perl_get_dollar_question", {});
         /* $AUTOLOAD — set by dispatch when AUTOLOAD is called */
         if (n.name == "AUTOLOAD") return callRT("perl_get_autoload_name", {});
+        if (n.name == "ARGV") return callRT("perl_get_dollar_argv", {});
         {
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
@@ -5294,27 +5557,46 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Readline: {
-        if (n.sval == "STDIN" || n.sval.empty())
+        if (n.sval.empty() || n.sval == "ARGV")
+            return callRT("perl_readline_argv", {});
+        if (n.sval == "STDIN")
             return callRT("perl_readline_stdin", {});
+        if (n.sval == "DATA") {
+            Value *fh = callRT("perl_get_data_fh", {});
+            return callRT("perl_readline", {fh});
+        }
         if (auto *slot = lookupVar(n.sval)) {
             Value *fh = builder_.CreateLoad(perlPtrTy_, slot);
+            return callRT("perl_readline", {fh});
+        }
+        if (isGlobName(n.sval) || !n.sval.empty()) {
+            globNames_.insert(n.sval);
+            Value *key = builder_.CreateGlobalStringPtr(n.sval);
+            Value *fh = callRT("perl_glob_get_scalar", {key});
             return callRT("perl_readline", {fh});
         }
         return perlUndef();
     }
 
     case NK::OpenFunc: {
-        Value *slot = nullptr;
-        if (n.sval == "my") {
-            slot = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
-            Value *pv = perlUndef();
-            builder_.CreateStore(pv, slot);
-            declareVar(n.name, slot);
+        Value *fh_pv = nullptr;
+        if (n.sval == "bare") {
+            globNames_.insert(n.name);
+            Value *key = builder_.CreateGlobalStringPtr(n.name);
+            fh_pv = callRT("perl_glob_get_scalar", {key});
         } else {
-            slot = lookupVar(n.name);
-            if (!slot) return perlUndef();
+            Value *slot = nullptr;
+            if (n.sval == "my") {
+                slot = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+                Value *pv = perlUndef();
+                builder_.CreateStore(pv, slot);
+                declareVar(n.name, slot);
+            } else {
+                slot = lookupVar(n.name);
+                if (!slot) return perlUndef();
+            }
+            fh_pv = builder_.CreateLoad(perlPtrTy_, slot);
         }
-        Value *fh_pv = builder_.CreateLoad(perlPtrTy_, slot);
         if (n.args.size() >= 2)
             return callRT("perl_open_fh",  {fh_pv, emitExpr(*n.args[0]), emitExpr(*n.args[1])});
         if (n.args.size() == 1)
@@ -6694,8 +6976,19 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::Call: return emitCall(n);
 
-    case NK::Typeglob:
+    case NK::Typeglob: {
+        /* If this name is a glob/FH, return the scalar/IO cell so
+           print {LOG} / close LOG work. Otherwise stringify *pkg::name. */
+        if (isGlobName(n.name) || n.name == "STDOUT" || n.name == "STDERR" ||
+            n.name == "STDIN") {
+            if (n.name == "STDOUT") return callRT("perl_get_stdout", {});
+            if (n.name == "STDERR") return callRT("perl_get_stderr", {});
+            if (n.name == "STDIN")  return callRT("perl_get_stdin", {});
+            Value *key = builder_.CreateGlobalStringPtr(n.name);
+            return callRT("perl_glob_get_scalar", {key});
+        }
         return perlStr("*" + currentPackage_ + "::" + n.name);
+    }
 
     case NK::ScalarFunc: {
         if (n.left) {
@@ -6924,20 +7217,76 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ExistsFunc: {
+        auto existsI32 = [&](Value *i32v) -> Value * {
+            return callRT("perl_alloc_int",
+                {builder_.CreateSExt(i32v, Type::getInt64Ty(ctx_))});
+        };
+        /* Chained exists $h{a}{b}: autoviv intermediates, exists on last. */
+        if (!n.args.empty() && n.left) {
+            struct ExLev { bool isArr; const Node *key; };
+            std::vector<ExLev> chain;
+            chain.push_back({n.sval == "array", n.left.get()});
+            for (auto &a : n.args)
+                chain.push_back({a->sval == "array", a->left.get()});
+            bool isArr = chain[0].isArr;
+            Value *hv = isArr ? nullptr : lookupHash(n.name);
+            Value *av = isArr ? lookupArray(n.name) : nullptr;
+            if (!hv && !av) return perlInt(0);
+            for (size_t i = 0; i + 1 < chain.size(); i++) {
+                bool nextArr = chain[i + 1].isArr;
+                const Node *keyN = chain[i].key;
+                if (isArr) {
+                    Value *idx = emitIdx(*keyN);
+                    if (nextArr)
+                        av = callRT("perl_array_autoviv_array", {av, idx});
+                    else {
+                        hv = callRT("perl_array_autoviv_hash", {av, idx});
+                        av = nullptr;
+                    }
+                } else {
+                    if (nextArr) {
+                        if (Value *kp = constKeyPtr(*keyN, builder_))
+                            av = callRT("perl_hash_autoviv_array", {hv, kp});
+                        else {
+                            Value *key = emitExpr(*keyN);
+                            av = callRT("perl_hash_autoviv_array_sv", {hv, key});
+                            freeIfOwned(key);
+                        }
+                        hv = nullptr;
+                    } else {
+                        if (Value *kp = constKeyPtr(*keyN, builder_))
+                            hv = callRT("perl_hash_autoviv_hash", {hv, kp});
+                        else {
+                            Value *key = emitExpr(*keyN);
+                            hv = callRT("perl_hash_autoviv_hash_sv", {hv, key});
+                            freeIfOwned(key);
+                        }
+                    }
+                }
+                isArr = nextArr;
+            }
+            const Node *lastKey = chain.back().key;
+            if (isArr) {
+                if (!av) return perlInt(0);
+                Value *idx = emitIdx(*lastKey);
+                Value *elem = callRT("perl_array_get_ref", {av, idx});
+                Value *def  = callRT("perl_defined", {elem});
+                return existsI32(def);
+            }
+            if (!hv) return perlInt(0);
+            return existsI32(emitHashExists(hv, *lastKey));
+        }
         if (n.sval == "array") {
             Value *av = lookupArray(n.name);
             if (!av) return perlInt(0);
             Value *idx = emitIdx(*n.left);
             Value *elem = callRT("perl_array_get_ref", {av, idx});
             Value *def  = callRT("perl_defined", {elem});
-            return callRT("perl_alloc_int",
-                {builder_.CreateSExt(def, Type::getInt64Ty(ctx_))});
+            return existsI32(def);
         }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlInt(0);
-        Value *r = emitHashExists(hv, *n.left);
-        return callRT("perl_alloc_int",
-            {builder_.CreateSExt(r, Type::getInt64Ty(ctx_))});
+        return existsI32(emitHashExists(hv, *n.left));
     }
 
     case NK::DeleteFunc: {
@@ -7873,6 +8222,16 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* Phase 1: collect captures from outer scopes */
         std::set<std::string> usedNames;
         collectAllScalarNames(*n.body, usedNames);
+        /* eval EXPR inside the closure can name outer lexicals that don't
+           appear as ScalarVar nodes in this AST (they're inside the string).
+           Capture every visible scalar so the eval pad can find them. */
+        if (n.body && hasEvalCall(*n.body)) {
+            for (auto &scope : scopes_)
+                for (auto &kv : scope)
+                    if (!evalPadSkipName(kv.first)) usedNames.insert(kv.first);
+            for (auto &kv : fileScalarGlobals_)
+                if (!evalPadSkipName(kv.first)) usedNames.insert(kv.first);
+        }
         std::vector<std::string> captureNames;
         std::vector<Value*>      captureVals;   /* PerlValue* loaded from outer alloca */
         std::vector<char>        captureSigils; /* '$'/'@'/'%' — how to re-declare on the other side */
@@ -7965,6 +8324,8 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto savedCapturedNames = capturedNamesInCurrentFn_;
         capturedNamesInCurrentFn_.clear();
         if (n.body) collectClosureCapturedNames(*n.body, capturedNamesInCurrentFn_);
+        bool savedAllCap = allNamesCaptured_;
+        allNamesCaptured_ = n.body && hasEvalCall(*n.body);
         /* emit sub entry */
         auto *subEntry = BasicBlock::Create(ctx_, "entry", subFn);
         builder_.SetInsertPoint(subEntry);
@@ -8088,6 +8449,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         currentSubBody_   = savedSubBody;
         evalReturnTargets_ = std::move(savedEvalReturnTargets);
         capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
+        allNamesCaptured_ = savedAllCap;
 
         /* Phase 4: build captures array and return closure (or plain code ref) */
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
@@ -9033,7 +9395,9 @@ Value *CodeGen::emitCall(const Node &n) {
             callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
             pushedWA = true;
         }
+        emitEvalPadFill();
         Value *r = callRT("perl_eval_string", {code});
+        callRT("perl_eval_pad_clear", {});
         if (pushedWA) callRT("perl_pop_wantarray", {});
         freeIfOwned(code);
         return r;

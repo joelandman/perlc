@@ -629,6 +629,8 @@ static void usage(const char *prog) {
               << "  --do-lib    Emit a do-FILE-loadable shared library instead of an\n"
               << "              executable (internal use — invoked by perl_do_file() at\n"
               << "              runtime to implement `do FILE`, D24)\n"
+              << "  --eval-lib  Like --do-lib, plus bind outer `my` cells from the eval pad\n"
+              << "              (internal use — invoked by perl_eval_string())\n"
               << "  -O[level]   Optimization level 0-5 (default: 1)\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
@@ -646,13 +648,14 @@ int main(int argc, char **argv) {
     std::string inputFile;
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
-    bool doLib = false;
+    bool doLib = false, evalLib = false;
     int optLevel = 2;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
         else if (!strcmp(argv[i], "--do-lib"))  doLib = true;
+        else if (!strcmp(argv[i], "--eval-lib")) { doLib = true; evalLib = true; }
         else if (!strcmp(argv[i], "--mini-gmp")) {
             /* D97: mini-gmp is always compiled into the runtime — this flag
                is a no-op (mini-gmp is the only backend), accepted for
@@ -726,7 +729,8 @@ int main(int argc, char **argv) {
 
         /* codegen */
         CodeGen cg(debugSymbols, optLevel);
-        cg.compile(*ast, inputFile, doLib);
+        if (lexer.hasDataSection()) cg.setDataSection(lexer.dataSection());
+        cg.compile(*ast, inputFile, doLib, evalLib);
 
         if (emitIR) {
             std::string irFile = outputFile == "a.out"

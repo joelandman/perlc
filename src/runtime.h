@@ -404,6 +404,13 @@ PerlValue *perl_readline(PerlValue *fh);
 PerlArray *perl_readline_all(PerlValue *fh);
 PerlValue *perl_readline_stdin(void);
 PerlArray *perl_readline_all_stdin(void);
+/* Diamond <> / <ARGV>: shift @ARGV, open each file, set $ARGV */
+PerlValue *perl_readline_argv(void);
+PerlArray *perl_readline_all_argv(void);
+PerlValue *perl_get_dollar_argv(void);
+void       perl_set_data_section(const char *s, long long n);
+PerlValue *perl_get_data_fh(void);
+void       perl_pv_flag_utf8(PerlValue *v);
 void       perl_print_fh(PerlValue *fh, PerlValue *v);
 void       perl_say_fh(PerlValue *fh, PerlValue *v);
 void       perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args);
@@ -710,9 +717,25 @@ PerlValue *perl_dbi_error(PerlValue *dbh);
 /* ── program cleanup (free shared-mutex side-table, named-captures hash, etc.) */
 void perl_cleanup(void);
 
-/* string eval EXPR — compile via --do-lib (no outer lexicals for dynamic
-   strings; constant strings are inlined by codegen into EvalBlock). */
+/* string eval EXPR — compile via --eval-lib (outer `my` cells are passed
+   through the eval pad; constant strings without new subs are inlined by
+   codegen into EvalBlock). */
 PerlValue *perl_eval_string(PerlValue *code_pv);
+
+/* Eval pad: host codegen dumps in-scope `my` cells before perl_eval_string;
+   --eval-lib codegen binds free names onto those same cells. */
+void       perl_eval_pad_begin(void);
+void       perl_eval_pad_add_scalar(const char *name, PerlValue *cell);
+void       perl_eval_pad_add_array(const char *name, PerlArray *av);
+void       perl_eval_pad_add_hash(const char *name, PerlHash *hv);
+void       perl_eval_pad_clear(void);
+void       perl_eval_pad_pin(void); /* extra capture bump; not released on clear */
+PerlValue *perl_eval_pad_get_scalar(const char *name);
+PerlArray *perl_eval_pad_get_array(const char *name);
+PerlHash  *perl_eval_pad_get_hash(const char *name);
+PerlValue *perl_eval_pad_get_scalar_or_undef(const char *name);
+PerlArray *perl_eval_pad_get_array_or_new(const char *name);
+PerlHash  *perl_eval_pad_get_hash_or_new(const char *name);
 
 /* typeglob slots — *foo = \$x / \@a / \%h share the pointed-to cell */
 void       perl_glob_assign(const char *name, PerlValue *rhs);
