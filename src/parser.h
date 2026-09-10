@@ -13,6 +13,14 @@ public:
     void setImportMap(std::map<std::string, std::string> m) { importMap_ = std::move(m); }
     void setConstMap(std::map<std::string, NodePtr> m)      { constMap_  = std::move(m); }
     static NodePtr parseExprFromTokens(std::vector<Token> tokens);  /* pre-parse const value expr */
+    /* D109: entry point for codegen to interpolate a raw string (e.g. an
+       s///REPLACEMENT/ that isn't a plain literal) outside of a normal
+       parse pass, using the same variable-interpolation scanner ordinary
+       "..." literals go through. `pkg` seeds currentPackage_ so a bare
+       `$Pkg::var` in the text resolves against the caller's actual
+       compiling package instead of always "main". */
+    static NodePtr parseInterpString(const std::string &raw, int line,
+                                      const std::string &pkg = "main");
     static NodeList parseExprListFromTokens(std::vector<Token> tokens);  /* comma-separated list, e.g. slice indices/keys */
     NodePtr parseProgram();   /* returns a Block */
     /* D56: warnings state accessors for codegen */

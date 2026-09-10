@@ -296,6 +296,7 @@ PerlValue *perl_hash_delete_str(PerlHash *h, const char *key);
 /* list operations */
 PerlArray *perl_hash_keys(PerlHash *h);    /* returns new PerlArray* of key strings */
 PerlArray *perl_hash_slice(PerlHash *h, PerlArray *keys); /* values for key list */
+PerlArray *perl_array_slice(PerlArray *a, PerlArray *idxs); /* D114: elements for index list */
 PerlArray *perl_hash_values(PerlHash *h);  /* returns new PerlArray* of values */
 PerlValue *perl_hash_size(PerlHash *h);    /* returns int count of key-value pairs */
 
@@ -484,6 +485,10 @@ PerlValue *perl_deref_scalar(PerlValue *ref);   /* returns (PerlValue*)ref->pval
 PerlArray *perl_deref_array(PerlValue *ref);    /* returns (PerlArray*)ref->pval */
 PerlArray *perl_deref_array_ro(PerlValue *ref); /* fast read-only variant, assumes REF_ARRAY */
 PerlHash  *perl_deref_hash(PerlValue *ref);     /* returns (PerlHash*)ref->pval */
+/* D105: promote a FLAT_ARRAY/FLOAT_PAIR value to a real REF_ARRAY in place
+   (no-op for any other tag) before it's cloned into a second alias. */
+void       perl_promote_ref_array(PerlValue *pv);
+void       perl_array_promote_refs(PerlArray *a);
 PerlValue *perl_ref_type(PerlValue *ref);       /* "SCALAR"/"ARRAY"/"HASH"/""   */
 
 /* ── code references ─────────────────────────────────────────────────────── */
@@ -508,6 +513,12 @@ PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a cl
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
 void       perl_register_method(const char *key, PerlSubFnCtx fn);
 PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx);
+/* D113: like perl_call_named_sub, but dies (matching real Perl's fatal
+   "Undefined subroutine" error) instead of silently returning undef when
+   no sub is registered under `name`. qualname is the fully-qualified
+   name to use in the error message (may equal name). */
+PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ctx,
+                                        const char *qualname, const char *file, int line);
 PerlValue *perl_get_or_create_global_scalar(const char *key); /* D58: process-wide package-scalar registry for --do-lib builds */
 /* ── threads ─────────────────────────────────────────────────────────────── */
 #include <pthread.h>
@@ -568,6 +579,23 @@ PerlValue *perl_su_looks_like_number(PerlValue *v);
 /* ── Carp functions ───────────────────────────────────────────────────────── */
 void       perl_carp_croak(PerlArray *args);   /* die with caller location    */
 void       perl_carp_carp(PerlArray *args);    /* warn with caller location   */
+
+/* Getopt::Long: args is the raw GetOptions(...) call arguments (spec
+   strings and ref targets, in order, optionally a leading %opt hashref);
+   argv_arr is the live @ARGV array, mutated in place to remove every
+   recognized option. Returns a boxed 1/0. */
+PerlValue *perl_getopt_long(PerlArray *args, PerlArray *argv_arr);
+
+/* Data::Dumper: args is the raw Dumper(...) call arguments; sortKeysFlag
+   is the current value of $Data::Dumper::Sortkeys if codegen found one in
+   scope (NULL/undef otherwise). Returns the full
+   "$VAR1 = ...;\n$VAR2 = ...;\n" text as one string. */
+PerlValue *perl_dumper(PerlArray *args, PerlValue *sortKeysFlag);
+
+/* File::Basename */
+PerlValue *perl_basename(PerlValue *pathPV, PerlArray *suffixes);
+PerlValue *perl_dirname(PerlValue *pathPV);
+PerlArray *perl_fileparse(PerlValue *pathPV, PerlArray *suffixes);
 
 /* ── file I/O extras ──────────────────────────────────────────────────────── */
 PerlValue *perl_seek_fh(PerlValue *fh, PerlValue *off, PerlValue *whence);

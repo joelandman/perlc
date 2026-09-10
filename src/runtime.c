@@ -3678,6 +3678,19 @@ PerlArray *perl_hash_slice(PerlHash *h, PerlArray *keys) {
     return result;
 }
 
+/* D114: array analog of perl_hash_slice — @x[LIST] where LIST is itself
+   list-shaped (a Range, an array variable, etc.) rather than one literal
+   index per subscript slot. Used by codegen when a single ArraySlice
+   subscript entry expands to more than one index. */
+PerlArray *perl_array_slice(PerlArray *a, PerlArray *idxs) {
+    PerlArray *result = perl_array_new();
+    for (long long i = 0; i < idxs->len; i++) {
+        long long idx = perl_to_int(idxs->elems[i]);
+        perl_array_push(result, perl_array_get_ref(a, idx));
+    }
+    return result;
+}
+
 PerlArray *perl_hash_values(PerlHash *h) {
     PerlArray *a = perl_array_new();
     for (int i = 0; i < PERL_HASH_BUCKETS; i++) {
@@ -3777,6 +3790,32 @@ PerlArray *perl_deref_array(PerlValue *ref) {
 /* Fast read-only deref — caller guarantees ref is a valid REF_ARRAY */
 __attribute__((pure)) HOTX PerlArray *perl_deref_array_ro(PerlValue *ref) {
     return (PerlArray *)ref->pval;
+}
+
+/* D105: FLAT_ARRAY / FLOAT_PAIR (Stage 22/23) are the compact
+   representation of an anonymous array-ref literal ([1,2,3] / [1,2]) —
+   they're references, so every alias of one must observe writes made
+   through any other alias. perl_clone() intentionally still deep-copies
+   them (so routine array/list-literal construction — e.g. the numeric
+   matrix rows in tests/d96_flat_row_op_assign.pl — keeps the full
+   Stage 22/23 fast path; nothing else aliases a literal's fresh temp
+   before it's pushed, so a deep copy there is unobservable and free of
+   the aliasing bug). This helper is for the opposite case: promoting an
+   EXISTING, already-named value to a real PERL_REF_ARRAY (in place, via
+   perl_deref_array's existing lazy-conversion) *before* it gets cloned
+   into a second location — the moment two live aliases of the same ref
+   can coexist. Callers: reading a bare scalar variable as a list/array
+   element (codegen.cpp), and copying a whole array's elements into
+   another array (`my @b = @a;`, D99). A no-op for every other tag. */
+void perl_promote_ref_array(PerlValue *pv) {
+    if (pv && (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR))
+        perl_deref_array(pv);
+}
+
+void perl_array_promote_refs(PerlArray *a) {
+    if (!a) return;
+    for (long long i = 0; i < a->len; i++)
+        perl_promote_ref_array(a->elems[i]);
 }
 
 PerlHash *perl_deref_hash(PerlValue *ref) {
@@ -4594,6 +4633,34 @@ PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx) {
         }
     }
     return perl_alloc_undef();
+}
+
+/* D113: real Perl dies with "Undefined subroutine &Pkg::name called at
+   FILE line N." (exit 255) rather than silently returning undef. Used
+   at codegen call sites that dispatch a genuine sub call (bareword /
+   dynamic / cross-module) through the runtime table — NOT at method or
+   operator-overload dispatch sites, which legitimately fall back
+   (AUTOLOAD, stringification-overload probing, etc.) and keep calling
+   the unchecked perl_call_named_sub above. */
+PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ctx,
+                                        const char *qualname, const char *file, int line) {
+    if (name) {
+        for (int i = 0; i < s_method_count; i++) {
+            if (strcmp(s_method_table[i].key, name) == 0) {
+                PerlSubFnCtx fn = s_method_table[i].fn;
+                if (fn) {
+                    PerlValue *result = fn(args, perl_push_wantarray(ctx));
+                    perl_pop_wantarray();
+                    return result;
+                }
+                break;
+            }
+        }
+    }
+    fprintf(stderr, "Undefined subroutine &%s called at %s line %d.\n",
+            qualname ? qualname : (name ? name : "(unknown)"),
+            file ? file : "-", line);
+    exit(255);
 }
 
 /* ── global (package) scalar registry (D58) ──────────────────────────────────
@@ -6619,7 +6686,22 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
         size_t pre = mstart - pos;
         ENSURE(pre); memcpy(out + out_len, s + pos, pre); out_len += pre;
 
-        /* expand replacement: handle $0 (whole match), $1..$9 */
+        /* expand replacement: handle $0 (whole match), $1..$9, $&, and
+           double-quote-style backslash escapes.
+
+           D107: this loop used to copy every non-$ character straight
+           through verbatim, with no backslash processing at all — so
+           `s/X/\\/` (an escaped backslash — one literal `\` in real
+           Perl) left the replacement text's raw two source characters
+           `\` `\` untouched, producing two backslashes instead of one;
+           same bug for `\n`/`\t`/etc. (which stayed as literal
+           backslash+letter instead of becoming an actual newline/tab).
+           Handles the common double-quote escapes; `\U`/`\L`/`\E`/`\u`/
+           `\l` case-folding and `\x{...}`/`\N{U+...}` are NOT
+           implemented — rare in s/// replacement text in practice
+           (documented simplification). An unrecognized `\X` strips the
+           backslash and keeps `X` literally, matching Perl's own
+           fallback for an unknown escape. */
         char *expanded = NULL; size_t exp_len = 0, exp_cap = 128;
         expanded = malloc(exp_cap);
 #define EXPENSURE(n) do { while(exp_len+(n)+1>exp_cap){exp_cap*=2;expanded=realloc(expanded,exp_cap);} } while(0)
@@ -6635,6 +6717,24 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
                 rp += 2;
                 size_t caplen = (mstart < mend) ? mend - mstart : 0;
                 EXPENSURE(caplen); memcpy(expanded + exp_len, s + mstart, caplen); exp_len += caplen;
+            } else if (*rp == '\\' && rp[1]) {
+                char lit;
+                switch (rp[1]) {
+                    case '\\': lit = '\\'; break;
+                    case 'n':  lit = '\n'; break;
+                    case 't':  lit = '\t'; break;
+                    case 'r':  lit = '\r'; break;
+                    case 'f':  lit = '\f'; break;
+                    case 'b':  lit = '\b'; break;
+                    case 'a':  lit = '\a'; break;
+                    case 'e':  lit = '\033'; break;
+                    case '0':  lit = '\0'; break;
+                    case '$':  lit = '$';  break;
+                    case '@':  lit = '@';  break;
+                    default:   lit = rp[1]; break; /* unknown escape: drop the backslash */
+                }
+                EXPENSURE(1); expanded[exp_len++] = lit;
+                rp += 2;
             } else {
                 EXPENSURE(1); expanded[exp_len++] = *rp++;
             }
@@ -8359,6 +8459,496 @@ void perl_carp_carp(PerlArray *args) {
     char *msg = (args && args->len > 0) ? perl_to_string_dup(args->elems[0]) : strdup("Warning: something's wrong");
     fprintf(stderr, "%s\n", msg);
     free(msg);
+}
+
+/* ── Getopt::Long ─────────────────────────────────────────────────────────────
+   Real-world-impact finding (2026-09): GetOptions() was completely
+   unimplemented — the bareword call silently resolved to nothing and
+   returned false, so every real script using it (far and away the most
+   common way Perl command-line tools parse @ARGV) fell straight into its
+   own "or die"/"or usage()" error path no matter what flags were passed.
+
+   Supports the two common calling conventions:
+     GetOptions("foo=s" => \$foo, "bar!" => \$bar, ...)
+     GetOptions(\%opt, "foo=s", "bar!", ...)     (options land in %opt,
+                                                    keyed by primary name)
+   and mixes of the two (a hashref first arg, with some specs still having
+   an explicit destination). Spec grammar: `name(|alias)*` optionally
+   followed by `!` (negatable boolean), `+` (increment), or `=`/`:`
+   followed by `s`/`i`/`f` (string/int/float, required either way — `:`
+   optional-value is treated as `=` required-value, a documented
+   simplification) optionally followed by `@` (push onto an array ref) or
+   `%` (split "key=value" into a hash ref).
+
+   Recognizes `--name`, `--name=value`, `--name value`, `--no-name`
+   (negation), `-x`, `-x value`, and `--` (end-of-options marker), matching
+   real (default-config) Getopt::Long — which, perhaps surprisingly,
+   rejects glued short values like `-xvalue` as an unknown option
+   "xvalue" unless bundling is configured, so this does too. Unknown
+   options print "Unknown option: NAME" to stderr (matching real
+   Getopt::Long) and are a parse failure (no pass_through/gnu_getopt
+   config support). Bundled short options (`-abc`) are NOT supported — a
+   documented simplification, not seen in the real-world scripts this
+   was built against.
+
+   Mutates argv_arr in place to remove every recognized option (matching
+   real Getopt::Long's contract) and returns a boxed 1/0 for success. */
+
+typedef struct {
+    char *names[8];
+    int   nnames;
+    char  type;      /* 0, 's', 'i', 'f' */
+    char  collect;   /* 0, '@', '%' */
+    int   negatable;
+    int   incr;
+    PerlValue *target; /* explicit \$x / \@x / \%x, or NULL (use optHash) */
+} GetoptSpec;
+
+static void getopt_parse_spec(const char *spec, GetoptSpec *out) {
+    memset(out, 0, sizeof(*out));
+    char buf[256];
+    size_t len = strlen(spec);
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    memcpy(buf, spec, len);
+    buf[len] = '\0';
+
+    if (len > 0 && (buf[len - 1] == '@' || buf[len - 1] == '%')) {
+        out->collect = buf[len - 1];
+        buf[--len] = '\0';
+    }
+    if (len > 0 && (buf[len - 1] == 's' || buf[len - 1] == 'i' || buf[len - 1] == 'f') &&
+        len > 1 && (buf[len - 2] == '=' || buf[len - 2] == ':')) {
+        out->type = buf[len - 1];
+        buf[len - 2] = '\0';
+        len -= 2;
+    } else if (len > 0 && buf[len - 1] == '!') {
+        out->negatable = 1;
+        buf[--len] = '\0';
+    } else if (len > 0 && buf[len - 1] == '+') {
+        out->incr = 1;
+        buf[--len] = '\0';
+    }
+    char *save = NULL;
+    char *tok = strtok_r(buf, "|", &save);
+    while (tok && out->nnames < 8) {
+        out->names[out->nnames++] = strdup(tok);
+        tok = strtok_r(NULL, "|", &save);
+    }
+}
+
+static GetoptSpec *getopt_find_spec(GetoptSpec *specs, int nspecs, const char *name) {
+    for (int k = 0; k < nspecs; k++)
+        for (int a = 0; a < specs[k].nnames; a++)
+            if (strcmp(specs[k].names[a], name) == 0) return &specs[k];
+    return NULL;
+}
+
+/* Write `val` (a freshly-allocated temp — always freed by the caller
+   after this returns) to the spec's destination: an explicit ref if one
+   was given, else the shared options hash (hashref calling convention),
+   else nowhere (still consumes the flag/value and returns success —
+   matches "no destination" not being fatal in practice here). */
+static void getopt_store(GetoptSpec *sp, PerlHash *optHash, PerlValue *val) {
+    if (sp->target) {
+        if (sp->collect == '@' && sp->target->tag == PERL_REF_ARRAY) {
+            perl_array_push((PerlArray *)sp->target->pval, val);
+        } else if (sp->collect == '%' && sp->target->tag == PERL_REF_HASH) {
+            const char *s = perl_to_string(val);
+            const char *eq = strchr(s, '=');
+            if (eq) {
+                char key[256];
+                size_t klen = (size_t)(eq - s);
+                if (klen >= sizeof(key)) klen = sizeof(key) - 1;
+                memcpy(key, s, klen); key[klen] = '\0';
+                PerlValue *v = perl_alloc_string(eq + 1);
+                perl_hash_set_str((PerlHash *)sp->target->pval, key, v);
+                perl_free(v);
+            } else {
+                perl_hash_set_str((PerlHash *)sp->target->pval, s, val);
+            }
+        } else if (sp->target->tag == PERL_REF_SCALAR) {
+            PerlValue *cell = (PerlValue *)sp->target->pval;
+            if (sp->incr) {
+                PerlValue *nv = perl_alloc_int(perl_to_int(cell) + 1);
+                perl_assign(cell, nv);
+                perl_free(nv);
+            } else {
+                perl_assign(cell, val);
+            }
+        }
+    } else if (optHash) {
+        perl_hash_set_str(optHash, sp->names[0], val);
+    }
+}
+
+PerlValue *perl_getopt_long(PerlArray *args, PerlArray *argv_arr) {
+    GetoptSpec specs[64];
+    int nspecs = 0;
+    PerlHash *optHash = NULL;
+    long long i = 0;
+
+    if (args && args->len > 0 && args->elems[0]->tag == PERL_REF_HASH) {
+        optHash = (PerlHash *)args->elems[0]->pval;
+        i = 1;
+    }
+    while (args && i < args->len && nspecs < 64) {
+        PerlValue *specPV = args->elems[i++];
+        if (specPV->tag != PERL_STRING) continue;
+        getopt_parse_spec(perl_to_string(specPV), &specs[nspecs]);
+        if (i < args->len) {
+            PerlTag t = args->elems[i]->tag;
+            if (t == PERL_REF_SCALAR || t == PERL_REF_ARRAY || t == PERL_REF_HASH) {
+                specs[nspecs].target = args->elems[i++];
+            }
+        }
+        nspecs++;
+    }
+
+    PerlArray *leftover = perl_array_new();
+    int ok = 1;
+    long long n = argv_arr ? argv_arr->len : 0;
+    long long idx = 0;
+    int noMoreOpts = 0;
+    while (idx < n) {
+        PerlValue *tok = argv_arr->elems[idx];
+        const char *s = perl_to_string(tok);
+        if (!noMoreOpts && strcmp(s, "--") == 0) { noMoreOpts = 1; idx++; continue; }
+        if (!noMoreOpts && s[0] == '-' && s[1] != '\0') {
+            int isLong = (s[1] == '-');
+            const char *body = isLong ? s + 2 : s + 1;
+            int negate = 0;
+            const char *name = body;
+            if (isLong && strncmp(body, "no-", 3) == 0) { negate = 1; name = body + 3; }
+            const char *eq = strchr(name, '=');
+            char namebuf[256];
+            size_t namelen = eq ? (size_t)(eq - name) : strlen(name);
+            if (namelen >= sizeof(namebuf)) namelen = sizeof(namebuf) - 1;
+            memcpy(namebuf, name, namelen); namebuf[namelen] = '\0';
+
+            GetoptSpec *sp = getopt_find_spec(specs, nspecs, namebuf);
+            if (!sp) {
+                /* Real Getopt::Long always lowercases the name in this
+                   message, even though option matching itself is
+                   case-sensitive — verified against real Getopt::Long. */
+                char lower[256];
+                size_t nl = strlen(namebuf);
+                for (size_t li = 0; li < nl && li < sizeof(lower) - 1; li++)
+                    lower[li] = (char)tolower((unsigned char)namebuf[li]);
+                lower[nl < sizeof(lower) - 1 ? nl : sizeof(lower) - 1] = '\0';
+                fprintf(stderr, "Unknown option: %s\n", lower);
+                ok = 0; idx++; continue;
+            }
+
+            PerlValue *val = NULL;
+            if (sp->type) {
+                const char *raw = NULL;
+                int consumedNext = 0;
+                if (eq) {
+                    raw = eq + 1;
+                } else if (idx + 1 < n) {
+                    raw = perl_to_string(argv_arr->elems[idx + 1]);
+                    consumedNext = 1;
+                } else {
+                    ok = 0; idx++; continue;
+                }
+                if (sp->type == 'i')      val = perl_alloc_int((long long)atoll(raw));
+                else if (sp->type == 'f') val = perl_alloc_float(atof(raw));
+                else                      val = perl_alloc_string(raw);
+                idx += consumedNext ? 2 : 1;
+            } else {
+                val = perl_alloc_bool(negate ? 0 : 1);
+                idx++;
+            }
+            getopt_store(sp, optHash, val);
+            perl_free(val);
+        } else {
+            perl_array_push(leftover, tok);
+            idx++;
+        }
+    }
+    if (argv_arr) perl_array_replace(argv_arr, leftover);
+    perl_array_free(leftover);
+    for (int k = 0; k < nspecs; k++)
+        for (int a = 0; a < specs[k].nnames; a++) free(specs[k].names[a]);
+    return perl_alloc_bool(ok);
+}
+
+/* ── Data::Dumper ─────────────────────────────────────────────────────────────
+   Another real-world-impact finding (2026-09): Dumper() was completely
+   unimplemented — silently produced no output at all. It's one of the
+   most commonly used debugging tools in real Perl code.
+
+   Reproduces the default Indent=2 style byte-for-byte: nested structures
+   are indented to (column of their opening bracket) + 2, and the closing
+   bracket is placed back at that same column — which depends on the
+   actual rendered width of everything before it on the line (key length,
+   "bless( " prefix, etc.), not a fixed per-depth indent. Supports
+   hash/array refs (nested arbitrarily), scalar refs, blessed objects
+   (`bless( {...}, 'Class' )`), undef, and the IV-unquoted/NV-and-string-
+   quoted distinction real Dumper makes (`Dumper(42)` → `42`, but
+   `Dumper(3.5)` → `'3.5'`, matching real Perl's own behavior).
+   $Data::Dumper::Sortkeys is honored (hash order is otherwise
+   unspecified, same as real Perl without it) — but only within the same
+   lexical scope $Sortkeys was set in (codegen passes its current value
+   in as an extra call argument via a plain variable lookup, not a true
+   cross-package global read; `$Data::Dumper::Sortkeys = 1;` followed by
+   `Dumper(...)` later in the *same sub or top-level scope* works, but
+   setting it at file scope and reading it from inside an unrelated sub
+   does not — that's a real, separate, pre-existing gap in how perlc
+   handles arbitrary `$Package::var` globals in general, not specific to
+   Dumper, and out of scope here).
+   Not implemented: $Data::Dumper::Indent/Terse/Deepcopy/Purity and other
+   config knobs, circular-reference detection, code refs/globs (fall back
+   to a best-effort stringification) — a documented simplification aimed
+   at the overwhelmingly common "dump a hash/array of scalars for
+   debugging" use case. Also: an all-numeric array/hash-value literal
+   (e.g. `[1,2,3]`) that took the Stage 22/23 FLAT_ARRAY/FLOAT_PAIR fast
+   path (see TESTS.md D105/D106) loses the IV/NV distinction in that
+   optimization's raw double[] storage, so Dumper prints its elements
+   quoted ('1','2','3') instead of bare (1,2,3) — a pre-existing
+   representational limitation of that fast path, not a Dumper bug. */
+
+typedef struct {
+    char  *buf;
+    size_t cap, pos, col;
+    int    sortKeys;
+} DumperBuf;
+
+static void dumper_ensure(DumperBuf *b, size_t n) {
+    while (b->pos + n + 1 > b->cap) { b->cap *= 2; b->buf = realloc(b->buf, b->cap); }
+}
+static void dumper_puts(DumperBuf *b, const char *s, size_t l) {
+    dumper_ensure(b, l);
+    memcpy(b->buf + b->pos, s, l);
+    b->pos += l;
+    for (size_t i = 0; i < l; i++) { if (s[i] == '\n') b->col = 0; else b->col++; }
+}
+static void dumper_putstr(DumperBuf *b, const char *s) { dumper_puts(b, s, strlen(s)); }
+static void dumper_newline(DumperBuf *b, size_t indent) {
+    dumper_puts(b, "\n", 1);
+    for (size_t i = 0; i < indent; i++) dumper_puts(b, " ", 1);
+}
+static void dumper_quoted(DumperBuf *b, const char *s, size_t len) {
+    dumper_puts(b, "'", 1);
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\'' || s[i] == '\\') dumper_puts(b, "\\", 1);
+        dumper_puts(b, s + i, 1);
+    }
+    dumper_puts(b, "'", 1);
+}
+
+static void dumper_value(DumperBuf *b, PerlValue *v);
+
+static void dumper_array(DumperBuf *b, PerlArray *a) {
+    if (!a || a->len == 0) { dumper_putstr(b, "[]"); return; }
+    size_t openCol = b->col;
+    dumper_putstr(b, "[");
+    size_t indent = openCol + 2;
+    for (long long i = 0; i < a->len; i++) {
+        dumper_newline(b, indent);
+        dumper_value(b, a->elems[i]);
+        if (i + 1 < a->len) dumper_putstr(b, ",");
+    }
+    dumper_newline(b, openCol);
+    dumper_putstr(b, "]");
+}
+
+static void dumper_hash(DumperBuf *b, PerlHash *h) {
+    if (!h || h->size == 0) { dumper_putstr(b, "{}"); return; }
+    /* gather keys (optionally sorted — real Data::Dumper only sorts when
+       $Data::Dumper::Sortkeys is set; hash order is otherwise
+       unspecified in real Perl too, so there's no "correct" order to
+       match when it isn't). */
+    char **keys = malloc(sizeof(char *) * (size_t)h->size);
+    PerlValue **vals = malloc(sizeof(PerlValue *) * (size_t)h->size);
+    long long n = 0;
+    for (int i = 0; i < PERL_HASH_BUCKETS; i++)
+        for (PerlHashEntry *e = h->buckets[i]; e; e = e->next) {
+            keys[n] = e->key; vals[n] = e->val; n++;
+        }
+    if (b->sortKeys) {
+        for (long long i = 1; i < n; i++) {
+            char *k = keys[i]; PerlValue *v = vals[i];
+            long long j = i - 1;
+            while (j >= 0 && strcmp(keys[j], k) > 0) {
+                keys[j+1] = keys[j]; vals[j+1] = vals[j]; j--;
+            }
+            keys[j+1] = k; vals[j+1] = v;
+        }
+    }
+    size_t openCol = b->col;
+    dumper_putstr(b, "{");
+    size_t indent = openCol + 2;
+    for (long long i = 0; i < n; i++) {
+        dumper_newline(b, indent);
+        dumper_quoted(b, keys[i], strlen(keys[i]));
+        dumper_putstr(b, " => ");
+        dumper_value(b, vals[i]);
+        if (i + 1 < n) dumper_putstr(b, ",");
+    }
+    dumper_newline(b, openCol);
+    dumper_putstr(b, "}");
+    free(keys); free(vals);
+}
+
+static void dumper_value(DumperBuf *b, PerlValue *v) {
+    if (!v || v->tag == PERL_UNDEF) { dumper_putstr(b, "undef"); return; }
+    perl_promote_ref_array(v); /* D105: FLAT_ARRAY/FLOAT_PAIR → real REF_ARRAY */
+    const char *cls = v->blessed_class;
+    if (cls) dumper_putstr(b, "bless( ");
+    switch (v->tag) {
+        case PERL_INT: {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)v->ival);
+            dumper_putstr(b, tmp);
+            break;
+        }
+        case PERL_FLOAT: {
+            /* Real Dumper quotes NV-stored numbers (stringify then
+               quote) — only IV-stored integers print bare. */
+            const char *s = perl_to_string(v);
+            dumper_quoted(b, s, strlen(s));
+            break;
+        }
+        case PERL_STRING:
+            dumper_quoted(b, v->sval, (size_t)v->slen);
+            break;
+        case PERL_REF_ARRAY:
+            dumper_array(b, (PerlArray *)v->pval);
+            break;
+        case PERL_REF_HASH:
+            dumper_hash(b, (PerlHash *)v->pval);
+            break;
+        case PERL_REF_SCALAR:
+            dumper_putstr(b, "\\");
+            dumper_value(b, (PerlValue *)v->pval);
+            break;
+        default: {
+            /* code refs, globs, DBI handles, etc. — best-effort */
+            const char *s = perl_to_string(v);
+            dumper_quoted(b, s, strlen(s));
+            break;
+        }
+    }
+    if (cls) {
+        char q[512];
+        snprintf(q, sizeof(q), ", '%.*s' )", 500, cls);
+        dumper_putstr(b, q);
+    }
+}
+
+PerlValue *perl_dumper(PerlArray *args, PerlValue *sortKeysFlag) {
+    DumperBuf b;
+    b.cap = 256; b.pos = 0; b.col = 0;
+    b.buf = malloc(b.cap);
+    b.sortKeys = sortKeysFlag ? perl_is_true(sortKeysFlag) : 0;
+    long long count = args ? args->len : 0;
+    for (long long i = 0; i < count; i++) {
+        char varname[32];
+        snprintf(varname, sizeof(varname), "$VAR%lld = ", i + 1);
+        dumper_putstr(&b, varname);
+        dumper_value(&b, args->elems[i]);
+        dumper_putstr(&b, ";\n");
+    }
+    PerlValue *result = perl_alloc_string_len(b.buf, (long long)b.pos);
+    free(b.buf);
+    return result;
+}
+
+/* ── File::Basename ───────────────────────────────────────────────────────────
+   Third real-world-impact finding (2026-09): basename()/dirname() were
+   completely unimplemented — silently returned undef (empty string)
+   instead of the path component, a common source of "works with real
+   perl, silently wrong with perlc" bugs in path-manipulation code.
+
+   Matches real File::Basename's POSIX-ish (not exactly POSIX basename(1)
+   — no special-casing of "//" etc.) behavior: trailing slashes are
+   stripped before splitting, dirname("/") is "/", dirname of a
+   slash-less path is ".", fileparse's dir part always ends in "/" (or is
+   "./" when the path has no directory component).
+
+   `suffixes` (basename's optional trailing args, fileparse's) may only
+   be plain strings here — real File::Basename also accepts a qr//
+   regex, but qr// isn't implemented as a value at all yet (a separate,
+   larger missing feature); a non-string suffix argument is silently
+   skipped rather than crashing. */
+
+static char *fb_strip_trailing_slashes(const char *path) {
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') len--;
+    char *out = malloc(len + 1);
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* Strips the first matching suffix (if any) from `name` in place. */
+static void fb_strip_suffix(char *name, PerlArray *suffixes, char **outSuffix) {
+    if (outSuffix) *outSuffix = strdup("");
+    if (!suffixes) return;
+    size_t nlen = strlen(name);
+    for (long long i = 0; i < suffixes->len; i++) {
+        if (suffixes->elems[i]->tag != PERL_STRING) continue; /* qr// unsupported */
+        const char *suf = perl_to_string(suffixes->elems[i]);
+        size_t slen = strlen(suf);
+        if (slen > 0 && slen <= nlen && strcmp(name + nlen - slen, suf) == 0) {
+            if (outSuffix) { free(*outSuffix); *outSuffix = strdup(suf); }
+            name[nlen - slen] = '\0';
+            return;
+        }
+    }
+}
+
+PerlValue *perl_basename(PerlValue *pathPV, PerlArray *suffixes) {
+    char *path = perl_to_string_dup(pathPV);
+    char *stripped = fb_strip_trailing_slashes(path);
+    char *slash = strrchr(stripped, '/');
+    char *base = strdup(slash ? slash + 1 : stripped);
+    fb_strip_suffix(base, suffixes, NULL);
+    PerlValue *r = perl_alloc_string(base);
+    free(path); free(stripped); free(base);
+    return r;
+}
+
+PerlValue *perl_dirname(PerlValue *pathPV) {
+    char *path = perl_to_string_dup(pathPV);
+    char *stripped = fb_strip_trailing_slashes(path);
+    char *slash = strrchr(stripped, '/');
+    PerlValue *r;
+    if (!slash) {
+        r = perl_alloc_string(".");
+    } else if (slash == stripped) {
+        r = perl_alloc_string("/");
+    } else {
+        *slash = '\0';
+        r = perl_alloc_string(stripped);
+    }
+    free(path); free(stripped);
+    return r;
+}
+
+PerlArray *perl_fileparse(PerlValue *pathPV, PerlArray *suffixes) {
+    char *path = perl_to_string_dup(pathPV);
+    char *slash = strrchr(path, '/');
+    char *dirpart, *namepart;
+    if (slash) {
+        size_t dlen = (size_t)(slash - path) + 1; /* keep the slash */
+        dirpart = malloc(dlen + 1);
+        memcpy(dirpart, path, dlen); dirpart[dlen] = '\0';
+        namepart = strdup(slash + 1);
+    } else {
+        dirpart = strdup("./");
+        namepart = strdup(path);
+    }
+    char *suffix = NULL;
+    fb_strip_suffix(namepart, suffixes, &suffix);
+
+    PerlArray *result = perl_array_new();
+    PerlValue *n = perl_alloc_string(namepart); perl_array_push(result, n); perl_free(n);
+    PerlValue *d = perl_alloc_string(dirpart);  perl_array_push(result, d); perl_free(d);
+    PerlValue *s = perl_alloc_string(suffix);   perl_array_push(result, s); perl_free(s);
+    free(path); free(dirpart); free(namepart); free(suffix);
+    return result;
 }
 
 /* ── File I/O ─────────────────────────────────────────────────────────────── */

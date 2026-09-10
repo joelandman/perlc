@@ -91,6 +91,12 @@ make clean
 
 **Module installation**: `-pm` flag automatically detects missing `use Module` dependencies (excluding pragmas), installs them via `cpanm --local-lib lib` into `lib/lib/perl5/`, and updates search paths.
 
+**Getopt::Long** (2026-09-09): `GetOptions("foo=s" => \$foo, ...)` and `GetOptions(\%opt, "foo=s", ...)`; boolean flags, alternate names (`"foo|f"`), negation (`"foo!"`/`--no-foo`), increment (`"foo+"`), typed values (`=s`/`=i`/`=f`), array-collecting (`=s@`) and hash-collecting (`=s%`) options, long/short forms, `--` end-of-options, unknown-option failure with the real `"Unknown option: name"` message. Mutates `@ARGV` in place. Not supported: bundled short options, glued short values (real Getopt::Long rejects these too by default), `pass_through`/`gnu_getopt` config.
+
+**Data::Dumper** (2026-09-09): `Dumper(...)` reproduces the default `Indent=2` style byte-for-byte, including blessed objects, scalar refs, and the IV-unquoted/NV-and-string-quoted distinction real Dumper makes. `$Data::Dumper::Sortkeys` is honored within the scope it's set in (see Known Limitations). Not supported: circular-reference detection, code refs/globs, other `$Data::Dumper::*` config knobs.
+
+**File::Basename** (2026-09-09): `basename`, `dirname`, `fileparse` (both list- and scalar-context forms). Suffix arguments must be plain strings, not `qr//` (not implemented as a value type at all yet).
+
 **Note**: Many simple CPAN modules work, but complex modules with advanced OO patterns or `our` variables may cause parser errors. POD (`=pod`/`=head1`…`=cut`) is skipped by the lexer.
 
 **eval/exceptions**: `eval { BLOCK }` — catches `die`, sets `$@`; uses `jmp_buf` alloca + `setjmp` in calling frame; `$@` is stable PerlValue* from runtime. String `eval EXPR`: constant strings without new subs are inlined (outer `my` visible); dynamic strings and strings that define subs compile via `--eval-lib`/`dlopen` with an eval pad so the caller's `my` cells are aliased.
@@ -135,6 +141,53 @@ make clean
 
 ## Known Limitations
 
+- **(2026-09-10, open correctness bugs — see `TESTS.md` for repros/status,
+  `MVP_ROADMAP.md` for the current priority plan)**
+  `my %c = %h` (hash-to-hash copy) produces wrong contents, not a copy
+  (D111); calling an undefined sub silently returns `undef` instead of
+  dying, and an unresolvable `use Module;` is silently dropped (D113);
+  array slices with a range or array-variable subscript (`@x[1..2]`,
+  `@x[@i]`) return one element instead of the slice (D114);
+  `__PACKAGE__`/`__FILE__`/`__LINE__`/`__SUB__` aren't implemented
+  (D116, hard parse error); a module's file-scope `my` variables can
+  collide with the main script's same-named variables (D112); bare
+  `return;` in list context yields one element instead of Perl's empty
+  list (D115); `s///`'s replacement text doesn't support `$name`/`@arr`
+  variable interpolation, and the same interpolation gap also affects
+  `$$aref[0]`/`@{$r}[0,1]` inside plain `"..."` strings (D109 — only
+  `$1`.. and `$&` capture refs work in `s///`); `$Package::var` (not
+  declared via `our`) isn't a true cross-scope global (D110) — it's
+  invisible from inside a `sub` if set at file scope; plain `"..."`
+  string literals don't recognize `\f`/`\a`/`\e`/`\b` (D108); `each
+  %hash` in scalar context returns the wrong value (D101 — a known Perl
+  gotcha, rarely used in practice); `die REF` / `die $blessed_obj` loses
+  the reference in `$@` (D102); integer arithmetic near the `2**63`
+  boundary silently wraps instead of promoting (D103); a ref stored in
+  an array/hash element (`$arr[0]`, `$h{k}`) and then read back out into
+  a second alias can miss writes made through that alias (D106, a
+  narrower remnant of D105 below); string→number coercion uses a
+  hand-rolled float parser instead of `strtod` (D117); `split` has no
+  LIMIT argument and doesn't trim trailing empty fields (D118). There is
+  also no `Exporter`/`@EXPORT` mechanism yet, so arbitrary pure-Perl
+  CPAN modules can't export subs into a caller's namespace.
+  (Fixed 2026-09-09: `my @b = @a;` used to alias `@a`'s storage instead of
+  copying it — this is now correct. Also fixed 2026-09-09, D105: an anon
+  array-ref literal like `[1,2]` or `[1,2,3]` bound to a scalar variable
+  and then aliased a second time — via `push`, a sub argument, a hash
+  value, `my $y = $x`, or an array-to-array copy — used to silently fork
+  into two independent arrays instead of staying one shared reference;
+  this is now correct. Also fixed 2026-09-09, D100: a list assignment used
+  as a `while`/`if`/`until`/`unless` condition — the standard
+  `while (my ($k,$v) = each %h)` iterator-draining idiom — used to never
+  run its body at all; this is now correct. Also fixed 2026-09-10, D107:
+  `s/\\/\\\\/g` used to double the inserted backslash, and `\t`/`\n`/etc.
+  in `s///` replacement text stayed literal instead of becoming the
+  actual escape character; this is now correct.)
+- Indented heredoc `<<~IDENT` (Perl 5.26+) is not supported (parse error)
+- `while (...) { } continue { }` is not supported (parse error)
+- `q[...]`/`qq[...]`/`qw[...]` don't balance nested `[`/`]` (unlike `qq{...}`, which balances nested `{`/`}`) — a `[` inside the string body causes a parse error
+- `qr/PATTERN/` is not implemented as a value type at all
+- `\my $var` / `\my %var` (reference to an inline lexical declaration) is not supported (parse error)
 - Typeglob `{IO}`/`{FORMAT}` slots are not implemented (`*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, and bare `open LOG`/`print LOG` work)
 - XS is an MVP FFI (≤4 scalar args), not DynaLoader / CPAN `.so` XSUBs
 - DBI is the SQLite subset in the contract tests

@@ -341,6 +341,33 @@ Token Lexer::readSubst() {
 std::vector<Token> Lexer::tokenize() {
     std::vector<Token> toks;
 
+    /* D121: $::name / @::arr / %::hash — Perl's shorthand for an explicit
+       main::name package-qualified variable (a bare :: prefix meaning
+       "main"). Only readIdent()'s own :: handling existed before this,
+       and that only fires once an identifier has already started with a
+       letter/underscore — a leading :: right after the sigil never
+       reaches it at all. Synthesizes the same IDENT token a written-out
+       "main::name" would produce, so every downstream consumer (parser,
+       codegen) needs no changes. */
+    auto tryReadMainColonIdent = [&]() -> bool {
+        if (pos_ + 2 < src_.size() && src_[pos_] == ':' && src_[pos_ + 1] == ':' &&
+            (isalpha((unsigned char)src_[pos_ + 2]) || src_[pos_ + 2] == '_')) {
+            pos_ += 2;
+            std::string name = "main::";
+            while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+                name += src_[pos_++];
+            while (pos_ + 1 < src_.size() && src_[pos_] == ':' && src_[pos_ + 1] == ':') {
+                pos_ += 2;
+                name += "::";
+                while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+                    name += src_[pos_++];
+            }
+            toks.push_back({TK::IDENT, name, line_});
+            return true;
+        }
+        return false;
+    };
+
     while (pos_ < src_.size()) {
         char c = peek();
 
@@ -630,6 +657,7 @@ std::vector<Token> Lexer::tokenize() {
             TK k = (c == '$') ? TK::SCALAR : TK::ARRAY;
             pos_++;
             toks.push_back({k, std::string(1, c), line_});
+            if (tryReadMainColonIdent()) continue; /* D121: $::name / @::arr */
             /* $#arr — last index of array */
             if (c == '$' && pos_ < src_.size() && src_[pos_] == '#') {
                 char nxt = (pos_+1 < src_.size()) ? src_[pos_+1] : 0;
@@ -680,6 +708,7 @@ std::vector<Token> Lexer::tokenize() {
             } else {
                 pos_++;
                 toks.push_back({TK::HASH, "%", line_});
+                if (tryReadMainColonIdent()) continue; /* D121: %::hash */
             }
             continue;
         }

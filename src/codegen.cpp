@@ -47,6 +47,74 @@ static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
     for (auto &a : n.args) collectAllScalarNames(*a, names);
 }
 
+/* D109: s/PATTERN/REPLACEMENT/'s REPLACEMENT text is captured 100% raw by
+   the lexer (readSubst/readSection do no escape processing at all, unlike
+   readString for ordinary "..." literals) — so before it can be handed to
+   Parser::parseInterpString (the same variable-interpolation scanner
+   "..." literals use), it needs the same backslash-escape pass readString
+   already applies for interpolating strings. Mirrors readString's switch
+   in src/lexer.cpp exactly, including \x02-marking \$ and \@ so the
+   interpolation scanner can tell an escaped-literal $/@ apart from a real
+   trigger. Also covers \f \a \e \b (D108's gap in readString itself is
+   NOT fixed by this — this is a separate, local copy of the table used
+   only for s///'s replacement text). */
+static std::string preprocessReplEscapes(const std::string &raw) {
+    std::string out;
+    out.reserve(raw.size());
+    size_t i = 0;
+    while (i < raw.size()) {
+        char c = raw[i];
+        if (c == '\\' && i + 1 < raw.size()) {
+            char esc = raw[i + 1];
+            i += 2;
+            switch (esc) {
+                case 'n':  out += '\n'; break;
+                case 't':  out += '\t'; break;
+                case 'r':  out += '\r'; break;
+                case 'f':  out += '\f'; break;
+                case 'b':  out += '\b'; break;
+                case 'a':  out += '\a'; break;
+                case 'e':  out += '\x1b'; break;
+                case '0':  out += '\0'; break;
+                case '\\': out += '\\'; break;
+                case '$':  out += '\x02'; out += '$'; break;
+                case '@':  out += '\x02'; out += '@'; break;
+                default:   out += esc; break; /* unknown escape: drop backslash, keep char (matches D107) */
+            }
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
+/* Does `s` (already escape-preprocessed by preprocessReplEscapes) contain
+   a real *named-variable* interpolation trigger? Deliberately excludes
+   $0-$9 and $&amp; (capture refs) — those are already handled correctly
+   by the existing fast raw-string path (perl_regex_subst, D107), and the
+   overwhelming majority of real replacement text is plain text or
+   capture-ref-only, so routing only genuinely new forms ($name, @arr,
+   ${...}, $$ref, $@) through the new closure machinery keeps every
+   already-passing capture-ref test on its proven path untouched. */
+static bool hasInterpTrigger(const std::string &s) {
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\x02') { i++; continue; }
+        if (s[i] == '$' && i + 1 < s.size()) {
+            char nc = s[i + 1];
+            if (nc >= '0' && nc <= '9') continue; /* $0-$9: old path */
+            if (nc == '&') continue;              /* $&: old path */
+            return true;
+        }
+        if (s[i] == '@' && i + 1 < s.size()) {
+            char nc = s[i + 1];
+            if (isalpha((unsigned char)nc) || nc == '_' || nc == '{' || nc == '$')
+                return true;
+        }
+    }
+    return false;
+}
+
 /* D64/D53: collect every scalar name referenced anywhere inside ANY
    closure (AnonSub, or sort{}'s custom comparator) nested within `n`, OR
    that ever has \$name (RefScalar) taken anywhere in `n` — used to decide
@@ -375,6 +443,7 @@ void CodeGen::declareRuntime() {
     RT("perl_hash_delete_str",   pv,  av, strPtrTy);
     RT("perl_hash_keys",     av,  av);
     RT("perl_hash_slice",    av,  av, av);
+    RT("perl_array_slice",   av,  av, av);
     RT("perl_hash_values",   av,  av);
     RT("perl_hash_size",     pv,  av);
     RT("perl_hash_from_list",voidTy, av, av);
@@ -426,6 +495,8 @@ void CodeGen::declareRuntime() {
     RT("perl_deref_array_ro", av, pv);
     RT("perl_deref_hash",   av, pv);  /* returns PerlHash* as opaque av */
     RT("perl_ref_type",     pv, pv);
+    RT("perl_promote_ref_array",  voidTy, pv);  /* D105 */
+    RT("perl_array_promote_refs", voidTy, av);  /* D105 */
     /* file I/O */
     RT("perl_open_fh",          pv,     pv, pv, pv);
     RT("perl_open2_fh",         pv,     pv, pv);
@@ -600,6 +671,7 @@ void CodeGen::declareRuntime() {
     RT("perl_runtime_require",  pv, i8p);
     RT("perl_do_file",          pv, pv);
     RT("perl_call_named_sub",   pv, i8p, av, Type::getInt32Ty(ctx_));
+    RT("perl_call_named_sub_checked", pv, i8p, av, Type::getInt32Ty(ctx_), i8p, i8p, Type::getInt32Ty(ctx_));
     RT("perl_xs_load_library",  pv, pv);
     RT("perl_xs_call_dynamic",  pv, pv, pv, pv, av);
     RT("perl_dbi_connect",      pv, pv, pv, pv);
@@ -678,6 +750,14 @@ RT("perl_clear_named_captures", voidTy);
     /* Carp */
     RT("perl_carp_croak",       voidTy, av);
     RT("perl_carp_carp",        voidTy, av);
+    /* Getopt::Long */
+    RT("perl_getopt_long",      pv, av, av);
+    /* Data::Dumper */
+    RT("perl_dumper",           pv, av, pv);
+    /* File::Basename */
+    RT("perl_basename",         pv, pv, av);
+    RT("perl_dirname",          pv, pv);
+    RT("perl_fileparse",        av, pv, av);
     /* File I/O (Tier 2) */
     RT("perl_seek_fh",          pv, pv, pv, pv);
     RT("perl_tell_fh",          pv, pv);
@@ -774,6 +854,18 @@ Value *CodeGen::lookupVar(const std::string &nm) {
     for (int i = (int)scopes_.size() - 1; i >= 0; i--) {
         auto it = scopes_[i].find(nm);
         if (it != scopes_[i].end()) return it->second;
+    }
+    /* D112: a free variable reference inside a sub (no local `my` of its
+       own) first tries ITS OWN package's qualified global before the bare
+       name. Two different packages' same-named file-scope `my` (or `our`)
+       variables are stored under distinct qualified keys (see case
+       NK::My below) — without this, a sub in package Foo referencing an
+       unqualified `$x` could resolve to package Bar's same-named
+       file-scope variable purely because Bar's declaration happened to
+       run first and claim the shared bare-name fallback slot. */
+    if (!currentPackage_.empty()) {
+        auto qit = fileScalarGlobals_.find(currentPackage_ + "::" + nm);
+        if (qit != fileScalarGlobals_.end()) return qit->second;
     }
     auto git = fileScalarGlobals_.find(nm);
     if (git != fileScalarGlobals_.end()) return git->second;
@@ -905,6 +997,12 @@ Value *CodeGen::lookupArray(const std::string &nm) {
         auto it = arrayScopes_[i].find(nm);
         if (it != arrayScopes_[i].end()) return it->second;
     }
+    /* D112: see the identical package-qualified-first lookup in lookupVar. */
+    if (!currentPackage_.empty()) {
+        auto qit = fileArrayGlobals_.find(currentPackage_ + "::" + nm);
+        if (qit != fileArrayGlobals_.end())
+            return builder_.CreateLoad(perlPtrTy_, qit->second, nm);
+    }
     auto git = fileArrayGlobals_.find(nm);
     if (git != fileArrayGlobals_.end())
         return builder_.CreateLoad(perlPtrTy_, git->second, nm);
@@ -924,6 +1022,12 @@ Value *CodeGen::lookupHash(const std::string &nm) {
     for (int i = (int)hashScopes_.size() - 1; i >= 0; i--) {
         auto it = hashScopes_[i].find(nm);
         if (it != hashScopes_[i].end()) return it->second;
+    }
+    /* D112: see the identical package-qualified-first lookup in lookupVar. */
+    if (!currentPackage_.empty()) {
+        auto qit = fileHashGlobals_.find(currentPackage_ + "::" + nm);
+        if (qit != fileHashGlobals_.end())
+            return builder_.CreateLoad(perlPtrTy_, qit->second, nm);
     }
     auto git = fileHashGlobals_.find(nm);
     if (git != fileHashGlobals_.end())
@@ -1003,6 +1107,29 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     }
     if (n.kind == NK::ArrayVar) {
         return lookupArray(n.name);
+    }
+    /* D111: a bare %hash in list context flattens to a (key, value, ...)
+       list — e.g. `my %c = %h;`, `my @flat = %h;`, `(%defaults,
+       %overrides)`. Previously unhandled here, so every one of those
+       fell through to this function returning null, which callers then
+       treated as "not list-shaped" and re-evaluated %h in *scalar*
+       context (its key count) as a single list element instead — wrong
+       contents, not just a missed optimization. Mirrors the already-
+       correct `perl_array_extend_hash` flattening `flattenArgInto` uses
+       for `foo(%h)` sub-call arguments. */
+    if (n.kind == NK::HashVar) {
+        Value *hv = lookupHash(n.name);
+        Value *av = callRT("perl_array_new", {});
+        if (hv) callRT("perl_array_extend_hash", {av, hv});
+        return av;
+    }
+    if (n.kind == NK::DerefHash) {
+        Value *ref = emitExpr(*n.left);
+        Value *hv  = callRT("perl_deref_hash", {ref});
+        freeIfOwned(ref);
+        Value *av = callRT("perl_array_new", {});
+        callRT("perl_array_extend_hash", {av, hv});
+        return av;
     }
     if (n.kind == NK::KeysFunc) {
         Value *av;
@@ -1547,10 +1674,22 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             av = lookupArray(n.name);
         }
         Value *res = callRT("perl_array_new", {});
-        for (auto &idxNode : n.args) {
-            Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(*idxNode)}) : perlUndef();
-            callRT("perl_array_push", {res, elem});
-        }
+        /* D114: an index subscript entry can itself be list-shaped (a
+           Range like `1..2`, an array variable like `@i`) rather than a
+           single scalar index — mirrors HashSlice's pushHashKey dispatch
+           just below, which already handles the equivalent `@h{@k}` case
+           correctly. */
+        auto pushArraySliceIdx = [&](const Node &idxNode) {
+            if (Value *idxAv = emitArrayPtr(idxNode)) {
+                Value *slice = av ? callRT("perl_array_slice", {av, idxAv})
+                                   : callRT("perl_array_new", {});
+                callRT("perl_array_extend", {res, slice});
+            } else {
+                Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(idxNode)}) : perlUndef();
+                callRT("perl_array_push", {res, elem});
+            }
+        };
+        for (auto &idxNode : n.args) pushArraySliceIdx(*idxNode);
         return res;
     }
     if (n.kind == NK::HashSlice) {
@@ -1690,7 +1829,9 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 callRT("perl_array_extend", {res, sub});
             } else {
                 /* Flatten LIST_RESULT (e.g. `(0 || listret())` inside parens —
-                   D94 + D95: single-element parens are ArrayLit, not unwrapped). */
+                   D94 + D95: single-element parens are ArrayLit, not unwrapped).
+                   D105: no promotion needed here — a ScalarVar `elem` already
+                   comes back promoted from emitExpr(ScalarVar) itself. */
                 Value *v = emitExpr(*elem);
                 callRT("perl_array_push_list_or_scalar", {res, v});
             }
@@ -1721,6 +1862,17 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::Call &&
         (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday")) {
         return callRT("perl_hires_gettimeofday_list", {});
+    }
+    /* File::Basename::fileparse in list context: (name, path, suffix).
+       Same reasoning as gettimeofday above — must be intercepted before
+       the generic user-sub Call handling below. */
+    if (n.kind == NK::Call &&
+        (n.name == "File::Basename::fileparse" || n.name == "fileparse")) {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *suf = callRT("perl_array_new", {});
+        for (size_t k = 1; k < n.args.size(); k++)
+            callRT("perl_array_push", {suf, emitExpr(*n.args[k])});
+        return callRT("perl_fileparse", {path, suf});
     }
     /* D69: List::Util::uniq in list context. Same reasoning as
        Time::HiRes::gettimeofday just above — "List::Util::uniq" only
@@ -4090,17 +4242,22 @@ void CodeGen::emitStmt(const Node &n) {
             std::string nm = n.name.substr(1);
             Value *hv = callRT("perl_hash_new", {});
             if (asGlobal) {
+                /* D112: keyed primarily by package-qualified name so two
+                   different packages' same-named file-scope %hash (`my`
+                   or `our`) don't collide on one shared global — see the
+                   identical fix/rationale on the scalar branch below. */
+                std::string qualKey = currentPackage_ + "::" + nm;
                 GlobalVariable *gv = nullptr;
-                auto git = fileHashGlobals_.find(nm);
+                auto git = fileHashGlobals_.find(qualKey);
                 if (git != fileHashGlobals_.end())
                     gv = git->second;
                 else {
                     gv = new GlobalVariable(*mod_, perlPtrTy_, false,
                         GlobalValue::InternalLinkage,
                         Constant::getNullValue(perlPtrTy_), "g.hash." + nm);
-                    fileHashGlobals_[nm] = gv;
-                    if (currentPackage_ != "main")
-                        fileHashGlobals_[currentPackage_ + "::" + nm] = gv;
+                    fileHashGlobals_[qualKey] = gv;
+                    if (!fileHashGlobals_.count(nm))
+                        fileHashGlobals_[nm] = gv;
                 }
                 builder_.CreateStore(hv, gv);
             } else {
@@ -4118,7 +4275,45 @@ void CodeGen::emitStmt(const Node &n) {
         } else if (isArr) {
             std::string nm = n.name.substr(1);
             Value *av = nullptr;
-            if (n.right) { callCtx_ = 1; av = emitArrayPtr(*n.right); callCtx_ = 0; }
+            if (n.right) {
+                callCtx_ = 1;
+                Value *rhsArr = emitArrayPtr(*n.right);
+                callCtx_ = 0;
+                if (rhsArr) {
+                    /* D99: emitArrayPtr can return a *borrowed* pointer that
+                       aliases existing storage (a plain @var, or @$ref /
+                       ->@* deref — see the identical ownsTmpArr check in
+                       Foreach above) rather than a freshly built array.
+                       Declaring that pointer directly as this `my` array's
+                       backing store would make the new variable and the
+                       source share one PerlArray — mutating either would
+                       corrupt the other ("my @b = @a; $b[0] = 1" also
+                       changing @a). Always materialize a fresh array and
+                       copy elements in, matching the sibling `@dst = @src`
+                       codegen path (case NK::Assign, ArrayVar LHS) below,
+                       which already does this correctly via
+                       perl_array_replace. */
+                    NK rk = n.right->kind;
+                    bool borrowed = (rk == NK::ArrayVar || rk == NK::DerefArray ||
+                                      (rk == NK::PostfixDeref && n.right->sval == "all_array"));
+                    if (borrowed) {
+                        av = callRT("perl_array_new", {});
+                        /* D105: rhsArr's own elements may themselves be
+                           FLAT_ARRAY/FLOAT_PAIR-tagged anon-array-ref
+                           values that are independently aliased elsewhere
+                           (e.g. `my $inner=[1,2]; my @a=($inner,...); my
+                           @b=@a;` — $inner must still observe writes made
+                           through $b[0]). Promote them to real REF_ARRAYs
+                           in place before the extend clones them, so the
+                           clone and every other alias end up sharing one
+                           PerlArray instead of silently forking. */
+                        callRT("perl_array_promote_refs", {rhsArr});
+                        callRT("perl_array_extend", {av, rhsArr});
+                    } else {
+                        av = rhsArr;
+                    }
+                }
+            }
            if (!av) {
                   av = callRT("perl_array_new", {});
                   /* scalar RHS (e.g. my @arr = $ref  or  my @arr = [1,2,3]) —
@@ -4131,7 +4326,10 @@ void CodeGen::emitStmt(const Node &n) {
                   }
               }
             if (asGlobal) {
-                auto git = fileArrayGlobals_.find(nm);
+                /* D112: see the identical package-qualified-key fix on the
+                   hash/scalar branches. */
+                std::string qualKey = currentPackage_ + "::" + nm;
+                auto git = fileArrayGlobals_.find(qualKey);
                 if (git != fileArrayGlobals_.end()) {
                     builder_.CreateStore(av, git->second);
                 } else {
@@ -4139,9 +4337,9 @@ void CodeGen::emitStmt(const Node &n) {
                         GlobalValue::InternalLinkage,
                         Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
                     builder_.CreateStore(av, gv);
-                    fileArrayGlobals_[nm] = gv;
-                    if (currentPackage_ != "main")
-                        fileArrayGlobals_[currentPackage_ + "::" + nm] = gv;
+                    fileArrayGlobals_[qualKey] = gv;
+                    if (!fileArrayGlobals_.count(nm))
+                        fileArrayGlobals_[nm] = gv;
                 }
             } else {
                 declareArray(nm, av);
@@ -4253,10 +4451,16 @@ void CodeGen::emitStmt(const Node &n) {
                      (n.right->kind == NK::MethodCall ||
                       n.right->kind == NK::BlessFunc))
                      fileScalarBlessed_.insert(nm);
+                 /* D112: always register the package-qualified key (not
+                    just when non-main) so lookupVar's qualified-first
+                    check (see above) can tell apart two different
+                    packages' same-named file-scope scalars — previously
+                    only non-main packages got a qualified entry, so a
+                    main-package var and a same-named module var could
+                    still collide via the shared bare fallback slot. */
                  fileScalarGlobals_[nm] = slot;
                 declareVar(nm, slot);
-                if (currentPackage_ != "main")
-                    fileScalarGlobals_[currentPackage_ + "::" + nm] = slot;
+                fileScalarGlobals_[currentPackage_ + "::" + nm] = slot;
             } else if (atFileScope) {
                 /* use a global variable so subroutines can access this file-scope var */
                 auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
@@ -4281,11 +4485,18 @@ void CodeGen::emitStmt(const Node &n) {
                      (n.right->kind == NK::MethodCall ||
                       n.right->kind == NK::BlessFunc))
                      fileScalarBlessed_.insert(nm);
+                 /* D112: register both the bare name (last-declared-wins
+                    fallback slot, unchanged prior behavior for lookups
+                    that don't know which package to prefer) and the
+                    package-qualified name unconditionally (not just for
+                    non-main) — this is what makes lookupVar's qualified-
+                    first check able to distinguish two different
+                    packages' same-named file-scope scalars instead of
+                    silently sharing whichever one happened to declare
+                    last. */
                  fileScalarGlobals_[nm] = gv;
                 declareVar(nm, gv);
-                /* also register as Package::name for cross-package access */
-                if (currentPackage_ != "main")
-                    fileScalarGlobals_[currentPackage_ + "::" + nm] = gv;
+                fileScalarGlobals_[currentPackage_ + "::" + nm] = gv;
             } else {
                 /* Unbox numeric scalars: skip PerlValue* alloca entirely.
                    Guard: 1D ArrowDeref may return an array/hash ref, not a scalar.
@@ -4592,6 +4803,27 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.CreateStore(myCondPv, alloca);
             declareVar(nm, alloca);
             myCondRhs = n.cond->right.get();
+        }
+
+        /* D100: same hoisting requirement as myCondPv above, but for the
+           multi-variable form `while (my ($a, $b, ...) = EXPR)`. The
+           parser wraps each variable as a bare NK::My node inside an
+           ArrayLit on the LHS of an Assign (see parser.cpp's
+           "'my ($a, $b, ...) = expr' in expression context"). Declare
+           each one exactly once, here, in the loop preheader — case
+           NK::Assign's ArrayLit-LHS codegen (which runs every iteration,
+           inside "while.cond") looks these up via lookupVar() and reuses
+           the slot instead of allocating fresh each time it runs. */
+        if (n.cond && n.cond->kind == NK::Assign && n.cond->left &&
+            n.cond->left->kind == NK::ArrayLit) {
+            for (auto &elem : n.cond->left->args) {
+                if (elem->kind != NK::My) continue;
+                std::string nm = elem->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + nm);
+                builder_.CreateStore(perlUndef(), alloca);
+                declareVar(nm, alloca);
+            }
         }
 
         builder_.CreateBr(cond);
@@ -5515,10 +5747,33 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
             if (sharedScalarNames_.count(nm)) {
                 Value *pv = builder_.CreateLoad(perlPtrTy_, slot, n.name);
-                return callRT("perl_atomic_load", {pv});
+                Value *loaded = callRT("perl_atomic_load", {pv});
+                callRT("perl_promote_ref_array", {loaded});
+                return loaded;
             }
         }
-        return builder_.CreateLoad(perlPtrTy_, slot, n.name);
+        {
+            /* D105: reading a bare scalar variable is the single choke
+               point every "hand this existing value to something that
+               will clone/store it elsewhere" idiom goes through — push(),
+               sub-call args, hash/array-element assignment, return, list
+               literals, etc. If the variable currently holds a
+               FLAT_ARRAY/FLOAT_PAIR (Stage 22/23 compact anon-array-ref),
+               promote it to a real REF_ARRAY in place *before* handing it
+               out, so every alias/clone made from this read shares one
+               PerlArray instead of silently forking (D105). No-op for
+               every other tag (int/float/string/REF_ARRAY/undef/...) — one
+               cheap tag check. Values that stay unboxed the whole time
+               (lookupIntVar/lookupFloatVar above) never reach here, and a
+               fresh literal (AnonArray et al.) is never read back through
+               a ScalarVar before its first real use, so the Stage 22/23
+               fast path for freshly-constructed numeric rows/matrices
+               (e.g. tests/d96_flat_row_op_assign.pl, tests/d98_flat_row_2d.pl)
+               is unaffected — see perl_promote_ref_array. */
+            Value *pv = builder_.CreateLoad(perlPtrTy_, slot, n.name);
+            callRT("perl_promote_ref_array", {pv});
+            return pv;
+        }
     }
 
     case NK::ArrayElem: {
@@ -6060,7 +6315,48 @@ Value *CodeGen::emitExpr(const Node &n) {
                         continue; /* skip emitLValue + assign path */
                     }
                 }
-                auto *slot = emitLValue(*n.left->args[i]);
+                /* D100: the expression-context parse of `my ($a, $b) = EXPR`
+                   (used inside a while/if condition — see parser.cpp's
+                   "'my ($a, $b, ...) = expr' in expression context") wraps
+                   each variable as a bare NK::My node with no separate
+                   declaration statement, unlike the statement-level
+                   `my ($a, $b) = EXPR;` form (which desugars into a
+                   FlatBlock of individual My-decl statements followed by
+                   an Assign whose LHS is already-declared ScalarVars).
+                   emitLValue() only understands ScalarVar/DollarAt, so an
+                   NK::My element here fell through its `default: return
+                   nullptr`, silently skipping both the declaration AND
+                   the assignment — `while (my ($k,$v) = each %h)` used to
+                   loop the correct number of times (once the D100 fix
+                   above made the loop condition's truth value correct)
+                   but $k/$v stayed undef for the whole loop.
+
+                   lookupVar() first: when this condition is a `while`
+                   loop, `While`'s own codegen (below) hoists one alloca
+                   per variable *before* the loop starts and pre-declares
+                   it — exactly like the existing single-variable
+                   `myCondPv` hoist — because this whole per-element loop
+                   lives inside the "while.cond" basic block, which is a
+                   loop back-edge target: an `alloca` placed directly in
+                   it would re-execute (and leak stack) on every
+                   iteration, not just once. Reusing an already-hoisted
+                   slot here keeps this code correct for both `while`
+                   (hoisted) and a one-shot `if (my ($k,$v) = ...)`
+                   (never hoisted, so falls to the fresh-alloca branch —
+                   safe since it only runs once either way). */
+                Value *slot;
+                if (n.left->args[i]->kind == NK::My) {
+                    std::string nm = n.left->args[i]->name;
+                    if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                    slot = lookupVar(nm);
+                    if (!slot) {
+                        slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + nm);
+                        builder_.CreateStore(perlUndef(), slot);
+                        declareVar(nm, slot);
+                    }
+                } else {
+                    slot = emitLValue(*n.left->args[i]);
+                }
                 if (!slot) continue;
                 Value *pv  = builder_.CreateLoad(perlPtrTy_, slot);
                 Value *idx = ConstantInt::get(Type::getInt64Ty(ctx_), (long long)i);
@@ -6101,10 +6397,22 @@ Value *CodeGen::emitExpr(const Node &n) {
                 }
                 freeIfOwned(elem);
             }
-            /* Stage 27b: list assignment is void — return non-owned null so
-               freeIfOwned (in ExprStmt) does nothing; emitBlockLast handles
-               the null-result case when this is the last expression. */
-            return llvm::ConstantPointerNull::get(perlPtrTy_);
+            /* D100 (was Stage 27b's "list assignment is void, return null"):
+               real Perl list assignment evaluates, in scalar/boolean
+               context, to the COUNT of elements on the RHS — e.g.
+               `while (my ($k,$v) = each %h)` keeps looping exactly as
+               long as each() returns a non-empty pair, and stops when it
+               returns count 0. Returning a null/void PerlValue* here made
+               `perl_is_true(null)` always false, so that idiom (and any
+               `if`/`while`/`until` guarded by a list assignment) never
+               ran its body at all. perl_array_len is already a registered
+               "owned temp" (see isOwnedTemp), so the existing generic
+               ExprStmt/emitBlockLast/If/While handling for an owned
+               result already frees/clones it correctly — no other call
+               site needs to change. A bare statement like
+               `my ($a,$b) = @list;` just gets one extra harmless
+               alloc+free of the count via ExprStmt's freeIfOwned. */
+            return callRT("perl_array_len", {rhsArr});
         }
         /* $h{key} = val */
         if (n.left->kind == NK::HashElem) {
@@ -7670,6 +7978,9 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (Value *sub = emitArrayPtr(*elem)) {
                 callRT("perl_array_extend", {av, sub});
             } else {
+                /* D105: no promotion needed here — a ScalarVar `elem` (e.g.
+                   `[$inner, [3,4]]`) already comes back promoted from
+                   emitExpr(ScalarVar) itself. */
                 Value *pv = emitExpr(*elem);
                 callRT("perl_array_push", {av, pv});
                 freeIfOwned(pv);
@@ -7687,9 +7998,20 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *hv = callRT("perl_anon_hash_new", {});
         Value *listArr = callRT("perl_array_new", {});
         for (auto &elem : n.args) {
-            Value *pv = emitExpr(*elem);
-            callRT("perl_array_push", {listArr, pv});
-            freeIfOwned(pv);
+            /* D111 (found via the same bug class in `{ %args, k=>v }`,
+               the `bless {%args}, $class` idiom): a list-producing
+               element — most commonly a spread %hash or @array — must be
+               extended into listArr, not pushed as one mistyped scalar
+               (a bare %hash element would otherwise be evaluated in
+               scalar context, i.e. its key count, as a single element).
+               Mirrors NK::AnonArray's identical dispatch just above. */
+            if (Value *sub = emitArrayPtr(*elem)) {
+                callRT("perl_array_extend", {listArr, sub});
+            } else {
+                Value *pv = emitExpr(*elem);
+                callRT("perl_array_push", {listArr, pv});
+                freeIfOwned(pv);
+            }
         }
         callRT("perl_hash_from_list", {hv, listArr});
         callRT("perl_array_free", {listArr});
@@ -7790,21 +8112,16 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *pat  = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
         Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");
 
-        /* D38c: /e — compile replacement as a Perl expression, call once
-           per match with $1/$& already installed by the runtime. */
-        bool hasE = flags.find('e') != std::string::npos;
-        if (hasE) {
-            NodePtr replExpr;
-            try {
-                Lexer lex(repl);
-                auto toks = lex.tokenize();
-                replExpr = Parser::parseExprFromTokens(std::move(toks));
-            } catch (const std::exception &ex) {
-                throw std::runtime_error(std::string("s///e: bad replacement expression: ") + ex.what());
-            }
-            if (!replExpr)
-                throw std::runtime_error("s///e: empty replacement expression");
-
+        /* D38c/D109: evaluate `replExpr` once per match, with $1/$& already
+           installed by the runtime, via a standalone closure function that
+           captures whatever outer lexicals it references — originally
+           built only for /e (replExpr = the replacement text parsed AS
+           CODE), and reused unchanged for D109 (replExpr = the
+           replacement text's *interpolation* AST — a concat chain of
+           literal-string and variable-reference parts, from
+           Parser::parseInterpString — same shape as parseExprFromTokens'
+           output as far as this machinery cares). */
+        auto emitSubstWithReplExpr = [&](NodePtr replExpr) -> Value* {
             /* Capture outer lexicals referenced by the replacement (like sort{}) */
             std::set<std::string> usedNames;
             collectAllScalarNames(*replExpr, usedNames);
@@ -7921,6 +8238,34 @@ Value *CodeGen::emitExpr(const Node &n) {
                 callRT("perl_array_push_capture", {capsAv, cv});
             Value *cnt = callRT("perl_regex_subst_e", {str, pat, flg, fnPtr, capsAv});
             return callRT("perl_alloc_int", {cnt});
+        };
+
+        bool hasE = flags.find('e') != std::string::npos;
+        if (hasE) {
+            NodePtr replExpr;
+            try {
+                Lexer lex(repl);
+                auto toks = lex.tokenize();
+                replExpr = Parser::parseExprFromTokens(std::move(toks));
+            } catch (const std::exception &ex) {
+                throw std::runtime_error(std::string("s///e: bad replacement expression: ") + ex.what());
+            }
+            if (!replExpr)
+                throw std::runtime_error("s///e: empty replacement expression");
+            return emitSubstWithReplExpr(std::move(replExpr));
+        }
+
+        /* D109: replacement text is parsed like a double-quoted string in
+           real Perl — arbitrary $name/@arr interpolation, not just
+           $0-$9/$&amp;. Only take this (more expensive) path when the text
+           actually contains a trigger beyond what the existing fast raw-
+           string path (perl_regex_subst, D107) already handles correctly,
+           so plain-text and capture-ref-only replacements are completely
+           unaffected. */
+        std::string processedRepl = preprocessReplEscapes(repl);
+        if (hasInterpTrigger(processedRepl)) {
+            NodePtr replExpr = Parser::parseInterpString(processedRepl, n.line, currentPackage_);
+            return emitSubstWithReplExpr(std::move(replExpr));
         }
 
         Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
@@ -7973,10 +8318,19 @@ Value *CodeGen::emitExpr(const Node &n) {
             freeIfOwned(ref);
         }
         Value *res = callRT("perl_array_new", {});
-        for (auto &idxNode : n.args) {
-            Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(*idxNode)}) : perlUndef();
-            callRT("perl_array_push", {res, elem});
-        }
+        /* D114: see the identical dispatch in emitArrayPtr's ArraySlice
+           handling above — a subscript entry can be list-shaped. */
+        auto pushArraySliceIdx = [&](const Node &idxNode) {
+            if (Value *idxAv = emitArrayPtr(idxNode)) {
+                Value *slice = av ? callRT("perl_array_slice", {av, idxAv})
+                                   : callRT("perl_array_new", {});
+                callRT("perl_array_extend", {res, slice});
+            } else {
+                Value *elem = av ? callRT("perl_array_get_ref", {av, emitIdx(idxNode)}) : perlUndef();
+                callRT("perl_array_push", {res, elem});
+            }
+        };
+        for (auto &idxNode : n.args) pushArraySliceIdx(*idxNode);
         return callRT("perl_ref_array", {res});
     }
 
@@ -9507,6 +9861,65 @@ Value *CodeGen::emitCall(const Node &n) {
         callRT("perl_carp_carp", {buildArgArray()});
         return perlUndef();
     }
+    /* Getopt::Long: GetOptions("foo=s" => \$foo, ...) or
+       GetOptions(\%opt, "foo=s", ...) — build a plain array of the raw
+       evaluated call args (spec strings and ref targets, in order; refs
+       evaluate to real REF_SCALAR/REF_ARRAY/REF_HASH PerlValue*s via the
+       ordinary \$x/\@x/\%x codegen, same as any other call argument) and
+       hand it to perl_getopt_long along with the live @ARGV array, which
+       it mutates in place to remove recognized options. */
+    if (n.name == "GetOptions" || n.name == "Getopt::Long::GetOptions") {
+        Value *argsArr = buildArgArray();
+        Value *argv = lookupArray("ARGV");
+        if (!argv) argv = callRT("perl_array_new", {});
+        return callRT("perl_getopt_long", {argsArr, argv});
+    }
+    /* Data::Dumper: flatten any array/list args (Dumper(@list)) the same
+       way List::Util::sum/min/max do above, rather than buildArgArray()'s
+       plain per-expression push, so `Dumper(@list)` dumps one $VARn per
+       element instead of one $VAR1 holding a LIST_RESULT. */
+    if (n.name == "Dumper" || n.name == "Data::Dumper::Dumper") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* $Data::Dumper::Sortkeys: a plain in-scope variable lookup, not
+           a true cross-package global read (see perl_dumper's comment) —
+           works when set earlier in the same scope, which is by far the
+           most common real-world usage (set once near the top of a
+           script or sub). */
+        Value *skVar = lookupVar("Data::Dumper::Sortkeys");
+        Value *sk = skVar ? builder_.CreateLoad(perlPtrTy_, skVar) : perlUndef();
+        return callRT("perl_dumper", {av, sk});
+    }
+    /* File::Basename */
+    if (n.name == "File::Basename::basename" || n.name == "basename") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *suf = callRT("perl_array_new", {});
+        for (size_t k = 1; k < n.args.size(); k++)
+            callRT("perl_array_push", {suf, emitExpr(*n.args[k])});
+        return callRT("perl_basename", {path, suf});
+    }
+    if (n.name == "File::Basename::dirname" || n.name == "dirname") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_dirname", {path});
+    }
+    if (n.name == "File::Basename::fileparse" || n.name == "fileparse") {
+        /* Scalar context: just the name (first element) — matches real
+           File::Basename. List context is intercepted in emitArrayPtr
+           above and never reaches here. */
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *suf = callRT("perl_array_new", {});
+        for (size_t k = 1; k < n.args.size(); k++)
+            callRT("perl_array_push", {suf, emitExpr(*n.args[k])});
+        Value *arr = callRT("perl_fileparse", {path, suf});
+        Value *elem = callRT("perl_array_get_ref", {arr, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+        Value *cloned = callRT("perl_clone", {elem});
+        callRT("perl_array_free", {arr});
+        return cloned;
+    }
     /* UNIVERSAL */
     if (n.name == "UNIVERSAL::isa") {
         Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
@@ -9756,14 +10169,18 @@ Value *CodeGen::emitCall(const Node &n) {
             ctxVal = ConstantInt::get(i32Ty, 0);
         callCtx_ = 0;
         Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
-        Value *retVal = callRT("perl_call_named_sub", {nameStr, argsArr, ctxVal});
+        Value *qualStr = builder_.CreateGlobalStringPtr(n.name);
+        Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_);
+        Value *lineVal = ConstantInt::get(i32Ty, n.line > 0 ? n.line : 1);
+        Value *retVal = callRT("perl_call_named_sub_checked",
+                                {nameStr, argsArr, ctxVal, qualStr, fileStr, lineVal});
         callRT("perl_array_free", {argsArr});
         return retVal;
     }
     /* D36 residual: bareword call `foo "arg"` to an unknown name is a
        compile error in real Perl ("String found where operator expected
-       / Do you need to predeclare"). Parenthesized `foo()` stays soft
-       (returns undef) — real Perl defers those to runtime. */
+       / Do you need to predeclare"). Parenthesized `foo()` is deferred to
+       runtime, matching real Perl — see D113 below. */
     if (n.ival == 1) {
         throw std::runtime_error(
             "String found where operator expected (Do you need to predeclare \"" +
@@ -9771,7 +10188,11 @@ Value *CodeGen::emitCall(const Node &n) {
             std::to_string(n.line > 0 ? n.line : 1));
     }
     /* Parenthesized call to a name not known at compile time — e.g. a sub
-       defined later via eval STRING. Dispatch through the runtime table. */
+       defined later via eval STRING, or a genuinely undefined sub (real
+       Perl defers this check to runtime and dies there — D113: this used
+       to silently return undef instead). Dispatch through the runtime
+       table, which now dies with "Undefined subroutine ... called" if
+       still unresolved by the time this call actually executes. */
     {
         Value *argsArr = callRT("perl_array_new", {});
         fillCallArgs(argsArr, n);
@@ -9789,7 +10210,14 @@ Value *CodeGen::emitCall(const Node &n) {
             ctxVal = ConstantInt::get(i32Ty, 0);
         callCtx_ = 0;
         Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
-        Value *retVal = callRT("perl_call_named_sub", {nameStr, argsArr, ctxVal});
+        std::string qualName = (n.name.find("::") != std::string::npos)
+                                    ? n.name
+                                    : (currentPackage_ + "::" + n.name);
+        Value *qualStr = builder_.CreateGlobalStringPtr(qualName);
+        Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_);
+        Value *lineVal = ConstantInt::get(i32Ty, n.line > 0 ? n.line : 1);
+        Value *retVal = callRT("perl_call_named_sub_checked",
+                                {nameStr, argsArr, ctxVal, qualStr, fileStr, lineVal});
         callRT("perl_array_free", {argsArr});
         return retVal;
     }

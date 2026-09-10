@@ -24,6 +24,12 @@ NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens) {
     return p.parseExpr();
 }
 
+NodePtr Parser::parseInterpString(const std::string &raw, int line, const std::string &pkg) {
+    Parser p({});
+    p.currentPackage_ = pkg;
+    return p.parseStringInterp(raw, line);
+}
+
 NodeList Parser::parseExprListFromTokens(std::vector<Token> tokens) {
     tokens.push_back({TK::EOF_TOK, "", 0});
     Parser p(std::move(tokens));

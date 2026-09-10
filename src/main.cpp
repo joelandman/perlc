@@ -60,6 +60,15 @@ static std::string readFile(const std::string &path) {
     return buf.str();
 }
 
+/* D113: extra module search directories from -I, PERL5LIB, and
+   `use lib "...";` — previously none of these were honored at all;
+   the module search path was a fixed relative-directory list. Populated
+   once at startup (-I, PERL5LIB) and grown as `use lib` statements are
+   seen while scanning the main script and any inlined modules.
+   Front-of-list order matches Perl's own @INC semantics (most recently
+   added `use lib` / earliest -I wins). */
+static std::vector<std::string> g_extraLibDirs;
+
 static std::string dirOf(const std::string &path) {
     auto p = path.rfind('/');
     return p == std::string::npos ? "." : path.substr(0, p);
@@ -178,20 +187,30 @@ static bool installMissingModules(const std::vector<Token> &tokens,
 }
 
 /* Scan module tokens for  our @EXPORT = qw(...)  and  our @EXPORT_OK = qw(...)
+   — plus (D122) the older `use vars qw(@EXPORT_OK); @EXPORT_OK = qw(...)`
+   style real core modules still use (e.g. File::Path.pm ships this way,
+   unmodified, with every Perl 5 install): a bare `@EXPORT[_OK] = ...`
+   assignment with no `our` prefix at all, because the array was already
+   declared via `use vars` rather than `our`. `our` is optional here for
+   exactly that reason — this function doesn't track scope/declarations
+   either way (an `our`-prefixed match anywhere in the token stream was
+   already accepted regardless of nesting before this fix; the `use
+   vars`-declared form is accepted the same way, for consistency).
    Returns map "EXPORT" → [names] and "EXPORT_OK" → [names]. */
 static std::map<std::string, std::vector<std::string>>
 scanExports(const std::vector<Token> &toks)
 {
     std::map<std::string, std::vector<std::string>> result;
-    for (size_t i = 0; i + 3 < toks.size(); i++) {
-        /* pattern: our @EXPORT [_OK] = qw(...) */
-        if (toks[i].kind != TK::KW_OUR) continue;
-        if (i+1 >= toks.size() || toks[i+1].kind != TK::ARRAY) continue;
-        if (i+2 >= toks.size()) continue;
-        std::string arrName = toks[i+2].text;
+    for (size_t i = 0; i + 2 < toks.size(); i++) {
+        /* pattern: [our] @EXPORT[_OK] = qw(...) */
+        size_t base = i;
+        if (toks[base].kind == TK::KW_OUR) base++;
+        if (base >= toks.size() || toks[base].kind != TK::ARRAY) continue;
+        if (base + 1 >= toks.size()) continue;
+        std::string arrName = toks[base + 1].text;
         if (arrName != "EXPORT" && arrName != "EXPORT_OK") continue;
         /* find = */
-        size_t j = i + 3;
+        size_t j = base + 2;
         while (j < toks.size() && toks[j].kind != TK::ASSIGN && toks[j].kind != TK::SEMI) j++;
         if (j >= toks.size() || toks[j].kind != TK::ASSIGN) continue;
         j++;
@@ -217,13 +236,24 @@ static std::vector<Token> inlineModules(
          bool isMainScript = true,
          const std::vector<std::string> &explicitImportNames = {})
 {
-    /* pragmas that are not files to load */
+    /* pragmas / perlc-internal built-in modules — not files to load, and
+       (D113) must never trigger the "module not found" error below even
+       though none of them have a corresponding .pm file on disk. This is
+       every qualified module name codegen/parser special-case dispatch on
+       internally, plus the handful of one-word pragmas perlc currently
+       accepts silently (accepted-but-not-fully-modeled, e.g. `integer` —
+       deliberately not hard-errored; see D113's write-up in TESTS.md for
+       why this stays a conservative allowlist rather than a from-scratch
+       Perl-semantics pragma engine). */
     static const std::set<std::string> PRAGMAS = {
-        "strict","warnings","feature","parent","base",
+        "strict","warnings","feature","parent","base","integer","utf8",
+        "vars",
         "Exporter","Carp","POSIX","Scalar::Util",
         "List::Util","Data::Dumper","Storable","overload",
         "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
+        "File::Basename","Getopt::Long","DBI","DBD::SQLite",
+        "threads","threads::shared","UNIVERSAL","Time::HiRes",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -232,6 +262,8 @@ static std::vector<Token> inlineModules(
     std::vector<std::string> searchDirsBase = {
         baseDir, baseDir + "/lib", "lib", "lib/lib/perl5", "."
     };
+    searchDirsBase.insert(searchDirsBase.begin(),
+                           g_extraLibDirs.begin(), g_extraLibDirs.end());
 
     /* D26: `use constant` declared inside an inlined module must not leak
        as a bareword-global sub the way it does for the main script's own
@@ -298,6 +330,13 @@ static std::vector<Token> inlineModules(
                 auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser,
                                                /*isMainScript=*/false, /*explicitImportNames=*/{});
                 if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK) expanded.pop_back();
+                /* D112 is fixed in codegen.cpp instead (package-qualified
+                   global storage keys) — a bare-block wrap here was tried
+                   first but breaks named subs' visibility into their own
+                   module's file-scope `my` variables, since named subs
+                   resolve free variables by name through the global
+                   registry, not through genuine lexical closure capture
+                   over enclosing blocks. See TESTS.md D112. */
                 modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
                 return true;
             };
@@ -471,6 +510,22 @@ static std::vector<Token> inlineModules(
             continue;
         }
 
+        /* D113: `use lib "path";` — previously silently ignored (parsed
+           as an ordinary unresolvable module `use`, then dropped). Now
+           actually prepends `path` to the module search path for the
+           rest of this compilation (main script + every module inlined
+           from here on, including recursively). */
+        if (modName == "lib") {
+            for (auto imp : explicitImports) {
+                if (!imp.empty() && imp[0] == '\x01') imp = imp.substr(1);
+                if (imp.empty()) continue;
+                bool already = false;
+                for (auto &d : g_extraLibDirs) if (d == imp) { already = true; break; }
+                if (!already) g_extraLibDirs.insert(g_extraLibDirs.begin(), imp);
+            }
+            continue;
+        }
+
         if (PRAGMAS.count(modName)) continue;
 
         /* convert Foo::Bar → Foo/Bar.pm */
@@ -487,6 +542,7 @@ static std::vector<Token> inlineModules(
             "lib/lib/perl5",
             "."
         };
+        searchDirs.insert(searchDirs.begin(), g_extraLibDirs.begin(), g_extraLibDirs.end());
 
         /* if module already loaded, only process explicit import list —
            still needs D26-follow-up validation (a second `use Module
@@ -522,9 +578,11 @@ static std::vector<Token> inlineModules(
             continue;
         }
 
+        bool moduleFileFound = false;
         for (auto &dir : searchDirs) {
             std::string fullPath = dir + "/" + modPath;
             if (access(fullPath.c_str(), R_OK) != 0) continue;
+            moduleFileFound = true;
 
             loaded.insert(modName);
             std::string src = readFile(fullPath);
@@ -539,6 +597,9 @@ static std::vector<Token> inlineModules(
             /* strip any EOF_TOK from expanded result too */
             if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK)
                 expanded.pop_back();
+            /* D112 is fixed in codegen.cpp (package-qualified global
+               storage keys) — see the note in the `require` handler
+               above for why a token-level block wrap was rejected. */
             modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
 
             /* build import map from @EXPORT / explicit list */
@@ -584,6 +645,24 @@ static std::vector<Token> inlineModules(
                 importMap[name] = modName + "::" + name;
 
             break;
+        }
+
+        /* D113: a `use Some::Module;` that resolves to neither a known
+           perlc built-in (PRAGMAS, checked above) nor an actual .pm file
+           anywhere in the search path used to be silently dropped —
+           the exact mechanism that let three completely-unimplemented
+           modules (Getopt::Long/Data::Dumper/File::Basename) go
+           unnoticed until a human manually diffed output. Now a hard
+           compile error, matching real Perl's "Can't locate Foo/Bar.pm
+           in @INC". Deliberately scoped to "::"-qualified names only —
+           a handful of one-word pragmas (see PRAGMAS above) are still
+           accepted-but-not-fully-modeled rather than risking false
+           positives on pragma-shaped names this pass doesn't know about. */
+        if (!moduleFileFound && modName.find("::") != std::string::npos) {
+            std::string incList;
+            for (auto &d : searchDirs) incList += (incList.empty() ? "" : " ") + d;
+            throw std::runtime_error("Can't locate " + modPath +
+                                      " in @INC (searched: " + incList + ")");
         }
     }
 
@@ -634,6 +713,7 @@ static void usage(const char *prog) {
               << "  -O[level]   Optimization level 0-5 (default: 1)\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
+              << "  -I<dir>     Add <dir> to the module search path (also: PERL5LIB, use lib)\n"
               << "  -g          Generate debugging symbols\n"
               << "  --mini-gmp  Confirm mini-gmp is used for Math::BigInt (default; no external GMP)\n";
 }
@@ -651,6 +731,21 @@ int main(int argc, char **argv) {
     bool doLib = false, evalLib = false;
     int optLevel = 2;
 
+    /* D113: PERL5LIB (colon-separated) is honored the same way real perl
+       honors it — prepended to the module search path. */
+    if (const char *p5lib = getenv("PERL5LIB")) {
+        std::string s(p5lib);
+        size_t start = 0;
+        while (start <= s.size()) {
+            size_t colon = s.find(':', start);
+            std::string dir = (colon == std::string::npos) ? s.substr(start)
+                                                             : s.substr(start, colon - start);
+            if (!dir.empty()) g_extraLibDirs.push_back(dir);
+            if (colon == std::string::npos) break;
+            start = colon + 1;
+        }
+    }
+
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--emit-ir"))      emitIR = true;
         else if (!strcmp(argv[i], "--emit-bc")) emitBC = true;
@@ -667,6 +762,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-pm"))       installPM = true;
         else if (!strcmp(argv[i], "-g"))         debugSymbols = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outputFile = argv[++i];
+        else if (!strcmp(argv[i], "-I") && i + 1 < argc) g_extraLibDirs.push_back(argv[++i]);
+        else if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0')
+            g_extraLibDirs.push_back(argv[i] + 2);
         else if (strncmp(argv[i], "-O", 2) == 0) {
             if (argv[i][2] == '\0') {
                 optLevel = 1;
