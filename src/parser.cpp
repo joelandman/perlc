@@ -3692,6 +3692,39 @@ NodePtr Parser::parsePrimary() {
         std::string nm = cur().text; advance();
         /* bare word string comparison ops handled in parseCmp */
         if (check(TK::FATARROW)) return makeStr(nm, line);
+        /* D116: __PACKAGE__/__LINE__ resolve to compile-time constants —
+           checked after the FATARROW auto-quote rule above (real Perl:
+           `__PACKAGE__ => 1` auto-quotes to the literal string
+           "__PACKAGE__", same as any other bareword there — verified
+           directly) but before the ARROW check below, since
+           `__PACKAGE__->method(...)` (a very common OO constructor
+           idiom) needs the resolved package name as the invocant, not
+           the literal 10-character string "__PACKAGE__". __FILE__
+           needs the compiling source filename, which the parser doesn't
+           track (only codegen's sourceFile_ does) — represented as an
+           ordinary NK::Call so codegen can resolve it, intercepted
+           early in emitCall specifically so it doesn't fall through to
+           the generic "undefined sub" die (D113) the way an actually
+           unknown bareword would. __SUB__ (reference to the currently-
+           executing sub) is deliberately NOT handled here — harder,
+           needs codegen support for a reference to the current
+           closure's captures, not just a constant substitution; see
+           TESTS.md D116. */
+        /* inKeyContext_ (a bareword hash subscript, $h{__PACKAGE__}) also
+           auto-quotes, same as FATARROW — verified directly against
+           real Perl: $h{__PACKAGE__} reads back the literal string key
+           "__PACKAGE__", not the resolved package name. */
+        if (!inKeyContext_ && nm == "__PACKAGE__") return makeStr(currentPackage_, line);
+        if (!inKeyContext_ && nm == "__LINE__") {
+            auto n = std::make_unique<Node>(); n->kind = NK::IntLit;
+            n->ival = line; n->line = line;
+            return n;
+        }
+        if (!inKeyContext_ && nm == "__FILE__") {
+            auto n = std::make_unique<Node>(); n->kind = NK::Call;
+            n->name = nm; n->line = line;
+            return n;
+        }
         if (check(TK::ARROW)) return makeStr(nm, line);
         /* Prototype-aware call: () constant-like, &@ block form. */
         if (const std::string *pr = lookupProto(nm)) {

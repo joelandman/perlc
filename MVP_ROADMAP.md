@@ -92,7 +92,7 @@ once, not one.
 
 ### Tier 1 — hard parse errors in common module syntax (loud, so lower risk per-instance, but each one gates an entire file)
 
-8. **D116 — `__PACKAGE__`/`__FILE__`/`__LINE__`/`__SUB__` entirely unimplemented.** Likely blocks more real module files from parsing at all than any other single item, since `bless {}, __PACKAGE__` is ubiquitous. Small fix (parser already tracks `currentPackage_`).
+8. ~~**D116** — `__PACKAGE__`/`__FILE__`/`__LINE__`/`__SUB__` entirely unimplemented.~~ **`__PACKAGE__`/`__FILE__`/`__LINE__` FIXED 2026-09-10** — was indeed a small fix, as predicted. `__SUB__` split off as **D124** (needs real closure-capture support, not a constant substitution — genuinely harder, still open).
 9. **`$obj->$method()` dynamic dispatch** — parse error. Common in accessors/plugin dispatch tables.
 10. **`map { {...} } @list`** (and the `+{...}` block/hashref disambiguator) — parse error. Extremely common.
 11. **`%EXPORT_TAGS` / `use Foo qw(:all)`** — hard error (also see the Exporter gap below).

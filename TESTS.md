@@ -83,7 +83,8 @@ eval STRING and eval-defined subs see outer `my`).
 | D113 | **FIXED** (2026-09-10) | No "unimplemented" signal: calling an undefined sub silently returned `undef` (real Perl: fatal `Undefined subroutine ... called`, exit 255) and an unresolvable `use Some::Module;` was silently dropped instead of erroring; `use lib`/`-I`/`PERL5LIB` weren't honored. See below. |
 | D114 | **FIXED** (2026-09-10) | Array slices `@x[LIST]` returned only one element when the subscript list was non-literal — a range (`@x[1..2]`) or an array variable (`@x[@i]`). Hash slices `@h{...}` already dispatched correctly for the equivalent cases; array slices weren't ported to the same dispatch. See below. |
 | D115 | OPEN (correctness, found 2026-09-10) | Bare `return;` in list context yields a 1-element list instead of Perl's empty list — breaks `my %h = (k => f())`-style "return nothing on failure" patterns. See below. |
-| D116 | OPEN (missing syntax, found 2026-09-10) | `__PACKAGE__` / `__FILE__` / `__LINE__` / `__SUB__` are not implemented at all (hard parse error) despite `bless {...}, __PACKAGE__` being one of the most common OO-Perl idioms in CPAN modules. See below. |
+| D116 | **FIXED** (2026-09-10, `__PACKAGE__`/`__FILE__`/`__LINE__` only) | `__PACKAGE__` / `__FILE__` / `__LINE__` were not implemented at all (hard parse error) despite `bless {...}, __PACKAGE__` being one of the most common OO-Perl idioms in CPAN modules. `__SUB__` (reference to the currently-executing sub) is intentionally not covered — harder, split off as **D124**. See below. |
+| D124 | OPEN (missing syntax, split off D116's `__SUB__` case, found 2026-09-10) | `__SUB__` (a reference to the currently-executing sub, needed for anonymous recursion — `use feature 'current_sub'`) is still a hard parse error. Needs codegen support for a reference to the current closure's own captures, not just a compile-time constant substitution like `__PACKAGE__`/`__LINE__`/`__FILE__`. See below. |
 | D117 | OPEN (correctness, found 2026-09-10) | `perl_atof_decimal` (`src/runtime.c`) is a hand-rolled decimal-string→float parser (manual digit accumulation plus a repeated-multiply exponent loop) instead of `strtod`, accumulating rounding error on ordinary decimal strings — every implicit string→number coercion goes through it. See below. |
 | D118 | OPEN (correctness, found 2026-09-10) | `split` has no 3rd LIMIT argument (codegen only ever passes 2 args) and doesn't trim trailing empty fields from the result, unlike real Perl's default `split` behavior. See below. |
 | D119 | OPEN (correctness, found 2026-09-10 while writing D111's test) | `scalar(keys %$href)` (keys on a deref'd hashref, in scalar context) returns `0` instead of the key count — `scalar(keys %h)` on a plain named hash and list-context `keys %$href` are both correct, so this is specific to the scalar-context + deref-hash combination. See below. |
@@ -869,30 +870,89 @@ needs to produce a genuinely empty list result (matching how `()`
 already behaves, if that's already correct) rather than defaulting to a
 1-element `(undef)` list.
 
-### D116 — `__PACKAGE__`/`__FILE__`/`__LINE__`/`__SUB__` unimplemented
+### D116 — `__PACKAGE__`/`__FILE__`/`__LINE__` unimplemented — **FIXED 2026-09-10** (`__SUB__` split off as D124)
 
 ```perl
 package Foo::Bar;
 sub whoami { return __PACKAGE__; }
 # perl:  Foo::Bar
-# perlc: Error: String found where operator expected
+# was:   Error: String found where operator expected
 #        (Do you need to predeclare "__PACKAGE__"?)
 ```
 
-Confirmed: hard parse error, not silent-wrong-data — these four tokens
-are not recognized anywhere in `lexer.cpp`/`parser.cpp`/`codegen.cpp`
-(grepped, zero hits). `bless {...}, __PACKAGE__` and
+Root cause: hard parse error, not silent-wrong-data — these tokens
+weren't recognized anywhere in `lexer.cpp`/`parser.cpp`/`codegen.cpp`
+(grepped, zero hits) before this fix. `bless {...}, __PACKAGE__` and
 `ref($class) || $class || __PACKAGE__`-style constructor idioms are
 among the single most common patterns in OO CPAN modules — this
-probably blocks more real module files from parsing *at all* than any
+probably blocked more real module files from parsing *at all* than any
 other single missing-syntax item, including `qr//`.
 
-**Fix shape:** small. Resolve `__PACKAGE__` at parse time as a string
-literal using the parser's already-tracked `currentPackage_`;
-`__FILE__`/`__LINE__` similarly trivial (source filename + current
-token line). `__SUB__` (reference to the currently-executing sub) is
-medium effort — needs codegen support for a reference to the current
-closure.
+**Fix** (`src/parser.cpp` `parsePrimary`, `src/codegen.cpp`
+`emitCall`): `__PACKAGE__` resolves directly to a string literal at
+parse time using the parser's already-tracked `currentPackage_`;
+`__LINE__` similarly to an integer literal using the current token's
+line. `__FILE__` needs the compiling source filename, which the parser
+doesn't track (only codegen's `sourceFile_` does) — represented as an
+ordinary `Call` node and intercepted at the very start of `emitCall`,
+specifically so it resolves before falling through to D113's
+"undefined sub" die path (which would otherwise treat it as a
+genuinely unknown bareword).
+
+Two context-sensitivity subtleties, both verified directly against
+real Perl and both required a fix:
+- `__PACKAGE__->method(...)` (`return __PACKAGE__->create(@_);` — a
+  very common OO constructor idiom, e.g. delegating to a factory
+  method) needs the *resolved* package name as the method-call
+  invocant, not the literal string `"__PACKAGE__"` — so the dunder
+  checks had to go before the parser's existing `ARROW` special-case
+  (which otherwise stringifies any bareword immediately followed by
+  `->` for bareword-class method calls).
+- `__PACKAGE__ => 1` (fat-arrow auto-quote) and `$h{__PACKAGE__}`
+  (bareword hash-subscript auto-quote) both auto-quote to the literal
+  10-character string `"__PACKAGE__"` in real Perl, same as any other
+  bareword in those two positions — so the dunder checks had to go
+  *after* the existing `FATARROW` auto-quote check, and were also
+  guarded by `!inKeyContext_` (the flag the parser already uses for
+  bareword hash-subscript auto-quoting) so they don't fire inside a
+  `{...}` subscript either.
+
+Verified against real Perl for: `__PACKAGE__` inside a sub in a
+non-main package, at top-level (`main`), `__FILE__` (checked for
+non-empty and the right suffix, since the exact path string is
+harness-argument-dependent), `__LINE__` incrementing correctly between
+two calls on consecutive lines, the `__PACKAGE__->method()` constructor
+idiom end-to-end (`bless { %args }, $class` included), and both
+auto-quote contexts staying unaffected. Tests:
+`tests/d116_dunder_consts_{smoke,deep}.pl`.
+
+**Not fixed here** (split off, harder): `__SUB__` — now **D124**.
+
+### D124 — `__SUB__` (current-sub reference) unimplemented
+
+```perl
+use feature 'current_sub';
+my $fact = sub { my $n = shift; $n <= 1 ? 1 : $n * __SUB__->($n - 1) };
+print $fact->(5), "\n";   # perl: 120  |  perlc: parse error
+```
+
+Split off from D116 since it's a fundamentally different kind of fix —
+`__PACKAGE__`/`__FILE__`/`__LINE__` are all compile-time constant
+substitutions (no codegen changes beyond the `__FILE__` interception),
+but `__SUB__` needs a genuine reference to the currently-executing
+closure, including whatever it captured, from *inside itself* —
+`case NK::AnonSub`'s codegen already has a `Function *subFn` (the LLVM
+function being emitted) and its `captureVals` in scope at the exact
+point this would need to be threaded through (`currentFn_` is
+generically available too, for a named sub), but simply wrapping
+`currentFn_` in a fresh `perl_make_code_ref` the way `\&name` does
+would silently drop the current closure's own captures if `__SUB__` is
+used inside a closure that itself captured outer variables — a correct
+fix needs the *same* captures array the enclosing closure was built
+with, not a capture-less code ref. Mostly relevant to anonymous
+recursion idioms; much less common than the other three dunders in
+real-world code, so left open rather than risking a subtly-wrong
+capture-sharing implementation under time pressure.
 
 ### D117 — `perl_atof_decimal` hand-rolled string→float parser
 

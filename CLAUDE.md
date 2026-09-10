@@ -18,20 +18,29 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-10, re-verified after D113/D111/D112/D114, again
-after D109 — 275/275 PASS, 0 FAIL — and again pending after D121/D122):**
-New this session: `d113_undefined_sub_die_{smoke,deep}.pl`,
+**Harness (2026-09-10, re-verified after each fix this session — most
+recently 279/279 PASS, 0 FAIL after D121/D122; D116 re-verification
+pending):** New this session: `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
 `d112_module_scope_{smoke,deep}.pl` (+ `tests/lib/D112Leaky.pm`),
 `d114_array_slice_{smoke,deep}.pl`, `d109_subst_interp_{smoke,deep}.pl`,
 `d121_bare_maincolon_{smoke,deep}.pl`,
 `d122_scanexports_usevars_{smoke,deep}.pl` (+
-`tests/lib/D122UseVarsExport.pm`).
+`tests/lib/D122UseVarsExport.pm`), `d116_dunder_consts_{smoke,deep}.pl`.
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
-**D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, and D122
-are now fixed (D121/D122/D113/D111/D112/D114/D109 detailed just below;
-D99/D105/D100/D107 write-ups follow):**
+**D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122, and
+D116 are now fixed (D116/D121/D122/D113/D111/D112/D114/D109 detailed
+just below; D99/D105/D100/D107 write-ups follow):**
+- D116 (`src/parser.cpp` `parsePrimary`, `src/codegen.cpp` `emitCall`):
+  `__PACKAGE__`/`__FILE__`/`__LINE__` now resolve correctly instead of
+  a hard parse error — `bless {...}, __PACKAGE__` and
+  `__PACKAGE__->method(...)`-style OO constructor idioms (very common
+  in CPAN modules) now work. Two auto-quote contexts (`__PACKAGE__ =>
+  1` and `$h{__PACKAGE__}`) needed explicit handling to keep matching
+  real Perl's literal-bareword behavior there. Split off `__SUB__`
+  (current-sub reference — needs real closure-capture support, not
+  just a constant substitution) as **D124** — logged, not fixed.
 - D121 (`src/lexer.cpp`): `$::name`/`@::arr`/`%::hash` (Perl's `main::`
   shorthand) no longer a parse error — the lexer now synthesizes the
   same token a spelled-out `main::name` would produce. Found (and
@@ -117,19 +126,21 @@ D99/D105/D100/D107 write-ups follow):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** **D101–D104, D106, D108, D110, D115–D120**
-(see `TESTS.md`). **D54** (tooling): `perlc_tsan` can hang compiling
-`tests/threads.pl` (TSan+`fork` of clang); workaround
+**Open generated-code defects:** **D101–D104, D106, D108, D110, D115,
+D117–D120, D124** (see `TESTS.md`). **D54** (tooling): `perlc_tsan` can
+hang compiling `tests/threads.pl` (TSan+`fork` of clang); workaround
 `TSAN_OPTIONS=die_after_fork=0`.
 
 **2026-09-10 five-agent MVP review:** a code-reviewer/architect, three
 engineers (runtime/codegen/parser depth), and a PM assessed real-world
 readiness for "common CPAN modules work." Found and byte-for-byte-
 verified **8 new defects (D111–D118)**; **D111–D114 are now fixed**, and
-the pre-existing **D109 is now fixed too** (see above) — the remaining
-open ones are `__PACKAGE__` etc. being unimplemented (D116), two runtime
-correctness gaps in very hot paths (D117: hand-rolled float parser;
-D118: `split` missing LIMIT + trailing-empty-trim), D115 (bare
+the pre-existing **D109 is now fixed too** (see above) — as is **D116**
+(`__PACKAGE__`/`__FILE__`/`__LINE__`, split from `__SUB__` which is now
+**D124**, harder, still open — see D116's write-up in TESTS.md). The
+remaining open ones are two runtime correctness gaps in very hot paths
+(D117: hand-rolled float parser; D118: `split` missing LIMIT + trailing-
+empty-trim), D115 (bare
 `return;` in list context), **D119** (found while fixing D111 —
 `scalar(keys %$href)` returns 0), and **D120** (split off D109's
 widened scope — subscripted deref in an interpolated string, e.g.

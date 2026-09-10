@@ -9684,6 +9684,12 @@ Value *CodeGen::emitBinOp(const Node &n) {
 }
 
 Value *CodeGen::emitCall(const Node &n) {
+    /* D116: __FILE__ — the parser can't resolve this itself (only
+       codegen's sourceFile_ tracks the compiling filename), so it's
+       represented as a plain Call and intercepted here, first, so it
+       never falls through to the generic "undefined sub" die (D113). */
+    if (n.name == "__FILE__") return perlStr(sourceFile_);
+
     /* Try AST-level inline first: eliminates @_ construction for simple subs. */
     if (Value *v = tryEmitInline(n)) return v;
 
