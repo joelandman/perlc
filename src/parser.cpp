@@ -3112,6 +3112,24 @@ NodePtr Parser::parsePrimary() {
         if (check(TK::ASSIGN)) { advance(); n->right = parseAssign(); }
         return n;
     }
+    /* D130: 'my @arr [= expr]' / 'my %hash [= expr]' in expression
+       context (e.g. if (my @rows = fetch())) — a single array/hash
+       variable declared inline as a condition, no parens around the
+       declaration. The parenthesized multi-variable list form
+       (`my ($a,$b) = ...`) was already handled below; this is the
+       single-array/hash-sigil form that fell through entirely before,
+       hitting the generic bareword-call parser and failing on `my`. */
+    if (check(TK::KW_MY) && (peek(1).kind == TK::ARRAY || peek(1).kind == TK::HASH)) {
+        advance();  /* my */
+        bool isArr = check(TK::ARRAY);
+        char sigil = isArr ? '@' : '%';
+        advance();  /* sigil */
+        std::string vname = advance().text;
+        auto n = std::make_unique<Node>(); n->kind = NK::My; n->line = line;
+        n->name = std::string(1, sigil) + vname;
+        if (check(TK::ASSIGN)) { advance(); n->right = parseAssign(); }
+        return n;
+    }
     /* 'my ($a, $b, ...) = expr' in expression context (e.g. while (my ($k,$v) = each %h)) */
     if (check(TK::KW_MY) && peek(1).kind == TK::LPAREN) {
         advance();  /* my */

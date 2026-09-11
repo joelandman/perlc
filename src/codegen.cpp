@@ -4273,7 +4273,8 @@ void CodeGen::emitStmt(const Node &n) {
                 std::string qualKey = currentPackage_ + "::" + nm;
                 GlobalVariable *gv = nullptr;
                 auto git = fileHashGlobals_.find(qualKey);
-                if (git != fileHashGlobals_.end())
+                bool reused = git != fileHashGlobals_.end();
+                if (reused)
                     gv = git->second;
                 else {
                     gv = new GlobalVariable(*mod_, perlPtrTy_, false,
@@ -4283,7 +4284,19 @@ void CodeGen::emitStmt(const Node &n) {
                     if (!fileHashGlobals_.count(nm))
                         fileHashGlobals_[nm] = gv;
                 }
-                builder_.CreateStore(hv, gv);
+                /* D131 (part 2): a repeated `our %hash;` (no initializer)
+                   for the same qualKey used to unconditionally overwrite
+                   the global with a brand-new empty hash here, wiping out
+                   whatever the first declaration's code had already
+                   populated — matching the identical bug/fix on the
+                   scalar branch below. When reusing, keep the existing
+                   hash object alive and populate through it instead of a
+                   disconnected fresh one; only a fresh global gets the
+                   fresh hash. */
+                if (reused && !n.right)
+                    hv = builder_.CreateLoad(perlPtrTy_, gv);
+                else
+                    builder_.CreateStore(hv, gv);
             } else {
                 declareHash(nm, hv);
             }
@@ -4354,16 +4367,30 @@ void CodeGen::emitStmt(const Node &n) {
                    hash/scalar branches. */
                 std::string qualKey = currentPackage_ + "::" + nm;
                 auto git = fileArrayGlobals_.find(qualKey);
-                if (git != fileArrayGlobals_.end()) {
-                    builder_.CreateStore(av, git->second);
+                bool reused = git != fileArrayGlobals_.end();
+                GlobalVariable *gv;
+                if (reused) {
+                    gv = git->second;
                 } else {
-                    auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                    gv = new GlobalVariable(*mod_, perlPtrTy_, false,
                         GlobalValue::InternalLinkage,
                         Constant::getNullValue(perlPtrTy_), "g.arr." + nm);
-                    builder_.CreateStore(av, gv);
                     fileArrayGlobals_[qualKey] = gv;
                     if (!fileArrayGlobals_.count(nm))
                         fileArrayGlobals_[nm] = gv;
+                }
+                /* D131 (part 2): a repeated `our @arr;` (no initializer)
+                   for the same qualKey used to unconditionally overwrite
+                   the global with a brand-new empty array here, wiping
+                   out whatever the first declaration's code had already
+                   populated — identical bug/fix to the hash branch above.
+                   Only overwrite when reused AND an initializer is
+                   actually given; otherwise keep the existing array
+                   alive and reload it. */
+                if (reused && !n.right) {
+                    av = builder_.CreateLoad(perlPtrTy_, gv);
+                } else {
+                    builder_.CreateStore(av, gv);
                 }
             } else {
                 declareArray(nm, av);
@@ -4413,15 +4440,33 @@ void CodeGen::emitStmt(const Node &n) {
                    (for cross-package reads), matching the existing
                    `my $scalar` file-scope path at line 2606. */
                 Value *pv;
-                if (atFileScope) {
-                    auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                        GlobalValue::InternalLinkage,
-                        Constant::getNullValue(perlPtrTy_), "g." + nm);
-                    pv = callRT("perl_make_shared_scalar", {});
-                    builder_.CreateStore(pv, gv);
+                /* D131: was `atFileScope` alone, ignoring `isOur` — an
+                   `our $x :shared` inside a nested block (not file
+                   scope) fell to the local-alloca branch below instead
+                   of getting real global storage, the same class of bug
+                   fixed for the plain (non-shared) scalar branch below. */
+                if (asGlobal) {
+                    /* D131 (part 2): reuse an existing global for a
+                       repeated `our $x :shared;` occurrence instead of
+                       minting a fresh disconnected one each time — see
+                       the identical fix/rationale on the plain scalar
+                       branch below. */
+                    std::string qualKey = currentPackage_ + "::" + nm;
+                    Value *gv = nullptr;
+                    auto sgit = fileScalarGlobals_.find(qualKey);
+                    if (sgit != fileScalarGlobals_.end()) {
+                        gv = sgit->second;
+                        pv = builder_.CreateLoad(perlPtrTy_, gv);
+                    } else {
+                        auto *newGv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                            GlobalValue::InternalLinkage,
+                            Constant::getNullValue(perlPtrTy_), "g." + nm);
+                        pv = callRT("perl_make_shared_scalar", {});
+                        builder_.CreateStore(pv, newGv);
+                        gv = newGv;
+                    }
                     fileScalarGlobals_[nm] = gv;
-                    if (currentPackage_ != "main")
-                        fileScalarGlobals_[currentPackage_ + "::" + nm] = gv;
+                    fileScalarGlobals_[qualKey] = gv;
                     declareVar(nm, gv);
                 } else {
                     auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
@@ -4438,7 +4483,16 @@ void CodeGen::emitStmt(const Node &n) {
                 sharedScalarNames_.insert(nm);  /* Phase 3: route through perl_atomic_* */
                 break;
             }
-            if (atFileScope && asDoLib_) {
+            /* D131: was `atFileScope && asDoLib_` — an `our $x;` inside
+               a nested block (not file scope) has isOur=true/asGlobal=
+               true but atFileScope=false, so it fell all the way to the
+               unbox-fast-path `else` branch below and got a plain
+               local-scope alloca instead of real global storage; a sub
+               referencing that same `our`-declared name from outside
+               the block then saw a completely disconnected variable
+               (via the "auto-vivify global-ish variable" fallback,
+               which finds nothing and silently starts fresh). */
+            if (asGlobal && asDoLib_) {
                 /* D58: in a --do-lib build, route file-scope scalars through
                    the process-wide global-scalar registry instead of an
                    ordinary per-compilation-unit GlobalVariable — each
@@ -4485,14 +4539,42 @@ void CodeGen::emitStmt(const Node &n) {
                  fileScalarGlobals_[nm] = slot;
                 declareVar(nm, slot);
                 fileScalarGlobals_[currentPackage_ + "::" + nm] = slot;
-            } else if (atFileScope) {
-                /* use a global variable so subroutines can access this file-scope var */
-                auto *gv = new GlobalVariable(*mod_, perlPtrTy_, false,
-                    GlobalValue::InternalLinkage,
-                    Constant::getNullValue(perlPtrTy_), "g." + nm);
-                Value *pv = perlUndef();
-                builder_.CreateStore(pv, gv);
+            } else if (asGlobal) {
+                /* D131: was `atFileScope` alone — see the identical fix
+                   note on the asDoLib_ branch just above. */
+                /* D131 (part 2): a second/later textual `our $x;` (or
+                   `our $x = ...;`) for the same package-qualified name —
+                   e.g. one occurrence at file scope and another inside a
+                   sub or a different nested block, the exact shape real
+                   Perl code uses to "bring an existing our-var into
+                   scope" — used to unconditionally mint a brand-new
+                   GlobalVariable here every time, unlike the sibling
+                   array/hash branches above which already look up
+                   fileArrayGlobals_/fileHashGlobals_ by qualified name
+                   and reuse the existing global. Every repeat occurrence
+                   therefore created its own disconnected LLVM global
+                   (LLVM auto-renames the symbol to avoid a name clash),
+                   so code in one occurrence's scope never saw writes
+                   made through another's. Fixed by reusing an existing
+                   global for this qualKey when present, and — since a
+                   bare `our $x;` with no initializer must leave the
+                   existing value untouched, matching real Perl — only
+                   resetting the storage to undef when the global is
+                   newly created. */
+                std::string qualKey = currentPackage_ + "::" + nm;
+                Value *gv = nullptr;
+                auto sgit = fileScalarGlobals_.find(qualKey);
+                if (sgit != fileScalarGlobals_.end()) {
+                    gv = sgit->second;
+                } else {
+                    auto *newGv = new GlobalVariable(*mod_, perlPtrTy_, false,
+                        GlobalValue::InternalLinkage,
+                        Constant::getNullValue(perlPtrTy_), "g." + nm);
+                    builder_.CreateStore(perlUndef(), newGv);
+                    gv = newGv;
+                }
                  if (n.right) {
+                     Value *pv = builder_.CreateLoad(perlPtrTy_, gv);
                      Value *init = emitExpr(*n.right);
                      callRT("perl_assign", {pv, init});
                      freeIfOwned(init);
@@ -6107,6 +6189,18 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
             if (auto *slot = lookupVar(nm))
                 return builder_.CreateLoad(perlPtrTy_, slot);
+        }
+        /* D130: 'my @arr = expr' / 'my %hash = expr' in expression
+           context (e.g. if (my @rows = fetch())) — boolean/scalar-
+           context value is the element count, matching how a bare
+           @arr/%hash already behaves in boolean context elsewhere. */
+        if (!n.name.empty() && n.name[0] == '@') {
+            std::string nm = n.name.substr(1);
+            if (Value *av = lookupArray(nm)) return callRT("perl_array_len", {av});
+        }
+        if (!n.name.empty() && n.name[0] == '%') {
+            std::string nm = n.name.substr(1);
+            if (Value *hv = lookupHash(nm)) return callRT("perl_hash_size", {hv});
         }
         return perlUndef();
     }

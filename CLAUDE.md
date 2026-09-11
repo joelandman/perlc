@@ -11,28 +11,61 @@ AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
                                       runtime.c
 ```
 
-## Current state (2026-09-10)
+## Current state (2026-09-11)
 
 Core language, OOP, regex (PCRE2 including `/x`), threads::shared, overload,
 Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-10, re-verified after each fix this session — most
-recently 279/279 PASS, 0 FAIL after D121/D122; D116 re-verification
-pending):** New this session: `d113_undefined_sub_die_{smoke,deep}.pl`,
+**Harness (2026-09-11, re-verified after D130/D131 — 299/299 PASS,
+0 FAIL):** New this session: `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
 `d112_module_scope_{smoke,deep}.pl` (+ `tests/lib/D112Leaky.pm`),
 `d114_array_slice_{smoke,deep}.pl`, `d109_subst_interp_{smoke,deep}.pl`,
 `d121_bare_maincolon_{smoke,deep}.pl`,
 `d122_scanexports_usevars_{smoke,deep}.pl` (+
-`tests/lib/D122UseVarsExport.pm`), `d116_dunder_consts_{smoke,deep}.pl`.
+`tests/lib/D122UseVarsExport.pm`), `d116_dunder_consts_{smoke,deep}.pl`,
+`d117_atof_precision_{smoke,deep}.pl`, `d118_split_limit_{smoke,deep}.pl`,
+`d119_keys_deref_scalar_{smoke,deep}.pl`, `d127_amp_export_{smoke,deep}.pl`
+(+ `tests/lib/D127AmpExport.pm`, `tests/lib/D127AmpExportOk.pm`),
+`d129_local_paren_{smoke,deep}.pl`, `d102_die_ref_{smoke,deep}.pl`,
+`d115_bare_return_list_{smoke,deep}.pl`, `d130_my_cond_{smoke,deep}.pl`,
+`d131_our_nested_block_{smoke,deep}.pl`.
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
-D116, D117, D118, D119, D127, D129, D102, and D115 are now fixed
-(D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/D111/D112/
-D114/D109 detailed just below; D99/D105/D100/D107 write-ups follow):**
+D116, D117, D118, D119, D127, D129, D102, D115, D130, and D131 are now
+fixed (D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/D111/
+D112/D114/D109 detailed just below; D99/D105/D100/D107 write-ups
+follow; D130/D131 write-ups are in TESTS.md):**
+- D131 (`src/codegen.cpp` `case NK::My`, scalar/`:shared`/array/hash
+  declaration branches): `our $var;`/`our @arr;`/`our %hash;` declared
+  inside a nested bare `{ }` block, or textually redeclared anywhere
+  (e.g. inside a sub, to bring an existing package var into scope) —
+  two stacked bugs. (1) The scalar branches gated global-vs-local
+  storage on `atFileScope` alone instead of `atFileScope || isOur`, so
+  a nested-block `our` fell to a disconnected local alloca. (2) Once
+  fixed, every repeated textual `our` occurrence for the same name was
+  found to unconditionally mint a brand-new LLVM global instead of
+  reusing the one already registered by package-qualified name (the
+  array/hash branches already partially did this for D112, but still
+  always overwrote the value on reuse even with no initializer,
+  silently resetting an already-populated `our @arr;`/`our %hash;`
+  back to empty). Fixed by looking up an existing global by qualified
+  name first on every branch, and only resetting storage when newly
+  created or an initializer is actually given.
+- D130 (`src/parser.cpp` expression-context `my`-parsing;
+  `src/codegen.cpp` expression-context `case NK::My` in `emitExpr`):
+  `if (my @arr = EXPR)` / `if (my %h = EXPR)` — a single array/hash
+  variable declared inline as an `if`/`while` condition, no
+  surrounding parens — was a hard parse error; the parenthesized
+  multi-variable list form (D100) and the single-scalar form already
+  worked, but this in-between shape didn't. Fixed with a parser branch
+  alongside the existing scalar case, plus array-length/hash-size
+  return handling in the expression-context codegen case so the
+  condition's truthiness matches real Perl's list-assignment-count
+  semantics.
 - D115 (`src/codegen.cpp` `case NK::Return` **and** its duplicate in
   `emitBlockLast`): bare `return;` in list context now yields a
   genuinely empty list instead of a 1-element `(undef)` list — needed
@@ -192,7 +225,7 @@ D114/D109 detailed just below; D99/D105/D100/D107 write-ups follow):**
   `/usr/bin/debconf-escape` script.
 
 **Open generated-code defects:** **D101, D103, D104, D106, D108, D110,
-D120, D124, D125, D126, D128, D130, D131** (see `TESTS.md`). **D54**
+D120, D124, D125, D126, D128** (see `TESTS.md`). **D54**
 (tooling): `perlc_tsan` can hang compiling `tests/threads.pl`
 (TSan+`fork` of clang); workaround `TSAN_OPTIONS=die_after_fork=0`.
 

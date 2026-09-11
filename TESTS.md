@@ -83,8 +83,8 @@ eval STRING and eval-defined subs see outer `my`).
 | D113 | **FIXED** (2026-09-10) | No "unimplemented" signal: calling an undefined sub silently returned `undef` (real Perl: fatal `Undefined subroutine ... called`, exit 255) and an unresolvable `use Some::Module;` was silently dropped instead of erroring; `use lib`/`-I`/`PERL5LIB` weren't honored. See below. |
 | D114 | **FIXED** (2026-09-10) | Array slices `@x[LIST]` returned only one element when the subscript list was non-literal — a range (`@x[1..2]`) or an array variable (`@x[@i]`). Hash slices `@h{...}` already dispatched correctly for the equivalent cases; array slices weren't ported to the same dispatch. See below. |
 | D115 | **FIXED** (2026-09-10) | Bare `return;` in list context yielded a 1-element list instead of Perl's empty list — broke `my %h = (k => f())`-style "return nothing on failure" patterns. See below. |
-| D130 | OPEN (missing syntax, found 2026-09-10 while testing D115) | `if (my @arr = EXPR)` — a single ARRAY variable declared inline as an `if`/`while` condition — is a hard parse error ("unexpected token 'my'"). The equivalent list form `if (my (@a,@b) = ...)` was fixed under D100; this is the single-array-variable-with-no-parens-around-the-declaration-list case, which D100 didn't cover. See below. |
-| D131 | OPEN (correctness, found 2026-09-10 while testing D129) | `our $var;` declared inside a nested bare `{ }` block (not at file scope) doesn't work correctly — a named sub referencing that variable from outside the block sees nothing, even though the same code works fine when the `our` is at true file scope. See below. |
+| D130 | **FIXED 2026-09-11** | `if (my @arr = EXPR)` — a single ARRAY/HASH variable declared inline as an `if`/`while` condition — was a hard parse error ("unexpected token 'my'"). See below. |
+| D131 | **FIXED 2026-09-11** | `our $var;`/`our @arr;`/`our %hash;` declared inside a nested bare `{ }` block, or repeated as a bare redeclaration anywhere, didn't work correctly. See below. |
 | D116 | **FIXED** (2026-09-10, `__PACKAGE__`/`__FILE__`/`__LINE__` only) | `__PACKAGE__` / `__FILE__` / `__LINE__` were not implemented at all (hard parse error) despite `bless {...}, __PACKAGE__` being one of the most common OO-Perl idioms in CPAN modules. `__SUB__` (reference to the currently-executing sub) is intentionally not covered — harder, split off as **D124**. See below. |
 | D124 | OPEN (missing syntax, split off D116's `__SUB__` case, found 2026-09-10) | `__SUB__` (a reference to the currently-executing sub, needed for anonymous recursion — `use feature 'current_sub'`) is still a hard parse error. Needs codegen support for a reference to the current closure's own captures, not just a compile-time constant substitution like `__PACKAGE__`/`__LINE__`/`__FILE__`. See below. |
 | D117 | **FIXED** (2026-09-10) | `perl_atof_decimal` (`src/runtime.c`) was a hand-rolled decimal-string→float parser (manual digit accumulation plus a repeated-multiply exponent loop) instead of `strtod`, accumulating rounding error on ordinary decimal strings — every implicit string→number coercion goes through it. See below. |
@@ -928,35 +928,45 @@ gap): **D130** — `if (my @arr = EXPR)` (a single array variable
 declared inline as an `if`/`while` condition, no parens around the
 declaration) is a hard parse error.
 
-### D130 — `if (my @arr = EXPR)` (single array var, no parens) is a parse error
+### D130 — `if (my @arr = EXPR)` (single array/hash var, no parens) — **FIXED 2026-09-11**
 
 ```perl
 sub f { return (1,2); }
 if (my @r = f()) { print "true\n"; } else { print "false\n"; }
 # perl:  true
-# perlc: Error: Parse error line 2: unexpected token 'my'
+# was:   Error: Parse error line 2: unexpected token 'my'
 ```
 
 Found while writing D115's deep test. D100 already fixed
 `while (my ($k,$v) = each %h)`-style parenthesized-list-form `my (...)
-= EXPR` as a boolean condition — this is the *unparenthesized
+= EXPR` as a boolean condition — this was the *unparenthesized
 single-array-variable* form (`my @arr = EXPR`, no `(...)` around the
 declaration at all), which D100's fix didn't cover since it's a
 structurally different AST shape (a plain `NK::My` array declaration,
-not an `ArrayLit`-wrapped list). `if`/`while`'s condition-parsing likely
-only special-cased the `my (LIST) = EXPR` shape D100 targeted, not a
-bare `my @name = EXPR` used directly as a condition.
+not an `ArrayLit`-wrapped list). The expression-context `my`-as-
+condition parsing only special-cased a single *scalar* (`if (my $x =
+...)`) alongside D100's parenthesized-list shape — a bare array/hash
+variable fell through to a hard parse error.
 
-**Fix shape:** extend the `if`/`while` condition parser's `my`-as-
-condition special-casing to also accept `my @name = EXPR` /
-`my %name = EXPR` (single array/hash declaration, no parens) the same
-way it already accepts the parenthesized multi-variable list form —
-likely a small addition next to D100's existing fix, reusing the same
-downstream boolean-context evaluation (an array/hash in boolean context
-is already correctly falsy-when-empty via existing scalar-context
-count logic).
+**Fix** (`src/parser.cpp`, alongside the existing scalar `my $x`
+expression-context branch): added a sibling branch recognizing `my
+@name` / `my %name` (`TK::ARRAY`/`TK::HASH` immediately after `my`)
+directly in expression context, producing the same `NK::My` node shape
+statement-context declarations already use, with an optional `=
+EXPR` right-hand side. (`src/codegen.cpp`, expression-context `case
+NK::My` in `emitExpr`): this node shape previously only handled a
+scalar; added array/hash handling that calls `perl_array_len`/
+`perl_hash_size` on the just-declared variable so the condition's
+truthiness matches real Perl's list-assignment-count-in-boolean-
+context semantics (an array/hash assigned an empty list is falsy; any
+non-empty result is truthy).
 
-### D131 — `our $var;` inside a nested block doesn't work correctly
+Verified against real Perl for: a truthy array-returning sub, an
+empty-list-returning sub (falsy), a hash-returning sub (truthy), and a
+plain array-to-array copy condition. Tests:
+`tests/d130_my_cond_{smoke,deep}.pl`.
+
+### D131 — `our $var;` inside a nested block / repeated `our` declarations — **FIXED 2026-09-11**
 
 ```perl
 {
@@ -966,21 +976,51 @@ count logic).
     print "$result\n";
 }
 # perl:  hi
-# perlc: (nothing printed)
+# was:   (nothing printed)
 ```
 
 Found while writing D129's deep test — moving the exact same code from
-true file scope into a nested bare `{ }` block breaks it entirely (at
-file scope, this identical code works correctly). Likely related to
-D110/D112's package-global-storage architecture (both about `our`/
-package-qualified variables not being true, scope-independent globals
-in every case) — `our` inside a block probably isn't recognized as
-"file-scope enough" to get the same global-storage treatment a
-top-level `our` gets, so the sub's write and the block's later read
-end up targeting different storage. Not investigated further given
-time budget; flagged for whoever picks up D110/D112-adjacent work
-next, since it's likely the same root cause wearing a different
-trigger condition.
+true file scope into a nested bare `{ }` block broke it entirely (at
+file scope, this identical code worked correctly). Two stacked bugs,
+both in `src/codegen.cpp`'s `case NK::My`:
+
+1. The scalar declaration branch computed `asGlobal` correctly
+   (`atFileScope || isOur`, matching the sibling array/hash branches)
+   but then gated its actual global-vs-local storage decision on
+   `atFileScope` alone in three separate spots (the `:shared` scalar
+   sub-branch, the `--do-lib` sub-branch, and the plain sub-branch) —
+   so `our $x` inside a nested block (`isOur=true`, `atFileScope=
+   false`) fell through to the local-alloca fast path instead of
+   getting real global storage. A sub referencing that same name from
+   outside the block then saw a completely disconnected variable.
+   Fixed by changing all three conditions to `asGlobal`.
+
+2. Fixing (1) surfaced a second, more general bug: **every** textual
+   occurrence of a plain `our $x;` / `our $x :shared;` (not just the
+   first) unconditionally minted a **brand-new** LLVM `GlobalVariable`
+   instead of reusing the one already registered under this package-
+   qualified name — LLVM silently auto-renames the symbol to dodge the
+   clash, so `our $x = 5;` at file scope plus a *second* `our $x;`
+   anywhere (a sub bringing the global into scope, or a second nested
+   block) produced two disconnected storage locations. The array/hash
+   `our` branches already looked up an existing global by qualified
+   name (D112) but still unconditionally overwrote its value even on
+   reuse with no initializer — silently resetting an already-populated
+   `our @arr;`/`our %hash;` back to empty. Fixed by, on every branch
+   (`plain scalar`, `:shared scalar`, array, hash): looking up an
+   existing global by package-qualified name first; only creating +
+   resetting-to-undef/empty when none exists; and when reusing, only
+   overwriting the stored value if this occurrence actually supplies an
+   initializer (`our $x = ...`) — a bare `our $x;`/`our @a;`/`our %h;`
+   redeclaration now correctly leaves the existing value untouched,
+   matching real Perl.
+
+Verified against real Perl for: `our $scalar` set via a sub then read
+via a second nested-block redeclaration; the same for `our @arr` and
+`our %hash`; and a bare `our $counter;` redeclaration (no initializer)
+across three separate `bump()` calls correctly preserving/accumulating
+the running total instead of resetting each time. Tests:
+`tests/d131_our_nested_block_{smoke,deep}.pl`.
 
 ### D116 — `__PACKAGE__`/`__FILE__`/`__LINE__` unimplemented — **FIXED 2026-09-10** (`__SUB__` split off as D124)
 

@@ -87,7 +87,7 @@ once, not one.
 4. ~~**D114** — array slices with a non-literal subscript (`@x[1..2]`, `@x[@i]`) return one element instead of the slice.~~ **FIXED 2026-09-10.**
 5. ~~**D109** — `s///` replacement text didn't support `$name`/`@arr` interpolation.~~ **FIXED 2026-09-10.** Turned out to need less unification than predicted — reused the `/e` flag's existing closure/capture machinery directly, routed through the same interpolation scanner `"..."` literals already use, rather than rebuilding anything. Split off the harder, non-`s///`-specific remainder (subscripted deref in *any* interpolated string, `$$aref[0]`/`@{$r}[0,1]`) as **D120** — that one is still open and is the "medium, needs the general engine unified" item this entry originally described. See TESTS.md.
 6. ~~**D102**~~ — **FIXED 2026-09-10.** Was `die REF`/`die $blessed_obj` losing the reference into `$@` (stringified instead, with a wrongly-appended location suffix). `perl_die` now assigns the reference directly instead of stringifying it.
-7. ~~**D115**~~ — **FIXED 2026-09-10.** Was bare `return;` yielding a 1-element list in list context instead of Perl's empty list — needed fixing in two separate duplicate codegen sites. Found **D130** (`if (my @arr = EXPR)` parse error) while testing.
+7. ~~**D115**~~ — **FIXED 2026-09-10.** Was bare `return;` yielding a 1-element list in list context instead of Perl's empty list — needed fixing in two separate duplicate codegen sites. Found ~~**D130**~~ (`if (my @arr = EXPR)` parse error) while testing — **FIXED 2026-09-11**, see TESTS.md.
 8. ~~**D119**~~ — **FIXED 2026-09-10.** Was `scalar(keys %$href)`/`scalar(values %$href)` returning 0 instead of the key count; small, mechanical fix as predicted (ported `emitArrayPtr`'s existing deref-hash handling into `emitExpr`'s scalar-context cases). See TESTS.md.
 
 ### Tier 1 — hard parse errors in common module syntax (loud, so lower risk per-instance, but each one gates an entire file)
@@ -266,9 +266,11 @@ green as that corpus grows.** Concretely:
    harder remainder is now **D120**. Remaining: D110 and D120 are medium
    per the codegen review / D120's own write-up (reuse existing
    machinery, don't rebuild). ~~D119~~, ~~D102~~, ~~D115~~, ~~D129~~ all
-   **DONE 2026-09-10.** Remaining Tier-0-adjacent small items found
-   along the way: D130 (`if (my @arr = ...)` parse error), D131 (`our`
-   inside a nested block).
+   **DONE 2026-09-10.** ~~D130~~ (`if (my @arr = ...)` parse error) and
+   ~~D131~~ (`our` inside a nested block, plus a deeper repeated-
+   `our`-declaration global-reuse bug found while fixing it) — both
+   small items found along the way — are **DONE 2026-09-11**; see
+   TESTS.md.
 4. **Tier 1 parse gaps**, prioritized by what the re-run survey (step 2)
    actually shows blocking real files — `__PACKAGE__` is the strongest
    a priori candidate given how common the `bless {}, __PACKAGE__`
