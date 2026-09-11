@@ -6055,13 +6055,22 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::EachFunc: {
-        /* scalar context: return undef when exhausted, else just call it */
+        /* D101: scalar-context `each %hash` must return the KEY (or
+           undef once exhausted) — this used to return
+           perl_array_len(av), the *count* of the [key,val] pair array
+           (0, 1, or 2), never the key itself. Masked in casual testing
+           because a truthy 2 happens to make `while (each ...)` iterate
+           the right *number* of times even though every scalar `$k` was
+           wrong. perl_array_get already returns undef for an
+           out-of-range index, matching the post-exhaustion case (an
+           empty pair array). */
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
         Value *av = callRT("perl_each_hash", {hv});
-        Value *len = callRT("perl_array_len", {av});
+        Value *idx0 = ConstantInt::get(Type::getInt64Ty(ctx_), 0);
+        Value *key = callRT("perl_array_get", {av, idx0});
         callRT("perl_array_free", {av});
-        return len;
+        return key;
     }
 
     case NK::PosFunc: {

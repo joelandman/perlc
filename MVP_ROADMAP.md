@@ -102,7 +102,7 @@ once, not one.
 
 ### Tier 2 — genuine but narrow (post-MVP is fine)
 
-D106 (narrow FLAT_ARRAY re-alias variant), D108 (`\f\a\e\b` in plain strings), D101 (`each` scalar context), D103 (2^63 overflow), ~~D117~~ (FIXED — `perl_atof_decimal` hand-rolled parser → `strtod`), ~~D118~~ (FIXED — `split` LIMIT + trailing-empty trim; found D126, a separate capturing-group-in-split-pattern bug, while testing).
+D106 (narrow FLAT_ARRAY re-alias variant), D108 (`\f\a\e\b` in plain strings), ~~D101~~ (FIXED 2026-09-11 — `each` scalar context returned the pair-array length instead of the key; see TESTS.md), D103 (2^63 overflow), ~~D117~~ (FIXED — `perl_atof_decimal` hand-rolled parser → `strtod`), ~~D118~~ (FIXED — `split` LIMIT + trailing-empty trim; found D126, a separate capturing-group-in-split-pattern bug, while testing).
 
 ### Architectural gap bigger than any single D-number: no Exporter/`@EXPORT`
 

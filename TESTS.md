@@ -68,7 +68,7 @@ eval STRING and eval-defined subs see outer `my`).
 | ID | Status | Notes |
 |----|--------|-------|
 | D54 | OPEN (tooling) | `perlc_tsan` hangs compiling `tests/threads.pl` (TSan+fork of clang-18). `TSAN_OPTIONS=die_after_fork=0` works around it. Not a generated-code bug. |
-| D101 | OPEN (correctness) | `each %hash` in scalar context returns the pair length (0/1/2), not the key. See below. |
+| D101 | **FIXED 2026-09-11** | `each %hash` in scalar context returned the pair length (0/1/2), not the key. See below. |
 | D102 | **FIXED** (2026-09-10) | `die REF` / `die $blessed_obj` lost the reference — `$@` became a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Broke OO exception handling. See below. |
 | D103 | OPEN (correctness, low freq.) | Integer overflow uses wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently go wrong or print in scientific notation instead of exact digits. See below. |
 | D104 | OPEN (missing syntax) | Indented heredoc `<<~IDENT` (Perl 5.26+) is not recognized by the lexer at all — hard parse error, not silent-wrong-data. See below. |
@@ -346,21 +346,34 @@ Tests: `tests/d100_list_assign_cond_smoke.pl`,
 if-inside-while nesting, the statement-level form staying unaffected, and
 the 50k-iteration stress test).
 
-### D101 — `each %hash` in scalar context returns the wrong value
+### D101 — `each %hash` in scalar context returns the wrong value — **FIXED 2026-09-11**
 
 ```perl
 my %h = (a=>1,b=>2,c=>3);
 while (my $k = each %h) { print "$k\n"; }
 # perl:  c / a / b  (actual keys, order unspecified)
-# perlc: 2 / 2 / 2   (always the pair-array length, never a key)
+# was:   2 / 2 / 2   (always the pair-array length, never a key)
 ```
-Root cause: `src/codegen.cpp:5682-5690`, `case NK::EachFunc` (scalar
-context): calls `perl_each_hash` to get the `[key,val]` pair array, then
-returns `perl_array_len(av)` — the *count* of the pair (0, 1, or 2) — not
-element 0 (the key). Should return the key, or `undef`/empty when
-exhausted. Masked in casual testing because a truthy 2 happens to make
-simple `while (each ...)` loops iterate the right *number* of times even
-though every `$k` is wrong.
+Root cause: `src/codegen.cpp`'s scalar-context `case NK::EachFunc`
+called `perl_each_hash` to get the `[key,val]` pair array, then
+returned `perl_array_len(av)` — the *count* of the pair (0, 1, or 2) —
+not element 0 (the key). Masked in casual testing because a truthy 2
+happens to make simple `while (each ...)` loops iterate the right
+*number* of times even though every `$k` is wrong.
+
+**Fix**: return `perl_array_get(av, 0)` instead — the existing
+runtime accessor already returns `undef` for an out-of-range index,
+which is exactly the post-exhaustion case (an empty pair array), so no
+new runtime code was needed. List-context `each %hash` (`my ($k,$v) =
+each %h`) was already correct and untouched — only the scalar-context
+case had the bug.
+
+Verified against real Perl for: a multi-key hash iterated to
+exhaustion (keys collected and sorted, since real iteration order is
+unspecified), a single-key hash (first call returns the key, second
+returns `undef`), an empty hash (immediately `undef`), and
+re-iterating a hash after it auto-resets past exhaustion. Tests:
+`tests/d101_each_scalar_{smoke,deep}.pl`.
 
 ### D102 — `die REF` loses the reference (breaks OO exceptions) — **FIXED 2026-09-10**
 

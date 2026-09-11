@@ -18,7 +18,7 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-11, re-verified after D130/D131 — 299/299 PASS,
+**Harness (2026-09-11, re-verified after D101 — 301/301 PASS,
 0 FAIL):** New this session: `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
 `d112_module_scope_{smoke,deep}.pl` (+ `tests/lib/D112Leaky.pm`),
@@ -31,14 +31,23 @@ gated by `make test-all` (byte-for-byte vs real `perl`).
 (+ `tests/lib/D127AmpExport.pm`, `tests/lib/D127AmpExportOk.pm`),
 `d129_local_paren_{smoke,deep}.pl`, `d102_die_ref_{smoke,deep}.pl`,
 `d115_bare_return_list_{smoke,deep}.pl`, `d130_my_cond_{smoke,deep}.pl`,
-`d131_our_nested_block_{smoke,deep}.pl`.
+`d131_our_nested_block_{smoke,deep}.pl`, `d101_each_scalar_{smoke,deep}.pl`.
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
-D116, D117, D118, D119, D127, D129, D102, D115, D130, and D131 are now
-fixed (D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/D111/
-D112/D114/D109 detailed just below; D99/D105/D100/D107 write-ups
-follow; D130/D131 write-ups are in TESTS.md):**
+D116, D117, D118, D119, D127, D129, D102, D115, D130, D131, and D101
+are now fixed (D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/
+D111/D112/D114/D109 detailed just below; D99/D105/D100/D107 write-ups
+follow; D130/D131/D101 write-ups are in TESTS.md):**
+- D101 (`src/codegen.cpp`, scalar-context `case NK::EachFunc`):
+  `each %hash` in scalar context (`while (my $k = each %h)`) returned
+  `perl_array_len(av)` — the [key,val] pair-array's *count* (0, 1, or
+  2) — instead of the key itself. Masked in casual testing because a
+  truthy 2 happens to make the loop iterate the right *number* of
+  times even though every `$k` was wrong. Fixed by returning
+  `perl_array_get(av, 0)` instead, which already returns `undef` for
+  an out-of-range index (the post-exhaustion case) — no new runtime
+  code needed. List-context `each` was already correct and untouched.
 - D131 (`src/codegen.cpp` `case NK::My`, scalar/`:shared`/array/hash
   declaration branches): `our $var;`/`our @arr;`/`our %hash;` declared
   inside a nested bare `{ }` block, or textually redeclared anywhere
@@ -224,7 +233,7 @@ follow; D130/D131 write-ups are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** **D101, D103, D104, D106, D108, D110,
+**Open generated-code defects:** **D103, D104, D106, D108, D110,
 D120, D124, D125, D126, D128** (see `TESTS.md`). **D54**
 (tooling): `perlc_tsan` can hang compiling `tests/threads.pl`
 (TSan+`fork` of clang); workaround `TSAN_OPTIONS=die_after_fork=0`.
