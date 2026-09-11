@@ -5511,23 +5511,42 @@ static char *appendDieLocation(char *msg, const char *filename, int line) {
  }
 
 void perl_die(PerlValue *msg, const char *filename, int line) {
-     char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
-     char *full = appendDieLocation(s, filename, line);
-     free(s);
+     /* D102: die REF / die $blessed_obj propagates the reference itself,
+        unmodified — confirmed directly against real Perl that no
+        " at FILE line N." location suffix is appended even for an
+        uncaught top-level ref-die (only plain string messages get that
+        treatment), and that $@ (when caught by eval) receives the
+        reference itself, not a stringified copy — real code routinely
+        branches on ref($@) to distinguish structured/typed exceptions
+        from plain string errors. */
+     int isRef = msg && (msg->tag == PERL_REF_ARRAY || msg->tag == PERL_REF_HASH ||
+                          msg->tag == PERL_REF_SCALAR || msg->tag == PERL_CODE_REF);
+     char *full;
+     if (isRef) {
+         full = perl_to_string_dup(msg);  /* stderr/__DIE__-handler text only */
+     } else {
+         char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
+         full = appendDieLocation(s, filename, line);
+         free(s);
+     }
 
      /* D49: $SIG{__DIE__} — called just before dying (eval or top-level).
         If the handler returns, dying continues. Depth guard against recursion. */
      if (s_sig_die_depth == 0) {
          s_sig_die_depth++;
-         PerlValue *msg_pv = perl_alloc_string(full);
+         PerlValue *msg_pv = isRef ? msg : perl_alloc_string(full);
          call_sig_handler("__DIE__", msg_pv);
-         perl_free(msg_pv);
+         if (!isRef) perl_free(msg_pv);
          s_sig_die_depth--;
      }
 
      if (s_eval_depth > 0) {
-         PerlValue pv = { .tag = PERL_STRING, .sval = full, .slen = (long long)strlen(full) };
-         perl_assign(&s_dollar_at, &pv);
+         if (isRef) {
+             perl_assign(&s_dollar_at, msg);
+         } else {
+             PerlValue pv = { .tag = PERL_STRING, .sval = full, .slen = (long long)strlen(full) };
+             perl_assign(&s_dollar_at, &pv);
+         }
          free(full);
          perl_local_restore_to(s_eval_local_depth[s_eval_depth - 1]);
          longjmp(*s_eval_stack[s_eval_depth - 1], 1);

@@ -30,9 +30,53 @@ pending):** New this session: `d113_undefined_sub_die_{smoke,deep}.pl`,
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
-D116, D117, and D118 are now fixed (D118/D117/D116/D121/D122/D113/D111/
-D112/D114/D109 detailed just below; D99/D105/D100/D107 write-ups
-follow):**
+D116, D117, D118, D119, D127, D129, D102, and D115 are now fixed
+(D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/D111/D112/
+D114/D109 detailed just below; D99/D105/D100/D107 write-ups follow):**
+- D115 (`src/codegen.cpp` `case NK::Return` **and** its duplicate in
+  `emitBlockLast`): bare `return;` in list context now yields a
+  genuinely empty list instead of a 1-element `(undef)` list — needed
+  fixing in *two* separate places, since `emitBlockLast` has its own
+  copy of this logic for when `return` is a sub's last statement (the
+  common case for a trivial `sub f { return; }`), and also needed
+  `hasWantarrayOrUserCall()` extended to recognize a bare `return;` as
+  something that now reads the wantarray stack (previously only
+  `return LIST_EXPR` and explicit `wantarray()` triggered that). Found
+  **D130** (`if (my @arr = EXPR)`, single array var with no parens, is
+  a parse error) while testing — logged, not fixed.
+- D102 (`src/runtime.c` `perl_die`): `die REF` / `die $blessed_obj` no
+  longer loses the reference into `$@` — `perl_die` now detects a
+  reference argument and assigns it directly via `perl_assign` instead
+  of unconditionally stringifying, and no longer wrongly appends the
+  `" at FILE line N."` location suffix to a reference (confirmed real
+  Perl never does, even at top level). Verified for hashref, arrayref,
+  scalarref, and blessed objects; plain-string dies are unaffected.
+- D129 (`src/parser.cpp`): `local(VAR, VAR, ...) = EXPR` — parenthesized
+  list-form `local`, including the single-variable case found verbatim
+  in real `Pod::Usage.pm` (`local($_) = shift;`) — no longer a parse
+  error. Desugars exactly like `my (...)`'s identical list form (a
+  `FlatBlock` of per-variable local-decls + one list-assignment), reusing
+  the existing, already-tested codegen path entirely — no codegen
+  changes needed. Found **D131** (`our $var;` inside a nested block
+  doesn't work correctly) while testing — logged, not fixed.
+- D127 (`src/main.cpp` `extractQw()`): a `qw()`-listed export/import
+  name with a leading `&`/`*` sigil (real `Pod::Usage.pm`'s `our
+  @EXPORT = qw(&pod2usage);`) is now stripped before being stored or
+  compared, so both default-`@EXPORT` bare-`use` and explicit
+  `@EXPORT_OK` imports resolve correctly instead of falsely rejecting a
+  genuinely-exported name or leaving it unreachable unqualified.
+  Verified against a local fixture and the real, unmodified
+  `Pod::Usage.pm`; re-verifying against the latter surfaced a new,
+  separate bug once past the export issue — **D129** (`local($var) =
+  EXPR;`, parenthesized single-variable `local`, is a parse error) —
+  logged, not fixed.
+- D119 (`src/codegen.cpp` `case NK::KeysFunc`/`ValuesFunc` in
+  `emitExpr`): `scalar(keys %$href)` / `scalar(values %$href)` now
+  return the correct count instead of `0` — the scalar-context cases
+  only ever resolved a *named* hash variable, missing the `n.left`
+  deref-hash handling `emitArrayPtr`'s identical list-context cases
+  already had. List-context `keys %$href` and named-hash `keys %h` (in
+  either context) were already correct and stay unaffected.
 - D118 (`src/parser.cpp` split-call parsing, `src/runtime.c`
   `perl_split`/`perl_split_regex`): `split(/:/, $line, 2)`'s 3rd LIMIT
   argument was a hard parse error (only 2 args were ever consumed) —
@@ -147,10 +191,27 @@ follow):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** **D101–D104, D106, D108, D110, D115,
-D119, D120, D124, D125, D126** (see `TESTS.md`). **D54** (tooling):
-`perlc_tsan` can hang compiling `tests/threads.pl` (TSan+`fork` of
-clang); workaround `TSAN_OPTIONS=die_after_fork=0`.
+**Open generated-code defects:** **D101, D103, D104, D106, D108, D110,
+D120, D124, D125, D126, D128, D130, D131** (see `TESTS.md`). **D54**
+(tooling): `perlc_tsan` can hang compiling `tests/threads.pl`
+(TSan+`fork` of clang); workaround `TSAN_OPTIONS=die_after_fork=0`.
+
+**2026-09-10 real-module survey #2:** 11 more real system scripts,
+targeting `Pod::Usage`, `Encode`, `File::Copy`, `Storable`, and others
+not covered by survey #1. Found and **fixed D127** (`Pod::Usage`'s
+`&pod2usage`-sigil export broke `scanExports()`'s match — likely
+blocked more real CLI scripts than anything else found so far, since
+`pod2usage()` for `--help`/`--man` is nearly universal). Re-verifying
+D127 against the real, unmodified `Pod::Usage.pm` got past the export
+issue and hit a new, separate bug — **D129** (`local($var) = EXPR;`,
+parenthesized single-variable `local`, is a parse error) — logged, not
+fixed. Also found **D128** (a parse error inside an inlined module
+reports a misleading line number/no filename — diagnostics issue, not
+correctness). Confirmed `File::Copy` (missing entirely, 10 real scripts
+hit it) should join the Tier 1 CPAN candidate list in
+`MVP_ROADMAP.md`, and reconfirmed `Storable::dclone` and the
+`%EXPORT_TAGS`/`:tag`-import gap are real (both already tracked). Full
+table: `TESTS.md` → "CPAN-module compile survey #2".
 
 **2026-09-10 five-agent MVP review:** a code-reviewer/architect, three
 engineers (runtime/codegen/parser depth), and a PM assessed real-world

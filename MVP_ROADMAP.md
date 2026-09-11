@@ -19,7 +19,7 @@ written up:
 | Undefined sub call returns `undef` instead of dying | ✅ confirmed — perl exits 255, perlc exits 0 |
 | `@x[1..2]` / `@x[@i]` array slices return 1 element | ✅ confirmed |
 | `__PACKAGE__` is a hard parse error | ✅ confirmed |
-| `die { ref }` loses the reference (D102) | ✅ re-confirmed, still open |
+| `die { ref }` loses the reference (D102) | ✅ re-confirmed at the time — **fixed 2026-09-10**, see below |
 
 New defects are logged as **D111–D118** in `TESTS.md`'s Open table and
 write-up sections (with full repro + root-cause detail there). This
@@ -86,9 +86,9 @@ once, not one.
 3. ~~**D113** — no failure signal.~~ **FIXED 2026-09-10.** Undefined-sub calls now die matching real Perl; unresolvable `use` now errors; `use lib`/`-I`/`PERL5LIB` now honored.
 4. ~~**D114** — array slices with a non-literal subscript (`@x[1..2]`, `@x[@i]`) return one element instead of the slice.~~ **FIXED 2026-09-10.**
 5. ~~**D109** — `s///` replacement text didn't support `$name`/`@arr` interpolation.~~ **FIXED 2026-09-10.** Turned out to need less unification than predicted — reused the `/e` flag's existing closure/capture machinery directly, routed through the same interpolation scanner `"..."` literals already use, rather than rebuilding anything. Split off the harder, non-`s///`-specific remainder (subscripted deref in *any* interpolated string, `$$aref[0]`/`@{$r}[0,1]`) as **D120** — that one is still open and is the "medium, needs the general engine unified" item this entry originally described. See TESTS.md.
-6. **D102 — `die REF` loses the reference.** Re-confirmed: `ref($@)` comes back empty and a wrong `" at FILE line N."` gets appended to what should be a reference. Blocks all typed/OO exception handling, which is how modern CPAN modules report errors. Still open.
-7. **D115 — bare `return;` yields a 1-element list in list context** instead of Perl's empty list. Breaks the standard "return nothing on failure" contract. Still open.
-8. **D119 (new, found 2026-09-10 while fixing D111) — `scalar(keys %$href)` returns 0 instead of the key count.** List-context `keys %$href` is correct; only scalar context is wrong. Small, mechanical fix (port `emitArrayPtr`'s existing deref-hash handling into `emitExpr`'s scalar-context `KeysFunc` case) — see TESTS.md.
+6. ~~**D102**~~ — **FIXED 2026-09-10.** Was `die REF`/`die $blessed_obj` losing the reference into `$@` (stringified instead, with a wrongly-appended location suffix). `perl_die` now assigns the reference directly instead of stringifying it.
+7. ~~**D115**~~ — **FIXED 2026-09-10.** Was bare `return;` yielding a 1-element list in list context instead of Perl's empty list — needed fixing in two separate duplicate codegen sites. Found **D130** (`if (my @arr = EXPR)` parse error) while testing.
+8. ~~**D119**~~ — **FIXED 2026-09-10.** Was `scalar(keys %$href)`/`scalar(values %$href)` returning 0 instead of the key count; small, mechanical fix as predicted (ported `emitArrayPtr`'s existing deref-hash handling into `emitExpr`'s scalar-context cases). See TESTS.md.
 
 ### Tier 1 — hard parse errors in common module syntax (loud, so lower risk per-instance, but each one gates an entire file)
 
@@ -135,7 +135,9 @@ found through.
 absent), `File::Path` (`make_path`/`remove_tree` — largely expressible
 via existing mkdir/rmdir/opendir/readdir primitives), `File::Find`
 (added 2026-09-10 — core module, came up immediately in a 10-script
-compile survey, see TESTS.md), `File::Temp` (needs an
+compile survey, see TESTS.md), `File::Copy` (added 2026-09-10,
+survey #2 — `copy`/`move`, 10 of 11 sampled scripts in that pass hit
+it, higher hit rate than `File::Find` got), `File::Temp` (needs an
 `mkstemp`-equivalent — currently absent, but `perl_sysopen_fh` with
 `O_EXCL|O_CREAT` gets most of the way there), `Sys::Hostname` (trivial
 — wraps `gethostname(2)`), `Time::Local` (trivial C wrappers around
@@ -155,6 +157,21 @@ missed the `use vars`-style export declaration real core
 once `File::Path` is otherwise implemented). Verifying D121 also
 widened **D110** to cover array/hash access, not just scalars — still
 open.
+
+**2026-09-10 compile-survey #2 note:** a second batch of 11 real
+scripts targeting `Pod::Usage`/`Encode`/`File::Copy`/`Storable`/others
+found and same-day-fixed ~~**D127**~~ (`Pod::Usage`'s `&pod2usage`-sigil
+export broke `scanExports()`'s match — likely the single biggest
+real-world blocker found in either survey pass, since `pod2usage()` for
+`--help`/`--man` is nearly universal in documented CLI scripts).
+Re-verifying D127 against the real, unmodified `Pod::Usage.pm` reached
+a new blocker once past the export issue: ~~**D129**~~ (`local($var) =
+EXPR;`, parenthesized single-variable `local`) — **also fixed
+2026-09-10**, same day. Also found **D128** (a parse error inside an
+inlined module reports a misleading line/no filename — a diagnostics
+gap, not a correctness bug, but one that will bite more often as more
+real modules get pulled in). Full table: `TESTS.md` → "CPAN-module
+compile survey #2".
 
 **Tier 2 — high frequency, moderate cost:** `Time::Piece` (OO wrapper
 over already-working `localtime`/`gmtime`/`strftime` primitives —
@@ -207,9 +224,10 @@ green as that corpus grows.** Concretely:
    is a force multiplier: it turns every subsequent "does X work" check
    from a manual diff into a simple pass/fail, and it's what makes the
    next real-world survey trustworthy.
-2. **Tier 0 correctness items (D111, D112, D114, D109-widened, D102,
-   D115) fixed** — these are the silent-wrong-data bugs in idioms common
-   enough to appear in nearly any real script.
+2. ~~**Tier 0 correctness items (D111, D112, D114, D109-widened, D102,
+   D115) fixed**~~ — **all done as of 2026-09-10** — these were the
+   silent-wrong-data bugs in idioms common enough to appear in nearly
+   any real script.
 3. **`make test-all` stays at 0 FAIL** as work proceeds — non-negotiable
    per existing project policy; every fix ships smoke+deep tests
    verified against real Perl, as already practiced.
@@ -247,8 +265,10 @@ green as that corpus grows.** Concretely:
    machinery directly, smaller than predicted too; see TESTS.md. D109's
    harder remainder is now **D120**. Remaining: D110 and D120 are medium
    per the codegen review / D120's own write-up (reuse existing
-   machinery, don't rebuild); D102, D115, and the newly-found D119 are
-   small.
+   machinery, don't rebuild). ~~D119~~, ~~D102~~, ~~D115~~, ~~D129~~ all
+   **DONE 2026-09-10.** Remaining Tier-0-adjacent small items found
+   along the way: D130 (`if (my @arr = ...)` parse error), D131 (`our`
+   inside a nested block).
 4. **Tier 1 parse gaps**, prioritized by what the re-run survey (step 2)
    actually shows blocking real files — `__PACKAGE__` is the strongest
    a priori candidate given how common the `bless {}, __PACKAGE__`

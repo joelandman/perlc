@@ -76,6 +76,18 @@ static std::string dirOf(const std::string &path) {
 
 /* Extract qw(...) word list from token stream starting after current position.
    Advances *pos past the closing ')'.  Returns list of words. */
+/* D127: a qw()/list export or import name may carry a leading & (or *)
+   sigil — an old-style "this is definitely a sub" marker Perl allows in
+   export lists, e.g. real Pod::Usage.pm's `our @EXPORT = qw(&pod2usage);`
+   — which is never part of the actual symbol name. Strip it so stored
+   export names and explicit import-list names compare equal to the
+   bareword form callers/importers actually use (`pod2usage`, not
+   `&pod2usage`). */
+static std::string stripExportSigil(const std::string &w) {
+    if (!w.empty() && (w[0] == '&' || w[0] == '*')) return w.substr(1);
+    return w;
+}
+
 static std::vector<std::string> extractQw(
         const std::vector<Token> &toks, size_t pos, size_t end)
 {
@@ -85,20 +97,20 @@ static std::vector<std::string> extractQw(
         if (toks[pos].kind == TK::QWORDS) {
             /* text is space-separated words */
             std::istringstream ss(toks[pos].text);
-            std::string w; while (ss >> w) words.push_back(w);
+            std::string w; while (ss >> w) words.push_back(stripExportSigil(w));
             return words;
         }
         if (toks[pos].kind == TK::LPAREN) {
             pos++;
             while (pos < end && toks[pos].kind != TK::RPAREN) {
                 if (toks[pos].kind == TK::IDENT || toks[pos].kind == TK::STRING)
-                    words.push_back(toks[pos].text);
+                    words.push_back(stripExportSigil(toks[pos].text));
                 pos++;
             }
             return words;
         }
         if (toks[pos].kind == TK::IDENT || toks[pos].kind == TK::STRING) {
-            words.push_back(toks[pos].text);
+            words.push_back(stripExportSigil(toks[pos].text));
             return words;  /* single unparenthesised name */
         }
         pos++;

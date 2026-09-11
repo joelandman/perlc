@@ -69,7 +69,7 @@ eval STRING and eval-defined subs see outer `my`).
 |----|--------|-------|
 | D54 | OPEN (tooling) | `perlc_tsan` hangs compiling `tests/threads.pl` (TSan+fork of clang-18). `TSAN_OPTIONS=die_after_fork=0` works around it. Not a generated-code bug. |
 | D101 | OPEN (correctness) | `each %hash` in scalar context returns the pair length (0/1/2), not the key. See below. |
-| D102 | OPEN (correctness) | `die REF` / `die $blessed_obj` loses the reference — `$@` becomes a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Breaks OO exception handling. See below. |
+| D102 | **FIXED** (2026-09-10) | `die REF` / `die $blessed_obj` lost the reference — `$@` became a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Broke OO exception handling. See below. |
 | D103 | OPEN (correctness, low freq.) | Integer overflow uses wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently go wrong or print in scientific notation instead of exact digits. See below. |
 | D104 | OPEN (missing syntax) | Indented heredoc `<<~IDENT` (Perl 5.26+) is not recognized by the lexer at all — hard parse error, not silent-wrong-data. See below. |
 | D106 | OPEN (correctness, narrow, found while fixing D105) | Same bug class as D105 but for a FLAT_ARRAY/FLOAT_PAIR ref read back out of an array/hash element (`$arr[0]`, `$h{k}`) rather than a plain scalar variable — a second alias made from that read doesn't see further writes. Deliberately not fixed alongside D105: the fix location (`case NK::ArrayElem`/`HashElem` in `emitExpr`) sits right next to the exact fast-path code that caused a segfault regression while fixing D105 (2D compound-assign, `llvm.assume(tag==FLAT_ARRAY)`). See below. |
@@ -82,14 +82,19 @@ eval STRING and eval-defined subs see outer `my`).
 | D112 | **FIXED** (2026-09-10) | `inlineModules()` (`src/main.cpp`) splices a `.pm`'s tokens directly into the main token stream with no lexical scope boundary — a module's file-scope `my $x` collided with the main script's `my $x` of the same name. See below. |
 | D113 | **FIXED** (2026-09-10) | No "unimplemented" signal: calling an undefined sub silently returned `undef` (real Perl: fatal `Undefined subroutine ... called`, exit 255) and an unresolvable `use Some::Module;` was silently dropped instead of erroring; `use lib`/`-I`/`PERL5LIB` weren't honored. See below. |
 | D114 | **FIXED** (2026-09-10) | Array slices `@x[LIST]` returned only one element when the subscript list was non-literal — a range (`@x[1..2]`) or an array variable (`@x[@i]`). Hash slices `@h{...}` already dispatched correctly for the equivalent cases; array slices weren't ported to the same dispatch. See below. |
-| D115 | OPEN (correctness, found 2026-09-10) | Bare `return;` in list context yields a 1-element list instead of Perl's empty list — breaks `my %h = (k => f())`-style "return nothing on failure" patterns. See below. |
+| D115 | **FIXED** (2026-09-10) | Bare `return;` in list context yielded a 1-element list instead of Perl's empty list — broke `my %h = (k => f())`-style "return nothing on failure" patterns. See below. |
+| D130 | OPEN (missing syntax, found 2026-09-10 while testing D115) | `if (my @arr = EXPR)` — a single ARRAY variable declared inline as an `if`/`while` condition — is a hard parse error ("unexpected token 'my'"). The equivalent list form `if (my (@a,@b) = ...)` was fixed under D100; this is the single-array-variable-with-no-parens-around-the-declaration-list case, which D100 didn't cover. See below. |
+| D131 | OPEN (correctness, found 2026-09-10 while testing D129) | `our $var;` declared inside a nested bare `{ }` block (not at file scope) doesn't work correctly — a named sub referencing that variable from outside the block sees nothing, even though the same code works fine when the `our` is at true file scope. See below. |
 | D116 | **FIXED** (2026-09-10, `__PACKAGE__`/`__FILE__`/`__LINE__` only) | `__PACKAGE__` / `__FILE__` / `__LINE__` were not implemented at all (hard parse error) despite `bless {...}, __PACKAGE__` being one of the most common OO-Perl idioms in CPAN modules. `__SUB__` (reference to the currently-executing sub) is intentionally not covered — harder, split off as **D124**. See below. |
 | D124 | OPEN (missing syntax, split off D116's `__SUB__` case, found 2026-09-10) | `__SUB__` (a reference to the currently-executing sub, needed for anonymous recursion — `use feature 'current_sub'`) is still a hard parse error. Needs codegen support for a reference to the current closure's own captures, not just a compile-time constant substitution like `__PACKAGE__`/`__LINE__`/`__FILE__`. See below. |
 | D117 | **FIXED** (2026-09-10) | `perl_atof_decimal` (`src/runtime.c`) was a hand-rolled decimal-string→float parser (manual digit accumulation plus a repeated-multiply exponent loop) instead of `strtod`, accumulating rounding error on ordinary decimal strings — every implicit string→number coercion goes through it. See below. |
 | D125 | OPEN (missing syntax, found 2026-09-10 while testing D117) | `use`/`no` pragma statements (`use strict;`, `no warnings 'numeric';`, etc.) are only recognized at the very top level of a file — nested inside a `sub {}` or a bare `{ }` block, they're a hard parse error ("unexpected token 'warnings'"/"'use'"). Root cause: the `use`/`no` handling (`src/parser.cpp:73`) lives in `parseProgram()`, not in the general `parseStmt()` every nested block/sub actually uses. See below. |
 | D118 | **FIXED** (2026-09-10) | `split` had no 3rd LIMIT argument at all (hard parse error, not just silently ignored) and didn't trim trailing empty fields from the result, unlike real Perl's default `split` behavior. See below. |
 | D126 | OPEN (correctness, found 2026-09-10 while testing D118) | `split(/(,)/, $str)` — a split pattern with a capturing group — doesn't include the captured delimiter text in the result the way real Perl does (`split(/(,)/, "a,b,c")` should give `("a", ",", "b", ",", "c")`, 5 elements; perlc gives `("a","b","c")`, 3). Pre-existing, confirmed unrelated to the D118 fix (reproduced on the pre-D118/D117 binary too). See below. |
-| D119 | OPEN (correctness, found 2026-09-10 while writing D111's test) | `scalar(keys %$href)` (keys on a deref'd hashref, in scalar context) returns `0` instead of the key count — `scalar(keys %h)` on a plain named hash and list-context `keys %$href` are both correct, so this is specific to the scalar-context + deref-hash combination. See below. |
+| D127 | **FIXED** (2026-09-10) | `scanExports()` stored an export name with a leading `&`/`*` sigil verbatim (e.g. real `Pod::Usage.pm`'s `our @EXPORT = qw(&pod2usage);`) instead of stripping it, so it never string-matched a plain `pod2usage` explicit import *or* an unqualified `pod2usage()` call after a bare `use Pod::Usage;`. High real-world impact — `pod2usage()` for `--help`/`--man` handling is one of the most common patterns in documented Perl CLI tools. See below. |
+| D129 | **FIXED** (2026-09-10) | `local($var) = EXPR;` — a parenthesized, single-variable list-form `local` — was a hard parse error ("expected $ but got '('"). Found in real, unmodified `Pod::Usage.pm` (`local($_) = shift;`). See below. |
+| D128 | OPEN (tooling/diagnostics, found 2026-09-10 real-module survey #2) | A parse error occurring *inside* an inlined module (`use Some::Module;`) is reported with a line number belonging to the wrong file (the main script's own line count at the point of inlining, not the module's internal line count) and no indication of which file the error is actually in — makes a real bug inside a `use`d module very hard to diagnose. Found via `corelist`/`podchecker` (both real system scripts) reporting implausibly early line numbers. See below. |
+| D119 | **FIXED** (2026-09-10) | `scalar(keys %$href)` (keys on a deref'd hashref, in scalar context) returned `0` instead of the key count — `scalar(keys %h)` on a plain named hash and list-context `keys %$href` were both correct, so this was specific to the scalar-context + deref-hash combination. See below. |
 | D110 | OPEN (correctness, found while implementing Data::Dumper; scope widened 2026-09-10) | `$Package::var` (an arbitrary fully-qualified global not declared via `our`) is not a true cross-scope global — it auto-vivifies as a plain variable in whatever scope first references it, so setting it at file scope is invisible from inside an unrelated `sub`. General bug, not module-specific; found via `$Data::Dumper::Sortkeys`. Widened 2026-09-10 while verifying D121: the same gap applies to `@Package::arr`/`%Package::hash` too, and more severely — an undeclared qualified array/hash doesn't just fail to cross scopes, whole-array/hash access (`my @c = @main::arr`, not just elements) returns nothing at all, vs. an `our`-declared array/hash (which works correctly, cross-package, today). See below. |
 | D99 | **FIXED** (2026-09-09) | `my @b = @a;` aliased storage — mutating `@b` mutated `@a`. Fixed in `src/codegen.cpp:4118-4149` (`case NK::My`, `isArr` branch): a borrowed pointer from `emitArrayPtr` (plain `@var`, `@$ref`, `->@*`) is now always copied into a fresh array via `perl_array_new`+`perl_array_extend`, instead of being declared directly as the new variable's backing store. Tests: `tests/d99_array_copy_smoke.pl`, `tests/d99_array_copy_deep.pl`. |
 | D100 | **FIXED** (2026-09-09) | List-assignment used as a boolean condition (`while (my ($k,$v)=...)`, `if ((...)=...)`) always evaluated false — loop/branch body never ran. Two stacked bugs, both fixed: (1) `case NK::Assign` (ArrayLit LHS) always returned a void/null PerlValue*; now returns `perl_array_len(rhsArr)` (real Perl's list-assignment-in-scalar-context semantics), which every existing consumer already handles correctly since `perl_array_len` was already a registered "owned temp". (2) The expression-context `my ($a,$b) = EXPR` parse wraps each variable as a bare `NK::My` node that `emitLValue()` didn't understand, so `$k`/`$v` stayed undef even once the loop iterated correctly; fixed by declaring `NK::My` LHS elements directly in the assignment loop, with `While` hoisting the one-time alloca before the loop (mirroring the existing single-variable `myCondPv` hoist) so a long-running loop doesn't re-execute an alloca (and leak stack) every iteration — verified with a 50k-iteration stress test. Tests: `tests/d100_list_assign_cond_smoke.pl`, `tests/d100_list_assign_cond_deep.pl`. |
@@ -357,23 +362,42 @@ exhausted. Masked in casual testing because a truthy 2 happens to make
 simple `while (each ...)` loops iterate the right *number* of times even
 though every `$k` is wrong.
 
-### D102 — `die REF` loses the reference (breaks OO exceptions)
+### D102 — `die REF` loses the reference (breaks OO exceptions) — **FIXED 2026-09-10**
 
 ```perl
 eval { die { code => 42 }; };
-print ref($@), "\n";      # perl: HASH   |   perlc: (empty)
-print "$@\n";              # perl: HASH(0x...)   |   perlc: HASH(0x...) at FILE line N.
+print ref($@), "\n";      # perl: HASH   |   was: (empty) (perlc, pre-fix)
+print "$@\n";              # perl: HASH(0x...)   |   was: HASH(0x...) at FILE line N. (pre-fix)
 ```
-Also confirmed with a blessed exception object
-(`die MyErr->new("oops")`) — `ref($@) && $@->isa('MyErr')` is false under
-perlc, so `$@->msg` is never called. `die` with a non-string reference is
-the standard Perl idiom for typed/OO exceptions (hand-rolled or
-`Exception::Class`-style); currently this pattern is completely broken —
-`$@` always ends up a plain string, and the `" at FILE line N."` suffix
-(which real Perl only appends to a *string* die lacking a trailing
-newline) gets appended even to a reference. Needs isolating in
-`perl_die`/the `eval` catch path in `src/runtime.c` — the thrown value's
-tag needs to be preserved into `$@` instead of always stringifying.
+
+Root cause (`src/runtime.c` `perl_die`, pre-fix): unconditionally called
+`perl_to_string_dup(msg)` at the very start regardless of `msg`'s tag,
+immediately losing reference identity for `die REF`/`die
+$blessed_obj` — the standard Perl idiom for typed/OO exceptions
+(hand-rolled or `Exception::Class`-style). Also wrongly appended the
+`" at FILE line N."` location suffix even to a reference — confirmed
+directly against real Perl that this suffix is *never* appended to a
+reference, at top level or inside `eval` alike (only a plain string
+message gets it).
+
+**Fix**: `perl_die` now checks whether `msg` is a reference (any of
+`PERL_REF_ARRAY`/`PERL_REF_HASH`/`PERL_REF_SCALAR`/`PERL_CODE_REF` —
+covers plain and blessed refs alike, since blessing only sets
+`blessed_class` alongside one of these tags, not a separate tag) before
+deciding how to handle it: a reference skips the location-suffix logic
+entirely and is assigned into `$@` via `perl_assign(&s_dollar_at, msg)`
+— the same primitive already used elsewhere for scalar globals, which
+already handles reference refcounting and `blessed_class` propagation
+correctly — instead of being stringified into a throwaway string first.
+The `$SIG{__DIE__}` handler now also receives the original reference
+(not a freshly-stringified copy) when one was thrown, matching real
+Perl's handler semantics. A plain string message (or no message at
+all) is completely unaffected — same stringify + location-suffix path
+as before. Verified against real Perl for: hashref, arrayref,
+scalarref, and a blessed object, plus regression checks that plain
+string dies (with and without a trailing newline) and a bare `die;`
+(defaults to `"Died"`) are unchanged. Tests:
+`tests/d102_die_ref_{smoke,deep}.pl`.
 
 ### D103 — integer overflow wraps instead of promoting (low frequency, but silent)
 
@@ -854,23 +878,109 @@ array-variable index lists, negative indices, a mixed literal+range
 slice, and the `@{$ref}[...]` deref-array form (a separate resolution
 branch from the plain-`@arr` case, same dispatch fix).
 
-### D115 — bare `return;` yields a 1-element list in list context
+### D115 — bare `return;` yields a 1-element list in list context — **FIXED 2026-09-10**
 
 ```perl
 sub f { return; }
 my @r = f();
-print scalar(@r), "\n";   # perl: 0   |  perlc: 1
+print scalar(@r), "\n";   # perl: 0   |  was: 1 (perlc, pre-fix)
 ```
 
-Breaks the common "return empty list to signal failure/no-result"
+Broke the common "return empty list to signal failure/no-result"
 contract, e.g. `if (my @r = f()) { ... }` or `my %h = (k => f())`
 (where `f()` returning nothing should leave the hash key absent, not
 map it to `undef`).
 
-**Fix shape:** codegen for a value-less `return` in list-call context
-needs to produce a genuinely empty list result (matching how `()`
-already behaves, if that's already correct) rather than defaulting to a
-1-element `(undef)` list.
+**Fix**: a value-less `return` in list-call context now produces a
+genuinely empty list (via `perl_array_to_list_return` on a freshly
+allocated empty array, selected at runtime by `wantarray` context, the
+same pattern `grep`/`map`/`sort`'s list-vs-scalar return already used)
+instead of defaulting to a 1-element `(undef)` list. Two things had to
+change together, both found the hard way:
+1. `case NK::Return` (`src/codegen.cpp`, statement-level) got the fix
+   directly.
+2. `emitBlockLast` has its **own separate, duplicate** copy of the same
+   return-value logic, used specifically when a `return` is the *last
+   statement of a sub body* (the overwhelmingly common shape for a
+   trivial `sub f { return; }`) — fixing only (1) left this exact,
+   most-common case still broken, since it never goes through
+   `case NK::Return` at all. Needed the identical fix applied there
+   too.
+3. `hasWantarrayOrUserCall()` (the static analysis that decides whether
+   a sub needs the caller's wantarray context pushed at all, as a perf
+   optimization for subs that never query it) didn't previously
+   consider a bare `return;` as something that reads that context —
+   only `return LIST_EXPR` and explicit `wantarray()` calls did. Since
+   the fix now makes bare `return;` read `perl_current_wantarray_ctx()`
+   at runtime, a sub whose only return is bare would have
+   `currentSubNeedsWantarray_` staying false, meaning the caller never
+   pushes a real context and the runtime read sees stale/wrong state.
+   Added `NK::Return && !n.left` to that analysis.
+
+Verified against real Perl for: a sub whose sole statement is a bare
+return, a bare return reached via a conditional (not the literal last
+statement), scalar-context `f()` (still plain undef, unaffected),
+nested propagation through a wrapper sub, and boolean/if-context list
+assignment. Tests: `tests/d115_bare_return_list_{smoke,deep}.pl`.
+
+Found while writing this fix's test, not fixed (unrelated pre-existing
+gap): **D130** — `if (my @arr = EXPR)` (a single array variable
+declared inline as an `if`/`while` condition, no parens around the
+declaration) is a hard parse error.
+
+### D130 — `if (my @arr = EXPR)` (single array var, no parens) is a parse error
+
+```perl
+sub f { return (1,2); }
+if (my @r = f()) { print "true\n"; } else { print "false\n"; }
+# perl:  true
+# perlc: Error: Parse error line 2: unexpected token 'my'
+```
+
+Found while writing D115's deep test. D100 already fixed
+`while (my ($k,$v) = each %h)`-style parenthesized-list-form `my (...)
+= EXPR` as a boolean condition — this is the *unparenthesized
+single-array-variable* form (`my @arr = EXPR`, no `(...)` around the
+declaration at all), which D100's fix didn't cover since it's a
+structurally different AST shape (a plain `NK::My` array declaration,
+not an `ArrayLit`-wrapped list). `if`/`while`'s condition-parsing likely
+only special-cased the `my (LIST) = EXPR` shape D100 targeted, not a
+bare `my @name = EXPR` used directly as a condition.
+
+**Fix shape:** extend the `if`/`while` condition parser's `my`-as-
+condition special-casing to also accept `my @name = EXPR` /
+`my %name = EXPR` (single array/hash declaration, no parens) the same
+way it already accepts the parenthesized multi-variable list form —
+likely a small addition next to D100's existing fix, reusing the same
+downstream boolean-context evaluation (an array/hash in boolean context
+is already correctly falsy-when-empty via existing scalar-context
+count logic).
+
+### D131 — `our $var;` inside a nested block doesn't work correctly
+
+```perl
+{
+    our $result;
+    sub foo { local($_) = shift; $result = $_; }
+    foo("hi");
+    print "$result\n";
+}
+# perl:  hi
+# perlc: (nothing printed)
+```
+
+Found while writing D129's deep test — moving the exact same code from
+true file scope into a nested bare `{ }` block breaks it entirely (at
+file scope, this identical code works correctly). Likely related to
+D110/D112's package-global-storage architecture (both about `our`/
+package-qualified variables not being true, scope-independent globals
+in every case) — `our` inside a block probably isn't recognized as
+"file-scope enough" to get the same global-storage treatment a
+top-level `our` gets, so the sub's write and the block's later read
+end up targeting different storage. Not investigated further given
+time budget; flagged for whoever picks up D110/D112-adjacent work
+next, since it's likely the same root cause wearing a different
+trigger condition.
 
 ### D116 — `__PACKAGE__`/`__FILE__`/`__LINE__` unimplemented — **FIXED 2026-09-10** (`__SUB__` split off as D124)
 
@@ -1085,34 +1195,172 @@ surrounding fields. Confined to `perl_split_regex`'s regex path; the
 plain-string/whitespace-separator path in `perl_split` has no
 capturing-group concept at all, so it's unaffected by design.
 
-### D119 — `scalar(keys %$href)` returns 0 instead of the key count
+### D127 — `scanExports()` doesn't strip a leading `&`/`*` sigil from an export name — **FIXED 2026-09-10**
+
+```perl
+# real Pod::Usage.pm (unmodified):
+our @EXPORT = qw(&pod2usage);
+```
+```perl
+use Pod::Usage;
+pod2usage(1);
+# perl:  works
+# was:   Undefined subroutine &main::pod2usage called ...  (perlc, pre-fix)
+```
+
+Found via the 2026-09-10 real-module survey #2 (`pod2man`, `pod2text`,
+`podchecker` — all real, unmodified system scripts). Real
+`Pod::Usage.pm` declares its one export with an explicit leading `&`
+sigil (an old-style "this is definitely a sub" marker, valid inside a
+`qw()` export list) — `our @EXPORT = qw(&pod2usage);`. `scanExports()`'s
+`extractQw()` (`src/main.cpp`) stored the token text verbatim, so the
+registered export name was literally `"&pod2usage"`, not `"pod2usage"`.
+This broke **both** forms:
+- An explicit `use Pod::Usage qw(pod2usage);` failed D26's
+  exported-name validation ("pod2usage" is not exported by the
+  Pod::Usage module") because `"pod2usage" != "&pod2usage"`.
+- A bare `use Pod::Usage;` (relying on the default `@EXPORT`) never
+  populated `importMap["pod2usage"]` at all — only the nonsensical
+  `importMap["&pod2usage"]` — so an unqualified `pod2usage(...)` call
+  was simply undefined, hitting D113's die.
+
+**Fix** (`src/main.cpp` `extractQw()`, used by both `scanExports()` and
+the explicit-import-list extraction): new `stripExportSigil()` helper
+strips a leading `&` or `*` from every word `extractQw()` returns,
+applied uniformly across all three of its extraction paths (`qw(...)`,
+parenthesized bareword/string list, and a single unparenthesised name)
+so both export declarations and explicit import lists are covered the
+same way. Verified against a local fixture reproducing Pod::Usage.pm's
+exact declaration shape (`our @EXPORT = qw(&name); our @EXPORT_OK =
+qw(&name2);`), for both the default-`@EXPORT` bare-`use` path and an
+explicit `@EXPORT_OK` import — and directly against the real,
+unmodified `Pod::Usage.pm` (pointing `-I` at a real Perl install): the
+"not exported" false-rejection is gone, and compilation now progresses
+past `Pod::Usage`'s own export declaration entirely (into a separate,
+newly-found bug inside the module's own body — **D129**, logged below,
+not fixed). Tests: `tests/d127_amp_export_{smoke,deep}.pl` +
+`tests/lib/D127AmpExport.pm`, `tests/lib/D127AmpExportOk.pm`.
+
+### D129 — `local($var) = EXPR;` (parenthesized single-var local) is a parse error — **FIXED 2026-09-10**
+
+```perl
+sub foo {
+    local($_) = shift;
+    print "$_\n";
+}
+foo("hi");
+# perl:  hi
+# was:   Error: Parse error line 2: expected $ but got '('  (perlc, pre-fix)
+```
+
+Found while re-verifying D127 against the real, unmodified
+`Pod::Usage.pm` (line 41: `local($_) = shift;`, the exact idiom this
+repro uses) — pointing `-I` at a real Perl install and compiling past
+D127's now-fixed export declaration reached this as the next blocker.
+`local $x = EXPR;` (no parens) already worked; it was specifically the
+parenthesized, list-form `local(...)` — single- or multi-variable —
+that failed to parse, since `local`'s statement parser only ever
+expected a bare sigil-variable token immediately after the keyword,
+never an opening paren.
+
+**Fix** (`src/parser.cpp`): added a `local(VAR, VAR, ...) = EXPR`
+branch that desugars exactly like `parseMy()`'s identical `my (...)`
+list form just above it in the same file — a `FlatBlock` of
+per-variable local-decl statements (`NK::LocalStmt`/`LocalArray`/
+`LocalHash`, no assignment on each), followed by one `NK::Assign` whose
+LHS is an `ArrayLit` of the now-localized variables. This reuses the
+exact same, already-tested list-assignment codegen path `my (...)`
+already uses (including D100's boolean-context fix), so **no codegen
+changes were needed at all** — purely a parser-level fix. Handles the
+single-variable case from the real-world repro and the general
+multi-variable list form (`local($a, $b) = (...)`) uniformly, plus
+`local(@arr)`/`local(%hash)` single-array/hash-variable parenthesized
+forms. Verified against real Perl for all of these, including dynamic-
+scope restoration after the enclosing sub returns. Tests:
+`tests/d129_local_paren_{smoke,deep}.pl`.
+
+Found while writing this fix's test, not fixed (unrelated pre-existing
+gap): **D131** — `our $var;` declared inside a nested bare `{ }` block
+doesn't work correctly (a sub referencing it from outside the block
+sees nothing), even though identical code at true file scope works
+fine.
+
+### D128 — a parse error inside an inlined module reports the wrong line/file
+
+```perl
+# corelist (real, unmodified, 148-line-equivalent main script logic,
+# but pulls in the large generated Module::CoreList.pm via `use`):
+# perlc: Error: Parse error line 3: unexpected token 'warnings'
+#        (the real `use warnings;` in the main script is at line 152;
+#        line 3 is nowhere near any "warnings" token at all)
+```
+
+Found via the 2026-09-10 real-module survey #2. `corelist` and
+`podchecker` (both real, unmodified system scripts) each produce a
+parse error whose reported line number is implausibly small relative
+to where the actual `use`/`no warnings`-adjacent tokens are — for
+`podchecker` (148 lines in the main script), the reported line is 545,
+which can only belong to an inlined module's own internal line
+numbering (`Pod::Checker.pm`, in that case). Root cause: `inlineModules`
+(`src/main.cpp`) splices each module's own token stream (lexed
+independently, with its own 1-based line counter) directly into the
+combined stream with no offset adjustment and no filename tag —
+downstream parse errors report whatever line number happened to be
+attached to the offending token, which is meaningless once multiple
+files' token streams have been concatenated, and never say which file
+is actually at fault.
+
+**Impact:** not a correctness bug in generated code — a diagnostics/DX
+problem — but a real one: it makes any parse failure that originates
+inside a `use`d module (as opposed to the main script) very hard to
+track down, since the reported location actively misleads rather than
+just being silent. Low priority relative to correctness defects, but
+worth fixing before CPAN-module support scales up further, since
+inlined-module parse failures will only get more common as more real
+modules are pulled in.
+
+**Fix shape:** larger than a one-line tweak — `inlineModules` needs to
+tag each spliced-in module's tokens with which file they came from
+(and either keep each module's own line numbers distinct from the main
+file's, e.g. via a `(file, line)` pair instead of a bare `int`, or
+prefix error messages with the originating filename when a token from
+an inlined module triggers a parse error). Touches the `Token`
+representation and every place that currently assumes a bare
+line-number int is enough to identify a source location.
+
+### D119 — `scalar(keys %$href)` returns 0 instead of the key count — **FIXED 2026-09-10**
 
 ```perl
 my %h = (a=>1, b=>2, c=>3);
 print scalar(keys %h), "\n";       # perl: 3  |  perlc: 3  (correct)
 my $href = \%h;
-print scalar(keys %$href), "\n";   # perl: 3  |  perlc: 0  (wrong)
+print scalar(keys %$href), "\n";   # perl: 3  |  was: 0 (perlc, pre-fix)
 ```
 
 Found while writing D111's deep test (`{ %args, extra=>1 }` merge —
 unrelated to the merge itself; a plain `\%h` reproduces it too). List-
-context `keys %$href` (e.g. `my @k = keys %$href;`) is correct — only
-the scalar-context form is wrong.
+context `keys %$href` (e.g. `my @k = keys %$href;`) was already
+correct — only the scalar-context form was wrong.
 
 Root cause (`src/codegen.cpp`, `case NK::KeysFunc` in `emitExpr` — the
 scalar-context path): `Value *hv = lookupHash(n.name);` only ever
-resolves a *named* hash variable (`n.name`); it has no handling at all
+resolved a *named* hash variable (`n.name`); it had no handling at all
 for the deref form (`n.left` set, `n.name` empty) the way
 `emitArrayPtr`'s own `NK::KeysFunc` case (used for list context) already
 does (`if (n.left) { ... perl_deref_hash ... }`). For `keys %$href`,
-`n.name` is empty, so `lookupHash("")` returns null and the function
-falls through to `return perlInt(0)`.
+`n.name` is empty, so `lookupHash("")` returned null and the function
+fell through to `return perlInt(0)`.
 
-**Fix shape:** small, mechanical — port `emitArrayPtr`'s existing
-`n.left` deref-hash handling into `emitExpr`'s scalar-context
-`KeysFunc` case (and check whether `NK::ValuesFunc`'s scalar-context
-case right below it has the identical gap for `values %$href` — it has
-the same `lookupHash(n.name)`-only shape).
+**Fix**: ported `emitArrayPtr`'s existing `n.left` deref-hash handling
+into `emitExpr`'s scalar-context `KeysFunc` case. `NK::ValuesFunc`'s
+scalar-context case right below it had the identical
+`lookupHash(n.name)`-only gap (`values %$href` in scalar context, same
+symptom) — fixed identically. Verified against real Perl for `%$href`
+and `%{$href}` forms of both `keys` and `values`, boolean context
+(`if (keys %$href)`), a deref through a sub-call return value
+(`keys %{ get_href() }`), and confirmed named-hash and list-context
+deref usage stayed correct (unaffected by this fix). Tests:
+`tests/d119_keys_deref_scalar_{smoke,deep}.pl`.
 
 ### D109 — `s///` replacement text doesn't interpolate variables — **FIXED 2026-09-10**
 
@@ -1354,6 +1602,31 @@ internal pattern matching) — `json_pp` hit a distinct, not-yet-
 diagnosed parse error inside real `JSON::PP.pm` itself (`unexpected
 token ';'`, line number not resolved — `JSON::PP.pm` is large and
 complex; worth a dedicated follow-up pass rather than more probing here).
+
+## 2026-09-10 CPAN-module compile survey #2
+
+Second batch: 11 real, unmodified Debian `/usr/bin` scripts targeting
+modules not covered by survey #1 — `Pod::Usage`, `Pod::Checker`,
+`Encode`, `File::Copy`, `Storable`, `Module::CoreList`,
+`LWP::Simple`/`LWP::UserAgent`, `WWW::Mechanize` — `pod2man`,
+`pod2text`, `podchecker`, `encguess`, `corelist`, `GET`, `HEAD`,
+`lwp-mirror`, `mech-dump`, `dh_installchangelogs`.
+
+| Module / script | Status | Root cause | Blast radius | Priority |
+|---|---|---|---|---|
+| `Pod::Usage` (`pod2man`, `pod2text`, `podchecker`) | Failing | **D127** — `&pod2usage`-sigil export name breaks `scanExports()`'s match, for both explicit-import and bare-`use` forms | High — `pod2usage()` for `--help`/`--man` is ubiquitous in documented CLI scripts | **High** — small, mechanical |
+| `Encode` `:fallbacks` tag (`encguess`) | Failing | `%EXPORT_TAGS` isn't recognized by `scanExports()` at all — confirms the already-logged `use Foo qw(:all)` missing-feature item with a concrete real-world hit | Medium — tag-style imports are common across many modules | Medium — bigger than D127, needs `%EXPORT_TAGS` parsing + tag expansion |
+| `File::Copy` (10 real scripts use it) | Failing | Not implemented — `Can't locate File/Copy.pm` | High — `copy`/`move` is extremely common in install/build/cleanup scripts, same genre as `File::Path` | High — add to the Tier 1 CPAN candidate list in `MVP_ROADMAP.md` |
+| `Storable::dclone` | Failing (loud, as designed) | Confirmed unimplemented; dies cleanly via D113 | Medium — matches existing Tier 2 roadmap item, no new information | Unchanged |
+| `Module::CoreList` (`corelist`) | Failing | **D128** — parse error inside the inlined module reported at a main-script line number | Low direct (build-tooling-specific module); **D128 itself is general** | Low for the module; Medium for D128 |
+| `Pod::Checker` (`podchecker`) | Failing | Same D128 symptom — reported line 545 in a 148-line main script | Low-Medium | Low (module-specific) |
+| `LWP::Simple`/`LWP::UserAgent` (`GET`, `HEAD`, `lwp-mirror`) | Failing | Missing `URI::Heuristic` + the wider LWP stack | Low for this project's sysadmin/CLI profile | Low — consistent with the existing "deprioritize heavy/web-framework-shaped modules" stance |
+| `WWW::Mechanize` (`mech-dump`) | Failing | Missing entirely (CPAN, not core) | Low | Low |
+| `Debian::Debhelper::Dh_Lib` (`dh_installchangelogs`) | Failing | Already-known Debian-internal module | N/A | Skip (already deprioritized) |
+
+`File::Copy` should be added to `MVP_ROADMAP.md`'s Tier 1 CPAN-module
+candidate list (higher real-world hit count in this sample than
+`File::Find` was when it was added).
 
 ## Source layout
 

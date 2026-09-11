@@ -376,6 +376,68 @@ NodePtr Parser::parseStmt() {
     }
     if (check(TK::KW_LOCAL)) {
         advance(); /* consume 'local' */
+        /* D129: local(VAR, VAR, ...) = EXPR — parenthesized list-form
+           local, including the single-variable case (`local($_) =
+           shift;`, found verbatim in real, unmodified Pod::Usage.pm).
+           Desugars exactly like parseMy()'s identical `my (...)` list
+           form just above: a FlatBlock of per-variable local-decl
+           statements (no assignment on each), followed by one
+           NK::Assign whose LHS is an ArrayLit of the now-localized
+           variables — reusing the same, already-tested list-assignment
+           codegen path `my (...)` uses (including D100's fix), so no
+           codegen changes are needed here at all. */
+        if (check(TK::LPAREN)) {
+            advance();
+            struct LocalVarDecl { std::string sigil; std::string name; };
+            std::vector<LocalVarDecl> allVars;
+            while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                if (check(TK::ARRAY)) { advance(); allVars.push_back({"@", cur().text}); advance(); }
+                else if (check(TK::HASH)) { advance(); allVars.push_back({"%", cur().text}); advance(); }
+                else if (check(TK::SCALAR)) { advance(); allVars.push_back({"$", cur().text}); advance(); }
+                else { advance(); continue; }
+                if (!match(TK::COMMA)) break;
+            }
+            consume(TK::RPAREN, ")");
+            NodePtr rhs;
+            if (match(TK::ASSIGN)) rhs = parseLowNot();
+            consumeLowOrChain();
+            match(TK::SEMI);
+            NodeList stmts;
+            for (auto &vd : allVars) {
+                auto decl = std::make_unique<Node>(); decl->line = line;
+                decl->name = vd.name;
+                if (vd.sigil == "@") decl->kind = NK::LocalArray;
+                else if (vd.sigil == "%") decl->kind = NK::LocalHash;
+                else decl->kind = NK::LocalStmt;
+                stmts.push_back(std::move(decl));
+            }
+            if (rhs) {
+                NodeList lhsList;
+                for (auto &vd : allVars) {
+                    if (vd.sigil == "@") {
+                        auto av = std::make_unique<Node>(); av->kind = NK::ArrayVar;
+                        av->name = vd.name; av->line = line;
+                        lhsList.push_back(std::move(av));
+                    } else if (vd.sigil == "%") {
+                        auto hv = std::make_unique<Node>(); hv->kind = NK::HashVar;
+                        hv->name = vd.name; hv->line = line;
+                        lhsList.push_back(std::move(hv));
+                    } else {
+                        lhsList.push_back(makeScalar(vd.name, line));
+                    }
+                }
+                auto lhsArr = std::make_unique<Node>(); lhsArr->kind = NK::ArrayLit;
+                lhsArr->args = std::move(lhsList); lhsArr->line = line;
+                auto asgn = std::make_unique<Node>(); asgn->kind = NK::Assign;
+                asgn->left = std::move(lhsArr); asgn->right = std::move(rhs); asgn->line = line;
+                auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt;
+                es->left = std::move(asgn); es->line = line;
+                stmts.push_back(std::move(es));
+            }
+            auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock;
+            fb->args = std::move(stmts); fb->line = line;
+            return fb;
+        }
         if (check(TK::ARRAY)) {  /* local @arr */
             advance();
             std::string arrName = cur().text; advance();

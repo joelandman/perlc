@@ -3965,6 +3965,12 @@ static bool hasWantarrayOrUserCall(const Node &n) {
             lk == NK::GrepFunc || lk == NK::SortFunc || lk == NK::DerefArray ||
             lk == NK::ReverseFunc) return true;
     }
+    /* D115: bare `return;` (no expression) also reads the wantarray
+       stack now, to decide between an empty list and undef — without
+       this, currentSubNeedsWantarray_ stays false for a sub whose only
+       return is bare, so the caller never pushes a real context and
+       perl_current_wantarray_ctx() reads stale/wrong state inside it. */
+    if (n.kind == NK::Return && !n.left) return true;
     /* implicit list return from grep/map/sort also reads wantarray stack */
     if (n.kind == NK::MapFunc || n.kind == NK::GrepFunc ||
         n.kind == NK::SortFunc) return true;
@@ -4170,10 +4176,24 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                 } else {
                     result = callRT("perl_array_to_list_return", {av});
                 }
+            } else if (!work->left) {
+                /* D115: bare `return;` as a sub's last (only) statement
+                   goes through this emitBlockLast-specific duplicate of
+                   case NK::Return's logic, not emitStmt's — must get the
+                   identical empty-list-in-list-context fix, or a sub
+                   whose sole statement is `return;` keeps the old
+                   1-element-undef-list bug regardless of the emitStmt
+                   fix above. */
+                Value *emptyAv = callRT("perl_array_new", {});
+                Value *listResult = callRT("perl_array_to_list_return", {emptyAv});
+                auto *i32Ty = Type::getInt32Ty(ctx_);
+                Value *ctx = callRT("perl_current_wantarray_ctx", {});
+                Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
+                result = builder_.CreateSelect(isList, listResult, perlUndef());
             } else {
                 int savedCtx = callCtx_;
                 callCtx_ = -1; /* D87: return EXPR inherits caller context */
-                result = work->left ? emitExpr(*work->left) : perlUndef();
+                result = emitExpr(*work->left);
                 callCtx_ = savedCtx;
             }
         } else {
@@ -5441,10 +5461,24 @@ void CodeGen::emitStmt(const Node &n) {
             } else {
                 v = callRT("perl_array_to_list_return", {av});
             }
+        } else if (!n.left) {
+            /* D115: bare `return;` must yield an empty LIST in list
+               context (real Perl: `my @r = f();` with `sub f { return;
+               }` gives `scalar(@r) == 0`), not a 1-element (undef) list
+               — scalar/void context still gets plain undef. Checked at
+               runtime the same way the grep/map/sort list-producing
+               branch above does, since the caller's context isn't known
+               at compile time here. */
+            Value *emptyAv = callRT("perl_array_new", {});
+            Value *listResult = callRT("perl_array_to_list_return", {emptyAv});
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *ctx = callRT("perl_current_wantarray_ctx", {});
+            Value *isList = builder_.CreateICmpEQ(ctx, ConstantInt::get(i32Ty, 1));
+            v = builder_.CreateSelect(isList, listResult, perlUndef());
             } else {
                 int savedCtx = callCtx_;
                 callCtx_ = -1; /* D87: return EXPR inherits caller context */
-                v = n.left ? emitExpr(*n.left) : perlUndef();
+                v = emitExpr(*n.left);
                 callCtx_ = savedCtx;
             }
         /* `return` inside eval{} exits just that eval block with this value
@@ -7517,6 +7551,17 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::KeysFunc: {
+        /* D119: keys %$href / keys %{$href} in scalar context — n.name is
+           empty for the deref form, so lookupHash(n.name) always missed
+           and this fell straight to perlInt(0). Mirrors emitArrayPtr's
+           identical n.left handling for keys in list context, which
+           already worked correctly. */
+        if (n.left) {
+            Value *ref = emitExpr(*n.left);
+            Value *h   = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+            return callRT("perl_hash_size", {h});
+        }
         if (n.name == "+") {
             Value *av = callRT("perl_plus_hash_keys", {});
             return callRT("perl_array_len", {av});
@@ -7528,6 +7573,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ValuesFunc: {
+        /* D119: values %$href / values %{$href} in scalar context — same
+           gap and fix as KeysFunc above. */
+        if (n.left) {
+            Value *ref = emitExpr(*n.left);
+            Value *h   = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+            return callRT("perl_hash_size", {h});
+        }
         Value *hv = lookupHash(n.name);
         return hv ? callRT("perl_hash_size", {hv}) : perlInt(0);
     }
