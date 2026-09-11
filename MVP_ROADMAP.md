@@ -102,7 +102,7 @@ once, not one.
 
 ### Tier 2 — genuine but narrow (post-MVP is fine)
 
-D106 (narrow FLAT_ARRAY re-alias variant), D108 (`\f\a\e\b` in plain strings), D101 (`each` scalar context), D103 (2^63 overflow), D117 (`perl_atof_decimal` hand-rolled parser — real, but Tier-0-adjacent since it underlies every string→number coercion; fix opportunistically alongside D111/D114, not urgent on its own), D118 (`split` LIMIT + trailing-empty trim — same "fix before building JSON/CSV on top of it" reasoning as D117).
+D106 (narrow FLAT_ARRAY re-alias variant), D108 (`\f\a\e\b` in plain strings), D101 (`each` scalar context), D103 (2^63 overflow), ~~D117~~ (FIXED — `perl_atof_decimal` hand-rolled parser → `strtod`), ~~D118~~ (FIXED — `split` LIMIT + trailing-empty trim; found D126, a separate capturing-group-in-split-pattern bug, while testing).
 
 ### Architectural gap bigger than any single D-number: no Exporter/`@EXPORT`
 
@@ -184,13 +184,18 @@ existing "Full XS/DynaLoader" non-goal in CLAUDE.md.
 
 ## Runtime correctness gaps (fix alongside Tier 0, before building on top)
 
-- **D117** — `perl_atof_decimal` is a hand-rolled digit-accumulation
-  parser (plus a repeated-multiply exponent loop) instead of `strtod`;
-  accumulates rounding error on *ordinary* decimal strings, not just
-  edge cases. Every implicit string→number coercion goes through it.
-- **D118** — `split` has no LIMIT argument (codegen never passes a 3rd
-  arg) and doesn't trim trailing empty fields, unlike Perl's default.
-  Both are prerequisites for trustworthy JSON/CSV work later.
+- ~~**D117**~~ — **FIXED 2026-09-10.** Was a hand-rolled digit-
+  accumulation parser (plus a repeated-multiply exponent loop) instead
+  of `strtod`; now scans the same decimal-only prefix and hands it to
+  `strtod`. Also picked up `Inf`/`Infinity`/`NaN` string-coercion
+  support (previously silently `0`). Split off **D125** (found while
+  testing — `use`/`no` pragmas only parse at file top-level).
+- ~~**D118**~~ — **FIXED 2026-09-10.** Was worse than described: the
+  LIMIT argument was a hard *parse error*, not silently dropped. Both
+  it and trailing-empty-trim are fixed, ahead of the JSON/CSV work they
+  were prerequisites for. Found **D126** (split with a capturing-group
+  pattern doesn't include the captures — pre-existing, unrelated to
+  LIMIT/trim) while testing.
 
 ## MVP definition
 

@@ -479,7 +479,7 @@ void CodeGen::declareRuntime() {
     RT("perl_substr2",  pv,   pv, pv);
     RT("perl_substr3",  pv,   pv, pv, pv);
     RT("perl_join",     pv,   pv, av);
-    RT("perl_split",    av,   pv, pv);
+    RT("perl_split",    av,   pv, pv, i64);
     RT("perl_pack",           pv, pv, av);
     RT("perl_unpack",         pv, pv, pv);
     RT("perl_unpack_to_array", av, pv, pv);
@@ -641,7 +641,7 @@ void CodeGen::declareRuntime() {
     RT("perl_regex_subst",     i64, pv, i8p, i8p, i8p);
     RT("perl_regex_subst_e",   i64, pv, i8p, i8p, i8p, av);
     RT("perl_capture",         pv,  i64);
-    RT("perl_split_regex",     av,  i8p, i8p, pv);
+    RT("perl_split_regex",     av,  i8p, i8p, pv, i64);
     /* OOP */
     RT("perl_bless",                   pv,     pv, pv);
     RT("perl_register_method",         voidTy, i8p, i8p);
@@ -1160,13 +1160,17 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     }
     if (n.kind == NK::SplitFunc) {
         Value *str = n.right ? emitExpr(*n.right) : perlUndef();
+        /* D118: optional 3rd LIMIT argument, stored in n.args[0] if given. */
+        Value *limit = n.args.empty()
+            ? ConstantInt::get(Type::getInt64Ty(ctx_), 0, true)
+            : callRT("perl_to_int", {emitExpr(*n.args[0])});
         if (n.ival) {
             Value *pat = builder_.CreateGlobalStringPtr(n.sval, "sp_pat");
             Value *flg = builder_.CreateGlobalStringPtr(n.name, "sp_flg");
-            return callRT("perl_split_regex", {pat, flg, str});
+            return callRT("perl_split_regex", {pat, flg, str, limit});
         }
         Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
-        return callRT("perl_split", {sep, str});
+        return callRT("perl_split", {sep, str, limit});
     }
     /* unpack(FORMAT, EXPR) in list context — D67 */
     if (n.kind == NK::UnpackFunc) {
@@ -7479,13 +7483,17 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::SplitFunc: {
         Value *str = n.right ? emitExpr(*n.right) : perlUndef();
+        /* D118: optional 3rd LIMIT argument, stored in n.args[0] if given. */
+        Value *limit = n.args.empty()
+            ? ConstantInt::get(Type::getInt64Ty(ctx_), 0, true)
+            : callRT("perl_to_int", {emitExpr(*n.args[0])});
         if (n.ival) {  /* regex split */
             Value *pat = builder_.CreateGlobalStringPtr(n.sval, "sp_pat");
             Value *flg = builder_.CreateGlobalStringPtr(n.name, "sp_flg");
-            return callRT("perl_split_regex", {pat, flg, str});
+            return callRT("perl_split_regex", {pat, flg, str, limit});
         }
         Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
-        return callRT("perl_split", {sep, str});
+        return callRT("perl_split", {sep, str, limit});
     }
 
     case NK::HashVar: {

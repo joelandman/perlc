@@ -85,8 +85,10 @@ eval STRING and eval-defined subs see outer `my`).
 | D115 | OPEN (correctness, found 2026-09-10) | Bare `return;` in list context yields a 1-element list instead of Perl's empty list — breaks `my %h = (k => f())`-style "return nothing on failure" patterns. See below. |
 | D116 | **FIXED** (2026-09-10, `__PACKAGE__`/`__FILE__`/`__LINE__` only) | `__PACKAGE__` / `__FILE__` / `__LINE__` were not implemented at all (hard parse error) despite `bless {...}, __PACKAGE__` being one of the most common OO-Perl idioms in CPAN modules. `__SUB__` (reference to the currently-executing sub) is intentionally not covered — harder, split off as **D124**. See below. |
 | D124 | OPEN (missing syntax, split off D116's `__SUB__` case, found 2026-09-10) | `__SUB__` (a reference to the currently-executing sub, needed for anonymous recursion — `use feature 'current_sub'`) is still a hard parse error. Needs codegen support for a reference to the current closure's own captures, not just a compile-time constant substitution like `__PACKAGE__`/`__LINE__`/`__FILE__`. See below. |
-| D117 | OPEN (correctness, found 2026-09-10) | `perl_atof_decimal` (`src/runtime.c`) is a hand-rolled decimal-string→float parser (manual digit accumulation plus a repeated-multiply exponent loop) instead of `strtod`, accumulating rounding error on ordinary decimal strings — every implicit string→number coercion goes through it. See below. |
-| D118 | OPEN (correctness, found 2026-09-10) | `split` has no 3rd LIMIT argument (codegen only ever passes 2 args) and doesn't trim trailing empty fields from the result, unlike real Perl's default `split` behavior. See below. |
+| D117 | **FIXED** (2026-09-10) | `perl_atof_decimal` (`src/runtime.c`) was a hand-rolled decimal-string→float parser (manual digit accumulation plus a repeated-multiply exponent loop) instead of `strtod`, accumulating rounding error on ordinary decimal strings — every implicit string→number coercion goes through it. See below. |
+| D125 | OPEN (missing syntax, found 2026-09-10 while testing D117) | `use`/`no` pragma statements (`use strict;`, `no warnings 'numeric';`, etc.) are only recognized at the very top level of a file — nested inside a `sub {}` or a bare `{ }` block, they're a hard parse error ("unexpected token 'warnings'"/"'use'"). Root cause: the `use`/`no` handling (`src/parser.cpp:73`) lives in `parseProgram()`, not in the general `parseStmt()` every nested block/sub actually uses. See below. |
+| D118 | **FIXED** (2026-09-10) | `split` had no 3rd LIMIT argument at all (hard parse error, not just silently ignored) and didn't trim trailing empty fields from the result, unlike real Perl's default `split` behavior. See below. |
+| D126 | OPEN (correctness, found 2026-09-10 while testing D118) | `split(/(,)/, $str)` — a split pattern with a capturing group — doesn't include the captured delimiter text in the result the way real Perl does (`split(/(,)/, "a,b,c")` should give `("a", ",", "b", ",", "c")`, 5 elements; perlc gives `("a","b","c")`, 3). Pre-existing, confirmed unrelated to the D118 fix (reproduced on the pre-D118/D117 binary too). See below. |
 | D119 | OPEN (correctness, found 2026-09-10 while writing D111's test) | `scalar(keys %$href)` (keys on a deref'd hashref, in scalar context) returns `0` instead of the key count — `scalar(keys %h)` on a plain named hash and list-context `keys %$href` are both correct, so this is specific to the scalar-context + deref-hash combination. See below. |
 | D110 | OPEN (correctness, found while implementing Data::Dumper; scope widened 2026-09-10) | `$Package::var` (an arbitrary fully-qualified global not declared via `our`) is not a true cross-scope global — it auto-vivifies as a plain variable in whatever scope first references it, so setting it at file scope is invisible from inside an unrelated `sub`. General bug, not module-specific; found via `$Data::Dumper::Sortkeys`. Widened 2026-09-10 while verifying D121: the same gap applies to `@Package::arr`/`%Package::hash` too, and more severely — an undeclared qualified array/hash doesn't just fail to cross scopes, whole-array/hash access (`my @c = @main::arr`, not just elements) returns nothing at all, vs. an `our`-declared array/hash (which works correctly, cross-package, today). See below. |
 | D99 | **FIXED** (2026-09-09) | `my @b = @a;` aliased storage — mutating `@b` mutated `@a`. Fixed in `src/codegen.cpp:4118-4149` (`case NK::My`, `isArr` branch): a borrowed pointer from `emitArrayPtr` (plain `@var`, `@$ref`, `->@*`) is now always copied into a fresh array via `perl_array_new`+`perl_array_extend`, instead of being declared directly as the new variable's backing store. Tests: `tests/d99_array_copy_smoke.pl`, `tests/d99_array_copy_deep.pl`. |
@@ -954,39 +956,134 @@ recursion idioms; much less common than the other three dunders in
 real-world code, so left open rather than risking a subtly-wrong
 capture-sharing implementation under time pressure.
 
-### D117 — `perl_atof_decimal` hand-rolled string→float parser
+### D117 — `perl_atof_decimal` hand-rolled string→float parser — **FIXED 2026-09-10**
 
-`src/runtime.c:1496-1532`. Every implicit string→number coercion
-(`"3.14" + 0`, numeric comparisons on strings) goes through a manual
-digit-accumulation parser (`result = result*10 + digit`, fractional part
-via repeated `frac *= 0.1`, exponent applied via a **repeated-multiply
-loop** instead of a single exact power) instead of `strtod`. This
-accumulates more rounding error than `strtod` produces on ordinary
-decimal strings — not just edge cases — and is directly relevant to any
-future JSON/CSV-style numeric-field parsing.
+```perl
+print "2.2250738585072014e-300"+0, "\n";
+# perl:  2.2250738585072e-300
+# was:   2.22507385850724e-300   (perlc, pre-fix)
+```
 
-**Fix shape:** keep the existing decimal-only grammar scan (it
-intentionally rejects hex/auto-`0x`, which must be preserved) but hand
-the matched substring to `strtod` for the actual conversion instead of
-manual arithmetic.
+Root cause (`src/runtime.c:1496-1532`, pre-fix): every implicit
+string→number coercion (`"3.14" + 0`, numeric comparisons on strings)
+went through a manual digit-accumulation parser (`result = result*10 +
+digit`, fractional part via repeated `frac *= 0.1`, exponent applied
+via a **repeated-multiply loop** instead of a single exact power)
+instead of `strtod`. This accumulated more rounding error than `strtod`
+produces — most visibly on extreme exponents (confirmed with a real
+diverging case above), but the underlying inexactness applied to
+ordinary decimal strings too — and was directly relevant to any future
+JSON/CSV-style numeric-field parsing.
 
-### D118 — `split` has no LIMIT argument and doesn't trim trailing empties
+**Fix**: kept the existing decimal-only grammar scan (still rejects
+hex/auto-`0x` and `1_000`-style underscore grouping — real Perl's
+implicit string→number coercion doesn't recognize either, confirmed
+directly, so the whole string can't just be handed to `strtod` blindly,
+which *would* auto-detect hex floats) to find the valid numeric prefix,
+then hands just that matched substring to `strtod` for the actual
+conversion. Also now recognizes `Inf`/`Infinity`/`NaN` (any case,
+optional sign) the way real Perl's string coercion does — found to be
+completely unhandled (silently became `0`) while designing this fix,
+not a pre-existing behavior worth preserving. Tests:
+`tests/d117_atof_precision_{smoke,deep}.pl`.
+
+Found while testing this fix, not fixed (split off — general parser
+gap, unrelated to number parsing itself): **D125** — `use`/`no` pragma
+statements only parse at file top-level, not inside a nested block or
+sub.
+
+### D125 — `use`/`no` pragma statements only parse at file top-level
+
+```perl
+sub foo {
+    no warnings 'numeric';   # or: use strict;  — either one
+    ...
+}
+# perl:  fine, scoped to the sub as expected
+# perlc: Error: Parse error line 2: unexpected token 'warnings'
+```
+
+Found while writing D117's deep test — the natural way to scope-
+suppress a deliberate "Argument ... isn't numeric" warning around a few
+specific lines is `no warnings 'numeric';` inside a small block, and
+that alone hit an unrelated hard parse error. Root cause:
+`src/parser.cpp:73`'s `use`/`no` handling lives inside `parseProgram()`
+(the file-level statement loop) — not in `parseStmt()`, which is what
+every nested block or sub body actually calls to parse its own
+statements. So `use`/`no` only works as the very first kind of
+statement the whole file's top-level loop sees, never inside any
+nested scope. Confirmed with both `no warnings '...';` and a plain
+`use strict;` inside a `sub {}` — same failure, so this isn't
+`warnings`-specific.
+
+**Fix shape:** move (or duplicate) the `use`/`no` pragma-handling block
+from `parseProgram()` into `parseStmt()` so it's reachable from any
+nested scope, not just the top level. Likely small, but touches a
+fairly large existing block (module-loading logic, `use constant`,
+`use parent`/`base`, feature/version handling, etc. all live in that
+same branch) — worth a careful pass rather than a rushed one given how
+much is packed into that one `if`.
+
+### D118 — `split` has no LIMIT argument and doesn't trim trailing empties — **FIXED 2026-09-10**
 
 ```perl
 split(/,/, "a,b,,")     # perl: ("a","b")  — trailing empty fields dropped
 split(/:/, $line, 2)    # perl: splits into exactly 2 pieces
+# was: split(/:/, $line, 2) — Error: Parse error, expected ) but got ','
 ```
 
-Neither `perl_split` (`src/runtime.c:2998`) nor `perl_split_regex`
-(`:6826`) strip trailing empty fields (Perl's default `split` behavior),
-and codegen call sites (`src/codegen.cpp:1052`, `:7338`) only ever pass
-2 arguments — the 3rd LIMIT parameter (extremely common for
-`split(/:/, $line, 2)`-style "key: value" parsing) isn't wired up at
-all.
+Root cause: neither `perl_split` (`src/runtime.c`) nor
+`perl_split_regex` stripped trailing empty fields (Perl's default
+`split` behavior), and — worse than the original write-up assumed — a
+3rd LIMIT argument wasn't silently dropped, it was a **hard parse
+error**: `src/parser.cpp`'s `split(...)` handling only ever consumed
+two args (`sep`/pattern, `str`) with no comma-loop for a third.
 
-**Fix shape:** add trailing-empty-trim (when no explicit LIMIT is given)
-to both split implementations, and thread a LIMIT parameter through
-from codegen call sites.
+**Fix**: parser now optionally consumes a 3rd LIMIT expression (stored
+in `n->args[0]`), passed through both `NK::SplitFunc` codegen sites
+(list-context in `emitArrayPtr`, scalar-context in `emitExpr`) as a new
+`long long limit` parameter on both `perl_split` and
+`perl_split_regex`. Both functions now bound the field count when
+`limit > 0` (the last field absorbs the remainder unsplit, matching
+real Perl exactly — verified for regex/string/whitespace/char-split
+separators alike) and call a new shared
+`perl_split_trim_trailing_empty()` helper when `limit == 0` (covers
+both "omitted" and "explicit zero", which real Perl treats
+identically) to strip trailing empty-string fields — `limit < 0` stays
+unbounded with no trimming, also matching real Perl. Tests:
+`tests/d118_split_limit_{smoke,deep}.pl`.
+
+Found while testing this fix, not fixed (pre-existing, confirmed
+unrelated to LIMIT/trim): **D126** — `split(/(PATTERN)/, ...)` with a
+capturing group doesn't include the captured delimiter text in the
+result the way real Perl does. See below.
+
+### D126 — `split` with a capturing-group pattern doesn't include captured delimiters
+
+```perl
+split(/(,)/, "a,b,c")
+# perl:  ("a", ",", "b", ",", "c")   — 5 elements, delimiters included
+# perlc: ("a", "b", "c")             — 3 elements, delimiters dropped
+```
+
+Real Perl's `split` includes the text matched by any capturing groups
+in the pattern as extra elements interleaved with the normal fields —
+a documented, deliberate feature (used to keep the separators
+themselves, e.g. `split /([,;])/, $csv_ish_line`). `perl_split_regex`
+(`src/runtime.c`) always discards everything between `mstart` and
+`mend` (the whole match) — it never inspects `pcre2_get_ovector_pointer`
+past index 0/1 (the whole-match bounds) to see whether the pattern had
+any capturing groups at all.
+
+**Fix shape:** after computing `mstart`/`mend` for the whole match,
+check `pcre2_get_ovector_count`/the compiled pattern's capture-group
+count; for each captured group present in this match (`ov[2*i]`/
+`ov[2*i+1]` for group `i`, skipping unset `PCRE2_UNSET` groups per
+Perl's own "unmatched optional group → `undef`, not omitted" rule),
+push its text as an additional array element between the two
+surrounding fields. Confined to `perl_split_regex`'s regex path; the
+plain-string/whitespace-separator path in `perl_split` has no
+capturing-group concept at all, so it's unaffected by design.
 
 ### D119 — `scalar(keys %$href)` returns 0 instead of the key count
 

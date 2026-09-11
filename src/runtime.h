@@ -253,7 +253,7 @@ PerlValue *perl_substr2(PerlValue *str, PerlValue *off);
 void perl_substr_replace(PerlValue *str, PerlValue *off, PerlValue *len, PerlValue *repl);
 PerlValue *perl_substr3(PerlValue *str, PerlValue *off, PerlValue *len);
 PerlValue *perl_join(PerlValue *sep, PerlArray *arr);
-PerlArray *perl_split(PerlValue *sep, PerlValue *str);
+PerlArray *perl_split(PerlValue *sep, PerlValue *str, long long limit); /* D118: limit 0 = unbounded+trim, >0 = bounded, <0 = unbounded+no trim */
 
 /* ── hash support ────────────────────────────────────────────────────────── */
 
@@ -475,7 +475,7 @@ typedef PerlValue *(*PerlSubstEvalFn)(void);
 long long  perl_regex_subst_e(PerlValue *str, const char *pattern, const char *flags,
                               PerlSubstEvalFn eval_fn, PerlArray *captures);
 PerlValue *perl_capture(long long n);
-PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str);
+PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str, long long limit); /* D118 */
 
 /* ── references ──────────────────────────────────────────────────────────── */
 PerlValue *perl_ref_scalar(PerlValue *v);

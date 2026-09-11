@@ -3145,10 +3145,22 @@ NodePtr Parser::parsePrimary() {
         NodePtr str;
         if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK))
             str = parseExpr();
+        /* D118: optional 3rd LIMIT argument — split(/:/, $line, 2) — was a
+           hard parse error before (only 2 args were ever consumed). Stored
+           in n->args[0] when present; absent means "no limit" (real Perl:
+           omitted/zero limit strips trailing empty fields; codegen passes
+           0 as the limit sentinel for that case, matching real Perl's
+           "omitted or zero" equivalence). */
+        NodePtr limitExpr;
+        if (match(TK::COMMA) &&
+            !check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
+            limitExpr = parseExpr();
+        }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::SplitFunc;
         n->left = std::move(sep); n->right = std::move(str); n->line = line;
         if (regexSplit) { n->ival = 1; n->sval = splitPat; n->name = splitFlags; }
+        if (limitExpr) n->args.push_back(std::move(limitExpr));
         return n;
     }
 

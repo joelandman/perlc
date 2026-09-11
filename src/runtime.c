@@ -1493,42 +1493,71 @@ static __attribute__((pure)) HOTX long long perl_atoll_decimal(const char *s) {
     return sign * result;
 }
 
+/* D117: previously a hand-rolled digit accumulator (result = result*10 +
+   digit for the integer/fractional parts, plus a REPEATED-MULTIPLY
+   exponent loop instead of a single correctly-rounded power) — measurably
+   less accurate than a real decimal-to-double conversion on ordinary
+   strings, not just extreme exponents (e.g. "2.2250738585072014e-300"+0
+   gave 2.22507385850724e-300 here vs real Perl's 2.2250738585072e-300).
+   Fixed by scanning the same decimal-only grammar as before (still no
+   hex/auto-0x — "0x10"+0 must stay 0, matching real Perl, so the whole
+   string can't just be handed to strtod() directly, which *would*
+   auto-detect hex floats) to find the valid numeric prefix, then handing
+   just that substring to strtod() for the actual conversion. Also now
+   recognizes Inf/Infinity/NaN (any case, optional sign) as real Perl's
+   string→number coercion does — strtod() already understands those once
+   the prefix scan lets a matching string reach it. */
 static __attribute__((pure)) HOTX double perl_atof_decimal(const char *s) {
     if (!s) return 0.0;
-    double result = 0.0;
-    int sign = 1;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { sign = -1; s++; }
-    else if (*s == '+') s++;
-    while (*s >= '0' && *s <= '9') {
-        result = result * 10 + (*s - '0');
-        s++;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
+    const char *start = p;
+    if (*p == '-' || *p == '+') p++;
+
+    /* Inf/Infinity/NaN — strtod() itself parses these (and their sign,
+       and trailing garbage) correctly; just hand it the whole tail. */
+    if ((p[0] == 'i' || p[0] == 'I') && (p[1] == 'n' || p[1] == 'N') &&
+        (p[2] == 'f' || p[2] == 'F')) {
+        return strtod(start, NULL);
     }
-    if (*s == '.') {
-        s++;
-        double frac = 0.1;
-        while (*s >= '0' && *s <= '9') {
-            result += frac * (*s - '0');
-            frac *= 0.1;
-            s++;
+    if ((p[0] == 'n' || p[0] == 'N') && (p[1] == 'a' || p[1] == 'A') &&
+        (p[2] == 'n' || p[2] == 'N')) {
+        return strtod(start, NULL);
+    }
+
+    int anyDigits = 0;
+    while (*p >= '0' && *p <= '9') { p++; anyDigits = 1; }
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') { p++; anyDigits = 1; }
+    }
+    if (!anyDigits) return 0.0;
+    if (*p == 'e' || *p == 'E') {
+        const char *ep = p + 1;
+        if (*ep == '-' || *ep == '+') ep++;
+        if (*ep >= '0' && *ep <= '9') {
+            p = ep;
+            while (*p >= '0' && *p <= '9') p++;
         }
     }
-    /* Skip exponent (rare in Perl string coercion, but handle for completeness) */
-    if (*s == 'e' || *s == 'E') {
-        s++;
-        int exp_sign = 1;
-        if (*s == '-') { exp_sign = -1; s++; }
-        else if (*s == '+') s++;
-        long long exp = 0;
-        while (*s >= '0' && *s <= '9') {
-            exp = exp * 10 + (*s - '0');
-            s++;
-        }
-        double mul = 1.0;
-        for (long long i = 0; i < exp; i++) mul *= (exp_sign > 0) ? 10.0 : 0.1;
-        result *= mul;
+
+    size_t len = (size_t)(p - start);
+    char stackBuf[64];
+    char *heapBuf = NULL;
+    const char *numStr;
+    if (len < sizeof(stackBuf)) {
+        memcpy(stackBuf, start, len);
+        stackBuf[len] = '\0';
+        numStr = stackBuf;
+    } else {
+        heapBuf = malloc(len + 1);
+        memcpy(heapBuf, start, len);
+        heapBuf[len] = '\0';
+        numStr = heapBuf;
     }
-    return sign * result;
+    double result = strtod(numStr, NULL);
+    free(heapBuf);
+    return result;
 }
 
 __attribute__((pure)) HOTX long long perl_to_int(const PerlValue *v) {
@@ -2995,10 +3024,27 @@ PerlValue *perl_join(PerlValue *sep, PerlArray *arr) {
     return r;
 }
 
-PerlArray *perl_split(PerlValue *sep, PerlValue *str) {
+/* D118: pops trailing empty-string elements — real Perl's default
+   (omitted or zero LIMIT) split() behavior, applied after an unbounded
+   split. Not applied when a nonzero LIMIT was given (real Perl doesn't
+   trim in that case either). */
+static void perl_split_trim_trailing_empty(PerlArray *arr) {
+    while (arr->len > 0) {
+        PerlValue *last = arr->elems[arr->len - 1];
+        int isEmpty = (last->tag == PERL_STRING) && (!last->sval || last->sval[0] == '\0');
+        if (!isEmpty) break;
+        PerlValue *popped = perl_array_pop(arr);
+        perl_free(popped);
+    }
+}
+
+PerlArray *perl_split(PerlValue *sep, PerlValue *str, long long limit) {
     char *s  = perl_to_string_dup(str);
     char *sp = perl_to_string_dup(sep);
     PerlArray *arr = perl_array_new();
+    /* D118: LIMIT > 0 bounds the field count — the last field absorbs
+       everything remaining unsplit, rather than being split further. */
+    int bounded = limit > 0;
 
     int ws_split = (strcmp(sp, " ") == 0 || strcmp(sp, "\\s+") == 0 ||
                     strcmp(sp, "\\s") == 0);
@@ -3007,6 +3053,12 @@ PerlArray *perl_split(PerlValue *sep, PerlValue *str) {
         char *p = s;
         while (isspace((unsigned char)*p)) p++;
         while (*p) {
+            if (bounded && (long long)arr->len == limit - 1) {
+                PerlValue *v = perl_alloc_string(p);
+                perl_array_push(arr, v); perl_free(v);
+                p += strlen(p);
+                break;
+            }
             char *start = p;
             while (*p && !isspace((unsigned char)*p)) p++;
             size_t len = (size_t)(p - start);
@@ -3019,6 +3071,11 @@ PerlArray *perl_split(PerlValue *sep, PerlValue *str) {
     } else if (strlen(sp) == 0) {
         /* split each character */
         for (char *p = s; *p; p++) {
+            if (bounded && (long long)arr->len == limit - 1) {
+                PerlValue *v = perl_alloc_string(p);
+                perl_array_push(arr, v); perl_free(v);
+                break;
+            }
             char buf[2] = {*p, '\0'};
             PerlValue *v = perl_alloc_string(buf);
             perl_array_push(arr, v); perl_free(v);
@@ -3041,7 +3098,8 @@ PerlArray *perl_split(PerlValue *sep, PerlValue *str) {
         size_t splen = strlen(real_sep);
         char *p = s;
         char *found;
-        while (splen > 0 && (found = strstr(p, real_sep)) != NULL) {
+        while (splen > 0 && !(bounded && (long long)arr->len == limit - 1) &&
+               (found = strstr(p, real_sep)) != NULL) {
             size_t len = (size_t)(found - p);
             char *elem = malloc(len + 1);
             memcpy(elem, p, len); elem[len] = '\0';
@@ -3052,6 +3110,7 @@ PerlArray *perl_split(PerlValue *sep, PerlValue *str) {
         PerlValue *v = perl_alloc_string(p);
         perl_array_push(arr, v); perl_free(v);
     }
+    if (limit == 0) perl_split_trim_trailing_empty(arr);
     free(s); free(sp);
     return arr;
 }
@@ -6864,19 +6923,28 @@ long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *fl
     return count;
 }
 
-PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str) {
+PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str, long long limit) {
     PerlArray *arr = perl_array_new();
     char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
+    /* D118: LIMIT > 0 bounds the field count — the last field absorbs
+       everything remaining unsplit, rather than being matched further. */
+    int bounded = limit > 0;
 
     /* empty pattern: split into individual characters (Perl semantics) */
     if (pattern[0] == '\0') {
         for (size_t i = 0; i < slen; i++) {
+            if (bounded && (long long)arr->len == limit - 1) {
+                PerlValue *v = perl_alloc_string(s + i);
+                perl_array_push(arr, v); perl_free(v);
+                break;
+            }
             char ch[2] = {s[i], '\0'};
             PerlValue *v = perl_alloc_string(ch);
             perl_array_push(arr, v); perl_free(v);
         }
         free(s);
+        if (limit == 0) perl_split_trim_trailing_empty(arr);
         return arr;
     }
 
@@ -6892,6 +6960,10 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
 
     while (pos <= slen) {
+        if (bounded && (long long)arr->len == limit - 1) {
+            PerlValue *v = perl_alloc_string(s + pos);
+            perl_array_push(arr, v); perl_free(v); break;
+        }
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
         if (rc > 0) populate_named_captures(md, s, re);
         if (rc <= 0) {
@@ -6913,6 +6985,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     free(s);
     pcre2_match_data_free(md);
     /* Do NOT free re — it comes from the shared cache. */
+    if (limit == 0) perl_split_trim_trailing_empty(arr);
     return arr;
 }
 
