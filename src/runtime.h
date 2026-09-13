@@ -142,6 +142,7 @@ const char *perl_to_string(const PerlValue *v);   /* stable for PERL_STRING/unde
 char       *perl_to_string_dup(const PerlValue *v); /* always heap-allocated (caller must free) */
 int        perl_defined(const PerlValue *v);
 int        perl_is_true(const PerlValue *v);
+int        perl_is_bigint_pv(const PerlValue *v); /* D132: cheap tag check for codegen's F64 fast path */
 
 /* assignment: dst = src  (manages dst's old string if any) */
 void perl_assign(PerlValue *dst, const PerlValue *src);
@@ -804,6 +805,11 @@ void perl_register_overload(const char *class_name, const char *op,
 
 /* ── Math::BigInt (D97) — built-in using mini-gmp, zero external dependency */
 PerlValue *perl_bigint_new(PerlValue *arg);
+/* D103: an UNBLESSED auto-BigInt from a decimal literal beyond INT64_MAX
+   but within UINT64_MAX (real Perl's own IV->UV literal promotion range).
+   Distinct from a declared Math::BigInt (perl_bigint_new) — see the D103
+   comment block above perl_add in runtime.c for the full rationale. */
+PerlValue *perl_bigint_from_decstr_unblessed(const char *decimal);
 PerlValue *perl_bigint_bmul(PerlValue *self, PerlValue *other);
 PerlValue *perl_bigint_badd(PerlValue *self, PerlValue *other);
 PerlValue *perl_bigint_bsub(PerlValue *self, PerlValue *other);

@@ -98,11 +98,11 @@ once, not one.
 11. **`%EXPORT_TAGS` / `use Foo qw(:all)`** — hard error (also see the Exporter gap below).
 12. **In-memory filehandles**, `open($fh, '<', \$string)` — unsupported; pervasive in module test suites (relevant once module test compilation becomes a goal, not just module use).
 13. **`grep { defined } @list`** — bare named-unary-with-implicit-`$_` inside a block — parse error.
-14. Already logged, unchanged priority: **`qr//`** (not implemented as a value type at all — see TESTS.md missing-features list), **`continue {}` blocks**, **`<<~` indented heredoc (D104)**, **`q[...]`/`qq[...]` nested-bracket balancing** (inconsistent — `s///`'s paired-delimiter form already tracks nesting depth correctly; `q`/`qq` non-brace forms don't), **`\my %var`/`\my @arr`**.
+14. Already logged, unchanged priority: **`qr//`** (not implemented as a value type at all — see TESTS.md missing-features list), **`continue {}` blocks**, **`q[...]`/`qq[...]` nested-bracket balancing** (inconsistent — `s///`'s paired-delimiter form already tracks nesting depth correctly; `q`/`qq` non-brace forms don't), **`\my %var`/`\my @arr`**. ~~`<<~` indented heredoc (D104)~~ **FIXED 2026-09-11** — see TESTS.md.
 
 ### Tier 2 — genuine but narrow (post-MVP is fine)
 
-D106 (narrow FLAT_ARRAY re-alias variant), D108 (`\f\a\e\b` in plain strings), ~~D101~~ (FIXED 2026-09-11 — `each` scalar context returned the pair-array length instead of the key; see TESTS.md), D103 (2^63 overflow), ~~D117~~ (FIXED — `perl_atof_decimal` hand-rolled parser → `strtod`), ~~D118~~ (FIXED — `split` LIMIT + trailing-empty trim; found D126, a separate capturing-group-in-split-pattern bug, while testing).
+~~D106~~ (FIXED 2026-09-11 — narrow FLAT_ARRAY re-alias variant, ported D105's fix to array/hash element reads; see TESTS.md), ~~D108~~ (FIXED 2026-09-11 — `\f\a\e\b` in plain strings), ~~D101~~ (FIXED 2026-09-11 — `each` scalar context returned the pair-array length instead of the key; see TESTS.md), ~~D103~~ (FIXED 2026-09-11 — 2^63 overflow now auto-promotes to a bounded, unblessed BigInt instead of wrapping/losing exactness; found and fixed a related pre-existing UB bug in the overflow-detection itself along the way; see TESTS.md), ~~D132~~ (FIXED 2026-09-12 — the narrow BigInt-bypass in the F64 fast path, plus a second pre-existing 1-ULP fix: mini-gmp `mpz_get_d` truncates instead of rounding), ~~D117~~ (FIXED — `perl_atof_decimal` hand-rolled parser → `strtod`), ~~D118~~ (FIXED — `split` LIMIT + trailing-empty trim), ~~D126~~ (FIXED 2026-09-12 — capturing-group split patterns now interleave capture texts; also fixed the pre-existing hang on all-zero-width split patterns), ~~D125~~ (FIXED 2026-09-12 — `use`/`no` pragmas parse in any nested scope), ~~D133~~/~~D134~~ (FIXED 2026-09-12 — Assign-fallback double-free; syscall buffer-arg writes now land in the caller's variable), ~~D128~~ (FIXED 2026-09-13 — inlined-module parse errors report the module's own file+line; token file-tag registry), ~~D135~~ (FIXED 2026-09-13 — sub-scope/bare-block int-promotion no longer truncates later NV assignments; fixpoint int-only scan; hot-loop IR byte-identical; see TESTS.md).
 
 ### Architectural gap bigger than any single D-number: no Exporter/`@EXPORT`
 
@@ -205,14 +205,16 @@ existing "Full XS/DynaLoader" non-goal in CLAUDE.md.
   accumulation parser (plus a repeated-multiply exponent loop) instead
   of `strtod`; now scans the same decimal-only prefix and hands it to
   `strtod`. Also picked up `Inf`/`Infinity`/`NaN` string-coercion
-  support (previously silently `0`). Split off **D125** (found while
-  testing — `use`/`no` pragmas only parse at file top-level).
+  support (previously silently `0`). Split off ~~**D125**~~ (found while
+  testing — `use`/`no` pragmas only parse at file top-level) — **FIXED
+  2026-09-12**, see TESTS.md.
 - ~~**D118**~~ — **FIXED 2026-09-10.** Was worse than described: the
   LIMIT argument was a hard *parse error*, not silently dropped. Both
   it and trailing-empty-trim are fixed, ahead of the JSON/CSV work they
-  were prerequisites for. Found **D126** (split with a capturing-group
-  pattern doesn't include the captures — pre-existing, unrelated to
-  LIMIT/trim) while testing.
+  were prerequisites for. Found ~~**D126**~~ (split with a
+  capturing-group pattern doesn't include the captures — pre-existing,
+  unrelated to LIMIT/trim) while testing — **FIXED 2026-09-12**, see
+  TESTS.md.
 
 ## MVP definition
 

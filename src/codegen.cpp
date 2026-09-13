@@ -348,6 +348,7 @@ void CodeGen::declareRuntime() {
     RT("perl_to_int",        i64, pv);
     RT("perl_to_float",      Type::getDoubleTy(ctx_), pv);
     RT("perl_is_true",       Type::getInt32Ty(ctx_), pv);
+    RT("perl_is_bigint_pv",  Type::getInt32Ty(ctx_), pv);   /* D132 */
     RT("perl_print",         voidTy, pv);
     RT("perl_say",           voidTy, pv);
     RT("perl_print_string",  voidTy, i8p);
@@ -409,6 +410,8 @@ void CodeGen::declareRuntime() {
     RT("perl_bigint_bsub",        pv,     pv, pv);
     RT("perl_bigint_bcmp",        pv,     pv, pv);
     RT("perl_bigint_numify",      pv,     pv);
+    /* D103: unblessed auto-BigInt from a decimal-literal string */
+    RT("perl_bigint_from_decstr_unblessed", pv, i8p);
     RT("perl_bigint_ovl_add",     pv,     pv, pv);
     RT("perl_bigint_ovl_sub",     pv,     pv, pv);
     RT("perl_bigint_ovl_mul",     pv,     pv, pv);
@@ -812,7 +815,8 @@ RT("perl_clear_named_captures", voidTy);
 
     /* Mark pure read-only functions so GVN/LICM can eliminate redundant calls */
     for (const char *nm : {"perl_array_get_ref", "perl_to_float", "perl_to_int",
-                            "perl_array_len", "perl_deref_array_ro"}) {
+                            "perl_array_len", "perl_deref_array_ro",
+                            "perl_is_bigint_pv"}) {
         auto *F = getRTFunc(nm);
         F->setMemoryEffects(MemoryEffects::readOnly());
         F->addFnAttr(Attribute::NoUnwind);
@@ -2691,6 +2695,361 @@ static bool needsFloatPrec(const Node &n, const std::string &nm) {
     return r;
 }
 
+/* D135: true iff 'nm' is ever used in a position where holding a plain
+   double (instead of a real PerlValue*) is observably different — string
+   interpolation/concat, ref-taking (\$x), as a call argument, key/index,
+   blessed-object positions, etc. Structurally identical to floatSafe but
+   its bare ScalarVar case returns TRUE (a plain read is fine for a float
+   var: emitExpr(ScalarVar) boxes on demand) instead of floatSafe's
+   inNum-gated false. Used by `case NK::My`'s unbox branch to decide
+   whether the float-alloca path is safe when the body leaves the integer
+   domain: if the var is never used in a non-numeric position, the float
+   alloca is observably equivalent. Conservative on every unrecognized
+   node kind (returns false → boxed PV path). */
+static bool floatVarUseSafe(const Node &n, const std::string &nm) {
+    if (n.kind == NK::ScalarVar && n.name == nm)
+        return true; /* plain read — boxing on demand is always correct */
+
+    switch (n.kind) {
+    case NK::BinOp: {
+        /* string ops and non-numeric ops with nm anywhere → unsafe */
+        bool isNum = (n.sval=="+"||n.sval=="-"||n.sval=="*"||n.sval=="/"||
+                      n.sval=="**"||n.sval=="%"||n.sval=="<"||n.sval=="<="
+                      ||n.sval==">"||n.sval==">="||n.sval=="=="||n.sval=="!=");
+        if (!isNum && (hasVar(n, nm))) return false;
+        bool ok = true;
+        if (n.left)  ok = ok && floatVarUseSafe(*n.left,  nm);
+        if (n.right) ok = ok && floatVarUseSafe(*n.right, nm);
+        return ok;
+    }
+    case NK::CompoundAssign: {
+        /* CompoundAssign nodes store the BARE operator (sval "/" for /=
+           etc. — see parseCompoundAssign). += -= *= /= **= %= are numeric;
+           anything else (. |= &= etc.) on nm needs the real PV. */
+        bool isNum = (n.sval=="+"||n.sval=="-"||n.sval=="*"||n.sval=="/"||
+                      n.sval=="**"||n.sval=="%");
+        if (!isNum && n.left && n.left->kind == NK::ScalarVar &&
+            n.left->name == nm)
+            return false; /* .=, |=, etc. on nm need the real PV */
+        bool ok = true;
+        if (n.left)  ok = ok && floatVarUseSafe(*n.left,  nm);
+        if (n.right) ok = ok && floatVarUseSafe(*n.right, nm);
+        return ok;
+    }
+    default: {
+        /* Assign and every other node kind: a bare assignment target or
+           plain read is fine; anything the default walk reaches is
+           checked positionally. */
+        bool ok = true;
+        if (n.left)  ok = ok && floatVarUseSafe(*n.left,  nm);
+        if (n.right) ok = ok && floatVarUseSafe(*n.right, nm);
+        for (auto &a : n.args) ok = ok && floatVarUseSafe(*a, nm);
+        if (n.body)  ok = ok && floatVarUseSafe(*n.body,  nm);
+        if (n.init)  ok = ok && floatVarUseSafe(*n.init,  nm);
+        if (n.cond)  ok = ok && floatVarUseSafe(*n.cond,  nm);
+        if (n.step)  ok = ok && floatVarUseSafe(*n.step,  nm);
+        for (auto &b : n.branches) {
+            if (b.cond) ok = ok && floatVarUseSafe(*b.cond, nm);
+            if (b.body) ok = ok && floatVarUseSafe(*b.body, nm);
+        }
+        return ok;
+    }
+    }
+}
+
+/* D135: static "is this RHS guaranteed to leave the integer domain
+   unchanged" test — conservative in the SAFE direction for int-promotion
+   (returns true = possibly-fractional unless the expression is provably
+   int-only). An IntLit is int-only; so is a BinOp over `+ - * %` whose
+   operands are both int-shaped (covers `$x = 2*3+1`-style literal
+   arithmetic). StringLits, FloatLits, Call/MethodCall results,
+    ScalarVar reads of other variables (we can't prove their type here),
+    coercions (`"7.25"+0` — a StringLit operand), and anything else are
+    treated as possibly-fractional: real Perl would store whatever the
+    value is, so an i64 alloca is only safe when the RHS is statically
+    int-only. Everything else → treat as float-shaped (skip int-promotion;
+    the boxed PV or float path stores the true value). */
+
+/* D135: the set of scan-root variables that are provably int-only —
+   every write (Assign/CompoundAssign direct target) has an int-shaped
+   RHS, and any initializer is int-shaped. Computed to a fixpoint:
+   start with vars whose writes' RHS are int-only WITHOUT variable
+   operands (IntLits, literal arithmetic), then repeatedly admit vars
+   whose RHS operands are all IntLits or vars already in the set.
+   ScalarVar operands count as int-shaped iff the name is in the set
+   (or the name is the variable being defined — a cycle through itself,
+   e.g. `$i += $i`, stays int if all its other writes are). The classic
+   hot idiom `my $s = 0; for (...) { $s += $i; }` keeps its i64 alloca
+   because $i (a foreach counter, or itself an int-only var) is in the
+   set. */
+struct D135IntSet {
+    std::set<std::string> names;
+
+    bool count(const std::string &nm) const { return names.count(nm) != 0; }
+};
+
+/* collect every ScalarVar name appearing anywhere in the tree (walks the
+   same child fields as the other D135 scanners) */
+static void d135CollectVarNames(const Node &n, std::set<std::string> &out) {
+    if (n.kind == NK::ScalarVar && !n.name.empty()) {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        out.insert(nm);
+    }
+    if (n.left)  d135CollectVarNames(*n.left,  out);
+    if (n.right) d135CollectVarNames(*n.right, out);
+    for (auto &a : n.args) d135CollectVarNames(*a, out);
+    if (n.body)  d135CollectVarNames(*n.body,  out);
+    if (n.init)  d135CollectVarNames(*n.init,  out);
+    if (n.cond)  d135CollectVarNames(*n.cond,  out);
+    if (n.step)  d135CollectVarNames(*n.step,  out);
+    for (auto &b : n.branches) {
+        if (b.cond) d135CollectVarNames(*b.cond, out);
+        if (b.body) d135CollectVarNames(*b.body, out);
+    }
+}
+
+/* one fixpoint iteration: would 'nm' be int-only under the given set? */
+
+static bool rhsIsIntShapedCtx(const Node &n, const D135IntSet &cur,
+                              const std::set<std::string> &selfOk) {
+    switch (n.kind) {
+    case NK::IntLit:
+        return true;
+    case NK::ScalarVar: {
+        if (n.name.empty()) return false;
+        std::string nm = n.name;
+        if (nm[0] == '$') nm = nm.substr(1);
+        return cur.count(nm) || selfOk.count(nm);
+    }
+    case NK::BinOp: {
+        if (!(n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%"))
+            return false;
+        return n.left && n.right && rhsIsIntShapedCtx(*n.left, cur, selfOk) &&
+               rhsIsIntShapedCtx(*n.right, cur, selfOk);
+    }
+    case NK::UnaryOp:
+        return n.sval == "-" && n.left && rhsIsIntShapedCtx(*n.left, cur, selfOk);
+    case NK::CompoundAssign: {
+        /* bare op stored ("+" for +=): + - * % int-preserve only when the
+           RHS is int-shaped too; / and ** always leave the int domain */
+        if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%")
+            return !n.right || rhsIsIntShapedCtx(*n.right, cur, selfOk);
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+/* does a write to 'nm' with this RHS keep the var int-only under 'cur'? */
+static bool d135WriteKeepsInt(const Node &rhs, const D135IntSet &cur,
+                              const std::string &nm,
+                              const std::set<std::string> &selfOk) {
+    std::set<std::string> self = selfOk;
+    self.insert(nm); /* self-reference stays int as long as other writes agree */
+    return rhsIsIntShapedCtx(rhs, cur, self);
+}
+
+/* walks the root finding every direct write to 'nm'; returns false the
+   moment any write's RHS would leave the integer domain under 'cur' */
+static bool d135CheckVarWrites(const Node &n, const std::string &nm,
+                               const D135IntSet &cur) {
+    switch (n.kind) {
+    case NK::Assign: {
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            return n.right && rhsIsIntShapedCtx(*n.right, cur, {nm});
+        break;
+    }
+    case NK::CompoundAssign: {
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm) {
+            /* bare op stored: + - * % keep int iff RHS int-shaped; / ** never */
+            if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%")
+                return n.right && rhsIsIntShapedCtx(*n.right, cur, {nm});
+            if (n.sval == "/" || n.sval == "**") return false;
+            /* .= and other non-numeric compounds need the real PV */
+            return false;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    bool ok = true;
+    if (n.left)  ok = ok && d135CheckVarWrites(*n.left,  nm, cur);
+    if (n.right) ok = ok && d135CheckVarWrites(*n.right, nm, cur);
+    for (auto &a : n.args) ok = ok && d135CheckVarWrites(*a, nm, cur);
+    if (n.body)  ok = ok && d135CheckVarWrites(*n.body,  nm, cur);
+    if (n.init)  ok = ok && d135CheckVarWrites(*n.init,  nm, cur);
+    if (n.cond)  ok = ok && d135CheckVarWrites(*n.cond,  nm, cur);
+    if (n.step)  ok = ok && d135CheckVarWrites(*n.step,  nm, cur);
+    for (auto &b : n.branches) {
+        if (b.cond) ok = ok && d135CheckVarWrites(*b.cond, nm, cur);
+        if (b.body) ok = ok && d135CheckVarWrites(*b.body, nm, cur);
+    }
+    return ok;
+}
+
+/* build the int-only set for a scan root by fixpoint iteration */
+static D135IntSet d135ComputeIntSet(const Node &root) {
+    std::set<std::string> all;
+    d135CollectVarNames(root, all);
+    D135IntSet cur;
+    for (int round = 0; round < 32; round++) {
+        D135IntSet next = cur;
+        bool changed = false;
+        for (const auto &nm : all) {
+            if (cur.count(nm)) continue;
+            if (d135CheckVarWrites(root, nm, cur)) {
+                next.names.insert(nm);
+                changed = true;
+            }
+        }
+        cur = next;
+        if (!changed) break;
+    }
+    return cur;
+}
+
+/* D135: true iff 'nm' is ever the LHS/element target of an assignment or
+   CompoundAssign whose RHS is *float-shaped* — i.e. NOT statically
+   int-only (see rhsIsIntShapedCtx above: FloatLit/StringLit/call results/
+   `"7.25"+0`-style coercions all count; IntLits and int-literal
+   arithmetic stay int-shaped, and ScalarVar operands count iff the name
+   is in the scan root's provably-int-only fixpoint set, so pure-int
+   bodies keep the i64 fast path) — or is incremented/decremented (++, --, +=, -=, ++/--)
+   somewhere in the body
+   (real Perl's numeric ++/-- treat an NV holding variable exactly and can
+   carry a fractional part through, so an int-promoted alloca is not
+   observably equivalent for those). Used by `case NK::My`'s unbox branch
+   to refuse int-promoting a sub-scoped `my $x = <int literal>` whose name
+   later leaves the integer domain — the int-var Assign fallback
+   truncates such an RHS via perl_to_int, silently holding 5 after
+   `$x = 5.5` (D135). Scans exactly the child fields hasVar/
+   needsFloatPrec walk (left/right/args/body/init/cond/step/branches); a
+   RHS that merely *reads* 'nm' does not count — only writes to it.
+   A variable RHS ($x = $y) counts as int-shaped iff $y is itself in the
+   scan root's provably-int-only set (D135's fixpoint analysis) — so the
+   classic `my $s = 0; for (...) { $s += $i; }` counter keeps its i64
+   alloca, while `$x = $maybeFloat` correctly forces the non-int path. */
+static bool assignsFloatLikeRhs(CodeGen &cg, const Node &n, const std::string &nm,
+                                const D135IntSet *intSet);
+
+static bool assignsFloatLikeRhs(CodeGen &cg, const Node &n, const std::string &nm,
+                                const D135IntSet *intSet) {
+    switch (n.kind) {
+    case NK::Assign: {
+        /* nm as the direct assignment target */
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            return n.right && !rhsIsIntShapedCtx(*n.right, *intSet, {});
+        /* nm inside a list-assignment LHS: its RHS pairing partner is
+           positional (same index), so a same-name RHS element would
+           self-pair (safe — no truncation); anything else paired with it
+           is conservatively treated as float-shaped (it is a write into
+           nm whose RHS shape is not statically known here). */
+        if (n.left && n.left->kind == NK::ArrayLit) {
+            if (n.right && n.right->kind == NK::ArrayLit) {
+                for (size_t i = 0; i < n.left->args.size() && i < n.right->args.size(); i++) {
+                    const Node &le = *n.left->args[i];
+                    if (le.kind == NK::ScalarVar && le.name == nm) {
+                        const Node &re = *n.right->args[i];
+                        if (re.kind != NK::ScalarVar || re.name != nm)
+                            return true;
+                    }
+                }
+                /* fall through to the generic walk below for the rest */
+            }
+        }
+        break;
+    }
+    case NK::CompoundAssign: {
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm) {
+            /* NOTE: CompoundAssign nodes store the BARE operator in sval
+               ("/" for /=, "+" for +=, "**" for **= — see parser.cpp's
+               parseCompoundAssign). `/` and `**` always produce NV-shaped
+               results (1/2 == 0.5, 2**-1) — real Perl stores the fraction,
+               so an int alloca would truncate it; + / - carry a fraction
+               when the RHS is float-shaped (a float literal, or an
+               expression that isn't statically int-only); ++/-- on a
+               fractional value must stay fractional (handled by NK::UnaryOp
+               below — bare ++/-- has no RHS here). Int-shaped + / - of a
+               counter are int-preserving in real Perl, so they alone do
+               NOT force float (an all-int counter must keep its i64
+               alloca); when the var separately leaves the integer domain
+               the float alloca handles it via the numeric path. */
+            if (n.sval == "/" || n.sval == "**") return true;
+            if (n.sval == "+" || n.sval == "-")
+                return n.right && !rhsIsIntShapedCtx(*n.right, *intSet, {});
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    bool r = false;
+    if (n.left)  r = r || assignsFloatLikeRhs(cg, *n.left,  nm, intSet);
+    if (n.right) r = r || assignsFloatLikeRhs(cg, *n.right, nm, intSet);
+    for (auto &a : n.args) r = r || assignsFloatLikeRhs(cg, *a, nm, intSet);
+    if (n.body)  r = r || assignsFloatLikeRhs(cg, *n.body,  nm, intSet);
+    if (n.init)  r = r || assignsFloatLikeRhs(cg, *n.init,  nm, intSet);
+    if (n.cond)  r = r || assignsFloatLikeRhs(cg, *n.cond,  nm, intSet);
+    if (n.step)  r = r || assignsFloatLikeRhs(cg, *n.step,  nm, intSet);
+    for (auto &b : n.branches) {
+        if (b.cond) r = r || assignsFloatLikeRhs(cg, *b.cond, nm, intSet);
+        if (b.body) r = r || assignsFloatLikeRhs(cg, *b.body, nm, intSet);
+    }
+    return r;
+}
+
+/* D135: true iff 'nm' is *read* in a context where a fractional value
+   must survive (float arithmetic, or any non-integer context
+   floatSafe's conservative walk would misclassify a genuinely-fractional
+   value in) somewhere in the sub body. Mirrors needsFloatPrec's
+   structure, extended to float-shaped reads needsFloatPrec itself
+   doesn't recognize: the float-var fast-path Assign/CompoundAssign
+   branches, which perl_to_int the value. The `my`-declaration fast path
+   uses this (together with assignsFloatLikeRhs) to refuse int-promotion
+   of a sub-scoped `my $x = <int literal>` whose body uses it in a way an
+   unboxed i64 cannot represent. Deliberately conservative: any uncertain
+   shape keeps the variable on the (always-correct) boxed PV path. */
+static bool readsFloatSensitive(const Node &n, const std::string &nm) {
+    bool r = false;
+    switch (n.kind) {
+    case NK::BinOp: {
+        bool isFloatOp = (n.sval == "/" || n.sval == "**");
+        if (n.left && n.right) {
+            bool lHas = n.left->kind == NK::ScalarVar && n.left->name == nm;
+            bool rHas = n.right->kind == NK::ScalarVar && n.right->name == nm;
+            if ((lHas || rHas) && isFloatOp) return true;
+        }
+        break;
+    }
+    case NK::SqrtFunc:
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            return true;
+        break;
+    case NK::UnaryOp:
+        if (n.sval == "-" && n.left && n.left->kind == NK::ScalarVar &&
+            n.left->name == nm)
+            return true;
+        break;
+    default:
+        break;
+    }
+    if (n.left)  r = r || readsFloatSensitive(*n.left,  nm);
+    if (n.right) r = r || readsFloatSensitive(*n.right, nm);
+    for (auto &a : n.args) r = r || readsFloatSensitive(*a, nm);
+    if (n.body)  r = r || readsFloatSensitive(*n.body,  nm);
+    if (n.init)  r = r || readsFloatSensitive(*n.init,  nm);
+    if (n.cond)  r = r || readsFloatSensitive(*n.cond,  nm);
+    if (n.step)  r = r || readsFloatSensitive(*n.step,  nm);
+    for (auto &b : n.branches) {
+        if (b.cond) r = r || readsFloatSensitive(*b.cond, nm);
+        if (b.body) r = r || readsFloatSensitive(*b.body, nm);
+    }
+    return r;
+}
+
 /* Pure predicate — can this expression be computed as a bare LLVM double?
    Never emits any IR. Returns true iff emitExprF64 will succeed. */
 bool CodeGen::canEmitF64(const Node &n) {
@@ -3323,6 +3682,7 @@ void CodeGen::compile(const Node &program, const std::string &modName,
                       bool asDoLib, bool asEvalPad) {
     mod_->setModuleIdentifier(modName);
     sourceFile_ = modName;
+    mainBody_ = &program; /* D135: scan root for bare-block-at-file-scope declarations */
     asDoLib_ = asDoLib || asEvalPad;
     asEvalPad_ = asEvalPad;
     if (debug_) initializeDebugInfo(modName);
@@ -4627,6 +4987,90 @@ void CodeGen::emitStmt(const Node &n) {
                     capturedNamesInCurrentFn_.count(nm) != 0 ||
                     capturedNamesInCurrentFn_.count("$" + nm) != 0;
                 if (n.right && !atFileScope && !rhsMayBeRef && !rhsMayBeBlessed && !mayBeCaptured) {
+                     /* D135: inside a sub, int-promotion must not pin the
+                        variable to i64 storage for its whole lifetime when
+                        the body later leaves the integer domain — every
+                        subsequent Assign routes through the int-var branch
+                        and its boxed fallback perl_to_ints the value,
+                        silently truncating `$x = 5.5` to 5 (real Perl has
+                        no sticky per-variable type).
+                        Decide with the existing body-scan machinery: skip
+                        the i64 promotion when the body (a) ever assigns
+                        this name a float-shaped RHS (`$x = 5.5`, `+= 0.5`,
+                        `/=`, ++/--), or (b) reads it in a float-sensitive
+                        context (`/`, `**`, sqrt, unary minus) — an unboxed
+                        i64 cannot represent either shape. When the
+                        initializer is float-representable AND the body
+                        never uses nm in a position where a plain double is
+                        observably different from a real PerlValue*
+                        (floatVarUseSafe), take the float path below; any
+                        other float-shaped case falls through to the plain
+                        boxed PV path — never int-promote.
+                        Pure-int bodies (loop counters etc.) pass both
+                        scans and keep the identical i64 fast path. The
+                        scan root is the enclosing sub body, or (bare
+                        block at file scope, D135) the program body; a
+                        true file-scope global declaration never reaches
+                        this branch (atFileScope takes the global path). */
+                     bool skipIntPromo = false;
+                     bool tryFloatPath = false;
+                     /* D135: the scan root is the scope that can still see
+                        this variable for the rest of its lifetime — the
+                        enclosing sub's body, or (for a bare block at file
+                        scope) the whole program body. A true file-scope
+                        declaration has neither (atFileScope true takes the
+                        global path long before this point). Over-scanning
+                        the program root for a block-local variable is
+                        conservative-safe: it may refuse promotion where
+                        the var is actually block-local, which only costs
+                        the boxed path (always correct), never correctness. */
+                     const Node *scanRoot =
+                         currentSubBody_ ? currentSubBody_
+                       : (!atFileScope && mainBody_) ? mainBody_
+                       : nullptr;
+                       if (scanRoot) {
+                           D135IntSet intSet = d135ComputeIntSet(*scanRoot);
+                           bool assignsFloat = assignsFloatLikeRhs(*this, *scanRoot, nm, &intSet);
+                           bool readsFloat   = readsFloatSensitive(*scanRoot, nm);
+                           if (assignsFloat || readsFloat) {
+                              skipIntPromo = true;
+                             /* Float-shaped RHS in the body: staying in the
+                                unboxed domain is only safe on the float
+                                alloca, and only when the body never uses nm
+                                in a position where a plain double would be
+                                observably different from a real PerlValue*
+                                (string ops, ref-taking, call args, keys,
+                                blessed positions...). floatVarUseSafe
+                                answers exactly that — a plain read is fine
+                                (boxF64 on demand), while floatSafe's
+                                bare-read case is deliberately false (it
+                                gates *int* promotion). When in doubt, the
+                                boxed PV path is always correct. */
+                             tryFloatPath = floatVarUseSafe(*scanRoot, nm);
+                         }
+                     }
+                    if (tryFloatPath) {
+                        if (Value *fval = emitExprF64(*n.right)) {
+                            auto *falloca = builder_.CreateAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
+                            builder_.CreateStore(fval, falloca);
+                            declareFloatVar(nm, falloca);
+                            /* Stage 30: if this var was assigned sqrt(x), remember x.
+                               Enables v*v → x and v*v*v → x*v (shorter sqrt critical path).
+                               D9: always clear any stale association for this name
+                               first — a new `my $var = ...` declaration is a brand-new
+                               binding with no relation to a previous sqrt-tracked value
+                               of the same name, whether that previous one came from an
+                               earlier declaration in this same function or (worse) a
+                               completely unrelated sub that happened to reuse the same
+                               variable name. Leaving the old entry in place made
+                               `$a*$a` silently return the *other* sub's sqrt input
+                               instead of this variable's actual squared value. */
+                            floatSqrtOf_.erase(nm);
+                            if (lastSqrtInput_) { floatSqrtOf_[nm] = lastSqrtInput_; lastSqrtInput_ = nullptr; }
+                            break;
+                        }
+                        /* initializer not float-representable → boxed PV path */
+                    } else if (!skipIntPromo) {
                     if (Value *ival = emitExprI64(*n.right)) {
                         auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
                         builder_.CreateStore(ival, ialloca);
@@ -4652,6 +5096,7 @@ void CodeGen::emitStmt(const Node &n) {
                         if (lastSqrtInput_) { floatSqrtOf_[nm] = lastSqrtInput_; lastSqrtInput_ = nullptr; }
                         break;
                     }
+                    } /* !skipIntPromo */
                 }
                 /* Stage 25/27c: @_ arg pre-promoted to int/float/derefAV —
                    skip PV alloca entirely.
@@ -5899,7 +6344,22 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::ArrayElem: {
         Value *av = lookupArray(n.name);
         if (!av) return perlUndef();
-        return callRT("perl_array_get_ref", {av, emitIdx(*n.left)});
+        Value *elem = callRT("perl_array_get_ref", {av, emitIdx(*n.left)});
+        /* D106: same bug/fix class as D105's ScalarVar read (see the
+           detailed comment there) — reading an array element that holds
+           a FLAT_ARRAY/FLOAT_PAIR anon-array-ref (Stage 22/23's compact
+           literal storage) must promote it to a real REF_ARRAY *before*
+           handing it out, so a second alias made from this read (`my $y
+           = $arr[0]; $y->[0] = 99;`) shares the same PerlArray instead of
+           silently forking. Confirmed NOT to touch the `$arr[$i] op=
+           rhs` compound-assign fast path or any 2D ArrowDeref-chain fast
+           path — both are separate `case`/dispatch branches that call
+           `perl_array_get_ref` directly themselves rather than routing
+           through this one, so this promotion (a no-op for every other
+           tag, exactly like D105's) cannot reach those FLAT_ARRAY-
+           sensitive branches. */
+        callRT("perl_promote_ref_array", {elem});
+        return elem;
     }
 
     case NK::ArrayVar: {
@@ -6250,6 +6710,26 @@ Value *CodeGen::emitExpr(const Node &n) {
                     builder_.CreateStore(next, ia);
                     bool isPre = (n.sval == "pre++" || n.sval == "pre--");
                     return boxI64(isPre ? next : cur);
+                }
+                /* D135: unboxed float variable — same shape as the int twin
+                   above. A float-promoted variable passed here would
+                   otherwise fall to emitIncTarget → emitExpr(ScalarVar) →
+                   boxF64(load), mutate the disposable boxed temp with
+                   perl_inc, and leave the alloca (and therefore every
+                   later read of the variable) untouched — an infinite loop
+                   in `while ($i < N) { ...; $i++ }` with a float-promoted
+                   counter. Numeric ++/-- on a double is exact, matching
+                   Perl (an NV counter holds 1.0 after ++). */
+                if (Value *fa = lookupFloatVar(nm)) {
+                    auto *f64 = Type::getDoubleTy(ctx_);
+                    Value *cur = builder_.CreateLoad(f64, fa);
+                    bool isInc = (n.sval == "pre++" || n.sval == "post++");
+                    Value *next = builder_.CreateFAdd(cur,
+                        ConstantFP::get(f64, isInc ? 1.0 : -1.0),
+                        isInc ? "fpreinc" : "fpredec");
+                    builder_.CreateStore(next, fa);
+                    bool isPre = (n.sval == "pre++" || n.sval == "pre--");
+                    return boxF64(isPre ? next : cur);
                 }
             }
         }
@@ -6872,8 +7352,17 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *rv = emitExpr(*n.right);
                 Value *iv = callRT("perl_to_int", {rv});
                 builder_.CreateStore(iv, ia);
+                /* D133: this fallback previously freeIfOwned(rv)'d the temp
+                   and still returned it — the statement context frees the
+                   return value again (ExprStmt/emitBlockLast both treat an
+                   owned-temp return as theirs to free), double-freeing
+                   $acc = "x" + 0 whenever the RHS was an owned boxed temp
+                   (segfault, found while verifying D125's deep test: the
+                   pre-D125 snapshot binary reproduces it identically).
+                   Clone before freeing so the caller gets its own value. */
+                Value *ret = callRT("perl_clone", {rv});
                 freeIfOwned(rv);
-                return rv;
+                return ret;
             }
             if (Value *fa = lookupFloatVar(nm)) {
                 Value *rhs = emitExprF64(*n.right);
@@ -6885,8 +7374,11 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *rv = emitExpr(*n.right);
                 Value *dbl = callRT("perl_to_float", {rv});
                 builder_.CreateStore(dbl, fa);
+                /* D133: same double-free shape as the int twin above —
+                   clone for the caller before freeing the temp. */
+                Value *ret = callRT("perl_clone", {rv});
                 freeIfOwned(rv);
-                return rv;
+                return ret;
             }
         }
         {
@@ -7650,7 +8142,18 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         Value *hv = lookupHash(n.name);
         if (!hv) return perlUndef();
-        return emitHashGetRef(hv, *n.left);
+        /* D106: same bug/fix class as ArrayElem above and D105's
+           ScalarVar read — promote a FLAT_ARRAY/FLOAT_PAIR-tagged
+           anon-array-ref value read out of a hash element before it can
+           be aliased a second time (`my $y = $h{k}; $y->[0] = 99;`).
+           Scoped to this one plain-read case only — `emitHashGetRef` is
+           a shared helper used by several other call sites (hash-slice
+           literals, delete/exists LHS refs, etc.); wrapping just this
+           return, rather than promoting inside the helper itself, keeps
+           the change from reaching any of those. */
+        Value *elem = emitHashGetRef(hv, *n.left);
+        callRT("perl_promote_ref_array", {elem});
+        return elem;
     }
 
     case NK::KeysFunc: {
@@ -9520,11 +10023,163 @@ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
     return emitExpr(rhsNode);
 }
 
+/* D103: the raw i64 fast path below (emitExprI64) does native wrapping
+   arithmetic with no overflow check at all — `my $big = 9223372036854775807;
+   $big + 1` silently wraps to a negative number instead of promoting like
+   real Perl. This only intercepts the OUTERMOST operator of a top-level
+   `+`/`-`/`*` BinOp: it uses LLVM's overflow-checked intrinsics on the two
+   operands (each still obtained via the ordinary emitExprI64, so a nested
+   arithmetic sub-expression's own overflow, if any, is unaffected — a
+   scoped, deliberately narrower fix than redesigning the fast path's
+   recursive descent itself, which stays untouched) and falls back to the
+   boxed perl_add/perl_sub/perl_mul (now overflow-aware — see runtime.c)
+   only on the rare overflow branch; the non-overflowing common case keeps
+   the exact same instructions as before. Returns nullptr (falls through to
+   the unchanged raw-i64 path just below) when the operands aren't directly
+   i64-representable — mirrors emitExprI64's own canEmitI64 guard exactly,
+   so neither operand is evaluated more than once. */
+Value *CodeGen::emitI64OverflowCheckedBinOp(const Node &n) {
+    if (n.sval != "+" && n.sval != "-" && n.sval != "*") return nullptr;
+    if (!n.left || !n.right || !canEmitI64(*n.left) || !canEmitI64(*n.right)) return nullptr;
+    Value *lv = emitExprI64(*n.left);
+    Value *rv = emitExprI64(*n.right);
+    if (!lv || !rv) return nullptr;
+
+    Intrinsic::ID id = n.sval == "+" ? Intrinsic::sadd_with_overflow
+                      : n.sval == "-" ? Intrinsic::ssub_with_overflow
+                                      : Intrinsic::smul_with_overflow;
+    auto *i64 = Type::getInt64Ty(ctx_);
+    Function *intr = Intrinsic::getDeclaration(mod_.get(), id, {i64});
+    Value *pair = builder_.CreateCall(intr, {lv, rv});
+    Value *rawResult = builder_.CreateExtractValue(pair, 0);
+    Value *overflowed = builder_.CreateExtractValue(pair, 1);
+
+    auto *fn    = builder_.GetInsertBlock()->getParent();
+    auto *okBB  = BasicBlock::Create(ctx_, "i64ovf.ok",   fn);
+    auto *slowBB = BasicBlock::Create(ctx_, "i64ovf.slow", fn);
+    auto *endBB = BasicBlock::Create(ctx_, "i64ovf.end",  fn);
+    builder_.CreateCondBr(overflowed, slowBB, okBB);
+
+    builder_.SetInsertPoint(okBB);
+    Value *fastResult = boxI64(rawResult);
+    builder_.CreateBr(endBB);
+    okBB = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(slowBB);
+    Value *boxedL = boxI64(lv);
+    Value *boxedR = boxI64(rv);
+    const char *rt = n.sval == "+" ? "perl_add" : n.sval == "-" ? "perl_sub" : "perl_mul";
+    Value *slowResult = callRT(rt, {boxedL, boxedR});
+    callRT("perl_free", {boxedL});
+    callRT("perl_free", {boxedR});
+    builder_.CreateBr(endBB);
+    slowBB = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(endBB);
+    PHINode *phi = builder_.CreatePHI(perlPtrTy_, 2);
+    phi->addIncoming(fastResult, okBB);
+    phi->addIncoming(slowResult, slowBB);
+    return phi;
+}
+
+/* D132: emitBinOp's F64 "stay unboxed" fast path (emitExprF64) converts
+   operands straight to double via perl_to_float and emits native
+   fadd/fsub/fmul — bypassing perl_add/perl_sub/perl_mul's D103 BigInt-aware
+   logic entirely. When a scalar-variable operand is BigInt-tagged at RUNTIME
+   (the tag isn't statically known: D103 auto-promotion can put an exact
+   UINT64_MAX-boundary value into an ordinary variable at any time), the
+   native double path truncates the value and diverges by 1 ULP after
+   stringification vs real Perl. This wrapper emits the same F64 fast-path
+   expression behind a runtime tag-check branch on each ScalarVar operand
+   (via the cheap, pure perl_is_bigint_pv predicate): if EITHER operand is
+   BigInt-tagged, fall back to the boxed runtime op (D103-aware); otherwise
+   emit the exact same native F64 instructions as before and box the double
+   result, so both branches yield a PerlValue* and this composes with
+   emitBinOp's normal (boxed-value) contract. Follows the branch-and-PHI
+   pattern emitI64OverflowCheckedBinOp (D103) already establishes.
+   Deliberately narrow: only the + - * operators with at least one ScalarVar
+   operand reach this; literals are never BigInt-tagged at runtime (a D103
+   huge literal is itself an emitCall node producing a boxed PerlValue*, and
+   emitExprF64 rejects it anyway), so no check is emitted for them and
+   non-variable code keeps identical instructions. Returns nullptr to fall
+   through to the unguarded paths when neither operand is a ScalarVar. */
+Value *CodeGen::emitF64BinOpWithBigIntGuard(const Node &n) {
+    if (n.sval != "+" && n.sval != "-" && n.sval != "*") return nullptr;
+    if (!n.left || !n.right) return nullptr;
+    bool lVar = n.left->kind == NK::ScalarVar;
+    bool rVar = n.right->kind == NK::ScalarVar;
+    if (!lVar && !rVar) return nullptr;
+    /* Both operands must be F64-representable for the fast path to be in
+       play at all — mirror emitExprF64's own gate so the guarded path is
+       only ever emitted where the unguarded one would have been. */
+    if (!canEmitF64(n)) return nullptr;
+
+    /* PerlValue* of each variable operand, loaded BEFORE the branch so it
+       dominates both arms. */
+    auto pvOf = [&](const Node &v) -> Value * {
+        std::string nm = v.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        Value *slot = lookupVar(nm);
+        if (!slot) return nullptr;
+        return builder_.CreateLoad(perlPtrTy_, slot, nm + ".gpv");
+    };
+    Value *lPv = lVar ? pvOf(*n.left) : nullptr;
+    Value *rPv = rVar ? pvOf(*n.right) : nullptr;
+    if ((lVar && !lPv) || (rVar && !rPv)) return nullptr;
+
+    Value *lBig = lPv ? callRT("perl_is_bigint_pv", {lPv}) : nullptr;
+    Value *rBig = rPv ? callRT("perl_is_bigint_pv", {rPv}) : nullptr;
+    Value *anyBig;
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+    if (lBig && rBig)
+        anyBig = builder_.CreateOr(lBig, rBig, "big.any");
+    else if (lBig)
+        anyBig = lBig;
+    else
+        anyBig = rBig;
+    Value *isBig = builder_.CreateICmpNE(anyBig, ConstantInt::get(i32Ty, 0),
+                                         "big.cond");
+
+    auto *fn      = builder_.GetInsertBlock()->getParent();
+    auto *fastBB  = BasicBlock::Create(ctx_, "big.fast", fn);
+    auto *slowBB  = BasicBlock::Create(ctx_, "big.slow", fn);
+    auto *endBB   = BasicBlock::Create(ctx_, "big.end",  fn);
+    builder_.CreateCondBr(isBig, slowBB, fastBB);
+
+    builder_.SetInsertPoint(fastBB);
+    Value *fastResult = emitExprF64(n);
+    if (!fastResult) return nullptr;   /* caller falls back; block is dead */
+    Value *fastBoxed = boxF64(fastResult);
+    builder_.CreateBr(endBB);
+    fastBB = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(slowBB);
+    const char *rt = n.sval == "+" ? "perl_add" : n.sval == "-" ? "perl_sub"
+                                                                : "perl_mul";
+    Value *lv = emitExpr(*n.left);
+    Value *rv = emitExpr(*n.right);
+    Value *slowResult = callRT(rt, {lv, rv});
+    freeIfOwned(lv);
+    freeIfOwned(rv);
+    builder_.CreateBr(endBB);
+    slowBB = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(endBB);
+    PHINode *phi = builder_.CreatePHI(perlPtrTy_, 2, "big.res");
+    phi->addIncoming(fastBoxed, fastBB);
+    phi->addIncoming(slowResult, slowBB);
+    return phi;
+}
+
 Value *CodeGen::emitBinOp(const Node &n) {
     /* Fast path: stay unboxed for integer arithmetic.
        W1: extended to constant-foldable `& | ^ <<` (bit-63/UV results return
        nullptr from emitExprI64), `>>` with constant count [1,63], and
        constant `**` (integer-power range exp 0..30, i64 fit). */
+    if (n.sval == "+" || n.sval == "-" || n.sval == "*") {
+        if (Value *checked = emitI64OverflowCheckedBinOp(n))
+            return checked;
+    }
     if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%" ||
         n.sval == "&" || n.sval == "|" || n.sval == "^" ||
         n.sval == "<<" || n.sval == ">>" || n.sval == "**") {
@@ -9566,8 +10221,21 @@ Value *CodeGen::emitBinOp(const Node &n) {
             }
         }
     }
-    /* Fast path: if both operands can be expressed as doubles, stay unboxed */
+    /* Fast path: if both operands can be expressed as doubles, stay unboxed.
+       D132: when either operand is a scalar variable, route through the
+       BigInt-guard wrapper instead of committing unconditionally to the
+       native-double path — a variable can hold a BigInt-tagged value at
+       runtime (D103 auto-promotion), which the native path truncates. The
+       wrapper emits the identical F64 instructions on the non-BigInt
+       branch, so non-BigInt code is unchanged; variable-free operands
+       skip the wrapper entirely (literals are never runtime-BigInt). */
     if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") {
+        bool hasVarOperand = (n.left && n.left->kind == NK::ScalarVar) ||
+                             (n.right && n.right->kind == NK::ScalarVar);
+        if (hasVarOperand && n.sval != "/") {
+            if (Value *gv = emitF64BinOpWithBigIntGuard(n))
+                return gv;
+        }
         if (Value *fv = emitExprF64(n))
             return boxF64(fv);
     }
@@ -9854,6 +10522,14 @@ Value *CodeGen::emitCall(const Node &n) {
        never falls through to the generic "undefined sub" die (D113). */
     if (n.name == "__FILE__") return perlStr(sourceFile_);
 
+    /* D103: an integer literal beyond INT64_MAX but within Perl's UV range
+       (0..UINT64_MAX) — see parser.cpp's identical interception pattern
+       and comment for __FILE__ above, and the D103 comment block above
+       perl_add in runtime.c for the full auto-BigInt rationale. */
+    if (n.name == "__auto_bigint_lit")
+        return callRT("perl_bigint_from_decstr_unblessed",
+                       {builder_.CreateGlobalStringPtr(n.sval)});
+
     /* Try AST-level inline first: eliminates @_ construction for simple subs. */
     if (Value *v = tryEmitInline(n)) return v;
 
@@ -10108,12 +10784,30 @@ Value *CodeGen::emitCall(const Node &n) {
     }
     /* syscall() — takes syscall number as first arg, optional additional args */
     if (n.name == "syscall") {
+        /* D134: push each argument by reference (perl_array_push_nc, no
+           clone) so a syscall that writes through a pointer argument —
+           SYS_clock_gettime's struct timespec buffer, read()'s buffer,
+           etc. — writes into the caller's own string buffer (a stable
+           variable cell's sval) instead of a pushed clone the caller can
+           never see. This is the same in-place-mutation mechanism
+           vec($str,off,bits)=val already relies on: emitExpr on a scalar
+           variable returns the stable PerlValue* cell. Temporaries (e.g.
+           `syscall(228, 4, "x" x 16)`) behave like real Perl's: the
+           write lands in the temp and is discarded with it. The array
+           shell is torn down with perl_array_free_nc (elements borrowed,
+           never freed by the array); owned temp elements are freed
+           explicitly after the call. */
         Value *av = callRT("perl_array_new", {});
+        SmallVector<Value *, 8> owned;
         for (auto &arg : n.args) {
             Value *v = emitExpr(*arg);
-            callRT("perl_array_push", {av, v});
+            callRT("perl_array_push_nc", {av, v});
+            if (isOwnedTemp(v)) owned.push_back(v);
         }
-        return callRT("perl_syscall", {av});
+        Value *r = callRT("perl_syscall", {av});
+        callRT("perl_array_free_nc", {av});
+        for (Value *v : owned) callRT("perl_free", {v});
+        return r;
     }
     /* W2: process / IPC / sockets — generic Call → perl_* helpers, no new AST */
     if (n.name == "fork")     return callRT("perl_fork", {});

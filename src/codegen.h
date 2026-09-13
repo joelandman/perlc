@@ -193,6 +193,7 @@ private:
      int                            callCtx_ = 0;
      /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
     const Node                    *currentSubBody_ = nullptr;
+    const Node                    *mainBody_ = nullptr;       /* D135: program root for bare-block-at-file-scope promotion scans */
     /* Stage 25: promotion kind for @_ args identified before sub body emission */
     enum class PPKind { Int, Float, DerefAV };
     std::unordered_map<std::string, PPKind> prePromotedArgs_;
@@ -275,6 +276,12 @@ private:
     llvm::Value *emitBlock(const Node &n);
     llvm::Value *emitBlockLast(const Node &n); /* emits block, returns last expr value */
     llvm::Value *emitBinOp(const Node &n);
+    llvm::Value *emitI64OverflowCheckedBinOp(const Node &n); /* D103: plus/minus/mul only */
+    /* D132: emitBinOp's F64 fast path guard for + - * with a scalar-variable
+       operand — branches on perl_is_bigint_pv(operand PV*) at runtime and
+       falls back to the boxed D103-aware runtime op when either operand is
+       BigInt-tagged. Common non-BigInt path keeps identical instructions. */
+    llvm::Value *emitF64BinOpWithBigIntGuard(const Node &n);
     llvm::Value *emitShortCircuitRhs(const Node &rhsNode); /* ||/&& RHS: real control-flow for `or return`/`and return` (D8a) */
     bool isCallLikeForContext(const Node &n); /* D12: safe to propagate outer list context into this node's own call */
     llvm::Value *emitCall(const Node &n);

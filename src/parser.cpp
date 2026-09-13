@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <cctype>
+#include <cerrno>
 
 /* Named low-precedence/word operators that, following a `$fh IDENT`
    sequence in print/say/printf's filehandle-detection heuristic, indicate
@@ -22,6 +23,23 @@ NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens) {
     tokens.push_back({TK::EOF_TOK, "", 0});
     Parser p(std::move(tokens));
     return p.parseExpr();
+}
+
+/* D128: the one place that decides how a parse error is prefixed. The
+   erroring (current) token carries the registered name of the file it was
+   lexed from (Token::file); when that tag is non-null and different from
+   the main script's, the error belongs to an inlined module — report the
+   module's own file name and its *internal* line number, since that is
+   the only frame the user can act on (the module's numbering bears no
+   relation to the combined stream the parser sees). Main-script and
+   untagged/synthetic tokens keep the exact legacy "Parse error line N: "
+   format, which existing tests and tooling match on. */
+std::string Parser::parseErrPrefix(int line) const {
+    const Token &t = toks_[pos_];
+    if (t.file && t.file != mainFileTag_)
+        return "Parse error in " + std::string(t.file) + " line " +
+               std::to_string(line) + ": ";
+    return "Parse error line " + std::to_string(line) + ": ";
 }
 
 NodePtr Parser::parseInterpString(const std::string &raw, int line, const std::string &pkg) {
@@ -58,7 +76,7 @@ bool  Parser::match(TK k)          { if (check(k)) { pos_++; return true; } retu
 Token Parser::consume(TK k, const char *msg) {
     if (!check(k)) {
         std::ostringstream os;
-        os << "Parse error line " << cur().line << ": expected " << (msg ? msg : "token")
+        os << parseErrPrefix(cur().line) << "expected " << (msg ? msg : "token")
            << " but got '" << cur().text << "'";
         throw std::runtime_error(os.str());
     }
@@ -70,7 +88,39 @@ Token Parser::consume(TK k, const char *msg) {
 NodePtr Parser::parseProgram() {
     NodeList stmts;
     while (!check(TK::EOF_TOK)) {
-        if (check(TK::KW_USE)) {
+        /* D125: `use`/`no` handling now lives in its own method, shared
+           with parseStmt() so pragmas/module-`use`s inside any nested
+           scope parse the same way the file top-level ones always did. */
+        if (check(TK::KW_USE) ||
+            (cur().kind == TK::IDENT && cur().text == "no")) {
+            auto useStmt = parseUseNoStmt();
+            /* Flatten: parseUseNoStmt returns a Block whose args hold the
+               statement(s) produced by one use/no statement (0..n). */
+            if (useStmt && useStmt->kind == NK::Block)
+                for (auto &s : useStmt->args) stmts.push_back(std::move(s));
+            else if (useStmt) stmts.push_back(std::move(useStmt));
+            continue;
+        }
+        stmts.push_back(parseStmt());
+    }
+    return makeBlock(std::move(stmts), 1);
+}
+
+/* D125: `use MODULE ...` / `use PRAGMA ...` / `no PRAGMA ...` — the whole
+   statement handling extracted verbatim from parseProgram() so nested
+   block/sub bodies (which parse through parseStmt()) can also contain
+   use/no statements, as real Perl allows (scoping is per-enclosing-lexical-
+   scope in real Perl; perlc's runtime effect for the few pragmas it
+   models is the acceptance criterion — WarningsStmt etc. emit the same
+   nodes the file-top path always did, and ignored pragmas stay no-ops).
+   Module inlining still happens earlier, in main.cpp's inlineModules()
+   token pass (it runs over the *whole* combined token stream regardless
+   of statement nesting), so a `use Some::Module;` inside a sub behaves
+   like the file-top form. */
+NodePtr Parser::parseUseNoStmt() {
+    NodeList stmts;
+    do {
+    if (check(TK::KW_USE)) {
             int line = cur().line;
             advance(); /* consume 'use' */
             /* use parent 'Base'  or  use base 'Base'  or  use parent qw(...) */
@@ -319,8 +369,11 @@ NodePtr Parser::parseProgram() {
             if (check(TK::STRING)) advance();
             match(TK::SEMI); continue;
         }
-        stmts.push_back(parseStmt());
-    }
+        break;
+    } while (0);
+    /* Fully-ignored use/no statements produce an empty statement block —
+       the caller (parseProgram/parseStmt) splices the Block's args into
+       its own statement list, and an empty arg list is a no-op. */
     return makeBlock(std::move(stmts), 1);
 }
 
@@ -338,6 +391,32 @@ NodePtr Parser::parseBlock() {
 
 NodePtr Parser::parseStmt() {
     int line = cur().line;
+
+    /* D125: `use MODULE` / `use PRAGMA` / `no PRAGMA` — previously only
+       reachable from parseProgram()'s file-level statement loop, so a
+       `use strict;` / `no warnings 'numeric';` inside any nested block or
+       sub body was a hard parse error ("unexpected token 'warnings'"/
+       "'use'"). parseUseNoStmt() is the exact same handling the file-top
+       path always had, extracted verbatim and now shared by both entry
+       points; module inlining itself happens earlier (main.cpp's
+       inlineModules() token pass runs over the whole combined stream
+       regardless of statement nesting), so a nested module-`use` behaves
+       like the file-top form. */
+    if (check(TK::KW_USE) ||
+        (cur().kind == TK::IDENT && cur().text == "no")) {
+        auto useStmt = parseUseNoStmt();
+        if (useStmt && useStmt->kind == NK::Block) {
+            /* Multi-statement (use parent → SetIsa per parent) or fully-
+               ignored forms: splice contents into a FlatBlock so every
+               produced node still runs, in order, in the current scope. */
+            auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock;
+            for (auto &s : useStmt->args) fb->args.push_back(std::move(s));
+            fb->line = line;
+            return fb;
+        }
+        if (useStmt) return useStmt;
+        return parseModifier(std::make_unique<Node>(), line); /* unreachable */
+    }
 
     /* package Foo; — changes current package context for sub naming */
     if (check(TK::KW_PACKAGE)) {
@@ -645,7 +724,7 @@ NodePtr Parser::parseStmt() {
         match(TK::COMMA);
         if (check(TK::STRING)) { n->args.push_back(makeStr(cur().text)); advance(); }
         else if (check(TK::IDENT)) { n->args.push_back(makeStr(cur().text)); advance(); }
-        else { throw std::runtime_error("tie: expected class name"); }
+        else { throw std::runtime_error(parseErrPrefix(cur().line) + "tie: expected class name"); }
         while (check(TK::COMMA)) { advance(); n->args.push_back(parseExpr()); }
         match(TK::RPAREN); match(TK::SEMI);
         return n;
@@ -898,11 +977,11 @@ void Parser::checkProtoArity(const std::string &name, const std::string &proto,
     int mn = protoMinArgs(proto);
     int mx = protoMaxArgs(proto);
     if (nargs < mn)
-        throw std::runtime_error("Not enough arguments for " + name +
-            " at " + std::to_string(line));
+        throw std::runtime_error(parseErrPrefix(line) +
+            "Not enough arguments for " + name);
     if (nargs > mx)
-        throw std::runtime_error("Too many arguments for " + name +
-            " at " + std::to_string(line));
+        throw std::runtime_error(parseErrPrefix(line) +
+            "Too many arguments for " + name);
 }
 
 NodePtr Parser::parseAnonSubBody(int line, const std::string &proto, NodePtr sigPrefix) {
@@ -1756,7 +1835,8 @@ NodePtr Parser::parseBinding() {
         bool negated = check(TK::NBIND);
         int line = cur().line; advance();
         if (check(TK::SUBST)) {
-            if (negated) throw std::runtime_error("!~ s/// doesn't make sense");
+            if (negated) throw std::runtime_error(parseErrPrefix(line) +
+                "!~ s/// doesn't make sense");
             std::string txt = cur().text; advance();
             size_t s1 = txt.find('\x01'), s2 = txt.find('\x01', s1 + 1);
             auto n = std::make_unique<Node>(); n->kind = NK::RegexSubst; n->line = line;
@@ -1775,14 +1855,16 @@ NodePtr Parser::parseBinding() {
             n->ival = negated ? 1 : 0;
             lhs = std::move(n);
         } else if (check(TK::TR)) {
-            if (negated) throw std::runtime_error("!~ tr/// doesn't make sense");
+            if (negated) throw std::runtime_error(parseErrPrefix(line) +
+                "!~ tr/// doesn't make sense");
             std::string txt = cur().text; advance();
             auto n = std::make_unique<Node>(); n->kind = NK::TrOp; n->line = line;
             n->left = std::move(lhs);
             n->sval = txt; /* search\x01replace\x01flags */
             lhs = std::move(n);
         } else {
-            throw std::runtime_error("Expected /regex/ or s/// or tr/// after =~");
+            throw std::runtime_error(parseErrPrefix(line) +
+                "Expected /regex/ or s/// or tr/// after =~");
         }
     }
     return lhs;
@@ -1950,8 +2032,8 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                     continue;
                 }
                 /* $r->@  (no *, no [...]) — error */
-                throw std::runtime_error("Parse error line " + std::to_string(line) +
-                    ": expected '*' or '[' after '->@'");
+                throw std::runtime_error(parseErrPrefix(line) +
+                    "expected '*' or '[' after '->@'");
             }
             if (check(TK::HASH)) {
                 advance();
@@ -1978,8 +2060,8 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                     base = std::move(n);
                     continue;
                 }
-                throw std::runtime_error("Parse error line " + std::to_string(line) +
-                    ": expected '*' or '{' after '->%'");
+                throw std::runtime_error(parseErrPrefix(line) +
+                    "expected '*' or '{' after '->%'");
             }
             if (check(TK::SCALAR) && peek(1).kind == TK::STAR) { /* $r->$* */
                 advance();  /* skip $ */
@@ -2176,8 +2258,28 @@ NodePtr Parser::parsePrimary() {
             long long v = std::stoll(text, nullptr, 0);
             return makeInt(v, line);
         } catch (...) {
-            /* D78: Integer literal too large for long long — parse as float
-               to match real Perl's auto-promotion on overflow. */
+            /* D78/D103: literal too large for long long (int64). Real Perl
+               auto-promotes this to an exact UV first (if it fits
+               0..UINT64_MAX — its own IV->UV literal range) and only
+               falls to NV/double beyond that. D78 originally always fell
+               straight to double here, losing exactness for any literal
+               in that UV window that isn't a suspiciously-round number
+               (D103's exact repro: `-9223372036854775808`, i.e. 2^63,
+               printed in scientific notation instead of exact digits).
+               Represented as an ordinary Call node (matching __FILE__'s
+               pattern just above) intercepted by codegen's emitCall,
+               which builds an unblessed auto-BigInt from the digit
+               string directly — see perl_bigint_from_decstr_unblessed. */
+            errno = 0;
+            char *end = nullptr;
+            unsigned long long uv = std::strtoull(text.c_str(), &end, 10);
+            bool fitsUV = errno == 0 && end && *end == '\0';
+            (void)uv;
+            if (fitsUV) {
+                auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                n->name = "__auto_bigint_lit"; n->sval = text; n->line = line;
+                return n;
+            }
             double v = std::stod(text);
             return makeFloat(v, line);
         }
@@ -3923,8 +4025,8 @@ NodePtr Parser::parsePrimary() {
         return makeStr(nm, line);
     }
 
-    throw std::runtime_error("Parse error line " + std::to_string(line) +
-        ": unexpected token '" + cur().text + "' (this may be due to advanced Perl syntax in an imported module)");
+    throw std::runtime_error(parseErrPrefix(line) +
+        "unexpected token '" + cur().text + "' (this may be due to advanced Perl syntax in an imported module)");
 }
 
 bool Parser::looksLikeBareCallArg() const {

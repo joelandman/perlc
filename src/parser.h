@@ -26,6 +26,12 @@ public:
     /* D56: warnings state accessors for codegen */
     bool getWarningsEnabled() const      { return warningsEnabled_; }
     bool getWarningsUninitialized() const { return warningsUninitialized_; }
+    /* D128: tell the parser which registered source-file tag (Token::file)
+       belongs to the main script. A parse error whose current token carries
+       a different (or any, when this is unset) non-null tag is reported as
+       "Parse error in <file> line N:" — the module's own file and internal
+       line — instead of the legacy main-script-only format. */
+    void setMainFileTag(const char *t)   { mainFileTag_ = t; }
 
 private:
     std::vector<Token>              toks_;
@@ -44,6 +50,15 @@ private:
     bool signaturesEnabled_   = false; /* use v5.20+ / use feature 'signatures' */
     bool utf8Enabled_         = false; /* use utf8 — string lits are characters */
     std::set<std::string>    knownBareFH_; /* open LOG, ... → print LOG */
+    /* D128: registered Token::file tag of the main script (nullptr when
+       unset — every non-null tag then reports as a foreign file). */
+    const char *mainFileTag_ = nullptr;
+    /* D128: the one place that decides how a parse error is prefixed.
+       Token is tagged with its source file (Token::file); an erroring
+       token from an inlined module reports the module's own file name and
+       internal line ("Parse error in X.pm line N: msg"); a main-script or
+       untagged token keeps the exact legacy "Parse error line N: msg". */
+    std::string parseErrPrefix(int line) const;
     NodePtr litStr(std::string s, int line); /* StringLit; UTF-8 flag if use utf8 */
 
     Token &cur();
@@ -56,6 +71,16 @@ private:
 
     NodePtr parseStmt();
     NodePtr parseBlock();
+    /* D125: the whole `use MODULE`/`use pragma`/`no PRAGMA` statement
+       handling, previously reachable only from parseProgram()'s file-level
+       loop — so `use strict;` / `no warnings 'numeric';` inside any
+       nested block or sub body was a hard parse error. Extracted verbatim
+       (the caller has already consumed nothing) so both parseProgram() and
+       parseStmt() share one implementation. Advances past the statement
+       and returns the statement node(s) to splice into the caller's
+       statement list (multiple for `use parent`), or an empty Block for
+       fully-ignored pragmas. */
+    NodePtr parseUseNoStmt();
     NodePtr parseIf();
     NodePtr parseWhile();
     NodePtr parseFor();

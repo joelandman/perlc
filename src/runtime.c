@@ -1507,6 +1507,11 @@ static __attribute__((pure)) HOTX long long perl_atoll_decimal(const char *s) {
    recognizes Inf/Infinity/NaN (any case, optional sign) as real Perl's
    string→number coercion does — strtod() already understands those once
    the prefix scan lets a matching string reach it. */
+/* D132: forward decl — defined in the D103 helpers block below, used
+   here by perl_to_float's PERL_BIGINT case (round-to-nearest mpz→double;
+   mini-gmp's own mpz_get_d truncates, 1 ULP below Perl's (NV) cast). */
+static __attribute__((pure)) double perl_mpz_get_double(const mpz_t z);
+
 static __attribute__((pure)) HOTX double perl_atof_decimal(const char *s) {
     if (!s) return 0.0;
     const char *p = s;
@@ -1567,6 +1572,10 @@ __attribute__((pure)) HOTX long long perl_to_int(const PerlValue *v) {
         case PERL_FLOAT:  return (long long)v->fval;
         case PERL_STRING: return perl_atoll_decimal(v->sval);
         case PERL_XS_PTR: return (long long)(uintptr_t)v->pval;
+        /* D103: lossy but consistent with perl_bigint_numify — matches
+           real Perl's own numeric-truncation semantics for values that
+           genuinely don't fit a native int. */
+        case PERL_BIGINT: return v->pval ? mpz_get_si(*(mpz_t*)v->pval) : 0;
         default:          return 0;
     }
 }
@@ -1578,6 +1587,19 @@ __attribute__((pure)) HOTX double perl_to_float(const PerlValue *v) {
         case PERL_FLOAT:  return v->fval;
         case PERL_STRING: return perl_atof_decimal(v->sval);
         case PERL_XS_PTR: return (double)(uintptr_t)v->pval;
+        /* D103/D132: mini-gmp's mpz_get_d TRUNCATES toward zero instead of
+           rounding to nearest (it just masks off low limbs), which puts a
+           value like UINT64_MAX at 0x1.fffffffffffffp+63 instead of Perl's
+           own (NV) cast result 0x1p+64 — a 1-ULP divergence from real Perl
+           visible in every stringified NV conversion of a BigInt at/above
+           the 2^53 mantissa boundary (e.g. "$big" or "$big / 2" printing
+           ...37095 vs perl's ...37096). perl_mpz_get_double rounds to
+           nearest via the exact decimal string and strtod — the same
+           conversion real Perl's (NV) cast performs for these magnitudes. */
+        case PERL_BIGINT: {
+            if (!v->pval) return 0.0;
+            return perl_mpz_get_double(*(mpz_t*)v->pval);
+        }
         default:          return 0.0;
     }
 }
@@ -1658,6 +1680,12 @@ const char *perl_to_string(const PerlValue *v) {
             else
                 snprintf(buf, sizeof buf, "PTR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
+        /* D103: only reached for an unblessed auto-promoted BigInt — a
+           blessed Math::BigInt is always intercepted earlier by the ""
+           overload check. mpz_get_str allocates exactly as much space as
+           needed (never truncates), unlike the fixed-size `buf` above. */
+        case PERL_BIGINT:
+            return v->pval ? mpz_get_str(NULL, 10, *(mpz_t*)v->pval) : strdup("0");
         case PERL_DBI_DBH:
             return strdup("DBI::db");
         case PERL_DBI_STH:
@@ -1777,6 +1805,12 @@ char *perl_to_string_dup(const PerlValue *v) {
             else
                 snprintf(buf, sizeof buf, "PTR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
+        /* D103: only reached for an unblessed auto-promoted BigInt — a
+           blessed Math::BigInt is always intercepted earlier by the ""
+           overload check. mpz_get_str allocates exactly as much space as
+           needed (never truncates), unlike the fixed-size `buf` above. */
+        case PERL_BIGINT:
+            return v->pval ? mpz_get_str(NULL, 10, *(mpz_t*)v->pval) : strdup("0");
         case PERL_DBI_DBH:
             return strdup("DBI::db");
         case PERL_DBI_STH:
@@ -1855,6 +1889,11 @@ int perl_is_true(const PerlValue *v) {
         case PERL_DBI_DBH:
         case PERL_DBI_STH:
             return v->pval != NULL;
+        /* D103: a nonzero BigInt (auto-promoted or a declared Math::BigInt
+           reaching here without its own 'bool' overload) is true, exactly
+           like a nonzero plain int. */
+        case PERL_BIGINT:
+            return v->pval && mpz_sgn(*(mpz_t*)v->pval) != 0;
         default: return 0;
     }
 }
@@ -1985,6 +2024,113 @@ HOT int both_int(const PerlValue *a, const PerlValue *b) {
     return a->tag == PERL_INT && b->tag == PERL_INT;
 }
 
+/* ── D103: bounded auto-BigInt overflow promotion ─────────────────────────
+ * Real Perl auto-promotes IV arithmetic that overflows 64-bit signed range
+ * into UV (exact, if non-negative and within 64-bit unsigned range), or
+ * NV (double) otherwise — and re-decides UV-vs-NV on every subsequent
+ * operation as a chain of overflowing arithmetic continues (it does not
+ * stay "exact forever" once it would exceed UV_MAX). This reuses the
+ * existing Math::BigInt (mini-gmp) machinery to represent that UV case
+ * exactly, but as an UNBLESSED PerlValue (tag=PERL_BIGINT, blessed_class=
+ * NULL) — deliberately distinct from a real, user-declared Math::BigInt
+ * object (which stays blessed and keeps its existing unbounded-range
+ * behavior via the overload-dispatch checks already at the top of each
+ * op below, untouched by any of this). Mixing an auto-promoted value
+ * with a real Math::BigInt naturally "graduates" it to full range: the
+ * mpz-extraction helpers already used by Math::BigInt's own methods
+ * (perl_bigint_z et al.) work on ANY PERL_BIGINT-tagged pval regardless
+ * of blessing, so once a blessed operand is involved the existing
+ * blessed-dispatch check above fires first and takes over unbounded. */
+
+
+/* Allocate an UNBLESSED PerlValue wrapping an mpz_t copy — the auto-
+   promotion counterpart to perl_bigint_alloc (blessed, Math::BigInt). */
+static PerlValue *perl_bigint_alloc_unblessed(const mpz_t val) {
+    PerlValue *v = perl_alloc_undef();
+    v->tag = PERL_BIGINT;
+    v->pval = malloc(sizeof(mpz_t));
+    mpz_init_set(*(mpz_t*)v->pval, val);
+    return v;
+}
+
+/* Real Perl's UV range is [0, UINT64_MAX]. unsigned long is 64-bit on
+   this target (x86_64 Linux), so mpz_fits_ulong_p is the exact check. */
+static int perl_bigint_fits_uv(const mpz_t z) {
+    return mpz_sgn(z) >= 0 && mpz_fits_ulong_p(z);
+}
+
+/* Widen a plain-int or already-auto-promoted-BigInt operand to an mpz_t.
+   Never called with a blessed operand — those are caught by the
+   blessed_class overload-dispatch checks before any of this runs. */
+static void perl_operand_to_mpz(mpz_t z, const PerlValue *v) {
+    if (v && v->tag == PERL_BIGINT && v->pval) mpz_init_set(z, *(mpz_t*)v->pval);
+    else mpz_init_set_si(z, perl_to_int(v));
+}
+
+/* Consumes (mpz_clear's) `exact`. Returns an unblessed auto-BigInt when
+   the exact result fits Perl's UV range, else a double converted from
+   the same exact value via perl_mpz_get_double (round-to-nearest, see
+   D132 on perl_to_float) — more principled (and, checked empirically,
+   more faithful to real Perl's own rounding) than each call site
+   separately re-deriving a float from already-rounded operands, which
+   can round differently at extreme magnitudes. */
+static PerlValue *perl_auto_bigint_or_float(mpz_t exact) {
+    PerlValue *result = perl_bigint_fits_uv(exact)
+        ? perl_bigint_alloc_unblessed(exact)
+        : perl_alloc_float(perl_mpz_get_double(exact));
+    mpz_clear(exact);
+    return result;
+}
+
+/* D132: mpz → double with ROUND-TO-NEAREST, matching real Perl's own
+   (NV) cast for BigInt magnitudes. mini-gmp's mpz_get_d truncates toward
+   zero (masks off low limbs without rounding), which puts values at/above
+   the 2^53 mantissa boundary 1 ULP below Perl's conversion (UINT64_MAX
+   lands at 0x1.fffffffffffffp+63 instead of 0x1p+64) — visible in every
+   NV-stringified BigInt. Converts via the exact decimal string and
+   strtod, which is correctly rounded by construction. */
+static __attribute__((pure)) double perl_mpz_get_double(const mpz_t z) {
+    char *txt = mpz_get_str(NULL, 10, z);
+    double d = txt ? strtod(txt, NULL) : 0.0;
+    free(txt);
+    return d;
+}
+
+/* True for a "pure integer" operand (never a genuine float) — used to
+   gate the auto-BigInt path so a real float operand always stays on the
+   ordinary float-arithmetic path instead of being coerced through mpz. */
+static int perl_is_intlike(const PerlValue *v) {
+    return v && (v->tag == PERL_INT || v->tag == PERL_BIGINT);
+}
+
+/* D132: exported cheap tag predicate for codegen's F64 fast path — an
+   unboxed native-double add/sub/mul must NOT be taken when either operand
+   is a BigInt-tagged scalar variable (the value could sit exactly at the
+   UINT64_MAX boundary, where converting to double first loses the exact
+   value and diverges from perl_add/perl_sub/perl_mul's D103-aware exact
+   result by 1 ULP after stringification). Blessed Math::BigInt operands
+   are also covered — perl_add et al. dispatch their overloads first, so
+   routing through them is correct in every case. */
+int perl_is_bigint_pv(const PerlValue *v) {
+    return v && v->tag == PERL_BIGINT;
+}
+
+/* D103: a decimal integer literal beyond INT64_MAX (parser.cpp's
+   std::stoll overflow catch previously always fell to a plain double
+   here — silently losing exactness for any such literal beyond ~2^53,
+   not just ones that don't happen to be a power of two). Called only
+   when the parser has already confirmed the literal fits Perl's own
+   UV range (0..UINT64_MAX); a literal beyond even that still falls to
+   double, matching real Perl exactly. */
+PerlValue *perl_bigint_from_decstr_unblessed(const char *decimal) {
+    mpz_t z;
+    mpz_init(z);
+    mpz_set_str(z, decimal, 10);
+    PerlValue *v = perl_bigint_alloc_unblessed(z);
+    mpz_clear(z);
+    return v;
+}
+
 /* ── arithmetic ──────────────────────────────────────────────────────────── */
 
 HOTX PerlValue *perl_add(const PerlValue *a, const PerlValue *b) {
@@ -1996,13 +2142,42 @@ HOTX PerlValue *perl_add(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "+", (PerlValue*)a, (PerlValue*)b);
         if (r) return r;
     }
+    /* D103: chained arithmetic on an already-auto-promoted (unblessed)
+       overflow value — re-derive exactly and re-check the UV bound on
+       every op, matching real Perl re-deciding UV-vs-NV each time a
+       chain of overflowing arithmetic continues. */
+    if (perl_is_intlike(a) && perl_is_intlike(b) &&
+        ((a && a->tag == PERL_BIGINT) || (b && b->tag == PERL_BIGINT))) {
+        mpz_t za, zb, zr;
+        perl_operand_to_mpz(za, a);
+        perl_operand_to_mpz(zb, b);
+        mpz_init(zr);
+        mpz_add(zr, za, zb);
+        mpz_clear(za); mpz_clear(zb);
+        return perl_auto_bigint_or_float(zr);
+    }
     if (both_int(a, b)) {
-        long long r = a->ival + b->ival;
-        /* D78: Detect signed integer overflow — auto-promote to float.
-           Overflow: pos+pos=neg or neg+neg=pos. */
-        if ((b->ival > 0 && a->ival > 0 && r < 0) ||
-            (b->ival < 0 && a->ival < 0 && r > 0))
-            return perl_alloc_float((double)a->ival + (double)b->ival);
+        long long r;
+        /* D78/D103: __builtin_add_overflow instead of the old "compute the
+           native add, then infer overflow from the wrapped result's sign"
+           pattern — that pattern relies on signed-overflow-is-UB, which
+           -O2 can (and, verified empirically, sometimes does) optimize
+           away entirely, silently defeating the very check it implements.
+           __builtin_add_overflow is defined behavior at any optimization
+           level. On overflow, try the exact bounded-BigInt promotion
+           first (D103) — it naturally falls back to the original float
+           promotion whenever the exact result doesn't fit Perl's UV
+           range (always true for a negative-direction overflow — there
+           is no negative UV, so it correctly stays float). */
+        if (__builtin_add_overflow(a->ival, b->ival, &r)) {
+            mpz_t za, zb, zr;
+            mpz_init_set_si(za, a->ival);
+            mpz_init_set_si(zb, b->ival);
+            mpz_init(zr);
+            mpz_add(zr, za, zb);
+            mpz_clear(za); mpz_clear(zb);
+            return perl_auto_bigint_or_float(zr);
+        }
         return perl_alloc_int(r);
     }
     return perl_alloc_float(perl_to_float(a) + perl_to_float(b));
@@ -2017,13 +2192,31 @@ HOTX PerlValue *perl_sub(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "-", (PerlValue*)a, (PerlValue*)b);
         if (r) return r;
     }
+    /* D103: see perl_add's identical comment. */
+    if (perl_is_intlike(a) && perl_is_intlike(b) &&
+        ((a && a->tag == PERL_BIGINT) || (b && b->tag == PERL_BIGINT))) {
+        mpz_t za, zb, zr;
+        perl_operand_to_mpz(za, a);
+        perl_operand_to_mpz(zb, b);
+        mpz_init(zr);
+        mpz_sub(zr, za, zb);
+        mpz_clear(za); mpz_clear(zb);
+        return perl_auto_bigint_or_float(zr);
+    }
     if (both_int(a, b)) {
-        long long r = a->ival - b->ival;
-        /* D78: Detect signed integer overflow — auto-promote to float.
-           Overflow: pos-neg=neg or neg-pos=pos. */
-        if ((b->ival < 0 && a->ival > 0 && r < 0) ||
-            (b->ival > 0 && a->ival < 0 && r > 0))
-            return perl_alloc_float((double)a->ival - (double)b->ival);
+        long long r;
+        /* D78/D103: see perl_add's identical comment on why
+           __builtin_sub_overflow replaces the old UB-vulnerable
+           wrap-then-infer-from-sign pattern. */
+        if (__builtin_sub_overflow(a->ival, b->ival, &r)) {
+            mpz_t za, zb, zr;
+            mpz_init_set_si(za, a->ival);
+            mpz_init_set_si(zb, b->ival);
+            mpz_init(zr);
+            mpz_sub(zr, za, zb);
+            mpz_clear(za); mpz_clear(zb);
+            return perl_auto_bigint_or_float(zr);
+        }
         return perl_alloc_int(r);
     }
     return perl_alloc_float(perl_to_float(a) - perl_to_float(b));
@@ -2038,20 +2231,34 @@ HOTX PerlValue *perl_mul(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "*", (PerlValue*)a, (PerlValue*)b);
         if (r) return r;
     }
+    /* D103: see perl_add's identical comment. */
+    if (perl_is_intlike(a) && perl_is_intlike(b) &&
+        ((a && a->tag == PERL_BIGINT) || (b && b->tag == PERL_BIGINT))) {
+        mpz_t za, zb, zr;
+        perl_operand_to_mpz(za, a);
+        perl_operand_to_mpz(zb, b);
+        mpz_init(zr);
+        mpz_mul(zr, za, zb);
+        mpz_clear(za); mpz_clear(zb);
+        return perl_auto_bigint_or_float(zr);
+    }
     if (both_int(a, b)) {
-        /* D78: Detect signed integer overflow — auto-promote to float.
-           Simple check: if either operand is non-zero and the division
-           of result by one operand doesn't give back the other, overflow.
-           Also check sign patterns. */
-        long long r = a->ival * b->ival;
-        int overflow = 0;
-        if (a->ival != 0 && b->ival != 0) {
-            if (r / a->ival != b->ival) overflow = 1;
-        } else if (a->ival == 0 || b->ival == 0) {
-            /* 0 * anything = 0, no overflow */
+        long long r;
+        /* D78/D103: __builtin_mul_overflow — see perl_add's identical
+           comment. The old check (divide back and compare) additionally
+           had its own latent bug: INT64_MIN / -1 is itself undefined
+           behavior, reachable when a->ival is INT64_MIN and b->ival is
+           -1. On overflow, try the exact bounded-BigInt promotion first
+           — falls back to float for a negative-magnitude product too. */
+        if (__builtin_mul_overflow(a->ival, b->ival, &r)) {
+            mpz_t za, zb, zr;
+            mpz_init_set_si(za, a->ival);
+            mpz_init_set_si(zb, b->ival);
+            mpz_init(zr);
+            mpz_mul(zr, za, zb);
+            mpz_clear(za); mpz_clear(zb);
+            return perl_auto_bigint_or_float(zr);
         }
-        if (overflow)
-            return perl_alloc_float((double)a->ival * (double)b->ival);
         return perl_alloc_int(r);
     }
     return perl_alloc_float(perl_to_float(a) * perl_to_float(b));
@@ -2173,6 +2380,25 @@ PerlValue *perl_negate(const PerlValue *a) {
     }
     if (a->tag == PERL_INT)   return perl_alloc_int(-a->ival);
     if (a->tag == PERL_FLOAT) return perl_alloc_float(-a->fval);
+    /* D103: negating an unblessed auto-BigInt (always non-negative, per
+       its own bounded-UV invariant — see the comment above perl_add) —
+       most commonly literal `-2**63`-magnitude constants. If the negated
+       exact value fits signed 64-bit (it does for exactly the IV_MIN
+       boundary case, 2^63 negated = -9223372036854775808), demote back
+       to a plain int, matching real Perl exactly instead of a lossy
+       double. Otherwise (magnitude too large even for IV_MIN) fall to
+       the same double behavior as before — matches real Perl's own NV
+       fallback in that rarer case too. */
+    if (a->tag == PERL_BIGINT && a->pval) {
+        mpz_t neg;
+        mpz_init(neg);
+        mpz_neg(neg, *(mpz_t*)a->pval);
+        PerlValue *result;
+        if (mpz_fits_slong_p(neg)) result = perl_alloc_int(mpz_get_si(neg));
+        else result = perl_alloc_float(-perl_to_float(a));
+        mpz_clear(neg);
+        return result;
+    }
     return perl_alloc_float(-perl_to_float(a));
 }
 
@@ -2257,6 +2483,25 @@ PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n_pv) {
 
 /* ── numeric comparisons ─────────────────────────────────────────────────── */
 
+/* D103: exact mpz-based comparison for two int-like operands where at
+   least one is an (unblessed) auto-promoted BigInt — avoids the
+   double-precision loss a plain perl_to_float compare would introduce
+   for magnitudes beyond 2^53 (well within the UV range this auto-
+   promotion targets). Returns -2 (not a valid mpz_cmp result) when not
+   applicable, so callers fall back to the ordinary float compare. A
+   blessed Math::BigInt never reaches here — it's already handled by
+   each caller's blessed_class overload-dispatch check above this. */
+static int perl_bigint_cmp_exact(const PerlValue *a, const PerlValue *b) {
+    if (!perl_is_intlike(a) || !perl_is_intlike(b)) return -2;
+    if (!(a && a->tag == PERL_BIGINT) && !(b && b->tag == PERL_BIGINT)) return -2;
+    mpz_t za, zb;
+    perl_operand_to_mpz(za, a);
+    perl_operand_to_mpz(zb, b);
+    int c = mpz_cmp(za, zb);
+    mpz_clear(za); mpz_clear(zb);
+    return c < 0 ? -1 : (c > 0 ? 1 : 0);
+}
+
 HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
@@ -2266,6 +2511,7 @@ HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
         if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
     }
+    { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c == 0); }
     return perl_alloc_bool(perl_to_float(a) == perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
@@ -2277,6 +2523,7 @@ HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
         if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
     }
+    { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c != 0); }
     return perl_alloc_bool(perl_to_float(a) != perl_to_float(b));
 }
 HOTX PerlValue *perl_num_lt(const PerlValue *a, const PerlValue *b) {
@@ -2288,6 +2535,7 @@ HOTX PerlValue *perl_num_lt(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
         if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c > 0); }
     }
+    { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c < 0); }
     return perl_alloc_bool(perl_to_float(a) <  perl_to_float(b));
 }
 HOTX PerlValue *perl_num_gt(const PerlValue *a, const PerlValue *b) {
@@ -2299,6 +2547,7 @@ HOTX PerlValue *perl_num_gt(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
         if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c < 0); }
     }
+    { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c > 0); }
     return perl_alloc_bool(perl_to_float(a) >  perl_to_float(b));
 }
 HOTX PerlValue *perl_num_le(const PerlValue *a, const PerlValue *b) {
@@ -2310,9 +2559,11 @@ HOTX PerlValue *perl_num_le(const PerlValue *a, const PerlValue *b) {
         PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
         if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c >= 0); }
     }
+    { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c <= 0); }
     return perl_alloc_bool(perl_to_float(a) <= perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ge(const PerlValue *a, const PerlValue *b) {
+    { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c >= 0); }
     return perl_alloc_bool(perl_to_float(a) >= perl_to_float(b));
 }
 
@@ -3028,10 +3279,17 @@ PerlValue *perl_join(PerlValue *sep, PerlArray *arr) {
    (omitted or zero LIMIT) split() behavior, applied after an unbounded
    split. Not applied when a nonzero LIMIT was given (real Perl doesn't
    trim in that case either). */
+/* D126: strip trailing empty-string (or undef — a trailing non-
+   participating capture, which real Perl's trim also removes, verified:
+   split(/(b)?,/, "a,") -> ("a")) fields. Shared by the string and regex
+   split paths; the string path can never hold undef so this is inert
+   there. */
 static void perl_split_trim_trailing_empty(PerlArray *arr) {
     while (arr->len > 0) {
         PerlValue *last = arr->elems[arr->len - 1];
-        int isEmpty = (last->tag == PERL_STRING) && (!last->sval || last->sval[0] == '\0');
+        int isEmpty = (last->tag == PERL_UNDEF) ||
+                      ((last->tag == PERL_STRING) &&
+                       (!last->sval || last->sval[0] == '\0'));
         if (!isEmpty) break;
         PerlValue *popped = perl_array_pop(arr);
         perl_free(popped);
@@ -6942,18 +7200,43 @@ long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *fl
     return count;
 }
 
+/* D126 (while fixing): real Perl's split-field walk, derived empirically
+   from perl itself (see the matching probes in the D126 write-up):
+   - a CONSUMING match [mstart,mend) ends the field s[fstart..mstart]
+     (always emitted, even empty — leading empty fields are produced),
+     appends that match's capture texts, then continues from mend;
+   - a ZERO-WIDTH match at mstart > fstart also ends the field
+     s[fstart..mstart] (with its captures) and restarts the field at
+     mstart+1 — an empty match acts as a separator BETWEEN characters,
+     exactly like the empty-pattern // case (split /x?/, "ab" -> a b);
+   - a ZERO-WIDTH match at mstart == fstart is skipped entirely (no field,
+     no captures): scan resumes at mstart+1 and the field keeps
+     accumulating (split /,?/, "a,b" -> a b, no empty field between the
+     field and the ',' separator);
+   - no match, or scanning past the end: the remainder s[fstart..slen] is
+     the final field.
+   pos always advances (consuming: mend > mstart >= pos; zero-width:
+   mstart+1 > pos; skip: mstart+1 > pos), so the walk terminates for any
+   pattern — no all-zero-width-pattern special case needed. fstart trails
+   pos whenever zero-width matches are skipped, and the bounded-LIMIT /
+   no-match remainders must therefore be taken from fstart, not pos. */
+
 PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str, long long limit) {
     PerlArray *arr = perl_array_new();
     char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
-    /* D118: LIMIT > 0 bounds the field count — the last field absorbs
-       everything remaining unsplit, rather than being matched further. */
+    /* D118: LIMIT > 0 bounds the FIELD count — the last field absorbs
+       everything remaining unsplit, rather than being matched further.
+       D126: captured-group texts are EXTRA elements interleaved after
+       their field and never count toward the LIMIT (verified against
+       real perl: split(/(,)/, "a,b,c,d", 3) -> a , b , "c,d"). */
     int bounded = limit > 0;
+    long long fields = 0;   /* field count so far (captures excluded) */
 
     /* empty pattern: split into individual characters (Perl semantics) */
     if (pattern[0] == '\0') {
         for (size_t i = 0; i < slen; i++) {
-            if (bounded && (long long)arr->len == limit - 1) {
+            if (bounded && fields == limit - 1) {
                 PerlValue *v = perl_alloc_string(s + i);
                 perl_array_push(arr, v); perl_free(v);
                 break;
@@ -6961,6 +7244,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
             char ch[2] = {s[i], '\0'};
             PerlValue *v = perl_alloc_string(ch);
             perl_array_push(arr, v); perl_free(v);
+            fields++;
         }
         free(s);
         if (limit == 0) perl_split_trim_trailing_empty(arr);
@@ -6977,29 +7261,104 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     if (!re) { free(s); return arr; }
     size_t pos = 0;
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    /* D126: ovector slots available in md (== 1 + number of capture
+       groups in the pattern, since match_data is created from the
+       pattern itself); a group `i` (1-based) occupies ov[2i]/ov[2i+1]. */
+    uint32_t ovec_count = pcre2_get_ovector_count(md);
 
-    while (pos <= slen) {
-        if (bounded && (long long)arr->len == limit - 1) {
-            PerlValue *v = perl_alloc_string(s + pos);
-            perl_array_push(arr, v); perl_free(v); break;
+    /* push s[start..slen] as one field */
+#define SPLIT_PUSH_FIELD(start)                                              \
+    do {                                                                     \
+        PerlValue *fv_ = perl_alloc_string(s + (start));                     \
+        perl_array_push(arr, fv_); perl_free(fv_);                           \
+        fields++;                                                            \
+    } while (0)
+
+    /* D126: append each capturing group's text for the current match.
+       A group that did not participate pushes UNDEF (not omitted —
+       verified: split(/(x)?,/, "a,b") -> 'a', undef, 'b'); a participating
+       empty group pushes "". Named groups (?<n>...) are ordinary capture
+       groups to PCRE2 and are included the same way. Called ONLY for
+       matches that actually end a field (a skipped zero-width match at
+       the field start contributes nothing — verified: split(/(x?)/,
+       "ab") -> 'a', '', 'b', i.e. exactly one capture element, from the
+       match that ended 'a', not from the skipped matches at 0 and 2). */
+#define SPLIT_PUSH_CAPTURES(ovp)                                             \
+    for (uint32_t i_ = 1; i_ < ovec_count; i_++) {                           \
+        PCRE2_SIZE cst_ = (ovp)[2 * i_], cen_ = (ovp)[2 * i_ + 1];           \
+        if (cst_ == PCRE2_UNSET || cen_ == PCRE2_UNSET ||                    \
+            cst_ > cen_ || cen_ > slen) {                                    \
+            PerlValue *uv_ = perl_alloc_undef();                             \
+            perl_array_push(arr, uv_); perl_free(uv_);                       \
+            continue;                                                        \
+        }                                                                    \
+        size_t clen_ = cen_ - cst_;                                          \
+        char *cap_ = malloc(clen_ + 1);                                      \
+        memcpy(cap_, s + cst_, clen_); cap_[clen_] = '\0';                   \
+        PerlValue *cv_ = perl_alloc_string(cap_); free(cap_);                \
+        perl_array_push(arr, cv_); perl_free(cv_);                           \
+    }
+
+    size_t fstart = 0;   /* start of the field being accumulated */
+    for (;;) {
+        if (bounded && fields == limit - 1) {
+            /* last field absorbs the whole remainder, from the field
+               start (not pos — skipped zero-width matches may have left
+               pos ahead of fstart) */
+            SPLIT_PUSH_FIELD(fstart);
+            break;
+        }
+        if (pos > slen) {
+            /* walked off the end: the accumulated field is final */
+            SPLIT_PUSH_FIELD(fstart);
+            break;
         }
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
         if (rc > 0) populate_named_captures(md, s, re);
         if (rc <= 0) {
-            PerlValue *v = perl_alloc_string(s + pos);
-            perl_array_push(arr, v); perl_free(v); break;
+            SPLIT_PUSH_FIELD(fstart);
+            break;
         }
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
         size_t mstart = ov[0], mend = ov[1];
-
-        size_t pre = mstart - pos;
-        char *elem = malloc(pre + 1);
-        memcpy(elem, s + pos, pre); elem[pre] = '\0';
-        PerlValue *v = perl_alloc_string(elem); free(elem);
-        perl_array_push(arr, v); perl_free(v);
-
-        pos = (mend > mstart) ? mend : mend + 1;
+        if (mend > mstart) {
+            /* consuming match: end the field at mstart (always emitted,
+               even when empty — real Perl produces leading empty fields,
+               e.g. split(/(,)/, ",a,b") -> '', ',', 'a', ',', 'b') */
+            size_t pre = mstart - fstart;
+            char *elem = malloc(pre + 1);
+            memcpy(elem, s + fstart, pre); elem[pre] = '\0';
+            PerlValue *v = perl_alloc_string(elem); free(elem);
+            perl_array_push(arr, v); perl_free(v);
+            fields++;
+            SPLIT_PUSH_CAPTURES(ov);
+            pos = mend;
+            fstart = mend;
+        } else if (mstart > fstart) {
+            /* zero-width match strictly inside the field: acts as a
+               separator between characters (like split //) — end the
+               field here, with this match's captures. The next field
+               starts AT mstart: the zero-width separator sits "between"
+               the previous char and the next, so the char at mstart
+               belongs to the next field (split /x?/, "ab" -> 'a','b'). */
+            size_t pre = mstart - fstart;
+            char *elem = malloc(pre + 1);
+            memcpy(elem, s + fstart, pre); elem[pre] = '\0';
+            PerlValue *v = perl_alloc_string(elem); free(elem);
+            perl_array_push(arr, v); perl_free(v);
+            fields++;
+            SPLIT_PUSH_CAPTURES(ov);
+            pos = mstart + 1;
+            fstart = mstart;
+        } else {
+            /* zero-width match at the field start: skipped — no field,
+               no captures, field keeps accumulating (e.g. the empty match
+               at 0 in "a,b" before the ',' at 1) */
+            pos = mstart + 1;
+        }
     }
+#undef SPLIT_PUSH_FIELD
+#undef SPLIT_PUSH_CAPTURES
 
     free(s);
     pcre2_match_data_free(md);

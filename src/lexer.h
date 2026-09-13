@@ -2,6 +2,13 @@
 #include <string>
 #include <vector>
 
+/* D128: registers a source-file name in a process-wide, address-stable
+   registry and returns a pointer that stays valid for the process's
+   lifetime (Token::file points at it — token streams are copied around
+   by value and outlive their Lexer, so the pointed-at storage must never
+   move or be freed). */
+const char *lexer_register_source_file(const std::string &name);
+
 enum class TK {
     /* literals */
     INT, FLOAT, STRING, REGEX,
@@ -92,12 +99,32 @@ struct Token {
     TK          kind;
     std::string text;
     int         line;
+    /* D128: source file this token was lexed from — a stable pointer into
+       the process-wide filename registry (lexer_register_source_file(),
+       lexer.cpp). Token streams are copied around by value (inlineModules()
+       splices module tokens into the combined stream) and outlive the
+       Lexer that produced them, so a pointer into a temporary std::string
+       would dangle; registry elements are guaranteed address-stable.
+       nullptr means "unknown/synthetic" — tokens manufactured by the
+       parser or codegen itself (e.g. const-sub splices, interpolation
+       fragments) — and keeps the legacy main-script error format. */
+    const char *file = nullptr;
 };
 
 class Lexer {
 public:
-    explicit Lexer(std::string src);
+    /* D128: `sourceName` is tagged onto every token this lexer emits (via
+       the process-wide filename registry; see Token::file). The driver
+       passes the main script's path; inlineModules() passes each module's
+       resolved fullPath. An empty name (the default) leaves tokens
+       untagged (file == nullptr) — used only for synthetic fragments
+       (s///-replacement text, interpolated-string sub-expressions), which
+       are not file text and should keep the legacy error format. */
+    explicit Lexer(std::string src, const std::string &sourceName = "");
     std::vector<Token> tokenize();
+    /* D128: the registered tag for this lexer's source file (nullptr if
+       constructed with no name). */
+    const char *sourceName() const { return fileTag_; }
     /* Text after __DATA__ / __END__ (the DATA filehandle). Empty if none. */
     const std::string &dataSection() const { return dataSection_; }
     bool hasDataSection() const { return hasDataSection_; }
@@ -108,6 +135,7 @@ private:
     bool        hasDataSection_ = false;
     size_t      pos_  = 0;
     int         line_ = 1;
+    const char *fileTag_ = nullptr; /* D128: registry pointer for this file */
     size_t      pendingHeredocPos_   = 0; /* if set, jump here after consuming the next \n */
     int         pendingHeredocLines_ = 0; /* extra line count for the heredoc body */
 

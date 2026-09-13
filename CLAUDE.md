@@ -18,8 +18,9 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-11, re-verified after D101 — 301/301 PASS,
-0 FAIL):** New this session: `d113_undefined_sub_die_{smoke,deep}.pl`,
+**Harness (2026-09-13, re-verified after D128/D135 — 321/321 PASS,
+0 FAIL; `make test` 47/47):** New this session:
+`d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
 `d112_module_scope_{smoke,deep}.pl` (+ `tests/lib/D112Leaky.pm`),
 `d114_array_slice_{smoke,deep}.pl`, `d109_subst_interp_{smoke,deep}.pl`,
@@ -31,14 +32,74 @@ gated by `make test-all` (byte-for-byte vs real `perl`).
 (+ `tests/lib/D127AmpExport.pm`, `tests/lib/D127AmpExportOk.pm`),
 `d129_local_paren_{smoke,deep}.pl`, `d102_die_ref_{smoke,deep}.pl`,
 `d115_bare_return_list_{smoke,deep}.pl`, `d130_my_cond_{smoke,deep}.pl`,
-`d131_our_nested_block_{smoke,deep}.pl`, `d101_each_scalar_{smoke,deep}.pl`.
+`d131_our_nested_block_{smoke,deep}.pl`, `d101_each_scalar_{smoke,deep}.pl`,
+`d103_int_overflow_{smoke,deep}.pl`, `d104_indented_heredoc_{smoke,deep}.pl`,
+`d106_flat_ref_elem_alias_{smoke,deep}.pl`, `d108_string_escapes_{smoke,deep}.pl`,
+`d125_pragma_nested_{smoke,deep}.pl` (+ `tests/lib/D125Pragma.pm`),
+`d126_split_captures_{smoke,deep}.pl`,
+`d132_bigint_f64_fastpath_{smoke,deep}.pl`,
+`d133_assign_double_free_{smoke,deep}.pl`,
+`d134_syscall_buf_{smoke,deep}.pl`,
+`d135_int_promo_nv_{smoke,deep}.pl`,
+`d128_module_error_location.sh` (+ `tests/lib/D128Broken.pm`,
+`tests/d128_module_error_main.pltxt` — compile-failure diagnostics
+fixtures, outside the harness corpus).
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
-D116, D117, D118, D119, D127, D129, D102, D115, D130, D131, and D101
-are now fixed (D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/
-D111/D112/D114/D109 detailed just below; D99/D105/D100/D107 write-ups
-follow; D130/D131/D101 write-ups are in TESTS.md):**
+D116, D117, D118, D119, D127, D129, D102, D115, D130, D131, D101,
+D103, D104, D106, D108, D125, D126, D132, D133, and D134 are now fixed
+(D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/D111/D112/
+D114/D109 detailed just below; D99/D105/D100/D107 write-ups follow;
+D130/D131/D101/D103/D104/D106/D108/D125/D126/D132/D133/D134 write-ups
+are in TESTS.md):**
+- D125/D126/D132/D133/D134 (2026-09-12, two-agent parallel session):
+  see TESTS.md for full write-ups. Summary: D125 is `use`/`no` pragmas
+  now parsing inside any nested scope (the whole handling extracted
+  from `parseProgram()` into `Parser::parseUseNoStmt()`, shared with
+  `parseStmt()`); D126 is `split` with capturing-group patterns now
+  interleaving capture texts (plus a side-effect fix for the
+  pre-existing hang/garbage on all-zero-width split patterns; LIMIT
+  counts fields only; non-participating groups yield UNDEF, matching
+  perl); D132 is `emitBinOp`'s F64 fast path no longer bypassing
+  D103's BigInt-aware ops for a BigInt-tagged scalar variable (runtime
+  tag-predicate guard, branch-and-PHI, non-BigInt IR byte-identical)
+  plus a second 1-ULP fix (mini-gmp `mpz_get_d` truncates → exact
+  decimal-string + `strtod` via `perl_mpz_get_double`); D133 is a
+  pre-existing double-free in the int/float-var Assign boxed fallback
+  (`freeIfOwned(rv)` then `return rv` — freed again by the statement
+  context; found via a segfault while verifying D125's deep test,
+  reproduces on the pre-fix snapshot); D134 is `syscall()` args now
+  pushed by reference so kernel writes through a pointer argument land
+  in the caller's buffer (fixes `make test`'s xs_ffi clock assertions;
+  `make test` is 47/47). Found, not fixed, while writing D133's deep
+- D128/D135 (2026-09-13, two-agent parallel session): see TESTS.md for
+  full write-ups. D128 is parse-error diagnostics: tokens now carry
+  their source file (process-wide deque filename registry; `Token`
+  grows one pointer), so a parse error inside an inlined module
+  reports `Parse error in <module> line N:` with the module's own
+  internal line, while main-file errors keep the legacy format;
+  D135 is sub-scope/bare-block int-promotion no longer pinning a
+  variable to i64 storage when the scope later writes it a
+  non-int-shaped value (fixpoint "provably-int-only" scan over the
+  scope's writes; float-unbox or boxed-PV fallback; pure-int counters
+  keep byte-identical IR). Both shipped with their own self-verifying
+  test assets (D128's are compile-failure fixtures outside the
+  harness corpus).
+- D103/D104/D106/D108: see TESTS.md for full write-ups. Summary: D103
+  is integer-overflow auto-promotion (bounded, unblessed auto-BigInt
+  reusing the existing Math::BigInt/mini-gmp machinery — see TESTS.md
+  for why threading a real UV type was judged too risky, and the
+  `__builtin_*_overflow` fix for a related pre-existing UB bug found
+  along the way); D104 is `<<~IDENT` indented-heredoc lexer support;
+  D106 is D105's identical FLAT_ARRAY-ref-alias fix ported to array/hash
+  *element* reads (`$arr[0]`, `$h{k}`), confirmed not to touch the
+  fragile 2D compound-assign fast paths that caused D105's own segfault
+  regression; D108 is `\f`/`\a`/`\e`/`\b` missing from plain
+  double-quoted string literals (two separate lexer code paths had the
+  identical gap). Found, not fixed, while verifying D103: **D132**
+  (`emitBinOp`'s F64 fast path can bypass D103's BigInt-aware ops for a
+  BigInt-tagged scalar variable — narrow, 1-ULP-only divergence).
 - D101 (`src/codegen.cpp`, scalar-context `case NK::EachFunc`):
   `each %hash` in scalar context (`while (my $k = each %h)`) returned
   `perl_array_len(av)` — the [key,val] pair-array's *count* (0, 1, or
@@ -233,8 +294,8 @@ follow; D130/D131/D101 write-ups are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** **D103, D104, D106, D108, D110,
-D120, D124, D125, D126, D128** (see `TESTS.md`). **D54**
+**Open generated-code defects:** **D110, D120, D124**
+(see `TESTS.md`). **D54**
 (tooling): `perlc_tsan` can hang compiling `tests/threads.pl`
 (TSan+`fork` of clang); workaround `TSAN_OPTIONS=die_after_fork=0`.
 

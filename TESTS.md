@@ -70,10 +70,10 @@ eval STRING and eval-defined subs see outer `my`).
 | D54 | OPEN (tooling) | `perlc_tsan` hangs compiling `tests/threads.pl` (TSan+fork of clang-18). `TSAN_OPTIONS=die_after_fork=0` works around it. Not a generated-code bug. |
 | D101 | **FIXED 2026-09-11** | `each %hash` in scalar context returned the pair length (0/1/2), not the key. See below. |
 | D102 | **FIXED** (2026-09-10) | `die REF` / `die $blessed_obj` lost the reference — `$@` became a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Broke OO exception handling. See below. |
-| D103 | OPEN (correctness, low freq.) | Integer overflow uses wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently go wrong or print in scientific notation instead of exact digits. See below. |
-| D104 | OPEN (missing syntax) | Indented heredoc `<<~IDENT` (Perl 5.26+) is not recognized by the lexer at all — hard parse error, not silent-wrong-data. See below. |
-| D106 | OPEN (correctness, narrow, found while fixing D105) | Same bug class as D105 but for a FLAT_ARRAY/FLOAT_PAIR ref read back out of an array/hash element (`$arr[0]`, `$h{k}`) rather than a plain scalar variable — a second alias made from that read doesn't see further writes. Deliberately not fixed alongside D105: the fix location (`case NK::ArrayElem`/`HashElem` in `emitExpr`) sits right next to the exact fast-path code that caused a segfault regression while fixing D105 (2D compound-assign, `llvm.assume(tag==FLAT_ARRAY)`). See below. |
-| D108 | OPEN (correctness, narrow, found while fixing D107) | Plain double-quoted string literals (`"..."`, unrelated to `s///`) don't recognize `\f`/`\a`/`\e`/`\b` — they pass through as literal backslash+letter. `src/lexer.cpp`'s double-quoted-string escape switch only has cases for `n t r 0 x \ ' " $ @`. Narrow, low real-world frequency. See below. |
+| D103 | **FIXED 2026-09-11** | Integer overflow used wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently went wrong or printed in scientific notation instead of exact digits. See below. |
+| D104 | **FIXED 2026-09-11** | Indented heredoc `<<~IDENT` (Perl 5.26+) was not recognized by the lexer at all — hard parse error, not silent-wrong-data. See below. |
+| D106 | **FIXED 2026-09-11** | Same bug class as D105 but for a FLAT_ARRAY/FLOAT_PAIR ref read back out of an array/hash element (`$arr[0]`, `$h{k}`) rather than a plain scalar variable — a second alias made from that read didn't see further writes. See below. |
+| D108 | **FIXED 2026-09-11** | Plain double-quoted string literals (`"..."`, unrelated to `s///`) didn't recognize `\f`/`\a`/`\e`/`\b` — they passed through as literal backslash+letter. See below. |
 | D109 | **FIXED** (2026-09-10) | `s///` replacement text didn't support arbitrary variable interpolation (`$name`, `@arr`) — only `$0`-`$9`/`$&` (capture refs) worked, even though real Perl parses the replacement like a double-quoted string. See below. |
 | D120 | OPEN (correctness, split off D109's widened scope, found 2026-09-10) | The *general* string-interpolation engine used by plain `"..."` literals (not just `s///`, which D109 now separately fixes) is wrong for `$$aref[0]` (prints `[0]`) and `@{$r}[0,1]` (prints `1 2 3[0,1]`) — subscripted dereference inside a double-quoted string. `src/parser.cpp`'s `parseStringInterp` explicitly documents this as a known, unfixed gap in its own `$$` handling comment. See below. |
 | D121 | **FIXED** (2026-09-10) | `$::name` / `@::arr` / `%::hash` (Perl's shorthand for `$main::name` — a bare `::` package prefix meaning "main") was a hard parse error ("unexpected token ':'"). Common in older/sysadmin-style Perl (found via the real `/usr/bin/ucfq` script). See below. |
@@ -85,15 +85,19 @@ eval STRING and eval-defined subs see outer `my`).
 | D115 | **FIXED** (2026-09-10) | Bare `return;` in list context yielded a 1-element list instead of Perl's empty list — broke `my %h = (k => f())`-style "return nothing on failure" patterns. See below. |
 | D130 | **FIXED 2026-09-11** | `if (my @arr = EXPR)` — a single ARRAY/HASH variable declared inline as an `if`/`while` condition — was a hard parse error ("unexpected token 'my'"). See below. |
 | D131 | **FIXED 2026-09-11** | `our $var;`/`our @arr;`/`our %hash;` declared inside a nested bare `{ }` block, or repeated as a bare redeclaration anywhere, didn't work correctly. See below. |
+| D132 | **FIXED 2026-09-12** | `emitBinOp`'s separate F64 "stay unboxed" fast path converted a BigInt-tagged scalar VARIABLE straight to `double` and added/subbed/muled natively, bypassing `perl_add`/`perl_sub`/`perl_mul`'s D103 BigInt-aware logic. Fixed with a runtime BigInt-tag guard branching to the boxed op (plus a second pre-existing 1-ULP fix: mini-gmp's `mpz_get_d` truncates instead of round-to-nearest). See below. |
 | D116 | **FIXED** (2026-09-10, `__PACKAGE__`/`__FILE__`/`__LINE__` only) | `__PACKAGE__` / `__FILE__` / `__LINE__` were not implemented at all (hard parse error) despite `bless {...}, __PACKAGE__` being one of the most common OO-Perl idioms in CPAN modules. `__SUB__` (reference to the currently-executing sub) is intentionally not covered — harder, split off as **D124**. See below. |
 | D124 | OPEN (missing syntax, split off D116's `__SUB__` case, found 2026-09-10) | `__SUB__` (a reference to the currently-executing sub, needed for anonymous recursion — `use feature 'current_sub'`) is still a hard parse error. Needs codegen support for a reference to the current closure's own captures, not just a compile-time constant substitution like `__PACKAGE__`/`__LINE__`/`__FILE__`. See below. |
 | D117 | **FIXED** (2026-09-10) | `perl_atof_decimal` (`src/runtime.c`) was a hand-rolled decimal-string→float parser (manual digit accumulation plus a repeated-multiply exponent loop) instead of `strtod`, accumulating rounding error on ordinary decimal strings — every implicit string→number coercion goes through it. See below. |
-| D125 | OPEN (missing syntax, found 2026-09-10 while testing D117) | `use`/`no` pragma statements (`use strict;`, `no warnings 'numeric';`, etc.) are only recognized at the very top level of a file — nested inside a `sub {}` or a bare `{ }` block, they're a hard parse error ("unexpected token 'warnings'"/"'use'"). Root cause: the `use`/`no` handling (`src/parser.cpp:73`) lives in `parseProgram()`, not in the general `parseStmt()` every nested block/sub actually uses. See below. |
+| D125 | **FIXED 2026-09-12** | `use`/`no` pragma statements (`use strict;`, `no warnings 'numeric';`, etc.) are only recognized at the very top level of a file — nested inside a `sub {}` or a bare `{ }` block, they're a hard parse error ("unexpected token 'warnings'"/"'use'"). Root cause: the `use`/`no` handling (`src/parser.cpp:73`) lives in `parseProgram()`, not in the general `parseStmt()` every nested block/sub actually uses. See below. |
 | D118 | **FIXED** (2026-09-10) | `split` had no 3rd LIMIT argument at all (hard parse error, not just silently ignored) and didn't trim trailing empty fields from the result, unlike real Perl's default `split` behavior. See below. |
-| D126 | OPEN (correctness, found 2026-09-10 while testing D118) | `split(/(,)/, $str)` — a split pattern with a capturing group — doesn't include the captured delimiter text in the result the way real Perl does (`split(/(,)/, "a,b,c")` should give `("a", ",", "b", ",", "c")`, 5 elements; perlc gives `("a","b","c")`, 3). Pre-existing, confirmed unrelated to the D118 fix (reproduced on the pre-D118/D117 binary too). See below. |
+| D126 | **FIXED 2026-09-12** | `split(/(,)/, $str)` — a split pattern with a capturing group — didn't include the captured delimiter text in the result the way real Perl does (`split(/(,)/, "a,b,c")` gives `("a", ",", "b", ",", "c")`, 5 elements). The rewrite also fixed a pre-existing hang/garbage on all-zero-width split patterns. See below. |
 | D127 | **FIXED** (2026-09-10) | `scanExports()` stored an export name with a leading `&`/`*` sigil verbatim (e.g. real `Pod::Usage.pm`'s `our @EXPORT = qw(&pod2usage);`) instead of stripping it, so it never string-matched a plain `pod2usage` explicit import *or* an unqualified `pod2usage()` call after a bare `use Pod::Usage;`. High real-world impact — `pod2usage()` for `--help`/`--man` handling is one of the most common patterns in documented Perl CLI tools. See below. |
 | D129 | **FIXED** (2026-09-10) | `local($var) = EXPR;` — a parenthesized, single-variable list-form `local` — was a hard parse error ("expected $ but got '('"). Found in real, unmodified `Pod::Usage.pm` (`local($_) = shift;`). See below. |
-| D128 | OPEN (tooling/diagnostics, found 2026-09-10 real-module survey #2) | A parse error occurring *inside* an inlined module (`use Some::Module;`) is reported with a line number belonging to the wrong file (the main script's own line count at the point of inlining, not the module's internal line count) and no indication of which file the error is actually in — makes a real bug inside a `use`d module very hard to diagnose. Found via `corelist`/`podchecker` (both real system scripts) reporting implausibly early line numbers. See below. |
+| D128 | **FIXED 2026-09-13** | A parse error occurring *inside* an inlined module (`use Some::Module;`) used to be reported with a line number belonging to the wrong file and no indication of which file the error is actually in. Tokens now carry their source-file tag; module errors report `Parse error in <module> line N:` with the module's own internal line; main-file errors keep the legacy `Parse error line N:` format byte-for-byte. See below. |
+| D133 | **FIXED 2026-09-12** | Double-free in `case NK::Assign`'s int/float-var boxed fallback (`src/codegen.cpp`): `my $var = "x" + 0` inside a bare block freed the owned boxed RHS temp *and* returned it for the statement context to free again — silent allocator corruption, segfaulting when the variable was later read via `==`. Found while verifying D125's deep test (the pre-D125 snapshot binary reproduces it identically). See below. |
+| D134 | **FIXED 2026-09-12** | `syscall()` arguments were pushed into the arg array with `perl_array_push`, which **clones** — a syscall that writes through a pointer argument (SYS_clock_gettime's `struct timespec` buffer) wrote into the clone, so the caller's `$buf` never changed (`make test`'s `xs_ffi.pl` clock assertions failed on this). Args are now pushed by reference (`perl_array_push_nc`) so kernel writes land in the caller's own buffer. See below. |
+| D135 | **FIXED 2026-09-13** | Inside a sub (or a nested bare block), a variable initialized with an integer (`my $x = 0;`) was int-promoted to an unboxed i64 alloca; any later assignment of a fractional NV (`$x = 5.5;`, `$x = "5.5" + 0;`, `$x = g();` where g returns 5.5, even a plain `$x = "7.25";`) silently truncated to the int part. Fixed with a fixpoint "provably-int-only" scan: int-promotion is refused when the scope ever writes the name a non-int-shaped value. Pure-int counters keep their i64 fast path (hot-loop IR byte-identical). See below. |
 | D119 | **FIXED** (2026-09-10) | `scalar(keys %$href)` (keys on a deref'd hashref, in scalar context) returned `0` instead of the key count — `scalar(keys %h)` on a plain named hash and list-context `keys %$href` were both correct, so this was specific to the scalar-context + deref-hash combination. See below. |
 | D110 | OPEN (correctness, found while implementing Data::Dumper; scope widened 2026-09-10) | `$Package::var` (an arbitrary fully-qualified global not declared via `our`) is not a true cross-scope global — it auto-vivifies as a plain variable in whatever scope first references it, so setting it at file scope is invisible from inside an unrelated `sub`. General bug, not module-specific; found via `$Data::Dumper::Sortkeys`. Widened 2026-09-10 while verifying D121: the same gap applies to `@Package::arr`/`%Package::hash` too, and more severely — an undeclared qualified array/hash doesn't just fail to cross scopes, whole-array/hash access (`my @c = @main::arr`, not just elements) returns nothing at all, vs. an `our`-declared array/hash (which works correctly, cross-package, today). See below. |
 | D99 | **FIXED** (2026-09-09) | `my @b = @a;` aliased storage — mutating `@b` mutated `@a`. Fixed in `src/codegen.cpp:4118-4149` (`case NK::My`, `isArr` branch): a borrowed pointer from `emitArrayPtr` (plain `@var`, `@$ref`, `->@*`) is now always copied into a fresh array via `perl_array_new`+`perl_array_extend`, instead of being declared directly as the new variable's backing store. Tests: `tests/d99_array_copy_smoke.pl`, `tests/d99_array_copy_deep.pl`. |
@@ -412,25 +416,110 @@ string dies (with and without a trailing newline) and a bare `die;`
 (defaults to `"Died"`) are unchanged. Tests:
 `tests/d102_die_ref_{smoke,deep}.pl`.
 
-### D103 — integer overflow wraps instead of promoting (low frequency, but silent)
+### D103 — integer overflow wraps instead of promoting — **FIXED 2026-09-11**
 
 ```perl
 my $big = 9223372036854775807;  # IV_MAX
-print $big + 1, "\n";            # perl: 9223372036854775808  |  perlc: -9223372036854775808 (wrapped)
-print -9223372036854775808, "\n"; # perl: -9223372036854775808 (exact) | perlc: -9.22337203685478e+18
+print $big + 1, "\n";            # perl: 9223372036854775808  |  was: -9223372036854775808 (wrapped)
+print -9223372036854775808, "\n"; # perl: -9223372036854775808 (exact) | was: -9.22337203685478e+18
 ```
 Real Perl's numeric model auto-promotes IV arithmetic that overflows
-64-bit signed range into UV (if positive and within 64-bit unsigned range)
-or NV (double), and its stringifier prints whole-valued NVs at this
-magnitude using exact digits, not `%g`-style scientific notation. perlc's
-"W1: I64 fast path" (see git log) does native wrapping `i64` arithmetic
-with no overflow check, and literals beyond `INT64_MAX` fall back to a
-plain `double` with no special-case exact-integer formatting on print.
-Affects only values within ~`LLONG_MAX` of the 64-bit boundary — rare in
-ordinary scripts, but silent (wrong answer, no warning) rather than a
-crash, which is why it's still worth fixing ahead of new features.
+64-bit signed range into UV (if positive and within 64-bit unsigned
+range) or NV (double), and its stringifier prints whole-valued NVs at
+this magnitude using exact digits, not `%g`-style scientific notation.
 
-### D104 — indented heredoc `<<~IDENT` unsupported (parse error, not silent)
+**Threading a genuine UV type through the whole codegen/runtime type
+system was judged too large and risky for what real-world code
+confirms is a rare corner case** (see the "Real-world module survey"
+reassessment above). Instead, this reuses the existing Math::BigInt
+(mini-gmp) machinery already in the runtime — bounded and kept
+distinct from a real, user-declared `Math::BigInt` object:
+
+1. **`src/runtime.c` `perl_add`/`perl_sub`/`perl_mul`**: the existing
+   D78 overflow check computed the native wrapped result and inferred
+   overflow from its sign — a pattern that relies on signed-integer-
+   overflow-being-undefined-behavior, which `-O2` can (and, verified
+   empirically during this fix, *did* for some call sites but not
+   others, depending on inlining) silently optimize away, defeating
+   the check it implemented. Replaced with `__builtin_{add,sub,mul}
+   _overflow`, which is well-defined at any optimization level. This
+   alone was a pre-existing latent bug independent of D103's main fix
+   (`perl_mul`'s old check also divided by a possibly-`INT64_MIN`/`-1`
+   pair, itself separately UB).
+2. On detected overflow, the exact result is computed via mini-gmp and,
+   if it fits Perl's own UV range (non-negative, ≤ `UINT64_MAX` — the
+   real boundary real Perl itself promotes across), returned as a new
+   **unblessed** `PerlValue` (`tag=PERL_BIGINT`, `blessed_class=NULL`)
+   — deliberately distinct from a real, user-declared (blessed)
+   `Math::BigInt`, which keeps its existing unbounded-range behavior
+   untouched (the blessed-overload-dispatch checks already at the top
+   of each op fire first and return before any of this new logic
+   runs). Beyond the UV range, falls back to `double` exactly as
+   before. Chained arithmetic on an already-auto-promoted value
+   re-derives exactly and re-checks the UV bound on *every* subsequent
+   op — it does not stay "exact forever"; it demotes back to `double`
+   the moment a chain of overflowing arithmetic would exceed
+   `UINT64_MAX`, matching real Perl's own per-operation UV-vs-NV
+   decision. Mixing an auto-promoted value with a real `Math::BigInt`
+   naturally "graduates" it to full, unbounded range for free — the
+   mpz-extraction helpers `Math::BigInt`'s own methods already use
+   work on any `PERL_BIGINT`-tagged value regardless of blessing, so
+   once a blessed operand is involved the existing overload dispatch
+   takes over entirely.
+3. **`src/codegen.cpp`**: the raw, unboxed i64 fast path (`emitExprI64`,
+   used to skip boxing overhead for hot arithmetic) had zero overflow
+   checking at all — this is the path the `$big + 1` repro actually
+   went through, so the runtime fix alone wasn't suf'ficient. New
+   `emitI64OverflowCheckedBinOp` wraps just the **outermost** operator
+   of a top-level `+`/`-`/`*` with LLVM's overflow-checked intrinsics
+   (`llvm.sadd/ssub/smul.with.overflow`), falling back to the boxed
+   (now overflow-aware) runtime op only on the rare overflow branch —
+   the common non-overflowing case emits the exact same instructions
+   as before. Deliberately scoped to the outermost operator only (a
+   nested arithmetic sub-expression's own overflow, if any, is
+   unaffected) rather than redesigning `emitExprI64`'s recursive
+   descent itself, which stays untouched.
+4. **`src/parser.cpp`**: integer-literal parsing previously always fell
+   straight to `double` for anything beyond `INT64_MAX` (D78) — losing
+   exactness for the *entire* UV window, not just conveniently-round
+   numbers (D103's own `-9223372036854775808` repro is this case: `2**63`
+   parsed as a literal). A literal fitting `0..UINT64_MAX` now builds
+   an unblessed auto-BigInt directly (represented as an ordinary `Call`
+   node, `__auto_bigint_lit`, mirroring `__FILE__`'s existing pattern,
+   intercepted in `emitCall`); beyond `UINT64_MAX` still falls to
+   `double`, matching real Perl exactly.
+5. **`perl_negate`** gained an unblessed-BigInt case: negating a
+   literal like `-2**63` (a BigInt value of exactly `2**63`) now
+   demotes back to a plain, exact `int` when the negated value fits
+   signed 64-bit (as it does here — `-2**63 == IV_MIN`), instead of a
+   lossy double.
+6. `perl_to_int`/`perl_to_float`/`perl_is_true`/stringification
+   (`perl_to_string`/`perl_to_string_dup`) all gained an unblessed-
+   `PERL_BIGINT` case for interop; the numeric comparison operators
+   (`perl_num_eq`/`lt`/`gt`/etc.) gained an exact mpz-based comparison
+   path so comparing two overflowed values doesn't lose precision the
+   way converting both to `double` first would (magnitudes in this
+   range are well beyond a double's 53-bit mantissa).
+
+**Found (not fixed) while verifying this — logged as D132**:
+`emitBinOp`'s *separate* F64 "stay unboxed" fast path can convert a
+BigInt-tagged **scalar variable** straight to `double` and add/sub/mul
+natively, bypassing all of the above entirely (it never calls into
+`perl_add`/etc.). This only ever surfaces as a 1-ULP divergence in the
+narrow case of a value sitting exactly at the `UINT64_MAX` literal
+boundary undergoing *further* arithmetic that itself crosses beyond
+it — narrower still than D103's own already-narrow scope.
+
+Verified against real Perl for: the write-up's exact `$big + 1` and
+`-2**63` repros, chained overflow staying exact across multiple ops,
+multiplication and subtraction overflow, negative-direction overflow
+(no negative UV — correctly still falls to `double`, unchanged from
+before this fix), ordinary non-overflowing arithmetic (unaffected),
+mixing an auto-promoted value with a real declared `Math::BigInt`
+(graduates to full range), and exact `==`/`<` comparisons against
+overflowed values. Tests: `tests/d103_int_overflow_{smoke,deep}.pl`.
+
+### D104 — indented heredoc `<<~IDENT` unsupported — **FIXED 2026-09-11**
 
 ```perl
 sub f {
@@ -440,14 +529,469 @@ sub f {
     return $x;
 }
 ```
-`./perlc` reports `Parse error line N: unexpected token '<<'`. `grep -n
-"<<~" src/lexer.cpp` finds nothing — the `<<~` indented-heredoc form
-(Perl 5.26+, strips the terminator's leading whitespace from every body
-line) was never added; only `<<IDENT`, `<<"IDENT"`, `<<'IDENT'` are
-recognized. This one fails loudly (compile error) rather than silently,
-so it's lower risk than D99–D103, but it's a syntax form common enough in
-modern Perl (used heavily for readable multi-line strings inside indented
-code) that it belongs on the missing-features list too.
+Root cause: `grep -n "<<~" src/lexer.cpp` found nothing — the `<<~`
+indented-heredoc form (Perl 5.26+, strips the terminator line's own
+leading whitespace from every body line) was never added; only
+`<<IDENT`, `<<"IDENT"`, `<<'IDENT'` were recognized, so this was a hard
+parse error (`unexpected token '<<'`), not silent-wrong-data.
+
+**Fix** (`src/lexer.cpp` `readHeredoc`): checks for a leading `~`
+immediately after the second `<` (before the existing quote/identifier
+scan). When present, the terminator-line search matches with leading
+whitespace stripped first, remembers that stripped prefix, and removes
+it from every line of the collected body — mirroring real Perl's own
+"strip the terminator's indentation from the whole body" rule. A body
+line less indented than the terminator is a real-Perl fatal error;
+this fix is permissive there instead, stripping only as much of the
+prefix as a given line actually has (rather than erroring).
+
+Verified against real Perl for: a basic multi-line body, the
+interpolating (`<<~"IDENT"`) and non-interpolating (`<<~'IDENT'`)
+quoted forms, and a body indented *more* than the terminator (leaving
+correctly-computed residual indentation). Tests:
+`tests/d104_indented_heredoc_{smoke,deep}.pl`.
+
+### D106 — FLAT_ARRAY ref alias via array/hash element — **FIXED 2026-09-11**
+
+```perl
+my @arr = ([1,2,3]);
+my $y = $arr[0];
+$y->[0] = 99;
+print "$arr[0][0]\n";   # perl: 99   |   was: 1 (stale)
+```
+(identical failure for a hash element, `$h{k}` in place of `$arr[0]`).
+
+Same bug class as D105 (a FLAT_ARRAY/FLOAT_PAIR-tagged anon-array-ref
+— Stage 22/23's compact storage for `[1,2]`-style literals — silently
+forking into two independent arrays when aliased a second time),
+narrowed to reading the ref back out of an **array or hash element**
+specifically, rather than a plain scalar variable (which D105 already
+covered). D105's fix already made `case NK::ScalarVar` in `emitExpr`
+call `perl_promote_ref_array` before handing out its value; the
+analogous `case NK::ArrayElem`/`case NK::HashElem` read paths did not.
+
+This was deliberately left open when D105 shipped: the fix site sits
+right next to the exact fast-path code (2D `ArrowDeref`-chain compound
+assign, `llvm.assume(tag==FLAT_ARRAY)`) that caused a segfault
+regression during D105's own fix, so it needed a careful read of every
+neighboring fast path before touching it.
+
+**Fix**: confirmed first that the `$arr[$i] op= rhs` / `$hash{key} op=
+rhs` compound-assign fast paths, and the 2D `ArrowDeref`-chain fast
+paths, are *separate* `case`/dispatch branches that call
+`perl_array_get_ref`/`emitHashGetRef` directly themselves — they do
+not route through the plain-read `case NK::ArrayElem`/`case
+NK::HashElem` in `emitExpr` at all, so promoting there cannot reach
+them. With that confirmed, both gained the identical
+`perl_promote_ref_array` call D105 already added for `ScalarVar`.
+
+Verified against real Perl for: array-element and hash-element alias
+writes visible both directions (through the alias and through the
+original element), plus an explicit regression check that the 2D
+compound-assign and `ArrowDeref`-chain fast paths are unaffected.
+Tests: `tests/d106_flat_ref_elem_alias_{smoke,deep}.pl`.
+
+### D108 — plain string literals miss `\f`/`\a`/`\e`/`\b` — **FIXED 2026-09-11**
+
+```perl
+print "a\fb\ac\ed\be\n";
+# perl: a<FF>b<BEL>c<ESC>d<BS>e   |   was: a\fb\ac\ed\be (literal backslash+letter)
+```
+Root cause: `src/lexer.cpp`'s double-quoted-string escape switch
+(`readString`, used by plain `"..."` literals — unrelated to `s///`,
+which D107 already fixed separately) only had cases for `n t r 0 x \
+' " $ @`; `f`/`a`/`e`/`b` fell to the `default` branch, which passes
+the backslash and letter through unchanged. Found while writing D107's
+tests (a confound in a test's own comparison string). A second,
+independent code path with the identical gap was also found while
+fixing this: the `qq{...}` balanced-brace escape switch (a separate
+manual scan, not shared with `readString`).
+
+**Fix**: added `case 'f'`/`'b'`/`'a'`/`'e'` (mapping to `\f`, `\b`,
+`\a`, `0x1b` respectively) to both switches.
+
+Verified against real Perl for: each of the four escapes individually
+(via `ord()`), a combined string exercising all four together, the
+`qq{...}` form, and a regression check that the already-working
+escapes (`\n`/`\t`/`\r`) are unaffected. Tests:
+`tests/d108_string_escapes_{smoke,deep}.pl`.
+
+### D132 — BigInt-tagged scalar var bypasses D103's overflow-aware ops — **FIXED 2026-09-12**
+
+```perl
+my $chain = 18446744073709551615;   # UINT64_MAX itself, fits UV exactly
+$chain = $chain + 1;                 # now exceeds UV_MAX -> NV
+print "$chain\n";
+# perl:  1.84467440737096e+19
+# perlc: 1.84467440737095e+19   (off by 1 ULP, pre-fix)
+```
+
+Found while verifying D103. Root cause: `emitBinOp` has a *separate*
+F64 "stay unboxed" fast path (distinct from the i64 fast path D103's
+`emitI64OverflowCheckedBinOp` intercepts) that, for a plain scalar
+variable operand, converted it straight to `double` via `perl_to_float`
+and added/subbed/muled natively — entirely bypassing
+`perl_add`/`perl_sub`/`perl_mul`'s D103 BigInt-aware logic (confirmed
+via `--emit-ir`: the add compiled to a direct `fadd double` on
+`perl_to_float`-converted operands with no `perl_add` call). The
+variable's tag isn't statically known, so the fast path's heuristic
+silently truncated a BigInt-holding variable.
+
+**Fix** (`src/codegen.cpp` new `emitF64BinOpWithBigIntGuard` +
+`emitBinOp` wiring; `src/runtime.{c,h}` new `perl_is_bigint_pv`): the
+F64 fast path for top-level `+`/`-`/`*` with at least one `ScalarVar`
+operand now branches on a cheap, pure runtime tag predicate
+(`perl_is_bigint_pv(PV*)`, marked read-only/NoUnwind/WillReturn for
+GVN) on each variable operand — the PV* is loaded once before the
+branch so it dominates both arms, following the branch-and-PHI pattern
+D103's `emitI64OverflowCheckedBinOp` establishes. If EITHER operand is
+BigInt-tagged, the boxed (D103-aware) `perl_add`/`perl_sub`/`perl_mul`
+runs (with `freeIfOwned` on the operand temps); the non-BigInt branch
+emits the *exact same* native F64 instructions as before, boxed via
+`boxF64` so both arms yield a `PerlValue*` for emitBinOp's contract.
+Literals are never BigInt-tagged at runtime (a D103 huge literal is
+itself an emitCall producing a boxed PV*, which `emitExprF64`
+rejects), so variable-free operands skip the wrapper entirely and
+their code is unchanged. Verified with `--emit-ir`: for
+`my $x = 1.5; my $y = $x + 2.25` the *fast* branch keeps the identical
+`perl_to_float` + `fadd double` sequence, with only the one predictable
+tag-compare/branch added; for a local unboxed float variable
+(`lookupFloatVar` hit) the generated IR is byte-identical to the
+pre-fix compiler, and `tests/nb.pl`'s hot loop IR is byte-identical
+(no performance regression in the numeric kernels).
+
+**Second, related pre-existing 1-ULP bug found and fixed while
+verifying** (`src/runtime.c` `perl_to_float` + new
+`perl_mpz_get_double`): mini-gmp's `mpz_get_d` *truncates* toward zero
+instead of rounding to nearest (it masks off low limbs without
+rounding), so ANY NV conversion of a BigInt at/above the 2^53 mantissa
+boundary sat 1 ULP below real Perl's own (NV) cast — UINT64_MAX landed
+at 0x1.fffffffffffffp+63 instead of 0x1p+64. This made even
+non-fast-path cases diverge ("$big" stringification, `$big / 2`,
+`$big + 0.5`, `$f + $big` all printed ...37095/...477 where perl
+prints ...37096/...478). `perl_to_float`'s PERL_BIGINT case and D103's
+`perl_auto_bigint_or_float` now convert via the exact decimal string +
+`strtod` (correctly rounded to nearest by construction) through the
+shared `perl_mpz_get_double` helper, matching real Perl byte-for-byte.
+Note `perl_is_intlike`'s mpz paths and Math::BigInt method semantics
+are untouched; D103's tests stay green.
+
+Verified against real Perl for: the exact `$chain` repro; `$chain * 2`;
+chained `+1+1`; `+=` and `*=` compound forms; mixing a BigInt var with
+a plain float var in both operand orders; plain BigInt stringification
+and `$big / 2`; subtraction within the UV window staying exact;
+huge-literal operand (already-boxed D103 path); ordinary
+float/int/mixed arithmetic; `--emit-ir` before/after identity for the
+non-BigInt fast path (local var: identical; file-scope var: fast
+branch identical, guard added); `arith.pl`, `nb.pl`, `nbody.pl`,
+`fibn.pl`, `mbs.pl` green with FP tolerance. Tests:
+`tests/d132_bigint_f64_fastpath_{smoke,deep}.pl`.
+
+### D126 — `split` with a capturing-group pattern doesn't include captured delimiters — **FIXED 2026-09-12**
+
+```perl
+split(/(,)/, "a,b,c")
+# perl:  ("a", ",", "b", ",", "c")   — 5 elements, delimiters included
+# perlc: ("a", "b", "c")             — 3 elements, delimiters dropped (pre-fix)
+```
+
+Real Perl's `split` includes the text matched by any capturing groups in
+the pattern as extra elements interleaved with the normal fields — a
+documented, deliberate feature (used to keep the separators themselves).
+`perl_split_regex` (`src/runtime.c`) always discarded everything between
+`mstart`/`mend` (the whole match) and never inspected
+`pcre2_get_ovector_pointer` past index 0/1 (the whole-match bounds), so
+capturing groups' text was silently dropped. Named captures
+(`(?<n>...)`) are ordinary capture groups to PCRE2 and were affected
+identically.
+
+**Fix** (`src/runtime.c` `perl_split_regex`, rewritten against real
+Perl's actual split algorithm, derived case-by-case from perl 5.42
+probes):
+
+1. Each match's capture texts (from `pcre2_get_ovector_count(md)` —
+   the match_data is created from the pattern, so this equals 1 + group
+   count) are appended right after the field they ended, in
+   group-number order. A group that did not participate in this match
+   (optional group that failed its branch, e.g. `(x)?` on "a,b") still
+   yields an element — **UNDEF, not omitted** (verified:
+   `split(/(x)?,/, "a,b")` -> 'a', undef, 'b'); a participating-but-
+   empty group yields "".
+2. The walk was rewritten to track the *field start* separately from
+   the scan position, matching real Perl's zero-width-match semantics,
+   derived empirically: a **zero-width match at the field start is
+   skipped** (no field, no captures — the empty match at 0 in "a,b"
+   before the ',' at 1); a **zero-width match strictly inside a field
+   ends it** (with this match's captures) and restarts at mstart,
+   acting as a separator between characters exactly like the
+   empty-pattern `//` case (`split(/x?/, "ab")` -> 'a','b'); a
+   **consuming match always ends the field**, even when the field is
+   empty (real Perl produces leading empty fields:
+   `split(/(,)/, ",a,b")` -> '', ',', 'a', ',', 'b');
+   no-match/end-of-string pushes the remainder **from the field start**
+   (skipped zero-width matches may have left the scan position ahead of
+   it). pos always advances, so the walk terminates for every pattern.
+3. Consequences of the rewrite (all verified against real perl): LIMIT
+   now counts *fields only* — capture texts are extra elements and
+   never consume the LIMIT budget
+   (`split(/(,)/, "a,b,c,d", 3)` -> a, ',', b, ',', "c,d"); the
+   pre-existing **hang/garbage on all-zero-width patterns**
+   (`split(/,?/, "a,b")` returned 0 elements, `split(/,*/, "a,xx,b")`
+   hung) is fixed as a side effect (`/,?/ "a,b"` -> a, b;
+   `/,*/ "a,xx,b"` -> a, x, x, b; `/x?/ "ab"` -> a, '', b); and the
+   trailing-empty trim (`perl_split_trim_trailing_empty`, limit==0)
+   also removes trailing UNDEF captures (verified
+   `split(/(b)?,/, "a,")` -> ("a")), while never removing a trailing
+   capture holding text (`split(/(,)/, "a,")` keeps the ','), and
+   never touching the plain string-separator path (which can hold no
+   undef).
+
+Verified byte-for-byte against real Perl for: the original repro;
+multi-group interleaving (`/(,)(;)/`, `((,)(;))` nested, `(?<n>,)`
+named, `(?<x>,)(?<y>)`, `(\w)(\d)`, `(a)|(b)` alternation with undef,
+`(,)|(:)`, `(,){2}`, `(:+)`, `(\s+)`, `(a*)`); optional-group undef
+rendering; LIMIT 1/2/3/5 with one and two groups and with optional
+groups; limit==0 trim with '', trailing-undef and capture interplay;
+negative LIMIT (no trim, undef kept); leading empty kept; empty target
+string; capture-with-empty-text -> ""; list-assignment usage; and five
+plain-split regression checks (regex/string separator, LIMIT, trim,
+negative LIMIT). Tests: `tests/d126_split_captures_{smoke,deep}.pl`.
+
+### D125 — `use`/`no` pragma statements only parse at file top-level — **FIXED 2026-09-12**
+
+```perl
+sub foo {
+    no warnings 'numeric';   # or: use strict;  — either one
+    ...
+}
+# perl:  fine, scoped to the sub as expected
+# perlc: Error: Parse error line 2: unexpected token 'warnings'  (pre-fix)
+```
+
+Found while writing D117's deep test. Root cause: `src/parser.cpp`'s
+`use`/`no` handling lived inside `parseProgram()` (the file-level
+statement loop) — not in `parseStmt()`, which is what every nested
+block or sub body actually calls to parse its own statements. So
+`use`/`no` only worked as the very first kind of statement the whole
+file's top-level loop sees, never inside any nested scope. Confirmed
+with both `no warnings '...';` and a plain `use strict;` inside a
+`sub {}` — same failure, so this isn't `warnings`-specific.
+
+**Fix** (`src/parser.cpp`, `src/parser.h`): the whole `use`/`no`
+statement handling was extracted verbatim from `parseProgram()` into a
+new private method `Parser::parseUseNoStmt()` (the caller has already
+consumed nothing), now called from both `parseProgram()`'s file-level
+loop and `parseStmt()` — so pragmas and module-`use`s inside any nested
+scope parse the same way the file-top ones always did. The method
+returns a Block whose args hold the statement(s) produced by one
+use/no statement (0..n — `use parent` produces one SetIsa per parent;
+fully-ignored pragmas produce an empty list), and both callers splice
+those into their own statement lists (`parseStmt()` wraps the splice
+in a `FlatBlock` so multi-statement results still run in order in the
+current scope). Module inlining itself is unaffected: main.cpp's
+`inlineModules()` token pass runs over the whole combined stream
+regardless of statement nesting, so a `use Some::Module;` inside a sub
+behaves like the file-top form. Note the `no` keyword is lexed as
+IDENT (not a keyword token), so the dispatch condition checks both
+`TK::KW_USE` and an IDENT "no".
+
+Verified against real Perl for: `no warnings 'numeric';` inside a sub
+(coercion still happens, sum identical), pragmas inside nested bare
+blocks at several depths, pragmas in if/while bodies, `use POSIX
+qw(floor)`-style module-`use` inside a sub actually importing
+(tested with a fixture module, `tests/lib/D125Pragma.pm`), a pragma
+immediately before a module-`use` in the same sub, file-top `use`s
+unchanged, qualified access to a module's non-imported `@EXPORT_OK`
+names after an explicit import, `no strict; no warnings; use integer;`
+no-op forms, and the D112/D122/D127/D129/D121 module/lexer suites
+staying green. Tests: `tests/d125_pragma_nested_{smoke,deep.pl}` +
+`tests/lib/D125Pragma.pm`.
+
+### D133 — double-free in the int/float-var Assign boxed fallback — **FIXED 2026-09-12**
+
+```perl
+sub f { my $acc = 0; { $acc = "x" + 0; } return $acc; }
+my $v = f();
+my $x = $v == 0;
+print "$x\n";
+# perl:  1
+# perlc: segfault (allocator corruption from a double free)
+```
+
+Found while verifying D125's deep test (the pre-D125 2026-09-11
+snapshot binary reproduces it identically — a pre-existing bug the
+existing 305-test corpus never happened to hit). Trigger shape: an
+int-or-float-promoted variable assigned a boxed owned temp (a
+string→number coercion result) inside a bare block, with the variable
+later read via a numeric comparison.
+
+Root cause (`src/codegen.cpp`, `case NK::Assign`, the int/float-var
+boxed-RHS fallbacks at the `lookupIntVar`/`lookupFloatVar` branches —
+"RHS not purely integer/numeric — extract int/float from boxed value"):
+after `perl_to_int`/`perl_to_float`-ing the boxed RHS into the unboxed
+alloca, the code called `freeIfOwned(rv)` **and then `return rv`** —
+handing the already-freed pointer back to the caller, whose statement
+context (`ExprStmt`'s `freeIfOwned`, or `emitBlockLast`'s clone+free)
+frees owned temps a second time. `isOwnedTemp` recognizes the
+`perl_add`-family results, so `"x" + 0` was exactly such an owned
+temp: freed twice. `perl_free` returns the PV to the slab pool
+immediately, so the second free corrupts the freelist; the crash
+surfaced later, at an unrelated allocation (`perl_alloc_undef`,
+`perl_concat`), which is why it looked like a string-printing bug at
+first (confirmed via gdb: SIGSEGV in `perl_concat` on a poisoned
+pointer; under valgrind, SIGILL "illegal opcode" in `perl_alloc_undef`
+— code/allocator corruption, classic double-free).
+
+**Fix**: both fallbacks (int and float twins) now clone the boxed temp
+for the caller *before* freeing it (`perl_clone` + `freeIfOwned`) so
+each side owns its own value — the same discipline every neighboring
+Assign path already follows. The common fast paths (`emitExprI64`/
+`emitExprF64` succeeding, no boxing at all) are untouched.
+
+Verified against real Perl for: the exact repro; the float-var twin
+(`$acc = "3.75" + 0`); nested bare blocks with two coercion assigns;
+the top-level (non-sub) form; a call-result RHS; a 200-iteration
+allocator-stress loop; and the original crash shape passed as a call
+argument (`checker("f", f() == 0)`). Tests:
+`tests/d133_assign_double_free_{smoke,deep}.pl`.
+
+### D134 — `syscall()` pointer-argument writes land in a pushed clone, invisible to the caller — **FIXED 2026-09-12**
+
+```perl
+my $buf = "\0" x 16;
+my $ret = syscall(228, 4, $buf);   # SYS_clock_gettime, CLOCK_MONOTONIC
+my ($sec) = unpack("LL", $buf);
+# perl:  sec ≈ 17551 (kernel wrote the timespec into $buf)
+# perlc: sec = 0  (pre-fix — kernel wrote into a pushed CLONE of $buf)
+```
+
+Found via `make test`: `tests/xs_ffi.pl`'s
+`clock_gettime_sec_positive`/`clock_gettime_realtime_sec_positive`
+assertions failed (buffer stayed all-zeros) while real perl passed.
+Root cause: syscall's codegen built the argument array with
+`perl_array_push`, which **clones** every element (`perl_clone` — a
+fresh `sval` malloc for strings), and `perl_syscall`
+(`src/runtime.c`) then handed the *clone's* `sval` to the kernel as
+the pointer argument. The syscall dutifully wrote into the clone; the
+caller's own cell never changed. This is the same in-place-buffer
+mechanism `vec($str, off, bits) = val` relies on — which works,
+because vec's codegen passes the variable's stable cell directly
+rather than pushing a clone — applied to a path that broke it.
+
+**Fix** (`src/codegen.cpp` `case "syscall"` in `emitCall`): each
+argument is now pushed with the existing `perl_array_push_nc`
+(no-clone, borrowed-ownership push — runtime already had it for
+closure captures) and the array shell is torn down with the existing
+`perl_array_free_nc` (elements never freed by the array); genuinely
+owned temp elements are `perl_free`d explicitly after the call. So
+`emitExpr($buf)`'s stable cell is what `perl_syscall` sees, and kernel
+writes land in the caller's own `sval` (length unchanged, as with
+real perl's fixed-size buffer). A temporary non-variable buffer
+(`syscall(228, 4, "\0" x 16)`) now writes into the temp and discards
+it with the temp.
+
+**Verified divergence, deliberately left as-is:** real perl dies with
+`Modification of a read-only value attempted` when a *literal/temp*
+string is passed to a syscall that would write through it (perl marks
+syscall lvalue-targets read-only); perlc has no read-only-value
+enforcement and silently succeeds. Documented here rather than
+emulated — the deep test deliberately excludes the temp case so it
+stays byte-for-byte comparable.
+
+Also fixed in passing: the arg array was leaked on every syscall
+(never `perl_array_free`d) — now released via `perl_array_free_nc`.
+
+Verified against real Perl for: CLOCK_MONOTONIC and CLOCK_REALTIME
+returns (ret==0, sec positive/large, nsec in range), realtime >
+monotonic, a reused buffer, a scalar cell that previously held a
+number then a string, 100 iterations (ownership-slip/corruption
+detector), a non-buffer syscall (`getpid`) unaffected, and the four
+`make test` `xs_ffi.pl` clock assertions now passing (47/47
+assertions, `make test` exit 0). Tests:
+`tests/d134_syscall_buf_{smoke,deep}.pl`.
+
+### D135 — sub-scope int-promoted variable truncates a later NV assignment — **FIXED 2026-09-13**
+
+```perl
+sub f { my $acc = 0; $acc = 5.5; return $acc; }
+print f(), "\n";
+# perl:  5.5
+# perlc: 5   (truncated to the int part, pre-fix)
+```
+
+Found while writing D133's deep test (`call_result_coerce` assertion
+failed). Pre-existing — reproduces identically on the 2026-09-11
+snapshot binary. Root cause: inside a sub, a variable initialized with
+an integer literal (`my $acc = 0;`) is int-promoted to an unboxed i64
+alloca (`case NK::My`'s `emitExprI64` unbox branch); every later
+assignment then routes through `case NK::Assign`'s int-var branch
+(`lookupIntVar` hit), whose boxed-RHS fallback unconditionally
+`perl_to_int`s the value before storing. `case NK::CompoundAssign`'s
+int-var branch had the same truncation (`/= 2` on an int-promoted var
+held 1, not 1.5). Real Perl has no such sticky per-variable type.
+
+Confirmed shapes (all truncated pre-fix, all inside a sub): literal
+float RHS (`= 5.5`), string-coercion RHS (`= "7.25" + 0`), sub-call
+RHS returning an NV, even a plain string RHS (`= "7.25"` — coerced
+through `perl_to_int`), chained self-assignment (`$t = $t + 0.5`),
+and division (`$q = 1/2`, `$q /= 2`). Also fired for a `my $x = 0;`
+declared inside a nested bare block at file scope (the block isn't a
+sub, but the var was still int-promoted and truncated). File-scope
+direct declarations were already correct; an uninitialized `my $acc;`
+then assigning 5.5 was also correct — it's specifically the int-shape
+initializer that triggered promotion.
+
+**Fix** (`src/codegen.cpp`, `src/codegen.h`): int-promotion in `case
+NK::My`'s unbox branch is now refused when a body scan says the
+variable's scope ever writes it a value that isn't statically
+int-only. The scan root is the variable's lifetime scope: the
+enclosing sub's body, or (bare block at file scope) the program body —
+the same body-scan machinery the `@_` promotion path already uses,
+extended with three new conservative walkers:
+
+- `rhsIsIntShapedCtx` — an expression is int-only iff it's an IntLit,
+  a `+ - * %` BinOp/CompoundAssign over int-only operands, a unary
+  minus of an int-only operand, or a ScalarVar read of a variable in
+  the provably-int-only set (or the variable itself — a self-referencing
+  `$i += $i` stays int). FloatLits, StringLits, call results, `/`/`**`
+  ops, and everything else are treated as possibly-fractional.
+- `d135ComputeIntSet` — computes that set to a **fixpoint**: start with
+  vars whose every write's RHS is int-only without variable operands;
+  repeatedly admit vars whose RHS operands are all IntLits or already
+  admitted vars. This is what keeps the classic hot idiom
+  `my $s = 0; for my $i (1..1000000) { $s += $i; }` on the i64 fast
+  path: `$i` (whose writes are the loop's self-increment) is admitted
+  round 0, `$s` round 1, and the generated IR is **byte-identical** to
+  the pre-fix compiler for the pure-int case (verified via
+  `--emit-ir`), so no numeric-kernel performance is lost.
+- `assignsFloatLikeRhs` / `readsFloatSensitive` — walk the scan root
+  for any write to the name with a non-int-shaped RHS (or any
+  float-sensitive read: `/`, `**`, sqrt, unary minus). When found, the
+  declaration either takes the float-unbox path (if the body never
+  uses the name in a position where a plain double is observably
+  different from a real PerlValue* — `floatVarUseSafe`, new, checks
+  string ops/ref-taking/call args/etc.) or falls through to the always-
+  correct boxed PV path.
+
+Note the CompoundAssign-sval subtlety this surfaced: CompoundAssign
+nodes store the **bare** operator in `sval` (`"/"` for `/=`, `"+"` for
+`+=` — see `parseCompoundAssign`), which the first-attempt scanners
+wrongly checked as `"/="`/`"+="` and therefore never matched; the
+wiring now checks the bare forms. With promotion refused, the
+truncating int/float-var Assign and CompoundAssign branches are never
+reached for such variables — the boxed PV path stores the true value.
+
+Verified against real Perl for: every trigger shape above (sub-scope
+literal/coercion/call/string RHS, chained, division both statement and
+compound forms), the float twin (`my $v = 0.5; $v = 3;` holds 3 and
+prints `3` like perl, not `3.0`), nested bare blocks, assignment inside
+an if body, formatting parity (`5.5` prints as `5.5`), a 1e6-iteration
+pure-int counter staying exact with byte-identical IR, a mixed
+int+float sub, int-variable copies (`$b = $a; $b += 4`), and ordinary
+string/numeric behavior. Full harness 321/321 (with D128's fixtures
+merged in the same binary), `make test` 47/47, `bench/nb.pl` and
+`bench/mbs.pl` within their normal runtimes. Tests:
+`tests/d135_int_promo_nv_{smoke,deep}.pl`.
 
 ## Remaining product gaps (not logged as D-numbers)
 
@@ -1338,48 +1882,85 @@ doesn't work correctly (a sub referencing it from outside the block
 sees nothing), even though identical code at true file scope works
 fine.
 
-### D128 — a parse error inside an inlined module reports the wrong line/file
+### D128 — a parse error inside an inlined module reports the wrong line/file — **FIXED 2026-09-13**
 
-```perl
-# corelist (real, unmodified, 148-line-equivalent main script logic,
-# but pulls in the large generated Module::CoreList.pm via `use`):
-# perlc: Error: Parse error line 3: unexpected token 'warnings'
-#        (the real `use warnings;` in the main script is at line 152;
-#        line 3 is nowhere near any "warnings" token at all)
-```
+    # main.pl (10 lines):
+    use lib 'tests/lib';
+    use D128Broken;
+    ...
+    # D128Broken.pm:
+    package D128Broken;
+    use warnings;
+    my = 5;        # line 3: the actual syntax error
+    1;
+
+    # perlc (pre-fix):  Error: Parse error line 3: unexpected token '=' ...
+    #   — no filename at all, and "line 3" is the module's internal line,
+    #     which for a real case (podchecker, 148-line main script) reported
+    #     line 545 — meaningless to anyone debugging the main script.
+    # perlc (post-fix): Error: Parse error in tests/lib/D128Broken.pm line 3:
+    #   unexpected token '=' (...)
+    # real perl:        syntax error at tests/lib/D128Broken.pm line 3, near "my ="
 
 Found via the 2026-09-10 real-module survey #2. `corelist` and
 `podchecker` (both real, unmodified system scripts) each produce a
 parse error whose reported line number is implausibly small relative
-to where the actual `use`/`no warnings`-adjacent tokens are — for
-`podchecker` (148 lines in the main script), the reported line is 545,
-which can only belong to an inlined module's own internal line
-numbering (`Pod::Checker.pm`, in that case). Root cause: `inlineModules`
-(`src/main.cpp`) splices each module's own token stream (lexed
-independently, with its own 1-based line counter) directly into the
-combined stream with no offset adjustment and no filename tag —
-downstream parse errors report whatever line number happened to be
-attached to the offending token, which is meaningless once multiple
-files' token streams have been concatenated, and never say which file
-is actually at fault.
+to where the actual `use`/`no warnings`-adjacent tokens are. Root
+cause: `inlineModules` (`src/main.cpp`) splices each module's own
+token stream (lexed independently, with its own 1-based line counter)
+directly into the combined stream with no offset adjustment and no
+filename tag — downstream parse errors report whatever line number
+happened to be attached to the offending token, which is meaningless
+once multiple files' token streams have been concatenated, and never
+say which file is actually at fault.
 
-**Impact:** not a correctness bug in generated code — a diagnostics/DX
-problem — but a real one: it makes any parse failure that originates
-inside a `use`d module (as opposed to the main script) very hard to
-track down, since the reported location actively misleads rather than
-just being silent. Low priority relative to correctness defects, but
-worth fixing before CPAN-module support scales up further, since
-inlined-module parse failures will only get more common as more real
-modules are pulled in.
+**Fix** (diagnostics-only; no codegen/runtime changes, `Token` grows
+by one pointer):
 
-**Fix shape:** larger than a one-line tweak — `inlineModules` needs to
-tag each spliced-in module's tokens with which file they came from
-(and either keep each module's own line numbers distinct from the main
-file's, e.g. via a `(file, line)` pair instead of a bare `int`, or
-prefix error messages with the originating filename when a token from
-an inlined module triggers a parse error). Touches the `Token`
-representation and every place that currently assumes a bare
-line-number int is enough to identify a source location.
+1. `Token` gains `const char *file` (default nullptr). Lifetime: a
+   process-wide `std::deque<std::string>` filename registry in
+   `lexer.cpp` (`lexer_register_source_file()`) — deque elements never
+   move, so the pointed-at name outlives every copied token stream;
+   the registry only ever grows (one entry per lexed file per
+   compile). No synchronization needed (single-threaded compile path).
+2. `Lexer` takes an optional `sourceName` (default `""`) and stamps it
+   onto every token it emits — done at `tokenize()`'s two exits so no
+   push site can be missed. `main()` passes the main script's path;
+   `inlineModules()` passes each module's resolved `fullPath` (both
+   the `use` and `require` load paths, plus the transient
+   `scanExports()` lexer). The by-value splice preserves the pointer.
+   Empty name (the parser/codegen's synthetic-fragment lexers) leaves
+   tokens untagged.
+3. All nine `Parse error` throw sites in `parser.cpp` now go through
+   one new helper, `Parser::parseErrPrefix(line)`: if the *current*
+   token's file tag is non-null and differs from the main file's
+   registered tag, the error is prefixed `Parse error in <module file>
+   line N: ` (the module's own internal line — the only frame the user
+   can act on); main-script and untagged tokens keep the exact legacy
+   `Parse error line N: ` format (existing tests/tooling match it).
+   The seven sites that previously threw with no line info at all
+   (tie, prototype arity, `=~`/`!~` regex ops) gained the same prefix
+   with their message text unchanged.
+4. Deliberately untagged (legacy format): tokens synthesized by the
+   compiler itself — `use constant`'s `sub NAME { return ...; }`
+   wrapper tokens, the synthetic `package main;` separator, and the
+   interpolation/sub-expression fragment lexers. These aren't file
+   text; a real parse error in a `use constant` *value* still reports
+   correctly because the value tokens themselves come from the tagged
+   source stream.
+
+Verified: the broken-module case reports `D128Broken.pm line 3`
+(matching real perl's blame), a main-file control keeps
+`Parse error line 2:` byte-for-byte, `require`-path and `use lib`-
+resolved modules and nested module-of-module errors report the right
+file, and parse errors inside `use constant` values blame the source
+file. Full harness 321/321, `make test` 47/47. Tests:
+`tests/d128_module_error_location.sh` (self-verifying —
+compile-failure diagnostics can't live in the stdout-diff harness)
+with fixtures `tests/lib/D128Broken.pm` +
+`tests/d128_module_error_main.pltxt` (the `.pltxt` extension keeps
+both outside the harness corpus, since the main fixture must fail to
+compile).
 
 ### D119 — `scalar(keys %$href)` returns 0 instead of the key count — **FIXED 2026-09-10**
 

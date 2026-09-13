@@ -141,49 +141,42 @@ make clean
 
 ## Known Limitations
 
-- **(2026-09-10, open correctness bugs — see `TESTS.md` for repros/status,
+- **(2026-09-13, open correctness bugs — see `TESTS.md` for repros/status,
   `MVP_ROADMAP.md` for the current priority plan)**
-  `my %c = %h` (hash-to-hash copy) produces wrong contents, not a copy
-  (D111); calling an undefined sub silently returns `undef` instead of
-  dying, and an unresolvable `use Module;` is silently dropped (D113);
-  array slices with a range or array-variable subscript (`@x[1..2]`,
-  `@x[@i]`) return one element instead of the slice (D114);
-  `__PACKAGE__`/`__FILE__`/`__LINE__`/`__SUB__` aren't implemented
-  (D116, hard parse error); a module's file-scope `my` variables can
-  collide with the main script's same-named variables (D112); bare
-  `return;` in list context yields one element instead of Perl's empty
-  list (D115); `s///`'s replacement text doesn't support `$name`/`@arr`
-  variable interpolation, and the same interpolation gap also affects
-  `$$aref[0]`/`@{$r}[0,1]` inside plain `"..."` strings (D109 — only
-  `$1`.. and `$&` capture refs work in `s///`); `$Package::var` (not
-  declared via `our`) isn't a true cross-scope global (D110) — it's
-  invisible from inside a `sub` if set at file scope; plain `"..."`
-  string literals don't recognize `\f`/`\a`/`\e`/`\b` (D108); `each
-  %hash` in scalar context returns the wrong value (D101 — a known Perl
-  gotcha, rarely used in practice); `die REF` / `die $blessed_obj` loses
-  the reference in `$@` (D102); integer arithmetic near the `2**63`
-  boundary silently wraps instead of promoting (D103); a ref stored in
-  an array/hash element (`$arr[0]`, `$h{k}`) and then read back out into
-  a second alias can miss writes made through that alias (D106, a
-  narrower remnant of D105 below); string→number coercion uses a
-  hand-rolled float parser instead of `strtod` (D117); `split` has no
-  LIMIT argument and doesn't trim trailing empty fields (D118). There is
-  also no `Exporter`/`@EXPORT` mechanism yet, so arbitrary pure-Perl
-  CPAN modules can't export subs into a caller's namespace.
-  (Fixed 2026-09-09: `my @b = @a;` used to alias `@a`'s storage instead of
-  copying it — this is now correct. Also fixed 2026-09-09, D105: an anon
-  array-ref literal like `[1,2]` or `[1,2,3]` bound to a scalar variable
-  and then aliased a second time — via `push`, a sub argument, a hash
-  value, `my $y = $x`, or an array-to-array copy — used to silently fork
-  into two independent arrays instead of staying one shared reference;
-  this is now correct. Also fixed 2026-09-09, D100: a list assignment used
-  as a `while`/`if`/`until`/`unless` condition — the standard
-  `while (my ($k,$v) = each %h)` iterator-draining idiom — used to never
-  run its body at all; this is now correct. Also fixed 2026-09-10, D107:
-  `s/\\/\\\\/g` used to double the inserted backslash, and `\t`/`\n`/etc.
-  in `s///` replacement text stayed literal instead of becoming the
-  actual escape character; this is now correct.)
-- Indented heredoc `<<~IDENT` (Perl 5.26+) is not supported (parse error)
+  `$Package::var` (not declared via `our`) isn't a true cross-scope
+  global (D110) — it's invisible from inside a `sub` if set at file
+  scope (the same gap applies to undeclared qualified arrays/hashes,
+  more severely); `$$aref[0]`-style subscripted dereference inside
+  plain `"..."` strings interpolates wrongly (D120); `__SUB__` is
+  unimplemented (D124, hard parse error). There is also no
+  `Exporter`/`@EXPORT` mechanism yet, so arbitrary pure-Perl CPAN
+  modules can't export subs into a caller's namespace.
+  (Fixed 2026-09-13: a parse error inside an inlined module now
+  reports the module's own file and line, D128; a sub-scope int-
+  promoted variable (`my $x = 0;`) no longer silently truncates a
+  later fractional NV assignment, D135.)
+  (Fixed 2026-09-12: `use`/`no` pragmas now parse inside any nested
+  scope, D125; `split` patterns with capturing groups now interleave
+  the captured delimiter text, D126; a BigInt-tagged variable operand
+  no longer bypasses overflow-aware arithmetic through the F64 fast
+  path, D132; a double-free in the int/float-variable assignment
+  fallback — `my $x = 0; { $x = "s" + 0; }` — no longer corrupts the
+  allocator, D133; `syscall()` buffer arguments now receive kernel
+  writes, D134. Fixed 2026-09-11: D103/D104/D106/D108. Fixed
+  2026-09-09/10: `my @b = @a;` used to alias `@a`'s storage (D99); an
+  aliased FLAT_ARRAY anon-arrayref silently forked into two arrays
+  (D105, D106); a list assignment used as a boolean condition never ran
+  its body (D100); `s/\\/\\\\/g` doubled the inserted backslash (D107);
+  hash-to-hash copy produced wrong contents (D111); module file-lexical
+  `my` collided with the main script's (D112); undefined-sub calls and
+  unresolvable `use`s were silent no-ops (D113); non-literal array
+  slices returned one element (D114); bare `return;` yielded a 1-element
+  list (D115); `s///` replacement text didn't interpolate variables
+  (D109); `$::name` shorthand was a parse error (D121); `use vars`
+  export declarations were missed (D122); `&`-sigil export names were
+  missed (D127); `local($var) = EXPR` was a parse error (D129); `die
+  REF` lost the reference (D102); string→number coercion used a
+  hand-rolled float parser (D117); `split` had no LIMIT (D118).)
 - `while (...) { } continue { }` is not supported (parse error)
 - `q[...]`/`qq[...]`/`qw[...]` don't balance nested `[`/`]` (unlike `qq{...}`, which balances nested `{`/`}`) — a `[` inside the string body causes a parse error
 - `qr/PATTERN/` is not implemented as a value type at all

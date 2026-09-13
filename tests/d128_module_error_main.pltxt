@@ -1,0 +1,11 @@
+#!/usr/bin/perl
+# D128 fixture — NOT a harness corpus test: this file deliberately fails to
+# compile (the `use`d module below contains a syntax error), so it must never
+# be diffed against perl by tests/harness.sh. The .pltxt extension keeps it
+# out of the harness's `find tests/ -name '*.pl'` discovery and of
+# run_tests.sh's identical sweep.
+#
+# Compile-failure diagnostics are verified by tests/d128_module_error_location.sh.
+use lib 'tests/lib';
+use D128Broken;
+print "never reached\n";

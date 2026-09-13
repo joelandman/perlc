@@ -1,6 +1,8 @@
 #include "lexer.h"
 #include <stdexcept>
 #include <unordered_map>
+#include <deque>
+#include <string>
 
 static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"my",       TK::KW_MY},    {"our",      TK::KW_OUR},
@@ -70,7 +72,27 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"pack",   TK::KW_PACK},    {"unpack",   TK::KW_UNPACK},
 };
 
-Lexer::Lexer(std::string src) : src_(std::move(src)) {}
+/* D128: process-wide registry of source-file names. Token::file points at
+   an element's heap storage, and tokens are copied around by value and
+   outlive the Lexer that made them, so the pointed-at std::string must
+   never move or die. A std::deque guarantees element-address stability
+   across push_back (unlike std::vector, which reallocates), and this
+   registry only grows (one entry per lexed source file per process —
+   the driver lexes the main script plus a handful of inlined modules,
+   so size is trivial). The registry is only ever touched from the single-
+   threaded compile path (no thread ever shares Token streams), so no
+   synchronization is needed. */
+static std::deque<std::string> s_token_files;
+
+const char *lexer_register_source_file(const std::string &name) {
+    s_token_files.push_back(name);
+    return s_token_files.back().c_str();
+}
+
+Lexer::Lexer(std::string src, const std::string &sourceName) : src_(std::move(src)) {
+    if (!sourceName.empty())
+        fileTag_ = lexer_register_source_file(sourceName);
+}
 
 char Lexer::peek(int offset) const {
     size_t p = pos_ + offset;
@@ -135,6 +157,10 @@ Token Lexer::readString(char delim, bool interpolates) {
                 case 'n':  raw += '\n'; break;
                 case 't':  raw += '\t'; break;
                 case 'r':  raw += '\r'; break;
+                case 'f':  raw += '\f'; break;
+                case 'b':  raw += '\b'; break;
+                case 'a':  raw += '\a'; break;
+                case 'e':  raw += '\x1b'; break;
                 case '0':  raw += '\0'; break;
                 case 'x': {
                     auto hexv = [](char h) -> int {
@@ -240,7 +266,12 @@ Token Lexer::readRegexDelim(char open, char close, bool paired) {
 }
 
 Token Lexer::readHeredoc() {
-    /* pos_ is just past the second '<'. Handle <<IDENT, <<"IDENT", <<'IDENT' */
+    /* pos_ is just past the second '<'. Handle <<IDENT, <<"IDENT", <<'IDENT',
+       and the D104 indented forms <<~IDENT / <<~"IDENT" / <<~'IDENT'
+       (Perl 5.26+) — the '~' must be checked before the quote/identifier
+       scan below, since it appears immediately after the second '<'. */
+    bool indented = false;
+    if (pos_ < src_.size() && src_[pos_] == '~') { indented = true; pos_++; }
     bool interp = true;
     char quote  = 0;
     if (pos_ < src_.size() && (src_[pos_] == '"' || src_[pos_] == '\'')) {
@@ -260,9 +291,15 @@ Token Lexer::readHeredoc() {
     size_t lineEnd = pos_;
     while (lineEnd < src_.size() && src_[lineEnd] != '\n') lineEnd++;
 
-    /* collect heredoc body from subsequent lines */
+    /* collect heredoc body from subsequent lines. For the indented form,
+       the terminator line may itself be preceded by whitespace — match it
+       with that leading whitespace stripped, and remember the stripped
+       prefix so it can be removed from every body line below (real Perl's
+       `<<~IDENT` strips the terminator line's own indentation from the
+       whole body). */
     size_t p = (lineEnd < src_.size()) ? lineEnd + 1 : lineEnd;
     std::string body;
+    std::string indentPrefix;
     int extraLines = 0;
     while (p < src_.size()) {
         size_t ls = p;
@@ -270,8 +307,34 @@ Token Lexer::readHeredoc() {
         std::string ln = src_.substr(ls, p - ls);
         if (p < src_.size()) p++; /* skip \n */
         extraLines++;
-        if (ln == delim) break; /* terminator line */
+        if (indented) {
+            size_t ws = 0;
+            while (ws < ln.size() && (ln[ws] == ' ' || ln[ws] == '\t')) ws++;
+            if (ln.substr(ws) == delim) { indentPrefix = ln.substr(0, ws); break; }
+        } else if (ln == delim) {
+            break; /* terminator line */
+        }
         body += ln + "\n";
+    }
+
+    if (indented && !indentPrefix.empty()) {
+        /* strip indentPrefix (or as much of it as a given line actually
+           has, permissively — real Perl fatal-errors on a body line less
+           indented than the terminator; we just strip what matches) from
+           every body line. */
+        std::string stripped;
+        size_t bp = 0;
+        while (bp < body.size()) {
+            size_t nl = body.find('\n', bp);
+            if (nl == std::string::npos) nl = body.size();
+            std::string ln = body.substr(bp, nl - bp);
+            size_t k = 0;
+            while (k < indentPrefix.size() && k < ln.size() && ln[k] == indentPrefix[k]) k++;
+            stripped += ln.substr(k);
+            stripped += '\n';
+            bp = nl + 1;
+        }
+        body = stripped;
     }
 
     /* after the current line's \n is consumed, jump past the heredoc body */
@@ -341,6 +404,18 @@ Token Lexer::readSubst() {
 std::vector<Token> Lexer::tokenize() {
     std::vector<Token> toks;
 
+    /* D128: stamp every token with this lexer's source-file registry tag.
+       Done at the two exits (rather than at each of the ~80 push sites)
+       so no token — current or future — can escape untagged; stamping an
+       already-stamped token is a no-op. Tokens are only stamped when this
+       lexer has a source name (fileTag_ != nullptr); nameless lexers (the
+       synthetic-fragment ones in codegen) leave tokens untagged so errors
+       keep the legacy main-script format. */
+    auto stampFile = [&](std::vector<Token> &v) {
+        if (fileTag_)
+            for (auto &t : v) t.file = fileTag_;
+    };
+
     /* D121: $::name / @::arr / %::hash — Perl's shorthand for an explicit
        main::name package-qualified variable (a bare :: prefix meaning
        "main"). Only readIdent()'s own :: handling existed before this,
@@ -362,6 +437,7 @@ std::vector<Token> Lexer::tokenize() {
                 while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
                     name += src_[pos_++];
             }
+            /* D121: $::name / @::arr / %::hash */
             toks.push_back({TK::IDENT, name, line_});
             return true;
         }
@@ -533,6 +609,11 @@ std::vector<Token> Lexer::tokenize() {
                         switch (esc) {
                             case 'n': raw += '\n'; break; case 't': raw += '\t'; break;
                             case 'r': raw += '\r'; break; case '\\': raw += '\\'; break;
+                            /* D108: same missing-escape bug as readString's
+                               switch, just in the qq{...} balanced-brace
+                               scan path. */
+                            case 'f': raw += '\f'; break; case 'b': raw += '\b'; break;
+                            case 'a': raw += '\a'; break; case 'e': raw += '\x1b'; break;
                             default:  raw += '\\'; raw += esc; break;
                         }
                         continue;
@@ -646,6 +727,7 @@ std::vector<Token> Lexer::tokenize() {
                 dataSection_ = src_.substr(pos_);
                 hasDataSection_ = true;
                 toks.push_back({TK::EOF_TOK, "", line_});
+                stampFile(toks);
                 return toks;
             }
             toks.push_back(t);
@@ -887,5 +969,6 @@ std::vector<Token> Lexer::tokenize() {
     /* (eq ne lt gt le ge) — already handled as IDENT; parser must promote */
 
     toks.push_back({TK::EOF_TOK, "", line_});
+    stampFile(toks);
     return toks;
 }

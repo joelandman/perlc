@@ -336,7 +336,13 @@ static std::vector<Token> inlineModules(
                 if (access(fullPath.c_str(), R_OK) != 0) return false;
                 loaded.insert(modName);
                 std::string src = readFile(fullPath);
-                Lexer modLexer(src);
+                /* D128: the module's resolved fullPath is registered and
+                   stamped onto its tokens so a parse error inside an
+                   inlined module reports the module file's own name and
+                   line, not the main script's. Token::file is a stable
+                   registry pointer, so the by-value splice below keeps
+                   the tag intact. */
+                Lexer modLexer(src, fullPath);
                 auto modToks = modLexer.tokenize();
                 if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK) modToks.pop_back();
                 auto expanded = inlineModules(modToks, dirOf(fullPath), loaded, importMap, constMap, parser,
@@ -567,7 +573,11 @@ static std::vector<Token> inlineModules(
                 for (auto &dir : searchDirs) {
                     std::string fullPath = dir + "/" + modPath;
                     if (access(fullPath.c_str(), R_OK) != 0) continue;
-                    auto exports = scanExports(Lexer(readFile(fullPath)).tokenize());
+                    /* D128: transient tokens for export scanning only —
+                       never reach the parser, so the file tag is harmless
+                       either way. */
+                    auto exports =
+                        scanExports(Lexer(readFile(fullPath), fullPath).tokenize());
                     auto exportedElsewhere = [&](const std::string &name) {
                         for (auto &tag : {"EXPORT", "EXPORT_OK"}) {
                             auto it = exports.find(tag);
@@ -598,7 +608,9 @@ static std::vector<Token> inlineModules(
 
             loaded.insert(modName);
             std::string src = readFile(fullPath);
-            Lexer modLexer(src);
+            /* D128: tag this module's tokens with its own file name — see
+               the `require` handler above (tryInlineFile) for why. */
+            Lexer modLexer(src, fullPath);
             auto modToks = modLexer.tokenize();
             /* strip EOF_TOK so it doesn't terminate the combined stream early */
             if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK)
@@ -802,8 +814,16 @@ int main(int argc, char **argv) {
 
     try {
         /* lex */
-        Lexer lexer(src);
+        /* D128: the main file's name is registered and stamped onto its
+           tokens so a parse error can distinguish "in the main script"
+           from "inside an inlined module" (whose tokens carry their own
+           registered names from inlineModules()). */
+        Lexer lexer(src, inputFile);
         auto tokens = lexer.tokenize();
+        /* D128: the main file's registered tag — main-script parse errors
+           keep the legacy "Parse error line N:" format by comparing the
+           erroring token's tag against this pointer. */
+        const char *mainFileTag = lexer.sourceName();
 
         if (verbose) {
             std::cerr << "[tokens]\n";
@@ -818,8 +838,9 @@ int main(int argc, char **argv) {
                 return 1;
             }
             /* re-lex after installing modules (in case new files were added) */
-            Lexer lexer2(src);
+            Lexer lexer2(src, inputFile);
             tokens = lexer2.tokenize();
+            mainFileTag = lexer2.sourceName();
         }
 
         /* inline any 'use Module' files before parsing; build import map */
@@ -835,6 +856,10 @@ int main(int argc, char **argv) {
         parser = Parser(std::move(expanded));
         parser.setImportMap(std::move(importMap));
         parser.setConstMap(std::move(constMap));
+        /* D128: parse errors keep the legacy main-script format only when
+           the erroring token belongs to the main file; tokens tagged with
+           any other registered file report that file's own name+line. */
+        parser.setMainFileTag(mainFileTag);
         auto ast = parser.parseProgram();
 
         /* codegen */
