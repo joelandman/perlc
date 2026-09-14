@@ -2216,6 +2216,88 @@ NodePtr Parser::parsePostfix() {
 NodePtr Parser::parsePrimary() {
     int line = cur().line;
 
+    /* D136 (part 2): inside a hash subscript key context ($h{all}),
+       ANY bareword-ish token — keyword or identifier — is the string
+       key, whatever follows (`my @a = @{ $r->{all} };` previously died
+       "unexpected token '}'" because the inner {all} key's `all` fell
+       into the KW_ALL builtin branch, which then demanded args and hit
+       the closing brace). Real Perl: barewords are strings in key
+       position, no exceptions. */
+    if (inKeyContext_ && !cur().text.empty() &&
+        (cur().kind == TK::IDENT ||
+         (cur().kind != TK::SCALAR && cur().kind != TK::ARRAY &&
+          cur().kind != TK::HASH && cur().kind != TK::LBRACE &&
+          cur().kind != TK::RBRACE && cur().kind != TK::LBRACKET &&
+          cur().kind != TK::RBRACKET && cur().kind != TK::LPAREN &&
+          cur().kind != TK::RPAREN && cur().kind != TK::SEMI &&
+          cur().kind != TK::COMMA && cur().kind != TK::FATARROW &&
+          cur().kind != TK::INT && cur().kind != TK::FLOAT &&
+          cur().kind != TK::STRING && cur().kind != TK::REGEX &&
+          cur().kind != TK::EOF_TOK))) {
+        std::string key = cur().text;
+        advance();
+        return makeStr(key, line);
+    }
+    /* D136 (part 1): bareword before a fat comma (=>) auto-quotes to a
+       string literal — real Perl does this for EVERY bareword, including
+       its own keywords (`all => 1`, `sub => 2`, `and => 3` all
+       auto-quote; verified directly). The lexer classifies many of those
+       as keyword tokens (KW_ALL, KW_SUB, ...), which previously fell into
+       the builtin-keyword parse branches below and died as "unexpected
+       token '=>'". Check before any keyword dispatch: any token that
+       carries text and is not itself punctuation/delimiter/number/
+       string/regex, when immediately followed by =>, is the string key
+       (the surrounding list/hash loop then consumes the => itself as
+       the pair separator — eating it here would strand the value). */
+    if (!inKeyContext_ && !cur().text.empty() && pos_ + 1 < toks_.size() &&
+        toks_[pos_ + 1].kind == TK::FATARROW &&
+        cur().kind != TK::INT && cur().kind != TK::FLOAT &&
+        cur().kind != TK::STRING && cur().kind != TK::REGEX &&
+        cur().kind != TK::LPAREN && cur().kind != TK::LBRACKET &&
+        cur().kind != TK::LBRACE && cur().kind != TK::SEMI &&
+        cur().kind != TK::COMMA && cur().kind != TK::FATARROW &&
+        cur().kind != TK::EOF_TOK && cur().kind != TK::RPAREN &&
+        cur().kind != TK::RBRACKET && cur().kind != TK::RBRACE &&
+        cur().kind != TK::SCALAR && cur().kind != TK::ARRAY &&
+        cur().kind != TK::HASH && cur().kind != TK::AND &&
+        cur().kind != TK::BACKSLASH && cur().kind != TK::STAR &&
+        cur().kind != TK::PLUS && cur().kind != TK::MINUS &&
+        cur().kind != TK::SLASH && cur().kind != TK::PERCENT &&
+        cur().kind != TK::QUESTION && cur().kind != TK::COLON &&
+        cur().kind != TK::TILDE && cur().kind != TK::CARET &&
+        cur().kind != TK::NOT && cur().kind != TK::OR &&
+        cur().kind != TK::LT && cur().kind != TK::GT &&
+        cur().kind != TK::DOT && cur().kind != TK::DOTDOT &&
+        cur().kind != TK::EQ && cur().kind != TK::NE &&
+        cur().kind != TK::KW_AND && cur().kind != TK::KW_OR &&
+        cur().kind != TK::KW_NOT && cur().kind != TK::SPACESHIP &&
+        cur().kind != TK::BACKTICK && cur().kind != TK::READLINE &&
+        cur().kind != TK::FILETEST && cur().kind != TK::BIND &&
+        cur().kind != TK::NBIND && cur().kind != TK::SUBST &&
+        cur().kind != TK::TR && cur().kind != TK::PLUS_PLUS &&
+        cur().kind != TK::MINUS_MINUS && cur().kind != TK::ASSIGN &&
+        cur().kind != TK::QWORDS && cur().kind != TK::KW_MY &&
+        cur().kind != TK::KW_OUR && cur().kind != TK::KW_LOCAL &&
+        cur().kind != TK::KW_SUB && cur().kind != TK::KW_USE &&
+        cur().kind != TK::KW_PACKAGE && cur().kind != TK::KW_RETURN &&
+        cur().kind != TK::KW_IF && cur().kind != TK::KW_UNLESS &&
+        cur().kind != TK::KW_WHILE && cur().kind != TK::KW_UNTIL &&
+        cur().kind != TK::KW_FOR && cur().kind != TK::KW_FOREACH &&
+        cur().kind != TK::KW_DO && cur().kind != TK::KW_GOTO &&
+        cur().kind != TK::KW_LAST && cur().kind != TK::KW_NEXT &&
+        cur().kind != TK::KW_REDO && cur().kind != TK::KW_EVAL &&
+        cur().kind != TK::KW_BEGIN && cur().kind != TK::KW_END) {
+        std::string key = cur().text;
+        advance();          /* the bareword */
+        return makeStr(key, line);
+    }
+
+    /* do { BLOCK } — block in expression context, returns last value */
+    if (check(TK::KW_DO) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
+        advance(); /* consume 'do' */
+        return parseBlock();
+    }
+
     /* do { BLOCK } — block in expression context, returns last value */
     if (check(TK::KW_DO) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
         advance(); /* consume 'do' */
@@ -2672,7 +2754,20 @@ NodePtr Parser::parsePrimary() {
                 auto n = std::make_unique<Node>(); n->kind = NK::HashSlice; n->line = line;
                 n->left = std::move(inner); /* ref expr stored in left */
                 while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
-                    n->args.push_back(parseExpr());
+                    /* D137: a qw(...) list as the key spec spreads into
+                       individual string keys — real Perl does this
+                       (@h{qw(a b)} is exactly @h{('a','b')}); previously
+                       the single QWORDS token was parsed as one element,
+                       which codegen turned into one undef key lookup, so
+                       multi-key qw slices silently came back empty. */
+                    if (check(TK::QWORDS)) {
+                        std::istringstream ss(cur().text);
+                        std::string w;
+                        while (ss >> w) n->args.push_back(makeStr(w, line));
+                        advance();
+                    } else {
+                        n->args.push_back(parseExpr());
+                    }
                     if (!match(TK::COMMA)) break;
                 }
                 consume(TK::RBRACE, "}");
@@ -2684,7 +2779,14 @@ NodePtr Parser::parsePrimary() {
                 auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice; n->line = line;
                 n->left = std::move(inner);
                 while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
-                    n->args.push_back(parseExpr());
+                    if (check(TK::QWORDS)) {
+                        std::istringstream ss(cur().text);
+                        std::string w;
+                        while (ss >> w) n->args.push_back(makeStr(w, line));
+                        advance();
+                    } else {
+                        n->args.push_back(parseExpr());
+                    }
                     if (!match(TK::COMMA)) break;
                 }
                 consume(TK::RBRACKET, "]");
@@ -2705,7 +2807,17 @@ NodePtr Parser::parsePrimary() {
                 n->left = std::move(refExpr);
                 inKeyContext_ = true;
                 while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
-                    n->args.push_back(parseExpr());
+                    /* D137: qw(...) as the key spec spreads into
+                       individual string keys (real Perl:
+                       @$href{qw(a b)} is @$href{('a','b')}). */
+                    if (check(TK::QWORDS)) {
+                        std::istringstream ss(cur().text);
+                        std::string w;
+                        while (ss >> w) n->args.push_back(makeStr(w, line));
+                        advance();
+                    } else {
+                        n->args.push_back(parseExpr());
+                    }
                     if (!match(TK::COMMA)) break;
                 }
                 inKeyContext_ = false;
@@ -2717,7 +2829,14 @@ NodePtr Parser::parsePrimary() {
                 auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice; n->line = line;
                 n->left = std::move(refExpr);
                 while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
-                    n->args.push_back(parseExpr());
+                    if (check(TK::QWORDS)) {
+                        std::istringstream ss(cur().text);
+                        std::string w;
+                        while (ss >> w) n->args.push_back(makeStr(w, line));
+                        advance();
+                    } else {
+                        n->args.push_back(parseExpr());
+                    }
                     if (!match(TK::COMMA)) break;
                 }
                 consume(TK::RBRACKET, "]");
@@ -2739,13 +2858,23 @@ NodePtr Parser::parsePrimary() {
             consume(TK::RBRACKET, "]");
             return n;
         }
-        /* @hash{'a','b'} — hash slice */
+        /* @hash{'a','b'} — hash slice (or qw key list) */
         if (check(TK::LBRACE)) {
             advance();
             auto n = std::make_unique<Node>(); n->kind = NK::HashSlice; n->name = nm; n->line = line;
             inKeyContext_ = true;
             while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
-                n->args.push_back(parseExpr());
+                /* D137: qw(...) key spec spreads into individual string
+                   keys, exactly like the @h{qw(a b)} = @h{('a','b')}
+                   equivalence real Perl defines. */
+                if (check(TK::QWORDS)) {
+                    std::istringstream ss(cur().text);
+                    std::string w;
+                    while (ss >> w) n->args.push_back(makeStr(w, line));
+                    advance();
+                } else {
+                    n->args.push_back(parseExpr());
+                }
                 if (!match(TK::COMMA)) break;
             }
             inKeyContext_ = false;
@@ -2878,8 +3007,17 @@ NodePtr Parser::parsePrimary() {
                 advance();
                 n->sval = "array_slice";
                 while (!check(TK::RBRACKET) && !check(TK::EOF_TOK)) {
-                    n->args.push_back(parseExpr());
-                    if (!match(TK::COMMA)) break;
+                    /* D137: qw(...) index spec spreads into individual
+                       string indices. */
+                    if (check(TK::QWORDS)) {
+                        std::istringstream ss(cur().text);
+                        std::string w;
+                        while (ss >> w) n->args.push_back(makeStr(w, line));
+                        advance();
+                    } else {
+                        n->args.push_back(parseExpr());
+                    }
+                    if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
                 }
                 consume(TK::RBRACKET, "]");
             } else {
@@ -2887,7 +3025,17 @@ NodePtr Parser::parsePrimary() {
                 n->sval = "hash_slice";
                 inKeyContext_ = true;
                 while (!check(TK::RBRACE) && !check(TK::EOF_TOK)) {
-                    n->args.push_back(parseExpr());
+                    /* D137: qw(...) key spec spreads into individual
+                       string keys (real Perl: delete @h{qw(a b)) is
+                       delete @h{('a','b'))). */
+                    if (check(TK::QWORDS)) {
+                        std::istringstream ss(cur().text);
+                        std::string w;
+                        while (ss >> w) n->args.push_back(makeStr(w, line));
+                        advance();
+                    } else {
+                        n->args.push_back(parseExpr());
+                    }
                     if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
                 }
                 inKeyContext_ = false;

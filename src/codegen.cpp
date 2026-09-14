@@ -1777,6 +1777,17 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                         callRT("perl_array_push", {res, old});
                         freeIfOwned(old);
                     }
+                } else if (keyNode.kind == NK::StringLit) {
+                    /* D137 companion: qw(...) key specs now spread into
+                       individual string-key args at parse time (parser.cpp
+                       HashSlice), so delete @h{qw(a b)} reaches here as
+                       one Str arg per key — each deletes its own entry.
+                       (Before D137 the whole qw was ONE parse element that
+                       this branch saw as a non-list, non-string node and
+                       silently deleted nothing.) */
+                    Value *old = emitHashDelete(hv, keyNode);
+                    callRT("perl_array_push", {res, old});
+                    freeIfOwned(old);
                 } else if (Value *kav = emitArrayPtr(keyNode)) {
                     Value *lenV = callRT("perl_array_len", {kav});
                     Value *len = callRT("perl_to_int", {lenV});

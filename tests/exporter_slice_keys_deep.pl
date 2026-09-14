@@ -1,0 +1,15 @@
+my %h = (alpha=>10, beta=>20, gamma=>30);
+my @k = @h{qw(alpha beta)};
+print "k: @k\n";
+my @k2 = @h{qw(alpha beta gamma)};
+print "k2: @k2\n";
+my $r = {all => [1,2], basic => ['m'], z => 9};
+my @a1 = @{$r->{all}};
+print "a1: @a1\n";
+my @a2 = @{ $r->{basic} };
+print "a2: @a2\n";
+my %copy = %h;
+print "copy: $copy{alpha} $copy{beta}\n";
+my @sl = @h{qw(alpha), qw(beta)};
+print "sl: @sl\n";
+print "deep_done\n";

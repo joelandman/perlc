@@ -231,6 +231,123 @@ scanExports(const std::vector<Token> &toks)
         while (end < toks.size() && toks[end].kind != TK::SEMI) end++;
         result[arrName] = extractQw(toks, j, end);
     }
+    /* Exporter mechanism, phase 1b: %EXPORT_TAGS = (tag => [...], ...).
+       Real modules (Pod::Usage, File::Path, ...) declare tag → ref-array
+       of names; importers then `use Module qw(:tag)` and Exporter's
+       import() expands the tag to that list. Stored under "TAG:<name>"
+       keys so the :tag/:all expansion in inlineModules() can find them.
+       Values seen in the wild: qw(...), ['...'], ["..."], \@EXPORT_OK,
+       and mixed lists. Handles all of them. */
+    for (size_t i = 0; i + 2 < toks.size(); i++) {
+        size_t base = i;
+        if (toks[base].kind == TK::KW_OUR) base++;
+        if (base >= toks.size() || toks[base].kind != TK::HASH) continue;
+        if (base + 1 >= toks.size()) continue;
+        std::string hashName = toks[base + 1].text;
+        if (hashName != "EXPORT_TAGS") continue;
+        size_t j = base + 2;
+        while (j < toks.size() && toks[j].kind != TK::ASSIGN && toks[j].kind != TK::SEMI) j++;
+        if (j >= toks.size() || toks[j].kind != TK::ASSIGN) continue;
+        j++;
+        size_t end = j;
+        while (end < toks.size() && toks[end].kind != TK::SEMI) end++;
+        /* walk the (tag => LIST, ...) pairs; lists may be qw(...),
+           [ ... ], ( ... ) nested, or \@EXPORT_OK-style (skipped — a
+           bareword-ref value's names can't be known here; the :all
+           expansion handles the common \@EXPORT_OK tag). */
+        size_t p = j;
+        /* values may reference the scanned export arrays by name:
+           `\@EXPORT_OK`, `[@EXPORT_OK]`, `\@EXPORT`. Resolve those AFTER
+           the array-scan pass (it runs fully first, above), since only
+           then are @EXPORT/@EXPORT_OK known. */
+        auto resolveNames = [&](size_t from, size_t end,
+                                std::vector<std::string> &out) {
+            while (from < end) {
+                if (toks[from].kind == TK::QWORDS) {
+                    std::istringstream ss(toks[from].text);
+                    std::string w;
+                    while (ss >> w) out.push_back(stripExportSigil(w));
+                } else if (toks[from].kind == TK::BACKSLASH ||
+                       toks[from].kind == TK::LBRACKET) {
+                    /* \@ARR / [@ARR] / ["a","b"] forms: scan to the
+                       matching closer, collecting bareword/STRING names,
+                       and resolving a bare EXPORT_OK/EXPORT array ref to
+                       the already-scanned array's contents */
+                    std::vector<std::string> collected;
+                    std::string refArr;
+                    from++;
+                    int depth = 1;
+                    while (from < end && depth > 0) {
+                        if (toks[from].text == "[" &&
+                            toks[from].kind == TK::LBRACKET) depth++;
+                        if (toks[from].text == "]" &&
+                            toks[from].kind == TK::RBRACKET) {
+                            depth--;
+                            if (depth == 0) { from++; break; }
+                        }
+                        if (depth == 1) {
+                            if (toks[from].kind == TK::ARRAY &&
+                                from + 1 < end && toks[from + 1].kind == TK::IDENT) {
+                                /* @EXPORT_OK lexes as ARRAY("@") + IDENT */
+                                refArr = toks[from + 1].text;
+                                from++;
+                            } else if (toks[from].kind == TK::IDENT ||
+                                       toks[from].kind == TK::STRING ||
+                                       toks[from].kind == TK::QWORDS) {
+                                if (toks[from].kind == TK::QWORDS) {
+                                    std::istringstream ss(toks[from].text);
+                                    std::string w;
+                                    while (ss >> w) collected.push_back(stripExportSigil(w));
+                                } else {
+                                    collected.push_back(stripExportSigil(toks[from].text));
+                                }
+                            }
+                        }
+                        from++;
+                    }
+                    if (!refArr.empty()) {
+                        auto it = result.find(refArr);
+                        if (it != result.end())
+                            out.insert(out.end(), it->second.begin(), it->second.end());
+                    } else {
+                        out.insert(out.end(), collected.begin(), collected.end());
+                    }
+                    return; /* one list value per tag */
+                } else if (toks[from].kind == TK::IDENT ||
+                           toks[from].kind == TK::STRING) {
+                    out.push_back(stripExportSigil(toks[from].text));
+                    from++;
+                } else {
+                    from++;
+                }
+            }
+        };
+        while (p < end) {
+            /* key: bareword (IDENT or KW_* with text — D136 makes
+               `all =>` parse as a string key now) */
+            if (toks[p].text.empty() ||
+                toks[p].kind == TK::FATARROW || toks[p].kind == TK::COMMA ||
+                toks[p].kind == TK::LPAREN || toks[p].kind == TK::RPAREN ||
+                toks[p].kind == TK::LBRACKET || toks[p].kind == TK::RBRACKET ||
+                toks[p].kind == TK::SEMI || toks[p].kind == TK::EOF_TOK) {
+                p++;
+                continue;
+            }
+            std::string tagName = toks[p].text;
+            p++;
+            if (p >= end || toks[p].kind != TK::FATARROW) continue;
+            p++;
+            /* value: collect names. A value that references a scanned
+               export array by name (\@EXPORT_OK / [@EXPORT_OK]) resolves
+               to that array's already-scanned contents (the array pass
+               above runs to completion first). */
+            std::vector<std::string> names;
+            resolveNames(p, end, names);
+            while (p < end && toks[p].kind != TK::COMMA) p++;
+            result["TAG:" + tagName] = names;
+            if (p < end && toks[p].kind == TK::COMMA) p++;
+        }
+    }
     return result;
 }
 
@@ -629,6 +746,86 @@ static std::vector<Token> inlineModules(
             /* build import map from @EXPORT / explicit list */
             auto exports = scanExports(modToks);
             std::vector<std::string> importList;
+            /* Exporter mechanism phase 1b: `:tag` / `:all` import specs.
+               Real Perl expands them through Exporter's import() using the
+               module's %EXPORT_TAGS (and @EXPORT+@EXPORT_OK for :all). The
+               expansion is done HERE, at compile time, matching the
+               compile-time-import model everything else already uses. */
+            std::vector<std::string> expandedImports;
+            bool usedTagExpansion = false;
+            {
+                auto itTags = exports.find("TAG:all");
+                std::vector<std::string> allNames;
+                {
+                    auto e1 = exports.find("EXPORT");
+                    if (e1 != exports.end())
+                        allNames.insert(allNames.end(), e1->second.begin(), e1->second.end());
+                    auto e2 = exports.find("EXPORT_OK");
+                    if (e2 != exports.end())
+                        for (auto &n : e2->second)
+                            if (std::find(allNames.begin(), allNames.end(), n) == allNames.end())
+                                allNames.push_back(n);
+                }
+                bool allTagDefined = exports.count("TAG:all") != 0;
+                for (auto &name : explicitImports) {
+                    if (!name.empty() && name[0] == ':') {
+                        usedTagExpansion = true;
+                        std::string tag = name.substr(1);
+                        if (tag == "all") {
+                            /* Real Exporter: :all is ONLY special when the
+                               module's own %EXPORT_TAGS defines it (verified:
+                               a module with @EXPORT but a :all tag over just
+                               @EXPORT_OK does NOT pull in @EXPORT names —
+                               probed directly against real perl). When
+                               :all is NOT defined in %EXPORT_TAGS but the
+                               module HAS some %EXPORT_TAGS, real Exporter
+                               dies ("is not defined in %EXPORT_TAGS");
+                               fall back to the @EXPORT+@EXPORT_OK union
+                               ONLY when the module declares no
+                               %EXPORT_TAGS at all — the sloppy-module
+                               case where real-world scripts expect :all
+                               to work anyway. */
+                            auto tagIt = exports.find("TAG:all");
+                            if (tagIt != exports.end()) {
+                                for (auto &n : tagIt->second)
+                                    expandedImports.push_back(n);
+                            } else if (allTagDefined ||
+                                       exports.count("EXPORT") ||
+                                       exports.count("EXPORT_OK")) {
+                                bool anyTags = false;
+                                for (auto &kv : exports)
+                                    if (kv.first.rfind("TAG:", 0) == 0) anyTags = true;
+                                if (!anyTags) {
+                                    for (auto &n : allNames)
+                                        expandedImports.push_back(n);
+                                } else {
+                                    throw std::runtime_error("\"" + name +
+                                        "\" is not defined in %EXPORT_TAGS of the " +
+                                        modName + " module");
+                                }
+                            } else {
+                                throw std::runtime_error("\"" + name +
+                                    "\" is not defined in %EXPORT_TAGS of the " +
+                                    modName + " module");
+                            }
+                        } else {
+                            auto it = exports.find("TAG:" + tag);
+                            if (it == exports.end())
+                                throw std::runtime_error("\"" + name +
+                                    "\" is not defined in %EXPORT_TAGS of the " +
+                                    modName + " module");
+                            for (auto &n : it->second) expandedImports.push_back(n);
+                        }
+                    } else if (!name.empty() && name[0] == '&') {
+                        /* &name form (real Pod::Usage exports qw(&pod2usage)) */
+                        expandedImports.push_back(name.substr(1));
+                    } else {
+                        expandedImports.push_back(name);
+                    }
+                }
+            }
+            const std::vector<std::string> &effectiveImports =
+                usedTagExpansion ? expandedImports : explicitImports;
             if (!explicitImports.empty()) {
                 /* explicit: use Module qw(a b) — import those names.
                    D26 follow-up: validate each requested name is actually
@@ -644,22 +841,28 @@ static std::vector<Token> inlineModules(
                    inlineModules() call, via the D26 fix's
                    visibleUnqualified/explicitImportNames mechanism, so
                    they're deliberately exempted from this check here to
-                   avoid rejecting a valid constant import. */
+                   avoid rejecting a valid constant import. Names pulled
+                   in by a :tag/:all expansion are validated against the
+                   tag's own contents at expansion time above. */
                 auto exportedElsewhere = [&](const std::string &name) {
                     for (auto &tag : {"EXPORT", "EXPORT_OK"}) {
                         auto it = exports.find(tag);
                         if (it == exports.end()) continue;
                         for (auto &n : it->second) if (n == name) return true;
                     }
+                    if (std::find(effectiveImports.begin(),
+                                  effectiveImports.end(), name) !=
+                        effectiveImports.end())
+                        return true;
                     return false;
                 };
-                for (auto &name : explicitImports) {
+                for (auto &name : effectiveImports) {
                     if (!exportedElsewhere(name) && !constMap->count(name)) {
                         throw std::runtime_error("\"" + name + "\" is not exported by the " +
                                                   modName + " module");
                     }
                 }
-                importList = explicitImports;
+                importList = effectiveImports;
             } else {
                 /* no list: use @EXPORT by default */
                 auto it = exports.find("EXPORT");
