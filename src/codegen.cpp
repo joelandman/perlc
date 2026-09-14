@@ -612,6 +612,7 @@ void CodeGen::declareRuntime() {
     RT("perl_get_dollar0", pv);
     RT("perl_make_code_ref",  pv, i8p);
     RT("perl_call_code_ref",  pv, pv, av);
+    RT("perl_get_current_code_ref", pv);
     RT("perl_eval_pop",        voidTy);
     RT("perl_get_dollar_at",   pv);
     RT("perl_eval_push",       voidTy, i8p);
@@ -882,6 +883,15 @@ static std::string globBareName(const std::string &nm) {
     return n;
 }
 
+/* D110: a fully-qualified variable name ("Other::h", "$Data::Dumper::x")
+   is a true package global — the runtime's process-wide typeglob registry
+   (perl_glob_get_*) is its single source of truth. Only qualified names
+   route there; bare names keep the historical per-scope auto-vivify
+   behavior unchanged. */
+static bool isQualifiedName(const std::string &nm) {
+    return nm.find("::") != std::string::npos;
+}
+
 bool CodeGen::isGlobName(const std::string &nm) const {
     std::string n = globBareName(nm);
     if (globNames_.count(n) || globNames_.count("main::" + n)) return true;
@@ -1010,6 +1020,18 @@ Value *CodeGen::lookupArray(const std::string &nm) {
     auto git = fileArrayGlobals_.find(nm);
     if (git != fileArrayGlobals_.end())
         return builder_.CreateLoad(perlPtrTy_, git->second, nm);
+    /* D110: an already-qualified name (@Other::arr) is a true global —
+       exact-qualified storage first, then the runtime glob registry.
+       Must precede isGlobName: glob_get's bare-name fallback would
+       otherwise attach @Other::arr to whatever entry the bare "arr"
+       name first created. */
+    if (isQualifiedName(nm)) {
+        auto qgit = fileArrayGlobals_.find(nm);
+        if (qgit != fileArrayGlobals_.end())
+            return builder_.CreateLoad(perlPtrTy_, qgit->second, nm);
+        Value *qkey = builder_.CreateGlobalStringPtr(nm);
+        return callRT("perl_glob_get_array", {qkey});
+    }
     if (isGlobName(nm)) {
         Value *key = builder_.CreateGlobalStringPtr(globBareName(nm));
         return callRT("perl_glob_get_array", {key});
@@ -1038,6 +1060,15 @@ Value *CodeGen::lookupHash(const std::string &nm) {
         return builder_.CreateLoad(perlPtrTy_, git->second, nm);
     if (nm == "SIG")
         return callRT("perl_get_sig_hash", {});
+    /* D110: an already-qualified name (%Other::h) is a true global —
+       identical shape to lookupArray's qualified branch above. */
+    if (isQualifiedName(nm)) {
+        auto qgit = fileHashGlobals_.find(nm);
+        if (qgit != fileHashGlobals_.end())
+            return builder_.CreateLoad(perlPtrTy_, qgit->second, nm);
+        Value *qkey = builder_.CreateGlobalStringPtr(nm);
+        return callRT("perl_glob_get_hash", {qkey});
+    }
     if (isGlobName(nm)) {
         Value *key = builder_.CreateGlobalStringPtr(globBareName(nm));
         return callRT("perl_glob_get_hash", {key});
@@ -4150,6 +4181,11 @@ void CodeGen::emitSub(const Node &n) {
 
     auto *savedFn = currentFn_;
     currentFn_ = fn;
+    /* D124: __SUB__ inside a named sub resolves to that sub's own code ref. */
+    std::string savedSubNm124 = currentSubName_;
+    bool savedAnonEmit124 = inAnonSubEmit_;
+    currentSubName_ = n.name;
+    inAnonSubEmit_ = false;
     auto savedLabels = std::move(stmtLabels_);
     stmtLabels_.clear();
     if (n.body) collectGotoLabels(*n.body);
@@ -4302,6 +4338,8 @@ void CodeGen::emitSub(const Node &n) {
     currentSubNeedsWantarray_ = savedNeedsWantarray;
     currentFn_ = savedFn;
     currentPackage_ = savedPackage;
+    currentSubName_ = savedSubNm124;
+    inAnonSubEmit_ = savedAnonEmit124;
     capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
     allNamesCaptured_ = savedAllCap;
     stmtLabels_ = std::move(savedLabels);
@@ -6082,10 +6120,29 @@ void CodeGen::emitStmt(const Node &n) {
         else {
             Value *slot = lookupVar(n.name);
             if (!slot) {
-                Value *uv = callRT("perl_alloc_undef", {});
-                slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
-                builder_.CreateStore(uv, slot);
-                declareVar(n.name, slot);
+                /* D110: `local $Other::x = ...` — same storage-selection
+                   order as emitLValue's qualified branch: fileScalarGlobals_
+                   slot first, else the glob registry cell in a temp alloca.
+                   perl_local_save snapshots the cell's *contents*, so the
+                   restore writes back through the registered cell — the
+                   pre-sub value is visible again after the sub returns. */
+                if (isQualifiedName(n.name)) {
+                    auto qgit = fileScalarGlobals_.find(n.name);
+                    if (qgit != fileScalarGlobals_.end()) {
+                        slot = qgit->second;
+                    } else {
+                        Value *qkey = builder_.CreateGlobalStringPtr(n.name);
+                        Value *cell = callRT("perl_glob_get_scalar", {qkey});
+                        slot = builder_.CreateAlloca(perlPtrTy_, nullptr,
+                                                     "gq." + n.name);
+                        builder_.CreateStore(cell, slot);
+                    }
+                } else {
+                    Value *uv = callRT("perl_alloc_undef", {});
+                    slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
+                    builder_.CreateStore(uv, slot);
+                    declareVar(n.name, slot);
+                }
             }
             pv = builder_.CreateLoad(perlPtrTy_, slot);
         }
@@ -6295,6 +6352,20 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         auto *slot = lookupVar(n.name);
         if (!slot) {
+            /* D110: a package-qualified name is a true global. Prefer
+               D112's fileScalarGlobals_ entry (module-`our` unification),
+               then the runtime glob registry. Must come BEFORE isGlobName:
+               a qualified non-filehandle name ($Other::x) must not be
+               swallowed by the typeglob branch's bare-name matching, and
+               glob_get's bare/main:: fallback could cross-wire two
+               same-bare-named packages. */
+            if (isQualifiedName(n.name)) {
+                auto git = fileScalarGlobals_.find(n.name);
+                if (git != fileScalarGlobals_.end())
+                    return builder_.CreateLoad(perlPtrTy_, git->second, n.name);
+                Value *key = builder_.CreateGlobalStringPtr(n.name);
+                return callRT("perl_glob_get_scalar", {key});
+            }
             if (isGlobName(n.name)) {
                 Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
                 return callRT("perl_glob_get_scalar", {key});
@@ -9333,6 +9404,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto  savedIntScopes   = intScopes_;
         auto *savedLocalDepth  = localDepthAlloca_;
         auto *savedSubBody     = currentSubBody_;
+        /* D124: __SUB__ inside this closure body must resolve to the
+           running closure's code-ref object (runtime call), not the
+           compile-time named-sub constant path. */
+        bool  savedAnonEmit    = inAnonSubEmit_;
+        std::string savedSubNm = currentSubName_;
+        inAnonSubEmit_ = true;
+        currentSubName_.clear();
         /* A `return` inside this anon sub's body must target the anon sub
            itself, never an enclosing eval{} — clear (and restore after)
            so the new-sub body starts with no active eval-return target,
@@ -9468,6 +9546,8 @@ Value *CodeGen::emitExpr(const Node &n) {
         intScopes_        = std::move(savedIntScopes);
         localDepthAlloca_ = savedLocalDepth;
         currentSubBody_   = savedSubBody;
+        inAnonSubEmit_    = savedAnonEmit;
+        currentSubName_   = savedSubNm;
         evalReturnTargets_ = std::move(savedEvalReturnTargets);
         capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
         allNamesCaptured_ = savedAllCap;
@@ -9948,6 +10028,21 @@ Value *CodeGen::emitLValue(const Node &n) {
         }
         auto *slot = lookupVar(n.name);
         if (!slot) {
+            /* D110: qualified-name write path — same ordering as the read
+               path above (fileScalarGlobals_ slot first, then the glob
+               registry cell held in a temp alloca). NO declareVar: this
+               is not a lexical, and registering it in the current scope
+               would shadow a later bare-name lookup, exactly as the
+               isGlobName branch below already behaves. */
+            if (isQualifiedName(n.name)) {
+                auto git = fileScalarGlobals_.find(n.name);
+                if (git != fileScalarGlobals_.end()) return git->second;
+                Value *key = builder_.CreateGlobalStringPtr(n.name);
+                Value *cell = callRT("perl_glob_get_scalar", {key});
+                auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "gq." + n.name);
+                builder_.CreateStore(cell, hold);
+                return hold;
+            }
             if (isGlobName(n.name)) {
                 Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
                 Value *cell = callRT("perl_glob_get_scalar", {key});
@@ -10521,6 +10616,33 @@ Value *CodeGen::emitCall(const Node &n) {
        represented as a plain Call and intercepted here, first, so it
        never falls through to the generic "undefined sub" die (D113). */
     if (n.name == "__FILE__") return perlStr(sourceFile_);
+
+    /* D124: __SUB__ — reference to the currently-executing sub.
+       - Inside an emitted closure body (AnonSub / sort comparator), the
+         correct answer is the RUNNING closure's code-ref object — only
+         the runtime knows it (it carries the fn pointer AND the capture
+         set; a compile-time fresh perl_make_code_ref(currentFn_) would
+         silently drop the closure's own captures). The runtime call
+         returns undef when no closure is executing, which is also the
+         right answer for __SUB__ at file scope (matches real perl).
+       - Inside a named sub's body, it's that named sub's own code ref —
+         same node shape NK::RefSub already produces (named subs here
+         resolve free variables by name, not captures, so a capture-less
+         code ref matches the existing model). */
+    if (n.name == "__SUB__") {
+        if (inAnonSubEmit_)
+            return callRT("perl_get_current_code_ref", {});
+        if (!currentSubName_.empty()) {
+            auto *subFn = mod_->getFunction(subLLVMName(currentSubName_));
+            if (subFn) {
+                Value *fnPtr = ConstantExpr::getPointerCast(
+                    subFn, PointerType::getUnqual(ctx_));
+                return callRT("perl_make_code_ref", {fnPtr});
+            }
+            return perlUndef();
+        }
+        return callRT("perl_get_current_code_ref", {});
+    }
 
     /* D103: an integer literal beyond INT64_MAX but within Perl's UV range
        (0..UINT64_MAX) — see parser.cpp's identical interception pattern

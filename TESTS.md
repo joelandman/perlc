@@ -75,7 +75,7 @@ eval STRING and eval-defined subs see outer `my`).
 | D106 | **FIXED 2026-09-11** | Same bug class as D105 but for a FLAT_ARRAY/FLOAT_PAIR ref read back out of an array/hash element (`$arr[0]`, `$h{k}`) rather than a plain scalar variable — a second alias made from that read didn't see further writes. See below. |
 | D108 | **FIXED 2026-09-11** | Plain double-quoted string literals (`"..."`, unrelated to `s///`) didn't recognize `\f`/`\a`/`\e`/`\b` — they passed through as literal backslash+letter. See below. |
 | D109 | **FIXED** (2026-09-10) | `s///` replacement text didn't support arbitrary variable interpolation (`$name`, `@arr`) — only `$0`-`$9`/`$&` (capture refs) worked, even though real Perl parses the replacement like a double-quoted string. See below. |
-| D120 | OPEN (correctness, split off D109's widened scope, found 2026-09-10) | The *general* string-interpolation engine used by plain `"..."` literals (not just `s///`, which D109 now separately fixes) is wrong for `$$aref[0]` (prints `[0]`) and `@{$r}[0,1]` (prints `1 2 3[0,1]`) — subscripted dereference inside a double-quoted string. `src/parser.cpp`'s `parseStringInterp` explicitly documents this as a known, unfixed gap in its own `$$` handling comment. See below. |
+| D120 | **FIXED** (2026-09-13) | The *general* string-interpolation engine used by plain `"..."` literals (not just `s///`, which D109 separately fixes) was wrong for `$$aref[0]` (printed the whole-ref stringification, plus literal bracket text on slice shapes) and `@{$r}[0,1]` (whole-array join + literal `[0,1]`) — subscripted dereference inside a double-quoted string. Fixed: `parseStringInterp` now consumes subscript groups after deref forms via a new `Parser::parseSubscriptGroup` helper emitting the exact node shapes the token-level parser produces (D63 ArrowDeref for `$$name[i]`; ArraySlice/HashSlice-in-JoinFunc for `@{$r}[...]` and the `@{[ ... ]}` trap idiom), with bareword-quoted hash keys. Bare `$$word`/`$$` and every previously-working form stay byte-identical. Tests: `tests/d120_string_deref_interp_{smoke,deep}.pl`. See below. |
 | D121 | **FIXED** (2026-09-10) | `$::name` / `@::arr` / `%::hash` (Perl's shorthand for `$main::name` — a bare `::` package prefix meaning "main") was a hard parse error ("unexpected token ':'"). Common in older/sysadmin-style Perl (found via the real `/usr/bin/ucfq` script). See below. |
 | D122 | **FIXED** (2026-09-10) | `inlineModules`'s `scanExports()` (`src/main.cpp`) only recognized `our @EXPORT[_OK] = qw(...)` — it missed the (still common, used by core `File::Path`) older `use vars qw(@EXPORT_OK); @EXPORT_OK = qw(...)` style, where the assignment isn't prefixed with `our`. Caused a false "X is not exported by the Y module" compile error for a name that real Perl does export. See below. |
 | D111 | **FIXED** (2026-09-10) | `my %c = %h;` (hash-to-hash copy) silently produced wrong contents — not a fresh copy. Corrected a wrong claim in D99's write-up below (`did NOT have this bug`). See below. |
@@ -87,7 +87,7 @@ eval STRING and eval-defined subs see outer `my`).
 | D131 | **FIXED 2026-09-11** | `our $var;`/`our @arr;`/`our %hash;` declared inside a nested bare `{ }` block, or repeated as a bare redeclaration anywhere, didn't work correctly. See below. |
 | D132 | **FIXED 2026-09-12** | `emitBinOp`'s separate F64 "stay unboxed" fast path converted a BigInt-tagged scalar VARIABLE straight to `double` and added/subbed/muled natively, bypassing `perl_add`/`perl_sub`/`perl_mul`'s D103 BigInt-aware logic. Fixed with a runtime BigInt-tag guard branching to the boxed op (plus a second pre-existing 1-ULP fix: mini-gmp's `mpz_get_d` truncates instead of round-to-nearest). See below. |
 | D116 | **FIXED** (2026-09-10, `__PACKAGE__`/`__FILE__`/`__LINE__` only) | `__PACKAGE__` / `__FILE__` / `__LINE__` were not implemented at all (hard parse error) despite `bless {...}, __PACKAGE__` being one of the most common OO-Perl idioms in CPAN modules. `__SUB__` (reference to the currently-executing sub) is intentionally not covered — harder, split off as **D124**. See below. |
-| D124 | OPEN (missing syntax, split off D116's `__SUB__` case, found 2026-09-10) | `__SUB__` (a reference to the currently-executing sub, needed for anonymous recursion — `use feature 'current_sub'`) is still a hard parse error. Needs codegen support for a reference to the current closure's own captures, not just a compile-time constant substitution like `__PACKAGE__`/`__LINE__`/`__FILE__`. See below. |
+| D124 | **FIXED** (2026-09-13) | `__SUB__` (a reference to the currently-executing sub, needed for anonymous recursion — `use feature 'current_sub'`) was a hard parse error. Fixed: `perl_call_code_ref` now tracks the running closure's code-ref object in a thread-local and `perl_get_current_code_ref()` returns it (captures included), so `__SUB__` inside a closure is the real running closure, not a capture-less substitute; named subs resolve to their own `\&name`-shaped code ref; undef at file scope. Tests: `tests/d124_current_sub_{smoke,deep}.pl`. See below. |
 | D117 | **FIXED** (2026-09-10) | `perl_atof_decimal` (`src/runtime.c`) was a hand-rolled decimal-string→float parser (manual digit accumulation plus a repeated-multiply exponent loop) instead of `strtod`, accumulating rounding error on ordinary decimal strings — every implicit string→number coercion goes through it. See below. |
 | D125 | **FIXED 2026-09-12** | `use`/`no` pragma statements (`use strict;`, `no warnings 'numeric';`, etc.) are only recognized at the very top level of a file — nested inside a `sub {}` or a bare `{ }` block, they're a hard parse error ("unexpected token 'warnings'"/"'use'"). Root cause: the `use`/`no` handling (`src/parser.cpp:73`) lives in `parseProgram()`, not in the general `parseStmt()` every nested block/sub actually uses. See below. |
 | D118 | **FIXED** (2026-09-10) | `split` had no 3rd LIMIT argument at all (hard parse error, not just silently ignored) and didn't trim trailing empty fields from the result, unlike real Perl's default `split` behavior. See below. |
@@ -99,7 +99,7 @@ eval STRING and eval-defined subs see outer `my`).
 | D134 | **FIXED 2026-09-12** | `syscall()` arguments were pushed into the arg array with `perl_array_push`, which **clones** — a syscall that writes through a pointer argument (SYS_clock_gettime's `struct timespec` buffer) wrote into the clone, so the caller's `$buf` never changed (`make test`'s `xs_ffi.pl` clock assertions failed on this). Args are now pushed by reference (`perl_array_push_nc`) so kernel writes land in the caller's own buffer. See below. |
 | D135 | **FIXED 2026-09-13** | Inside a sub (or a nested bare block), a variable initialized with an integer (`my $x = 0;`) was int-promoted to an unboxed i64 alloca; any later assignment of a fractional NV (`$x = 5.5;`, `$x = "5.5" + 0;`, `$x = g();` where g returns 5.5, even a plain `$x = "7.25";`) silently truncated to the int part. Fixed with a fixpoint "provably-int-only" scan: int-promotion is refused when the scope ever writes the name a non-int-shaped value. Pure-int counters keep their i64 fast path (hot-loop IR byte-identical). See below. |
 | D119 | **FIXED** (2026-09-10) | `scalar(keys %$href)` (keys on a deref'd hashref, in scalar context) returned `0` instead of the key count — `scalar(keys %h)` on a plain named hash and list-context `keys %$href` were both correct, so this was specific to the scalar-context + deref-hash combination. See below. |
-| D110 | OPEN (correctness, found while implementing Data::Dumper; scope widened 2026-09-10) | `$Package::var` (an arbitrary fully-qualified global not declared via `our`) is not a true cross-scope global — it auto-vivifies as a plain variable in whatever scope first references it, so setting it at file scope is invisible from inside an unrelated `sub`. General bug, not module-specific; found via `$Data::Dumper::Sortkeys`. Widened 2026-09-10 while verifying D121: the same gap applies to `@Package::arr`/`%Package::hash` too, and more severely — an undeclared qualified array/hash doesn't just fail to cross scopes, whole-array/hash access (`my @c = @main::arr`, not just elements) returns nothing at all, vs. an `our`-declared array/hash (which works correctly, cross-package, today). See below. |
+| D110 | **FIXED** (2026-09-13) | `$Package::var` (an arbitrary fully-qualified global not declared via `our`) is not a true cross-scope global — it auto-vivifies as a plain variable in whatever scope first references it, so setting it at file scope is invisible from inside an unrelated `sub`. Widened 2026-09-10: the same gap applies to `@Package::arr`/`%Package::hash`, and worse — whole-array/hash access (`my @c = @main::arr`) returned nothing at all. Fixed: any name containing `::` now routes to the runtime's process-wide typeglob registry (`perl_glob_get_{scalar,array,hash}`) at every read/write choke point in `src/codegen.cpp` (`emitExpr`/`emitLValue` ScalarVar, `lookupArray`, `lookupHash`, `NK::LocalStmt`), preferring a `fileScalarGlobals_`/`fileArrayGlobals_`/`fileHashGlobals_` exact-qualified entry when present so module-`our` storage unifies with qualified access (D112 keys). Qualified names are checked BEFORE `isGlobName` so the typeglob branch's bare-name fallback can't swallow them. Bare-name behavior untouched. Also fixed while testing: `$#Pkg::arr` was a hard parse error (lexer's `$#` branch didn't read `::` chains), `@::arr`/`%::h` in code and in interpolated strings stayed literal (the `::`-shorthand interp triggers were `$`-only in practice), and `"$$Pkg::x"`/`"$Pkg::h{k}"` dropped the package prefix or stayed literal in interpolated strings. Bare `$#arr` in interpolated strings was literal text even for bare names — now interpolates (note: a bare file-scope `@arr = (...)` assignment still doesn't register global storage, so `scalar(@arr)`/`$#arr` after one is 0/-1 — pre-existing, logged below). Tests: `tests/d110_qual_global_{smoke,deep}.pl`. See below. |
 | D99 | **FIXED** (2026-09-09) | `my @b = @a;` aliased storage — mutating `@b` mutated `@a`. Fixed in `src/codegen.cpp:4118-4149` (`case NK::My`, `isArr` branch): a borrowed pointer from `emitArrayPtr` (plain `@var`, `@$ref`, `->@*`) is now always copied into a fresh array via `perl_array_new`+`perl_array_extend`, instead of being declared directly as the new variable's backing store. Tests: `tests/d99_array_copy_smoke.pl`, `tests/d99_array_copy_deep.pl`. |
 | D100 | **FIXED** (2026-09-09) | List-assignment used as a boolean condition (`while (my ($k,$v)=...)`, `if ((...)=...)`) always evaluated false — loop/branch body never ran. Two stacked bugs, both fixed: (1) `case NK::Assign` (ArrayLit LHS) always returned a void/null PerlValue*; now returns `perl_array_len(rhsArr)` (real Perl's list-assignment-in-scalar-context semantics), which every existing consumer already handles correctly since `perl_array_len` was already a registered "owned temp". (2) The expression-context `my ($a,$b) = EXPR` parse wraps each variable as a bare `NK::My` node that `emitLValue()` didn't understand, so `$k`/`$v` stayed undef even once the loop iterated correctly; fixed by declaring `NK::My` LHS elements directly in the assignment loop, with `While` hoisting the one-time alloca before the loop (mirroring the existing single-variable `myCondPv` hoist) so a long-running loop doesn't re-execute an alloca (and leak stack) every iteration — verified with a 50k-iteration stress test. Tests: `tests/d100_list_assign_cond_smoke.pl`, `tests/d100_list_assign_cond_deep.pl`. |
 | D105 | **FIXED** (2026-09-09) | Reads through one alias to a shared array-ref (`$m[0][0]` after `my @m2=@m; $m2[0][0]=99`, or a bare `$inner->[0]=55` then reading `$m[0][0]` where `$m[0]==$inner`) didn't see writes made through another alias. Root cause: FLAT_ARRAY/FLOAT_PAIR (Stage 22/23's compact storage for numeric anon-array-ref literals) were deep-copied on clone instead of preserving reference identity. Fixed via a new `perl_promote_ref_array()` in `src/runtime.c` that lazily promotes FLAT_ARRAY/FLOAT_PAIR to a real `PERL_REF_ARRAY` in place (reusing `perl_deref_array`'s existing lazy-conversion) at the exact points a second alias can be created — `case NK::ScalarVar` reads in `src/codegen.cpp` (covers push/sub-args/hash-values/return/etc. generically) plus D99's array-to-array copy path — while leaving fresh literal construction (`@bodies = ([1,2,3], ...)`) untouched, so Stage 22/23 keeps its fast path. See below. |
@@ -1637,31 +1637,58 @@ auto-quote contexts staying unaffected. Tests:
 
 **Not fixed here** (split off, harder): `__SUB__` — now **D124**.
 
-### D124 — `__SUB__` (current-sub reference) unimplemented
+### D124 — `__SUB__` (current-sub reference) unimplemented — **FIXED 2026-09-13**
 
 ```perl
 use feature 'current_sub';
 my $fact = sub { my $n = shift; $n <= 1 ? 1 : $n * __SUB__->($n - 1) };
-print $fact->(5), "\n";   # perl: 120  |  perlc: parse error
+print $fact->(5), "\n";   # perl: 120  |  was: parse error
 ```
 
-Split off from D116 since it's a fundamentally different kind of fix —
-`__PACKAGE__`/`__FILE__`/`__LINE__` are all compile-time constant
-substitutions (no codegen changes beyond the `__FILE__` interception),
-but `__SUB__` needs a genuine reference to the currently-executing
-closure, including whatever it captured, from *inside itself* —
-`case NK::AnonSub`'s codegen already has a `Function *subFn` (the LLVM
-function being emitted) and its `captureVals` in scope at the exact
-point this would need to be threaded through (`currentFn_` is
-generically available too, for a named sub), but simply wrapping
-`currentFn_` in a fresh `perl_make_code_ref` the way `\&name` does
-would silently drop the current closure's own captures if `__SUB__` is
-used inside a closure that itself captured outer variables — a correct
-fix needs the *same* captures array the enclosing closure was built
-with, not a capture-less code ref. Mostly relevant to anonymous
-recursion idioms; much less common than the other three dunders in
-real-world code, so left open rather than risking a subtly-wrong
-capture-sharing implementation under time pressure.
+Split off from D116. The hard part TESTS.md's D116 write-up identified
+was real: a correct `__SUB__` inside a closure must be the *running*
+closure object — carrying the fn pointer AND the capture set it was
+built with — which no compile-time substitution can produce (wrapping
+`currentFn_` in a fresh `perl_make_code_ref` would silently drop the
+closure's own captures, detaching `__SUB__`-recursion from the captured
+lexicals it mutates through).
+
+**Fix** (`src/runtime.c`/`src/runtime.h`, `src/parser.cpp`,
+`src/codegen.cpp`, `src/codegen.h`): the runtime already funnels every
+closure invocation through `perl_call_code_ref`, which installs the
+running closure's capture array in thread-locals. It now also installs
+the closure's `PerlValue*` code-ref object itself in a new
+`__thread PerlValue *s_current_coderef` (saved/restored around the call,
+nesting-safe), exposed as `perl_get_current_code_ref()`. `__SUB__` is
+parsed exactly like `__FILE__` (a plain `NK::Call`, so the parser needs
+no constant-substitution machinery) and intercepted first in
+`CodeGen::emitCall`:
+
+- inside an emitted closure body (`case NK::AnonSub`; the new
+  `inAnonSubEmit_` flag, save/restored around the emission — sort
+  comparators excluded, see below): `callRT
+  ("perl_get_current_code_ref")` — the actual running closure, captures
+  included, verified by a deep test where two closures made from the
+  same factory but capturing different `$add` values recurse through
+  `__SUB__` and each sees only its own;
+- inside a named sub's body: that sub's own code ref, built the same way
+  `case NK::RefSub` does (`perl_make_code_ref(cast(currentFn_))`) from
+  the new `currentSubName_` state — correct here because named subs in
+  this codebase resolve free variables by name rather than captures, so
+  a capture-less code ref matches the existing `\&name` model (verified:
+  `__SUB__ == \&in_named` is true);
+- at file scope: `perl_get_current_code_ref` returns undef — matching
+  real Perl, `defined(__SUB__)` is false outside any sub.
+
+Also fixed to make the feature reachable: the `use feature
+'current_sub'` feature flag already parsed (D116-era feature handling);
+the RT registration table gained the new runtime symbol ("Unknown
+runtime function" otherwise). Logged, not fixed: `__SUB__` inside a
+`sort { ... }` comparator returns undef (comparators are emitted as raw
+LLVM functions called through a non-`perl_call_code_ref` C-style path,
+and real Perl's behavior there is itself an edge case); `__SUB__` inside
+an eval-STRING-compiled sub works through the same `perl_call_code_ref`
+path but is untested. Tests: `tests/d124_current_sub_{smoke,deep}.pl`.
 
 ### D117 — `perl_atof_decimal` hand-rolled string→float parser — **FIXED 2026-09-10**
 
@@ -2061,31 +2088,78 @@ specific): subscripted deref-in-a-string (`$$aref[0]`, `@{$r}[0,1]`) is
 still wrong in the *general* interpolation engine (`parseStringInterp`
 itself, used by plain `"..."` literals too) — now tracked as **D120**.
 
-### D120 — subscripted deref-in-a-string doesn't interpolate correctly
+### D120 — subscripted deref-in-a-string doesn't interpolate correctly — **FIXED 2026-09-13**
 
 ```perl
 my $aref = [10, 20, 30];
-print "first: $$aref[0]\n";      # perl: first: 10   |  perlc: first: [0]
+print "first: $$aref[0]\n";      # perl: first: 10   |  was: first: [0]
 my $r = [1,2,3];
-print "slice: @{$r}[0,1]\n";     # perl: slice: 1 2   |  perlc: slice: 1 2 3[0,1]
+print "slice: @{$r}[0,1]\n";     # perl: slice: 1 2   |  was: slice: 1 2 3[0,1]
 ```
 
 `src/parser.cpp`'s `parseStringInterp` (the raw-string interpolation
-scanner used by all `"..."` literals, backtick strings, and now — since
-D109 — `s///` replacement text) explicitly documents this exact gap in
-its own `$$` handling comment: subscripted deref-in-a-string is "a
-separate, deeper, pre-existing gap — not fixed here." Bare `$$word`
-(scalar deref, no subscript) and `$$` (PID) both already work; it's
-specifically `$$word[i]` / `$$word{k}` / `@{$expr}[...]` that don't.
+scanner used by all `"..."` literals, backtick strings, and — since
+D109 — `s///` replacement text) explicitly documented this exact gap in
+its own `$$` handling comment. Bare `$$word` (scalar deref, no
+subscript) and `$$` (PID) already worked; it was specifically
+`$$word[i]` / `$$word{k}` / `@{$expr}[...]` / `@$ref[...]` / the
+`@{[ ... ]}` trap idiom that didn't — the deref part interpolated and
+the following `[...]`/`{...}` stayed literal text.
 
-**Fix shape:** larger than D109 was — `parseStringInterp` is a
-hand-rolled character scanner reimplementing a subset of expression
-parsing, not a thin wrapper over the tokenizer/parser; teaching it
-`$$word[i]`-style postfix subscripting after a deref would mean
-extending that hand-rolled scanner's grammar (or re-architecting it to
-lex+parse a bounded token span instead of scanning raw characters by
-hand) rather than a small dispatch fix like most of this pass's other
-items.
+Pre-fix divergence table (form | perlc | perl): `$$aref[0]` →
+`ARRAY(0x…)` — the whole-ref deref, not the element (and on a slice,
+the same plus literal bracket text); `$$href{k}` → ref stringification;
+`@{$r}[0,1]` → whole-array join + literal `[0,1]`; `@{[ ... ]}` → the
+literal `[ ... ]` text after the array's join (the idiom is a hard parse
+error in some shapes); `$$aref[-1]` / `$$aref[$i]` / `$$href{$k}` all
+truncated to bare-deref + literal subscript.
+
+**Fix** (`src/parser.cpp`, `src/codegen.cpp`): kept the hand-rolled
+scanner (Option 1) and taught it the missing grammar via one new helper,
+`Parser::parseSubscriptGroup(raw, i, line, nameRef, isOpenBracket,
+exprRef)`, which consumes one or more adjacent subscript groups from the
+raw string text and builds exactly the node shape the token-level parser
+produces for the equivalent spelling:
+
+- nameRef form (`$$name[0]`, `$$name{k}`, `${name}[0]`): the first group
+  is D63's single-deref element access — `ArrowDeref("array"/"hash")`
+  with the inner scalar in `left` (real Perl: `$$aref[0]` is
+  `${$aref}[0]`, exactly one deref level); further adjacent groups chain
+  as ArrowDeref on the previous result (`$$aref[0][1]`), matching the
+  existing $varname machinery.
+- exprRef form (`@{$r}[...]`, `@$ref[...]`, `@{[ ... ]}`): the first
+  group is an `ArraySlice`/`HashSlice` with the derefed-ref expr in
+  `left` (real Perl requires an explicit `->` for further groups, so
+  the run stops there), and the slice is wrapped in the same
+  `JoinFunc(" ")` wrapper the surrounding whole-`@{$r}`/D73 slice paths
+  use (a bare slice node in the interpolation assembly emits the ref,
+  not its elements).
+- `{...}` groups bareword-quote their keys (split on top-level commas,
+  `makeStr` for bare text, re-lex only `$`/`@`-prefixed parts) — a
+  bareword handed to the token-level `parseExprListFromTokens` outside
+  `inKeyContext_` is a hard "String found where operator expected" parse
+  error (this is why `"$$href{k}"` initially hard-errored the whole
+  file). `[...]` groups keep `parseExprListFromTokens` (indices are
+  expressions: numbers, `$vars`, ranges).
+
+Two implementation subtleties worth recording: (1) the helper's entry
+originally did `NodePtr node = exprRef ? std::move(exprRef) : …` and
+then checked `if (exprRef)` for the build branch — the parameter was
+already moved-from (nil) by then, so every slice silently degraded to
+the bare base node; fixed by latching `const bool isExprRef` before the
+move and branching on that. (2) the `@{expr}` branch's balanced-brace
+scan already yields `exprNode` from the inner text, so the slice hooks
+reuse it directly — no re-lexing.
+
+Also fixed while verifying: `s///` replacement text (D109's
+`parseInterpString` path) shares the same `$$`-subscript machinery, so
+`s/^x/$$aref[1]/` works too. Intentionally unchanged: everything that
+already worked (`"$name"`, `"@arr"`, `"${name}"`, `"$h{k}"`,
+`"$arr[0]"`, `"$$word"`, `"$$"`, escaped sigils) stays byte-identical —
+the full harness gates that. Logged, not fixed: `$$href` where `$href`
+holds a *hash* ref die in real perl ("Not a SCALAR reference") but
+perlc prints the ref and continues (runtime wrong-ref-deref semantics,
+not interpolation). Tests: `tests/d120_string_deref_interp_{smoke,deep}.pl`.
 
 ### D121 — `$::name` (bare `main::` shorthand) is a hard parse error
 

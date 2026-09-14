@@ -18,7 +18,7 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-13, re-verified after D128/D135 — 321/321 PASS,
+**Harness (2026-09-13, re-verified after D110/D120/D124 — 327/327 PASS,
 0 FAIL; `make test` 47/47):** New this session:
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
@@ -41,6 +41,9 @@ gated by `make test-all` (byte-for-byte vs real `perl`).
 `d133_assign_double_free_{smoke,deep}.pl`,
 `d134_syscall_buf_{smoke,deep}.pl`,
 `d135_int_promo_nv_{smoke,deep}.pl`,
+`d110_qual_global_{smoke,deep}.pl`,
+`d120_string_deref_interp_{smoke,deep}.pl`,
+`d124_current_sub_{smoke,deep}.pl`,
 `d128_module_error_location.sh` (+ `tests/lib/D128Broken.pm`,
 `tests/d128_module_error_main.pltxt` — compile-failure diagnostics
 fixtures, outside the harness corpus).
@@ -86,6 +89,21 @@ are in TESTS.md):**
   keep byte-identical IR). Both shipped with their own self-verifying
   test assets (D128's are compile-failure fixtures outside the
   harness corpus).
+- D110/D120/D124 (2026-09-13, two-agent parallel session — the last
+  three open generated-code defects; see TESTS.md for full write-ups):
+  D110 makes any `::`-containing name a true cross-scope global (reads,
+  writes, elements, slices, whole-container ops, `local`) via the
+  runtime's process-wide glob registry, preferring module-`our` storage
+  when present; D120 teaches the general `"..."` interpolation scanner
+  subscripted-deref forms (`$$aref[0]`, `$$href{k}`, `@{$r}[0,1]`,
+  `@$ref[1..2]`, the `@{[ ... ]}` trap idiom) via a new
+  `parseSubscriptGroup` helper emitting the token-level parser's node
+  shapes; D124 is `__SUB__` — `perl_call_code_ref` now tracks the
+  running closure's code-ref object in a thread-local
+  (`perl_get_current_code_ref`) so recursion through `__SUB__` keeps the
+  closure's own captures, with named subs resolving to their own
+  capture-less `\&name`-shaped ref (matching this codebase's named-sub
+  model) and undef at file scope.
 - D103/D104/D106/D108: see TESTS.md for full write-ups. Summary: D103
   is integer-overflow auto-promotion (bounded, unblessed auto-BigInt
   reusing the existing Math::BigInt/mini-gmp machinery — see TESTS.md
@@ -208,7 +226,7 @@ are in TESTS.md):**
   1` and `$h{__PACKAGE__}`) needed explicit handling to keep matching
   real Perl's literal-bareword behavior there. Split off `__SUB__`
   (current-sub reference — needs real closure-capture support, not
-  just a constant substitution) as **D124** — logged, not fixed.
+  just a constant substitution) as **D124** — since fixed (2026-09-13).
 - D121 (`src/lexer.cpp`): `$::name`/`@::arr`/`%::hash` (Perl's `main::`
   shorthand) no longer a parse error — the lexer now synthesizes the
   same token a spelled-out `main::name` would produce. Found (and
@@ -294,8 +312,8 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** **D110, D120, D124**
-(see `TESTS.md`). **D54**
+**Open generated-code defects:** none — **D110, D120, and D124 were
+fixed 2026-09-13** (see TESTS.md). **D54**
 (tooling): `perlc_tsan` can hang compiling `tests/threads.pl`
 (TSan+`fork` of clang); workaround `TSAN_OPTIONS=die_after_fork=0`.
 
@@ -322,7 +340,7 @@ readiness for "common CPAN modules work." Found and byte-for-byte-
 verified **8 new defects (D111–D118)**; **D111–D114 are now fixed**, and
 the pre-existing **D109 is now fixed too** (see above) — as is **D116**
 (`__PACKAGE__`/`__FILE__`/`__LINE__`, split from `__SUB__` which is now
-**D124**, harder, still open) and **D117** (`perl_atof_decimal` hand-
+**D124**, since fixed 2026-09-13) and **D117** (`perl_atof_decimal` hand-
 rolled float parser → `strtod`, plus now-recognized `Inf`/`Infinity`/
 `NaN` string coercion — split off **D125**, found while testing D117:
 `use`/`no` pragmas only parse at file top-level, not inside a nested

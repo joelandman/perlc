@@ -508,6 +508,7 @@ typedef struct PerlClosure {
 PerlValue *perl_make_code_ref(PerlSubFnCtx fp);                     /* no captures */
 PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures); /* with captures */
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args);
+PerlValue *perl_get_current_code_ref(void); /* D124: __SUB__ inside a closure body */
 PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a closure call */
 
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */

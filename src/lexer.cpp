@@ -437,7 +437,8 @@ std::vector<Token> Lexer::tokenize() {
                 while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
                     name += src_[pos_++];
             }
-            /* D121: $::name / @::arr / %::hash */
+            /* D121: $::name / %::hash — D110: @::arr (the sigil branch's
+               tryReadMainColonIdent call used to be $-only in practice) */
             toks.push_back({TK::IDENT, name, line_});
             return true;
         }
@@ -739,8 +740,12 @@ std::vector<Token> Lexer::tokenize() {
             TK k = (c == '$') ? TK::SCALAR : TK::ARRAY;
             pos_++;
             toks.push_back({k, std::string(1, c), line_});
-            if (tryReadMainColonIdent()) continue; /* D121: $::name / @::arr */
-            /* $#arr — last index of array */
+            if (tryReadMainColonIdent()) continue; /* D121: $::name / @::arr — D110: also @::arr (previously only $ and %) */
+            /* $#arr — last index of array. D110: the name may be
+               package-qualified ($#Other::arr); without the :: handling
+               the scan stopped at the bare segment and left "::arr" for
+               the parser (hard parse error downstream). Mirrors
+               readIdent()'s own :: handling. */
             if (c == '$' && pos_ < src_.size() && src_[pos_] == '#') {
                 char nxt = (pos_+1 < src_.size()) ? src_[pos_+1] : 0;
                 if (isalpha((unsigned char)nxt) || nxt == '_') {
@@ -748,6 +753,12 @@ std::vector<Token> Lexer::tokenize() {
                     std::string arrname;
                     while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
                         arrname += src_[pos_++];
+                    while (pos_ + 1 < src_.size() && src_[pos_] == ':' && src_[pos_ + 1] == ':') {
+                        pos_ += 2;
+                        arrname += "::";
+                        while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+                            arrname += src_[pos_++];
+                    }
                     toks.back().text = "#" + arrname;
                     continue;
                 }

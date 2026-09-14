@@ -3919,6 +3919,17 @@ NodePtr Parser::parsePrimary() {
             n->name = nm; n->line = line;
             return n;
         }
+        /* D124: __SUB__ — reference to the currently-executing sub. Inside
+           a closure body this must be the RUNNING closure object itself
+           (carrying its captures), which only the runtime knows; in a
+           named sub it's that sub's own code ref. Both resolve in codegen
+           (emitCall intercepts the name before the undefined-sub die,
+           exactly like __FILE__); at file scope it's undef. */
+        if (!inKeyContext_ && nm == "__SUB__") {
+            auto n = std::make_unique<Node>(); n->kind = NK::Call;
+            n->name = nm; n->line = line;
+            return n;
+        }
         if (check(TK::ARROW)) return makeStr(nm, line);
         /* Prototype-aware call: () constant-like, &@ block form. */
         if (const std::string *pr = lookupProto(nm)) {
@@ -4100,6 +4111,148 @@ NodePtr Parser::parseCall(std::string name, int line) {
 
 /* ── string interpolation ────────────────────────────────────────────────── */
 
+/* D120: shared helper for parseStringInterp — consume one subscript
+   group ('[' indices ']' or '{' keys '}') plus any further adjacent
+   groups from `raw` starting at `i` (advanced past the close), and build
+   the node the token-level parser produces for that shape:
+
+   - nameRef form (bare array/hash ref, first subscript): ArrowDeref with
+     the inner scalar in `left` (D63's single-deref semantics for
+     $$name[i] / $$name{k}).
+   - exprRef form (@{$r}[...], @$ref[...], @{[...]}[...]): ArraySlice /
+     HashSlice with the derefed-ref expr in `left`.
+   - nullptr: plain element forms — ArrayElem / HashElem on the named
+     array/hash.
+
+   Index/key expressions go through Lexer + parseExprFromTokens /
+   parseExprListFromTokens, matching how the existing subscript paths in
+   the scanner already do it. */
+NodePtr Parser::parseSubscriptGroup(const std::string &raw, size_t &i, int line,
+                                    const char *nameRef, bool isOpenBracket,
+                                    NodePtr exprRef) {
+    /* D120: consume one or more adjacent subscript groups from `raw`
+       starting at `i`, building the node the token-level parser produces
+       for the equivalent spelling:
+
+       - exprRef form (@{$r}[...], @$ref[...], ${$r}{...}): the FIRST
+         group is an ArraySlice / HashSlice with the derefed-ref expr in
+         `left` (further adjacent groups don't occur without an explicit
+         -> in real interpolation grammar — stop there).
+       - nameRef form ($$name[0], $$name{k}, ${name}[0]): the first group
+         is D63's single-deref element access — ArrowDeref("array"/"hash")
+         with the inner scalar in `left` (NOT a slice: $$aref[0] is the
+         one element ${$aref}[0]). Further adjacent groups chain as
+         ArrowDeref on the previous result ($$aref[0][1] idiom), matching
+         the existing $varname machinery below.
+
+       Index/key expressions go through Lexer + parseExprListFromTokens,
+       exactly like the existing scanner subscript paths. An unterminated
+       group returns the base node unchanged (text stays literal). */
+    const bool isExprRef = (exprRef != nullptr);
+    NodePtr node = isExprRef ? std::move(exprRef)
+                 : (nameRef ? makeScalar(nameRef, line) : nullptr);
+    bool first = true;
+    for (;;) {
+        if (i >= raw.size() || (raw[i] != '[' && raw[i] != '{')) break;
+        bool isArr = raw[i] == '[';
+        char open = raw[i], close = (isArr) ? ']' : '}';
+        i++;
+        std::string inner;
+        int depth = 1;
+        while (i < raw.size() && depth > 0) {
+            char c = raw[i];
+            if (c == open) depth++;
+            else if (c == close) { if (--depth == 0) { i++; break; } }
+            inner += c; i++;
+        }
+        if (depth != 0) {
+            /* unterminated: rewind consumed opener, keep node as-is */
+            i--;
+            break;
+        }
+        Lexer innerLex(inner);
+        NodeList group;
+        if (isArr) {
+            auto itoks = innerLex.tokenize();
+            group = Parser::parseExprListFromTokens(std::move(itoks));
+        } else {
+            /* Hash keys: real Perl bareword-quotes them inside {} — the
+               working $varname{key} machinery in this scanner makes a Str
+               for bare text and only re-lexes $/@-prefixed parts; mirror
+               that (a bareword handed to parseExprListFromTokens would be
+               a hard "String found where operator expected" parse error,
+               since the token parser has no in-key context). */
+            size_t b = 0;
+            while (b <= inner.size()) {
+                size_t e = inner.find(',', b);
+                if (e == std::string::npos) e = inner.size();
+                std::string part = inner.substr(b, e - b);
+                /* trim surrounding whitespace */
+                size_t ps = 0, pe = part.size();
+                while (ps < pe && (part[ps]==' '||part[ps]=='\t')) ps++;
+                while (pe > ps && (part[pe-1]==' '||part[pe-1]=='\t')) pe--;
+                part = part.substr(ps, pe - ps);
+                NodePtr keyExpr;
+                if (!part.empty() && (part[0] == '$' || part[0] == '@')) {
+                    Lexer kl(part); auto ktoks = kl.tokenize();
+                    group.push_back(Parser::parseExprFromTokens(std::move(ktoks)));
+                } else if (part.empty()) {
+                    group.push_back(makeStr("", line));
+                } else {
+                    group.push_back(makeStr(part, line));
+                }
+                if (e >= inner.size()) break;
+                b = e + 1;
+            }
+        }
+        auto n = std::make_unique<Node>();
+        if (isExprRef) {
+            if (!first) break; /* slice root: one group only */
+            n->kind = isArr ? NK::ArraySlice : NK::HashSlice;
+            n->left = std::move(node);
+            n->args = std::move(group);
+        } else if (nameRef) {
+            if (first) {
+                /* D63 single-deref element access: ${name}[i] */
+                n->kind = NK::ArrowDeref;
+                n->sval = isArr ? "array" : "hash";
+                n->left = std::move(node);
+                n->right = group.empty() ? (NodePtr)makeInt(0, line)
+                                         : std::move(group.front());
+            } else {
+                /* chained: $$aref[0][1] — implicit -> on the result */
+                n->kind = NK::ArrowDeref;
+                n->sval = isArr ? "array" : "hash";
+                n->left = std::move(node);
+                n->right = group.empty() ? (NodePtr)makeInt(0, line)
+                                         : std::move(group.front());
+            }
+        } else {
+            break;
+        }
+        n->line = line;
+        /* A slice node must join its elements with $" like every other
+           list-interpolation (the surrounding D73/@{expr} paths wrap
+           theirs in JoinFunc; a bare slice node handed straight to the
+           interpolation assembly is emitted as a ref, not its elements). */
+        if (n->kind == NK::ArraySlice || n->kind == NK::HashSlice) {
+            auto jn = std::make_unique<Node>();
+            jn->kind = NK::JoinFunc;
+            jn->left = makeStr(" ", line);
+            jn->args.push_back(std::move(n));
+            jn->line = line;
+            node = std::move(jn);
+        } else {
+            node = std::move(n);
+        }
+        first = false;
+        if (i >= raw.size()) break;
+    }
+    if (!node)
+        return makeScalar(nameRef ? nameRef : "aref", line);
+    return node;
+}
+
 NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
     /* scan raw for $var / ${var} / $1-$9 / $@ / $0 / $arr[i] / $hash{k}
        and @arr and split into string + expression fragments */
@@ -4193,12 +4346,45 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                     vname += raw[i++];
                 auto n = std::make_unique<Node>(); n->kind = NK::DerefScalar;
                 n->left = makeScalar(vname, line); n->line = line;
+                /* D120: $$name[i] / $$name{k} — a subscript immediately
+                   after a bare deref means ${name}[i] / ${name}{k}, i.e.
+                   the inner scalar is the ref being indexed (exactly one
+                   deref level). The token-level parser models this (D63)
+                   by unwrapping the DerefScalar to its inner scalar and
+                   emitting ArrowDeref("array"/"hash"); mirror that node
+                   shape here. Without this, "[0]"/"{k}" stayed literal
+                   text after the deref. */
+                if (i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
+                    bool isArr = raw[i] == '[';
+                    auto e = parseSubscriptGroup(raw, i, line, vname.c_str(), isArr);
+                    parts.push_back(std::move(e));
+                    continue;
+                }
                 parts.push_back(std::move(n));
             } else {
                 i += 2;
                 auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc; n->line = line;
                 parts.push_back(std::move(n));
             }
+            continue;
+        }
+        /* D110: $#arr / $#Pkg::arr — last index, interpolated as an
+           expression (scalar(@arr) - 1), same shape the token-level
+           parser produces (NK::ScalarFunc minus 1). Previously stayed
+           literal text (true for bare names too). */
+        if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '#' &&
+            i + 2 < raw.size() && (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_')) {
+            flush(); i += 2; /* skip $# */
+            std::string vname;
+            while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+            while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
+                   i + 2 < raw.size() && (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_')) {
+                vname += raw[i++]; vname += raw[i++];
+                while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+            }
+            auto scNode = std::make_unique<Node>();
+            scNode->kind = NK::ScalarFunc; scNode->name = vname; scNode->line = line;
+            parts.push_back(makeBin("-", std::move(scNode), makeInt(1, line), line));
             continue;
         }
         /* $1-$9 — capture vars */
@@ -4231,10 +4417,136 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 std::string vname;
                 while (i < raw.size() && raw[i] != '}') vname += raw[i++];
                 if (i < raw.size()) i++; /* skip } */
+                /* D120: ${name}[idx] / ${name}{key} — subscripted scalar
+                   deref: the inner scalar is the ref being indexed. Same
+                   ArrowDeref shape the token-level parser's D63 path
+                   emits. A trailing group whose opener is '[' / '{' is
+                   the subscript; anything else (e.g. "${a}b") stays a
+                   plain scalar. */
+                if (!vname.empty() && i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
+                    bool isArr = raw[i] == '[';
+                    parts.push_back(parseSubscriptGroup(raw, i, line, vname.c_str(), isArr));
+                    continue;
+                }
                 parts.push_back(makeScalar(vname, line));
             }
             continue;
         }
+        /* D110: "$::name" (and "${::name}" handled above) — the trigger
+           requires a letter/underscore right after '$'; a leading '::'
+           (main-package shorthand) never matched anything and stayed
+           literal text. Route it through the same $varname machinery as
+           a written-out "main::name". */
+         if (raw[i] == '$' && i + 2 < raw.size() && raw[i+1] == ':' &&
+             raw[i+2] == ':' && i + 3 < raw.size() &&
+             (isalpha((unsigned char)raw[i+3]) || raw[i+3] == '_')) {
+             /* D110: peek past the qualified name — "$::h{k}" / "$::arr[0]" /
+                "$::ref->[i]" are element accesses on the qualified container
+                (the general $varname machinery below handles subscripts), so
+                only hijack when no subscript follows. */
+             {
+                 size_t j = i + 3;
+                 while (j < raw.size() && (isalnum((unsigned char)raw[j]) || raw[j] == '_')) j++;
+                 while (j + 1 < raw.size() && raw[j] == ':' && raw[j+1] == ':' &&
+                        j + 2 < raw.size() && (isalpha((unsigned char)raw[j+2]) || raw[j+2] == '_')) {
+                     j += 2;
+                     while (j < raw.size() && (isalnum((unsigned char)raw[j]) || raw[j] == '_')) j++;
+                 }
+                 if (j >= raw.size() || (raw[j] != '[' && raw[j] != '{' &&
+                     !(raw[j] == '-' && j + 1 < raw.size() && raw[j+1] == '>' &&
+                       j + 2 < raw.size() && (raw[j+2] == '[' || raw[j+2] == '{')))) {
+                     flush(); i += 3; /* skip $ and :: */
+                     std::string vname = "main::";
+                     while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+                     while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
+                            i + 2 < raw.size() && (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_')) {
+                         vname += raw[i++]; vname += raw[i++];
+                         while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+                     }
+                     parts.push_back(makeScalar(vname, line));
+                     continue;
+                 }
+                 /* subscript follows: let the bare $varname rule below handle
+                    it — it consumes $ + [letter/underscore] + ::-chain +
+                    subscripts. Set vnameEmptySignal so its trigger accepts a
+                    leading '::': fall through with i unchanged, and pre-seed
+                    via the '$' + '::' path by rewriting vname below. */
+                 /* The rule below requires a letter right after '$'. Emit the
+                    qualified var ourselves through its subscript loop by
+                    inlining: consume $ + :: + name + subscripts. */
+                  flush(); i += 3; /* skip $ and :: */
+                 std::string vname2 = "main::";
+                 while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname2 += raw[i++];
+                 while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
+                        i + 2 < raw.size() && (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_')) {
+                     vname2 += raw[i++]; vname2 += raw[i++];
+                     while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname2 += raw[i++];
+                 }
+                 NodePtr qnode = makeScalar(vname2, line);
+                 bool haveSubscriptQ = false;
+                 for (;;) {
+                     bool arrowSeenQ = false;
+                     if (i + 1 < raw.size() && raw[i] == '-' && raw[i+1] == '>' &&
+                         i + 2 < raw.size() && (raw[i+2] == '[' || raw[i+2] == '{')) {
+                         i += 2; arrowSeenQ = true;
+                     }
+                     if (i < raw.size() && raw[i] == '[') {
+                         i++;
+                         std::string idx_s;
+                         while (i < raw.size() && raw[i] != ']') idx_s += raw[i++];
+                         if (i < raw.size()) i++;
+                         NodePtr idxExpr;
+                         if (!idx_s.empty() && (idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
+                             Lexer il(idx_s); auto itoks = il.tokenize();
+                             idxExpr = Parser::parseExprFromTokens(std::move(itoks));
+                         } else {
+                             long long idx = idx_s.empty() ? 0 : std::stoll(idx_s);
+                             idxExpr = makeInt(idx, line);
+                         }
+                         if (!arrowSeenQ && !haveSubscriptQ) {
+                             auto n = std::make_unique<Node>(); n->kind = NK::ArrayElem;
+                             n->name = vname2; n->left = std::move(idxExpr); n->line = line;
+                             qnode = std::move(n);
+                         } else {
+                             auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+                             n->sval = "array"; n->left = std::move(qnode);
+                             n->right = std::move(idxExpr); n->line = line;
+                             qnode = std::move(n);
+                         }
+                         haveSubscriptQ = true;
+                         continue;
+                     }
+                     if (i < raw.size() && raw[i] == '{') {
+                         i++;
+                         std::string key_s;
+                         while (i < raw.size() && raw[i] != '}') key_s += raw[i++];
+                         if (i < raw.size()) i++;
+                         NodePtr keyExpr;
+                         if (!key_s.empty() && (key_s[0] == '$' || key_s[0] == '@')) {
+                             Lexer kl(key_s); auto ktoks = kl.tokenize();
+                             keyExpr = Parser::parseExprFromTokens(std::move(ktoks));
+                         } else {
+                             keyExpr = makeStr(key_s, line);
+                         }
+                         if (!arrowSeenQ && !haveSubscriptQ) {
+                             auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
+                             n->name = vname2; n->left = std::move(keyExpr); n->line = line;
+                             qnode = std::move(n);
+                         } else {
+                             auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+                             n->sval = "hash"; n->left = std::move(qnode);
+                             n->right = std::move(keyExpr); n->line = line;
+                             qnode = std::move(n);
+                         }
+                         haveSubscriptQ = true;
+                         continue;
+                     }
+                     break;
+                 }
+                 parts.push_back(std::move(qnode));
+                 continue;
+             }
+         }
         /* $varname possibly followed by [idx]/{key}, and/or a D72 arrow-deref
            chain: ->[idx], ->{key}, and further adjacent [idx]/{key} segments
            (real Perl treats $ref->{a}{b} and $ref->{a}->{b} identically —
@@ -4247,13 +4559,94 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             flush(); i++;
             std::string vname;
             while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
-            /* $Pkg::var — consume ::Name chains */
+            /* $Pkg::var — consume ::Name chains. D110: also handle the
+               $::name form (leading '::' = main) — previously the trigger
+               required a letter/underscore right after '$', so "$::x"
+               stayed literal text. */
+            if (vname.empty() && i + 1 < raw.size() && raw[i] == ':' &&
+                raw[i+1] == ':' && i + 2 < raw.size() &&
+                (isalpha(raw[i+2]) || raw[i+2] == '_')) {
+                vname = "main::";
+                i += 2;
+            }
             while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
                    i + 2 < raw.size() && (isalpha(raw[i+2]) || raw[i+2] == '_')) {
                 vname += raw[i++]; vname += raw[i++]; /* :: */
                 while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
             }
 
+            /* D110: "$Pkg::arr[0]"/"$Pkg::h{k}" — a qualified name followed
+               by a subscript is element access on the qualified array/hash,
+               NOT element access on a bare-named container (the old code
+               dropped the package prefix). */
+            if (!vname.empty() && vname.find("::") != std::string::npos) {
+                NodePtr qnode = makeScalar(vname, line);
+                bool haveSubscriptQ = false;
+                for (;;) {
+                    bool arrowSeenQ = false;
+                    size_t saveQ = i;
+                    if (i + 1 < raw.size() && raw[i] == '-' && raw[i+1] == '>' &&
+                        i + 2 < raw.size() && (raw[i+2] == '[' || raw[i+2] == '{')) {
+                        i += 2;
+                        arrowSeenQ = true;
+                    }
+                    if (i < raw.size() && raw[i] == '[') {
+                        i++;
+                        std::string idx_s;
+                        while (i < raw.size() && raw[i] != ']') idx_s += raw[i++];
+                        if (i < raw.size()) i++;
+                        NodePtr idxExpr;
+                        if (!idx_s.empty() && (idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
+                            Lexer il(idx_s); auto itoks = il.tokenize();
+                            idxExpr = Parser::parseExprFromTokens(std::move(itoks));
+                        } else {
+                            long long idx = idx_s.empty() ? 0 : std::stoll(idx_s);
+                            idxExpr = makeInt(idx, line);
+                        }
+                        if (!arrowSeenQ && !haveSubscriptQ) {
+                            auto n = std::make_unique<Node>(); n->kind = NK::ArrayElem;
+                            n->name = vname; n->left = std::move(idxExpr); n->line = line;
+                            qnode = std::move(n);
+                        } else {
+                            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+                            n->sval = "array"; n->left = std::move(qnode);
+                            n->right = std::move(idxExpr); n->line = line;
+                            qnode = std::move(n);
+                        }
+                        haveSubscriptQ = true;
+                        continue;
+                    }
+                    if (i < raw.size() && raw[i] == '{') {
+                        i++;
+                        std::string key_s;
+                        while (i < raw.size() && raw[i] != '}') key_s += raw[i++];
+                        if (i < raw.size()) i++;
+                        NodePtr keyExpr;
+                        if (!key_s.empty() && (key_s[0] == '$' || key_s[0] == '@')) {
+                            Lexer kl(key_s); auto ktoks = kl.tokenize();
+                            keyExpr = Parser::parseExprFromTokens(std::move(ktoks));
+                        } else {
+                            keyExpr = makeStr(key_s, line);
+                        }
+                        if (!arrowSeenQ && !haveSubscriptQ) {
+                            auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
+                            n->name = vname; n->left = std::move(keyExpr); n->line = line;
+                            qnode = std::move(n);
+                        } else {
+                            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+                            n->sval = "hash"; n->left = std::move(qnode);
+                            n->right = std::move(keyExpr); n->line = line;
+                            qnode = std::move(n);
+                        }
+                        haveSubscriptQ = true;
+                        continue;
+                    }
+                    if (arrowSeenQ) i = saveQ;
+                    break;
+                }
+                parts.push_back(std::move(qnode));
+                continue;
+            }
             NodePtr node = makeScalar(vname, line);
             bool haveSubscript = false;
             for (;;) {
@@ -4342,6 +4735,17 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             Lexer innerLex(inner);
             auto innerToks = innerLex.tokenize();
             NodePtr exprNode = Parser::parseExprFromTokens(std::move(innerToks));
+            /* D120: @{expr}[indices] / @{expr}{keys} — a slice directly on
+               the derefed ref, not a join of the whole thing plus literal
+               bracket text. Same node shapes the token-level parser emits
+               (ArraySlice/HashSlice with the ref expr in `left`). */
+            if (i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
+                bool isArr = raw[i] == '[';
+
+                parts.push_back(parseSubscriptGroup(raw, i, line, nullptr, isArr,
+                                                    std::move(exprNode)));
+                continue;
+            }
             auto derefNode = std::make_unique<Node>();
             derefNode->kind = NK::DerefArray; derefNode->left = std::move(exprNode); derefNode->line = line;
             auto joinNode = std::make_unique<Node>();
@@ -4357,26 +4761,135 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
             auto derefNode = std::make_unique<Node>();
             derefNode->kind = NK::DerefArray; derefNode->left = makeScalar(vname, line); derefNode->line = line;
+            /* D120: @$ref[indices] / @$ref{keys} — slice on the derefed
+               ref. Same node shapes the token-level parser emits. */
+            if (i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
+                bool isArr = raw[i] == '[';
+                parts.push_back(parseSubscriptGroup(raw, i, line, nullptr, isArr,
+                                                    std::move(derefNode)));
+                continue;
+            }
             auto joinNode = std::make_unique<Node>();
             joinNode->kind = NK::JoinFunc; joinNode->left = makeStr(" ", line);
             joinNode->args.push_back(std::move(derefNode)); joinNode->line = line;
             parts.push_back(std::move(joinNode));
             continue;
         }
+        /* D110: "%::h{k}" — same leading-'::' gap as the @ form below
+           (a % trigger exists for bare names only). */
+        if (raw[i] == '%' && i + 2 < raw.size() && raw[i+1] == ':' &&
+            raw[i+2] == ':' && i + 3 < raw.size() &&
+            (isalpha((unsigned char)raw[i+3]) || raw[i+3] == '_')) {
+            flush(); i += 3; /* skip % and :: */
+            std::string vname = "main::";
+            while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+            while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
+                   i + 2 < raw.size() && (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_')) {
+                vname += raw[i++]; vname += raw[i++];
+                while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+            }
+            NodePtr listNodeH = nullptr;
+            if (i < raw.size() && raw[i] == '{') {
+                i++;
+                std::string inner;
+                int depth = 1;
+                while (i < raw.size() && depth > 0) {
+                    char c = raw[i];
+                    if (c == '{') depth++;
+                    else if (c == '}') { if (--depth == 0) { i++; break; } }
+                    inner += c; i++;
+                }
+                Lexer kl(inner);
+                auto ktoks = kl.tokenize();
+                NodeList keys = Parser::parseExprListFromTokens(std::move(ktoks));
+                auto n = std::make_unique<Node>();
+                n->kind = NK::HashSlice; n->name = vname;
+                n->args = std::move(keys); n->line = line;
+                listNodeH = std::move(n);
+            } else {
+                auto n = std::make_unique<Node>(); n->kind = NK::HashVar;
+                n->name = vname; n->line = line;
+                listNodeH = std::move(n);
+            }
+            auto sepNodeH  = makeStr(" ", line);
+            auto joinNodeH = std::make_unique<Node>(); joinNodeH->kind = NK::JoinFunc;
+            joinNodeH->left = std::move(sepNodeH);
+            joinNodeH->args.push_back(std::move(listNodeH));
+            joinNodeH->line = line;
+            parts.push_back(std::move(joinNodeH));
+            continue;
+        }
+        /* D110: "@::arr" (and "%::h{k}") — the trigger requires a
+           letter/underscore right after '@'; a leading '::' (main-package
+           shorthand) never matched anything and stayed literal text.
+           Route it through the same @arr machinery as a written-out
+           "main::arr". Don't hijack "@::arr[0]" — a following '[' must
+           fall through to the bare @arr rule below (which handles
+           slices). */
+        if (raw[i] == '@' && i + 2 < raw.size() && raw[i+1] == ':' &&
+            raw[i+2] == ':' && i + 3 < raw.size() &&
+            (isalpha((unsigned char)raw[i+3]) || raw[i+3] == '_') &&
+            raw[i+3] != '[' && raw[i+3] != '{') {
+            flush(); i += 3; /* skip @ and :: */
+            std::string vname = "main::";
+            while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+            while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
+                   i + 2 < raw.size() && (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_')) {
+                vname += raw[i++]; vname += raw[i++];
+                while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
+            }
+            NodePtr listNode;
+            if (i < raw.size() && raw[i] == '[') {
+                i++;
+                std::string inner;
+                int depth = 1;
+                while (i < raw.size() && depth > 0) {
+                    char c = raw[i];
+                    if (c == '[') depth++;
+                    else if (c == ']') { if (--depth == 0) { i++; break; } }
+                    inner += c; i++;
+                }
+                Lexer il(inner);
+                auto itoks = il.tokenize();
+                NodeList indices = Parser::parseExprListFromTokens(std::move(itoks));
+                auto n = std::make_unique<Node>();
+                n->kind = NK::ArraySlice; n->name = vname;
+                n->args = std::move(indices); n->line = line;
+                listNode = std::move(n);
+            } else {
+                auto n = std::make_unique<Node>(); n->kind = NK::ArrayVar;
+                n->name = vname; n->line = line;
+                listNode = std::move(n);
+            }
+            auto sepNode2  = makeStr(" ", line);
+            auto joinNode2 = std::make_unique<Node>(); joinNode2->kind = NK::JoinFunc;
+            joinNode2->left = std::move(sepNode2);
+            joinNode2->args.push_back(std::move(listNode));
+            joinNode2->line = line;
+            parts.push_back(std::move(joinNode2));
+            continue;
+        }
         /* @arr — interpolate entire array joined by $" (default space); or,
-           D73, @arr[LIST]/@hash{LIST} — an array/hash SLICE, also joined
-           by $" the same way. Previously only the whole-array form was
-           recognized: "@arr[1,2]" interpolated the *entire* array (all of
-           it, space-joined) and then appended the literal, un-parsed text
-           "[1,2]" afterward, since nothing here ever looked for a
-           following [ or {; "@h{'a','b'}" was worse — @h isn't even a
-           valid array/hash name by itself, so it silently interpolated as
-           an empty array ("") followed by literal "{'a','b'}" text. */
+            D73, @arr[LIST]/@hash{LIST} — an array/hash SLICE, also joined
+            by $" the same way. Previously only the whole-array form was
+            recognized: "@arr[1,2]" interpolated the *entire* array (all of
+            it, space-joined) and then appended the literal, un-parsed text
+            "[1,2]" afterward, since nothing here ever looked for a
+            following [ or {; "@h{'a','b'}" was worse — @h isn't even a
+            valid array/hash name by itself, so it silently interpolated as
+            an empty array ("") followed by literal "{'a','b'}" text. */
         if (raw[i] == '@' && i + 1 < raw.size() && (isalpha(raw[i+1]) || raw[i+1] == '_')) {
             flush(); i++;
             std::string vname;
             while (i < raw.size() && (isalnum(raw[i]) || raw[i] == '_')) vname += raw[i++];
-            /* @Pkg::arr — consume ::Name chains */
+            /* @Pkg::arr — consume ::Name chains. D110: also the @::arr
+               (main::) form, mirroring the $ trigger above. */
+            if (vname.empty() && i + 1 < raw.size() && raw[i] == ':' &&
+                raw[i+1] == ':' && i + 2 < raw.size() &&
+                (isalpha(raw[i+2]) || raw[i+2] == '_')) {
+                vname = "main::";
+                i += 2;
+            }
             while (i + 1 < raw.size() && raw[i] == ':' && raw[i+1] == ':' &&
                    i + 2 < raw.size() && (isalpha(raw[i+2]) || raw[i+2] == '_')) {
                 vname += raw[i++]; vname += raw[i++];

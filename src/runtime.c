@@ -4182,6 +4182,13 @@ PerlValue *perl_ref_type(PerlValue *ref) {
 /* active capture context — saved/restored on each code-ref call */
 static __thread PerlValue **s_current_captures = NULL;
 static __thread int        s_ncaptures         = 0;
+/* D124: the PerlValue* code-ref object perl_call_code_ref is currently
+   executing — __SUB__ inside a closure body returns exactly this object,
+   so it carries the same fn pointer AND the same capture set as the
+   running closure (wrapping the raw fn pointer in a fresh capture-less
+   code ref here would silently detach __SUB__ from the closure's own
+   captured lexicals). */
+static __thread PerlValue  *s_current_coderef   = NULL;
 
 static PerlValue *make_code_ref_impl(PerlSubFnCtx fp, PerlValue **caps, int ncaps) {
     PerlClosure *cl = malloc(sizeof *cl);
@@ -4748,6 +4755,8 @@ PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
     int         saved_n    = s_ncaptures;
     s_current_captures = cl->captures;
     s_ncaptures        = cl->ncaptures;
+    PerlValue  *saved_ref = s_current_coderef;
+    s_current_coderef  = ref;
     /* The codegen for CallCodeRef (and the named-sub call sites in main)
        already calls perl_push_wantarray(ctx) before perl_call_code_ref
        and perl_pop_wantarray() after.  Pass the current ctx directly to
@@ -4757,7 +4766,18 @@ PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args) {
     PerlValue *result = ((PerlSubFnCtx)cl->fn)(args, ctx);
     s_current_captures = saved_caps;
     s_ncaptures        = saved_n;
+    s_current_coderef  = saved_ref;
     return result;
+}
+
+/* D124: __SUB__ — the code-ref object of the closure currently executing
+   (set by perl_call_code_ref). NULL when no closure is executing: codegen
+   uses a \&named-sub constant for named subs and perlUndef() at file
+   scope, so this runtime call only matters inside closure bodies. */
+PerlValue *perl_get_current_code_ref(void) {
+    if (!s_current_coderef)
+        return perl_alloc_undef();
+    return s_current_coderef;
 }
 
 PerlValue *perl_get_capture(long long idx) {

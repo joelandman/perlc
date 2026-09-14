@@ -51,10 +51,11 @@ path, step 1).
 
 ## Two flagship items, re-assessed
 
-**D110 (`$Package::var` not a true cross-scope global) is over-rated.**
-Verified: `our $VERSION`, `our %CONFIG`, and cross-package/cross-sub
+**D110 (`$Package::var` not a true cross-scope global) was judged
+over-rated at review time — and has since been FIXED (2026-09-13).**
+Verified then: `our $VERSION`, `our %CONFIG`, and cross-package/cross-sub
 read *and write* via `our`-declared globals all work correctly today.
-D110 only bites *undeclared* `$Pkg::var` (no `our`) — real modules
+D110 only bit *undeclared* `$Pkg::var` (no `our`) — real modules
 almost always declare with `our`. The codegen review found the real fix
 is **medium effort, not large**: a working global-scalar registry
 (`perl_get_or_create_global_scalar`) already exists and is already used
@@ -85,14 +86,14 @@ once, not one.
 2. ~~**D112** — module file-lexical `my` collides with the main script's.~~ **FIXED 2026-09-10.** Turned out not to need the architectural block-scoping change this entry originally proposed — see TESTS.md's D112 write-up for why that approach was tried and rejected, and what the actual (smaller) fix was.
 3. ~~**D113** — no failure signal.~~ **FIXED 2026-09-10.** Undefined-sub calls now die matching real Perl; unresolvable `use` now errors; `use lib`/`-I`/`PERL5LIB` now honored.
 4. ~~**D114** — array slices with a non-literal subscript (`@x[1..2]`, `@x[@i]`) return one element instead of the slice.~~ **FIXED 2026-09-10.**
-5. ~~**D109** — `s///` replacement text didn't support `$name`/`@arr` interpolation.~~ **FIXED 2026-09-10.** Turned out to need less unification than predicted — reused the `/e` flag's existing closure/capture machinery directly, routed through the same interpolation scanner `"..."` literals already use, rather than rebuilding anything. Split off the harder, non-`s///`-specific remainder (subscripted deref in *any* interpolated string, `$$aref[0]`/`@{$r}[0,1]`) as **D120** — that one is still open and is the "medium, needs the general engine unified" item this entry originally described. See TESTS.md.
+5. ~~**D109** — `s///` replacement text didn't support `$name`/`@arr` interpolation.~~ **FIXED 2026-09-10.** Turned out to need less unification than predicted — reused the `/e` flag's existing closure/capture machinery directly, routed through the same interpolation scanner `"..."` literals already use, rather than rebuilding anything. Split off the harder, non-`s///`-specific remainder (subscripted deref in *any* interpolated string, `$$aref[0]`/`@{$r}[0,1]`) as **D120** — **FIXED 2026-09-13** (the general scanner learned subscripted-deref forms via a new `parseSubscriptGroup` helper; see TESTS.md).
 6. ~~**D102**~~ — **FIXED 2026-09-10.** Was `die REF`/`die $blessed_obj` losing the reference into `$@` (stringified instead, with a wrongly-appended location suffix). `perl_die` now assigns the reference directly instead of stringifying it.
 7. ~~**D115**~~ — **FIXED 2026-09-10.** Was bare `return;` yielding a 1-element list in list context instead of Perl's empty list — needed fixing in two separate duplicate codegen sites. Found ~~**D130**~~ (`if (my @arr = EXPR)` parse error) while testing — **FIXED 2026-09-11**, see TESTS.md.
 8. ~~**D119**~~ — **FIXED 2026-09-10.** Was `scalar(keys %$href)`/`scalar(values %$href)` returning 0 instead of the key count; small, mechanical fix as predicted (ported `emitArrayPtr`'s existing deref-hash handling into `emitExpr`'s scalar-context cases). See TESTS.md.
 
 ### Tier 1 — hard parse errors in common module syntax (loud, so lower risk per-instance, but each one gates an entire file)
 
-8. ~~**D116** — `__PACKAGE__`/`__FILE__`/`__LINE__`/`__SUB__` entirely unimplemented.~~ **`__PACKAGE__`/`__FILE__`/`__LINE__` FIXED 2026-09-10** — was indeed a small fix, as predicted. `__SUB__` split off as **D124** (needs real closure-capture support, not a constant substitution — genuinely harder, still open).
+8. ~~**D116** — `__PACKAGE__`/`__FILE__`/`__LINE__`/`__SUB__` entirely unimplemented.~~ **`__PACKAGE__`/`__FILE__`/`__LINE__` FIXED 2026-09-10** — was indeed a small fix, as predicted. `__SUB__` split off as **D124** — **FIXED 2026-09-13** (runtime tracks the running closure's code-ref object in a thread-local; captures kept through `__SUB__` recursion).
 9. **`$obj->$method()` dynamic dispatch** — parse error. Common in accessors/plugin dispatch tables.
 10. **`map { {...} } @list`** (and the `+{...}` block/hashref disambiguator) — parse error. Extremely common.
 11. **`%EXPORT_TAGS` / `use Foo qw(:all)`** — hard error (also see the Exporter gap below).
@@ -155,8 +156,8 @@ bare-`main::`-shorthand parse error) and ~~**D122**~~ (`scanExports()`
 missed the `use vars`-style export declaration real core
 `File::Path.pm` itself uses — an own-goal that would have misfired even
 once `File::Path` is otherwise implemented). Verifying D121 also
-widened **D110** to cover array/hash access, not just scalars — still
-open.
+widened **D110** to cover array/hash access, not just scalars — fixed
+2026-09-13 along with the scalar form.
 
 **2026-09-10 compile-survey #2 note:** a second batch of 11 real
 scripts targeting `Pod::Usage`/`Encode`/`File::Copy`/`Storable`/others
@@ -265,9 +266,10 @@ green as that corpus grows.** Concretely:
    (smaller, different) fix and why the predicted approach was tried and
    rejected first. ~~D109~~ **DONE 2026-09-10** — reused `/e`'s existing
    machinery directly, smaller than predicted too; see TESTS.md. D109's
-   harder remainder is now **D120**. Remaining: D110 and D120 are medium
-   per the codegen review / D120's own write-up (reuse existing
-   machinery, don't rebuild). ~~D119~~, ~~D102~~, ~~D115~~, ~~D129~~ all
+   harder remainder was **D120** — **DONE 2026-09-13** (the interpolation
+   scanner learned subscripted-deref forms via a new helper; see
+   TESTS.md). ~~D110~~ **DONE 2026-09-13.** ~~D119~~, ~~D102~~,
+   ~~D115~~, ~~D129~~ all
    **DONE 2026-09-10.** ~~D130~~ (`if (my @arr = ...)` parse error) and
    ~~D131~~ (`our` inside a nested block, plus a deeper repeated-
    `our`-declaration global-reuse bug found while fixing it) — both

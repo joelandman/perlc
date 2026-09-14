@@ -194,6 +194,11 @@ private:
      /* body of the currently-emitting named sub (for @_ arg promotion analysis) */
     const Node                    *currentSubBody_ = nullptr;
     const Node                    *mainBody_ = nullptr;       /* D135: program root for bare-block-at-file-scope promotion scans */
+    /* D124: state for __SUB__ resolution — name of the currently-emitting
+       named sub ("" outside named subs) and whether the currently-emitting
+       body is an anonymous closure (AnonSub / sort comparator). */
+    std::string                    currentSubName_;
+    bool                           inAnonSubEmit_ = false;
     /* Stage 25: promotion kind for @_ args identified before sub body emission */
     enum class PPKind { Int, Float, DerefAV };
     std::unordered_map<std::string, PPKind> prePromotedArgs_;

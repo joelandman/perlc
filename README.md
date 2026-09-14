@@ -141,20 +141,17 @@ make clean
 
 ## Known Limitations
 
-- **(2026-09-13, open correctness bugs — see `TESTS.md` for repros/status,
-  `MVP_ROADMAP.md` for the current priority plan)**
-  `$Package::var` (not declared via `our`) isn't a true cross-scope
-  global (D110) — it's invisible from inside a `sub` if set at file
-  scope (the same gap applies to undeclared qualified arrays/hashes,
-  more severely); `$$aref[0]`-style subscripted dereference inside
-  plain `"..."` strings interpolates wrongly (D120); `__SUB__` is
-  unimplemented (D124, hard parse error). There is also no
-  `Exporter`/`@EXPORT` mechanism yet, so arbitrary pure-Perl CPAN
-  modules can't export subs into a caller's namespace.
-  (Fixed 2026-09-13: a parse error inside an inlined module now
-  reports the module's own file and line, D128; a sub-scope int-
-  promoted variable (`my $x = 0;`) no longer silently truncates a
-  later fractional NV assignment, D135.)
+- **(2026-09-13, no open generated-code defects remain — see `TESTS.md`
+  for the fixed-defect write-ups and `MVP_ROADMAP.md` for the current
+  priority plan)**
+  There is no `Exporter`/`@EXPORT` mechanism yet, so arbitrary pure-Perl
+  CPAN modules can't export subs into a caller's namespace — arguably
+  the remaining ceiling on "arbitrary module just works."
+  (Fixed 2026-09-13: fully-qualified `$Pkg::var`/`@Pkg::arr`/`%Pkg::hash`
+  are now true cross-scope globals, D110; `$$aref[0]`-style subscripted
+  dereference inside plain `"..."` strings now interpolates correctly,
+  D120; `__SUB__` works — anonymous recursion keeps the closure's own
+  captures, D124.)
   (Fixed 2026-09-12: `use`/`no` pragmas now parse inside any nested
   scope, D125; `split` patterns with capturing groups now interleave
   the captured delimiter text, D126; a BigInt-tagged variable operand
