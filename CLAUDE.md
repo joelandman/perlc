@@ -18,8 +18,8 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-14, re-verified after Exporter/D136/D137/DynaLoader —
-331/331 PASS,
+**Harness (2026-09-15, re-verified after survey-3 fixes + Tier-1 modules —
+341/341 PASS,
 0 FAIL; `make test` 47/47):** New this session:
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
@@ -52,7 +52,10 @@ fixtures, outside the harness corpus),
 (+ `tests/lib/E/Tagged.pm` — Exporter mechanism, 2026-09-14),
 `dynaloader_ffi.sh` (+ `tests/dynaloader_ffi_{smoke,deep}.pltxt`,
 `tests/lib/auto/My/Clib/Clib.so`, `tests/lib/auto/My/Pxs/Pxs.pl` —
-DynaLoader-compatible FFI, self-verifying, outside the harness corpus).
+DynaLoader-compatible FFI, self-verifying, outside the harness corpus),
+`cwd_{smoke,deep}.pl`, `sys_hostname_{smoke,deep}.pl`,
+`file_spec{,_functions}_{smoke,deep}.pl`, `time_local_{smoke,deep}.pl`
+(Tier-1 native modules, 2026-09-15).
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
@@ -126,6 +129,19 @@ are in TESTS.md):**
   and register their boot hook under `<Module>::boot` (with real
   DynaLoader's `boot_<mangled>` names also tried). Real perlguts XSUBs
   (SV*-based) remain out of scope.
+- Survey-3 + Tier-1 modules (2026-09-15, two-agent parallel session):
+  see TESTS.md for the full write-up. Agent A's 12-script probe survey
+  found and fixed 8 items (mixed-sigil `my (%h)`/`our (%a, $b)` lists;
+  `use constant` multi-token values incl. the OOB-crash shape; `1<<5`
+  mis-lex as heredoc + its inlineModules crash; arbitrary-delimiter
+  `q!`/`qq!`/`tr|/|_`; `qw (` spacing; `print($fh "str")` fh-in-parens;
+  `&delete()` keyword-named sub calls; Getopt::Long::Configure no-op)
+  and logged 10 open items (W16/W19/W22/W23/W27–W31 — Config.pm's
+  computed typeglob is the top one). Agent B implemented Cwd,
+  Sys::Hostname, File::Spec(+::Functions, native, all three invocation
+  styles, real quirks matched), Time::Local (all 8 exports, real DST
+  semantics), and fixed scalar-context `gmtime(EXPR)`/`localtime(EXPR)`
+  returning the epoch.
 - D103/D104/D106/D108: see TESTS.md for full write-ups. Summary: D103
   is integer-overflow auto-promotion (bounded, unblessed auto-BigInt
   reusing the existing Math::BigInt/mini-gmp machinery — see TESTS.md

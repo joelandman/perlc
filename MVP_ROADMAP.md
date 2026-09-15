@@ -132,17 +132,19 @@ scripts like `debconf-escape` and `ptardiff` that earlier work was
 found through.
 
 **Tier 1 — very high frequency in this genre, low-to-moderate cost:**
-`File::Spec`, `Cwd` (needs a `getcwd`/`realpath` wrapper — currently
-absent), `File::Path` (`make_path`/`remove_tree` — largely expressible
-via existing mkdir/rmdir/opendir/readdir primitives), `File::Find`
+~~`File::Spec`~~ (IMPLEMENTED 2026-09-15 — native, all three invocation
+styles), ~~`Cwd`~~ (IMPLEMENTED 2026-09-15 — `getcwd`/`cwd`/`abs_path`/
+`fast_abs_path`/`realpath`), `File::Path` (`make_path`/`remove_tree` —
+largely expressible via existing mkdir/rmdir/opendir/readdir
+primitives), `File::Find`
 (added 2026-09-10 — core module, came up immediately in a 10-script
 compile survey, see TESTS.md), `File::Copy` (added 2026-09-10,
 survey #2 — `copy`/`move`, 10 of 11 sampled scripts in that pass hit
 it, higher hit rate than `File::Find` got), `File::Temp` (needs an
 `mkstemp`-equivalent — currently absent, but `perl_sysopen_fh` with
-`O_EXCL|O_CREAT` gets most of the way there), `Sys::Hostname` (trivial
-— wraps `gethostname(2)`), `Time::Local` (trivial C wrappers around
-`mktime`/`timegm`), `Text::Wrap`.
+`O_EXCL|O_CREAT` gets most of the way there), ~~`Sys::Hostname`~~
+(IMPLEMENTED 2026-09-15), ~~`Time::Local`~~ (IMPLEMENTED 2026-09-15 —
+all 8 exports, real DST semantics), `Text::Wrap`.
 
 **2026-09-10 compile-survey note:** actually compiling 10 real scripts
 against this list (see TESTS.md's "CPAN-module compile survey" section)

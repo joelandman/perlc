@@ -719,6 +719,8 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_time_val",     pv);
     RT("perl_localtime_val",av,     pv);
     RT("perl_gmtime_val",   av,     pv);
+    RT("perl_scalar_gmtime",  pv,   pv);
+    RT("perl_scalar_localtime",pv,  pv);
     RT("perl_sleep_val",    pv,     pv);
     RT("perl_alarm_val",    pv,     pv);
     /* Time::HiRes (D30, built-in) */
@@ -767,6 +769,37 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_basename",         pv, pv, av);
     RT("perl_dirname",          pv, pv);
     RT("perl_fileparse",        av, pv, av);
+    /* Cwd / Sys::Hostname / File::Spec / Time::Local (Tier 1, native) */
+    RT("perl_getcwd",           pv);
+    RT("perl_abs_path",         pv, pv);
+    RT("perl_realpath",         pv, pv);
+    RT("perl_hostname",         pv);
+    RT("perl_fspec_canonpath",  pv, pv);
+    RT("perl_fspec_catdir",     pv, av);
+    RT("perl_fspec_catfile",    pv, av);
+    RT("perl_fspec_splitpath",  av, pv, pv);
+    RT("perl_fspec_splitdir",   av, pv);
+    RT("perl_fspec_catpath",    pv, av);
+    RT("perl_fspec_rel2abs",    pv, pv, pv);
+    RT("perl_fspec_abs2rel",    pv, pv, pv);
+    RT("perl_fspec_curdir",     pv);
+    RT("perl_fspec_updir",      pv);
+    RT("perl_fspec_rootdir",    pv);
+    RT("perl_fspec_devnull",    pv);
+    RT("perl_fspec_tmpdir",     pv);
+    RT("perl_fspec_file_name_is_absolute", pv, pv);
+    RT("perl_fspec_no_upwards", av, av);
+    RT("perl_fspec_join",       pv, av);
+    RT("perl_fspec_case_tolerant", pv);
+    RT("perl_fspec_path",       av);
+    RT("perl_timegm",           pv, av);
+    RT("perl_timelocal",        pv, av);
+    RT("perl_timegm_nocheck",   pv, av);
+    RT("perl_timelocal_nocheck",pv, av);
+    RT("perl_timegm_modern",    pv, av);
+    RT("perl_timelocal_modern", pv, av);
+    RT("perl_timegm_posix",     pv, av);
+    RT("perl_timelocal_posix",  pv, av);
     /* File I/O (Tier 2) */
     RT("perl_seek_fh",          pv, pv, pv, pv);
     RT("perl_tell_fh",          pv, pv);
@@ -1238,7 +1271,10 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         if (!hv) return callRT("perl_array_new", {});
         return callRT("perl_each_hash", {hv});
     }
-    /* localtime / gmtime in list context → 9-element array */
+    /* localtime / gmtime in list context → 9-element array.
+       No-arg localtime()/gmtime() means "now" — pass undef so the runtime
+       uses time(NULL); a plain perlUndef() constant evaluated at compile
+       time as the argument would freeze this call's epoch. */
     if (n.kind == NK::LocaltimeFunc) {
         Value *t = n.left ? emitExpr(*n.left) : perlUndef();
         return callRT("perl_localtime_val", {t});
@@ -1928,6 +1964,38 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         for (size_t k = 1; k < n.args.size(); k++)
             callRT("perl_array_push", {suf, emitExpr(*n.args[k])});
         return callRT("perl_fileparse", {path, suf});
+    }
+    /* File::Spec::splitpath in list context: (volume, directories, file).
+       Same builtin-name-dispatch reasoning — intercepted before the
+       generic user-sub Call handling below. */
+    if (n.kind == NK::Call &&
+        (n.name == "File::Spec::splitpath" || n.name == "File::Spec::Unix::splitpath" ||
+         n.name == "splitpath")) {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *nof  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_fspec_splitpath", {path, nof});
+    }
+    if (n.kind == NK::Call &&
+        (n.name == "File::Spec::splitdir" || n.name == "File::Spec::Unix::splitdir" ||
+         n.name == "splitdir")) {
+        Value *dir = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_fspec_splitdir", {dir});
+    }
+    if (n.kind == NK::Call &&
+        (n.name == "File::Spec::no_upwards" || n.name == "File::Spec::Unix::no_upwards" ||
+         n.name == "no_upwards")) {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        return callRT("perl_fspec_no_upwards", {av});
+    }
+    if (n.kind == NK::Call &&
+        (n.name == "File::Spec::path" || n.name == "File::Spec::Unix::path" ||
+         n.name == "path")) {
+        return callRT("perl_fspec_path", {});
     }
     /* D69: List::Util::uniq in list context. Same reasoning as
        Time::HiRes::gettimeofday just above — "List::Util::uniq" only
@@ -8443,13 +8511,15 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left) freeIfOwned(s);
         return r;
     }
-    /* localtime / gmtime in scalar context return a string */
+    /* localtime / gmtime in scalar context return a ctime()-style string
+       ("Thu Jan  1 00:00:00 1970"); list context is intercepted in
+       emitArrayPtr and returns the 9-element list. */
     case NK::LocaltimeFunc:
     case NK::GmtimeFunc: {
-        /* In scalar context we can't easily tell, so return the epoch for further use.
-           Most common use is in list context via emitArrayPtr; scalar context: return time. */
         Value *t = n.left ? emitExpr(*n.left) : perlUndef();
-        Value *r = callRT("perl_time_val", {});
+        Value *r = n.kind == NK::GmtimeFunc
+            ? callRT("perl_scalar_gmtime", {t})
+            : callRT("perl_scalar_localtime", {t});
         if (n.left) freeIfOwned(t);
         return r;
     }
@@ -9746,6 +9816,86 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *meth = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
             return callRT("perl_can_check", {obj, meth});
         }
+        /* File::Spec class methods — File::Spec->catfile(...) etc. The
+           invocant is the string "File::Spec" (or "File::Spec::Unix", the
+           actual implementation package real File::Spec @ISA-delegates to;
+           both dispatch identically since perlc implements the Unix
+           functionality natively). List-returning methods (splitpath/
+           splitdir/no_upwards/path) must adapt to context: raw PerlArray*
+           results are wrapped as PERL_LIST_RESULT in list context (so
+           perl_array_push_list_or_scalar spreads them) or reduced to the
+           first element in scalar context (real Perl's splitpath in scalar
+           context returns just the file part — actually real Perl returns
+           the LAST element in scalar context; hmm, list-context results
+           assigned to a scalar return the LAST value in Perl, but splitpath
+           docs say it "should" be used in list context; real behavior:
+           scalar(splitdir) is the element count via @-assignment, but
+           a bare method call in scalar context returns the last element.
+           Match the last-element rule). */
+        if (n.left && n.left->kind == NK::StringLit &&
+            (n.left->sval == "File::Spec" || n.left->sval == "File::Spec::Unix")) {
+            const std::string &m = n.sval;
+            auto flattenArgs = [&]() -> Value * {
+                Value *av = callRT("perl_array_new", {});
+                for (auto &arg : n.args) {
+                    Value *sub = emitArrayPtr(*arg);
+                    if (sub) { callRT("perl_array_extend", {av, sub}); continue; }
+                    callRT("perl_array_push", {av, emitExpr(*arg)});
+                }
+                return av;
+            };
+            /* adapt a PerlArray* result to the enclosing context.
+               LIST_RESULT only spreads when the wantarray stack says list
+               (perl_array_to_list_return reads the runtime stack, not
+               callCtx_), so push/pop the caller's context around it. */
+            auto adaptList = [&](Value *av) -> Value * {
+                auto *i32Ty = Type::getInt32Ty(ctx_);
+                int ctxInt = (callCtx_ == 1 || callCtx_ == 2) ? 1 : 0;
+                callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
+                Value *wrapped = callRT("perl_array_to_list_return", {av});
+                callRT("perl_pop_wantarray", {});
+                return wrapped;
+            };
+            if (m == "catdir")  return callRT("perl_fspec_catdir",  {flattenArgs()});
+            if (m == "catfile") return callRT("perl_fspec_catfile", {flattenArgs()});
+            if (m == "catpath") return callRT("perl_fspec_catpath", {flattenArgs()});
+            if (m == "join")    return callRT("perl_fspec_catfile", {flattenArgs()});
+            if (m == "canonpath") {
+                Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                return callRT("perl_fspec_canonpath", {path});
+            }
+            if (m == "curdir")  return callRT("perl_fspec_curdir", {});
+            if (m == "updir")   return callRT("perl_fspec_updir", {});
+            if (m == "rootdir") return callRT("perl_fspec_rootdir", {});
+            if (m == "devnull") return callRT("perl_fspec_devnull", {});
+            if (m == "tmpdir")  return callRT("perl_fspec_tmpdir", {});
+            if (m == "file_name_is_absolute") {
+                Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                return callRT("perl_fspec_file_name_is_absolute", {path});
+            }
+            if (m == "rel2abs") {
+                Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                Value *base = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+                return callRT("perl_fspec_rel2abs", {path, base});
+            }
+            if (m == "abs2rel") {
+                Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                Value *base = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+                return callRT("perl_fspec_abs2rel", {path, base});
+            }
+            if (m == "splitpath") {
+                Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                Value *nof  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+                return adaptList(callRT("perl_fspec_splitpath", {path, nof}));
+            }
+            if (m == "splitdir") {
+                Value *dir = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+                return adaptList(callRT("perl_fspec_splitdir", {dir}));
+            }
+            if (m == "no_upwards") return adaptList(callRT("perl_fspec_no_upwards", {flattenArgs()}));
+            if (m == "path")       return adaptList(callRT("perl_fspec_path", {}));
+            if (m == "case_tolerant") return callRT("perl_fspec_case_tolerant", {});
+        }
         /* SUPER::method — dispatch starting from parent of caller package */
         if (n.sval.size() > 7 && n.sval.substr(0, 7) == "SUPER::") {
             std::string realMethod = n.sval.substr(7);
@@ -10852,6 +11002,16 @@ Value *CodeGen::emitCall(const Node &n) {
        ordinary \$x/\@x/\%x codegen, same as any other call argument) and
        hand it to perl_getopt_long along with the live @ARGV array, which
        it mutates in place to remove recognized options. */
+    /* Getopt::Long::Configure("no_ignore_case", ...) — real Getopt::Long
+       mutates its parser config; perlc's perl_getopt_long implements the
+       fixed default configuration (no pass_through/gnu_getopt), so a
+       Configure() call is accepted and ignored. Without this, any real
+       script calling Getopt::Long::Configure (xsubpp, dirsplit's
+       qw(:config ...) import path, ...) died "Undefined subroutine
+       &Getopt::Long::Configure". Returns 1 like real Configure. */
+    if (n.name == "Configure" || n.name == "Getopt::Long::Configure") {
+        return perlInt(1);
+    }
     if (n.name == "GetOptions" || n.name == "Getopt::Long::GetOptions") {
         Value *argsArr = buildArgArray();
         Value *argv = lookupArray("ARGV");
@@ -10903,6 +11063,312 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *cloned = callRT("perl_clone", {elem});
         callRT("perl_array_free", {arr});
         return cloned;
+    }
+    /* ── Cwd (Tier 1, native) ──
+       getcwd()/cwd()/fastcwd()/fastgetcwd() — all the same getcwd(3) call
+       in real Cwd. abs_path/fast_abs_path/realpath/fast_realpath — all the
+       same realpath(3)-equivalent (dies ENOENT, undef other failures).
+       Both bare (explicitly imported or the export-defaulted names) and
+       fully-qualified forms dispatch here. */
+    if (n.name == "Cwd::getcwd" || n.name == "getcwd" ||
+        n.name == "Cwd::cwd" || n.name == "cwd" ||
+        n.name == "Cwd::fastcwd" || n.name == "fastcwd" ||
+        n.name == "Cwd::fastgetcwd" || n.name == "fastgetcwd") {
+        return callRT("perl_getcwd", {});
+    }
+    if (n.name == "Cwd::abs_path" || n.name == "abs_path" ||
+        n.name == "Cwd::fast_abs_path" || n.name == "fast_abs_path" ||
+        n.name == "Cwd::realpath" || n.name == "realpath" ||
+        n.name == "Cwd::fast_realpath" || n.name == "fast_realpath") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_abs_path", {path});
+    }
+    /* ── Sys::Hostname (Tier 1, native) ── */
+    if (n.name == "Sys::Hostname::hostname" || n.name == "hostname") {
+        return callRT("perl_hostname", {});
+    }
+    /* ── File::Spec / File::Spec::Functions / File::Spec::Unix ──
+       Method calls (File::Spec->catfile) are intercepted in the MethodCall
+       case; these bare/qualified Call forms cover File::Spec::Unix::catdir
+       and explicitly-imported File::Spec::Functions names (importMap maps
+       them to File::Spec::Functions::<name>). */
+    if (n.name == "File::Spec::catdir" || n.name == "File::Spec::Unix::catdir" ||
+        n.name == "File::Spec::Functions::catdir" || n.name == "catdir") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        return callRT("perl_fspec_catdir", {av});
+    }
+    if (n.name == "File::Spec::catfile" || n.name == "File::Spec::Unix::catfile" ||
+        n.name == "File::Spec::Functions::catfile" || n.name == "catfile" ||
+        n.name == "File::Spec::join" || n.name == "File::Spec::Unix::join" ||
+        n.name == "File::Spec::Functions::join" || n.name == "join") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        return callRT("perl_fspec_catfile", {av});
+    }
+    if (n.name == "File::Spec::catpath" || n.name == "File::Spec::Unix::catpath" ||
+        n.name == "File::Spec::Functions::catpath" || n.name == "catpath") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        return callRT("perl_fspec_catpath", {av});
+    }
+    if (n.name == "File::Spec::canonpath" || n.name == "File::Spec::Unix::canonpath" ||
+        n.name == "File::Spec::Functions::canonpath" || n.name == "canonpath") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_fspec_canonpath", {path});
+    }
+    if (n.name == "File::Spec::curdir" || n.name == "File::Spec::Unix::curdir" ||
+        n.name == "File::Spec::Functions::curdir" || n.name == "curdir") {
+        return callRT("perl_fspec_curdir", {});
+    }
+    if (n.name == "File::Spec::updir" || n.name == "File::Spec::Unix::updir" ||
+        n.name == "File::Spec::Functions::updir" || n.name == "updir") {
+        return callRT("perl_fspec_updir", {});
+    }
+    if (n.name == "File::Spec::rootdir" || n.name == "File::Spec::Unix::rootdir" ||
+        n.name == "File::Spec::Functions::rootdir" || n.name == "rootdir") {
+        return callRT("perl_fspec_rootdir", {});
+    }
+    if (n.name == "File::Spec::devnull" || n.name == "File::Spec::Unix::devnull" ||
+        n.name == "File::Spec::Functions::devnull" || n.name == "devnull") {
+        return callRT("perl_fspec_devnull", {});
+    }
+    if (n.name == "File::Spec::tmpdir" || n.name == "File::Spec::Unix::tmpdir" ||
+        n.name == "File::Spec::Functions::tmpdir" || n.name == "tmpdir") {
+        return callRT("perl_fspec_tmpdir", {});
+    }
+    if (n.name == "File::Spec::file_name_is_absolute" ||
+        n.name == "File::Spec::Unix::file_name_is_absolute" ||
+        n.name == "File::Spec::Functions::file_name_is_absolute" ||
+        n.name == "file_name_is_absolute") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_fspec_file_name_is_absolute", {path});
+    }
+    if (n.name == "File::Spec::rel2abs" || n.name == "File::Spec::Unix::rel2abs" ||
+        n.name == "File::Spec::Functions::rel2abs" || n.name == "rel2abs") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *base = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_fspec_rel2abs", {path, base});
+    }
+    if (n.name == "File::Spec::abs2rel" || n.name == "File::Spec::Unix::abs2rel" ||
+        n.name == "File::Spec::Functions::abs2rel" || n.name == "abs2rel") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *base = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_fspec_abs2rel", {path, base});
+    }
+    if (n.name == "File::Spec::Functions::splitpath" || n.name == "splitpath") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *nof  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        /* same context-adaptation as the MethodCall splitpath case */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        int ctxInt = (callCtx_ == 1 || callCtx_ == 2) ? 1 : 0;
+        callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
+        Value *r = callRT("perl_array_to_list_return",
+                          {callRT("perl_fspec_splitpath", {path, nof})});
+        callRT("perl_pop_wantarray", {});
+        return r;
+    }
+    if (n.name == "File::Spec::Functions::splitdir" || n.name == "splitdir") {
+        Value *dir = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        int ctxInt = (callCtx_ == 1 || callCtx_ == 2) ? 1 : 0;
+        callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
+        Value *r = callRT("perl_array_to_list_return",
+                          {callRT("perl_fspec_splitdir", {dir})});
+        callRT("perl_pop_wantarray", {});
+        return r;
+    }
+    if (n.name == "File::Spec::Functions::no_upwards" || n.name == "no_upwards") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* same context-adaptation as the MethodCall splitpath/splitdir cases */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        int ctxInt = (callCtx_ == 1 || callCtx_ == 2) ? 1 : 0;
+        callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
+        Value *r = callRT("perl_array_to_list_return",
+                          {callRT("perl_fspec_no_upwards", {av})});
+        callRT("perl_pop_wantarray", {});
+        return r;
+    }
+    if (n.name == "File::Spec::Functions::path") {
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        int ctxInt = (callCtx_ == 1 || callCtx_ == 2) ? 1 : 0;
+        callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
+        Value *r = callRT("perl_array_to_list_return", {callRT("perl_fspec_path", {})});
+        callRT("perl_pop_wantarray", {});
+        return r;
+    }
+    if (n.name == "File::Spec::Functions::case_tolerant" || n.name == "case_tolerant") {
+        return callRT("perl_fspec_case_tolerant", {});
+    }
+    /* ── Time::Local (Tier 1, native) ── */
+    if (n.name == "Time::Local::timegm" || n.name == "timegm") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timegm", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "Time::Local::timelocal" || n.name == "timelocal") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timelocal", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "Time::Local::timegm_nocheck" || n.name == "timegm_nocheck") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timegm_nocheck", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "Time::Local::timelocal_nocheck" || n.name == "timelocal_nocheck") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timelocal_nocheck", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "Time::Local::timegm_modern" || n.name == "timegm_modern") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timegm_modern", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "Time::Local::timelocal_modern" || n.name == "timelocal_modern") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timelocal_modern", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "Time::Local::timegm_posix" || n.name == "timegm_posix") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timegm_posix", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "Time::Local::timelocal_posix" || n.name == "timelocal_posix") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        /* croak-location support: push a caller frame so the runtime's
+           range-check die reports this source line (real Time::Local's
+           Carp::croak does exactly that). */
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32Ty, n.line)});
+        Value *r = callRT("perl_timelocal_posix", {av});
+        callRT("perl_pop_call_frame", {});
+        return r;
     }
     /* UNIVERSAL */
     if (n.name == "UNIVERSAL::isa") {

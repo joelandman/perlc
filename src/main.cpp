@@ -384,6 +384,8 @@ static std::vector<Token> inlineModules(
         "File::Basename","Getopt::Long","DBI","DBD::SQLite",
         "threads","threads::shared","UNIVERSAL","Time::HiRes",
         "DynaLoader","XSLoader",
+        "Cwd","Sys::Hostname","Time::Local",
+        "File::Spec","File::Spec::Unix","File::Spec::Functions",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -576,8 +578,15 @@ static std::vector<Token> inlineModules(
                     std::vector<Token> result(tokens.begin() + start, tokens.begin() + p);
                     return result;
                 }
-                /* simple value: single token */
-                return {tokens[start]};
+                /* value: the full multi-token expression up to `end`
+                   (exclusive of the statement-ending ';'). Values such as
+                   `-1`, `!!$flag`, `5 - 3`, or `$ENV{X}` are several
+                   tokens; capturing only the first one truncated the
+                   constant (silently wrong, e.g. `5 - 3` became `5`) or
+                   produced an unparseable injected `sub NAME { return !; }`
+                   — Encode.pm's `use constant DEBUG => !!$ENV{...}` hit
+                   exactly this. */
+                return std::vector<Token>(tokens.begin() + start, tokens.begin() + end);
             };
 
             if (defStart < defEnd && tokens[defStart].kind == TK::LBRACE) {
@@ -589,7 +598,24 @@ static std::vector<Token> inlineModules(
                         std::string cname = tokens[p].text;
                         p += 2;
                         if (p < defEnd) {
-                            auto vtoks = extractValueTokens(p, defEnd);
+                            /* block form: this entry's value ends at the
+                               next top-level COMMA or the closing RBRACE —
+                               NOT at defEnd (that's the whole block). The
+                               multi-token capture below must not swallow
+                               the following NAME => VAL pairs. */
+                            size_t vEnd = p;
+                            int bdepth = 0;
+                            while (vEnd < defEnd) {
+                                TK k = tokens[vEnd].kind;
+                                if (k == TK::LPAREN || k == TK::LBRACKET || k == TK::LBRACE) bdepth++;
+                                else if (k == TK::RPAREN || k == TK::RBRACKET || k == TK::RBRACE) {
+                                    if (bdepth == 0) break;
+                                    bdepth--;
+                                }
+                                else if (k == TK::COMMA && bdepth == 0) break;
+                                vEnd++;
+                            }
+                            auto vtoks = extractValueTokens(p, vEnd);
                             emitConstSub(cname, vtoks);
                             p += vtoks.size();
                             /* skip past ')' if we captured one */
@@ -643,6 +669,48 @@ static std::vector<Token> inlineModules(
         if (modName == "Time::HiRes") {
             for (auto &name : explicitImports)
                 importMap[name] = "Time::HiRes::" + name;
+            continue;
+        }
+
+        /* Tier 1 native modules (Cwd / Sys::Hostname / Time::Local /
+           File::Spec::Functions). No .pm file exists for these — the
+           functionality is dispatched natively by name in codegen. Just
+           map the requested short names to their qualified call names so
+           parseCall/parseBareCall resolve them (same model as Time::HiRes
+           above). A bare `use Cwd;` needs no importMap entries: Cwd's
+           @EXPORT names (cwd/getcwd) are already in codegen's bare-name
+           dispatch. */
+        if (modName == "Cwd" || modName == "Sys::Hostname" ||
+            modName == "Time::Local" || modName == "File::Spec::Functions") {
+            /* File::Spec::Functions' real %EXPORT_TAGS defines
+               ALL => [@EXPORT_OK, @EXPORT] — expand :ALL to that union.
+               (Real File::Spec::Functions' %EXPORT_TAGS has only ALL.) */
+            std::vector<std::string> names = explicitImports;
+            if (modName == "File::Spec::Functions") {
+                std::vector<std::string> expanded;
+                for (auto &name : names) {
+                    if (name.size() > 1 && name[0] == ':' &&
+                        (name.substr(1) == "ALL" || name.substr(1) == "all")) {
+                        /* @EXPORT_OK then @EXPORT, matching %EXPORT_TAGS ALL */
+                        for (const char *ok : {"splitpath","splitdir","catpath",
+                                               "abs2rel","rel2abs","devnull",
+                                               "tmpdir","case_tolerant",
+                                               "canonpath","catdir","catfile",
+                                               "curdir","rootdir","updir",
+                                               "no_upwards","file_name_is_absolute",
+                                               "path","join"})
+                            expanded.push_back(ok);
+                    } else {
+                        expanded.push_back(name);
+                    }
+                }
+                names = expanded;
+            }
+            for (auto &name : names) {
+                if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (name.empty() || name[0] == ':') continue;
+                importMap[name] = modName + "::" + name;
+            }
             continue;
         }
 

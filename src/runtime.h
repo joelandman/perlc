@@ -599,6 +599,44 @@ PerlValue *perl_basename(PerlValue *pathPV, PerlArray *suffixes);
 PerlValue *perl_dirname(PerlValue *pathPV);
 PerlArray *perl_fileparse(PerlValue *pathPV, PerlArray *suffixes);
 
+/* ── Cwd / Sys::Hostname / File::Spec / Time::Local (Tier 1, native) ──────── */
+PerlValue *perl_getcwd(void);                  /* Cwd::getcwd / cwd / fastcwd   */
+PerlValue *perl_abs_path(PerlValue *pathPV);   /* Cwd::abs_path / fast_abs_path */
+PerlValue *perl_realpath(PerlValue *pathPV);   /* Cwd::realpath (= abs_path)    */
+PerlValue *perl_hostname(void);                /* Sys::Hostname::hostname       */
+
+/* File::Spec (Unix semantics, faithful to File::Spec::Unix 3.95's
+   pure-text algorithms) */
+PerlValue *perl_fspec_canonpath(PerlValue *pathPV);
+PerlValue *perl_fspec_catdir(PerlArray *args);
+PerlValue *perl_fspec_catfile(PerlArray *args);
+PerlArray *perl_fspec_splitpath(PerlValue *pathPV, PerlValue *nofilePV);
+PerlArray *perl_fspec_splitdir(PerlValue *dirPV);
+PerlValue *perl_fspec_catpath(PerlArray *args);
+PerlValue *perl_fspec_rel2abs(PerlValue *pathPV, PerlValue *basePV);
+PerlValue *perl_fspec_abs2rel(PerlValue *pathPV, PerlValue *basePV);
+PerlValue *perl_fspec_curdir(void);
+PerlValue *perl_fspec_updir(void);
+PerlValue *perl_fspec_rootdir(void);
+PerlValue *perl_fspec_devnull(void);
+PerlValue *perl_fspec_tmpdir(void);
+PerlValue *perl_fspec_file_name_is_absolute(PerlValue *pathPV);
+PerlArray *perl_fspec_no_upwards(PerlArray *args);
+PerlValue *perl_fspec_join(PerlArray *args);      /* = catfile */
+PerlValue *perl_fspec_case_tolerant(void);        /* returns 0 */
+PerlArray *perl_fspec_path(void);                 /* split $ENV{PATH} on ':'  */
+
+/* Time::Local (year-munging/range-check rules probed byte-for-byte
+   against Time::Local 1.35 — see TESTS.md) */
+PerlValue *perl_timegm(PerlArray *args);
+PerlValue *perl_timelocal(PerlArray *args);
+PerlValue *perl_timegm_nocheck(PerlArray *args);
+PerlValue *perl_timelocal_nocheck(PerlArray *args);
+PerlValue *perl_timegm_modern(PerlArray *args);
+PerlValue *perl_timelocal_modern(PerlArray *args);
+PerlValue *perl_timegm_posix(PerlArray *args);
+PerlValue *perl_timelocal_posix(PerlArray *args);
+
 /* ── file I/O extras ──────────────────────────────────────────────────────── */
 PerlValue *perl_seek_fh(PerlValue *fh, PerlValue *off, PerlValue *whence);
 PerlValue *perl_tell_fh(PerlValue *fh);
@@ -628,6 +666,8 @@ void       perl_srand_val(PerlValue *seed);     /* srand [seed] */
 PerlValue *perl_time_val(void);                 /* time() — epoch seconds */
 PerlArray *perl_localtime_val(PerlValue *t);    /* localtime — 9-element list */
 PerlArray *perl_gmtime_val(PerlValue *t);       /* gmtime — 9-element list */
+PerlValue *perl_scalar_gmtime(PerlValue *t);    /* scalar gmtime — ctime string */
+PerlValue *perl_scalar_localtime(PerlValue *t); /* scalar localtime — ctime string */
 PerlValue *perl_sleep_val(PerlValue *secs);     /* sleep — returns actual secs slept */
 PerlValue *perl_alarm_val(PerlValue *secs);     /* alarm — returns prev alarm value */
 
@@ -691,6 +731,8 @@ PerlValue *perl_get_dollar_at(void);   /* returns stable $@ PerlValue* */
 /* ── caller() call stack ─────────────────────────────────────────────────── */
 void perl_push_call_frame(const char *pkg, const char *file, int line);
 void perl_pop_call_frame(void);
+void perl_current_call_frame(const char **file, int *line); /* croak location */
+void perl_die_croak(const char *fmt, ...); /* printf-formatted die */
 PerlArray *perl_caller(int level);
 
 /* ── local @arr / local %hash ───────────────────────────────────────────── */

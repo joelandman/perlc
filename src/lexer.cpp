@@ -284,6 +284,15 @@ Token Lexer::readHeredoc() {
         delim += src_[pos_++];
     if (delim.empty())
         return {TK::EOF_TOK, "", line_}; /* not a heredoc — caller handles */
+    /* A digit-leading unquoted delimiter (`1<<5`) is the left-shift
+       operator in real Perl (verified: `print 1<<5` → 32), not a heredoc
+       with terminator "5" — heredocs need a bareword identifier or a
+       quoted string. Rewind to just after '<<' and let the caller emit
+       LSHIFT. Only bareword letters/underscore continue as heredocs. */
+    if (!quote && (isdigit((unsigned char)delim[0]))) {
+        pos_ -= delim.size();
+        return {TK::EOF_TOK, "", line_}; /* not a heredoc — caller handles */
+    }
     if (quote && pos_ < src_.size() && src_[pos_] == quote)
         pos_++; /* consume closing quote */
 
@@ -541,9 +550,17 @@ std::vector<Token> Lexer::tokenize() {
              toks.back().kind == TK::HASH) &&
             toks.back().text.size() == 1;
 
-        /* qw(...) – quote-word list */
+        /* qw(...) – quote-word list. Real Perl allows whitespace
+           (including newlines) between 'qw' and the delimiter
+           (`qw (...)` / `qw(\n  a\n  b\n)` — Encode/Alias.pm's exact
+           shape); previously the delimiter had to be adjacent, so a
+           space made close=' ' and swallowed the rest of the file. */
         if (!afterSigil && c == 'q' && peek(1) == 'w' && !isalnum(peek(2)) && peek(2) != '_') {
             pos_ += 2; /* skip 'qw' */
+            while (pos_ < src_.size() && (src_[pos_] == ' ' || src_[pos_] == '\t' || src_[pos_] == '\n')) {
+                if (src_[pos_] == '\n') line_++;
+                pos_++;
+            }
             char open = peek();
             char close = (open == '(') ? ')' : (open == '[') ? ']' :
                          (open == '{') ? '}' : (open == '<') ? '>' : open;
@@ -573,7 +590,17 @@ std::vector<Token> Lexer::tokenize() {
            legitimately follow a bareword `q` in valid Perl outside the
            quote-like-operator meaning. */
         auto isQDelimStart = [](char ch) {
-            return ch == '(' || ch == '[' || ch == '<' || ch == '/';
+            /* Real Perl accepts almost any non-alphanumeric, non-whitespace
+               character as a q/qq delimiter (q!..!, q%..%, q#..#, q$..$,
+               even q,..,). Only the commonest ones used to be accepted,
+               which broke real-world modules (Encode/Alias.pm's q$...$).
+               Closers } ] > ) and = are excluded exactly like qw()'s own
+               guard (D60's regression: `$h{q}` must stay a bareword key —
+               real Perl also refuses `q}`-style openers). */
+            return ch && !isalnum((unsigned char)ch) && ch != '_' &&
+                   ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' &&
+                   ch != '}' && ch != ']' && ch != ')' && ch != '>' &&
+                   ch != '='; /* q=..= conflicts with POD/directives */
         };
         /* D65: unlike qw's existing `!isalnum(peek(2)) && peek(2) != '_'`
            guard above, the "qq" branch here had NO check at all that the
@@ -691,27 +718,75 @@ std::vector<Token> Lexer::tokenize() {
             }
         }
 
-        /* tr/search/replace/flags  or  y/search/replace/flags */
-        if ((c == 't' && peek(1) == 'r' && peek(2) == '/') ||
-            (c == 'y' && peek(1) == '/')) {
-            size_t skip = (c == 't') ? 3 : 2;
-            pos_ += skip;
-            auto readSec = [&](char delim) {
-                std::string s;
-                while (pos_ < src_.size()) {
-                    char ch = src_[pos_];
-                    if (ch == delim) { pos_++; break; }
-                    if (ch == '\\' && pos_ + 1 < src_.size()) { s += ch; s += src_[++pos_]; pos_++; continue; }
-                    s += ch; pos_++;
+        /* tr/search/replace/flags  or  y/search/replace/flags —
+           any non-word delimiter, matching s/// (real Perl: tr|/|_,
+           tr{/}{_}, tr!..! all work; previously only '/' was accepted,
+           which made update-xmlcatalog's `$x =~ tr|/|_|;` a hard parse
+           error). Same guard as s///: not after a bare sigil, closers
+           excluded ($h{tr} collision). */
+        {
+            bool afterBareSigilTr = !toks.empty() &&
+                (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
+                 toks.back().kind == TK::HASH) &&
+                toks.back().text.size() <= 1;
+            bool isTr = !afterBareSigilTr &&
+                        (c == 't' && peek(1) == 'r' &&
+                         peek(2) && !isalnum((unsigned char)peek(2)) &&
+                         peek(2) != '_' && peek(2) != ' ' && peek(2) != '\t' &&
+                         peek(2) != '\n' && peek(2) != '\r' &&
+                         peek(2) != '}' && peek(2) != ']' && peek(2) != ')');
+            bool isY  = !afterBareSigilTr &&
+                        (c == 'y' && peek(1) && !isalnum((unsigned char)peek(1)) &&
+                         peek(1) != '_' && peek(1) != ' ' && peek(1) != '\t' &&
+                         peek(1) != '\n' && peek(1) != '\r' &&
+                         peek(1) != '}' && peek(1) != ']' && peek(1) != ')');
+            if (isTr || isY) {
+                char delim = isTr ? peek(2) : peek(1);
+                size_t skip = isTr ? 3 : 2;
+                pos_ += skip;
+                char close = delim;
+                if      (delim == '{') close = '}';
+                else if (delim == '(') close = ')';
+                else if (delim == '[') close = ']';
+                else if (delim == '<') close = '>';
+                auto readSec = [&](char d) {
+                    std::string s;
+                    int depth = (close != delim) ? 1 : 0;
+                    while (pos_ < src_.size()) {
+                        char ch = src_[pos_];
+                        if (ch == delim && close != delim) depth++;
+                        if (ch == close) {
+                            if (close != delim) {
+                                if (--depth == 0) { pos_++; break; }
+                            } else { pos_++; break; }
+                        }
+                        if (ch == '\\' && pos_ + 1 < src_.size()) { s += ch; s += src_[++pos_]; pos_++; continue; }
+                        s += ch; pos_++;
+                    }
+                    return s;
+                };
+                std::string search = readSec(close);
+                /* skip optional whitespace between sections for paired delims */
+                if (close != delim) {
+                    while (pos_ < src_.size() && (src_[pos_] == ' ' || src_[pos_] == '\t' || src_[pos_] == '\n')) {
+                        if (src_[pos_] == '\n') line_++;
+                        pos_++;
+                    }
+                    if (pos_ < src_.size()) {
+                        char o2 = src_[pos_++];
+                        close = o2;
+                        if      (o2 == '{') close = '}';
+                        else if (o2 == '(') close = ')';
+                        else if (o2 == '[') close = ']';
+                        else if (o2 == '<') close = '>';
+                    }
                 }
-                return s;
-            };
-            std::string search = readSec('/');
-            std::string repl   = readSec('/');
-            std::string flags;
-            while (pos_ < src_.size() && isalpha(src_[pos_])) flags += src_[pos_++];
-            toks.push_back({TK::TR, search + "\x01" + repl + "\x01" + flags, line_});
-            continue;
+                std::string repl = readSec(close);
+                std::string flags;
+                while (pos_ < src_.size() && isalpha(src_[pos_])) flags += src_[pos_++];
+                toks.push_back({TK::TR, search + "\x01" + repl + "\x01" + flags, line_});
+                continue;
+            }
         }
 
         /* identifiers and keywords */

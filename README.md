@@ -151,7 +151,12 @@ make clean
   are now true cross-scope globals, D110; `$$aref[0]`-style subscripted
   dereference inside plain `"..."` strings now interpolates correctly,
   D120; `__SUB__` works — anonymous recursion keeps the closure's own
-  captures, D124.)
+  captures, D124. Fixed 2026-09-14/15: bareword `all => 1` auto-quote +
+  `@h{qw(a b)}` slice keys, D136/D137; `%EXPORT_TAGS`/`:tag`/`:all`
+  Exporter imports; DynaLoader-compatible FFI; Cwd, Sys::Hostname,
+  File::Spec(+::Functions), Time::Local native modules; mixed-sigil
+  `my (%h)`/`our (%a, $b)` lists; multi-token `use constant` values;
+  `q!`/`tr|/|_` arbitrary delimiters; `1<<5` heredoc mis-lex.)
   (Fixed 2026-09-12: `use`/`no` pragmas now parse inside any nested
   scope, D125; `split` patterns with capturing groups now interleave
   the captured delimiter text, D126; a BigInt-tagged variable operand

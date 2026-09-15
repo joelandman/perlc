@@ -1173,7 +1173,7 @@ NodePtr Parser::parseMy() {
         advance();
 
         /* my (%h) = rhs — single hash captures the whole list */
-        if (check(TK::HASH)) {
+        if (check(TK::HASH) && peek(1).kind == TK::RPAREN) {
             advance();
             std::string nm = cur().text; advance();
             consume(TK::RPAREN, ")");
@@ -1203,8 +1203,10 @@ NodePtr Parser::parseMy() {
             else if (check(TK::HASH)) { advance(); allVars.push_back({"%", cur().text}); advance(); }
             else if (check(TK::SCALAR)) { advance(); allVars.push_back({"$", cur().text}); advance(); }
             else { advance(); continue; }
+            if (getenv("PERLC_DBG")) fprintf(stderr, "DBG mylist tok='%s'\n", cur().text.c_str());
             if (!match(TK::COMMA)) break;
         }
+        if (getenv("PERLC_DBG")) fprintf(stderr, "DBG mylist exit tok='%s'\n", cur().text.c_str());
         consume(TK::RPAREN, ")");
         /* Sub-task 3: `our ($a, $b) : shared = ...` form.  Parse the
            `: shared` attribute (if present) and apply it to every
@@ -1382,6 +1384,31 @@ NodePtr Parser::parsePrint(bool isSay) {
 
     NodeList args;
     bool hasParen = match(TK::LPAREN);
+    /* print($fh LIST) — scalar filehandle variable in a parenthesized
+       print with NO comma: real Perl treats it as the filehandle
+       (verified: print($fh "str") writes to $fh, while print($x, "y")
+       with a comma prints $x's VALUE followed by "y"). update-xmlcatalog
+       writes print( CATALOG_DATA "<x>\n" ) exactly like this. The sigil
+       and the name are two tokens ($ then IDENT), so the separator to
+       inspect is peek(2). */
+    if (hasParen && fhname.empty() && check(TK::SCALAR) &&
+        pos_ + 2 < toks_.size() &&
+        (toks_[pos_+2].kind == TK::STRING || toks_[pos_+2].kind == TK::INT ||
+         toks_[pos_+2].kind == TK::FLOAT || toks_[pos_+2].kind == TK::QWORDS ||
+         toks_[pos_+2].kind == TK::BACKTICK) &&
+        toks_[pos_+1].kind == TK::IDENT) {
+        pos_++; /* skip $ */
+        fhname = advance().text;
+    }
+    /* print( LOG "str" ) — bareword filehandle inside parens (real Perl:
+       writes to LOG; a comma there is a real-Perl compile error we don't
+       model). Only known/bare-fh names qualify so print( "str", ... )
+       stays a plain value list. */
+    if (hasParen && fhname.empty() && check(TK::IDENT) &&
+        (isBareFhName(cur().text) || cur().text == "STDIN" ||
+         cur().text == "STDOUT" || cur().text == "STDERR")) {
+        fhname = cur().text; advance();
+    }
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
         args.push_back(parseExpr());
@@ -2426,7 +2453,15 @@ NodePtr Parser::parsePrimary() {
     }
 
     /* &NAME / &NAME() — sub call that bypasses prototype */
-    if (check(TK::AND) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::IDENT) {
+    /* &NAME / &NAME() — sub call that bypasses prototype. NAME may be
+       spelled with any bareword-like token, including lexer keywords
+       (`&delete($x)` calling a user sub named delete, the idiom in real
+       pptpsetup) — the earlier check only accepted TK::IDENT. */
+    if (check(TK::AND) && pos_ + 1 < toks_.size() &&
+        (toks_[pos_+1].kind == TK::IDENT ||
+         (!toks_[pos_+1].text.empty() &&
+          (isalnum((unsigned char)toks_[pos_+1].text[0]) ||
+           toks_[pos_+1].text[0] == '_')))) {
         advance();
         std::string nm = cur().text; advance();
         auto it = importMap_.find(nm);
@@ -4839,6 +4874,7 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 }
                 if (i < raw.size() && raw[i] == '{') {
                     i++;
+                    while (i < raw.size() && isspace((unsigned char)raw[i])) i++;
                     std::string key_s;
                     while (i < raw.size() && raw[i] != '}') key_s += raw[i++];
                     if (i < raw.size()) i++;

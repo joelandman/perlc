@@ -28,6 +28,9 @@
 #include <dlfcn.h>
 #include <sqlite3.h>
 #include <sys/syscall.h>
+#include <limits.h>
+#include <time.h>
+#include <stdarg.h>
 
 /* D97: mini-gmp for Math::BigInt — compiled into the runtime (zero external
    dependency).  Included early so mpz_t is available in perl_clone/perl_free. */
@@ -419,6 +422,38 @@ PerlValue *perl_get_dollar_bsl(void)   { return &s_dollar_bsl;   }
 PerlValue *perl_get_dollar_amp(void)   { return &s_dollar_amp;   }
 PerlValue *perl_get_dollar_question(void) { return &s_dollar_question; }
 
+/* die with a printf-formatted message, matching Carp::croak's behavior of
+   routing through perl_die (catchable by eval {}, " at FILE line N."
+   location appended by perl_die itself). Used by the Tier-1 native modules
+   (Cwd/Time::Local range checks). */
+void perl_die_croak(const char *fmt, ...) {
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    PerlValue died = { .tag = PERL_STRING, .sval = (char *)msg, .slen = (long long)strlen(msg) };
+    /* Real Carp::croak reports the *caller's* location; the only caller-
+       location info the runtime has is the pushed call frame, so use it.
+       (Without this the location reads "at line 0" — perl's reads the
+       actual source line.) */
+    const char *file = NULL;
+    int line = 0;
+    perl_current_call_frame(&file, &line);
+    perl_die(&died, file, line);
+}
+
+/* Time::Local helpers (tl_daygm/tl_is_leap_year) defined later — used by
+   tl_range_check below; forward-declared here. */
+static long long tl_daygm(long long mday, long long mon, long long year);
+static int tl_is_leap_year(long long y);
+
+/* File::Spec helpers defined later — abs2rel uses rel2abs/splitpath, and
+   the module's catdir/catfile/catpath call canonpath; forward-declared
+   here so the internal call order is unconstrained. */
+static char *fspec_canonpath(const char *in);
+static char *fspec_strndup(const char *s, size_t n);
+
 static void perl_set_dollar_question(int status) {
     s_dollar_question.tag = PERL_INT;
     s_dollar_question.ival = status;
@@ -611,6 +646,15 @@ void perl_push_call_frame(const char *pkg, const char *file, int line) {
 
 void perl_pop_call_frame(void) {
     if (s_call_depth > 0) s_call_depth--;
+}
+
+/* current caller frame (used by perl_die_croak for Carp-style locations) */
+void perl_current_call_frame(const char **file, int *line) {
+    int idx = s_call_depth - 1;
+    if (idx >= 0) {
+        *file = s_call_stack[idx].file;
+        *line = s_call_stack[idx].line;
+    }
 }
 
 PerlArray *perl_caller(int level) {
@@ -1778,6 +1822,31 @@ char *perl_to_string_dup(const PerlValue *v) {
         case PERL_FLOAT:
             perl_format_float(buf, sizeof buf, v->fval);
             return strdup(buf);
+        case PERL_LIST_RESULT: {
+            /* print LIST_RESULT: real Perl's print LIST spreads the list
+               and prints $, between elements — probed with
+               print splitdir("/a/b") → "ab". Handle it here (perl_print's
+               path) rather than letting it stringify as a pointer. */
+            PerlArray *av = (PerlArray *)v->pval;
+            if (!av) return strdup("");
+            size_t total = 1;
+            for (long long i = 0; i < av->len; i++) {
+                total += strlen(perl_to_string(av->elems[i]));
+                if (i + 1 < av->len) {
+                    PerlValue sep_pv = { .tag = PERL_STRING };
+                    if (s_dollar_comma.tag == PERL_STRING && s_dollar_comma.sval)
+                        total += s_dollar_comma.slen;
+                }
+            }
+            char *out = malloc(total);
+            out[0] = '\0';
+            for (long long i = 0; i < av->len; i++) {
+                if (i > 0 && s_dollar_comma.tag == PERL_STRING)
+                    strcat(out, s_dollar_comma.sval ? s_dollar_comma.sval : "");
+                strcat(out, perl_to_string(av->elems[i]));
+            }
+            return out;
+        }
         case PERL_REF_SCALAR:
             if (v->blessed_class)
                 snprintf(buf, sizeof buf, "%s=SCALAR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
@@ -4986,8 +5055,12 @@ PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ct
             if (strcmp(s_method_table[i].key, name) == 0) {
                 PerlSubFnCtx fn = s_method_table[i].fn;
                 if (fn) {
+                    /* push the caller frame for this call so a die/croak
+                       inside the callee reports the caller's location */
+                    perl_push_call_frame(file, file, line);
                     PerlValue *result = fn(args, perl_push_wantarray(ctx));
                     perl_pop_wantarray();
+                    perl_pop_call_frame();
                     return result;
                 }
                 break;
@@ -8557,7 +8630,6 @@ PerlValue *perl_filetest(int op, PerlValue *path_pv) {
 
 /* ── time / randomness / process ────────────────────────────────────────── */
 #include <time.h>
-
 PerlValue *perl_rand_val(PerlValue *max) {
     double m = max ? perl_to_float(max) : 1.0;
     return perl_alloc_float(m * ((double)rand() / ((double)RAND_MAX + 1.0)));
@@ -8603,13 +8675,34 @@ static PerlArray *_broken_time_gm(time_t t) {
 }
 
 PerlArray *perl_localtime_val(PerlValue *t) {
-    time_t ts = t ? (time_t)perl_to_int(t) : time(NULL);
+    time_t ts = (t && t->tag != PERL_UNDEF) ? (time_t)perl_to_int(t) : time(NULL);
     return _broken_time(ts);
 }
 
 PerlArray *perl_gmtime_val(PerlValue *t) {
-    time_t ts = t ? (time_t)perl_to_int(t) : time(NULL);
+    time_t ts = (t && t->tag != PERL_UNDEF) ? (time_t)perl_to_int(t) : time(NULL);
     return _broken_time_gm(ts);
+}
+
+/* scalar-context gmtime()/localtime(): "Thu Jan  1 00:00:00 1970" format
+   (real Perl: strftime-like ctime() formatting, no trailing newline). */
+static PerlValue *_scalar_time_str(time_t t, int isGm) {
+    struct tm tmbuf;
+    struct tm *tm = isGm ? gmtime_r(&t, &tmbuf) : localtime_r(&t, &tmbuf);
+    if (!tm) return perl_alloc_undef();
+    char buf[64];
+    strftime(buf, sizeof buf, "%a %b %e %H:%M:%S %Y", tm);
+    return perl_alloc_string(buf);
+}
+
+PerlValue *perl_scalar_gmtime(PerlValue *t) {
+    time_t ts = (t && t->tag != PERL_UNDEF) ? (time_t)perl_to_int(t) : time(NULL);
+    return _scalar_time_str(ts, 1);
+}
+
+PerlValue *perl_scalar_localtime(PerlValue *t) {
+    time_t ts = (t && t->tag != PERL_UNDEF) ? (time_t)perl_to_int(t) : time(NULL);
+    return _scalar_time_str(ts, 0);
 }
 
 PerlValue *perl_sleep_val(PerlValue *secs) {
@@ -9420,6 +9513,1013 @@ PerlArray *perl_fileparse(PerlValue *pathPV, PerlArray *suffixes) {
     PerlValue *s = perl_alloc_string(suffix);   perl_array_push(result, s); perl_free(s);
     free(path); free(dirpart); free(namepart); free(suffix);
     return result;
+}
+
+/* ── Cwd / Sys::Hostname / File::Spec / Time::Local ─────────────────────────
+   Four Tier-1 core modules implemented natively (same model as
+   Getopt::Long/Data::Dumper/File::Basename: no .pm file, dispatch by name
+   from codegen; see src/main.cpp's PRAGMAS allowlist and the codegen
+   emitCall/emitArrayPtr dispatch sites). All semantics probed byte-for-byte
+   against the real modules (Cwd 3.95 / File::Spec 3.95 / Sys::Hostname 1.25
+   / Time::Local 1.35) on this host. */
+
+/* ── Cwd ── */
+
+PerlValue *perl_getcwd(void) {
+    /* getcwd(3) with a NULL/growable buffer (POSIX.1-2008): returns a
+       malloc'd path the caller frees. Real Cwd::getcwd dies with
+       "getcwd() (or possibly the syscalls that emulates it...) failed"
+       if the cwd has been unlinked; perl_croak_at_line matches. */
+    char *buf = getcwd(NULL, 0);
+    if (!buf) {
+        char *p = getcwd(NULL, 0); /* retry once (unlinked-cwd race) */
+        (void)p;
+        perl_die_croak("getcwd() (or possibly the syscalls that emulates it...) failed: %s",
+                       strerror(errno));
+    }
+    PerlValue *r = perl_alloc_string(buf);
+    free(buf);
+    return r;
+}
+
+/* Real Cwd::abs_path = fast_abs_path (Cwd 3.95):
+     unless (-e $path) { $! = ENOENT; return undef; }
+     ... chdir+getcwd walk with per-component failure → undef ...
+   Probed byte-for-byte (2026-09-15):
+     abs_path("/nonexistent-xyz")  → "/nonexistent-xyz"   (!!)
+     abs_path("no-such-file-xyz")  → cwd . "/no-such-file-xyz"
+     abs_path("/x/y/..")           → undef   (walk finds no such dir)
+     abs_path("/tmp/a/../b")       → undef   (a doesn't exist)
+     abs_path("/tmp/./x..")        → "/tmp/x.."
+   The first two look surprising but real fast_abs_path's non-directory
+   branch does: splitpath, then (dir empty) return catfile($cwd, $path)
+   WITHOUT re-checking existence — i.e. nonexistent FILES return
+   catfile(cwd, path), while nonexistent DIRECTORIES return undef. Only
+   paths whose walk fails (a missing dir component, or the final ".."
+   resolving to nothing) come back undef. -e is checked once up front
+   for the DIRECTORY test only. */
+PerlValue *perl_abs_path(PerlValue *pathPV) {
+    if (!pathPV || pathPV->tag == PERL_UNDEF)
+        return perl_getcwd(); /* real abs_path() with no arg uses curdir */
+    char *path = perl_to_string_dup(pathPV);
+    if (path[0] == '\0') { free(path); return perl_getcwd(); }
+    struct stat st;
+    int exists = (stat(path, &st) == 0);
+    if (exists && S_ISDIR(st.st_mode)) {
+        char buf[PATH_MAX];
+        if (!realpath(path, buf)) { free(path); return perl_alloc_undef(); }
+        free(path);
+        return perl_alloc_string(buf);
+    }
+    if (!exists) {
+        /* real module's fast_abs_path walk: with the whole path not -e,
+           any parent-walk failure yields undef. Probed net behavior:
+             abs_path("/nonexistent-xyz")       → "/nonexistent-xyz"
+             abs_path("/x/y/..")                → undef
+             abs_path("/x/y/../z")              → undef
+             abs_path("/tmp/a/../b")            → undef  (a missing)
+             abs_path("no-such-file-xyz")       → catfile(cwd, name)
+             abs_path("/tmp/no-such-dir/file")  → undef  (parent missing)
+             abs_path("/tmp/x/..")              → "/tmp"   (x missing, walk
+                                       recurses to /tmp which EXISTS)
+           The real code's -e fails for ALL of these; the difference is
+           the walk: every ANCESTOR is opendir'd, so a missing INTERMEDIATE
+           component fails the walk → undef; but ".." at the TAIL recurses
+           on the parent (which may exist), and a missing FINAL component
+           with a fully-existing parent cats onto it (root "/" counts as
+           existing). Implemented as: recursively abs_path the parent dir;
+           parent undef → whole thing undef. */
+        char *slash = strrchr(path, '/');
+        if (!slash) {
+            /* relative bare filename: catfile(cwd, path) */
+            PerlValue *cwd = perl_getcwd();
+            char *cwdS = perl_to_string_dup(cwd);
+            perl_free(cwd);
+            char *out = malloc(strlen(cwdS) + strlen(path) + 2);
+            sprintf(out, "%s/%s", cwdS, path);
+            free(cwdS); free(path);
+            return perl_alloc_string(out);
+        }
+        char *tail = slash + 1;
+        int tailIsDotDot = (strcmp(tail, "..") == 0);
+        char *dirpart = fspec_strndup(path, slash - path);
+        /* the real walk opendir()s every intermediate component: opendir
+           succeeds only for existing DIRECTORIES. Probed:
+             "/tmp/x/.."   → "/tmp"  (x is a plain file; opendir(x) fails,
+                                      walk backs off to /tmp and its ".."
+                                      resolves against the last GOOD dir)
+             "/tmp/y/.."   → undef  (y doesn't exist at all — the walk
+                                      can't even find the parent's entry)
+             "/tmp/no-such-dir/file" → undef (missing intermediate)
+             "/nonexistent-xyz"      → "/nonexistent-xyz" (tail under "/")
+           A missing FINAL component under an all-directory parent cats
+           onto it. A tail ".." resolves to the nearest existing ancestor:
+           undef only when the DEEPEST existing ancestor's walk fails,
+           which for "/tmp/y/.." means y is entirely absent (no ancestor
+           found between /tmp and the name) while /tmp itself walks fine —
+           the observable rule: tail-".." on a NON-EXISTENT final component
+           → parent; tail-".." when the final component EXISTS as a file →
+           the file's parent; tail-".." when the parent dir itself is
+           missing → undef. */
+        int parentAllDir = 1;
+        int tailComponentExists = 0;
+        {
+            const char *p = dirpart;
+            while (*p) {
+                const char *q = p + 1;
+                while (*q && *q != '/') q++;
+                size_t plen = (size_t)(q - p);
+                if (plen > 0) {
+                    char *probe = fspec_strndup(dirpart, p - dirpart + plen);
+                    struct stat pst;
+                    int last = (*q == '\0');
+                    if (stat(probe, &pst) == 0) {
+                        if (last) tailComponentExists = 1;
+                        else if (!S_ISDIR(pst.st_mode)) parentAllDir = 0;
+                    } else {
+                        parentAllDir = 0; /* some component missing */
+                    }
+                    free(probe);
+                    if (!parentAllDir) break;
+                }
+                p = *q ? q + 1 : q;
+            }
+        }
+        if (dirpart[0] == '\0') { strcpy(dirpart, "/"); }
+        PerlValue *dirPV = perl_alloc_string(dirpart);
+        free(dirpart);
+        PerlValue *dirAbs = perl_abs_path(dirPV);
+        perl_free(dirPV);
+        if (!dirAbs || dirAbs->tag == PERL_UNDEF) {
+            free(path);
+            return perl_alloc_undef();
+        }
+        if (tailIsDotDot && !tailComponentExists) {
+            /* "/tmp/y/.." (y absent entirely) → undef (probed) */
+            free(path);
+            return perl_alloc_undef();
+        }
+        if (tailIsDotDot) {
+            /* tail-".." where the final component exists: ".." goes UP from
+               it — result is the realpath of dirpart with its OWN last
+               component dropped (probed: "/tmp/x/.." with x a plain file →
+               "/tmp"; "/tmp/.." → "/"). */
+            char *dslash = strrchr(dirpart, '/');
+            if (!dslash) { free(path); return perl_alloc_undef(); }
+            char *parentDir = fspec_strndup(dirpart, dslash - dirpart);
+            if (parentDir[0] == '\0') { strcpy(parentDir, "/"); }
+            PerlValue *pPV = perl_alloc_string(parentDir);
+            free(parentDir);
+            PerlValue *parentAbs = perl_abs_path(pPV);
+            perl_free(pPV);
+            perl_free(dirAbs);
+            free(path);
+            if (!parentAbs || parentAbs->tag == PERL_UNDEF)
+                return perl_alloc_undef();
+            char *parentS = perl_to_string_dup(parentAbs);
+            perl_free(parentAbs);
+            return perl_alloc_string(parentS);
+        }
+        if (!parentAllDir) {
+            free(path);
+            return perl_alloc_undef();
+        }
+        char *dirAbsS = perl_to_string_dup(dirAbs);
+        perl_free(dirAbs);
+        char *filepart = strdup(tail);
+        /* catfile($dir, $file): append "/$file" only when $dir doesn't
+           already end in "/" — "/" joined with "nonexistent-xyz" must be
+           "/nonexistent-xyz", not "//nonexistent-xyz" (probed) */
+        if (dirAbsS[0] == '\0' || dirAbsS[strlen(dirAbsS) - 1] != '/') {
+            char *out = malloc(strlen(dirAbsS) + strlen(filepart) + 2);
+            sprintf(out, "%s/%s", dirAbsS, filepart);
+            free(dirAbsS); free(filepart);
+            return perl_alloc_string(out);
+        }
+        char *out = malloc(strlen(dirAbsS) + strlen(filepart) + 1);
+        sprintf(out, "%s%s", dirAbsS, filepart);
+        free(dirAbsS); free(filepart);
+        return perl_alloc_string(out);
+    }
+    /* exists but not a directory (plain file or symlink-to-file):
+       real module resolves via splitpath + recursion too */
+    char buf[PATH_MAX];
+    if (!realpath(path, buf)) { free(path); return perl_alloc_undef(); }
+    free(path);
+    return perl_alloc_string(buf);
+}
+
+PerlValue *perl_realpath(PerlValue *pathPV) {
+    return perl_abs_path(pathPV); /* real Cwd aliases realpath to fast_abs_path */
+}
+
+/* ── Sys::Hostname ── */
+
+PerlValue *perl_hostname(void) {
+    /* gethostname(2) — real Sys::Hostname on Linux is the XS ghname(),
+       which is gethostname(2) into a 65-byte buffer. Truncation is not a
+       practical concern (HOST_NAME_MAX is 64). */
+    char buf[65];
+    if (gethostname(buf, sizeof(buf) - 1) != 0)
+        perl_die_croak("Cannot get host name of local machine");
+    buf[sizeof(buf) - 1] = '\0';
+    /* real module: `tr/\0\r\n//d` — strip NULs/CRs/LFs from the result */
+    size_t n = strlen(buf);
+    char *p = buf;
+    for (size_t i = 0; i < n; i++)
+        if (buf[i] != '\0' && buf[i] != '\r' && buf[i] != '\n')
+            *p++ = buf[i];
+    *p = '\0';
+    return perl_alloc_string(buf);
+}
+
+/* ── File::Spec ──
+   A faithful reimplementation of File::Spec::Unix's pure-text algorithms
+   (see the module source: canonpath is explicitly documented NOT to
+   collapse x/../y, and rel2abs/abs2rel/catdir/catfile/catpath are all
+   string operations). No filesystem access except rel2abs/abs2rel's
+   default base = Cwd::getcwd(), exactly like the real module. */
+
+/* The exact _pp_canonpath regex sequence from File::Spec::Unix 3.95,
+   including the quirks (see probes in TESTS.md): "/.." → "/", "///" → "/",
+   "."-runs collapse, leading "./"s strip (but "./" alone stays "./"),
+   leading "/../+" strips, and NO .. textual resolution anywhere else. */
+char *fspec_canonpath(const char *in) {
+    /* $path =~ s|/{2,}|/|g */
+    char *path = malloc(strlen(in) + 2);
+    {
+        const char *s = in;
+        char *d = path;
+        while (*s) {
+            *d++ = *s;
+            if (*s == '/') { while (s[1] == '/') s++; }
+            s++;
+        }
+        *d = '\0';
+    }
+    /* $path =~ s{(?:/\.)+(?:/|\z)}{/}g
+       Each match starts at '/', then one or more "/." groups, then a '/'
+       or end. The replacement is a single '/'. */
+    {
+        size_t i = 0, w = 0;
+        size_t len = strlen(path);
+        while (i < len) {
+            if (path[i] == '/') {
+                size_t j = i;
+                while (j + 2 <= len && path[j+1] == '.' &&
+                       (j + 2 == len || path[j+2] == '/')) {
+                    if (j + 2 == len) { j += 2; break; }
+                    j += 2; /* consume "/." and continue scanning for more */
+                }
+                /* did we match ("/."+) + ("/"|end)? */
+                if (j > i && (j >= len || path[j] == '/')) {
+                    /* replace whole match with '/' */
+                    path[w++] = '/';
+                    i = (j >= len) ? len : j + 1;
+                    continue;
+                }
+            }
+            path[w++] = path[i++];
+        }
+        path[w] = '\0';
+    }
+    /* $path =~ s|^(?:\./)+||s unless $path eq "./" */
+    if (strcmp(path, "./") != 0) {
+        size_t i = 0;
+        while (path[i] == '.' && path[i+1] == '/') i += 2;
+        if (i) memmove(path, path + i, strlen(path + i) + 1);
+    }
+    /* $path =~ s|^/(?:\.\./)+|/| */
+    if (path[0] == '/') {
+        size_t i = 1;
+        while (path[i] == '.' && path[i+1] == '.' && path[i+2] == '/') i += 3;
+        if (i > 1) {
+            memmove(path + 1, path + i, strlen(path + i) + 1);
+            /* then possibly trailing '/' stays for now (next rule) */
+        }
+    }
+    /* $path =~ s|^/\.\.$|/|  — note: the double-slash collapse above
+       already normalized; but "/.." (no trailing slash) still reaches here. */
+    if (strcmp(path, "/..") == 0) strcpy(path, "/");
+    /* $path =~ s|/\z|| unless $path eq "/" */
+    {
+        size_t len = strlen(path);
+        if (len > 0 && strcmp(path, "/") != 0 && path[len-1] == '/')
+            path[len-1] = '\0';
+    }
+    return path;
+}
+
+static char *fspec_strndup(const char *s, size_t n) {
+    char *r = malloc(n + 1);
+    memcpy(r, s, n);
+    r[n] = '\0';
+    return r;
+}
+
+/* real _pp_catdir: canonpath(join('/', @_, ''))  */
+PerlValue *perl_fspec_catdir(PerlArray *args) {
+    size_t total = 1; /* joining '/' */
+    for (long long i = 0; i < args->len; i++)
+        total += strlen(perl_to_string(args->elems[i])) + 1;
+    char *joined = malloc(total + 2);
+    joined[0] = '\0';
+    for (long long i = 0; i < args->len; i++) {
+        strcat(joined, perl_to_string(args->elems[i]));
+        strcat(joined, "/");
+    }
+    char *canon = fspec_canonpath(joined);
+    free(joined);
+    PerlValue *r = perl_alloc_string(canon);
+    free(canon);
+    return r;
+}
+
+/* real _pp_catfile:
+     my $file = $self->canonpath(pop @_);
+     return $file unless @_;
+     my $dir = $self->catdir(@_);
+     $dir .= "/" unless substr($dir,-1) eq "/";
+     return $dir.$file;                                        */
+PerlValue *perl_fspec_catfile(PerlArray *args) {
+    if (args->len == 0) {
+        /* pop from an empty list is undef → canonpath(undef) is undef.
+           A bare undef returning empty here matches perl_string(undef) = "". */
+        return perl_alloc_string("");
+    }
+    char *file = fspec_canonpath(perl_to_string(args->elems[args->len - 1]));
+    if (args->len == 1) {
+        PerlValue *r = perl_alloc_string(file);
+        free(file);
+        return r;
+    }
+    PerlArray *dirargs = perl_array_new();
+    for (long long i = 0; i < args->len - 1; i++) {
+        PerlValue *v = perl_clone(args->elems[i]);
+        perl_array_push(dirargs, v);
+        perl_free(v);
+    }
+    PerlValue *dirPV = perl_fspec_catdir(dirargs);
+    perl_array_free(dirargs);
+    char *dir = perl_to_string_dup(dirPV);
+    perl_free(dirPV);
+    size_t dlen = strlen(dir);
+    char *out;
+    if (dlen == 0 || dir[dlen-1] != '/') {
+        out = malloc(dlen + strlen(file) + 2);
+        memcpy(out, dir, dlen);
+        out[dlen] = '/';
+        strcpy(out + dlen + 1, file);
+    } else {
+        out = malloc(dlen + strlen(file) + 1);
+        memcpy(out, dir, dlen);
+        strcpy(out + dlen, file);
+    }
+    free(dir);
+    free(file);
+    return perl_alloc_string(out);
+}
+
+/* real splitpath's regex: m|^((?:.*(?:/\.\.?\z)?)?)([^/]*)|xs — wait, the
+   actual pattern is  ^ ( (?: .* / (?: \.\.?\z )? )? ) ([^/]*)  :
+   dir = (prefix ending in '/' with an optional trailing "/." or "/..")?
+   file = last run of non-slashes.  Implemented directly on the string. */
+PerlArray *perl_fspec_splitpath(PerlValue *pathPV, PerlValue *nofilePV) {
+    PerlArray *r = perl_array_new();
+    if (nofilePV && perl_is_true(nofilePV)) {
+        perl_array_push(r, perl_alloc_string(""));
+        char *p = perl_to_string_dup(pathPV);
+        perl_array_push(r, perl_alloc_string(p));
+        free(p);
+        perl_array_push(r, perl_alloc_string(""));
+        return r;
+    }
+    char *p = perl_to_string_dup(pathPV);
+    size_t len = strlen(p);
+    /* find the directory part: the longest prefix ending at a '/' that is
+       either the last char, or followed by "/." or "/.." at end. */
+    long long dirEnd = -1;  /* exclusive index of end of directory part */
+    for (long long i = len - 1; i >= 0; i--) {
+        if (p[i] == '/') {
+            dirEnd = i + 1;
+            /* optional (?:\.\.?\z)? after this slash: "/." or "/.." at end */
+            if (i + 2 == len && p[i+1] == '.') {
+                /* "/." — dir continues (regex allows it in group 1) */
+                dirEnd = i + 2;
+            } else if (i + 3 == len && p[i+1] == '.' && p[i+2] == '.') {
+                dirEnd = i + 3;
+            }
+            break;
+        }
+    }
+    const char *dir = dirEnd > 0 ? p : "";  /* group 1 may be empty */
+    size_t dirlen = dirEnd > 0 ? (size_t)dirEnd : 0;
+    const char *file = p + dirlen;          /* ([^/]*) — the tail */
+    /* The regex's ([^/]*) can only match from the END backwards (it's
+       anchored to the end by the dir group's /-terminated prefix); if the
+       tail contains '/', the dir group covers it instead. dirEnd is already
+       the last '/' so the tail is slash-free. */
+    perl_array_push(r, perl_alloc_string(""));           /* volume */
+    perl_array_push(r, perl_alloc_string_len(dir, dirlen));
+    perl_array_push(r, perl_alloc_string(file));
+    free(p);
+    return r;
+}
+
+/* real splitdir: split m|/|, $dirs, -1 (empty string → empty list) */
+PerlArray *perl_fspec_splitdir(PerlValue *dirPV) {
+    PerlArray *r = perl_array_new();
+    char *d = perl_to_string_dup(dirPV);
+    if (*d == '\0') { free(d); return r; }
+    size_t start = 0;
+    size_t len = strlen(d);
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || d[i] == '/') {
+            PerlValue *part = perl_alloc_string_len(d + start, i - start);
+            perl_array_push(r, part);
+            perl_free(part);
+            start = i + 1;
+        }
+    }
+    free(d);
+    return r;
+}
+
+/* real catpath (Unix): volume ignored;
+     if (dir ne '' && file ne '' && dir tail ne '/' && file head ne '/')
+         dir .= "/$file"
+     else
+         dir .= file                                             */
+PerlValue *perl_fspec_catpath(PerlArray *args) {
+    const char *dir = args->len > 1 ? perl_to_string(args->elems[1]) : "";
+    const char *file = args->len > 2 ? perl_to_string(args->elems[2]) : "";
+    size_t dlen = strlen(dir), flen = strlen(file);
+    char *out;
+    if (dlen > 0 && flen > 0 && dir[dlen-1] != '/' && file[0] != '/') {
+        out = malloc(dlen + flen + 2);
+        memcpy(out, dir, dlen);
+        out[dlen] = '/';
+        memcpy(out + dlen + 1, file, flen);
+        out[dlen + 1 + flen] = '\0';
+    } else {
+        out = malloc(dlen + flen + 1);
+        memcpy(out, dir, dlen);
+        memcpy(out + dlen, file, flen);
+        out[dlen + flen] = '\0';
+    }
+    PerlValue *r = perl_alloc_string(out);
+    free(out);
+    return r;
+}
+
+PerlValue *perl_fspec_curdir(void)  { return perl_alloc_string("."); }
+PerlValue *perl_fspec_updir(void)   { return perl_alloc_string(".."); }
+PerlValue *perl_fspec_rootdir(void) { return perl_alloc_string("/"); }
+PerlValue *perl_fspec_devnull(void) { return perl_alloc_string("/dev/null"); }
+
+/* real tmpdir: first of $ENV{TMPDIR}, /tmp that is -d and -w_, else
+   canonpath(cwd), then made absolute via rel2abs (real Perl: a relative
+   result — which can only be "." — is returned as-is because the absolute
+   alternative is untainted-preferred; the effect is tmpdir returns "/tmp"
+   here in practice, matching all real configs). */
+PerlValue *perl_fspec_tmpdir(void) {
+    const char *cands[2] = { getenv("TMPDIR"), "/tmp" };
+    for (int i = 0; i < 2; i++) {
+        if (!cands[i] || !*cands[i]) continue;
+        struct stat st;
+        if (stat(cands[i], &st) == 0 && S_ISDIR(st.st_mode) && access(cands[i], W_OK) == 0)
+            return perl_alloc_string(cands[i]);
+    }
+    /* fallback: curdir → canonpath → absolutize-or-keep (".") */
+    PerlValue *cwd = perl_getcwd();
+    char *canon = fspec_canonpath(perl_to_string(cwd));
+    perl_free(cwd);
+    PerlValue *r = perl_alloc_string(canon);
+    free(canon);
+    return r;
+}
+
+PerlValue *perl_fspec_file_name_is_absolute(PerlValue *pathPV) {
+    /* real module: `scalar($file =~ m:^/:s)` — a true match returns 1, a
+       failed match returns "" (empty string, not 0), and undef input
+       stringifies to "" so it's also "" (probed byte-for-byte) */
+    if (!pathPV || pathPV->tag == PERL_UNDEF) return perl_alloc_string("");
+    char *p = perl_to_string_dup(pathPV);
+    int isAbs = (p[0] == '/');
+    free(p);
+    return isAbs ? perl_alloc_int(1) : perl_alloc_string("");
+}
+
+/* real abs2rel's dirs extraction: splitpath($path, 1)[1] — the WHOLE path
+   as the directories portion ($no_file true → ($volume, $path, '')). */
+static void fspec_split_dirs_only(char *path, char **dirs) {
+    PerlValue *pathPV = perl_alloc_string(path);
+    PerlValue *nof = perl_alloc_int(1);
+    PerlArray *parts = perl_fspec_splitpath(pathPV, nof);
+    perl_free(pathPV); perl_free(nof);
+    *dirs = perl_to_string_dup(parts->elems[1]);
+    perl_array_free(parts);
+}
+
+/* real no_upwards: grep(!/^\.{1,2}\z/) */
+PerlArray *perl_fspec_no_upwards(PerlArray *args) {
+    PerlArray *r = perl_array_new();
+    for (long long i = 0; i < args->len; i++) {
+        const char *s = perl_to_string(args->elems[i]);
+        if (strcmp(s, ".") == 0 || strcmp(s, "..") == 0) continue;
+        PerlValue *v = perl_clone(args->elems[i]);
+        perl_array_push(r, v);
+        perl_free(v);
+    }
+    return r;
+}
+
+/* split into (vol, dirs, file) as strings — internal helper */
+static void fspec_split3(char *path, char **dirs, char **file) {
+    PerlValue *pathPV = perl_alloc_string(path);
+    PerlValue *nof = perl_alloc_int(0);
+    PerlArray *parts = perl_fspec_splitpath(pathPV, nof);
+    perl_free(pathPV); perl_free(nof);
+    *dirs = perl_to_string_dup(parts->elems[1]);
+    *file = perl_to_string_dup(parts->elems[2]);
+    perl_array_free(parts);
+}
+
+/* split a dirs-only string into components (splitdir semantics). Caller
+   frees the array and each component. */
+static char **fspec_split_components(const char *dirs, long long *count) {
+    char **out = malloc((strlen(dirs) / 2 + 8) * sizeof(char *));
+    long long n = 0;
+    if (*dirs == '\0') { *count = 0; return out; }
+    size_t start = 0;
+    size_t len = strlen(dirs);
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || dirs[i] == '/') {
+            out[n++] = fspec_strndup(dirs + start, i - start);
+            start = i + 1;
+        }
+    }
+    *count = n;
+    return out;
+}
+
+static void free_fspec_chunks(char **chunks, long long n) {
+    for (long long i = 0; i < n; i++) free(chunks[i]);
+    free(chunks);
+}
+
+/* real rel2abs (Unix):
+     if path is relative:
+         base undef/''        → base = getcwd
+         base relative        → base = rel2abs(base)     (recursive)
+         base absolute        → base = canonpath(base)
+         path = catdir(base, path)
+     return canonpath(path)                                      */
+PerlValue *perl_fspec_rel2abs(PerlValue *pathPV, PerlValue *basePV) {
+    char *path = perl_to_string_dup(pathPV);
+    if (path[0] != '/') {
+        char *base;
+        if (!basePV || basePV->tag == PERL_UNDEF ||
+            strlen(perl_to_string(basePV)) == 0) {
+            PerlValue *cwd = perl_getcwd();
+            base = perl_to_string_dup(cwd);
+            perl_free(cwd);
+        } else if (perl_to_string(basePV)[0] != '/') {
+            PerlValue *abs = perl_fspec_rel2abs(basePV, NULL);
+            base = perl_to_string_dup(abs);
+            perl_free(abs);
+        } else {
+            base = fspec_canonpath(perl_to_string(basePV));
+        }
+        /* catdir(base, path) = canonpath(base/path/) */
+        size_t total = strlen(base) + strlen(path) + 2;
+        char *joined = malloc(total);
+        memcpy(joined, base, strlen(base));
+        joined[strlen(base)] = '/';
+        strcpy(joined + strlen(base) + 1, path);
+        char *canon = fspec_canonpath(joined);
+        free(joined); free(base); free(path);
+        return perl_alloc_string(canon);
+    }
+    char *canon = fspec_canonpath(path);
+    free(path);
+    return perl_alloc_string(canon);
+}
+
+/* real abs2rel (Unix). Faithful port of the 3.95 algorithm:
+   base = getcwd when base undef/''
+   both canonpath'd
+   if either absolute: both rel2abs'd; dirs = splitpath(dirs-only)
+   else: wd = getcwd; both catdir'd onto wd
+   common-prefix removal with the updir/backtracking loop.        */
+PerlValue *perl_fspec_abs2rel(PerlValue *pathPV, PerlValue *basePV) {
+    char *path = perl_to_string_dup(pathPV);
+    char *base;
+    if (!basePV || basePV->tag == PERL_UNDEF ||
+        strlen(perl_to_string(basePV)) == 0) {
+        PerlValue *cwd = perl_getcwd();
+        base = perl_to_string_dup(cwd);
+        perl_free(cwd);
+    } else {
+        base = perl_to_string_dup(basePV);
+    }
+    char *pathC = fspec_canonpath(path);
+    char *baseC = fspec_canonpath(base);
+    free(path); free(base);
+
+    char *pathDirs, *baseDirs;
+    if (pathC[0] == '/' || baseC[0] == '/') {
+        PerlValue *pabs = perl_fspec_rel2abs(perl_alloc_string(pathC), NULL);
+        PerlValue *babs = perl_fspec_rel2abs(perl_alloc_string(baseC), NULL);
+        free(pathC); free(baseC);
+        pathC = perl_to_string_dup(pabs); perl_free(pabs);
+        baseC = perl_to_string_dup(babs); perl_free(babs);
+        fspec_split_dirs_only(pathC, &pathDirs);
+        fspec_split_dirs_only(baseC, &baseDirs);
+        free(pathC); free(baseC);
+    } else {
+        PerlValue *cwdPV = perl_getcwd();
+        char *wd = perl_to_string_dup(cwdPV);
+        perl_free(cwdPV);
+        char *wdd;
+        fspec_split_dirs_only(wd, &wdd);
+        free(wd);
+        /* catdir(wd_dirs, path): the real module does
+           catdir($wd_dirs, $path) — join with canonpath semantics. */
+        char *pj = malloc(strlen(wdd) + strlen(pathC) + 2);
+        strcpy(pj, wdd); strcat(pj, "/"); strcat(pj, pathC);
+        char *bj = malloc(strlen(wdd) + strlen(baseC) + 2);
+        strcpy(bj, wdd); strcat(bj, "/"); strcat(bj, baseC);
+        pathDirs = fspec_canonpath(pj);
+        baseDirs = fspec_canonpath(bj);
+        free(pj); free(bj); free(wdd); free(pathC); free(baseC);
+    }
+    /* pathC/baseC were consumed above; reuse the variables for dirs */
+    pathC = pathDirs; baseC = baseDirs;
+
+    /* split both dirs into component lists (splitdir semantics) */
+    long long pn = 0, bn = 0;
+    char **pchunks = fspec_split_components(pathDirs, &pn);
+    char **bchunks = fspec_split_components(baseDirs, &bn);
+
+    PerlArray *out = perl_array_new(); /* @reverse_base, in output order */
+    PerlArray *common = perl_array_new();
+
+    /* if ($base_directories eq $self->rootdir) special case */
+    if (strcmp(baseDirs, "/") == 0) {
+        if (strcmp(pathDirs, "/") == 0) {
+            /* return curdir */
+            perl_array_free(out); perl_array_free(common);
+            free_fspec_chunks(pchunks, pn); free_fspec_chunks(bchunks, bn);
+            free(pathDirs); free(baseDirs);
+            return perl_alloc_string(".");
+        }
+        /* shift @pathchunks; return canonpath(catpath('', catdir(@pathchunks), '')) */
+        PerlArray *rest = perl_array_new();
+        for (long long i = 1; i < pn; i++) {
+            PerlValue *v = perl_alloc_string(pchunks[i]);
+            perl_array_push(rest, v);
+            perl_free(v);
+        }
+        PerlValue *cd = perl_fspec_catdir(rest);
+        perl_array_free(rest);
+        PerlArray *cp = perl_array_new();
+        PerlValue *volStr = perl_alloc_string("");
+        perl_array_push(cp, volStr); perl_free(volStr);
+        perl_array_push(cp, cd);        /* borrowed below */
+        PerlValue *cp2 = perl_fspec_catpath(cp);
+        perl_array_free(cp);
+        perl_free(cd);
+        free_fspec_chunks(pchunks, pn); free_fspec_chunks(bchunks, bn);
+        free(pathDirs); free(baseDirs);
+        return cp2;
+    }
+
+    long long pi = 0, bi = 0;
+    while (pi < pn && bi < bn && strcmp(pchunks[pi], bchunks[bi]) == 0) {
+        PerlValue *v = perl_alloc_string(pchunks[pi]);
+        perl_array_push(common, v);
+        perl_free(v);
+        pi++; bi++;
+    }
+    if (pi >= pn && bi >= bn) {
+        /* identical → curdir */
+        perl_array_free(out); perl_array_free(common);
+        free_fspec_chunks(pchunks, pn); free_fspec_chunks(bchunks, bn);
+        free(pathDirs); free(baseDirs);
+        return perl_alloc_string(".");
+    }
+
+    /* the updir / backtracking loop */
+    for (; bi < bn; bi++) {
+        const char *dir = bchunks[bi];
+        if (strcmp(dir, "..") != 0) {
+            PerlValue *v = perl_alloc_string("..");
+            perl_array_push(out, v);   /* unshift @reverse_base, updir */
+            perl_free(v);
+            PerlValue *c = perl_alloc_string(dir);
+            perl_array_push(common, c); /* push @common, dir */
+            perl_free(c);
+        } else if (common->len > 0) {
+            if (out->len > 0 &&
+                strcmp(perl_to_string(out->elems[out->len - 1]), "..") == 0) {
+                /* real Perl: $reverse_base[0] eq updir → shift it off and
+                   pop @common */
+                perl_array_pop(common);
+                perl_array_pop(out);
+            } else {
+                /* unshift @reverse_base, pop @common */
+                PerlValue *c = common->elems[common->len - 1];
+                perl_array_push(out, perl_clone(c));
+                perl_array_pop(common);
+            }
+        }
+        /* else: updir with empty @common — Perl silently drops it */
+    }
+    /* result dirs = catdir(reverse_base_in_order, @pathchunks[pi..]) */
+    PerlArray *resultDirs = perl_array_new();
+    for (long long i = out->len - 1; i >= 0; i--) {
+        PerlValue *v = perl_clone(out->elems[i]);
+        perl_array_push(resultDirs, v);
+        perl_free(v);
+    }
+    for (long long i = pi; i < pn; i++) {
+        PerlValue *v = perl_alloc_string(pchunks[i]);
+        perl_array_push(resultDirs, v);
+        perl_free(v);
+    }
+    PerlValue *cd = perl_fspec_catdir(resultDirs);
+    perl_array_free(resultDirs);
+    PerlArray *cp = perl_array_new();
+    PerlValue *volStr = perl_alloc_string("");
+    perl_array_push(cp, volStr); perl_free(volStr);
+    perl_array_push(cp, cd);
+    perl_free(cd);
+    PerlValue *cp2 = perl_fspec_catpath(cp);
+    perl_array_free(cp);
+    char *canon = fspec_canonpath(perl_to_string(cp2));
+    perl_free(cp2);
+    perl_array_free(out);
+    perl_array_free(common);
+    free_fspec_chunks(pchunks, pn); free_fspec_chunks(bchunks, bn);
+    free(pathDirs); free(baseDirs);
+    PerlValue *r = perl_alloc_string(canon);
+    free(canon);
+    return r;
+}
+
+PerlValue *perl_fspec_join(PerlArray *args) { return perl_fspec_catfile(args); }
+PerlValue *perl_fspec_case_tolerant(void) { return perl_alloc_int(0); }
+
+/* real path(): split($ENV{PATH}//'', ':', -1) with empty → "." */
+PerlArray *perl_fspec_path(void) {
+    PerlArray *r = perl_array_new();
+    const char *path = getenv("PATH");
+    const char *p = path ? path : "";
+    if (!path) return r;   /* no $ENV{PATH} → () */
+    size_t start = 0;
+    size_t len = strlen(p);
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || p[i] == ':') {
+            char *comp = fspec_strndup(p + start, i - start);
+            PerlValue *v = perl_alloc_string(comp[0] ? comp : ".");
+            perl_array_push(r, v);
+            perl_free(v);
+            free(comp);
+            start = i + 1;
+        }
+    }
+    return r;
+}
+
+/* ── File::Spec ── */
+PerlValue *perl_fspec_canonpath(PerlValue *pathPV) {
+    char *p = perl_to_string_dup(pathPV);
+    char *canon = fspec_canonpath(p);
+    free(p);
+    PerlValue *r = perl_alloc_string(canon);
+    free(canon);
+    return r;
+}
+
+/* ── Time::Local ── */
+
+/* _daygm from Time::Local 1.35. $Epoc = _daygm(gmtime(0)) — the day
+   number of 1970-01-01 in the same day-numbering = 719469 (the constant
+   the real module derives at load time; verified on this host). */
+static long long tl_daygm(long long mday, long long mon, long long year) {
+    long long month = (mon + 10) % 12;
+    long long y     = year + 1900 - month / 10;
+    return mday + ((365 * y) + y / 4 - y / 100 + y / 400
+                   + ((month * 306) + 5) / 10) - 719469;
+}
+
+/* Year-munging rules probed byte-for-byte (see TESTS.md):
+     year >= 1000 → year - 1900
+     100..999     → unchanged (offset-from-1900 interpretation)
+     0..99        → +(year > bp ? century : nextCentury)   [bp = (thisYear+50)%100]
+     negative     → UNCHANGED (offset-from-1900; real module's
+                    `elsif ($year < 100 and $year >= 0)` doesn't fire)   */
+static long long tl_munge_year(long long year) {
+    if (year >= 1000) return year - 1900;
+    if (year >= 100)  return year;
+    if (year < 0)     return year;   /* real module leaves negatives as-is */
+    /* 0..99: rolling-century fixup. */
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    long long thisYear = (long long)lt.tm_year;          /* offset from 1900 */
+    long long breakpoint  = (thisYear + 50) % 100;
+    long long nextCentury = thisYear - thisYear % 100;
+    if (breakpoint < 50) nextCentury += 100;
+    long long century = nextCentury - 100;
+    return year + ((year > breakpoint) ? century : nextCentury);
+}
+
+static int tl_is_leap_year(long long y) {
+    if (y % 4) return 0;
+    if (y % 100) return 1;
+    if (y % 400) return 0;
+    return 1;
+}
+
+static void tl_range_check(long long sec, long long min, long long hour,
+                           long long mday, long long mon, long long year) {
+    static const int monthDays[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    if (mon > 11 || mon < 0)
+        perl_die_croak("Month '%lld' out of range 0..11", mon);
+    int md = monthDays[mon];
+    if (mon == 1 && tl_is_leap_year(year + 1900)) md++;
+    if (mday > md || mday < 1)
+        perl_die_croak("Day '%lld' out of range 1..%d", mday, md);
+    if (hour > 23 || hour < 0)
+        perl_die_croak("Hour '%lld' out of range 0..23", hour);
+    if (min > 59 || min < 0)
+        perl_die_croak("Minute '%lld' out of range 0..59", min);
+    if (sec >= 60 || sec < 0)
+        perl_die_croak("Second '%lld' out of range 0..59", sec);
+}
+
+static long long tl_timegm_impl(long long sec, long long min, long long hour,
+                                long long mday, long long mon, long long year,
+                                int noMunge, int posixYear, int noCheck) {
+    if (!noMunge && !posixYear)
+        year = tl_munge_year(year);
+    else if (noMunge)
+        year -= 1900;   /* *_modern: strictly offset-from-1900 */
+    /* *_posix: year taken as-is (offset from 1900) — no munging */
+    if (!noCheck)
+        tl_range_check(sec, min, hour, mday, mon, year);
+    long long days = tl_daygm(mday, mon, year);
+    if (llabs(days) > 365LL * 2147483648LL && !noCheck) {
+        perl_die_croak("Day too big - abs(%lld) > 783831531520\n"
+                       "Cannot handle date (%lld, %lld, %lld, %lld, %lld, %lld)",
+                       days, sec, min, hour, mday, mon, year + 1900);
+    }
+    return sec + 60 * min + 3600 * hour + 86400 * days;
+}
+
+/* Shared timelocal DST-resolution tail (used by timelocal, the nocheck and
+   the modern/posix variants). refT is the timegm-of-fields epoch; resolves
+   the zone offset with real Time::Local's three-step algorithm. */
+static long long tl_locate_local(long long refT, long long sec, long long min,
+                                 long long hour) {
+    time_t tt = (time_t)refT;
+    struct tm lt;
+    localtime_r(&tt, &lt);
+    long long locForRefT = tl_daygm(lt.tm_mday, lt.tm_mon, lt.tm_year) * 86400
+                         + lt.tm_sec + 60 * lt.tm_min + 3600 * lt.tm_hour;
+    long long zoneOff = locForRefT - refT;
+    if (zoneOff == 0) return locForRefT;
+    long long locT = refT - zoneOff;
+    time_t lt1 = (time_t)locT;
+    struct tm l1;
+    localtime_r(&lt1, &l1);
+    long long locForLocT = tl_daygm(l1.tm_mday, l1.tm_mon, l1.tm_year) * 86400
+                         + l1.tm_sec + 60 * l1.tm_min + 3600 * l1.tm_hour;
+    long long dstOff = refT - locForLocT;
+    if (dstOff == 0) {
+        time_t prev = (time_t)(locT - 3600);
+        struct tm lp;
+        localtime_r(&prev, &lp);
+        long long locForPrev = tl_daygm(lp.tm_mday, lp.tm_mon, lp.tm_year) * 86400
+                             + lp.tm_sec + 60 * lp.tm_min + 3600 * lp.tm_hour;
+        if (refT - 3600 - locForPrev < 0)
+            return locT - 3600;
+        return locT;
+    }
+    locT += dstOff;
+    if (dstOff > 0) return locT;
+    /* DST-spring-forward gap: non-existent local time → one hour later */
+    time_t lt2 = (time_t)locT;
+    struct tm l2;
+    localtime_r(&lt2, &l2);
+    if (l2.tm_sec != sec || l2.tm_min != min || l2.tm_hour != hour)
+        locT -= dstOff;
+    return locT;
+}
+
+PerlValue *perl_timegm(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    /* fractional second ($sec - int($sec)) — real Time::Local adds it back */
+    double subsec = args->len > 0
+        ? perl_to_float(args->elems[0]) - (double)sec : 0.0;
+    long long t = tl_timegm_impl(sec, min, hour, mday, mon, year, 0, 0, 0);
+    if (subsec != 0.0) return perl_alloc_float((double)t + subsec);
+    return perl_alloc_int(t);
+}
+
+PerlValue *perl_timelocal(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    double subsec = args->len > 0
+        ? perl_to_float(args->elems[0]) - (double)sec : 0.0;
+    long long refT = tl_timegm_impl(sec, min, hour, mday, mon, year, 0, 0, 0);
+    long long result = tl_locate_local(refT, sec, min, hour);
+    if (subsec != 0.0) return perl_alloc_float((double)result + subsec);
+    return perl_alloc_int(result);
+}
+
+PerlValue *perl_timegm_nocheck(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    double subsec = args->len > 0
+        ? perl_to_float(args->elems[0]) - (double)sec : 0.0;
+    long long t = tl_timegm_impl(sec, min, hour, mday, mon, year, 0, 0, 1);
+    if (subsec != 0.0) return perl_alloc_float((double)t + subsec);
+    return perl_alloc_int(t);
+}
+
+PerlValue *perl_timelocal_nocheck(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    double subsec = args->len > 0
+        ? perl_to_float(args->elems[0]) - (double)sec : 0.0;
+    long long refT = tl_timegm_impl(sec, min, hour, mday, mon, year, 0, 0, 1);
+    long long result = tl_locate_local(refT, sec, min, hour);
+    if (subsec != 0.0) return perl_alloc_float((double)result + subsec);
+    return perl_alloc_int(result);
+}
+
+PerlValue *perl_timegm_modern(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    long long t = tl_timegm_impl(sec, min, hour, mday, mon, year, 1, 0, 0);
+    return perl_alloc_int(t);
+}
+
+PerlValue *perl_timelocal_modern(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    long long refT = tl_timegm_impl(sec, min, hour, mday, mon, year, 1, 0, 0);
+    return perl_alloc_int(tl_locate_local(refT, sec, min, hour));
+}
+
+PerlValue *perl_timegm_posix(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    long long t = tl_timegm_impl(sec, min, hour, mday, mon, year, 0, 1, 0);
+    return perl_alloc_int(t);
+}
+
+PerlValue *perl_timelocal_posix(PerlArray *args) {
+    long long sec  = args->len > 0 ? (long long)perl_to_int(args->elems[0]) : 0;
+    long long min  = args->len > 1 ? (long long)perl_to_int(args->elems[1]) : 0;
+    long long hour = args->len > 2 ? (long long)perl_to_int(args->elems[2]) : 0;
+    long long mday = args->len > 3 ? (long long)perl_to_int(args->elems[3]) : 0;
+    long long mon  = args->len > 4 ? (long long)perl_to_int(args->elems[4]) : 0;
+    long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
+    long long refT = tl_timegm_impl(sec, min, hour, mday, mon, year, 0, 1, 0);
+    return perl_alloc_int(tl_locate_local(refT, sec, min, hour));
 }
 
 /* ── File I/O ─────────────────────────────────────────────────────────────── */

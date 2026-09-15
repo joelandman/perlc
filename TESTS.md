@@ -2418,6 +2418,106 @@ modules not covered by survey #1 — `Pod::Usage`, `Pod::Checker`,
 candidate list (higher real-world hit count in this sample than
 `File::Find` was when it was added).
 
+## 2026-09-14 real-world probe survey #3 + Tier-1 module batch
+
+Two parallel agents: one ran a 12-script probe survey (never covered by
+surveys #1/#2), the other implemented the Tier-1 native modules
+(Cwd, Sys::Hostname, File::Spec/+::Functions, Time::Local — see the
+sections above). Both gated 331/331 in their sandboxes; merged tree is
+341/341.
+
+**Implemented (agent B)**: Cwd (`getcwd`/`cwd`/`abs_path`/`fast_abs_path`/
+`realpath` — a faithful `fast_abs_path` port incl. its "nonexistent
+path → catfile($cwd,$path), not undef" quirk), Sys::Hostname
+(`hostname()` with real 1.25's trailing-NUL/CR/LF strip), File::Spec
+(+ ::Functions + ::Unix: canonpath/catdir/catfile/catpath/join/splitpath/
+splitdir/rel2abs/abs2rel/curdir/updir/rootdir/devnull/tmpdir/
+file_name_is_absolute/no_upwards/case_tolerant/path, all three
+invocation styles — class method, qualified, imported-bare — with the
+real module's exact quirks: `canonpath("/a/../b")` stays
+`/a/../b` by design; `file_name_is_absolute("x")` returns `""` not 0;
+`catfile("a","","b")` → `a/b`), and Time::Local (all eight exports:
+timegm/timelocal/`_nocheck`/`_modern`/`_posix`, real 1.35's
+three-step DST algorithm and exact croak messages with caller
+location). Also fixed en route: scalar-context `gmtime(EXPR)`/
+`localtime(EXPR)` returned the epoch instead of the ctime string.
+Tests: `tests/{cwd,sys_hostname,file_spec,file_spec_functions,time_local}_{smoke,deep}.pl`
+(10 files, byte-for-byte).
+
+**Survey #3 table** (compile pass 1 as-is; pass 2 with `-I` at real
+perl's core dirs):
+
+| Script | Modules | P1 | P2 blocker (now fixed unless noted) |
+|---|---|---|---|
+| update-locale | Getopt::Long | OK | — (byte-identical) |
+| xsubpp | Getopt::Long | OK | — (Configure() no-op added; byte-identical) |
+| pptpsetup | Getopt::Long | OK | — (`&delete()` keyword-named-sub call fixed; byte-identical) |
+| update-xmlcatalog | File::Spec, Getopt::Long | no | File::Spec → now implemented; byte-identical no-args |
+| geteltorito | Getopt::Std | no | `${"opt_$x"}` symbolic deref (W22, open) |
+| instmodsh | ExtUtils::Installed, IO::File | no | Fcntl SEEK_SET tag export+value (W16, open) |
+| pod2usage | Config | no | Config.pm:52 `*{$pkg.'::'.$f}=\&{$f}` (W27, open) |
+| validlocale | POSIX qw(LC_ALL) | no | LC_ALL bareword-constant value (W16, open) |
+| pl2pm | core only | no | `s/\|foo\|bar/next`-style `next` after `||` (W2-class, open) |
+| update-language | Text::ParseWords | no | `local *_ = \join(...)` (W29, open) |
+| piconv | Encode, Encode::Alias | no | `$find =~ $alias` (W28, open; needs `qr//` too) |
+| shasum | Digest::SHA, Fcntl | no | Errno.pm's `eval "sub $name()..."` (W30, open) |
+
+**Fixed during the survey** (each verified vs real perl; full harness
+331/331 + `make test` 47/47 in the agent sandbox before merge):
+
+- `my (%h)`/`our (%Config, $VERSION)` list declarations with mixed
+  sigils (Config.pm:11 — blocked 6 of the 12 scripts): `parseMy`'s
+  paren fast-path now only fires when the *next* token is `)`.
+- `use constant` multi-token values: `5 - 3` was silently `5`
+  (single-token capture), and `!!$ENV{X}` produced an unparseable
+  injected `sub { return !; }` that OOB-crashed — values are now
+  captured as full expressions, and the `{ }` block form scopes each
+  entry's value end at the next top-level comma.
+- `<<5` after an integer (`1<<5`) lexed as a heredoc (real Perl prints
+  32) — and the mis-lex also OOB-crashed `inlineModules` (perli11ndoc
+  compiler crash).
+- `q!...!`-style arbitrary-delimiter `q`/`qq` openers (any non-alnum
+  opener now accepted; closers and `=` still excluded).
+- whitespace between `qw` and its delimiter (`qw (` — Encode/Alias).
+- `tr///` with arbitrary delimiter pairs (`tr|/|_`, `tr{/}{_}`,
+  `tr!-!!d`), matching `s///`'s existing delimiter handling.
+- `print($fh "str")` (no comma) is a filehandle form, matching real
+  Perl exactly; `print(LOG "str")` bare-fh-in-parens too.
+- `&delete()`/`&help()` — keyword-named subs callable with `&`
+  (pptpsetup idiom).
+- `Getopt::Long::Configure(...)` accepted as a no-op returning 1
+  (real Getopt::Long's parser config isn't modeled; unblocked xsubpp).
+
+**Logged, not fixed** (repros in git history of the survey agent's
+report; the highest-leverage next items):
+1. **W27 — Config.pm's `*{$pkg.'::'.$f}=\&{$f}`** (computed typeglob
+   assignment) — Config.pm is the highest-leverage single target (it
+   gates pod2usage, instmodsh, perlthanks, h2ph, splain...).
+2. **W16 — Exporter tag validation + XS-constant values**: requesting a
+   name that's only in a `%EXPORT_TAGS` value (e.g. Fcntl's SEEK_SET in
+   `:standard`) is falsely rejected, and there's no value path for
+   XS-module constants (LC_ALL, SEEK_SET) once validation passes.
+3. **W30 — runtime sub-defining string eval** (`eval "sub $name() { 2 }"`
+   — Errno.pm, and with it File::Path users).
+4. **W22 — `${"opt_$x"}` symbolic deref** (Getopt/Std.pm → geteltorito).
+5. **W23 — in-key auto-quote swallows builtin keywords** in
+   `$h{lc $k}`-style expressions (D136 over-generalization;
+   Debconf::ConfModule, Encode::MIME::Name).
+6. **W28 — `$s =~ $var`** (pattern in a variable; Encode/Alias →
+   piconv; entangled with the still-open `qr//` gap).
+7. **W29 — `local *_ = \join(...)`** (Text::ParseWords → update-language).
+8. **W31 — `sub f { return (32); }` returns empty** (real: 32); also
+   makes `use constant D => (32)` yield empty.
+9. **W19 — `use constant B => A + 1`** — the fresh-Parser constant
+   injection lacks constMap, so a bareword prior constant misparses.
+10. `qr//` remains the single biggest parse blocker for the File::Spec/
+    regex-heavy module family (now that File::Spec's *functional* API
+    is native, qr// mostly blocks remaining module-internal uses).
+
+Updated Tier-1 module priority after the survey: (1) Config.pm chain
+(W27+W30), (2) Fcntl/POSIX constants + tag validation (W16), (3)
+`=~ $var` + `qr//` (W28).
+
 ## Source layout
 
 | File | Role |
