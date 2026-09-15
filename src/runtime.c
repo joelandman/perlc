@@ -10166,6 +10166,409 @@ void perl_xs_cleanup(void) {
     s_xs_module_list = NULL;
 }
 
+/* ── DynaLoader-compatible FFI (phase 2) ──────────────────────────────────
+ *
+ * Implements the surface real DynaLoader scripts and XSLoader use, on top
+ * of the same dlopen/dlsym machinery XS::load_library uses:
+ *
+ *   dl_load_file($path, $flags)     → opaque libref (a small integer index;
+ *                                     real perl's libref is also opaque)
+ *   dl_find_symbol($libref, $sym)   → opaque symref (integer index into an
+ *                                     internal function-pointer table)
+ *   dl_install_xsub($name, $symref) → registers the C fn pointer as a
+ *                                     Perl-callable sub under $name
+ *   dl_error()                      → last dlerror() text
+ *   bootstrap($module [, $version]) → the full real-DynaLoader flow, with
+ *                                     a perlc twist (see below)
+ *
+ * The perlc twist: a perlc-compiled "XS module" is a .pl (compiled on
+ * demand via the same PERLC_SELF_PATH --do-lib subprocess perl_do_file
+ * uses) or a prebuilt .so (built with perlc --do-lib, its perl_*
+ * references resolving against this process at dlopen time). Either way,
+ * dlopen'ing it registers its subs into THIS process's function registry.
+ * bootstrap() then calls the module's own boot_<Module> sub (underscores
+ * substituted for non-word chars, exactly like real DynaLoader's
+ * $bootname mangling), which is expected to do the module's
+ * initialization — for C-backed modules that means dl_install_xsub calls
+ * mapping C symbols into Perl names; for perlc-built modules the subs it
+ * defines are already registered and boot_ is free to do any setup.
+ *
+ * The registered-xsub calling convention is the perlc one:
+ * PerlValue *(*)(PerlArray *args, int ctx) — the same shape every
+ * perlc-compiled sub has. Raw C functions (different ABI) are reached
+ * through the existing XS::call signature-dispatch machinery instead.
+ *
+ * $DynaLoader::dl_error is also kept as a scalar for scripts that read it
+ * directly. */
+
+#define DL_TABLE_MAX 256
+static void *s_dl_handles[DL_TABLE_MAX];  /* libref index → dlopen handle */
+static int   s_dl_handle_count = 0;
+static void *s_dl_syms[DL_TABLE_MAX];     /* symref index → dlsym result */
+static int   s_dl_sym_count = 0;
+static char *s_dl_error_text = NULL;
+static char *s_dl_shared_objects[DL_TABLE_MAX];
+static int   s_dl_shared_count = 0;
+
+static void dl_set_error(const char *msg) {
+    free(s_dl_error_text);
+    s_dl_error_text = msg ? strdup(msg) : NULL;
+    perl_set_dollar_at_cstr(s_dl_error_text ? s_dl_error_text : "DynaLoader error");
+}
+
+static const char *dl_last_error(void) {
+    return s_dl_error_text ? s_dl_error_text : "";
+}
+
+static void *dl_libref_handle(long long libref) {
+    if (libref < 1 || libref > s_dl_handle_count) return NULL;
+    return s_dl_handles[libref - 1];
+}
+
+PerlValue *perl_dl_load_file(PerlValue *path_pv, PerlValue *flags_pv) {
+    char *path;
+    int flags = 0;
+    void *handle;
+
+    (void)flags_pv;
+    if (flags_pv && flags_pv->tag != PERL_UNDEF)
+        flags = (int)perl_to_int(flags_pv);
+
+    if (!path_pv || path_pv->tag == PERL_UNDEF) {
+        dl_set_error("DynaLoader::dl_load_file: missing path");
+        return perl_alloc_undef();
+    }
+    path = perl_to_string_dup(path_pv);
+    if (!path) {
+        dl_set_error("DynaLoader::dl_load_file: invalid path");
+        return perl_alloc_undef();
+    }
+
+    dlerror();
+    handle = dlopen(path, flags ? RTLD_NOW | RTLD_GLOBAL : RTLD_NOW);
+    if (!handle) {
+        const char *err = dlerror();
+        dl_set_error(err ? err : "dl_load_file failed");
+        free(path);
+        return perl_alloc_undef();
+    }
+    if (s_dl_handle_count < DL_TABLE_MAX) {
+        s_dl_handles[s_dl_handle_count++] = handle;
+        if (s_dl_shared_count < DL_TABLE_MAX)
+            s_dl_shared_objects[s_dl_shared_count++] = strdup(path);
+    }
+    dl_set_error(NULL);
+    free(path);
+    /* libref is 1-based so it's always truthy in Perl code */
+    return perl_alloc_int((long long)s_dl_handle_count);
+}
+
+PerlValue *perl_dl_find_symbol(PerlValue *libref_pv, PerlValue *sym_pv) {
+    long long libref;
+    char *symname;
+    void *handle;
+    void *sym;
+
+    if (!libref_pv || !sym_pv || libref_pv->tag == PERL_UNDEF ||
+        sym_pv->tag == PERL_UNDEF) {
+        dl_set_error("DynaLoader::dl_find_symbol: expected (libref, symbol)");
+        return perl_alloc_undef();
+    }
+    libref = perl_to_int(libref_pv);
+    handle = dl_libref_handle(libref);
+    if (!handle) {
+        dl_set_error("DynaLoader::dl_find_symbol: invalid libref");
+        return perl_alloc_undef();
+    }
+    symname = perl_to_string_dup(sym_pv);
+    if (!symname) {
+        dl_set_error("DynaLoader::dl_find_symbol: invalid symbol name");
+        return perl_alloc_undef();
+    }
+    dlerror();
+    sym = dlsym(handle, symname);
+    if (!sym) {
+        const char *err = dlerror();
+        char msg[512];
+        snprintf(msg, sizeof(msg), "DynaLoader::dl_find_symbol: %s: %s",
+                 symname, err ? err : "not found");
+        dl_set_error(msg);
+        free(symname);
+        return perl_alloc_undef();
+    }
+    free(symname);
+    if (s_dl_sym_count < DL_TABLE_MAX)
+        s_dl_syms[s_dl_sym_count++] = sym;
+    dl_set_error(NULL);
+    return perl_alloc_int((long long)s_dl_sym_count);
+}
+
+PerlValue *perl_dl_error(void) {
+    const char *e = dl_last_error();
+    return *e ? perl_alloc_string(e) : perl_alloc_undef();
+}
+
+PerlValue *perl_dl_install_xsub(PerlValue *name_pv, PerlValue *symref_pv) {
+    char *name;
+    long long symref;
+    void *sym;
+
+    if (!name_pv || !symref_pv || name_pv->tag == PERL_UNDEF ||
+        symref_pv->tag == PERL_UNDEF) {
+        dl_set_error("DynaLoader::dl_install_xsub: expected (perl_name, symref)");
+        return perl_alloc_undef();
+    }
+    name = perl_to_string_dup(name_pv);
+    if (!name || !strchr(name, ':')) {
+        /* XSUB names must be fully qualified for the process registry */
+        char fq[512];
+        snprintf(fq, sizeof(fq), "main::%s", name ? name : "");
+        free(name);
+        name = strdup(fq);
+    }
+    symref = perl_to_int(symref_pv);
+    if (symref < 1 || symref > s_dl_sym_count) {
+        dl_set_error("DynaLoader::dl_install_xsub: invalid symref");
+        free(name);
+        return perl_alloc_undef();
+    }
+    sym = s_dl_syms[symref - 1];
+    /* perlc XSUB convention: PerlValue *fn(PerlArray *args, int ctx) */
+    perl_register_method(name, (PerlSubFnCtx)sym);
+    dl_set_error(NULL);
+    free(name);
+    return perl_alloc_int(1);
+}
+
+/* bootstrap($module [, $version]) — the full flow. Returns 1 on success;
+   on failure returns undef with the error in $@ (matching DynaLoader's
+   croak-ish behavior closely enough for callers that wrap in eval). */
+PerlValue *perl_dl_bootstrap(PerlValue *module_pv, PerlValue *version_pv) {
+    char *module = NULL;
+    char modpath[1024];
+    char bootname[512];
+    char soPath[256], errPath[256];
+    char cmd[2560];
+    const char *search[8];
+    int nsearch = 0;
+    int found = 0;
+    char resolved[1024];
+    int rc;
+    void *handle;
+    PerlSubFnCtx entry;
+    char *dot;
+
+    (void)version_pv;
+    if (!module_pv || module_pv->tag == PERL_UNDEF) {
+        dl_set_error("DynaLoader::bootstrap: missing module name");
+        return perl_alloc_undef();
+    }
+    module = perl_to_string_dup(module_pv);
+    if (!module || !*module) {
+        dl_set_error("DynaLoader::bootstrap: invalid module name");
+        free(module);
+        return perl_alloc_undef();
+    }
+
+    /* Search: PERLC_LIB (perlc-specific, set by the test/embedding env),
+       PERL5LIB (colon-separated, the same var real perl honors), then
+       ".", "lib". Mirrors how the compiler resolves `use Module` (cwd +
+       lib/ + -I dirs) as closely as the runtime can know them. */
+    {
+        const char *envlib = getenv("PERLC_LIB");
+        const char *dlpath = getenv("PERL5LIB");
+        if (envlib && *envlib) search[nsearch++] = envlib;
+        search[nsearch++] = "lib";
+        search[nsearch++] = ".";
+        if (dlpath && *dlpath) {
+            /* colon-separated */
+            char *copy = strdup(dlpath);
+            char *tok = copy;
+            while (tok && nsearch < 7) {
+                char *colon = strchr(tok, ':');
+                if (colon) *colon = 0;
+                if (*tok) search[nsearch++] = tok;
+                tok = colon ? colon + 1 : NULL;
+            }
+        }
+    }
+
+    /* Try each search dir for auto/Mod/ule/Name.so and Name.pl */
+    for (int d = 0; d < nsearch && !found; d++) {
+        snprintf(modpath, sizeof(modpath), "%s/auto/%s", search[d], module);
+        /* "Foo::Bar" → "Foo/Bar" (collapse :: pairs, not per-char) */
+        {
+            char *w = modpath + strlen(search[d]) + 5;
+            char *r = w;
+            while (*r) {
+                if (r[0] == ':' && r[1] == ':') { *w++ = '/'; r += 2; }
+                else { *w++ = *r++; }
+            }
+            *w = '\0';
+        }
+        /* Real DynaLoader layout: auto/<Mod/pname>/<Modfname>.so — the
+           leaf directory is the module's last :: part and the file inside
+           it repeats that name. */
+        const char *leaf = strrchr(modpath, '/');
+        leaf = leaf ? leaf + 1 : modpath;
+        snprintf(resolved, sizeof(resolved), "%s/%s.so", modpath, leaf);
+        if (access(resolved, R_OK) == 0) { found = 1; break; }
+        snprintf(resolved, sizeof(resolved), "%s/%s.pl", modpath, leaf);
+        if (access(resolved, R_OK) == 0) { found = 1; break; }
+    }
+
+    if (!found) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg),
+                 "Can't locate loadable object for module %s in @INC",
+                 module);
+        dl_set_error(msg);
+        free(module);
+        return perl_alloc_undef();
+    }
+    dot = strrchr(resolved, '.');
+    if (!dot || (strcmp(dot, ".so") != 0 && strcmp(dot, ".pl") != 0)) {
+        dl_set_error("DynaLoader::bootstrap: internal path error");
+        free(module);
+        return perl_alloc_undef();
+    }
+
+    if (strcmp(dot, ".so") == 0) {
+        /* Prebuilt perlc --do-lib .so: dlopen directly (its perl_*
+           references resolve against this process). */
+        dlerror();
+        handle = dlopen(resolved, RTLD_NOW);
+        if (!handle) {
+            const char *err = dlerror();
+            char msg[1400];
+            snprintf(msg, sizeof(msg), "Can't load '%s' for module %s: %s",
+                     resolved, module, err ? err : dl_last_error());
+            dl_set_error(msg);
+            free(module);
+            return perl_alloc_undef();
+        }
+        if (s_dl_handle_count < DL_TABLE_MAX)
+            s_dl_handles[s_dl_handle_count++] = handle;
+    } else {
+        /* .pl: compile on demand exactly like perl_do_file does. */
+        static long long s_boot_counter = 0;
+        long long id = __atomic_fetch_add(&s_boot_counter, 1, __ATOMIC_RELAXED);
+        snprintf(soPath,  sizeof(soPath),  "/tmp/_perlc_boot_%d_%lld.so",  (int)getpid(), id);
+        snprintf(errPath, sizeof(errPath), "/tmp/_perlc_boot_%d_%lld.err", (int)getpid(), id);
+        snprintf(cmd, sizeof(cmd), "%s --do-lib \"%s\" -o \"%s\" >\"%s\" 2>&1",
+                 PERLC_SELF_PATH, resolved, soPath, errPath);
+        rc = system(cmd);
+        if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+            char *errtext = perl_read_runtime_file(errPath);
+            char msg[1600];
+            if (errtext && errtext[0])
+                snprintf(msg, sizeof(msg), "Can't load '%s' for module %s: %s",
+                         resolved, module, errtext);
+            else
+                snprintf(msg, sizeof(msg), "Can't load '%s' for module %s: compilation error",
+                         resolved, module);
+            dl_set_error(msg);
+            free(errtext);
+            unlink(soPath);
+            unlink(errPath);
+            free(module);
+            return perl_alloc_undef();
+        }
+        unlink(errPath);
+        dlerror();
+        handle = dlopen(soPath, RTLD_NOW);
+        unlink(soPath);
+        if (!handle) {
+            const char *err = dlerror();
+            char msg[1400];
+            snprintf(msg, sizeof(msg), "Can't load '%s' for module %s: %s",
+                     resolved, module, err ? err : "dlopen failed");
+            dl_set_error(msg);
+            free(module);
+            return perl_alloc_undef();
+        }
+        if (s_dl_handle_count < DL_TABLE_MAX)
+            s_dl_handles[s_dl_handle_count++] = handle;
+    }
+    if (s_dl_shared_count < DL_TABLE_MAX)
+        s_dl_shared_objects[s_dl_shared_count++] = strdup(resolved);
+
+    /* Running the module's entry registers all of its subs (its boot_
+       sub included) into this process's function registry. */
+    entry = (PerlSubFnCtx)dlsym(handle, "__perlc_do_run");
+    if (entry) {
+        PerlArray *noargs = perl_array_new();
+        PerlValue *ignored = entry(noargs, 0);
+        perl_free(ignored);
+        perl_array_free_nc(noargs);
+    }
+
+    /* Try the boot hook under the name shapes a perlc-built module
+       realistically registers (do-lib registers subs under their
+       package-qualified names, plus a main:: alias for bare ones):
+         1. "<Module>::boot"        — perlc convention, unambiguous
+         2. "<Module>::boot_<mang>" — real DynaLoader's boot_My_Mod
+         3. "boot_<mangled>"        — bare (registered when the module's
+                                      boot_ sub is defined outside any
+                                      package, or as a main:: alias) */
+    const char *candidates[3];
+    char qualname[512];
+    snprintf(bootname, sizeof(bootname), "boot_%s", module);
+    for (char *c = bootname + 5; *c; c++)
+        if (!isalnum((unsigned char)*c) && *c != '_') *c = '_';
+    snprintf(qualname, sizeof(qualname), "%s::boot", module);
+    candidates[0] = qualname;
+    {
+        static char cand2[512], cand3[512];
+        snprintf(cand2, sizeof(cand2), "%s::%s", module, bootname);
+        candidates[1] = cand2;
+        candidates[2] = bootname;
+    }
+
+    /* Call it via the process registry (registered by the module's own
+       code — a perlc-built module's subs are all registered at load). */
+    {
+        PerlValue *bootret = NULL;
+        int called = 0;
+        for (int ci = 0; ci < 3 && !called; ci++) {
+            PerlArray *noargs2 = perl_array_new();
+            bootret = perl_call_named_sub(candidates[ci], noargs2, 0);
+            perl_array_free_nc(noargs2);
+            if (bootret && bootret->tag != PERL_UNDEF) called = 1;
+            else perl_free(bootret);
+        }
+        if (!called) {
+            /* No boot_ sub anywhere: fatal, like real DynaLoader's
+               "Can't find 'boot_...' symbol" */
+            char msg[1200];
+            snprintf(msg, sizeof(msg), "Can't find '%s' symbol in %s",
+                     bootname, resolved);
+            dl_set_error(msg);
+            free(module);
+            return perl_alloc_undef();
+        }
+        perl_free(bootret);
+    }
+
+    dl_set_error(NULL);
+    free(module);
+    return perl_alloc_int(1);
+}
+
+void perl_dl_cleanup(void) {
+    for (int i = 0; i < s_dl_handle_count; i++)
+        if (s_dl_handles[i]) dlclose(s_dl_handles[i]);
+    s_dl_handle_count = 0;
+    s_dl_sym_count = 0;
+    for (int i = 0; i < s_dl_shared_count; i++) {
+        free(s_dl_shared_objects[i]);
+        s_dl_shared_objects[i] = NULL;
+    }
+    s_dl_shared_count = 0;
+    free(s_dl_error_text);
+    s_dl_error_text = NULL;
+}
+
 /* ── program cleanup ────────────────────────────────────────────────────────
  * Free all program-lifetime runtime state so valgrind reports zero leaks.
  * Called at exit via atexit() from main.cpp.                                                    */
@@ -10202,6 +10605,9 @@ void perl_cleanup(void) {
 
     /* 3. XS module list (reload of existing cleanup). */
     perl_xs_cleanup();
+
+    /* 3a. DynaLoader-compat handles/symrefs. */
+    perl_dl_cleanup();
 
     /* 3b. do-lib list (D24: dlopen()ed `do FILE` shared libraries). */
     perl_do_lib_cleanup();

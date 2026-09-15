@@ -18,7 +18,8 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-13, re-verified after D110/D120/D124 — 327/327 PASS,
+**Harness (2026-09-14, re-verified after Exporter/D136/D137/DynaLoader —
+331/331 PASS,
 0 FAIL; `make test` 47/47):** New this session:
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
@@ -46,7 +47,12 @@ gated by `make test-all` (byte-for-byte vs real `perl`).
 `d124_current_sub_{smoke,deep}.pl`,
 `d128_module_error_location.sh` (+ `tests/lib/D128Broken.pm`,
 `tests/d128_module_error_main.pltxt` — compile-failure diagnostics
-fixtures, outside the harness corpus).
+fixtures, outside the harness corpus),
+`exporter_tags_{smoke,deep}.pl` + `exporter_slice_keys_{smoke,deep}.pl`
+(+ `tests/lib/E/Tagged.pm` — Exporter mechanism, 2026-09-14),
+`dynaloader_ffi.sh` (+ `tests/dynaloader_ffi_{smoke,deep}.pltxt`,
+`tests/lib/auto/My/Clib/Clib.so`, `tests/lib/auto/My/Pxs/Pxs.pl` —
+DynaLoader-compatible FFI, self-verifying, outside the harness corpus).
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
@@ -104,6 +110,22 @@ are in TESTS.md):**
   closure's own captures, with named subs resolving to their own
   capture-less `\&name`-shaped ref (matching this codebase's named-sub
   model) and undef at file scope.
+- Exporter/D136/D137/DynaLoader-FFI (2026-09-14): see TESTS.md for the
+  full write-ups. D136 is bareword-`=>` auto-quote (real Perl quotes
+  every bareword before `=>`, including its own keywords — `all => 1`,
+  `sub => 2` were hard parse errors) plus bareword hash-subscript keys
+  (`my @a = @{ $r->{all} };` used to die); D137 is `qw(...)` slice key
+  specs spreading into individual keys/indices (`@h{qw(a b)}`,
+  `delete @h{qw(a b)}` — previously one undef key lookup, silently
+  empty); the Exporter mechanism makes `%EXPORT_TAGS`/`:tag`/`:all`
+  imports, `&`-sigil'd export names, and `$var` exports work at compile
+  time with real Exporter semantics; the DynaLoader-compatible FFI
+  (phase 2) implements `dl_load_file`/`dl_find_symbol`/
+  `dl_install_xsub`/`dl_error`/`bootstrap` + `XSLoader::load` natively —
+  perlc-compiled modules load on demand via the `--do-lib` subprocess
+  and register their boot hook under `<Module>::boot` (with real
+  DynaLoader's `boot_<mangled>` names also tried). Real perlguts XSUBs
+  (SV*-based) remain out of scope.
 - D103/D104/D106/D108: see TESTS.md for full write-ups. Summary: D103
   is integer-overflow auto-promotion (bounded, unblessed auto-BigInt
   reusing the existing Math::BigInt/mini-gmp machinery — see TESTS.md
@@ -385,7 +407,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 | Gap | Notes |
 |-----|-------|
 | Typeglob `{IO}`/`{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, and bare `open LOG` / `print LOG` work. `*FH{IO}` / FORMAT slots are not implemented. |
-| Full XS | MVP FFI, ≤4 scalar args — not DynaLoader / `boot_` XSUBs |
+| Full XS | DynaLoader-compatible FFI: `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load` (perlc `.so`/`.pl` modules + raw C via `XS::call` sig dispatch). Real perlguts XSUBs (SV* ABI) not implemented |
 | `pidigits.pl` vs perl | Skipped in harness: mini-gmp spigot `extract_digit` still diverges from Calc. `$,`/`$\` work. |
 | Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |
 | eval/`do` at runtime | Needs `perlc` + `clang-18` on the target (`--eval-lib` / `--do-lib`). |

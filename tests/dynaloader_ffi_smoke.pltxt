@@ -1,0 +1,10 @@
+$ENV{PERLC_LIB} = 'tests/lib';
+use lib 'tests/lib';
+use DynaLoader;
+
+# C .so: dl_load_file -> dl_find_symbol -> dl_install_xsub (perlc XSUB conv)
+my $libref = DynaLoader::dl_load_file("tests/lib/auto/My/Clib/Clib.so", 0);
+print "libref_defined=", defined($libref) ? 1 : 0, "\n";
+my $symref = DynaLoader::dl_find_symbol($libref, "my_greet");
+print "symref_defined=", defined($symref) ? 1 : 0, "\n";
+print "smoke_done\n";

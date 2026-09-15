@@ -995,9 +995,10 @@ merged in the same binary), `make test` 47/47, `bench/nb.pl` and
 
 ## Remaining product gaps (not logged as D-numbers)
 
-Full XS (FFI is not DynaLoader); complex CPAN (advanced `our`/OO — POD is
-skipped). Typeglob `{IO}`/`{FORMAT}` slots are not implemented. String
-`eval EXPR` sees outer `my`. Runtime `eval`/`do` still needs clang+perlc
+Real perlguts XS (SV*-ABI XSUBs) and complex CPAN (advanced `our`/OO —
+POD is skipped). Typeglob `{IO}`/`{FORMAT}` slots are not implemented.
+String `eval EXPR` sees outer `my`. Runtime `eval`/`do` still needs
+clang+perlc
 on the target.
 
 **2026-09-09 note:** `src/runtime.c` (commit `706b478`, "updates") added
@@ -1062,7 +1063,7 @@ positioned to catch collateral damage from once it's fixed.
 4. **D104** — indented heredoc `<<~IDENT` (Perl 5.26+) — hard parse error, common modern-Perl idiom, lexer has zero support today.
 5. **`\my $var` / `\my %var`** (reference to an inline lexical declaration, e.g. `GetOptions(\my %opt, ...)`) — parse error. Found in `/usr/bin/lwp-dump`, a real (if newer-style) Getopt::Long idiom.
 6. **Typeglob `{IO}}`/`{FORMAT}` slots** — parser/codegen wiring only; the runtime half (`perl_glob_slot` etc.) already landed unused (see note above) — this is now a small, well-scoped piece of work, not a new subsystem.
-7. **Full XS / DynaLoader** — current XS is an MVP FFI capped at ≤4 scalar args; real CPAN `.so`/`.xs` modules (most non-pure-Perl CPAN) don't load.
+7. **~~Full XS / DynaLoader~~ → downgraded to "real perlguts XSUBs only"** — the DynaLoader-compatible FFI (phase 2, 2026-09-14) implements `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`dl_error`/`bootstrap` + `XSLoader::load` natively (see below), so `use DynaLoader; bootstrap(Module)` and the raw-C `dl_*` surface work for perlc-built `.so`/`.pl` modules and for hand-built C libraries via `XS::call`. What remains impossible without an SV-ABI emulation layer is loading genuine perlguts XSUB modules compiled against real perl headers.
 8. **Complex CPAN OO / advanced `our`** — parser still fails on some advanced module patterns; blocks `-pm`-installed dependencies with nontrivial internals. Confirmed again via the real-world survey (`Debian::Debhelper::Dh_Lib.pm` — a real, if Debian-specific, module — still fails to parse once its own missing-module error is worked around).
 9. **DBI beyond the SQLite subset** — no MySQL/Postgres drivers, no full DBI method surface.
 10. **`given`/`when` / smart-match `~~`**, `format`/`write`, runtime `eval`/`do FILE` needing `clang-18`+`perlc` on the target, `sprintf`/`printf`'s `%vd` vector flag, and POD being skipped/not introspectable — all previously-logged lower-impact items, unchanged by this pass.
@@ -1217,6 +1218,87 @@ raw `double[]` storage, so Dumper prints its elements quoted
 representational limitation of that fast path, confirmed independent of
 the Dumper implementation itself (mixed-type arrays, which don't take
 the fast path, dump correctly).
+
+### Exporter mechanism + DynaLoader-compatible FFI — 2026-09-14
+
+Two capability additions (not D-number defects — these close roadmap
+items from `MVP_ROADMAP.md`).
+
+**D136 — bareword `=>` auto-quote** (`src/parser.cpp`): real Perl
+auto-quotes EVERY bareword before a fat comma, including its own
+keywords — `my %t = (all => 1, sub => 2, and => 3);` is exactly
+`('all','1','sub','2','and','3')` (verified directly). perlc's lexer
+classifies `all`/`sub`/`and` as keyword tokens (KW_ALL, KW_SUB, ...),
+which fell into the builtin-keyword parse branches and died as
+`unexpected token '=>'` — `my %t = (all => 1);`, one of the most common
+hash-literal spellings, was a hard parse error. Fixed at the top of
+`parsePrimary`: any token carrying text that is not itself a delimiter/
+number/string/regex, when immediately followed by `=>`, returns
+`makeStr(text)` — with the `=>` left for the surrounding list loop to
+consume as the pair separator (eating it there strands the value).
+Also part 2: in hash-subscript key context (`inKeyContext_`, set around
+`$h{...}` key parsing), ANY bareword-ish token is the string key
+whatever follows — `my @a = @{ $r->{all} };` previously died
+"unexpected token '}'" because the inner key `all` fell into the
+KW_ALL builtin branch which then demanded args and hit the closing
+brace. Real Perl: barewords are strings in key position, no exceptions.
+
+**D137 — `qw(...)` slice key specs spread into individual keys**
+(`src/parser.cpp` HashSlice/ArraySlice parse loops + `src/codegen.cpp`
+DeleteFunc): `@h{qw(a b)}` is exactly `@h{('a','b')}` in real Perl.
+perlc parsed the single QWORDS token as ONE element; codegen turned
+that into one undef key lookup, so multi-key qw slices silently came
+back empty, and `delete @h{qw(a b)}` deleted nothing. All four
+slice-form parse sites (deref-brace, deref-bracket, named-hash-brace,
+and the delete statement's own hash/array slice branches) now spread a
+QWORDS token into individual string keys/indices, and the delete
+codegen handles the resulting per-key StringLit args.
+
+**Exporter mechanism** (`src/main.cpp` `scanExports`/`inlineModules`):
+`%EXPORT_TAGS = (tag => [...])` is parsed at compile time (value forms:
+`qw(...)`, `['a','b']`, `["a"]`, and `\@EXPORT_OK`/`[@EXPORT_OK]` refs
+resolving to the already-scanned `@EXPORT_OK` contents), exposed as
+`TAG:<name>` entries. `use Module qw(:tag)` expands via the tag's list;
+`:all` expands to the module's own `TAG:all` when defined — matching
+real Exporter, which does NOT auto-include `@EXPORT` names in a custom
+`:all` tag (verified: a module with `@EXPORT` and `:all => \@EXPORT_OK`
+does not export the `@EXPORT` names); when the module has *some*
+`%EXPORT_TAGS` but no `:all` tag, real Exporter dies and perlc now dies
+with the same message; the `@EXPORT`+`@EXPORT_OK` union is used only
+when the module declares no `%EXPORT_TAGS` at all (the sloppy-module
+case real scripts assume works). `&`-sigil'd export names
+(`qw(&pod2usage)`, real Pod::Usage style) strip the sigil before
+matching/aliasing. Tests: `tests/exporter_tags_{smoke,deep}.pl` +
+`tests/exporter_slice_keys_{smoke,deep}.pl` (+ `tests/lib/E/Tagged.pm`),
+all byte-for-byte vs real perl.
+
+**DynaLoader-compatible FFI, phase 2** (`src/runtime.c`, `src/
+codegen.cpp`, `src/main.cpp`): `use DynaLoader;` is now accepted, and
+the native surface is `DynaLoader::dl_load_file($path, $flags)` →
+opaque libref (a 1-based integer index into an internal dlopen-handle
+table; real perl's libref is equally opaque), `dl_find_symbol($libref,
+$sym)` → opaque symref (index into a dlsym-result table),
+`dl_install_xsub($perl_name, $symref)` (registers the fn pointer as a
+Perl-callable sub under that name — the perlc XSUB convention is
+`PerlValue *(*)(PerlArray *args, int ctx)`, the same shape every
+perlc-compiled sub has; raw-C ABIs stay on `XS::call`'s signature
+dispatch), `dl_error()`, and `bootstrap($module [, $version])` +
+`XSLoader::load($module [, $version])`. bootstrap implements real
+DynaLoader's flow with a perlc twist: it searches `PERLC_LIB`/`PERL5LIB`
++ `.`/`lib` for `auto/<Mod/pname>/<Modfname>.so` (real DynaLoader's
+layout) and — the twist — also `<Modfname>.pl`, compiling it on demand
+via the same `PERLC_SELF_PATH --do-lib` subprocess `do FILE` uses; the
+loaded module's subs register into this process's registry, and the
+boot hook is called under `<Module>::boot` (perlc convention, unambiguous)
+with real DynaLoader's `<Module>::boot_<mangled>` and bare
+`boot_<mangled>` also tried. Fixtures: `tests/lib/auto/My/Clib/Clib.so`
+(hand-built C library: `my_add`, `my_greet`, `my_scale`) and
+`tests/lib/auto/My/Pxs/Pxs.pl` (perlc-compiled bootstrap module). Tests:
+`tests/dynaloader_ffi.sh` (self-verifying, outside the stdout-diff
+harness corpus like d128's — the behaviors exercised are perlc-specific
+by design: real perl cannot bootstrap a perlc-compiled module). Real
+perlguts XSUBs (SV*-ABI, compiled against real perl headers) remain out
+of scope — that would require an SV emulation layer.
 
 ### File::Basename — FIXED 2026-09-09
 

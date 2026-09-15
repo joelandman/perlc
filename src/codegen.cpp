@@ -678,6 +678,11 @@ void CodeGen::declareRuntime() {
     RT("perl_call_named_sub_checked", pv, i8p, av, Type::getInt32Ty(ctx_), i8p, i8p, Type::getInt32Ty(ctx_));
     RT("perl_xs_load_library",  pv, pv);
     RT("perl_xs_call_dynamic",  pv, pv, pv, pv, av);
+    RT("perl_dl_load_file",     pv, pv, pv);
+    RT("perl_dl_find_symbol",   pv, pv, pv);
+    RT("perl_dl_install_xsub",  pv, pv, pv);
+    RT("perl_dl_error",         pv);
+    RT("perl_dl_bootstrap",     pv, pv, pv);
     RT("perl_dbi_connect",      pv, pv, pv, pv);
     RT("perl_local_restore_to", voidTy, Type::getInt32Ty(ctx_));
     /* special globals */
@@ -11102,6 +11107,46 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *lib = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
         Value *ret = callRT("perl_xs_load_library", {lib});
         freeIfOwned(lib);
+        return ret;
+    }
+    /* DynaLoader-compatible FFI (phase 2): the native surface real
+       DynaLoader scripts and XSLoader use. All return through perl_*
+       runtime functions; see the runtime.c section comment for the
+       perlc calling/boot conventions. */
+    if (n.name == "DynaLoader::dl_load_file" || n.name == "dl_load_file") {
+        Value *path = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *flg  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *ret = callRT("perl_dl_load_file", {path, flg});
+        freeIfOwned(path);
+        freeIfOwned(flg);
+        return ret;
+    }
+    if (n.name == "DynaLoader::dl_find_symbol" || n.name == "dl_find_symbol") {
+        Value *libref = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *sym    = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *ret = callRT("perl_dl_find_symbol", {libref, sym});
+        freeIfOwned(libref);
+        freeIfOwned(sym);
+        return ret;
+    }
+    if (n.name == "DynaLoader::dl_install_xsub" || n.name == "dl_install_xsub") {
+        Value *nm  = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *ref = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *ret = callRT("perl_dl_install_xsub", {nm, ref});
+        freeIfOwned(nm);
+        freeIfOwned(ref);
+        return ret;
+    }
+    if (n.name == "DynaLoader::dl_error" || n.name == "dl_error") {
+        return callRT("perl_dl_error", {});
+    }
+    if (n.name == "DynaLoader::bootstrap" || n.name == "bootstrap" ||
+        n.name == "XSLoader::load") {
+        Value *mod = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *ver = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *ret = callRT("perl_dl_bootstrap", {mod, ver});
+        freeIfOwned(mod);
+        freeIfOwned(ver);
         return ret;
     }
     if (n.name == "XS::call") {

@@ -179,7 +179,10 @@ make clean
 - `qr/PATTERN/` is not implemented as a value type at all
 - `\my $var` / `\my %var` (reference to an inline lexical declaration) is not supported (parse error)
 - Typeglob `{IO}`/`{FORMAT}` slots are not implemented (`*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, and bare `open LOG`/`print LOG` work)
-- XS is an MVP FFI (≤4 scalar args), not DynaLoader / CPAN `.so` XSUBs
+- XS: DynaLoader-compatible FFI (`dl_load_file`/`dl_find_symbol`/
+  `dl_install_xsub`/`bootstrap`/`XSLoader::load`) for perlc-compiled
+  modules and hand-built C libraries (via `XS::call`); real perlguts
+  XSUB `.so`s (SV* ABI) can't load
 - DBI is the SQLite subset in the contract tests
 - Complex CPAN (advanced OO / `our`) may fail to parse; POD is skipped
 - String `eval` / `do FILE` at runtime re-invoke `perlc` + `clang-18`
@@ -197,6 +200,7 @@ make clean
 - `XS::call($lib, "symbol", "signature", @args)` calls native functions through a constrained ABI bridge
 - Supported MVP types: `long`, `double`, `string`, `ptr`, `void`; supported across scalar-only signatures up to 4 arguments as validated by the contract tests
 - `ptr` values are opaque native pointers suitable for handles and buffers; null pointer returns map to `undef`
+- **DynaLoader-compatible surface** (2026-09-14): `DynaLoader::dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`dl_error`, `bootstrap(Module)` and `XSLoader::load(Module)`. perlc-built modules (a `.pl` under `auto/...` compiled on demand, or a prebuilt `--do-lib` `.so`) load with their boot hook (`<Module>::boot`) called like real DynaLoader's `boot_<mangled>`; hand-built C libraries load via `dl_*` + `XS::call`. Real perlguts XSUB `.so`s (SV* ABI) are out of scope.
 
 ### DBI/SQLite Integration
 - SQLite-backed DBI subset: `connect`, `prepare`, `execute`, `do`, `fetchrow_arrayref`, `fetchall_arrayref`, `rows`, `disconnect`, `errstr`

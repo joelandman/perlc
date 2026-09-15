@@ -1,0 +1,22 @@
+$ENV{PERLC_LIB} = 'tests/lib';
+use lib 'tests/lib';
+use DynaLoader;
+
+# bootstrap() a perlc-compiled module (compile-on-demand via --do-lib):
+my $ok = bootstrap("My::Pxs");
+print "boot_ok=", defined($ok) ? $ok : 0, "\n";
+print "double: ", My::Pxs::double_it(21), "\n";
+print "greet: ", My::Pxs::greet("world"), "\n";
+
+# Raw C .so through the DynaLoader surface:
+my $libref = DynaLoader::dl_load_file("tests/lib/auto/My/Clib/Clib.so", 0);
+my $symref = DynaLoader::dl_find_symbol($libref, "my_greet");
+print "sym_ok=", defined($symref) ? 1 : 0, "\n";
+my $missing = DynaLoader::dl_find_symbol($libref, "no_such_symbol_xyz");
+print "missing_undef=", defined($missing) ? 0 : 1, "\n";
+print "err_set=", DynaLoader::dl_error() =~ /no_such_symbol|not found|undefined symbol/i ? 1 : 0, "\n";
+
+# XS::call path still works alongside:
+my $sum = XS::call("tests/lib/auto/My/Clib/Clib.so", "my_add", "long(long,long)", 20, 22);
+print "add: $sum\n";
+print "deep_done\n";

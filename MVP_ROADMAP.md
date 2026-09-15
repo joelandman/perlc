@@ -248,9 +248,14 @@ green as that corpus grows.** Concretely:
    a minimal Exporter/`@EXPORT` mechanism, enabling the Tier-1 CPAN
    module list above to actually be `use`-able as external `.pm` files
    rather than only as perlc-internal hardcoded dispatch.
-7. **Explicit non-goals**, unchanged from existing project stance: full
-   XS/DynaLoader, non-SQLite DBI, `given`/`when`, `format`/`write`,
-   web-framework-shaped modules.
+7. **Explicit non-goals**, unchanged from existing project stance: real
+   perlguts XSUB `.so`s (SV* ABI), non-SQLite DBI, `given`/`when`,
+   `format`/`write`, web-framework-shaped modules.
+   (**Update 2026-09-14:** a DynaLoader-compatible FFI now exists —
+   `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/
+   `XSLoader::load` for perlc-built modules and hand-built C libraries —
+   so "full XS/DynaLoader" as a blanket non-goal is downgraded: only the
+   SV-ABI XSUB layer remains out of scope. See TESTS.md.)
 
 ## Critical path (recommended order)
 

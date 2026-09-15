@@ -383,6 +383,7 @@ static std::vector<Token> inlineModules(
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
         "File::Basename","Getopt::Long","DBI","DBD::SQLite",
         "threads","threads::shared","UNIVERSAL","Time::HiRes",
+        "DynaLoader","XSLoader",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */

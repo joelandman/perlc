@@ -713,6 +713,14 @@ PerlValue *perl_xs_load_library(PerlValue *libname_pv);
 PerlValue *perl_xs_call_dynamic(PerlValue *libname_pv, PerlValue *funcname_pv,
                                 PerlValue *signature_pv, PerlArray *args);
 
+/* ── DynaLoader-compatible FFI (phase 2) ─────────────────────────────────── */
+PerlValue *perl_dl_load_file(PerlValue *path_pv, PerlValue *flags_pv);
+PerlValue *perl_dl_find_symbol(PerlValue *libref_pv, PerlValue *sym_pv);
+PerlValue *perl_dl_install_xsub(PerlValue *name_pv, PerlValue *symref_pv);
+PerlValue *perl_dl_error(void);
+PerlValue *perl_dl_bootstrap(PerlValue *module_pv, PerlValue *version_pv);
+void       perl_dl_cleanup(void);
+
 /* ── DBI/SQLite integration ──────────────────────────────────────────────── */
 /* SQLite database handle */
 typedef struct PerlDBIHandle {
