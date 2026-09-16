@@ -18,8 +18,8 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-15, re-verified after survey-3 fixes + Tier-1 modules —
-341/341 PASS,
+**Harness (2026-09-16, re-verified after Config/Fcntl-constants/W-batch —
+356/356 PASS,
 0 FAIL; `make test` 47/47):** New this session:
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
@@ -55,7 +55,13 @@ fixtures, outside the harness corpus),
 DynaLoader-compatible FFI, self-verifying, outside the harness corpus),
 `cwd_{smoke,deep}.pl`, `sys_hostname_{smoke,deep}.pl`,
 `file_spec{,_functions}_{smoke,deep}.pl`, `time_local_{smoke,deep}.pl`
-(Tier-1 native modules, 2026-09-15).
+(Tier-1 native modules, 2026-09-15),
+`config_{smoke,deep}.pl`, `fcntl_posix_{smoke,deep}.pl`
+(Config + Fcntl/POSIX/Errno native constants, 2026-09-16),
+`w31_return_list_{smoke,deep}.pl`, `w23_key_expr_{smoke,deep}.pl`,
+`w28_match_var_{smoke,deep}.pl`,
+`w22_symbolic_deref_{smoke,deep,deep2}.pl`,
+`w19_unary_plus_{smoke,deep}.pl` (survey-3 W-items, 2026-09-16).
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
@@ -142,6 +148,17 @@ are in TESTS.md):**
   styles, real quirks matched), Time::Local (all 8 exports, real DST
   semantics), and fixed scalar-context `gmtime(EXPR)`/`localtime(EXPR)`
   returning the epoch.
+- W-item batch (2026-09-16, two-agent session): see TESTS.md. Config
+  is native (special %Config hash from a generated host-perl table +
+  myconfig/config_sh/config_vars/config_re byte-identical; Config.pm's
+  computed-typeglob import never runs); Fcntl/POSIX/Errno are native
+  constant tables (86 probed values, real croak message, real @EXPORT
+  tag sets, sysseek added); W31 single-element `return (32)`;
+  W23 in-key builtin-call vs string-key disambiguation + `(not => 1)`;
+  W28 `$s =~ $var` dynamic patterns; W22 symbolic deref `${"name"}`/
+  `${$ref}` + `\$arr[1]` element-ref fix; W19 unary `+` + constant
+  chains. Remaining open: list-context non-/g match captures,
+  qr//, W29 `local *_`, false-bool stringify.
 - D103/D104/D106/D108: see TESTS.md for full write-ups. Summary: D103
   is integer-overflow auto-promotion (bounded, unblessed auto-BigInt
   reusing the existing Math::BigInt/mini-gmp machinery — see TESTS.md

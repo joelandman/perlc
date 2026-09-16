@@ -1,0 +1,13 @@
+our $opt_foo = 42;
+my $x = "foo";
+my $v = ${"opt_$x"};
+print "v=$v\n";
+my $w = ${$x};
+print "w=$w\n";
+${"opt_$x"} = 99;
+print "after=$opt_foo\n";
+my $z = ${"opt_" . $x};
+print "z=$z\n";
+$Foo::bar = 7;
+my $n = "bar";
+print "pkg=" . ${"Foo::" . $n}, "\n";

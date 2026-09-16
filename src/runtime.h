@@ -377,6 +377,7 @@ PerlValue *perl_shutdown_fh(PerlValue *fh, PerlValue *how);
 PerlValue *perl_getsockname_fh(PerlValue *fh);
 PerlValue *perl_getpeername_fh(PerlValue *fh);
 PerlValue *perl_sysopen_fh(PerlValue *fh, PerlValue *path, PerlValue *mode, PerlValue *perms);
+PerlValue *perl_sysseek_fh(PerlValue *fh, PerlValue *off, PerlValue *whence);
 PerlValue *perl_sysread_fh(PerlValue *fh, PerlValue *buf, PerlValue *len, PerlValue *off);
 PerlValue *perl_syswrite_fh(PerlValue *fh, PerlValue *buf, PerlValue *len, PerlValue *off);
 PerlValue *perl_flock_fh(PerlValue *fh, PerlValue *op);
@@ -876,6 +877,22 @@ PerlValue *perl_bigint_ovl_neg(PerlValue *self);
 
 /* Note: runtime require/do of dynamic files now also set $@ + return undef.
    Compile-time 'use' and static 'require' are still inlined by the driver. */
+
+/* ── Native constants (Fcntl/POSIX/Errno, generated table) ────────────────── */
+/* Zero-arg constant call "Fcntl::SEEK_SET"-style: returns the integer
+   value; unknown names die like the real XS AUTOLOAD's invalid-macro
+   croak. */
+PerlValue *perl_native_constant(const char *qualifiedName);
+
+/* ── Config (native module) ──────────────────────────────────────────────── */
+PerlValue *perl_config_get(PerlValue *keyPV);
+int        perl_config_exists(PerlValue *keyPV);
+PerlArray *perl_config_keys(void);
+PerlValue *perl_config_myconfig(void);
+PerlValue *perl_config_configsh(void);
+PerlValue *perl_config_config_vars(PerlArray *args);
+PerlValue *perl_config_config_re(PerlValue *patternPV);
+int        perl_env_exists(PerlValue *keyPV);
 
 #ifdef __cplusplus
 }

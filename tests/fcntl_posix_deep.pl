@@ -1,0 +1,22 @@
+use Fcntl qw(:flock :seek :DEFAULT);
+use POSIX ();
+use Errno;
+print "seek: ", SEEK_SET, ",", SEEK_CUR, ",", SEEK_END, "\n";
+print "flock: ", LOCK_SH, ",", LOCK_EX, ",", LOCK_UN, ",", LOCK_NB, "\n";
+print "open: ", O_CREAT, ",", O_EXCL, ",", O_TRUNC, ",", O_APPEND, ",", O_RDWR, "\n";
+print "fcntl: ", Fcntl::F_GETFD, ",", Fcntl::F_SETFD, ",", FD_CLOEXEC, "\n";
+print "perm: ", S_IRUSR, ",", S_IWUSR, ",", S_IXUSR, ",", S_IRWXO, "\n";
+print "posix: ", POSIX::LC_ALL, " ", POSIX::LC_COLLATE, "\n";
+print "errno: ", Errno::ENOENT, ",", Errno::EBADF, ",", Errno::EINVAL, "\n";
+# sysseek with SEEK_CUR as a value:
+open(my $fh, "+>tests/_dp_tmp.txt") or die "open: $!";
+print $fh "hello";
+sysseek($fh, 0, SEEK_SET);
+my $buf;
+sysread($fh, $buf, 5);
+print "sysseek: $buf\n";
+close $fh;
+unlink "tests/_dp_tmp.txt";
+eval { Fcntl::NOT_A_REAL_MACRO() };
+print "bad-macro: ", $@ =~ /not a valid Fcntl macro/ ? 1 : 0, "\n";
+print "deep_done\n";

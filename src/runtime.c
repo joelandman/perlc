@@ -7631,6 +7631,17 @@ PerlValue *perl_env_get(PerlValue *key) {
     return val ? perl_alloc_string(val) : perl_alloc_undef();
 }
 
+int perl_env_exists(PerlValue *keyPV) {
+    char *key = keyPV ? perl_to_string_dup(keyPV) : NULL;
+    int found = 0;
+    if (key) {
+        const char *v = getenv(key);
+        found = v != NULL;
+        free(key);
+    }
+    return found;
+}
+
 void perl_env_set(PerlValue *key, PerlValue *val) {
     char *k = perl_to_string_dup(key);
     char *v = perl_to_string_dup(val);
@@ -8091,6 +8102,20 @@ PerlValue *perl_sysopen_fh(PerlValue *fh, PerlValue *path, PerlValue *mode, Perl
     if (!fp) { close(fd); return perl_alloc_undef(); }
     pv_attach_fh(fh, fp);
     return perl_alloc_int(1);
+}
+
+/* sysseek(FH, offset, whence) — lseek(2) wrapper; returns the new file
+   position in bytes (or undef on failure), exactly like real sysseek.
+   whence comes in already resolved to the SEEK_* numeric values by the
+   caller's own code. */
+PerlValue *perl_sysseek_fh(PerlValue *fh, PerlValue *off_pv, PerlValue *whence_pv) {
+    int fd = pv_as_fd(fh);
+    if (fd < 0) return perl_alloc_undef();
+    long long off = off_pv ? perl_to_int(off_pv) : 0;
+    int whence = whence_pv ? (int)perl_to_int(whence_pv) : 0;
+    off_t r = lseek(fd, (off_t)off, whence);
+    if (r == (off_t)-1) return perl_alloc_undef();
+    return perl_alloc_int((long long)r);
 }
 
 PerlValue *perl_sysread_fh(PerlValue *fh, PerlValue *buf, PerlValue *len_pv, PerlValue *off_pv) {
@@ -9733,6 +9758,102 @@ PerlValue *perl_hostname(void) {
     return perl_alloc_string(buf);
 }
 
+/* ── Config (native module) ──
+ * %Config / $Config::Config: special hash from the generated table in
+ * src/config_data.h (tools/gen_config_data.pl, run once on the host perl;
+ * output committed). Real Config.pm's import uses computed typeglobs
+ * (survey W27) which perlc doesn't model — since the module is native the
+ * file is never inlined and the typeglob trick never runs. The 4 real
+ * functions print/return the same bytes real Config does on this host. */
+#include "config_data.h"
+
+PerlValue *perl_config_get(PerlValue *keyPV) {
+    char *key = keyPV ? perl_to_string_dup(keyPV) : NULL;
+    PerlValue *r = NULL;
+    if (key) {
+        for (int i = 0; i < perlc_config_pairs_n; i++) {
+            if (strcmp(perlc_config_pairs[i].key, key) == 0) {
+                r = perl_alloc_string(perlc_config_pairs[i].value);
+                break;
+            }
+        }
+        if (!r) r = perl_alloc_undef();
+        free(key);
+    } else {
+        r = perl_alloc_undef();
+    }
+    return r;
+}
+
+int perl_config_exists(PerlValue *keyPV) {
+    char *key = keyPV ? perl_to_string_dup(keyPV) : NULL;
+    int found = 0;
+    if (key) {
+        for (int i = 0; i < perlc_config_pairs_n; i++) {
+            if (strcmp(perlc_config_pairs[i].key, key) == 0) { found = 1; break; }
+        }
+        free(key);
+    }
+    return found;
+}
+
+PerlArray *perl_config_keys(void) {
+    PerlArray *av = perl_array_new();
+    for (int i = 0; i < perlc_config_pairs_n; i++)
+        perl_array_push_nc(av, perl_alloc_string(perlc_config_pairs[i].key));
+    return av;
+}
+
+PerlValue *perl_config_myconfig(void) {
+    return perl_alloc_string(perlc_config_myconfig);
+}
+
+PerlValue *perl_config_configsh(void) {
+    return perl_alloc_string(perlc_config_configsh);
+}
+
+/* config_vars('k1','k2') prints "name='value';" lines to stdout (real
+   Config::config_vars behavior). Returns undef. */
+PerlValue *perl_config_config_vars(PerlArray *args) {
+    int n = args ? (int)args->len : 0;
+    for (int i = 0; i < n; i++) {
+        char *k = perl_to_string_dup(args->elems[i]);
+        if (!k) continue;
+        const char *v = "";
+        for (int j = 0; j < perlc_config_pairs_n; j++) {
+            if (strcmp(perlc_config_pairs[j].key, k) == 0) {
+                v = perlc_config_pairs[j].value;
+                break;
+            }
+        }
+        printf("%s='%s';\n", k, v);
+        free(k);
+    }
+    return perl_alloc_undef();
+}
+
+/* config_re($pattern) prints matching "name='value';" lines (regex over
+   the whole "name=value" text, like real Config::config_re). */
+PerlValue *perl_config_config_re(PerlValue *patPV) {
+    char *pat = patPV ? perl_to_string_dup(patPV) : NULL;
+    if (!pat || !*pat) { free(pat); return perl_alloc_undef(); }
+    /* Build the regex matcher through the shared perl_regex machinery so
+       the pattern dialect matches perl exactly. */
+    for (int i = 0; i < perlc_config_pairs_n; i++) {
+        char line[4096];
+        snprintf(line, sizeof(line), "%s='%s';", perlc_config_pairs[i].key,
+                 perlc_config_pairs[i].value);
+        PerlValue *sv = perl_alloc_string(line);
+        PerlValue *res = perl_regex_match(sv, pat, "");
+        if (res && perl_is_true(res))
+            printf("%s\n", line);
+        perl_free(res);
+        perl_free(sv);
+    }
+    free(pat);
+    return perl_alloc_undef();
+}
+
 /* ── File::Spec ──
    A faithful reimplementation of File::Spec::Unix's pure-text algorithms
    (see the module source: canonpath is explicitly documented NOT to
@@ -11323,6 +11444,32 @@ static const char *dl_last_error(void) {
 static void *dl_libref_handle(long long libref) {
     if (libref < 1 || libref > s_dl_handle_count) return NULL;
     return s_dl_handles[libref - 1];
+}
+
+/* ── Native constants (Fcntl/POSIX/Errno, generated table) ─────────────────
+ * Real Fcntl/POSIX/Errno are XS constant subs + Exporter tags. perlc's
+ * tables live in src/native_constants.h (generated from the host perl by
+ * tools/gen_native_constants.pl, output committed). Dispatch: a zero-arg
+ * call "Fcntl::SEEK_SET" / "POSIX::LC_ALL" / bare "SEEK_SET" after
+ * `use Fcntl qw(...)` looks the name up here and yields the integer value;
+ * an unknown name dies like the real AUTOLOAD would. */
+#include "native_constants.h"
+
+PerlValue *perl_native_constant(const char *qualifiedName) {
+    const char *name = strrchr(qualifiedName, ':');
+    name = (name && name[1]) ? name + 1 : qualifiedName;
+    for (int i = 0; i < perlc_native_consts_n; i++) {
+        if (strcmp(perlc_native_consts[i].name, name) == 0)
+            return perl_alloc_int(perlc_native_consts[i].value);
+    }
+    /* Match the real modules' invalid-macro die (probed: real Fcntl's
+       croak is "NOT_A_REAL_MACRO is not a valid Fcntl macro at FILE
+       line N." — the bare name, no package prefix). */
+    const char *pkg = "Fcntl";
+    if (strncmp(qualifiedName, "POSIX::", 7) == 0) pkg = "POSIX";
+    else if (strncmp(qualifiedName, "Errno::", 7) == 0) pkg = "Errno";
+    perl_die_croak("%s is not a valid %s macro", name, pkg);
+    return NULL; /* not reached */
 }
 
 PerlValue *perl_dl_load_file(PerlValue *path_pv, PerlValue *flags_pv) {

@@ -2518,6 +2518,92 @@ Updated Tier-1 module priority after the survey: (1) Config.pm chain
 (W27+W30), (2) Fcntl/POSIX constants + tag validation (W16), (3)
 `=~ $var` + `qr//` (W28).
 
+### W16/W15b/W27-for-Config/W19/W23/W28/W31/W22 — survey-3 items FIXED (2026-09-16)
+
+**Config native module** (`src/runtime.c` `perl_config_*` + generated
+`src/config_data.h` + `src/codegen.cpp`): `use Config;` is now a native
+module — `%Config`/`$Config::Config` is a special hash (HashElem,
+ExistsFunc, KeysFunc dispatch) backed by a generated key/value table of
+ALL 1261 real keys from the host perl (`tools/gen_config_data.pl`, run
+once, output committed), and the 4 real functions
+`myconfig()`/`config_sh()`/`config_vars()`/`config_re()` produce
+byte-identical output to real Config on this host (myconfig/config_sh
+are baked strings from the host `perl -V`). Because the module is native
+its file is never inlined, so Config.pm's computed-typeglob import
+(W27) never executes — that item stops mattering for Config users
+(pod2usage, instmodsh, perlthanks, h2ph, splain). `exists $Config{...}`
+and `exists $ENV{...}` now work (the ExistsFunc single-key path had no
+special-hash handling; real message parity maintained). Keys iteration
+(`keys %Config`, both contexts) works. Behavioral note: perlc resolves
+`$Config{...}` without requiring `use Config;` (the special hash is
+always present), unlike real perl which needs the import — accepted
+divergence; every strict/warnings script uses `use Config;` anyway.
+
+**Fcntl/POSIX/Errno native constants** (`src/native_constants.h` from
+`tools/gen_native_constants.pl`, probed from the host perl — 86
+constants: SEEK_*, O_*, F_*, LOCK_*, FD_CLOEXEC, S_*/S_IF*/DT_*,
+POSIX LC_*, Errno's errno values): a zero-arg call
+`Fcntl::SEEK_SET` / `POSIX::LC_ALL` / `Errno::ENOENT` (or the bare
+imported name) resolves through the table; unknown names die with real
+Fcntl's exact croak ("NOT_A_REAL_MACRO is not a valid Fcntl macro" —
+bare name, no package prefix). `use Fcntl qw(:seek :flock :DEFAULT)` /
+`:flock` tags expand in main.cpp with the REAL module sets (probed:
+Fcntl's @EXPORT does NOT contain SEEK_*/LOCK_* — they're @EXPORT_OK;
+:DEFAULT is exactly @Fcntl::EXPORT). `use Fcntl` + sysseek now works
+(new `perl_sysseek_fh`, an lseek(2) wrapper). Real-perl quirk matched
+in the parser: a bareword followed by a list COMMA in an imported
+constant's place is a plain STRING (`print "perm: ", S_IRUSR, ","...`
+prints the string "S_IRUSR" when S_IRUSR wasn't imported — verified),
+while a QUALIFIED all-caps `Fcntl::F_GETFD` after a comma is always the
+constant call (no import needed). Tests:
+`tests/config_{smoke,deep}.pl`, `tests/fcntl_posix_{smoke,deep}.pl`.
+
+**W16 (Exporter tag-value validation)**: resolved for the native
+modules by design (the tag tables above are the validated export sets;
+a bogus tag dies ""is not defined in %EXPORT_TAGS"). For arbitrary
+.pm modules the scanExports TAG: values are now accepted during
+validation, closing the Fcntl-SEEK_SET false rejection for file-backed
+modules too.
+
+**W31 — `sub f { return (32); }`**: single-element parenthesized
+returns yield the element (both `case NK::Return` sites); list-context
+`return (1,2)` scalar-context semantics and bare `return;` (D115)
+verified unchanged. `use constant D => (32)` yields the element.
+Tests: `tests/w31_return_list_{smoke,deep}.pl`.
+
+**W23 — in-key auto-quote over-reach**: a builtin keyword in hash-key
+position followed by an argument starter is the builtin call
+(`$h{lc $k}` → key = lc($k); `map { $c{uc $_} = 1 }`), while
+`$h{all}`/`$h{keys}` (keyword followed by `}`/`,`/`=>`) stay string
+keys; `$h{__PACKAGE__}` still auto-quotes. Extra find: `(not => 1)`
+died in parseLowNot before the D136 hook could see it — fixed with a
+`=>` lookahead. Tests: `tests/w23_key_expr_{smoke,deep}.pl`.
+
+**W28 — `$s =~ $var`**: the RHS of =~/!~ may now be any expression; a
+non-regex RHS is stringified and matched with empty flags at runtime
+(new `RegexMatchExpr` node; `!~` covered; `s/$var/repl/` and
+`split($var, ...)` verified working). Logged, not fixed: list-context
+captures from a NON-/g match (`my @m = ($s =~ $p)`) still return scalar
+truth — pre-existing for literal patterns too, needs a new runtime
+entry. Tests: `tests/w28_match_var_{smoke,deep}.pl`.
+
+**W22 — `${"opt_$x"}` symbolic deref** (`Getopt/Std.pm` idiom):
+`${ EXPR }` resolves the named global through the process glob registry
+(both read and lvalue write), and `${$ref}` with a REF value derefs
+normally (tag check, not glob lookup). Bonus real-perl parity fix:
+`\$arr[1]`/`\$h{k}` now take the ref of the ELEMENT (real Perl's `\`
+binds looser than subscripts) — writes through the ref update the
+container. Tests: `tests/w22_symbolic_deref_{smoke,deep,deep2}.pl`.
+
+**W19 — `use constant B => A + 1`**: parser side — unary `+` was
+missing from parsePrimary (real Perl's documented no-op unary plus), so
+`A + 1` died "unexpected token '+'"; and the throwaway value-parser now
+sees earlier constants (`parseExprFromTokens(tokens, constMap*)`
+overload + main.cpp passing the live constMap at both emitConstSub
+sites), so the chained constant evaluates. Tests:
+`tests/w19_unary_plus_{smoke,deep}.pl` + a chained-constant probe
+verified byte-for-byte.
+
 ## Source layout
 
 | File | Role |

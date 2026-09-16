@@ -12,7 +12,22 @@ public:
     /* importMap: short_name → qualified Module::name for re-exported symbols */
     void setImportMap(std::map<std::string, std::string> m) { importMap_ = std::move(m); }
     void setConstMap(std::map<std::string, NodePtr> m)      { constMap_  = std::move(m); }
+    /* W19: non-owning view for parseExprFromTokens' throwaway parser —
+       constMap_ entries are cloned at each use (parsePrimary), so sharing
+       the map without transferring ownership is safe for the parse's
+       lifetime. */
+    void setConstMapView(const std::map<std::string, NodePtr> *m) {
+        for (const auto &kv : *m) constMap_[kv.first] = kv.second->clone();
+    }
     static NodePtr parseExprFromTokens(std::vector<Token> tokens);  /* pre-parse const value expr */
+    /* W19: same, but seed the throwaway parser with the constants already
+       declared by earlier `use constant` statements — `use constant B => A + 1`
+       parses its value in a fresh parser, and without the map `A` falls to
+       the bareword-call heuristic (PLUS is a valid arg starter), producing
+       Call(A,[1]) instead of the constant's value. main.cpp must pass its
+       constMap for the chain to resolve (parser-side support only). */
+    static NodePtr parseExprFromTokens(std::vector<Token> tokens,
+                                       const std::map<std::string, NodePtr> *consts);
     /* D109: entry point for codegen to interpolate a raw string (e.g. an
        s///REPLACEMENT/ that isn't a plain literal) outside of a normal
        parse pass, using the same variable-interpolation scanner ordinary
@@ -123,6 +138,10 @@ private:
     NodePtr parsePrimary();
     NodePtr parseCall(std::string name, int line);
     bool    looksLikeBareCallArg() const; /* D36 */
+    /* W23: inside a hash-key context, is the current keyword token a
+       builtin followed by an argument starter (so it is a real call,
+       not a string key)?  cur() must be a KW_* token. */
+    bool    inKeyBuiltinFollowedByArg() const;
     NodePtr parseBareCall(std::string name, int line); /* D36: foo "arg" without () */
     std::string parsePrototype();
     bool        looksLikeSignature() const;

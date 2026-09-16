@@ -25,6 +25,16 @@ NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens) {
     return p.parseExpr();
 }
 
+NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens,
+                                    const std::map<std::string, NodePtr> *consts) {
+    if (!consts || consts->empty())
+        return parseExprFromTokens(std::move(tokens));
+    tokens.push_back({TK::EOF_TOK, "", 0});
+    Parser p(std::move(tokens));
+    p.setConstMapView(consts); /* deep-cloned view; parsePrimary clones on use */
+    return p.parseExpr();
+}
+
 /* D128: the one place that decides how a parse error is prefixed. The
    erroring (current) token carries the registered name of the file it was
    lexed from (Token::file); when that tag is non-null and different from
@@ -1705,6 +1715,16 @@ NodePtr Parser::parseOrRhs() {
 /* low-precedence: not (below assignment) */
 NodePtr Parser::parseLowNot() {
     if (check(TK::KW_NOT)) {
+        /* W23/D136: `not => 1` — real Perl auto-quotes EVERY bareword
+           before =>, including `not` (verified: (not => 1) is a string
+           key "not"). The unary-not dispatch here would otherwise eat
+           the KW_NOT and die on the following '=>'. */
+        if (pos_ + 1 < toks_.size() && toks_[pos_ + 1].kind == TK::FATARROW) {
+            int line = cur().line;
+            std::string key = cur().text;
+            advance();
+            return makeStr(key, line);
+        }
         int line = cur().line; advance();
         return makeUnary("!", parseLowNot(), line);
     }
@@ -1890,8 +1910,31 @@ NodePtr Parser::parseBinding() {
             n->sval = txt; /* search\x01replace\x01flags */
             lhs = std::move(n);
         } else {
-            throw std::runtime_error(parseErrPrefix(line) +
-                "Expected /regex/ or s/// or tr/// after =~");
+            /* W28: the pattern side of =~/!~ may be ANY expression —
+               real Perl compiles the RHS's string value as a regex at
+               runtime (m/$var/); Encode/Alias.pm's `$alias =~ $key`
+               and `$s =~ $var` in general. Previously the only accepted
+               shapes here were the literal /regex/, s///, tr/// tokens,
+               so a variable pattern was a hard parse error. A bareword
+               RHS is still NOT allowed to fall in here as a string
+               (real Perl would treat a bareword as a sub call/string —
+               and the practical real-world shapes all use a variable or
+               a parenthesized/dereferenced expression), so the arg is
+               parsed as a normal binding-level expression via
+               parseShift() — the same precedence level real Perl gives
+               the pattern operand (it binds tighter than comparison,
+               looser than unary). */
+            if (check(TK::SEMI) || check(TK::EOF_TOK) ||
+                check(TK::RPAREN) || check(TK::RBRACE) ||
+                check(TK::RBRACKET) || check(TK::COMMA) ||
+                check(TK::FATARROW) || isModifier())
+                throw std::runtime_error(parseErrPrefix(line) +
+                    "Expected /regex/ or s/// or tr/// after =~");
+            auto n = std::make_unique<Node>(); n->kind = NK::RegexMatchExpr; n->line = line;
+            n->left = std::move(lhs);
+            n->right = parseBinding();   /* pattern expression (same level) */
+            n->ival = negated ? 1 : 0;
+            lhs = std::move(n);
         }
     }
     return lhs;
@@ -1971,6 +2014,13 @@ NodePtr Parser::parseUnary() {
     if (check(TK::MINUS)) { advance(); return makeUnary("-", parsePow(), line); }
     if (check(TK::NOT))   { advance(); return makeUnary("!", parsePow(), line); }
     if (check(TK::TILDE)) { advance(); return makeUnary("~", parsePow(), line); }
+    /* W19 (found while fixing `use constant B => A + 1`): unary plus —
+       real Perl's "+EXPR" is an explicit no-op ("unary plus ... has no
+       effect whatsoever, even on strings"). It appeared here as the
+       argument-start of a bareword call's operand (`A + 1` parsed as
+       A(+1)); parsePrimary had no case for it and threw "unexpected
+       token '+'". Return the operand unchanged. */
+    if (check(TK::PLUS)) { advance(); return parsePow(); }
     if (check(TK::PLUS_PLUS)) {
         advance(); return makeUnary("pre++", parsePostfix(), line);
     }
@@ -2226,6 +2276,12 @@ NodePtr Parser::parsePostfix() {
                k == NK::ArraySlice || k == NK::HashSlice ||
                k == NK::ScalarVar;
     };
+    /* W22: `\$ar->[1]` / `\$h{k}` — real Perl's `\` binds looser than
+       the subscript, so the ref is of the ELEMENT. A RefScalar base
+       followed by an explicit -> (or adjacent subscript) parses as
+       RefScalar(ArrowDeref(base, idx)): RefScalar's codegen evaluates
+       the full inner expression (the element read) and refs the element
+       PV — exactly `\( $ar->[1] )`. */
     if (check(TK::ARROW) ||
         (isSubscriptable(expr->kind) && (check(TK::LBRACKET) || check(TK::LBRACE)))) {
         expr = parseSubscript(std::move(expr), ln);
@@ -2249,21 +2305,44 @@ NodePtr Parser::parsePrimary() {
        "unexpected token '}'" because the inner {all} key's `all` fell
        into the KW_ALL builtin branch, which then demanded args and hit
        the closing brace). Real Perl: barewords are strings in key
-       position, no exceptions. */
+       position, no exceptions.
+       W23 refinement (verified directly against real Perl): that
+       no-exceptions rule holds only when the key token stands alone
+       before the closing brace/comma — `$h{all}`, `$h{keys}`,
+       `$h{shift}` are string keys (even a keyword like `keys`, `shift`,
+       `time` is the literal key there). But a BUILTIN keyword followed
+       by an argument starter is a real call, not a key string:
+       `$h{lc $k}` is lc($k) as the key, `map { $c{uc $_} = 1 }`
+       keys on uc($_) — real Perl parses those as expressions
+       (bareword-before-`}`/`,`/`;` is what makes it a string, plus the
+       compile-time known-builtin exception). Plain IDENT followed by an
+       arg starter (`$h{foo $x}`) still parses as a bareword sub call
+       below via the normal path (parseBareCall), which is what real
+       Perl does for a *known sub*; unknown barewords there are a real
+       Perl compile error we can't model yet, so the previous
+       string-fallback behavior stays for IDENT. */
     if (inKeyContext_ && !cur().text.empty() &&
         (cur().kind == TK::IDENT ||
          (cur().kind != TK::SCALAR && cur().kind != TK::ARRAY &&
-          cur().kind != TK::HASH && cur().kind != TK::LBRACE &&
-          cur().kind != TK::RBRACE && cur().kind != TK::LBRACKET &&
-          cur().kind != TK::RBRACKET && cur().kind != TK::LPAREN &&
-          cur().kind != TK::RPAREN && cur().kind != TK::SEMI &&
-          cur().kind != TK::COMMA && cur().kind != TK::FATARROW &&
-          cur().kind != TK::INT && cur().kind != TK::FLOAT &&
-          cur().kind != TK::STRING && cur().kind != TK::REGEX &&
-          cur().kind != TK::EOF_TOK))) {
-        std::string key = cur().text;
-        advance();
-        return makeStr(key, line);
+           cur().kind != TK::HASH && cur().kind != TK::LBRACE &&
+           cur().kind != TK::RBRACE && cur().kind != TK::LBRACKET &&
+           cur().kind != TK::RBRACKET && cur().kind != TK::LPAREN &&
+           cur().kind != TK::RPAREN && cur().kind != TK::SEMI &&
+           cur().kind != TK::COMMA && cur().kind != TK::FATARROW &&
+           cur().kind != TK::INT && cur().kind != TK::FLOAT &&
+           cur().kind != TK::STRING && cur().kind != TK::REGEX &&
+           cur().kind != TK::EOF_TOK))) {
+        /* W23: a builtin keyword that is followed by something that can
+           start an argument (anything but } , ; => EOF) is a call, not
+           a string key. Fall through to the normal keyword dispatch by
+           NOT taking the string-key shortcut here. */
+        if (cur().kind != TK::IDENT && inKeyBuiltinFollowedByArg()) {
+            /* fall through to keyword handling below */
+        } else {
+            std::string key = cur().text;
+            advance();
+            return makeStr(key, line);
+        }
     }
     /* D136 (part 1): bareword before a fat comma (=>) auto-quotes to a
        string literal — real Perl does this for EVERY bareword, including
@@ -2296,24 +2375,32 @@ NodePtr Parser::parsePrimary() {
         cur().kind != TK::LT && cur().kind != TK::GT &&
         cur().kind != TK::DOT && cur().kind != TK::DOTDOT &&
         cur().kind != TK::EQ && cur().kind != TK::NE &&
-        cur().kind != TK::KW_AND && cur().kind != TK::KW_OR &&
-        cur().kind != TK::KW_NOT && cur().kind != TK::SPACESHIP &&
+        /* KW_AND/KW_OR/KW_NOT also auto-quote before => (real Perl:
+           {and => 3}, {or => 4}, {not => 5} are string keys — verified
+           directly). In expression position these tokens never reach
+           here as operators because => can only follow an operand. */
+        cur().kind != TK::SPACESHIP &&
         cur().kind != TK::BACKTICK && cur().kind != TK::READLINE &&
         cur().kind != TK::FILETEST && cur().kind != TK::BIND &&
         cur().kind != TK::NBIND && cur().kind != TK::SUBST &&
         cur().kind != TK::TR && cur().kind != TK::PLUS_PLUS &&
         cur().kind != TK::MINUS_MINUS && cur().kind != TK::ASSIGN &&
-        cur().kind != TK::QWORDS && cur().kind != TK::KW_MY &&
-        cur().kind != TK::KW_OUR && cur().kind != TK::KW_LOCAL &&
-        cur().kind != TK::KW_SUB && cur().kind != TK::KW_USE &&
-        cur().kind != TK::KW_PACKAGE && cur().kind != TK::KW_RETURN &&
-        cur().kind != TK::KW_IF && cur().kind != TK::KW_UNLESS &&
-        cur().kind != TK::KW_WHILE && cur().kind != TK::KW_UNTIL &&
-        cur().kind != TK::KW_FOR && cur().kind != TK::KW_FOREACH &&
-        cur().kind != TK::KW_DO && cur().kind != TK::KW_GOTO &&
-        cur().kind != TK::KW_LAST && cur().kind != TK::KW_NEXT &&
-        cur().kind != TK::KW_REDO && cur().kind != TK::KW_EVAL &&
-        cur().kind != TK::KW_BEGIN && cur().kind != TK::KW_END) {
+        cur().kind != TK::QWORDS &&
+        /* W23/D136-widening: the statement-keyword exclusions that used
+           to be here (KW_MY/KW_SUB/KW_IF/... — ~30 KW_* kinds) are gone.
+           Real Perl auto-quotes EVERY bareword before =>, including its
+           own keywords — verified directly: {sub => 2}, {if => 3},
+           {BEGIN => 17}, {keys => 7}, {time => 10} all produce string
+           keys (a full 60-keyword sweep against real perl 5.44 shows
+           no keyword that stays a keyword there). This check runs in
+           parsePrimary (expression context) — statement-position `sub`
+           etc. are dispatched by parseStmt long before reaching here,
+           so the exclusions only ever broke {sub => 2}-shaped hash
+           constructors (real Getopt::Long-style code uses
+           `{sub => \&f}` rarely, but Exporter-style %EXPORT spec
+           hashes do). The punctuation exclusions above stay: those
+           tokens carry no bareword text. */
+        1) {
         std::string key = cur().text;
         advance();          /* the bareword */
         return makeStr(key, line);
@@ -2487,6 +2574,51 @@ NodePtr Parser::parsePrimary() {
             std::string nm = cur().text; advance();
             auto n = std::make_unique<Node>(); n->kind = NK::RefScalar;
             n->left = makeScalar(nm, line); n->line = line;
+            /* W22: subscripts following the ref'd variable bind tighter
+               than `\` (real Perl: ref of the ELEMENT / the hash value).
+               - `\$name->[idx]` (explicit ->): the ref'd $name is a
+                 SCALAR holding a ref; the read is ArrowDeref($name, idx).
+                 RefScalar wraps it: RefScalar(ArrowDeref(name, idx)) —
+                 codegen refs the element PV read.
+               - `\$arr[idx]` / `\$h{key}` (adjacent, no ->): the ref'd
+                 name is an ARRAY/HASH; the read is ArrayElem/HashElem.
+                 parseSubscript(ScalarVar, [/{) already produces exactly
+                 ArrowDeref for [ and HashElem for { — but for the [
+                 case with an ARRAY base it must be ArrayElem, which
+                 parsePostfix's own $arr[idx] path does (parsePrimary's
+                 LBRACKET branch). So: run parseSubscript only for the
+                 explicit-arrow form; for adjacent [/{ build the
+                 element-read via a recursive parsePostfix on a synthetic
+                 `$name` token stream? Too heavy — instead build the node
+                 directly here. */
+            if (check(TK::ARROW)) {
+                n->left = parseSubscript(std::move(n->left), line);
+                return n;
+            }
+            if (check(TK::LBRACKET)) {
+                advance();
+                auto idx = parseExpr();
+                consume(TK::RBRACKET, "]");
+                /* $arr[idx] element read — NK::ArrayElem (name=arr) */
+                auto ae = std::make_unique<Node>();
+                ae->kind = NK::ArrayElem;
+                ae->name = nm; ae->left = std::move(idx); ae->line = line;
+                n->left = std::move(ae);
+                return n;
+            }
+            if (check(TK::LBRACE)) {
+                advance();
+                inKeyContext_ = true;
+                auto key = parseExpr();
+                inKeyContext_ = false;
+                consume(TK::RBRACE, "}");
+                /* $h{key} element read — NK::HashElem (name=h) */
+                auto he = std::make_unique<Node>();
+                he->kind = NK::HashElem;
+                he->name = nm; he->left = std::move(key); he->line = line;
+                n->left = std::move(he);
+                return n;
+            }
             return n;
         }
         if (check(TK::ARRAY)) {
@@ -2510,8 +2642,17 @@ NodePtr Parser::parsePrimary() {
             n->name = nm; n->line = line;
             return n;
         }
-        /* \(expr) — ref to expr value, treat as RefScalar of expr */
-        auto inner = parsePrimary();
+        /* \(expr) — ref to expr value, treat as RefScalar of expr.
+           W22: parse at postfix level (not parsePrimary) so the postfix
+           subscript chain stays attached to the INNER expression —
+           `\$ar->[1]` is a ref to the ELEMENT (real Perl: `\` binds
+           looser than `->`), not a ref of the ref. parsePrimary would
+           stop the chain at the ArrowDeref... actually parsePrimary does
+           NOT consume subscripts (parsePostfix does), so the subscript
+           after the RefScalar was silently DROPPED by parsePostfix's
+           isSubscriptable check (RefScalar isn't subscriptable) and the
+           `[1]` attached at the outer statement level instead. */
+        auto inner = parsePostfix();
         auto n = std::make_unique<Node>(); n->kind = NK::RefScalar;
         n->left = std::move(inner); n->line = line;
         return n;
@@ -2660,6 +2801,25 @@ NodePtr Parser::parsePrimary() {
             auto node = std::make_unique<Node>(); node->kind = NK::CaptureVar;
             node->ival = n; node->line = line;
             return node;
+        }
+        /* W22: ${ EXPR } — symbolic scalar dereference by computed name
+           (Getopt/Std.pm's `${"opt_$first"} = 1;`). Real Perl: a BLOCK
+           after `$` is a symbolic reference — the block's string value
+           names the (global) variable to deref-read/deref-write. When
+           the block's expression is a runtime value this needs the
+           process glob registry (D110's machinery, perl_glob_get_scalar)
+           — codegen case NK::SymbolicDeref does both read and lvalue
+           write. Only the `${ EXPR }` form is handled here; the
+           already-working `@{ EXPR }` / `%{ EXPR }` block derefs are
+           untouched. */
+        if (check(TK::LBRACE)) {
+            advance();
+            auto inner = parseExpr();
+            consume(TK::RBRACE, "}");
+            auto n = std::make_unique<Node>();
+            n->kind = NK::SymbolicDeref;
+            n->left = std::move(inner); n->line = line;
+            return n;
         }
         /* $$ — process ID or $$ref deref */
         if (check(TK::SCALAR)) {
@@ -4208,6 +4368,54 @@ NodePtr Parser::parsePrimary() {
                 break;
             }
             if (isBareCall) {
+                /* importMap remap (same as parseBareCall): a name imported
+                   from a native module (`use Fcntl qw(...)` → Fcntl::SEEK_
+                   SET constant calls) resolves qualified here. A name NOT
+                   imported that is followed by a list COMMA is a plain
+                   bareword string in real Perl (print S_IRUSR, "," — real
+                   prints the string; only `foo "arg"`-shaped calls with an
+                   actual argument die "String found where operator
+                   expected"). */
+                auto iit = importMap_.find(nm);
+                if (iit != importMap_.end()) {
+                    auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                    n->name = iit->second; n->args = NodeList{};
+                    n->line = line;
+                    n->ival = 1; /* bareword call */
+                    return n;
+                }
+                if (cur().kind == TK::COMMA) {
+                    /* Qualified all-caps names in the constant modules
+                       (Fcntl::F_GETFD) are ALWAYS the constant call — no
+                       import needed (real Perl's qualified constant form
+                       bypasses the export list; the AUTOLOAD dies on
+                       unknown names, same as the runtime helper does).
+                       Everything else after a list comma is a bareword
+                       string (print S_IRUSR, "," — real prints the
+                       string). */
+                    std::string bare = nm;
+                    auto sc = bare.rfind("::");
+                    bool constQual = false;
+                    if (sc != std::string::npos) {
+                        std::string pkg = bare.substr(0, sc);
+                        bare = bare.substr(sc + 2);
+                        if ((pkg == "Fcntl" || pkg == "POSIX" || pkg == "Errno")
+                            && !bare.empty()) {
+                            constQual = true;
+                            for (char c : bare)
+                                if (!isupper((unsigned char)c) && c != '_' &&
+                                    !isdigit((unsigned char)c))
+                                    { constQual = false; break; }
+                        }
+                    }
+                    if (constQual) {
+                        auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                        n->name = nm; n->args = NodeList{}; n->line = line;
+                        n->ival = 1;
+                        return n;
+                    }
+                    return makeStr(nm, line);
+                }
                 auto n = std::make_unique<Node>(); n->kind = NK::Call;
                 n->name = nm; n->args = NodeList{}; n->line = line;
                 n->ival = 1; /* bareword call */
@@ -4251,9 +4459,73 @@ bool Parser::looksLikeBareCallArg() const {
     }
 }
 
+/* W23: inside a hash-key context (inKeyContext_), decide whether the
+   current keyword token is a builtin followed by an argument starter —
+   in which case it is a real builtin call used as the key expression
+   ($h{lc $k}, map { $c{uc $_} = 1 }), not a string key ($h{keys},
+   $h{shift}, $h{all} stay strings when nothing callable follows).
+   Verified against real Perl: a bareword/keyword in {key} position is
+   the literal key string only when the NEXT token is one of
+   } , ; => — otherwise the bareword is parsed as an expression (a
+   builtin call when it names one; a user-sub bareword call would also
+   be tried by real Perl, but IDENT-that-isn't-a-builtin keeps the
+   D136 string fallback here since we can't know user subs at parse
+   time — unchanged behavior).
+   cur() must be a keyword (KW_*) token when called. */
+bool Parser::inKeyBuiltinFollowedByArg() const {
+    TK k = toks_[pos_].kind;
+    /* Only builtin-ish keywords take the call path. Statement keywords
+       (my/our/if/while/return/...) and control flow never appear as
+       callable key expressions in real Perl — leave those on the
+       string-key path ($h{if} stays a string; real Perl deprecates
+       but accepts bareword keys regardless). */
+    bool isBuiltin;
+    switch (k) {
+    case TK::KW_SCALAR: case TK::KW_DEFINED: case TK::KW_UNDEF:
+    case TK::KW_KEYS: case TK::KW_VALUES: case TK::KW_EACH:
+    case TK::KW_EXISTS: case TK::KW_DELETE:
+    case TK::KW_LENGTH: case TK::KW_SUBSTR: case TK::KW_JOIN:
+    case TK::KW_SPLIT: case TK::KW_INDEX: case TK::KW_RINDEX:
+    case TK::KW_UC: case TK::KW_LC: case TK::KW_UCFIRST: case TK::KW_LCFIRST:
+    case TK::KW_REVERSE: case TK::KW_REF:
+    case TK::KW_ABS: case TK::KW_INT: case TK::KW_SQRT:
+    case TK::KW_CHR: case TK::KW_ORD: case TK::KW_HEX: case TK::KW_OCT:
+    case TK::KW_MAP: case TK::KW_GREP: case TK::KW_SORT:
+    case TK::KW_SHIFT: case TK::KW_POP:
+    case TK::KW_WANTARRAY: case TK::KW_CALLER:
+    case TK::KW_RAND: case TK::KW_SRAND: case TK::KW_TIME:
+    case TK::KW_LOCALTIME: case TK::KW_GMTIME: case TK::KW_SLEEP:
+    case TK::KW_ALARM: case TK::KW_CHDIR:
+    case TK::KW_SUM: case TK::KW_MIN: case TK::KW_MAX:
+    case TK::KW_FIRST: case TK::KW_ANY: case TK::KW_ALL:
+    case TK::KW_NONE: case TK::KW_UNIQ: case TK::KW_REDUCE:
+    case TK::KW_PACK: case TK::KW_UNPACK:
+    case TK::KW_CHOMP: case TK::KW_CHOP:
+    case TK::KW_POS:
+        isBuiltin = true;
+        break;
+    default:
+        isBuiltin = false;
+        break;
+    }
+    if (!isBuiltin) return false;
+    /* An argument follows unless the next token closes the key or
+       separates: } , ; => EOF. */
+    TK nk = toks_[pos_ + 1 < toks_.size() ? pos_ + 1 : toks_.size() - 1].kind;
+    switch (nk) {
+    case TK::RBRACE: case TK::COMMA: case TK::SEMI:
+    case TK::FATARROW: case TK::EOF_TOK:
+        return false;
+    default:
+        return true;
+    }
+}
+
 NodePtr Parser::parseBareCall(std::string name, int line) {
     /* D36: foo ARG, ARG2  — list-operator style, no parentheses.
        ival=1 marks bareword-style call (unknown name → compile error). */
+    if (getenv("PERLC_DEBUG_BARE"))
+        fprintf(stderr, "BARECALL: '%s' line %d\n", name.c_str(), line);
     auto it = importMap_.find(name);
     if (it != importMap_.end()) name = it->second;
     const std::string *pr = lookupProto(name);

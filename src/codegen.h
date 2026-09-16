@@ -278,6 +278,8 @@ private:
 
     void   emitStmt(const Node &n);
     llvm::Value *emitExpr(const Node &n);
+    /* W22: symbolic-ref half of ${ EXPR } (shared by read + lvalue paths) */
+    llvm::Value *emitSymbolicDeref(const Node &n);
     llvm::Value *emitBlock(const Node &n);
     llvm::Value *emitBlockLast(const Node &n); /* emits block, returns last expr value */
     llvm::Value *emitBinOp(const Node &n);

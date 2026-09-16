@@ -535,7 +535,7 @@ static std::vector<Token> inlineModules(
                        bareword-global sub (unchanged pre-D26 behavior). */
                     emitOneConstSub(cname, valTokens);
                     if (constMap && !valTokens.empty() && parser) {
-                        auto parsed = Parser::parseExprFromTokens(valTokens);
+                        auto parsed = Parser::parseExprFromTokens(valTokens, constMap);
                         if (parsed) (*constMap)[cname] = std::move(parsed);
                     }
                     return;
@@ -551,7 +551,9 @@ static std::vector<Token> inlineModules(
                     emitOneConstSub(cname, valTokens);
                     /* also record in constMap so bare NAME (without parens) resolves */
                     if (constMap && !valTokens.empty() && parser) {
-                        auto parsed = Parser::parseExprFromTokens(valTokens);
+                        /* W19: pass constMap so the value can reference
+                           earlier constants (use constant B => A + 1). */
+                        auto parsed = Parser::parseExprFromTokens(valTokens, constMap);
                         if (parsed) (*constMap)[cname] = std::move(parsed);
                     }
                 }
@@ -680,6 +682,100 @@ static std::vector<Token> inlineModules(
            above). A bare `use Cwd;` needs no importMap entries: Cwd's
            @EXPORT names (cwd/getcwd) are already in codegen's bare-name
            dispatch. */
+        if (modName == "Fcntl" || modName == "POSIX" || modName == "Errno") {
+            /* Native constant modules (Fcntl/POSIX/Errno): the requested
+               names map to qualified constant calls (codegen resolves
+               them through the generated value table). Tag specs (:seek,
+               :flock, :DEFAULT, ...) expand to the module's real default
+               export set — probed from real perl's @EXPORT/@EXPORT_OK and
+               the survey-3 constant list; unknown bare names still die
+               "not exported" like real Exporter (validated below). */
+            static const std::map<std::string, std::vector<std::string>>
+                nativeTagExports = {
+                {"Fcntl", {
+                    /* :DEFAULT = the real @Fcntl::EXPORT set (probed from
+                       the host perl; note SEEK_* / LOCK_* are @EXPORT_OK,
+                       NOT @EXPORT — matching real Fcntl) */
+                    "FD_CLOEXEC","F_ALLOCSP","F_ALLOCSP64","F_COMPAT",
+                    "F_DUP2FD","F_DUPFD","F_EXLCK","F_FREESP","F_FREESP64",
+                    "F_FSYNC","F_FSYNC64","F_GETFD","F_GETFL","F_GETLK",
+                    "F_GETLK64","F_GETOWN","F_NODNY","F_POSIX","F_RDACC",
+                    "F_RDDNY","F_RDLCK","F_RWACC","F_RWDNY","F_SETFD",
+                    "F_SETFL","F_SETLK","F_SETLK64","F_SETLKW","F_SETLKW64",
+                    "F_SETOWN","F_SHARE","F_SHLCK","F_UNLCK","F_UNSHARE",
+                    "F_WRACC","F_WRDNY","F_WRLCK",
+                    "O_ACCMODE","O_ALIAS","O_APPEND","O_ASYNC","O_BINARY",
+                    "O_CREAT","O_DEFER","O_DIRECT","O_DIRECTORY","O_DSYNC",
+                    "O_EXCL","O_EXLOCK","O_LARGEFILE","O_NDELAY","O_NOCTTY",
+                    "O_NOFOLLOW","O_NOINHERIT","O_NONBLOCK","O_RANDOM",
+                    "O_RAW","O_RDONLY","O_RDWR","O_RSRC","O_RSYNC",
+                    "O_SEQUENTIAL","O_SHLOCK","O_SYNC","O_TEMPORARY",
+                    "O_TEXT","O_TRUNC","O_WRONLY",
+                }},
+                {"POSIX", {
+                    /* real POSIX's %EXPORT tags carry the LC_* constants
+                       (probed) */
+                    "LC_ALL","LC_COLLATE","LC_CTYPE","LC_NUMERIC",
+                    "LC_MONETARY","LC_MESSAGES",
+                    "EXIT_SUCCESS","EXIT_FAILURE",
+                }},
+                {"Errno", {}},
+            };
+            /* Tags per real module: Fcntl %EXPORT_TAGS
+               (:seek => SEEK_*, :flock => LOCK_*, :DEFAULT => @EXPORT,
+                :ALL => everything); POSIX similar. */
+            static const std::map<std::string,
+                std::map<std::string, std::vector<std::string>>> nativeTags = {
+                {"Fcntl", {
+                    {"seek", {"SEEK_SET","SEEK_CUR","SEEK_END"}},
+                    {"flock", {"LOCK_SH","LOCK_EX","LOCK_UN","LOCK_NB"}},
+                    {"DEFAULT", {}},   /* overridden above by the DEFAULT branch */
+                }},
+                {"POSIX", {
+                    {"all", {"LC_ALL","LC_COLLATE","LC_CTYPE","LC_NUMERIC",
+                             "LC_MONETARY","LC_MESSAGES"}},
+                }},
+            };
+            std::vector<std::string> names = explicitImports;
+            bool hasTag = false;
+            for (auto &name : names)
+                if (!name.empty() && name[0] == ':') hasTag = true;
+            if (hasTag) {
+                std::vector<std::string> expanded;
+                for (auto &name : names) {
+                    if (!name.empty() && name[0] == ':') {
+                        std::string tag = name.substr(1);
+                        if (tag == "DEFAULT" || tag == "all" || tag == "ALL") {
+                            for (auto &n2 : nativeTagExports.at(modName))
+                                expanded.push_back(n2);
+                        } else {
+                            auto &tagmap = nativeTags.at(modName);
+                            auto it = tagmap.find(tag);
+                            if (it == tagmap.end()) {
+                                throw std::runtime_error("\"" + name +
+                                    "\" is not defined in %EXPORT_TAGS of the " +
+                                    modName + " module");
+                            }
+                            for (auto &n2 : it->second)
+                                expanded.push_back(n2);
+                        }
+                    } else {
+                        expanded.push_back(name);
+                    }
+                }
+                names = expanded;
+            }
+            for (auto &name : names) {
+                if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (name.empty() || name[0] == ':') continue;
+                importMap[name] = modName + "::" + name;
+            }
+            if (getenv("PERLC_DEBUG_IMPORTS")) {
+                fprintf(stderr, "FcntlImport: %s -> %zu names\n", modName.c_str(), names.size());
+                for (auto &name : names) fprintf(stderr, "  [%s]\n", name.c_str());
+            }
+            continue;
+        }
         if (modName == "Cwd" || modName == "Sys::Hostname" ||
             modName == "Time::Local" || modName == "File::Spec::Functions") {
             /* File::Spec::Functions' real %EXPORT_TAGS defines

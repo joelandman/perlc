@@ -156,7 +156,13 @@ make clean
   Exporter imports; DynaLoader-compatible FFI; Cwd, Sys::Hostname,
   File::Spec(+::Functions), Time::Local native modules; mixed-sigil
   `my (%h)`/`our (%a, $b)` lists; multi-token `use constant` values;
-  `q!`/`tr|/|_` arbitrary delimiters; `1<<5` heredoc mis-lex.)
+  `q!`/`tr|/|_` arbitrary delimiters; `1<<5` heredoc mis-lex.
+  Fixed 2026-09-16: native `Config` module (`$Config{...}` + the 4
+  functions, host-exact values), Fcntl/POSIX/Errno native constants
+  (`use Fcntl qw(:seek :flock)`, SEEK_SET/O_CREAT/LC_ALL/ENOENT ...),
+  `sysseek`, `$s =~ $var` dynamic match patterns, `${"opt_$x"}`
+  symbolic deref, `sub f { return (32); }` returning the element,
+  `$h{lc $k}` computed keys, `use constant B => A + 1` chains.)
   (Fixed 2026-09-12: `use`/`no` pragmas now parse inside any nested
   scope, D125; `split` patterns with capturing groups now interleave
   the captured delimiter text, D126; a BigInt-tagged variable operand

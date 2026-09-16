@@ -1,0 +1,15 @@
+my %h = (all => "v", keys => "v", shift => "v", defined => "v", abs => "v", k => "v");
+print "$h{all} $h{keys} $h{shift} $h{defined} $h{abs}\n";
+my $k = "K";
+print $h{lc $k}, "\n";
+print $h{lc($k)}, "\n";
+print $h{uc "k"}, "\n";
+print $h{int(5.7)}, "\n";
+my @c = ("List", "Get");
+my %c;
+map { $c{uc $_} = 1 } @c;
+print "$c{LIST}$c{GET}\n";
+my @ks = keys %h;
+print scalar(@ks) >= 5, "\n";
+print $h{join ",", "k"}, "\n";
+print $h{length "kk"}, "|", $h{substr "abc", 1}, "|\n";

@@ -800,6 +800,16 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_timelocal_modern", pv, av);
     RT("perl_timegm_posix",     pv, av);
     RT("perl_timelocal_posix",  pv, av);
+    RT("perl_native_constant",  pv, i8p);
+    RT("perl_config_get",       pv, pv);
+    RT("perl_config_exists",    Type::getInt32Ty(ctx_), pv);
+    RT("perl_config_keys",      av);
+    RT("perl_config_myconfig",  pv);
+    RT("perl_config_configsh",  pv);
+    RT("perl_config_config_vars", pv, av);
+    RT("perl_config_config_re", pv, pv);
+    RT("perl_env_exists",       Type::getInt32Ty(ctx_), pv);
+    RT("perl_sysseek_fh",       pv, pv, pv, pv);
     /* File I/O (Tier 2) */
     RT("perl_seek_fh",          pv, pv, pv, pv);
     RT("perl_tell_fh",          pv, pv);
@@ -865,9 +875,28 @@ RT("perl_clear_named_captures", voidTy);
 
 Function *CodeGen::getRTFunc(const std::string &nm) {
     auto it = rtFuncs_.find(nm);
-    if (it == rtFuncs_.end())
-        throw std::runtime_error("Unknown runtime function: " + nm);
-    return it->second;
+    if (it != rtFuncs_.end()) return it->second;
+    /* W22/W28: perl_to_string_dup (runtime.c:1772) and libc free are not
+       in the RT() table (deliberately untouched for this fix), so they
+       are declared on demand here — the central lookup is the one place
+       every call site goes through, so a lazy declaration here covers
+       all of them. */
+    if (nm == "perl_to_string_dup") {
+        auto *fn = Function::Create(
+            makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+            Function::ExternalLinkage, nm, mod_.get());
+        rtFuncs_[nm] = fn;
+        return fn;
+    }
+    if (nm == "free") {
+        auto *fn = Function::Create(
+            makeRT(ctx_, Type::getVoidTy(ctx_),
+                          {PointerType::getUnqual(ctx_)}),
+            Function::ExternalLinkage, nm, mod_.get());
+        rtFuncs_[nm] = fn;
+        return fn;
+    }
+    throw std::runtime_error("Unknown runtime function: " + nm);
 }
 
 /* ── scope management ────────────────────────────────────────────────────── */
@@ -1206,6 +1235,9 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     }
     if (n.kind == NK::KeysFunc) {
         Value *av;
+        /* keys %Config (list context) — native special hash */
+        if (n.name == "Config" || n.name == "Config::Config")
+            return callRT("perl_config_keys", {});
         if (n.left) {                      /* keys %{$ref} or keys %$ref */
             Value *ref = emitExpr(*n.left);
             Value *h   = callRT("perl_deref_hash", {ref});
@@ -5052,7 +5084,28 @@ void CodeGen::emitStmt(const Node &n) {
                     auto *newGv = new GlobalVariable(*mod_, perlPtrTy_, false,
                         GlobalValue::InternalLinkage,
                         Constant::getNullValue(perlPtrTy_), "g." + nm);
-                    builder_.CreateStore(perlUndef(), newGv);
+                    /* W22: ONE shared undef PerlValue backs both storages —
+                       the LLVM global (compile-time-known reads/writes of
+                       the named variable) and the runtime glob registry
+                       cell (symbolic dereferences by computed name,
+                       ${ EXPR }, which real Perl resolves through the
+                       symbol table at runtime when the name isn't known
+                       at compile time). Both alias the same PerlValue, so
+                       perl_assign's in-place mutation is visible through
+                       either path. The bare-name fallback registration
+                       matches glob_get_or_create's own bare-vs-qualified
+                       matching (its ::-suffix strip), so a main-package
+                       ${"name"} finds it either way. */
+                    Value *shared = perlUndef();
+                    builder_.CreateStore(shared, newGv);
+                    if (currentPackage_.empty() || currentPackage_ == "main") {
+                        Value *bareKey = builder_.CreateGlobalStringPtr(
+                            std::string("main::") + nm);
+                        callRT("perl_glob_set_scalar", {bareKey, shared});
+                    } else {
+                        Value *pkgKey = builder_.CreateGlobalStringPtr(qualKey);
+                        callRT("perl_glob_set_scalar", {pkgKey, shared});
+                    }
                     gv = newGv;
                 }
                  if (n.right) {
@@ -6394,6 +6447,40 @@ void CodeGen::emitStmt(const Node &n) {
 
 /* ── expression emission ─────────────────────────────────────────────────── */
 
+/* W22: the symbolic-reference half of ${ EXPR } (read form). EXPR's
+   string value names a global variable, resolved through the process
+   glob registry (D110's machinery) with the current package as the
+   default qualifier — real Perl resolves a symbolic ref without an
+   explicit package in the current package. main:: names use the bare
+   key directly (the registry keys bare names under main:: for D110).
+   Returns the registry CELL (the stable PerlValue* the global aliases),
+   so a read sees in-place writes made through the LLVM global and the
+   lvalue path can hand the same cell to the generic assign machinery. */
+Value *CodeGen::emitSymbolicDeref(const Node &n) {
+    int savedCtx = callCtx_;
+    callCtx_ = -1;
+    Value *namePv = emitExpr(*n.left);
+    callCtx_ = savedCtx;
+    Value *nm = callRT("perl_to_string_dup", {namePv});
+    freeIfOwned(namePv);
+    Value *key;
+    if (!currentPackage_.empty() && currentPackage_ != "main") {
+        Value *dot = builder_.CreateGlobalStringPtr("::", "sd.dot");
+        Value *pkg = builder_.CreateGlobalStringPtr(currentPackage_, "sd.pkg");
+        /* key = pkg . "::" . nm — via perl_concat */
+        Value *p1 = callRT("perl_concat", {pkg, dot});
+        key = callRT("perl_concat", {p1, nm});
+        freeIfOwned(p1);
+    } else {
+        /* main:: — the glob registry already keys bare names under
+           main:: for D110; use the bare name directly */
+        key = nm;
+    }
+    Value *cell = callRT("perl_glob_get_scalar", {key});
+    builder_.CreateCall(getRTFunc("free"), {nm});
+    return cell;
+}
+
 Value *CodeGen::emitExpr(const Node &n) {
     if (debug_ && n.line > 0) {
         builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
@@ -7257,6 +7344,49 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *rhs = emitExpr(*n.right);
             callRT("perl_assign", {target, rhs});
             return rhs;
+        }
+        /* W22: ${$ref} = val — block-form spelling of `$$ref = val`.
+           The parser routes any `${ ... }` to SymbolicDeref, so a REF
+           block-form lvalue lands here; deref the referent cell and
+           perl_assign through it (same semantics as the DerefScalar
+           branch immediately above). A string-valued EXPR instead goes
+           through emitLValue's SymbolicDeref lvalue case (glob registry).
+           NOTE: the ref form is detected at runtime (the tag check inside
+           emitLValue), so this static branch only catches the common
+           compile-time-obvious `${$ref}` spelling where the inner node
+           is a ScalarVar; general expressions fall to emitLValue. */
+        if (n.left->kind == NK::SymbolicDeref && n.left->left &&
+            n.left->left->kind == NK::ScalarVar) {
+            Value *ref = emitExpr(*n.left->left);
+            Value *isRef = callRT("perl_su_reftype", {ref});
+            Value *hasRef = builder_.CreateICmpNE(
+                builder_.CreateCall(getRTFunc("perl_is_true"), {isRef}),
+                ConstantInt::get(Type::getInt32Ty(ctx_), 0), "sd.as.isref");
+            auto *curFn = builder_.GetInsertBlock()->getParent();
+            auto *refBB = BasicBlock::Create(ctx_, "sd.as.ref", curFn);
+            auto *genBB = BasicBlock::Create(ctx_, "sd.as.gen", curFn);
+            auto *joinBB = BasicBlock::Create(ctx_, "sd.as.join", curFn);
+            builder_.CreateCondBr(hasRef, refBB, genBB);
+            builder_.SetInsertPoint(refBB);
+            Value *rhsR = emitExpr(*n.right);
+            Value *targetR = callRT("perl_deref_scalar", {ref});
+            callRT("perl_assign", {targetR, rhsR});
+            builder_.CreateBr(joinBB);
+            auto *refBBp = builder_.GetInsertBlock();
+            builder_.SetInsertPoint(genBB);
+            Value *rhsG = emitExpr(*n.right);
+            Value *lhsG = emitLValue(*n.left);
+            if (lhsG) {
+                Value *lhsValG = builder_.CreateLoad(perlPtrTy_, lhsG);
+                callRT("perl_assign", {lhsValG, rhsG});
+            }
+            builder_.CreateBr(joinBB);
+            auto *genBBp = builder_.GetInsertBlock();
+            builder_.SetInsertPoint(joinBB);
+            auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "sd.as.res");
+            phi->addIncoming(rhsR, refBBp);
+            phi->addIncoming(rhsG, genBBp);
+            return phi;
         }
         /* $ref->[i] = val  or  $ref->{k} = val  (with autovivification) */
         if (n.left->kind == NK::ArrowDeref) {
@@ -8291,6 +8421,10 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *key = emitExpr(*n.left);
             return callRT("perl_env_get", {key});
         }
+        if (n.name == "Config" || n.name == "Config::Config") {
+            Value *key = emitExpr(*n.left);
+            return callRT("perl_config_get", {key});
+        }
         if (n.name == "+") {
             Value *key = emitExpr(*n.left);
             return callRT("perl_plus_hash_get", {key});
@@ -8312,6 +8446,8 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::KeysFunc: {
+        if (n.name == "Config" || n.name == "Config::Config")
+            return callRT("perl_config_keys", {});
         /* D119: keys %$href / keys %{$href} in scalar context — n.name is
            empty for the deref form, so lookupHash(n.name) always missed
            and this fell straight to perlInt(0). Mirrors emitArrayPtr's
@@ -8351,6 +8487,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             return callRT("perl_alloc_int",
                 {builder_.CreateSExt(i32v, Type::getInt64Ty(ctx_))});
         };
+        /* exists $Config{...} / exists $ENV{...} — native special hashes */
+        if (n.left &&
+            (n.name == "Config" || n.name == "Config::Config" ||
+             n.name == "ENV" || n.name == "::ENV"))
+            return existsI32(callRT(
+                n.name == "ENV" ? "perl_env_exists" : "perl_config_exists",
+                {emitExpr(*n.left)}));
         /* Chained exists $h{a}{b}: autoviv intermediates, exists on last. */
         if (!n.args.empty() && n.left) {
             struct ExLev { bool isArr; const Node *key; };
@@ -8847,6 +8990,63 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_deref_scalar", {ref});
     }
 
+    /* W22: ${ EXPR } — symbolic scalar deref by computed name (real Perl:
+       a BLOCK after `$` is a symbolic reference whose string value names
+       the variable to access — Getopt/Std.pm's `${"opt_$first"} = 1;`).
+       When EXPR is a runtime string, the named (global) variable is
+       resolved through the process glob registry (D110's machinery,
+       perl_glob_get_scalar) with the current package as the default
+       qualifier, exactly like the isQualifiedName/ isGlobName read paths
+       above. When EXPR is a plain scalar variable holding a REF, this
+       case is not used — the existing $$ref path (NK::DerefScalar from
+       the `$$` parse branch) handles that; but a ${$ref} spelling also
+       lands here, so detect that shape in the parser instead and keep
+       this case name-only (matching real Perl: ${$r} where $r holds a
+        non-string ref derefs the ref). */
+    case NK::SymbolicDeref: {
+        /* W22 (part 2): ${$ref} — block-form deref of a REF-typed value
+           is the ordinary scalar deref (same node as `$$ref`), NOT a
+           symbolic-name lookup. The symbolic path's glob-registry read
+           of a REF PerlValue would have returned the ref itself, and
+           the runtime's glob lookup for the "SCALAR(0x...)" stringified
+           key would silently create a fresh empty global. Real Perl:
+           ${$r} and $$r are the same operator — a block after `$` derefs
+           whatever the block evaluates to (a REF value derefs the
+           referent; a string is a symbolic reference to the named
+           global, resolved in the current package). The runtime tag
+           check is perl_su_reftype (returns undef when the value is not
+           a reference). */
+        if (n.left) {
+            int savedCtx0 = callCtx_;
+            callCtx_ = -1;
+            Value *refPv = emitExpr(*n.left);
+            callCtx_ = savedCtx0;
+            Value *isRef = callRT("perl_su_reftype", {refPv});
+            Value *hasRef = builder_.CreateICmpNE(
+                builder_.CreateCall(getRTFunc("perl_is_true"), {isRef}),
+                ConstantInt::get(Type::getInt32Ty(ctx_), 0), "sd.isref");
+            auto *curFn = builder_.GetInsertBlock()->getParent();
+            auto *refBB = BasicBlock::Create(ctx_, "sd.ref", curFn);
+            auto *symBB = BasicBlock::Create(ctx_, "sd.sym", curFn);
+            auto *joinBB = BasicBlock::Create(ctx_, "sd.join", curFn);
+            builder_.CreateCondBr(hasRef, refBB, symBB);
+            builder_.SetInsertPoint(refBB);
+            Value *refRes = callRT("perl_deref_scalar", {refPv});
+            builder_.CreateBr(joinBB);
+            auto *refBBp = builder_.GetInsertBlock();
+            builder_.SetInsertPoint(symBB);
+            Value *symRes = emitSymbolicDeref(n);
+            auto *symBBp = builder_.GetInsertBlock();
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(joinBB);
+            auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "sd.res");
+            phi->addIncoming(refRes, refBBp);
+            phi->addIncoming(symRes, symBBp);
+            return phi;
+        }
+        return emitSymbolicDeref(n);
+    }
+
     case NK::DerefArray: {
         Value *ref = emitExpr(*n.left);
         return callRT("perl_deref_array", {ref});
@@ -8925,6 +9125,51 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
         bool isG   = n.name.find('g') != std::string::npos;
         Value *res = callRT(isG ? "perl_regex_match_g" : "perl_regex_match", {str, pat, flg});
+        return n.ival ? callRT("perl_not", {res}) : res;
+    }
+
+    /* W28: $s =~ EXPR — the pattern comes from a runtime value (real Perl
+       compiles the RHS's string value as a regex at runtime, m/$var/).
+       left = target string, right = pattern expression, ival = !~ flag.
+       No flags exist in this form (real Perl m/$var/ carries none), so
+       the runtime gets the empty flags string, which perl_regex_match
+       already handles (its regex cache keys on (pattern, flags)).
+       The pattern must reach perl_regex_match as a `const char*` (its
+       declared ABI, fixed in the RT() table which is deliberately not
+       touched for this fix), so the pattern PerlValue* is converted
+       with the runtime's existing perl_to_string_dup (declared here
+       inline the same way declareRuntime's setjmp special case declares
+       its non-table function — the C symbol exists in runtime.c:1772;
+       its returned buffer is freed right after the call). */
+    case NK::RegexMatchExpr: {
+        /* one-time inline declaration of `char *perl_to_string_dup(const PerlValue*)`
+           (the C symbol lives in runtime.c:1772, outside the RT() table's
+           namespace — declared here the same way declareRuntime's setjmp
+           special case declares its non-table function) */
+        if (!rtFuncs_.count("perl_to_string_dup"))
+            rtFuncs_["perl_to_string_dup"] = Function::Create(
+                makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
+        /* same for `void free(void*)` (libc) — the dup'd buffer's owner */
+        Function *freeFn = rtFuncs_.count("free")
+            ? rtFuncs_["free"]
+            : (rtFuncs_["free"] = Function::Create(
+                   makeRT(ctx_, Type::getVoidTy(ctx_),
+                          {PointerType::getUnqual(ctx_)}),
+                   Function::ExternalLinkage, "free", mod_.get()));
+
+        Value *str = emitExpr(*n.left);
+        int savedCtx = callCtx_;
+        callCtx_ = -1;              /* pattern expr inherits caller context */
+        Value *patPv = emitExpr(*n.right);
+        callCtx_ = savedCtx;
+        /* const char* pattern: dup the pattern's string out, then free it */
+        Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
+        Value *flg = builder_.CreateGlobalStringPtr("", "re_expr_flg");
+        Value *res = callRT("perl_regex_match", {str, patC, flg});
+        builder_.CreateCall(freeFn, {patC});
+        freeIfOwned(str);
+        freeIfOwned(patPv);
         return n.ival ? callRT("perl_not", {res}) : res;
     }
 
@@ -10224,6 +10469,60 @@ Value *CodeGen::emitLValue(const Node &n) {
         }
         return slot;
     }
+    /* W22: ${ EXPR } = ... — lvalue form of the symbolic scalar deref.
+       Same glob-registry resolution as the read case in emitExpr, but
+       returns the registry CELL itself (a PerlValue** held in a temp
+       alloca, matching the isQualifiedName/isGlobName write paths just
+       above) so the generic assign path writes through it to the real
+       global. */
+    case NK::SymbolicDeref: {
+        /* W22 lvalue: ${ EXPR } = ... — for a REF-typed EXPR this is the
+           ordinary scalar deref (same node as `$$ref`), whose lvalue is
+           handled by the existing NK::DerefScalar lvalue case above; for
+           a string-valued EXPR the glob registry resolves the named
+           global. The read path's phi-split can't be reused here (the
+           two arms return different shapes), so the tag check simply
+           selects which of the two lvalue forms to return. */
+        int savedCtx = callCtx_;
+        callCtx_ = -1;
+        Value *namePv = emitExpr(*n.left);
+        callCtx_ = savedCtx;
+        Value *isRef = callRT("perl_su_reftype", {namePv});
+        Value *hasRef = builder_.CreateICmpNE(
+            builder_.CreateCall(getRTFunc("perl_is_true"), {isRef}),
+            ConstantInt::get(Type::getInt32Ty(ctx_), 0), "sd.lv.isref");
+        auto *curFn = builder_.GetInsertBlock()->getParent();
+        auto *refBB = BasicBlock::Create(ctx_, "sd.lv.ref", curFn);
+        auto *symBB = BasicBlock::Create(ctx_, "sd.lv.sym", curFn);
+        auto *joinBB = BasicBlock::Create(ctx_, "sd.lv.join", curFn);
+        builder_.CreateCondBr(hasRef, refBB, symBB);
+        builder_.SetInsertPoint(refBB);
+        /* ref arm: deref the ref — the referent cell itself is the lvalue
+           storage (a live PerlValue* in a temp alloca, same shape the
+           generic assign path expects). */
+        Value *refCell = callRT("perl_deref_scalar", {namePv});
+        auto *holdRef = builder_.CreateAlloca(perlPtrTy_, nullptr,
+                                              "symderef.lval");
+        builder_.CreateStore(refCell, holdRef);
+        builder_.CreateBr(joinBB);
+        auto *refBBp = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(symBB);
+        /* name arm: the glob registry's cell IS the stable PerlValue* the
+           generic assign path mutates in place via perl_assign — hold it
+           in a temp alloca, exactly like the isQualifiedName/isGlobName
+           write paths just above. */
+        Value *cell = emitSymbolicDeref(n);
+        auto *holdSym = builder_.CreateAlloca(perlPtrTy_, nullptr,
+                                              "symderef.lval");
+        builder_.CreateStore(cell, holdSym);
+        builder_.CreateBr(joinBB);
+        auto *symBBp = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(joinBB);
+        auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "sd.lv.res");
+        phi->addIncoming(holdRef, refBBp);
+        phi->addIncoming(holdSym, symBBp);
+        return phi;
+    }
     default: return nullptr;
     }
 }
@@ -11368,6 +11667,62 @@ Value *CodeGen::emitCall(const Node &n) {
              ConstantInt::get(i32Ty, n.line)});
         Value *r = callRT("perl_timelocal_posix", {av});
         callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    /* Native constants (Fcntl/POSIX/Errno): a zero-arg call whose name is
+       an all-caps identifier in one of those packages resolves through the
+       generated value table (src/native_constants.h). Unknown names die
+       like the real XS AUTOLOAD's invalid-macro die (message inside the
+       runtime helper). Bare all-caps names reach here only via importMap
+       ("<mod>::<name>" entries) after `use Fcntl qw(...)` etc. */
+    {
+        std::string bare = n.name;
+        auto sc = bare.rfind("::");
+        if (sc != std::string::npos) bare = bare.substr(sc + 2);
+        bool allCaps = !bare.empty();
+        for (char c : bare)
+            if (!isupper((unsigned char)c) && c != '_' && !isdigit((unsigned char)c))
+                { allCaps = false; break; }
+        if (allCaps && n.args.empty() &&
+            (n.name.rfind("Fcntl::", 0) == 0 ||
+             n.name.rfind("POSIX::", 0) == 0 ||
+             n.name.rfind("Errno::", 0) == 0)) {
+            Value *r = callRT("perl_native_constant",
+                {builder_.CreateGlobalStringPtr(n.name)});
+            return r;
+        }
+    }
+    /* sysseek(FH, offset, whence) — real lseek(2); SEEK_* constants are
+       plain values by the time they arrive. */
+    if (n.name == "sysseek" || n.name == "Fcntl::sysseek") {
+        Value *fh = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *off = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *wh = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+        Value *r = callRT("perl_sysseek_fh", {fh, off, wh});
+        freeIfOwned(fh); freeIfOwned(off); freeIfOwned(wh);
+        return r;
+    }
+    /* Config (native): the 4 real functions. %Config access goes through
+       the HashElem/ExistsFunc/KeysFunc special cases, not here. */
+    if (n.name == "Config::myconfig" || n.name == "myconfig") {
+        return callRT("perl_config_myconfig", {});
+    }
+    if (n.name == "Config::config_sh" || n.name == "config_sh") {
+        return callRT("perl_config_configsh", {});
+    }
+    if (n.name == "Config::config_vars" || n.name == "config_vars") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+        }
+        return callRT("perl_config_config_vars", {av});
+    }
+    if (n.name == "Config::config_re" || n.name == "config_re") {
+        Value *pat = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *r = callRT("perl_config_config_re", {pat});
+        freeIfOwned(pat);
         return r;
     }
     /* UNIVERSAL */
