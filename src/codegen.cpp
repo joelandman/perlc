@@ -810,6 +810,10 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_config_config_re", pv, pv);
     RT("perl_env_exists",       Type::getInt32Ty(ctx_), pv);
     RT("perl_sysseek_fh",       pv, pv, pv, pv);
+    RT("perl_make_qr",          pv, i8p, i8p);
+    RT("perl_regex_match_sv",   pv, pv, pv, Type::getInt32Ty(ctx_));
+    RT("perl_value_is_qr",      Type::getInt32Ty(ctx_), pv);
+    RT("perl_regex_match_captures_list", av, pv, i8p, i8p);
     /* File I/O (Tier 2) */
     RT("perl_seek_fh",          pv, pv, pv, pv);
     RT("perl_tell_fh",          pv, pv);
@@ -1764,6 +1768,70 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *pat = builder_.CreateGlobalStringPtr(n.sval, "ra_pat");
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "ra_flg");
         return callRT("perl_regex_match_all", {str, pat, flg});
+    }
+    /* List-context non-/g match: the CAPTURE LIST (empty = no match),
+       exactly like real perl's `my @m = ($str =~ /pat/);`. RegexMatchExpr
+       with a QR operand also lands here (`my @m = ($str =~ $re);`).
+       NOTE: !~ is excluded — real perl's !~ returns a plain boolean even
+       in list context (never a capture list). */
+    if (((n.kind == NK::RegexMatch && n.name.find('g') == std::string::npos) ||
+         n.kind == NK::RegexMatchExpr) && !n.ival) {
+        Value *str = emitExpr(*n.left);
+        if (n.kind == NK::RegexMatch) {
+            Value *pat = builder_.CreateGlobalStringPtr(n.sval, "rmc_pat");
+            Value *flg = builder_.CreateGlobalStringPtr(n.name, "rmc_flg");
+            return callRT("perl_regex_match_captures_list", {str, pat, flg});
+        }
+        int savedCtxRmc = callCtx_;
+        callCtx_ = -1;
+        Value *patPv = emitExpr(*n.right);
+        callCtx_ = savedCtxRmc;
+        if (!rtFuncs_.count("perl_to_string_dup"))
+            rtFuncs_["perl_to_string_dup"] = Function::Create(
+                makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
+        Function *freeFnRmc = rtFuncs_.count("free")
+            ? rtFuncs_["free"]
+            : (rtFuncs_["free"] = Function::Create(
+                   makeRT(ctx_, Type::getVoidTy(ctx_),
+                          {PointerType::getUnqual(ctx_)}),
+                   Function::ExternalLinkage, "free", mod_.get()));
+        /* QR operand: use its pattern/flags directly via accessors. */
+        Value *isQr = callRT("perl_value_is_qr", {patPv});
+        auto *curFnRmc = builder_.GetInsertBlock()->getParent();
+        auto *qrBB = BasicBlock::Create(ctx_, "rmc.qr", curFnRmc);
+        auto *strBB = BasicBlock::Create(ctx_, "rmc.str", curFnRmc);
+        auto *phiBB = BasicBlock::Create(ctx_, "rmc.phi", curFnRmc);
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(
+                isQr, ConstantInt::get(Type::getInt32Ty(ctx_), 0), "rmc.qrchk"),
+            qrBB, strBB);
+        builder_.SetInsertPoint(qrBB);
+        if (!rtFuncs_.count("perl_qr_pattern")) {
+            rtFuncs_["perl_qr_pattern"] = Function::Create(
+                makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                Function::ExternalLinkage, "perl_qr_pattern", mod_.get());
+            rtFuncs_["perl_qr_flags"] = Function::Create(
+                makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                Function::ExternalLinkage, "perl_qr_flags", mod_.get());
+        }
+        Value *qpat = builder_.CreateCall(rtFuncs_["perl_qr_pattern"], {patPv});
+        Value *qflg = builder_.CreateCall(rtFuncs_["perl_qr_flags"], {patPv});
+        Value *qrList = callRT("perl_regex_match_captures_list", {str, qpat, qflg});
+        builder_.CreateBr(phiBB);
+        builder_.SetInsertPoint(strBB);
+        Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
+        Value *flgE = builder_.CreateGlobalStringPtr("", "rmc_flg");
+        Value *strList = callRT("perl_regex_match_captures_list", {str, patC, flgE});
+        builder_.CreateCall(freeFnRmc, {patC});
+        builder_.CreateBr(phiBB);
+        builder_.SetInsertPoint(phiBB);
+        auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "rmc.av");
+        phi->addIncoming(qrList, qrBB);
+        phi->addIncoming(strList, strBB);
+        freeIfOwned(str);
+        freeIfOwned(patPv);
+        return phi;
     }
     if (n.kind == NK::SpliceFunc) {
         Value *av = lookupArray(n.name);
@@ -9141,6 +9209,47 @@ Value *CodeGen::emitExpr(const Node &n) {
        inline the same way declareRuntime's setjmp special case declares
        its non-table function — the C symbol exists in runtime.c:1772;
        its returned buffer is freed right after the call). */
+    case NK::QrRegex: {
+        /* qr/PAT/FLAGS — a compiled-pattern VALUE (real perl's qr//).
+           Built once at this statement's execution and refcounted; the
+           PV flows through subs/arrays/hashes like any scalar. When the
+           pattern text has interpolation triggers (n.right set), it is
+           built at runtime through the same interp machinery "..." uses. */
+        Value *pat;
+        if (n.right) {
+            Value *pv = emitExpr(*n.right);
+            if (!rtFuncs_.count("perl_to_string_dup"))
+                rtFuncs_["perl_to_string_dup"] = Function::Create(
+                    makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                    Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
+            pat = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {pv});
+            freeIfOwned(pv);
+        } else {
+            pat = builder_.CreateGlobalStringPtr(n.sval, "qr_pat");
+        }
+        Value *flg = builder_.CreateGlobalStringPtr(n.name, "qr_flg");
+        Value *r = callRT("perl_make_qr", {pat, flg});
+        return r;
+    }
+
+    case NK::RegexMatchInterp: {
+        /* $s =~ /pat-with-$vars/ — the pattern is an InterpolatedStr AST
+           (parseStringInterp output): evaluate it to its runtime string
+           and match with the node's flags. !~ via ival. */
+        Value *str = emitExpr(*n.left);
+        Value *patPv = emitExpr(*n.right);
+        if (!rtFuncs_.count("perl_to_string_dup"))
+            rtFuncs_["perl_to_string_dup"] = Function::Create(
+                makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
+        Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
+        Value *flg = builder_.CreateGlobalStringPtr(n.name, "rmi_flg");
+        Value *res = callRT("perl_regex_match", {str, patC, flg});
+        freeIfOwned(patPv);
+        freeIfOwned(str);
+        return n.ival ? callRT("perl_not", {res}) : res;
+    }
+
     case NK::RegexMatchExpr: {
         /* one-time inline declaration of `char *perl_to_string_dup(const PerlValue*)`
            (the C symbol lives in runtime.c:1772, outside the RT() table's
@@ -9163,14 +9272,14 @@ Value *CodeGen::emitExpr(const Node &n) {
         callCtx_ = -1;              /* pattern expr inherits caller context */
         Value *patPv = emitExpr(*n.right);
         callCtx_ = savedCtx;
-        /* const char* pattern: dup the pattern's string out, then free it */
-        Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
-        Value *flg = builder_.CreateGlobalStringPtr("", "re_expr_flg");
-        Value *res = callRT("perl_regex_match", {str, patC, flg});
-        builder_.CreateCall(freeFn, {patC});
+        /* QR-aware dispatch: a qr// operand uses its own pattern+flags;
+           anything else is stringified and matched with empty flags
+           (W28's original string-pattern behavior). */
+        Value *res = callRT("perl_regex_match_sv",
+            {str, patPv, ConstantInt::get(Type::getInt32Ty(ctx_), n.ival ? 1 : 0)});
         freeIfOwned(str);
         freeIfOwned(patPv);
-        return n.ival ? callRT("perl_not", {res}) : res;
+        return res;
     }
 
     case NK::RegexSubst: {
@@ -9178,7 +9287,21 @@ Value *CodeGen::emitExpr(const Node &n) {
         size_t sep = n.name.find('\x01');
         std::string repl  = n.name.substr(0, sep);
         std::string flags = n.name.substr(sep + 1);
-        Value *pat  = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
+        /* s/$var.../ pattern interpolation: when n.right is set (the
+           pattern was parsed as an InterpolatedStr AST), build the pattern
+           at runtime; otherwise it's the compile-time literal. */
+        Value *pat;
+        if (n.right) {
+            Value *pv = emitExpr(*n.right);
+            if (!rtFuncs_.count("perl_to_string_dup"))
+                rtFuncs_["perl_to_string_dup"] = Function::Create(
+                    makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                    Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
+            pat = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {pv});
+            freeIfOwned(pv);
+        } else {
+            pat = builder_.CreateGlobalStringPtr(n.sval, "rs_pat");
+        }
         Value *flg  = builder_.CreateGlobalStringPtr(flags,  "rs_flg");
 
         /* D38c/D109: evaluate `replExpr` once per match, with $1/$& already

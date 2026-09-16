@@ -25,6 +25,7 @@ typedef enum {
     PERL_DBI_STH      = 15, /* DBI statement handle — pval=PerlDBIStatement* */
     PERL_XS_PTR       = 16, /* opaque native pointer — pval=void* */
     PERL_BIGINT       = 17, /* Math::BigInt — pval=mpz_t* (GMP or mini-gmp), blessed_class="Math::BigInt" */
+    PERL_QR           = 18, /* compiled regex — pval=PerlQrRegex* */
 } PerlTag;
 
 /* PV_FLAG_SHARED: cell is a threads::shared variable (see SharedMutex below). */
@@ -493,6 +494,13 @@ void       perl_promote_ref_array(PerlValue *pv);
 void       perl_array_promote_refs(PerlArray *a);
 PerlValue *perl_ref_type(PerlValue *ref);       /* "SCALAR"/"ARRAY"/"HASH"/""   */
 
+/* qr// compiled-pattern object (PERL_QR pval) */
+typedef struct PerlQrRegex {
+    char *pattern;
+    char *flags;
+    int   refcount; /* mirrors PerlClosure's wrapper-count pattern */
+} PerlQrRegex;
+
 /* ── code references ─────────────────────────────────────────────────────── */
 typedef PerlValue *(*PerlSubFnCtx)(PerlArray *, int ctx);
 
@@ -511,6 +519,18 @@ PerlValue *perl_make_closure(PerlSubFnCtx fp, PerlArray *captures); /* with capt
 PerlValue *perl_call_code_ref(PerlValue *ref, PerlArray *args);
 PerlValue *perl_get_current_code_ref(void); /* D124: __SUB__ inside a closure body */
 PerlValue *perl_get_capture(long long idx);  /* returns capture[idx] during a closure call */
+
+/* ── qr// compiled-pattern values ────────────────────────────────────────── */
+PerlValue *perl_make_qr(const char *pattern, const char *flags);
+const char *perl_qr_pattern(PerlValue *qr); /* NULL if not a QR */
+const char *perl_qr_flags(PerlValue *qr);
+/* $s =~ $var: QR-aware match dispatch (uses the QR's own pattern+flags;
+   other operands are stringified). negate implements !~. */
+PerlValue *perl_regex_match_sv(PerlValue *str, PerlValue *pattern_pv, int negate);
+/* List-context non-/g match: capture LIST (empty = no match); sets $&,$1.. */
+PerlArray *perl_regex_match_captures_list(PerlValue *str, const char *pattern,
+                                          const char *flags);
+int perl_value_is_qr(PerlValue *pv);
 
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);

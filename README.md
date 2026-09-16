@@ -162,7 +162,11 @@ make clean
   (`use Fcntl qw(:seek :flock)`, SEEK_SET/O_CREAT/LC_ALL/ENOENT ...),
   `sysseek`, `$s =~ $var` dynamic match patterns, `${"opt_$x"}`
   symbolic deref, `sub f { return (32); }` returning the element,
-  `$h{lc $k}` computed keys, `use constant B => A + 1` chains.)
+  `$h{lc $k}` computed keys, `use constant B => A + 1` chains.
+  Fixed 2026-09-16 (cont.): `qr//` as a compiled-pattern value
+  (`ref()` → Regexp, stringification, =~/!~ dispatch), `/$var/`
+  regex-pattern interpolation (also in `s///` and `qr/$var/`), and
+  list-context match captures (`my @m = ($s =~ /pat/)`).
   (Fixed 2026-09-12: `use`/`no` pragmas now parse inside any nested
   scope, D125; `split` patterns with capturing groups now interleave
   the captured delimiter text, D126; a BigInt-tagged variable operand

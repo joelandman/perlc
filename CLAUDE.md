@@ -18,8 +18,8 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-16, re-verified after Config/Fcntl-constants/W-batch —
-356/356 PASS,
+**Harness (2026-09-16, re-verified after qr// + match-captures —
+360/360 PASS,
 0 FAIL; `make test` 47/47):** New this session:
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
@@ -61,7 +61,10 @@ DynaLoader-compatible FFI, self-verifying, outside the harness corpus),
 `w31_return_list_{smoke,deep}.pl`, `w23_key_expr_{smoke,deep}.pl`,
 `w28_match_var_{smoke,deep}.pl`,
 `w22_symbolic_deref_{smoke,deep,deep2}.pl`,
-`w19_unary_plus_{smoke,deep}.pl` (survey-3 W-items, 2026-09-16).
+`w19_unary_plus_{smoke,deep}.pl` (survey-3 W-items, 2026-09-16),
+`qr_regex_{smoke,deep}.pl`, `qr_match_list_{smoke,deep}.pl`
+(qr// + list-context match captures + regex-pattern interpolation,
+2026-09-16).
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
@@ -157,8 +160,12 @@ are in TESTS.md):**
   W23 in-key builtin-call vs string-key disambiguation + `(not => 1)`;
   W28 `$s =~ $var` dynamic patterns; W22 symbolic deref `${"name"}`/
   `${$ref}` + `\$arr[1]` element-ref fix; W19 unary `+` + constant
-  chains. Remaining open: list-context non-/g match captures,
-  qr//, W29 `local *_`, false-bool stringify.
+  chains; qr// as a compiled-pattern value (lexer/parser/runtime tag,
+  ref()=Regexp, (?^msix:...) stringification, QR-aware =~ dispatch),
+  list-context non-/g match captures (groupless → (1) like real perl),
+  and regex-pattern interpolation (/$name/, s/$pat/.../, qr/$var/);
+  !~ stays boolean in list context. Remaining open: W29 `local *_`,
+  false-bool stringify, qr->() invocation.
 - D103/D104/D106/D108: see TESTS.md for full write-ups. Summary: D103
   is integer-overflow auto-promotion (bounded, unblessed auto-BigInt
   reusing the existing Math::BigInt/mini-gmp machinery — see TESTS.md

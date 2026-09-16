@@ -62,6 +62,7 @@ enum class TK {
     BIND,   /* =~ */
     NBIND,  /* !~ */
     SUBST,  /* s/pat/repl/flags */
+    QR,     /* qr/pattern/flags — compiled-pattern value (pattern + \x01 + flags) */
     TR,     /* tr/search/replace/flags  or  y/search/replace/flags */
     /* sigils */
     SCALAR,   /* $ */

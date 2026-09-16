@@ -2604,6 +2604,46 @@ sites), so the chained constant evaluates. Tests:
 `tests/w19_unary_plus_{smoke,deep}.pl` + a chained-constant probe
 verified byte-for-byte.
 
+### qr// + list-context match captures + regex-pattern interpolation — FIXED 2026-09-16
+
+**`qr/PAT/FLAGS` as a value** (lexer TK::QR + parser `NK::QrRegex` +
+runtime `PERL_QR` tag + `PerlQrRegex` refcounted object): `my $re =
+qr/^uc/i;` is a compiled-pattern value — `ref($re)` is `"Regexp"`,
+`"$re"` stringifies as real perl's `(?^FLAGS:PATTERN)` with flags
+canonicalized to m,s,i,x order (probed: `qr/x/simx` → `(?^msix:x)`,
+`qr/x/mix` → `(?^mix:x)`, `qr/x/n` → `(?^n:x)`), the value flows through
+subs/args/arrays/hash values with proper refcounting (clone + assign
+paths bump/release like CODE_REF does), and `$s =~ $re` / `!~ $re` use
+the QR's own pattern+flags directly through the W28 dynamic-match path
+(`perl_regex_match_sv`). `qr{...}`/`qr(...)`/`qr!...!` arbitrary
+delimiters work, with the m//'s collision guards (bare sigil, `->`,
+closers, `qr =>` fat-comma keys).
+
+**Regex-pattern interpolation** (`/pat-with-$var/`, `s/$pat/x/`,
+`qr/$var/`): a regex literal whose pattern text contains a `$`/`@`
+interp trigger is parsed through the same `parseStringInterp` machinery
+string literals use (new `NK::RegexMatchInterp` node for `=~`, and
+`n.right` on RegexSubst/QrRegex), the pattern being built at runtime —
+`/$name/`, `s/f$name/XX/`, `s/$pat/X/` with a qr operand, and
+`/$qqr/` with a qr all match real perl byte-for-byte. Previously
+regex-literal patterns were compile-time-only (`/$var/` silently
+matched the literal text `$var`).
+
+**List-context non-/g match captures**: `my @m = ($s =~ /pat/);` (and
+the `$s =~ $re` qr form) now returns real perl's capture LIST via a new
+`perl_regex_match_captures_list` (a dedicated PCRE2 pass that also
+updates `$&`/`$1..$N` like the scalar match); a groupless match yields
+the one-element truthy list `(1)` (real perl: `my $c = () = ($s =~
+/a/)` is 1); `!~` is excluded — it stays a plain boolean even in list
+context (the sys_hostname_deep regression this caught). `/g` list form
+(`perl_regex_match_all`) unchanged. Tests:
+`tests/qr_regex_{smoke,deep}.pl`,
+`tests/qr_match_list_{smoke,deep}.pl`.
+
+Remaining regex gaps: `(?&name)` recursion and embedded-code patterns
+(`(??{...})`) are PCRE2-level niceties real modules rarely use;
+`$qr->(...)` code-sub invocation of a Regexp object is unimplemented.
+
 ## Source layout
 
 | File | Role |

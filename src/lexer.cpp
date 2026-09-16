@@ -698,6 +698,36 @@ std::vector<Token> Lexer::tokenize() {
             }
         }
 
+        /* qr/pattern/flags — compiled-regex VALUE (real perl's qr//).
+           Any non-word delimiter like m//, with the same collision
+           guards: not after a bare sigil, not after `->` (a method named
+           qr), not a closer delimiter ($h{qr}), and `qr =>` is a
+           fat-comma key. */
+        if (c == 'q' && pos_ + 1 < src_.size() && peek(1) == 'r' &&
+            pos_ + 2 < src_.size()) {
+            bool afterBareSigil = !toks.empty() &&
+                (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
+                 toks.back().kind == TK::HASH) &&
+                toks.back().text.size() <= 1;
+            bool afterArrow = !toks.empty() && toks.back().kind == TK::ARROW;
+            size_t look = 2;
+            while (peek(look) == ' ' || peek(look) == '\t') look++;
+            char d = peek(look);
+            bool closerDelim = (d == '}' || d == ']' || d == ')');
+            bool fatComma = (d == '=' && peek(look + 1) == '>');
+            if (!afterBareSigil && !afterArrow && !closerDelim && !fatComma &&
+                d != '\0' && !isalnum((unsigned char)d) && d != '_') {
+                pos_ += look; /* skip 'qr' and optional whitespace */
+                pos_++;       /* skip opening delimiter */
+                char close = (d == '{') ? '}' : (d == '(') ? ')' :
+                             (d == '[') ? ']' : (d == '<') ? '>' : d;
+                bool paired = (close != d);
+                Token t = readRegexDelim(d, close, paired);
+                toks.push_back({TK::QR, t.text, t.line});
+                continue;
+            }
+        }
+
         /* s/pattern/replacement/flags — any non-word delimiter.
            Not after a bare sigil ($s / @s / %s are variable names).
            Closers `}` `]` `)` are legal-but-vanishingly-rare s/// openers

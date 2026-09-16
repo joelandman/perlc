@@ -157,6 +157,7 @@ private:
     NodePtr parseSubscript(NodePtr base, int line); /* chains ->[]/->{}  */
     /* D120: subscript group(s) inside interpolated strings — see
        parseStringInterp for the node shapes. */
+    NodePtr interpRegexPattern(const std::string &pattern, int line);
     NodePtr parseSubscriptGroup(const std::string &raw, size_t &i, int line,
                                 const char *nameRef, bool isOpenBracket,
                                 NodePtr exprRef = nullptr);

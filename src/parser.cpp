@@ -1891,16 +1891,30 @@ NodePtr Parser::parseBinding() {
             n->sval  = txt.substr(0, s1);                       /* pattern */
             n->name  = txt.substr(s1 + 1, s2 - s1 - 1)         /* replacement */
                      + "\x01" + txt.substr(s2 + 1);             /* flags */
+            if (NodePtr interp = interpRegexPattern(n->sval, line))
+                n->right = std::move(interp);   /* pattern built at runtime */
             lhs = std::move(n);
         } else if (check(TK::REGEX)) {
             std::string txt = cur().text; advance();
             size_t sep = txt.find('\x01');
-            auto n = std::make_unique<Node>(); n->kind = NK::RegexMatch; n->line = line;
-            n->left = std::move(lhs);
-            n->sval = txt.substr(0, sep);
-            n->name = (sep != std::string::npos) ? txt.substr(sep + 1) : "";
-            n->ival = negated ? 1 : 0;
-            lhs = std::move(n);
+            std::string pat = txt.substr(0, sep);
+            std::string flags = (sep != std::string::npos) ? txt.substr(sep + 1) : "";
+            if (NodePtr interp = interpRegexPattern(pat, line)) {
+                auto n = std::make_unique<Node>(); n->kind = NK::RegexMatchInterp;
+                n->line = line;
+                n->left = std::move(lhs);
+                n->right = std::move(interp);
+                n->name = flags;
+                n->ival = negated ? 1 : 0;
+                lhs = std::move(n);
+            } else {
+                auto n = std::make_unique<Node>(); n->kind = NK::RegexMatch; n->line = line;
+                n->left = std::move(lhs);
+                n->sval = pat;
+                n->name = flags;
+                n->ival = negated ? 1 : 0;
+                lhs = std::move(n);
+            }
         } else if (check(TK::TR)) {
             if (negated) throw std::runtime_error(parseErrPrefix(line) +
                 "!~ tr/// doesn't make sense");
@@ -2294,6 +2308,29 @@ NodePtr Parser::parsePostfix() {
         expr = makeUnary(op, std::move(expr), line);
     }
     return expr;
+}
+
+    /* Regex-pattern interpolation: /pat$var/ etc. — when the pattern text
+   contains a $ or @ interpolation trigger, the pattern must be built at
+   runtime. Returns the pattern's InterpolatedStr AST (via the same
+   parseStringInterp scanner string literals use), or nullptr when the
+   pattern is static (use the compile-time sval). */
+NodePtr Parser::interpRegexPattern(const std::string &pattern, int line) {
+    for (size_t i = 0; i < pattern.size(); i++) {
+        char c = pattern[i];
+        if ((c == '$' || c == '@') && i + 1 < pattern.size()) {
+            char n2 = pattern[i + 1];
+            if (isalnum((unsigned char)n2) || n2 == '_' || n2 == '{' ||
+                n2 == '$' || n2 == '{' || (c == '$' && n2 == '{')) {
+                /* skip $$ (dollar-dollar = a literal "$" anchor-free sigil) */
+                if (c == '$' && n2 == '$' && i + 2 < pattern.size() &&
+                    (pattern[i+2] == 'w' || pattern[i+2] == 's'))
+                    continue;
+                return parseStringInterp(pattern, line);
+            }
+        }
+    }
+    return nullptr;
 }
 
 NodePtr Parser::parsePrimary() {
@@ -3918,11 +3955,35 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::REGEX)) {
         std::string txt = cur().text; advance();
         size_t sep = txt.find('\x01');
+        std::string pat = txt.substr(0, sep);
+        std::string flags = (sep != std::string::npos) ? txt.substr(sep + 1) : "";
+        if (NodePtr interp = interpRegexPattern(pat, line)) {
+            auto n = std::make_unique<Node>(); n->kind = NK::RegexMatchInterp;
+            n->line = line;
+            n->left = makeScalar("_", line);
+            n->right = std::move(interp);
+            n->name = flags;
+            n->ival = 0;
+            return n;
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::RegexMatch; n->line = line;
         n->left = makeScalar("_", line);
+        n->sval = pat;
+        n->name = flags;
+        n->ival = 0;
+        return n;
+    }
+
+    /* qr/pat/flags — compiled-regex VALUE (real perl's qr//) */
+    if (check(TK::QR)) {
+        std::string txt = cur().text; advance();
+        size_t sep = txt.find('\x01');
+        auto n = std::make_unique<Node>(); n->kind = NK::QrRegex; n->line = line;
         n->sval = txt.substr(0, sep);
         n->name = (sep != std::string::npos) ? txt.substr(sep + 1) : "";
-        n->ival = 0;
+        if (NodePtr interp = interpRegexPattern(n->sval, line)) {
+            n->right = std::move(interp);   /* pattern built at runtime */
+        }
         return n;
     }
     /* Bare s/// — substitute on $_ */

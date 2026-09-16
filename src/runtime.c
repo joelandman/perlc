@@ -1,4 +1,5 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
+#define _GNU_SOURCE 1
 /* Force-inline helpers: HOT for file-private fns, HOTX for exported fns */
 #define HOT  __attribute__((always_inline)) static inline
 #define HOTX __attribute__((always_inline))
@@ -1260,6 +1261,8 @@ PerlValue *perl_clone(const PerlValue *src) {
            either one doesn't tear down the closure while the other still
            references it. */
         ((PerlClosure *)src->pval)->refcount++;
+    } else if (src->tag == PERL_QR && src->pval) {
+        ((PerlQrRegex *)src->pval)->refcount++;
     }
     return v;
 }
@@ -1316,6 +1319,14 @@ HOTX void perl_free(PerlValue *v) {
         perl_dbi_statement_release((PerlDBIStatement *)v->pval);
     if (v->tag == PERL_DBI_DBH && v->pval)
         perl_dbi_handle_release((PerlDBIHandle *)v->pval);
+    if (v->tag == PERL_QR && v->pval) {
+        PerlQrRegex *qr = (PerlQrRegex *)v->pval;
+        if (qr->refcount > 0 && --qr->refcount == 0) {
+            free(qr->pattern);
+            free(qr->flags);
+            free(qr);
+        }
+    }
     if (v->tag == PERL_REF_ARRAY && v->pval) {
         PerlArray *av = (PerlArray *)v->pval;
         /* call DESTROY on blessed array objects */
@@ -1718,6 +1729,30 @@ const char *perl_to_string(const PerlValue *v) {
         case PERL_FILEHANDLE:
             snprintf(buf, sizeof buf, "GLOB(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
+        case PERL_QR: {
+            /* Real perl stringifies qr// as (?^FLAGS:PATTERN) with the
+               flags canonicalized to m,s,i,x order (probed: qr/x/simx →
+               (?^msix:x), qr/x/mix → (?^mix:x)). */
+            PerlQrRegex *qr = (PerlQrRegex *)v->pval;
+            const char *fl = qr ? qr->flags : "";
+            /* Build the canonical flag order m,s,i,x, then any others. */
+            char ordered[8];
+            int oi = 0;
+            const char *order = "msix";
+            for (const char *o = order; *o; o++)
+                for (const char *p = fl; *p; p++)
+                    if (*p == *o) { ordered[oi++] = *p; break; }
+            for (const char *p = fl; *p; p++)
+                if (!strchr("msix", *p) && oi < 7) ordered[oi++] = *p;
+            ordered[oi] = '\0';
+            char *out;
+            if (oi > 0)
+                asprintf(&out, "(?^%.*s:%s)", oi, ordered, qr ? qr->pattern : "");
+            else
+                asprintf(&out, "(?^:%s)", qr ? qr->pattern : "");
+            char *r = out ? out : strdup("");
+            return r;
+        }
         case PERL_XS_PTR:
             if (v->blessed_class)
                 snprintf(buf, sizeof buf, "%s=PTR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
@@ -1868,6 +1903,30 @@ char *perl_to_string_dup(const PerlValue *v) {
         case PERL_FILEHANDLE:
             snprintf(buf, sizeof buf, "GLOB(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
+        case PERL_QR: {
+            /* Real perl stringifies qr// as (?^FLAGS:PATTERN) with the
+               flags canonicalized to m,s,i,x order (probed: qr/x/simx →
+               (?^msix:x), qr/x/mix → (?^mix:x)). */
+            PerlQrRegex *qr = (PerlQrRegex *)v->pval;
+            const char *fl = qr ? qr->flags : "";
+            /* Build the canonical flag order m,s,i,x, then any others. */
+            char ordered[8];
+            int oi = 0;
+            const char *order = "msix";
+            for (const char *o = order; *o; o++)
+                for (const char *p = fl; *p; p++)
+                    if (*p == *o) { ordered[oi++] = *p; break; }
+            for (const char *p = fl; *p; p++)
+                if (!strchr("msix", *p) && oi < 7) ordered[oi++] = *p;
+            ordered[oi] = '\0';
+            char *out;
+            if (oi > 0)
+                asprintf(&out, "(?^%.*s:%s)", oi, ordered, qr ? qr->pattern : "");
+            else
+                asprintf(&out, "(?^:%s)", qr ? qr->pattern : "");
+            char *r = out ? out : strdup("");
+            return r;
+        }
         case PERL_XS_PTR:
             if (v->blessed_class)
                 snprintf(buf, sizeof buf, "%s=PTR(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
@@ -2009,6 +2068,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
            bump the closure's refcount so it isn't torn down while dst also
            references it. */
         ((PerlClosure *)src->pval)->refcount++;
+    } else if (src && src->tag == PERL_QR && src->pval) {
+        ((PerlQrRegex *)src->pval)->refcount++;
     }
     /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
@@ -2045,6 +2106,15 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         /* D62: dst is about to be overwritten (*dst = *src below) — release
            dst's old share of whatever closure it was pointing at first. */
         perl_closure_release((PerlClosure *)dst->pval);
+    }
+    if (dst->tag == PERL_QR && dst->pval) {
+        PerlQrRegex *qr = (PerlQrRegex *)dst->pval;
+        if (qr->refcount > 0 && --qr->refcount == 0) {
+            free(qr->pattern);
+            free(qr->flags);
+            free(qr);
+        }
+        dst->pval = NULL;
     }
     if (dst->tag == PERL_BIGINT && dst->pval) {
         mpz_clear(*(mpz_t*)dst->pval);
@@ -4241,6 +4311,7 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_FLOAT_PAIR:  return perl_alloc_string("ARRAY");
         case PERL_REF_HASH:    return perl_alloc_string("HASH");
         case PERL_CODE_REF:    return perl_alloc_string("CODE");
+        case PERL_QR:          return perl_alloc_string("Regexp");
         case PERL_XS_PTR:      return perl_alloc_string("PTR");
         default:               return perl_alloc_string("");
     }
@@ -4273,6 +4344,63 @@ static PerlValue *make_code_ref_impl(PerlSubFnCtx fp, PerlValue **caps, int ncap
     v->blessed_class = NULL;
     return v;
 }
+
+/* ── qr// compiled-pattern values ────────────────────────────────────────── */
+
+PerlValue *perl_make_qr(const char *pattern, const char *flags) {
+    PerlValue *v = pv_alloc();
+    PerlQrRegex *qr = (PerlQrRegex *)calloc(1, sizeof(PerlQrRegex));
+    if (!qr) return v;
+    qr->pattern = strdup(pattern ? pattern : "");
+    qr->flags = strdup(flags ? flags : "");
+    qr->refcount = 1;
+    v->tag = PERL_QR;
+    v->pval = qr;
+    return v;
+}
+
+const char *perl_qr_pattern(PerlValue *qr) {
+    if (!qr || qr->tag != PERL_QR || !qr->pval) return NULL;
+    return ((PerlQrRegex *)qr->pval)->pattern;
+}
+
+const char *perl_qr_flags(PerlValue *qr) {
+    if (!qr || qr->tag != PERL_QR || !qr->pval) return "";
+    return ((PerlQrRegex *)qr->pval)->flags;
+}
+
+int perl_value_is_qr(PerlValue *pv) {
+    return pv && pv->tag == PERL_QR;
+}
+
+/* W28/qr: match `str` against `pattern_pv` — when the pattern operand is a
+   PERL_QR its own pattern+flags are used (no re-compile from stringified
+   text); any other operand is stringified (already-compiled W28 behavior)
+   and matched with empty flags. `negate` implements !~. */
+PerlValue *perl_regex_match_sv(PerlValue *str, PerlValue *pattern_pv, int negate) {
+    PerlValue *res;
+    if (pattern_pv && pattern_pv->tag == PERL_QR && pattern_pv->pval) {
+        PerlQrRegex *qr = (PerlQrRegex *)pattern_pv->pval;
+        res = perl_regex_match(str, qr->pattern, qr->flags);
+    } else {
+        char *pat = pattern_pv ? perl_to_string_dup(pattern_pv) : NULL;
+        res = perl_regex_match(str, pat ? pat : "", "");
+        free(pat);
+    }
+    if (negate) {
+        PerlValue *n = perl_not(res);
+        perl_free(res);
+        res = n;
+    }
+    return res;
+}
+
+/* List-context non-/g match: returns the CAPTURE LIST as a new PerlArray
+   (empty array = no match), exactly like real perl's
+   `my @m = ($str =~ /pat/);` — implemented through the same PCRE2
+   machinery perl_regex_match uses, re-emitting each numbered capture.
+   The capture globals ($1..) are still set (a single match run). */
+
 
 PerlValue *perl_make_code_ref(PerlSubFnCtx fp) {
     return make_code_ref_impl(fp, NULL, 0);
@@ -7033,6 +7161,62 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
     pcre2_match_data_free(md);
     /* Do NOT free re — it comes from the shared cache. */
     return perl_alloc_int(rc > 0 ? 1 : 0);
+}
+
+/* List-context non-/g match: returns the CAPTURE LIST as a new PerlArray
+   (empty array = no match), exactly like real perl's
+   `my @m = ($str =~ /pat/);`. Also updates $&, $1..$N like the scalar
+   single-match (real perl's list-context match updates the globals). */
+PerlArray *perl_regex_match_captures_list(PerlValue *str, const char *pattern, const char *flags) {
+    PerlArray *out = perl_array_new();
+    if (!str || !pattern || !*pattern) return out;
+    pcre2_code *re = regex_cache_lookup(pattern, flags);
+    if (!re) {
+        int errcode; PCRE2_SIZE erroffset;
+        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                           pcre_flags(flags), &errcode, &erroffset, NULL);
+        if (re) regex_cache_insert(pattern, flags, re);
+    }
+    if (!re) return out;
+    char *s = perl_to_string_dup(str);
+    size_t slen = strlen(s);
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, 0, 0, md, NULL);
+    if (rc > 0) {
+        PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+        populate_named_captures(md, s, re);
+        /* Store $& and $1..$N exactly like the scalar single-match path
+           (real perl's list-context match updates the capture globals). */
+        if (s_dollar_amp.tag == PERL_STRING && s_dollar_amp.sval) free(s_dollar_amp.sval);
+        { size_t ms = ov[0], me = ov[1];
+          char *ms_str = malloc(me - ms + 1);
+          memcpy(ms_str, s + ms, me - ms); ms_str[me-ms] = '\0';
+          s_dollar_amp.tag = PERL_STRING; s_dollar_amp.sval = ms_str;
+          s_dollar_amp.slen = (long long)(me - ms); }
+        for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
+            if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
+        }
+        int pushed = 0;
+        for (int i = 1; i < rc && i <= PERL_MAX_CAPTURES; i++) {
+            size_t cstart = ov[2*i], cend = ov[2*i+1];
+            char *cap = malloc(cend - cstart + 1);
+            memcpy(cap, s + cstart, cend - cstart);
+            cap[cend - cstart] = '\0';
+            perl_captures_[i] = perl_alloc_string(cap);
+            perl_array_push(out, perl_alloc_string(cap));
+            free(cap);
+            pushed++;
+        }
+        if (!pushed) {
+            /* Real perl: a match with NO capture groups yields the truthy
+               one-element list (1) in list context (`my $c = () = ($s =~
+               /a/)` is 1, not 0). */
+            perl_array_push(out, perl_alloc_int(1));
+        }
+    }
+    free(s);
+    pcre2_match_data_free(md);
+    return out;
 }
 
 /* Install $1..$9 and $& from a successful pcre2 match (shared by match/subst). */
