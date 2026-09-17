@@ -81,6 +81,7 @@ enum class NK {
     RegexMatch,   /* $s =~ /pat/flags  – left=str, sval=pat, name=flags, ival=1 if !~ */
     RegexMatchExpr, /* W28: $s =~ EXPR – left=str, right=pattern expr, ival=1 if !~ */
     QrRegex,      /* qr/pat/flags – compiled-pattern VALUE; sval=pat, name=flags */
+    LocalGlob,    /* W29: local *_ = ... — localize the glob's scalar slot (global $_ for *_); name=glob name */
     RegexMatchInterp, /* $s =~ /pat-with-$vars/ – left=str, right=pattern interp AST,
                          name=flags, ival=1 if !~ (pattern built at runtime) */
     SymbolicDeref,  /* W22: ${EXPR} – left=name expr; read or lvalue of global named by string */

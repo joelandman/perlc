@@ -543,6 +543,18 @@ NodePtr Parser::parseStmt() {
         if (match(TK::ASSIGN)) n->left = parseLowNot();
             return parseModifier(std::move(n), line);
         }
+        /* W29: `local *_ = \join(...)` (Text::ParseWords) — the typeglob
+           form localizes the glob's SCALAR slot, which for *_ is the
+           global $_. Same runtime treatment as `local $_`. */
+        if (check(TK::STAR)) {
+            advance();
+            std::string globName = "_";
+            if (check(TK::IDENT)) { globName = cur().text; advance(); }
+            auto n = std::make_unique<Node>(); n->kind = NK::LocalGlob;
+            n->name = globName; n->line = line;
+            if (match(TK::ASSIGN)) n->left = parseLowNot();
+            return parseModifier(std::move(n), line);
+        }
         consume(TK::SCALAR, "$");
         std::string varName;
         if (check(TK::SLASH))     { advance(); varName = "/"; }
@@ -552,7 +564,16 @@ NodePtr Parser::parseStmt() {
         else if (check(TK::BACKSLASH)) { advance(); varName = "\\"; }
         else if (check(TK::AND))  { advance(); varName = "&"; }
         else { varName = cur().text; advance(); }
-        auto n = std::make_unique<Node>(); n->kind = NK::LocalStmt;
+        auto n = std::make_unique<Node>();
+        if (varName == "_") {
+            /* `local $_` localizes the global $_ (real perl semantics:
+               called subs see the localized value). */
+            auto lg = std::make_unique<Node>(); lg->kind = NK::LocalGlob;
+            lg->name = "_"; lg->line = line;
+            if (match(TK::ASSIGN)) lg->left = parseLowNot();
+            return parseModifier(std::move(lg), line);
+        }
+        n->kind = NK::LocalStmt;
         n->name = varName; n->line = line;
         /* D41: local $h{key} / local $arr[idx] */
         if (check(TK::LBRACKET)) {

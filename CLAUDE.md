@@ -18,8 +18,8 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-16, re-verified after qr// + match-captures —
-360/360 PASS,
+**Harness (2026-09-16, re-verified after W29 + false-bool —
+364/364 PASS,
 0 FAIL; `make test` 47/47):** New this session:
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
@@ -64,7 +64,9 @@ DynaLoader-compatible FFI, self-verifying, outside the harness corpus),
 `w19_unary_plus_{smoke,deep}.pl` (survey-3 W-items, 2026-09-16),
 `qr_regex_{smoke,deep}.pl`, `qr_match_list_{smoke,deep}.pl`
 (qr// + list-context match captures + regex-pattern interpolation,
-2026-09-16).
+2026-09-16), `local_glob_{smoke,deep}.pl` (W29 `local *_`/`local $_`),
+`false_bool_{smoke,deep}.pl` (booleans stringify as 1/"" like real
+perl).
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
@@ -164,8 +166,12 @@ are in TESTS.md):**
   ref()=Regexp, (?^msix:...) stringification, QR-aware =~ dispatch),
   list-context non-/g match captures (groupless → (1) like real perl),
   and regex-pattern interpolation (/$name/, s/$pat/.../, qr/$var/);
-  !~ stays boolean in list context. Remaining open: W29 `local *_`,
-  false-bool stringify, qr->() invocation.
+  !~ stays boolean in list context. Remaining open: qr->() invocation.
+- W29 + false-bool (2026-09-16): see TESTS.md. `local *_ =
+  \join(...)`/`local $_ = v` work (NK::LocalGlob; global `$_` cell +
+  sub-shadow saved/assigned, depth-restored; Assign-to-`$_` now syncs the
+  cell), and boolean results stringify as 1/"" like real perl
+  (perl_not/defined/=~ via perl_alloc_bool).
 - D103/D104/D106/D108: see TESTS.md for full write-ups. Summary: D103
   is integer-overflow auto-promotion (bounded, unblessed auto-BigInt
   reusing the existing Math::BigInt/mini-gmp machinery — see TESTS.md

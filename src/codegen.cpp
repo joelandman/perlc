@@ -814,6 +814,8 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_regex_match_sv",   pv, pv, pv, Type::getInt32Ty(ctx_));
     RT("perl_value_is_qr",      Type::getInt32Ty(ctx_), pv);
     RT("perl_regex_match_captures_list", av, pv, i8p, i8p);
+    RT("perl_get_dollar_under", pv);
+    RT("perl_deref_if_ref",     pv, pv);
     /* File I/O (Tier 2) */
     RT("perl_seek_fh",          pv, pv, pv, pv);
     RT("perl_tell_fh",          pv, pv);
@@ -4397,11 +4399,21 @@ void CodeGen::emitSub(const Node &n) {
        numeric subs like advance() that never touch $_. */
     bool subUsesDefaultVar = !n.body || hasDefaultVarUse(*n.body);
     if (subUsesDefaultVar) {
-        Value *udv  = callRT("perl_alloc_undef", {});
+        /* W29: the sub's $_ starts as the GLOBAL $_ cell's current value
+           (real perl: bare $_ inside a sub IS the global unless
+           localized — `local $_` in a caller is visible here). The
+           alloca still shadows for assignment within the sub; the global
+           cell is only the initial value. */
+        Value *cell = callRT("perl_get_dollar_under", {});
+        /* s_dollar_under IS the PerlValue (an s_dollar_at-style stable
+           cell, not a pointer-slot) — clone it for the sub's local
+           $_ storage; the clone is freed on scope exit while the cell
+           keeps its own contents. */
+        Value *udv  = callRT("perl_clone", {cell});
         auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
         builder_.CreateStore(udv, slotUs);
         declareVar("_", slotUs);
-        trackPv(udv);  /* ensure $_ stable pv is freed on scope exit */
+        trackPv(udv);
     }
 
     /* Sub-task 2 (named-sub closure capture): if the sub has a
@@ -4638,7 +4650,8 @@ static bool hasDefaultVarUse(const Node &n) {
 
 /* Stage 17: skip local save/restore for blocks that contain no local() */
 static bool hasLocalStmt(const Node &n) {
-    if (n.kind == NK::LocalStmt || n.kind == NK::LocalArray || n.kind == NK::LocalHash) return true;
+    if (n.kind == NK::LocalStmt || n.kind == NK::LocalArray || n.kind == NK::LocalHash ||
+        n.kind == NK::LocalGlob) return true;
     bool r = false;
     if (n.left)  r = r || hasLocalStmt(*n.left);
     if (n.right) r = r || hasLocalStmt(*n.right);
@@ -6296,6 +6309,38 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
+    case NK::LocalGlob: {
+        /* W29: `local *_ = ...` / `local $_ = ...` — localize the GLOBAL
+           $_ cell. The sub's lexical $_ shadow (if present) is saved and
+           assigned too: reads inside this sub see the localized value,
+           and the depth-based restore puts both the shadow and the cell
+           back at scope exit (matching real perl's restore-after-local). */
+        Value *shadow = lookupVar("_");
+        if (shadow) {
+            /* The sub's lexical $_ shadow is localized too: both storages
+               are saved (depth-restore puts both back) and assigned. */
+            Value *shadowPv = builder_.CreateLoad(perlPtrTy_, shadow, "lg.shadow");
+            callRT("perl_local_save", {shadowPv});
+        }
+        Value *cell = callRT("perl_get_dollar_under", {});
+        callRT("perl_local_save", {cell});
+        if (n.left) {
+            Value *rhs = emitExpr(*n.left);
+            /* `local *_ = \join(...)`: the RHS is a REFERENCE — the glob's
+               scalar slot becomes an ALIAS of the referent, so deref
+               before assigning. Non-ref RHS (plain `local $_ = v`)
+               assigns directly. */
+            Value *val = callRT("perl_deref_if_ref", {rhs});
+            if (shadow)
+                callRT("perl_assign",
+                       {builder_.CreateLoad(perlPtrTy_, shadow, "lg.shadow2"), val});
+            callRT("perl_assign", {cell, val});
+            callRT("perl_free", {val});
+            freeIfOwned(rhs);
+        }
+        return;
+    }
+
     case NK::LocalStmt: {
         /* save current value, optionally assign new one.
            D41: also local $h{key} / local $arr[idx] via element lvalues. */
@@ -6590,6 +6635,17 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
         }
         auto *slot = lookupVar(n.name);
+        if (!slot && n.name == "_") {
+            /* W29: bare $_ with no lexical in scope reads the GLOBAL $_
+               cell (real perl semantics: local $_ / local *_ in a caller
+               is visible to called subs). The cell IS the PerlValue
+               (s_dollar_at-style stable struct) — wrap it in a slot the
+               generic load path can deref. */
+            Value *cell = callRT("perl_get_dollar_under", {});
+            auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "global.under");
+            builder_.CreateStore(cell, hold);
+            slot = hold;
+        }
         if (!slot) {
             /* D110: a package-qualified name is a true global. Prefer
                D112's fileScalarGlobals_ entry (module-`our` unification),
@@ -7844,6 +7900,14 @@ Value *CodeGen::emitExpr(const Node &n) {
                 }
             }
             callRT("perl_assign", {lhsVal, rhs});
+            /* W29: assignments to $_ keep the GLOBAL $_ cell in sync (the
+               sub/file-scope $_ shadow and the cell must agree, or a
+               later `local $_`'s save snapshot misses the value). */
+            if (n.left->kind == NK::ScalarVar && n.left->name == "_" &&
+                !sharedScalarNames_.count("_")) {
+                Value *gcell = callRT("perl_get_dollar_under", {});
+                callRT("perl_assign", {gcell, rhs});
+            }
         }
         return rhs;
         }
@@ -8305,7 +8369,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *i32  = callRT("perl_defined", {v});
         Value *bit  = builder_.CreateICmpNE(i32, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
         Value *i64  = builder_.CreateZExt(bit, Type::getInt64Ty(ctx_));
-        return callRT("perl_alloc_int", {i64});
+        /* real perl's defined() result is a boolean: "1" or "" (false
+           stringifies as nothing, not IV 0) — W1's perl_alloc_bool. */
+        return callRT("perl_alloc_bool", {i64});
     }
 
     case NK::PopExpr: {

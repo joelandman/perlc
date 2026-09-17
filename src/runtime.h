@@ -531,6 +531,7 @@ PerlValue *perl_regex_match_sv(PerlValue *str, PerlValue *pattern_pv, int negate
 PerlArray *perl_regex_match_captures_list(PerlValue *str, const char *pattern,
                                           const char *flags);
 int perl_value_is_qr(PerlValue *pv);
+PerlValue *perl_deref_if_ref(PerlValue *pv);
 
 /* ── OOP / bless / method dispatch ──────────────────────────────────────── */
 PerlValue *perl_bless(PerlValue *ref, PerlValue *class_pv);
@@ -748,6 +749,7 @@ void perl_clear_named_captures(void);
 void       perl_eval_push(jmp_buf *jb); /* push caller's jmp_buf onto eval stack */
 void       perl_eval_pop(void);          /* pop after eval completes */
 PerlValue *perl_get_dollar_at(void);   /* returns stable $@ PerlValue* */
+PerlValue *perl_get_dollar_under(void); /* W29: stable global $_ cell */
 
 /* ── caller() call stack ─────────────────────────────────────────────────── */
 void perl_push_call_frame(const char *pkg, const char *file, int line);

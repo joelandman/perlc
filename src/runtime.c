@@ -371,6 +371,12 @@ static __thread jmp_buf *s_eval_stack[EVAL_STACK_MAX];
 static __thread int      s_eval_local_depth[EVAL_STACK_MAX]; /* local()-stack depth at eval entry */
 static __thread int      s_eval_depth = 0;
  static __thread PerlValue s_dollar_at; /* $@ — zero-initialized = UNDEF per thread */
+/* W29: the global $_ — stable cell for `local $_`/`local *_` and bare
+ * $_ reads from called subs (real perl's global $_ semantics). */
+static __thread PerlValue s_dollar_under;
+/* W29: the global $_ — a stable cell so `local $_` / `local *_` and bare
+   `$_` reads in subs all see the same storage, matching real perl's
+   per-package (here: one process-wide) $_ semantics. */
 
 /* Forward declarations for die-related functions — needed so calls before
    the definition (perl_mod, div-by-zero, substr) see the correct signature. */
@@ -684,6 +690,9 @@ void perl_eval_pop(void) {
 }
 
 PerlValue *perl_get_dollar_at(void) { return &s_dollar_at; }
+
+/* W29: stable global $_ cell */
+PerlValue *perl_get_dollar_under(void) { return &s_dollar_under; }
 
 static void perl_set_dollar_at_cstr(const char *msg) {
     /* D85: .slen must be set explicitly — perl_assign now copies exactly
@@ -2761,7 +2770,9 @@ PerlValue *perl_str_ge(const PerlValue *a, const PerlValue *b) {
 /* ── logical ─────────────────────────────────────────────────────────────── */
 
 PerlValue *perl_not(const PerlValue *a) {
-    return perl_alloc_int(!perl_is_true(a));
+    /* Real perl's boolean false stringifies as "" (W1's perl_alloc_bool
+       convention): (not 1) prints nothing, not IV 0. */
+    return perl_alloc_bool(!perl_is_true(a));
 }
 PerlValue *perl_and(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_int(perl_is_true(a) && perl_is_true(b));
@@ -4371,6 +4382,16 @@ const char *perl_qr_flags(PerlValue *qr) {
 
 int perl_value_is_qr(PerlValue *pv) {
     return pv && pv->tag == PERL_QR;
+}
+
+/* W29: local *_ = \REF — deref when the operand is a reference, else
+   pass through (so the glob-scalar localization can alias the referent). */
+PerlValue *perl_deref_if_ref(PerlValue *pv) {
+    if (pv && pv->tag == PERL_REF_SCALAR) {
+        PerlValue *inner = (PerlValue *)pv->pval;
+        return inner ? perl_clone(inner) : perl_alloc_undef();
+    }
+    return pv ? perl_clone(pv) : perl_alloc_undef();
 }
 
 /* W28/qr: match `str` against `pattern_pv` — when the pattern operand is a
@@ -7160,7 +7181,10 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
     free(s);
     pcre2_match_data_free(md);
     /* Do NOT free re — it comes from the shared cache. */
-    return perl_alloc_int(rc > 0 ? 1 : 0);
+    /* Boolean PV: "1" or "" (real perl's =~ false stringifies as nothing,
+       W1's convention) — but /g callers and numeric contexts see the same
+       values through perl_to_int(""). */
+    return perl_alloc_bool(rc > 0 ? 1 : 0);
 }
 
 /* List-context non-/g match: returns the CAPTURE LIST as a new PerlArray

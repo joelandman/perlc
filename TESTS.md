@@ -2458,7 +2458,7 @@ perl's core dirs):
 | pod2usage | Config | no | Config.pm:52 `*{$pkg.'::'.$f}=\&{$f}` (W27, open) |
 | validlocale | POSIX qw(LC_ALL) | no | LC_ALL bareword-constant value (W16, open) |
 | pl2pm | core only | no | `s/\|foo\|bar/next`-style `next` after `||` (W2-class, open) |
-| update-language | Text::ParseWords | no | `local *_ = \join(...)` (W29, open) |
+| update-language | Text::ParseWords | yes | W29 `local *_` fixed 2026-09-16 |
 | piconv | Encode, Encode::Alias | no | `$find =~ $alias` (W28, open; needs `qr//` too) |
 | shasum | Digest::SHA, Fcntl | no | Errno.pm's `eval "sub $name()..."` (W30, open) |
 
@@ -2643,6 +2643,42 @@ context (the sys_hostname_deep regression this caught). `/g` list form
 Remaining regex gaps: `(?&name)` recursion and embedded-code patterns
 (`(??{...})`) are PCRE2-level niceties real modules rarely use;
 `$qr->(...)` code-sub invocation of a Regexp object is unimplemented.
+
+### W29 (`local *_ = ...` / `local $_ = ...`) + false-bool stringification — FIXED 2026-09-16
+
+**W29** (`src/parser.cpp` `local *_`/`local $_` branch → new `NK::LocalGlob`;
+`src/runtime.c` `s_dollar_under` stable cell + `perl_get_dollar_under()` +
+`perl_deref_if_ref()`; `src/codegen.cpp` `case NK::LocalGlob`): the
+Text::ParseWords idiom `local *_ = \join(...)` (and plain `local $_ = v`)
+now works. The global `$_` cell is localized with the standard depth-save
+mechanism; the sub's lexical `$_` shadow (when the sub uses `$_`) is saved
+AND assigned too, so reads inside the sub see the localized value and the
+sub-exit depth-restore puts both storages back. Three stacked details were
+needed to match real perl: (1) `hasLocalStmt()` had to learn `NK::LocalGlob`
+— named subs only emit the epilogue `perl_local_restore_to(depth)` when the
+body contains a known local node kind, so `local *_` alone produced saves
+with no restore (every later read saw the localized value); (2) the
+RHS of `local *_ = \join(...)` is a REFERENCE — the glob's slot becomes an
+ALIAS of the referent — so the value is `perl_deref_if_ref`'d before
+assignment; (3) assignments to a plain `$_` (the LHS-scalar path in
+`case NK::Assign`) now also write the global cell, because the cell and the
+file-scope/sub lexical shadow must agree — a pre-existing divergence that
+this idiom exposed: the file-scope `$_ = "orig"` only wrote the shadow, so
+the `local`'s save snapshot saw an undef cell and the restore wiped the
+value every later sub's `$_` shadow was seeded from. Verified shapes:
+`local *_ = \join(...)` + `split(/ /, $_)`, `local $_` visible to a called
+sub, restore-after-local (value back), sub defined after the localizing sub
+reads the restored value via its own entry-time shadow seed.
+Tests: `tests/local_glob_{smoke,deep}.pl`. Remaining W29 nuance: `local *_
+= \*STDOUT`-style whole-glob aliasing of other slots (IO/ARRAY/HASH) is
+not implemented — only the scalar-slot alias.
+
+**False-bool stringification**: boolean results printed as `"1"`/`"0"`
+instead of real perl's `"1"`/`""` (empty). Fixed at the three boolean
+producers: `perl_not` → `perl_alloc_bool` (the W1 false=`""` convention),
+`defined()` (`DefinedFunc`), and `=~`/`!~` boolean results
+(`perl_regex_match` return). Numeric/boolean *contexts* were already
+correct — only the string form was wrong.
 
 ## Source layout
 

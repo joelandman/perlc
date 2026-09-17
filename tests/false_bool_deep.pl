@@ -1,0 +1,20 @@
+my $x = 1;
+print "t=[", ($x == 1), "]\n";
+print "f=[", ($x == 2), "]\n";
+print "not=[", (not 0), "]\n";
+print "notF=[", (not 1), "]\n";
+print "bangT=[", (!0), "]\n";
+print "bangF=[", (!1), "]\n";
+print "eq=[", ("a" eq "a"), "]\n";
+print "eqF=[", ("a" eq "b"), "]\n";
+my $u; my $d = defined($u);
+print "dU=[", defined($u), "]\n";
+my $av = 5;
+print "dV=[", defined($av), "]\n";
+print "reT=[", ("abc" =~ /b/), "]\n";
+print "reF=[", ("abc" =~ /z/), "]\n";
+print "reN=[", ("abc" !~ /z/), "]\n";
+# numeric context of a bool:
+print "numT=[", ((1 < 2) + 0), "]\n";
+print "numF=[", ((2 < 1) + 0), "]\n";
+print "deep_done\n";
