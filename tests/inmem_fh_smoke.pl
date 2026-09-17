@@ -1,0 +1,12 @@
+my $s = "a\nb\n";
+open(my $fh, '<', \$s) or die "open failed: $!";
+my $l1 = <$fh>;
+my $l2 = <$fh>;
+close $fh;
+print "l1=[$l1] l2=[$l2]\n";
+my $w = "";
+open(my $wfh, '>', \$w) or die "w failed: $!";
+print $wfh "hello\n";
+close $wfh;
+print "w=[$w]\n";
+print "smoke_done\n";

@@ -563,6 +563,8 @@ PerlArray *perl_threads_list(void);
 void       perl_threads_yield(void);
 
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args);
+PerlValue *perl_dispatch_method_sv(PerlValue *obj, PerlValue *method_pv, PerlArray *args);
+PerlArray *perl_hash_pairs_array(PerlValue *pv);
 PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                                       const char *method, PerlArray *args);
 

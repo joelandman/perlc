@@ -18,8 +18,8 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-16, re-verified after W29 + false-bool —
-364/364 PASS,
+**Harness (2026-09-16, re-verified after parser-gaps + in-mem-fh +
+or-next — 372/372 PASS,
 0 FAIL; `make test` 47/47):** New this session:
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
@@ -48,6 +48,8 @@ gated by `make test-all` (byte-for-byte vs real `perl`).
 `d128_module_error_location.sh` (+ `tests/lib/D128Broken.pm`,
 `tests/d128_module_error_main.pltxt` — compile-failure diagnostics
 fixtures, outside the harness corpus),
+`parse_gaps_{smoke,deep}.pl`, `inmem_fh_{smoke,deep}.pl`,
+`w30_sub_eval_{smoke,deep}.pl`, `or_next_{smoke,deep}.pl`,
 `exporter_tags_{smoke,deep}.pl` + `exporter_slice_keys_{smoke,deep}.pl`
 (+ `tests/lib/E/Tagged.pm` — Exporter mechanism, 2026-09-14),
 `dynaloader_ffi.sh` (+ `tests/dynaloader_ffi_{smoke,deep}.pltxt`,

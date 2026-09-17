@@ -659,6 +659,8 @@ void CodeGen::declareRuntime() {
     RT("perl_glob_get_hash",   av, i8p); /* returns PerlHash* as ptr */
     RT("perl_glob_copy",       voidTy, i8p, i8p);
     RT("perl_dispatch_method",         pv,     pv, i8p, av);
+    RT("perl_dispatch_method_sv",      pv,     pv, pv,  av);
+    RT("perl_hash_pairs_array",        av,     pv);
     RT("perl_dispatch_method_super",   pv,     pv, i8p, i8p, av);
     RT("perl_set_isa",                 voidTy, i8p, i8p);
     RT("perl_register_overload",       voidTy, i8p, i8p, i8p);
@@ -1716,6 +1718,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                via emitArrayPtr (extend) or emitExpr (push). */
             Value *mapAv = nullptr;
             Value *mapPv = nullptr;
+            bool mapPairsDone = false;
             if (n.body && !n.body->args.empty()) {
                 const auto &stmts = n.body->args;
                 for (size_t si = 0; si + 1 < stmts.size(); si++)
@@ -1726,8 +1729,18 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 if (e) { mapAv = emitArrayPtr(*e); if (!mapAv) mapPv = emitExpr(*e); }
                 else   emitStmt(last);
             } else if (n.left) {
-                mapAv = emitArrayPtr(*n.left);
-                if (!mapAv) mapPv = emitExpr(*n.left);
+                if (n.left->kind == NK::AnonHash) {
+                    /* `map { $_ => 1 } @list` — the braces are the hash
+                       constructor itself (parser put it in n.left): real
+                       Perl yields the key/value PAIRS in list context. */
+                    Value *hvPv = emitExpr(*n.left);
+                    Value *pairs = callRT("perl_hash_pairs_array", {hvPv});
+                    callRT("perl_array_extend", {resultArr, pairs});
+                    mapPairsDone = true;
+                } else {
+                    mapAv = emitArrayPtr(*n.left);
+                    if (!mapAv) mapPv = emitExpr(*n.left);
+                }
             }
             /* Clone scalar result before popScope() frees scope variables it may
                reference (e.g. last expr is a ScalarVar whose alloca is being freed). */
@@ -1737,7 +1750,9 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 freeIfOwned(orig);
             }
             popScope();
-            if (mapAv)      callRT("perl_array_extend", {resultArr, mapAv});
+            if (mapPairsDone)  /* pairs already extended */
+                ;
+            else if (mapAv)      callRT("perl_array_extend", {resultArr, mapAv});
             else if (mapPv) callRT("perl_array_push",   {resultArr, mapPv});
         } else {
             /* grep: push element if block result is true */
@@ -5592,10 +5607,19 @@ void CodeGen::emitStmt(const Node &n) {
         auto *body  = BasicBlock::Create(ctx_, "while.body", fn);
         auto *exit  = BasicBlock::Create(ctx_, "while.end",  fn);
 
+        /* `while (...) BLOCK continue BLOCK`: `next` runs the continue
+           block, then re-checks the condition. Without a continue block,
+           `next` jumps straight to the condition. */
+        BasicBlock *contTarget = cond;
+        BasicBlock *contBB = nullptr;
+        if (n.contBlock) {
+            contBB = BasicBlock::Create(ctx_, "while.cont", fn);
+            contTarget = contBB;
+        }
         loopExits_.push_back(exit);
-        loopContinues_.push_back(cond);
+        loopContinues_.push_back(contTarget);
         loopRedos_.push_back(body);
-        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, cond, body});
+        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, contTarget, body});
 
         /* If condition is 'my $var = rhs', hoist the variable allocation before
          * the loop so the alloca and stable PerlValue* are created exactly once.
@@ -5659,7 +5683,13 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.SetInsertPoint(body);
         emitBlock(*n.body);
         if (!builder_.GetInsertBlock()->getTerminator())
-            builder_.CreateBr(cond);
+            builder_.CreateBr(contTarget);
+        if (contBB) {
+            builder_.SetInsertPoint(contBB);
+            emitBlock(*n.contBlock);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(cond);
+        }
 
         loopExits_.pop_back();
         loopContinues_.pop_back();
@@ -5719,10 +5749,18 @@ void CodeGen::emitStmt(const Node &n) {
         auto *stepBB = BasicBlock::Create(ctx_, "for.step", fn);
         auto *exit   = BasicBlock::Create(ctx_, "for.end",  fn);
 
+        /* `for (...) BLOCK continue BLOCK`: `next` runs the continue
+           block, then the step expression, then re-checks. */
+        BasicBlock *contTargetF = stepBB;
+        BasicBlock *contBBF = nullptr;
+        if (n.contBlock) {
+            contBBF = BasicBlock::Create(ctx_, "for.cont", fn);
+            contTargetF = contBBF;
+        }
         loopExits_.push_back(exit);
-        loopContinues_.push_back(stepBB);
+        loopContinues_.push_back(contTargetF);
         loopRedos_.push_back(bodyBB);
-        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, stepBB, bodyBB});
+        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, contTargetF, bodyBB});
 
         pushScope();
         if (n.init) emitStmt(*n.init);
@@ -5792,7 +5830,13 @@ void CodeGen::emitStmt(const Node &n) {
             emitBlock(*n.body);
         }
         if (!builder_.GetInsertBlock()->getTerminator())
-            builder_.CreateBr(stepBB);
+            builder_.CreateBr(contTargetF);
+        if (contBBF) {
+            builder_.SetInsertPoint(contBBF);
+            emitBlock(*n.contBlock);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(stepBB);
+        }
 
         builder_.SetInsertPoint(stepBB);
         if (n.step && n.step->kind == NK::FlatBlock) {
@@ -5882,10 +5926,17 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.CreateStore(lo, counterAlloca);
 
             auto *condBB2 = BasicBlock::Create(ctx_, "foreach.cond", fn);
+            /* `foreach (...) BLOCK continue BLOCK` */
+            BasicBlock *contTargetA = stepBB;
+            BasicBlock *contBBA = nullptr;
+            if (n.contBlock) {
+                contBBA = BasicBlock::Create(ctx_, "foreach.cont", fn);
+                contTargetA = contBBA;
+            }
             loopExits_.push_back(exit);
-            loopContinues_.push_back(stepBB);
+            loopContinues_.push_back(contTargetA);
             loopRedos_.push_back(bodyBB);
-            if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, stepBB, bodyBB});
+            if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, contTargetA, bodyBB});
 
             /* Stage 23: call perl_array_is_all_flat ONCE before the loop for each
                derefAV that will be row-dereffed in the body. The result is stored
@@ -6033,11 +6084,17 @@ void CodeGen::emitStmt(const Node &n) {
             }
 
             emitBlock(*n.body);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(contTargetA);
+            if (contBBA) {
+                builder_.SetInsertPoint(contBBA);
+                emitBlock(*n.contBlock);
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateBr(stepBB);
+            }
             popScope();
             /* Clean up allflat slots added by this loop level. */
             for (auto &nm : newAllflatNames) avAllflatSlots_.erase(nm);
-            if (!builder_.GetInsertBlock()->getTerminator())
-                builder_.CreateBr(stepBB);
 
             builder_.SetInsertPoint(stepBB);
             Value *cur2 = builder_.CreateLoad(i64, counterAlloca);
@@ -6104,10 +6161,17 @@ void CodeGen::emitStmt(const Node &n) {
 
         auto *condBB = BasicBlock::Create(ctx_, "foreach.cond", fn);
 
+        /* `foreach (...) BLOCK continue BLOCK` */
+        BasicBlock *contTargetB = stepBB;
+        BasicBlock *contBBB = nullptr;
+        if (n.contBlock) {
+            contBBB = BasicBlock::Create(ctx_, "foreach.cont", fn);
+            contTargetB = contBBB;
+        }
         loopExits_.push_back(exit);
-        loopContinues_.push_back(stepBB);
+        loopContinues_.push_back(contTargetB);
         loopRedos_.push_back(bodyBB);
-        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, stepBB, bodyBB});
+        if (!n.sval.empty()) loopLabels_.push_back({n.sval, exit, contTargetB, bodyBB});
 
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
@@ -6129,9 +6193,15 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.CreateStore(elemRef, loopVar);
 
         emitBlock(*n.body);
-        popScope();
         if (!builder_.GetInsertBlock()->getTerminator())
-            builder_.CreateBr(stepBB);
+            builder_.CreateBr(contTargetB);
+        if (contBBB) {
+            builder_.SetInsertPoint(contBBB);
+            emitBlock(*n.contBlock);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                builder_.CreateBr(stepBB);
+        }
+        popScope();
 
         builder_.SetInsertPoint(stepBB);
         Value *idx2 = builder_.CreateLoad(i64, idxAlloca);
@@ -6401,8 +6471,10 @@ void CodeGen::emitStmt(const Node &n) {
         if (n.left) {
             Value *rhs = emitExpr(*n.left);
             callRT("perl_assign", {pv, rhs});
-        } else if (n.sval == "hash_elem" || n.sval == "array_elem") {
-            /* D41: bare `local $h{k}` / `local $a[i]` temporarily undefs */
+        } else {
+            /* bare `local $x;` / `local $h{k}` / `local $/;` — real Perl
+               assigns UNDEF (that's the whole point of `local $/;` for
+               slurp mode). */
             callRT("perl_assign", {pv, perlUndef()});
         }
         break;
@@ -9528,7 +9600,28 @@ Value *CodeGen::emitExpr(const Node &n) {
 
         Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
         Value *cnt  = callRT("perl_regex_subst", {str, pat, rep, flg});
-        return callRT("perl_alloc_int", {cnt});
+        /* Real Perl's s/// returns "" (not 0) when nothing matched — the
+           zero case stringifies empty. Branch on the count. */
+        auto *fn2   = builder_.GetInsertBlock()->getParent();
+        auto *zeroBB = BasicBlock::Create(ctx_, "subst.zero", fn2);
+        auto *someBB = BasicBlock::Create(ctx_, "subst.some", fn2);
+        auto *joinBB = BasicBlock::Create(ctx_, "subst.join", fn2);
+        auto *i64Ty2 = Type::getInt64Ty(ctx_);
+        Value *isZero = builder_.CreateICmpEQ(cnt, ConstantInt::get(i64Ty2, 0));
+        builder_.CreateCondBr(isZero, zeroBB, someBB);
+        builder_.SetInsertPoint(zeroBB);
+        Value *emptyPv = callRT("perl_alloc_string_len",
+                                {builder_.CreateGlobalStringPtr(""),
+                                 ConstantInt::get(i64Ty2, 0)});
+        builder_.CreateBr(joinBB);
+        builder_.SetInsertPoint(someBB);
+        Value *cntPv = callRT("perl_alloc_int", {cnt});
+        builder_.CreateBr(joinBB);
+        builder_.SetInsertPoint(joinBB);
+        auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "subst.res");
+        phi->addIncoming(emptyPv, zeroBB);
+        phi->addIncoming(cntPv, someBB);
+        return phi;
     }
 
     case NK::CaptureVar: {
@@ -10331,6 +10424,19 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (m == "case_tolerant") return callRT("perl_fspec_case_tolerant", {});
         }
         /* SUPER::method — dispatch starting from parent of caller package */
+        /* Dynamic method name: $obj->$meth(...) — the name comes from an
+           expression (parser leaves sval empty and puts it in n.right). */
+        if (n.sval.empty() && n.right) {
+            Value *methodStr = emitExpr(*n.right);
+            callRT("perl_push_call_frame",
+                {builder_.CreateGlobalStringPtr(currentPackage_),
+                 builder_.CreateGlobalStringPtr(sourceFile_),
+                 ConstantInt::get(Type::getInt32Ty(ctx_), n.line)});
+            Value *r = callRT("perl_dispatch_method_sv", {obj, methodStr, argsArr});
+            callRT("perl_pop_call_frame", {});
+            freeIfOwned(methodStr);
+            return r;
+        }
         if (n.sval.size() > 7 && n.sval.substr(0, 7) == "SUPER::") {
             std::string realMethod = n.sval.substr(7);
             Value *callerPkg  = builder_.CreateGlobalStringPtr(n.name);

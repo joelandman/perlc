@@ -86,6 +86,7 @@ private:
 
     NodePtr parseStmt();
     NodePtr parseBlock();
+    bool scanBraceHashLike();
     /* D125: the whole `use MODULE`/`use pragma`/`no PRAGMA` statement
        handling, previously reachable only from parseProgram()'s file-level
        loop — so `use strict;` / `no warnings 'numeric';` inside any
@@ -110,7 +111,7 @@ private:
 
     bool    isModifier() const;
     NodePtr parseModifier(NodePtr stmt, int line);
-    void    consumeLowOrChain();  /* consume or/and/xor statement separators */
+    NodePtr consumeLowOrChain(NodePtr init);  /* consume or/and/xor statement separators, folding onto init; returns the chain (or init) */
 
     NodePtr parseExpr();
     NodePtr parseLowOr();

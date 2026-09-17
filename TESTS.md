@@ -2680,6 +2680,72 @@ producers: `perl_not` → `perl_alloc_bool` (the W1 false=`""` convention),
 (`perl_regex_match` return). Numeric/boolean *contexts* were already
 correct — only the string form was wrong.
 
+### Parser-gaps batch + in-memory filehandles + W30 + or-next fixes — FIXED 2026-09-16
+
+**Parser gaps (all in `src/parser.cpp` unless noted):**
+- **`$obj->$method()` dynamic dispatch**: method name from an expression
+  (`$obj->$name(...)`, `$obj->$name[k]`) — parser branch in
+  `parseSubscript`'s arrow loop builds `NK::MethodCall` with `sval=""`
+  and the name expr in `n.right`; codegen routes it through the new
+  `perl_dispatch_method_sv(obj, PerlValue* method, args)` (stringifies
+  via `perl_to_string_dup`), inserted before the `SUPER::` check.
+- **`map { {k=>$_} }` hashref blocks**: `scanBraceHashLike()` detects a
+  brace that is a hash constructor (top-level `=>`, empty `{}`, or
+  leading `%` sigil) instead of a bare block; used in map/grep block
+  parsing and for statement-position `{k=>v}` (an `AnonHash` expr-stmt).
+  Pairs-flattening `map { ($_ => 1) } LIST`-shaped hash results go via
+  the new `perl_hash_pairs_array()` (walks hash buckets → key/value
+  list); nested `map { {k=>...} }` still yields single hashrefs.
+- **`grep { defined }` bare named-unary in block**: `defined`/`ref`/
+  `length` followed by `}`/`;`/`)`/`,`/EOF now take an implicit `$_`
+  argument (the check is on `cur()`, not `peek(1)`).
+- **`continue {}` blocks** (new `KW_CONTINUE` keyword, `Node::contBlock`,
+  codegen `contBB` at While/For/both Foreach sites): `next` targets the
+  continue block; the foreach cont block emits before `popScope()` so
+  the loop var is visible inside it. C-style `for(...){} continue{}`
+  is deliberately not tested (real perl calls that a syntax error).
+- **`X || next` / `X or next` / `my $v = ... or next` statement
+  or/and/xor folding**: `parseOrRhs`/`parseOr`/`parseAnd` now consume a
+  trailing `next`/`last`/`redo` keyword into a Block body, and
+  `consumeLowOrChain(init)` (parameterized, signature in `parser.h`)
+  folds the statement's or/and/xor chain onto the initializer/expr at
+  all 5 call sites with the correct operator (the old code hardcoded
+  `||`, breaking `my $z = ... and next;`). Root cause of the earlier
+  or-next probes failing: `parseLastNextRedoBody` doesn't consume the
+  keyword, so callers must `advance()` first.
+
+**s/// zero-substitution stringification** (`src/codegen.cpp` `case
+NK::RegexSubst`): the non-`/e` path now returns `""` (empty string, not
+`0`) when nothing matched, matching real Perl — `s///` as an `||` LHS
+and as an assigned scalar were both wrong (`"0"` truthy-quirk + `n=[0]`
+vs `n=[]`). Implemented as a count-equals-zero branch + PHI (empty
+`perl_alloc_string_len` vs `perl_alloc_int`).
+
+**In-memory filehandles** (`src/runtime.c` `perl_open_in_memory` +
+`PerlMemFile` cookie): `open my $fh, '<', \$buf` (and `'>':'>>':'+>'`)
+now work — `fmemopen` for read and `r+` in-place write; `fopencookie`
+for write modes with write-back into the referent on close. `open $fh,
+MODE, $scalar_ref` was previously unimplemented (fell through to a
+string path).
+
+**Bare `local $/;`** (`src/codegen.cpp` `case NK::LocalStmt` no-init
+path): assigns undef for ALL shapes now (was only hash_elem/array_elem)
+— fixes slurp mode via `local $/;` on regular files, not just the
+already-working element forms.
+
+**W30** (`eval "sub $name() { 42 }"`): already worked via the
+string-eval inliner; regression tests added.
+
+**A regression this round found + fixed:** the DBG-removal pass had
+accidentally deleted `case NK::Next:` from `src/codegen.cpp`, leaving
+its body unreachable dead code after `case NK::Last:`'s `break` —
+every bare `X || next` / `X or next` / `X and next` compiled to a
+no-op (foreach-next, while-next, foreach-last all probed: last worked,
+next silently didn't). Restored verbatim.
+
+Tests: `tests/parse_gaps_{smoke,deep}.pl`, `tests/inmem_fh_{smoke,deep}.pl`,
+`tests/w30_sub_eval_{smoke,deep}.pl`, `tests/or_next_{smoke,deep}.pl`.
+
 ## Source layout
 
 | File | Role |

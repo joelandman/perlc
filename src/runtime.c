@@ -5643,6 +5643,37 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
     return result;
 }
 
+/* Hash-constructor pair flattening for list contexts (real Perl's
+   `{ k=>v, ... }` in list context yields the key/value pairs). */
+PerlArray *perl_hash_pairs_array(PerlValue *pv) {
+    PerlArray *out = perl_array_new();
+    PerlHash *hv = NULL;
+    if (!pv) return out;
+    if (pv->tag == PERL_REF_HASH && pv->pval)
+        hv = (PerlHash *)pv->pval;
+    if (!hv) return out;
+    for (int b = 0; b < PERL_HASH_BUCKETS; b++) {
+        for (PerlHashEntry *e = hv->buckets[b]; e; e = e->next) {
+            perl_array_push(out,
+                perl_alloc_string_len(e->key ? e->key : "",
+                                      (long long)(e->key ? strlen(e->key) : 0)));
+            perl_array_push(out, e->val);
+        }
+    }
+    return out;
+}
+
+/* Dynamic method dispatch: $obj->$meth(...) — the method name arrives as
+   a PerlValue (stringified first, matching real Perl's runtime method
+   name resolution). */
+PerlValue *perl_dispatch_method_sv(PerlValue *obj, PerlValue *method_pv,
+                                   PerlArray *args) {
+    char *name = perl_to_string_dup(method_pv);
+    PerlValue *r = perl_dispatch_method(obj, name ? name : "", args);
+    free(name);
+    return r;
+}
+
 PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                                       const char *method, PerlArray *args) {
     /* D75: SUPER::method searches caller_pkg's @ISA parents in order,
@@ -5710,7 +5741,134 @@ static const char *mode_to_cmode(const char *m) {
     return "r";
 }
 
+/* ── In-memory filehandles: open($fh, MODE, \$string) ──────────────────── *
+ * Real Perl treats a scalar REFERENCE as the filename argument as an
+ * in-memory file. Read modes map to fmemopen over the referent's bytes;
+ * write/append modes use an fopencookie FILE whose cookie accumulates the
+ * written bytes and installs them into the referent when the handle is
+ * closed (Perl's copy-on-close semantics for in-memory files). */
+
+typedef struct PerlMemFile {
+    char      *buf;    /* accumulated bytes (write modes) */
+    size_t     len, cap;
+    PerlValue *target; /* the referent PV — receives the bytes on close */
+    int        rw;     /* write-capable (>, >>, +<, +>) */
+} PerlMemFile;
+
+static ssize_t pmf_write(void *c, const char *data, size_t n) {
+    PerlMemFile *m = (PerlMemFile *)c;
+    if (m->len + n + 1 > m->cap) {
+        m->cap = (m->len + n + 1) * 2;
+        m->buf = (char *)realloc(m->buf, m->cap);
+    }
+    memcpy(m->buf + m->len, data, n);
+    m->len += n;
+    m->buf[m->len] = '\0';
+    return (ssize_t)n;
+}
+
+static int pmf_close(void *c) {
+    PerlMemFile *m = (PerlMemFile *)c;
+    if (m->rw && m->target) {
+        char *nb = (char *)malloc(m->len + 1);
+        if (nb) {
+            if (m->len) memcpy(nb, m->buf, m->len);
+            nb[m->len] = '\0';
+            if (m->target->sval) free(m->target->sval);
+            m->target->sval = nb;
+            m->target->slen = (long long)m->len;
+        }
+    }
+    free(m->buf);
+    free(m);
+    return 0;
+}
+
+static cookie_io_functions_t pmf_funcs = { NULL, pmf_write, NULL, pmf_close };
+
+static FILE *perl_open_in_memory(PerlValue *target, const char *mode,
+                                 PerlValue *ref_pv) {
+    PerlValue *referent = NULL;
+    if (ref_pv->tag == PERL_REF_SCALAR && ref_pv->pval)
+        referent = (PerlValue *)ref_pv->pval;
+    if (!referent) return NULL;
+
+    int append  = (mode[0] == '>' && mode[1] == '>');
+    int trunc   = (mode[0] == '>');
+    int readwr  = (mode[0] == '+');
+    int rw      = append || trunc || readwr;
+
+    if (!rw || (readwr && mode[1] == '<')) {
+        /* '<' (read) and '+<' (read-write): a live FILE* over the
+           referent's current bytes; '+<' writes land IN the referent's
+           buffer in place (Perl's in-memory update semantics, capped at
+           the existing content — glibc fmemopen with a non-NULL buffer). */
+        const char *data = "";
+        size_t dlen = 0;
+        if (referent->tag == PERL_STRING && referent->sval) {
+            data = referent->sval;
+            dlen = (referent->slen > 0)
+                   ? (size_t)referent->slen : strlen(referent->sval);
+        }
+        if (!rw) {
+            FILE *fp = fmemopen((void *)data, dlen, "r");
+            return fp;
+        }
+        FILE *fp = fmemopen((void *)data, dlen, "r+");
+        return fp;
+    }
+
+    PerlMemFile *m = (PerlMemFile *)calloc(1, sizeof *m);
+    if (!m) return NULL;
+    m->target = referent;
+    m->rw     = 1;
+    if (append || readwr) {
+        /* append starts from the referent's existing content */
+        if (referent->tag == PERL_STRING && referent->sval &&
+            referent->slen >= 0) {
+            size_t ilen = (size_t)referent->slen;
+            m->buf = (char *)malloc(ilen + 1);
+            if (!m->buf) { free(m); return NULL; }
+            memcpy(m->buf, referent->sval, ilen);
+            m->buf[ilen] = '\0';
+            m->len = ilen;
+            m->cap = ilen + 1;
+        } else {
+            m->buf = (char *)malloc(1);
+            m->buf[0] = '\0';
+            m->len = 0;
+            m->cap = 1;
+        }
+    } else {
+        /* '>' truncates */
+        m->buf = (char *)malloc(1);
+        m->buf[0] = '\0';
+        m->len = 0;
+        m->cap = 1;
+    }
+    FILE *fp = fopencookie(m, readwr ? "r+" : "w", pmf_funcs);
+    if (!fp) { free(m->buf); free(m); }
+    return fp;
+}
+
 PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filename_pv) {
+    /* In-memory filehandle: the filename argument is a scalar REFERENCE
+       (open($fh, '<', \$str) — real Perl treats it as an in-memory file). */
+    if (filename_pv && filename_pv->tag == PERL_REF_SCALAR) {
+        char *mms = perl_to_string_dup(mode_pv);
+        FILE *mfp = perl_open_in_memory(target, mms, filename_pv);
+        free(mms);
+        if (mfp) {
+            if (target->tag == PERL_FILEHANDLE && target->pval)
+                fclose((FILE*)target->pval);
+            target->tag = PERL_FILEHANDLE;
+            target->pval = mfp;
+            target->matchpos = 0;
+            target->flags &= ~PV_FLAG_UTF8;
+            return target;
+        }
+        /* not a usable ref → fall through to the regular file path */
+    }
     char *ms = perl_to_string_dup(mode_pv);
     char *fs = perl_to_string_dup(filename_pv);
     if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);

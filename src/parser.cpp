@@ -389,6 +389,35 @@ NodePtr Parser::parseUseNoStmt() {
 
 /* ── statements ──────────────────────────────────────────────────────────── */
 
+/* Token lookahead for map/grep/sort's `{`: real Perl decides between a
+   BLOCK and an anon-hash constructor. Hash-like when the brace's TOP
+   level contains a fat comma (`=>`), or the brace closes immediately
+   (empty anon hash), or starts with a sigil-deref of a hash (e.g.
+   `{%$_, k=>1}` — the bare % sigil can't start a statement). */
+bool Parser::scanBraceHashLike() {
+    size_t i = pos_; /* cur() is the LBRACE */
+    if (i >= toks_.size() || toks_[i].kind != TK::LBRACE) return false;
+    i++; /* past { */
+    if (i < toks_.size() && toks_[i].kind == TK::RBRACE) return true; /* {} */
+    int depth = 1;
+    /* leading bare %-sigil (hash deref) inside a map/grep block is the
+       anon-hash start: `{ %$h, ... }` */
+    if (i < toks_.size() && toks_[i].kind == TK::HASH) return true;
+    while (i < toks_.size()) {
+        TK k = toks_[i].kind;
+        if (k == TK::LBRACE || k == TK::LBRACKET || k == TK::LPAREN) depth++;
+        else if (k == TK::RBRACE) {
+            depth--;
+            if (depth == 0) return false; /* no top-level => found */
+        } else if (k == TK::RBRACKET || k == TK::RPAREN) depth--;
+        else if (k == TK::FATARROW && depth == 1) return true;
+        else if (k == TK::SEMI && depth == 1) return false;
+        if (depth <= 0) return false;
+        i++;
+    }
+    return false;
+}
+
 NodePtr Parser::parseBlock() {
     int line = cur().line;
     consume(TK::LBRACE, "{");
@@ -489,7 +518,7 @@ NodePtr Parser::parseStmt() {
             consume(TK::RPAREN, ")");
             NodePtr rhs;
             if (match(TK::ASSIGN)) rhs = parseLowNot();
-            consumeLowOrChain();
+            rhs = consumeLowOrChain(std::move(rhs));
             match(TK::SEMI);
             NodeList stmts;
             for (auto &vd : allVars) {
@@ -777,7 +806,23 @@ NodePtr Parser::parseStmt() {
         auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt; n->sval = modname; n->line = line;
         return parseModifier(std::move(n), line);
     }
-    if (check(TK::LBRACE))    return parseBlock();
+    if (check(TK::LBRACE)) {
+        /* `{ key => val, ... }` in STATEMENT position (inside a
+           map/grep/sort block or any bare block) — when the top level of
+           the braces contains a fat comma (or is empty, or starts with a
+           bare % sigil) real Perl treats it as an anon-hash-constructor
+           EXPRESSION, not a block: `map { {k=>$_} } @list` */
+        if (scanBraceHashLike()) {
+            int eline = cur().line;
+            auto expr = parsePrimary(); /* LBRACE case builds NK::AnonHash */
+            auto es = std::make_unique<Node>();
+            es->kind = NK::ExprStmt;
+            es->left = std::move(expr);
+            es->line = eline;
+            return parseModifier(std::move(es), eline);
+        }
+        return parseBlock();
+    }
     if (check(TK::KW_DIE) || check(TK::KW_WARN)) {
         bool isDie = check(TK::KW_DIE); advance();
         auto stmt = parseDieWarnBody(isDie, line);
@@ -834,6 +879,15 @@ NodePtr Parser::parseWhile() {
     auto body = parseBlock();
     auto n = std::make_unique<Node>(); n->kind = NK::While; n->line = line;
     n->cond = std::move(cond); n->body = std::move(body);
+    /* `while (...) BLOCK continue BLOCK` — the continue block runs at
+       the loop's continue point (before the condition re-check); `next`
+       inside the body lands there. */
+    if (check(TK::KW_CONTINUE)) {
+        int cline = cur().line;
+        advance();
+        n->contBlock = parseBlock();
+        n->contBlock->line = cline;
+    }
     return n;
 }
 
@@ -897,6 +951,13 @@ NodePtr Parser::parseFor() {
             auto n = std::make_unique<Node>(); n->kind = NK::For; n->line = line;
             n->init = std::move(init); n->cond = std::move(cond);
             n->step = std::move(step); n->body = std::move(body);
+            /* `for (...) BLOCK continue BLOCK` */
+            if (check(TK::KW_CONTINUE)) {
+                int cline = cur().line;
+                advance();
+                n->contBlock = parseBlock();
+                n->contBlock->line = cline;
+            }
             return n;
         }
     }
@@ -935,6 +996,13 @@ NodePtr Parser::parseForeachBody(int line) {
     auto n = std::make_unique<Node>(); n->kind = NK::Foreach; n->name = varName; n->line = line;
     /* store list in args, body in body */
     n->args = std::move(elems); n->body = std::move(body);
+    /* `foreach (LIST) BLOCK continue BLOCK` */
+    if (check(TK::KW_CONTINUE)) {
+        int cline = cur().line;
+        advance();
+        n->contBlock = parseBlock();
+        n->contBlock->line = cline;
+    }
     return n;
 }
 
@@ -1251,7 +1319,7 @@ NodePtr Parser::parseMy() {
         }
         NodePtr rhs;
         if (match(TK::ASSIGN)) rhs = parseLowNot();
-        consumeLowOrChain();
+        rhs = consumeLowOrChain(std::move(rhs));
         match(TK::SEMI);
         /* emit as FlatBlock with multiple decls */
         NodeList stmts;
@@ -1310,7 +1378,7 @@ NodePtr Parser::parseMy() {
         if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
         }
-        consumeLowOrChain();
+        decl->right = consumeLowOrChain(std::move(decl->right));
         match(TK::SEMI);
         return decl;
     }
@@ -1330,7 +1398,7 @@ NodePtr Parser::parseMy() {
        if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
         }
-        consumeLowOrChain();
+        decl->right = consumeLowOrChain(std::move(decl->right));
         match(TK::SEMI);
         return decl;
     }
@@ -1349,7 +1417,7 @@ NodePtr Parser::parseMy() {
         if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
         }
-        consumeLowOrChain();
+        decl->right = consumeLowOrChain(std::move(decl->right));
         match(TK::SEMI);
         return decl;
     }
@@ -1565,12 +1633,25 @@ bool Parser::isModifier() const {
 /* Consume a low-precedence or/and/xor chain (statement separators in
    Perl).  Used after my/local/state declarations where the initializer
    is parsed with parseLowNot() which stops before or/and/xor. */
-void Parser::consumeLowOrChain() {
+/* Consume a low-precedence or/and/xor chain after a declaration's
+   initializer. Historically the chain was parsed and DISCARDED (no-op
+   semantics); but when the RHS is a control-flow keyword
+   (`my $n = EXPR || next;` — pl2pm), discarding it changes program
+   behavior, so the chain is now returned as a real BinOp node (nullptr
+   when there was nothing). Callers fold it onto the declared RHS. */
+NodePtr Parser::consumeLowOrChain(NodePtr init) {
+    NodePtr acc = std::move(init);
     while (check(TK::KW_OR) || check(TK::KW_AND) ||
            (cur().kind == TK::IDENT && cur().text == "xor")) {
+        int line = cur().line;
+        std::string op = check(TK::KW_AND) ? "&&" : "||";
         advance();
-        parseOrRhs();
+        NodePtr rhs = parseOrRhs();
+        if (cur().kind == TK::IDENT && cur().text == "xor") op = "xor";
+        if (!acc) acc = std::move(rhs);
+        else      acc = makeBin(op, std::move(acc), std::move(rhs), line);
     }
+    return acc;
 }
 
 /* Wrap stmt in an if/while/foreach node if a modifier keyword follows.
@@ -1683,9 +1764,9 @@ NodePtr Parser::parseOrRhs() {
     if      (k == TK::KW_RETURN) { stmt = parseReturn(); }
     else if (k == TK::KW_DIE)    { stmt = parseDieWarnBody(true,  line); }
     else if (k == TK::KW_WARN)   { stmt = parseDieWarnBody(false, line); }
-    else if (k == TK::KW_LAST)   { stmt = parseLastNextRedoBody(NK::Last, line); }
-    else if (k == TK::KW_NEXT)   { stmt = parseLastNextRedoBody(NK::Next, line); }
-    else if (k == TK::KW_REDO)   { auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
+    else if (k == TK::KW_LAST)   { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
+    else if (k == TK::KW_NEXT)   { advance(); stmt = parseLastNextRedoBody(NK::Next, line); }
+    else if (k == TK::KW_REDO)   { advance(); auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
     else if (k == TK::KW_PRINT)  { stmt = parsePrint(false); }
     else if (k == TK::KW_SAY)    { stmt = parsePrint(true);  }
     else if (k == TK::KW_PUSH)   { stmt = parsePush();       }
@@ -1839,6 +1920,21 @@ NodePtr Parser::parseOr() {
         int line = cur().line;
         std::string op = check(TK::DEFINED_OR) ? "//" : "||";
         advance();
+        /* `EXPR || next/last/redo` (pl2pm's `$x =~ s/.../.../ || next`)
+           — the control-flow keyword as the RHS: parse it as a
+           statement-body (no `;` consumed) and wrap in a Block exactly
+           like parseOrRhs's low-precedence `or` handling, so the
+           short-circuit codegen sees a value. */
+        if (check(TK::KW_NEXT) || check(TK::KW_LAST) || check(TK::KW_REDO)) {
+            NodePtr stmt;
+            if      (check(TK::KW_LAST)) { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
+            else if (check(TK::KW_NEXT)) { advance(); stmt = parseLastNextRedoBody(NK::Next, line); }
+            else                         { advance(); auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
+            NodeList b; b.push_back(std::move(stmt));
+            auto rhs = makeBlock(std::move(b), line);
+            lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
+            continue;
+        }
         auto rhs = parseAnd();
         lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
     }
@@ -1849,6 +1945,16 @@ NodePtr Parser::parseAnd() {
     auto lhs = parseBitOr();
     while (check(TK::AND2)) {
         int line = cur().line; advance();
+        if (check(TK::KW_NEXT) || check(TK::KW_LAST) || check(TK::KW_REDO)) {
+            NodePtr stmt;
+            if      (check(TK::KW_LAST)) { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
+            else if (check(TK::KW_NEXT)) { advance(); stmt = parseLastNextRedoBody(NK::Next, line); }
+            else                         { advance(); auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
+            NodeList b; b.push_back(std::move(stmt));
+            auto rhs = makeBlock(std::move(b), line);
+            lhs = makeBin("&&", std::move(lhs), std::move(rhs), line);
+            continue;
+        }
         auto rhs = parseBitOr();
         lhs = makeBin("&&", std::move(lhs), std::move(rhs), line);
     }
@@ -2174,6 +2280,46 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                 }
                 throw std::runtime_error(parseErrPrefix(line) +
                     "expected '*' or '{' after '->%'");
+            }
+            /* ->$var(args) — DYNAMIC method dispatch: the method name is
+               whatever $var evaluates to at runtime (real Perl's
+               $obj->$meth(...) accessors/dispatch-table idiom). */
+            if (check(TK::SCALAR)) {
+                /* The lexer emits `$name` as SCALAR("$") + IDENT("name")
+                   (or one SCALAR token for the `$::name`/`$#arr`/`$^X`
+                   special forms) — normalize both spellings. */
+                std::string varName = cur().text;
+                size_t methodConsume = 1; /* tokens to eat for the name */
+                if (varName == "$") {
+                    if (peek(1).kind == TK::IDENT) {
+                        varName = peek(1).text;
+                        methodConsume = 2;
+                    } else
+                        varName = "$";
+                } else if (varName.size() > 1 && varName[0] == '$')
+                    varName = varName.substr(1);
+                /* `->$_` is the implicit-$_ glob — only a dynamic METHOD
+                   call when followed by '(' */
+                TK after = peek(methodConsume).kind;
+                if (varName != "$" && (after == TK::LPAREN ||
+                                       after == TK::LBRACKET ||
+                                       after == TK::LBRACE)) {
+                    for (size_t ci = 0; ci < methodConsume; ci++) advance();
+                    auto n = std::make_unique<Node>(); n->kind = NK::MethodCall;
+                    n->sval = ""; /* dynamic: name from n.right */
+                    n->right = makeScalar(varName, line);
+                    n->left = std::move(base); n->line = line;
+                    if (check(TK::LPAREN)) {
+                        advance();
+                        while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                            n->args.push_back(parseExpr());
+                            if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+                        }
+                        consume(TK::RPAREN, ")");
+                    }
+                    base = std::move(n);
+                    continue;
+                }
             }
             if (check(TK::SCALAR) && peek(1).kind == TK::STAR) { /* $r->$* */
                 advance();  /* skip $ */
@@ -3173,6 +3319,13 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_REF)) {
         advance();
         bool hasParen = match(TK::LPAREN);
+        TK rnx = cur().kind;
+        if (rnx == TK::RBRACE || rnx == TK::SEMI || rnx == TK::RPAREN ||
+            rnx == TK::COMMA || rnx == TK::EOF_TOK) {
+            auto n = std::make_unique<Node>(); n->kind = NK::RefFunc;
+            n->left = makeScalar("_", line); n->line = line;
+            return n;
+        }
         auto inner = parseExpr();
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::RefFunc;
@@ -3196,6 +3349,15 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_DEFINED)) {
         advance();
         bool hasParen = match(TK::LPAREN);
+        /* bare `defined` (no argument, block/closer next): real Perl's
+           named-unary with implicit $_ — `grep { defined } @list` */
+        TK nx = cur().kind;
+        if (nx == TK::RBRACE || nx == TK::SEMI || nx == TK::RPAREN ||
+            nx == TK::COMMA || nx == TK::EOF_TOK) {
+            auto n = std::make_unique<Node>(); n->kind = NK::DefinedFunc;
+            n->left = makeScalar("_", line); n->line = line;
+            return n;
+        }
         NodePtr inner = hasParen ? parseExpr() : parseShift();
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::DefinedFunc;
@@ -3480,6 +3642,13 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_LENGTH)) {
         advance();
         bool hasParen = match(TK::LPAREN);
+        TK lnx = cur().kind;
+        if (lnx == TK::RBRACE || lnx == TK::SEMI || lnx == TK::RPAREN ||
+            lnx == TK::COMMA || lnx == TK::EOF_TOK) {
+            auto n = std::make_unique<Node>(); n->kind = NK::LengthFunc;
+            n->left = makeScalar("_", line); n->line = line;
+            return n;
+        }
         auto inner = parseExpr();
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::LengthFunc;
@@ -3956,7 +4125,13 @@ NodePtr Parser::parsePrimary() {
         auto n = std::make_unique<Node>();
         n->kind = isMap ? NK::MapFunc : NK::GrepFunc; n->line = line;
         bool hp = match(TK::LPAREN);
-        if (check(TK::LBRACE)) {
+        if (check(TK::LBRACE) && scanBraceHashLike()) {
+            /* `{ key => val, ... }` anon-hash-constructor transform (real
+               Perl's map/grep/sort hashref heuristic: a brace block whose
+               top level contains a fat comma — or is immediately empty —
+               is an anon-hash REF returned per element) */
+            n->left = parsePrimary(); /* LBRACE case builds NK::AnonHash */
+        } else if (check(TK::LBRACE)) {
             n->body = parseBlock(); /* block form: map { BLOCK } LIST */
         } else {
             n->left = parseExpr(); /* expr form: map EXPR, LIST */

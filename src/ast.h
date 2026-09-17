@@ -198,6 +198,7 @@ struct Node {
 
     /* children */
     NodePtr            left, right, cond, body, init, step;
+    NodePtr            contBlock; /* `while/for/foreach ... continue BLOCK` */
     NodeList           args;      /* call args, print args, array elements */
     std::vector<IfBranch> branches; /* if/elsif/else */
 
