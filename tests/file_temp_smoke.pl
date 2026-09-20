@@ -1,0 +1,11 @@
+use File::Temp qw(tempdir tempfile mkstemp mkdtemp mktemp tmpnam);
+my $d = tempdir("/tmp/perlc_ftsmoke_XXXXXX");
+print "d_ok=", ($d =~ m{^/tmp/perlc_ftsmoke_[A-Za-z0-9_]{6}$} ? 1 : 0), " isdir=", (-d $d ? 1 : 0), "\n";
+my ($fh, $fn) = tempfile(DIR => $d);
+print "fn_dir_ok=", (index($fn, "$d/") == 0 ? 1 : 0), " exists=", (-e $fn ? 1 : 0), "\n";
+print $fh "hello\n"; close $fh;
+print "size=", (-s $fn), "\n";
+my $d2 = tempdir();
+print "d2_ok=", ($d2 =~ m{^/tmp/[A-Za-z0-9_]{10}$} ? 1 : 0), "\n";
+rmdir $d2;
+print "done\n";

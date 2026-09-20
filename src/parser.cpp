@@ -2727,7 +2727,12 @@ NodePtr Parser::parsePrimary() {
         std::string flag = cur().text; advance();
         bool hp = match(TK::LPAREN);
         NodePtr path;
-        if (!check(TK::SEMI) && !check(TK::EOF_TOK))
+        /* bare filetest (implicit $_) when the next token can't begin an
+           operand: statement end, list/paren/brace end, or a logical
+           operator (-d && ... / -d || ... / -d or die) */
+        if (!check(TK::SEMI) && !check(TK::EOF_TOK) && !check(TK::RPAREN) &&
+            !check(TK::RBRACE) && !check(TK::COMMA) && !check(TK::AND2) &&
+            !check(TK::OR2) && !check(TK::KW_AND) && !check(TK::KW_OR))
             path = hp ? parseExpr() : parsePostfix(); /* postfix-level: grabs $var, "str", $arr[i] */
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::FileTestOp;

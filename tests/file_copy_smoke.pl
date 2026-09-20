@@ -1,0 +1,17 @@
+use File::Copy;
+mkdir "/tmp/perlc_fcopy_smoke";
+my $src = "/tmp/perlc_fcopy_smoke/src.txt";
+open(W, ">", $src) or die "write: $!";
+print W "line1\nline2\n";
+close W;
+my $dst = "/tmp/perlc_fcopy_smoke/dst.txt";
+unlink $dst;
+print "copy1=", copy($src, $dst), "\n";
+print "dst_size=", -s $dst, "\n";
+print "copy_missing=", copy("/tmp/perlc_fcopy_smoke/nope.txt", $dst), " err=[$!]\n";
+print "mv1=", move($dst, "/tmp/perlc_fcopy_smoke/moved.txt"), "\n";
+print "dst_gone=", (-e $dst ? 1 : 0), " moved=", (-e "/tmp/perlc_fcopy_smoke/moved.txt" ? 1 : 0), "\n";
+print "syscopy=", File::Copy::syscopy("/tmp/perlc_fcopy_smoke/moved.txt", "/tmp/perlc_fcopy_smoke/s.txt"), "\n";
+print "cp=", File::Copy::cp("/tmp/perlc_fcopy_smoke/s.txt", "/tmp/perlc_fcopy_smoke/c.txt"), "\n";
+print "mv=", File::Copy::mv("/tmp/perlc_fcopy_smoke/c.txt", "/tmp/perlc_fcopy_smoke/m.txt"), "\n";
+print "done\n";

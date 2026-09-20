@@ -126,7 +126,7 @@ static bool installMissingModules(const std::vector<Token> &tokens,
     static const std::set<std::string> PRAGMAS = {
         "strict","warnings","feature","parent","base",
         "Exporter","Carp","POSIX","Scalar::Util",
-        "List::Util","Data::Dumper","Storable","overload",
+        "List::Util","Data::Dumper","overload",
         "constant",
         "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
@@ -378,7 +378,7 @@ static std::vector<Token> inlineModules(
         "strict","warnings","feature","parent","base","integer","utf8",
         "vars",
         "Exporter","Carp","POSIX","Scalar::Util",
-        "List::Util","Data::Dumper","Storable","overload",
+        "List::Util","Data::Dumper","overload",
         "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
         "File::Basename","Getopt::Long","DBI","DBD::SQLite",
@@ -386,6 +386,8 @@ static std::vector<Token> inlineModules(
         "DynaLoader","XSLoader",
         "Cwd","Sys::Hostname","Time::Local",
         "File::Spec","File::Spec::Unix","File::Spec::Functions",
+        "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
+        "Storable",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -777,7 +779,10 @@ static std::vector<Token> inlineModules(
             continue;
         }
         if (modName == "Cwd" || modName == "Sys::Hostname" ||
-            modName == "Time::Local" || modName == "File::Spec::Functions") {
+            modName == "Time::Local" || modName == "File::Spec::Functions" ||
+            modName == "File::Copy" || modName == "File::Path" ||
+            modName == "File::Find" || modName == "File::Temp" ||
+            modName == "Text::Wrap" || modName == "Storable") {
             /* File::Spec::Functions' real %EXPORT_TAGS defines
                ALL => [@EXPORT_OK, @EXPORT] — expand :ALL to that union.
                (Real File::Spec::Functions' %EXPORT_TAGS has only ALL.) */

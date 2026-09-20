@@ -760,17 +760,23 @@ std::vector<Token> Lexer::tokenize() {
                 (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
                  toks.back().kind == TK::HASH) &&
                 toks.back().text.size() <= 1;
+            /* {y=>1} / {tr=>1}: a bareword hash KEY spelled y/tr — the
+               '=>' fatarrow disqualifies the y/// / tr/// operator (real
+               perl's tokenizer treats '=>' as the key separator, not a
+               delimiter) */
             bool isTr = !afterBareSigilTr &&
                         (c == 't' && peek(1) == 'r' &&
                          peek(2) && !isalnum((unsigned char)peek(2)) &&
                          peek(2) != '_' && peek(2) != ' ' && peek(2) != '\t' &&
                          peek(2) != '\n' && peek(2) != '\r' &&
-                         peek(2) != '}' && peek(2) != ']' && peek(2) != ')');
+                         peek(2) != '}' && peek(2) != ']' && peek(2) != ')' &&
+                         !(peek(2) == '=' && peek(3) == '>'));
             bool isY  = !afterBareSigilTr &&
                         (c == 'y' && peek(1) && !isalnum((unsigned char)peek(1)) &&
                          peek(1) != '_' && peek(1) != ' ' && peek(1) != '\t' &&
                          peek(1) != '\n' && peek(1) != '\r' &&
-                         peek(1) != '}' && peek(1) != ']' && peek(1) != ')');
+                         peek(1) != '}' && peek(1) != ']' && peek(1) != ')' &&
+                         !(peek(1) == '=' && peek(2) == '>'));
             if (isTr || isY) {
                 char delim = isTr ? peek(2) : peek(1);
                 size_t skip = isTr ? 3 : 2;

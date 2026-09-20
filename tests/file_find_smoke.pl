@@ -1,0 +1,16 @@
+use File::Find;
+system("rm -rf /tmp/perlc_ffind_smoke");
+mkdir "/tmp/perlc_ffind_smoke";
+mkdir "/tmp/perlc_ffind_smoke/sub";
+open(my $f, ">", "/tmp/perlc_ffind_smoke/a.txt") or die; close $f;
+open($f, ">", "/tmp/perlc_ffind_smoke/sub/b.txt") or die; close $f;
+my @seen;
+find(sub { push @seen, "$File::Find::name|$_" }, "/tmp/perlc_ffind_smoke");
+print "seen=[@seen]\n";
+my @dirs;
+find(sub { push @dirs, $File::Find::name if -d }, "/tmp/perlc_ffind_smoke");
+print "dirs=[@dirs]\n";
+my @files;
+find(sub { push @files, $_ if -f }, "/tmp/perlc_ffind_smoke");
+print "files=[@files]\n";
+print "done\n";

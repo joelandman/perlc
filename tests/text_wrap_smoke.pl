@@ -1,0 +1,10 @@
+use Text::Wrap;
+my $long = "The quick brown fox jumps over the lazy dog and then some more words to make this long enough to wrap around a few times for testing purposes indeed";
+print "W1=[" . wrap("", "", $long) . "]\n";
+print "W2=[" . wrap("  ", "\n", "One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen") . "]\n";
+print "F1=[" . fill("", "", "The quick brown fox jumps over the lazy dog and then some more words") . "]\n";
+$Text::Wrap::columns = 20;
+print "F2=[" . fill("", "", "one two three four five six seven eight") . "]\n";
+$Text::Wrap::separator = "|";
+print "F3=[" . fill("", "", "one two three four five six seven eight") . "]\n";
+print "done\n";

@@ -1,0 +1,15 @@
+use File::Path qw(make_path remove_tree);
+system("rm -rf /tmp/perlc_fpath_smoke");
+my @r = make_path("/tmp/perlc_fpath_smoke/a/b/c");
+print "r=[@r]\n";
+print "d=", (-d "/tmp/perlc_fpath_smoke/a/b/c" ? 1 : 0), "\n";
+my @r2 = make_path("/tmp/perlc_fpath_smoke/a/b/c");
+print "r2=[@r2]\n";
+my $n = make_path("/tmp/perlc_fpath_smoke/e/f");
+print "n=$n\n";
+my @r3 = remove_tree("/tmp/perlc_fpath_smoke/a");
+print "r3=[@r3]\n";
+print "gone=", (-e "/tmp/perlc_fpath_smoke/a" ? 1 : 0), "\n";
+my @r4 = remove_tree("/tmp/perlc_fpath_smoke/absent");
+print "r4=[@r4]\n";
+print "done\n";

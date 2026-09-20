@@ -776,6 +776,19 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_abs_path",         pv, pv);
     RT("perl_realpath",         pv, pv);
     RT("perl_hostname",         pv);
+    RT("perl_fpath_collect",    voidTy, av, pv);
+    RT("perl_file_find",        pv, pv, av, i32);
+    RT("perl_file_temp_template", pv, av, i32, i32);
+    RT("perl_file_temp",        av, av, i32, i32);
+    RT("perl_file_temp_tmpnam", pv);
+    RT("perl_storable_dclone",  pv, pv);
+    RT("perl_text_wrap",        pv, pv, pv, av, pv, pv, pv, pv, pv);
+    RT("perl_text_fill",        pv, pv, pv, av, pv, pv, pv, pv, pv);
+    RT("perl_make_path",        av, av, pv, i32);
+    RT("perl_remove_tree",      av, av, pv, i32);
+    RT("perl_fcopy",            pv, pv, pv, pv, pv, pv);
+    RT("perl_fsyscopy",         pv, pv, pv, pv, pv, pv);
+    RT("perl_fmove",            pv, pv, pv, pv, pv);
     RT("perl_fspec_canonpath",  pv, pv);
     RT("perl_fspec_catdir",     pv, av);
     RT("perl_fspec_catfile",    pv, av);
@@ -2113,6 +2126,56 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         (n.name == "File::Spec::path" || n.name == "File::Spec::Unix::path" ||
          n.name == "path")) {
         return callRT("perl_fspec_path", {});
+    }
+    /* File::Path in list context (@dirs = make_path(...)) — the created
+       paths / per-dir removal counts reach emitArrayPtr, which must
+       return the PerlArray itself (same reasoning as uniq below). */
+    if (n.kind == NK::Call &&
+        (n.name == "File::Path::make_path" || n.name == "make_path" ||
+         n.name == "File::Path::mkpath"    || n.name == "mkpath" ||
+         n.name == "File::Path::remove_tree" || n.name == "remove_tree" ||
+         n.name == "File::Path::rmtree"    || n.name == "rmtree")) {
+        std::vector<Value*> raw;
+        for (auto &a : n.args) raw.push_back(emitExpr(*a));
+        Value *opts = perlUndef();
+        auto *i32TyP = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32TyP, n.line)});
+        Value *dirs = callRT("perl_array_new", {});
+        for (size_t k = 0; k < raw.size(); k++)
+            callRT("perl_fpath_collect", {dirs, raw[k]});
+        Value *r;
+        if (n.name == "File::Path::make_path" || n.name == "make_path" ||
+            n.name == "File::Path::mkpath"    || n.name == "mkpath")
+            r = callRT("perl_make_path",
+                       {dirs, opts, ConstantInt::get(i32TyP, 1)});
+        else
+            r = callRT("perl_remove_tree",
+                       {dirs, opts, ConstantInt::get(i32TyP, 1)});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    /* File::Temp list context: my ($fh, $name) = tempfile(...) — the
+       (fh, name) pair reaches emitArrayPtr, which must return the raw
+       PerlArray (same convention as make_path/uniq). mkstemp likewise
+       returns (fh, name) in list context. */
+    if (n.kind == NK::Call &&
+        (n.name == "File::Temp::tempfile" || n.name == "tempfile")) {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_file_temp",
+                      {av, ConstantInt::get(Type::getInt32Ty(ctx_), 1),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), 1)});
+    }
+    if (n.kind == NK::Call &&
+        (n.name == "File::Temp::mkstemp" || n.name == "mkstemp")) {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_file_temp_template",
+                      {av, ConstantInt::get(Type::getInt32Ty(ctx_), 0),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), 1)});
     }
     /* D69: List::Util::uniq in list context. Same reasoning as
        Time::HiRes::gettimeofday just above — "List::Util::uniq" only
@@ -9650,7 +9713,17 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::FileTestOp: {
         int op = (unsigned char)n.sval[0];
-        Value *path = n.left ? emitExpr(*n.left) : perlStr("");
+        Value *path;
+        if (n.left) {
+            path = emitExpr(*n.left);
+        } else {
+            /* bare `-d` etc. tests $_ (real Perl implicit-topic rule).
+               Read the in-scope $_ slot if the sub has one (W29 shadow),
+               else the global $_ cell. */
+            Value *slot = lookupVar("_");
+            path = slot ? builder_.CreateLoad(perlPtrTy_, slot)
+                        : callRT("perl_get_dollar_under", {});
+        }
         Value *opv  = ConstantInt::get(Type::getInt32Ty(ctx_), op);
         return callRT("perl_filetest", {opv, path});
     }
@@ -11657,6 +11730,198 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *cloned = callRT("perl_clone", {elem});
         callRT("perl_array_free", {arr});
         return cloned;
+    }
+    /* ── Storable::dclone (Tier 2, native) ──
+       bare `dclone` (the codebase's looseness for @EXPORT_OK names) is
+       kept; real Storable has no `copy` function (dclone IS the copy
+       entry point), and bare `copy` must stay File::Copy's. */
+    if (n.name == "Storable::dclone" || n.name == "dclone") {
+        return callRT("perl_storable_dclone",
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef()});
+    }
+    /* ── Text::Wrap (Tier 1, native) ──
+       wrap(IP, XP, @texts) / fill(IP, XP, @lines) with the live package
+       vars $Text::Wrap::columns / $separator / $separator2 / $huge read
+       at call time through the glob registry. */
+    {
+        auto isWrapCall = [&](const char *bare, const char *qual) {
+            return n.name == qual || n.name == bare;
+        };
+        if (isWrapCall("wrap", "Text::Wrap::wrap") ||
+            isWrapCall("fill", "Text::Wrap::fill")) {
+            bool isFill = isWrapCall("fill", "Text::Wrap::fill");
+            Value *ip = n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlStr("");
+            Value *xp = n.args.size() >= 2 ? emitExpr(*n.args[1]) : perlStr("");
+            Value *av = callRT("perl_array_new", {});
+            for (size_t k = 2; k < n.args.size(); k++) {
+                Value *sub = emitArrayPtr(*n.args[k]);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*n.args[k])});
+            }
+            auto pkgVar = [&](const char *bare, const char *dflt) -> Value* {
+                std::string qn = std::string("Text::Wrap::") + bare;
+                Value *key = builder_.CreateGlobalStringPtr(qn);
+                Value *pv = callRT("perl_glob_get_scalar", {key});
+                /* if unset, the PV is undef — runtime falls back to the default */
+                (void)dflt;
+                return pv;
+            };
+            Value *cols = pkgVar("columns", "76");
+            Value *sep  = pkgVar("separator", "");
+            Value *sep2 = pkgVar("separator2", "");
+            Value *huge = pkgVar("huge", "");
+            Value *unx  = pkgVar("unexpand", "");
+            if (isFill)
+                return callRT("perl_text_fill",
+                              {ip, xp, av, cols, sep, sep2, huge, unx});
+            return callRT("perl_text_wrap",
+                          {ip, xp, av, cols, sep, sep2, huge, unx});
+        }
+    }
+    /* ── File::Temp (Tier 1, native) ──
+       tempdir(TEMPLATE | DIR=>.. | TEMPLATE=>.. | no args) → new 0700
+       dir; tempfile(DIR=>.., SUFFIX=>..) → (fh, name) in list ctx, fh in
+       scalar ctx; mkstemp/mkdtemp/mktemp on an XXXXXX template;
+       tmpnam(). Args go to the runtime flat so DIR=>/SUFFIX=>/TEMPLATE=>
+       key/value pairs are paired there (D136 auto-quote makes the keys
+       strings). */
+    if (n.name == "File::Temp::tempdir" || n.name == "tempdir") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_file_temp",
+                      {av, ConstantInt::get(Type::getInt32Ty(ctx_), 0),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+    }
+    if (n.name == "File::Temp::tempfile" || n.name == "tempfile") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_file_temp",
+                      {av, ConstantInt::get(Type::getInt32Ty(ctx_), 1),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), 1)});
+    }
+    if (n.name == "File::Temp::mkstemp" || n.name == "mkstemp") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_file_temp_template",
+                      {av, ConstantInt::get(Type::getInt32Ty(ctx_), 0),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), 1)});
+    }
+    if (n.name == "File::Temp::mkdtemp" || n.name == "mkdtemp") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_file_temp_template",
+                      {av, ConstantInt::get(Type::getInt32Ty(ctx_), 1),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+    }
+    if (n.name == "File::Temp::mktemp" || n.name == "mktemp") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        return callRT("perl_file_temp_template",
+                      {av, ConstantInt::get(Type::getInt32Ty(ctx_), 2),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+    }
+    if (n.name == "File::Temp::tmpnam" || n.name == "tmpnam")
+        return callRT("perl_file_temp_tmpnam", {});
+    /* ── File::Find (Tier 1, native) ──
+       find(\&wanted, @dirs) / finddepth(\&wanted, @dirs) /
+       find({wanted=>..., no_chdir=>..., bydepth=>...}, @dirs) — the
+       wanted coderef + dirs go to the runtime, which sets $_ and the
+       $File::Find::* globals per entry. Returns undef like real find. */
+    if (n.name == "File::Find::find" || n.name == "find" ||
+        n.name == "File::Find::finddepth" || n.name == "finddepth") {
+        if (n.args.empty()) return perlUndef();
+        int dfs = (n.name == "finddepth" ||
+                   n.name == "File::Find::finddepth") ? 1 : 0;
+        Value *w = emitExpr(*n.args[0]);
+        Value *dirs = callRT("perl_array_new", {});
+        for (size_t k = 1; k < n.args.size(); k++) {
+            Value *sub = emitArrayPtr(*n.args[k]);
+            if (sub) callRT("perl_array_extend", {dirs, sub});
+            else     callRT("perl_array_push",   {dirs, emitExpr(*n.args[k])});
+        }
+        return callRT("perl_file_find",
+                      {w, dirs, ConstantInt::get(Type::getInt32Ty(ctx_), dfs)});
+    }
+    /* ── File::Path (Tier 1, native) ──
+       make_path(dirs..., {opts}) / mkpath(dirs... | [$dirs], $verbose,
+       $mode) — creates each missing component; list ctx returns the
+       created component paths, scalar ctx the count. remove_tree/rmtree
+       return per-dir removal counts (list) or the total (scalar). */
+    if (n.name == "File::Path::make_path" || n.name == "make_path" ||
+        n.name == "File::Path::mkpath"   || n.name == "mkpath") {
+        std::vector<Value*> raw;
+        for (auto &a : n.args) raw.push_back(emitExpr(*a));
+        Value *opts = perlUndef();
+        auto *i32TyP = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32TyP, n.line)});
+        Value *dirs = callRT("perl_array_new", {});
+        for (size_t k = 0; k < raw.size(); k++)
+            callRT("perl_fpath_collect", {dirs, raw[k]});
+        Value *r = callRT("perl_make_path",
+                          {dirs, opts, ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "File::Path::remove_tree" || n.name == "remove_tree" ||
+        n.name == "File::Path::rmtree"   || n.name == "rmtree") {
+        std::vector<Value*> raw;
+        for (auto &a : n.args) raw.push_back(emitExpr(*a));
+        Value *opts = perlUndef();
+        Value *dirs = callRT("perl_array_new", {});
+        for (size_t k = 0; k < raw.size(); k++)
+            callRT("perl_fpath_collect", {dirs, raw[k]});
+        return callRT("perl_remove_tree",
+                      {dirs, opts, ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+    }
+    /* ── File::Copy (Tier 1, native) ──
+       copy(FROM,TO[,BUF])/syscopy/cp and move/mv — FROM/TO may be path
+       strings or filehandles; returns 1/0 with $! set on failure. Bare
+       copy/move are @EXPORT (work after plain `use File::Copy;`); cp/mv
+       are @EXPORT_OK (importMap routes them to the qualified names).
+       A `*GLOB` argument additionally passes its display name so the
+       runtime's identical-file warning prints '*main::A' like real
+       File::Copy (whose stat() sees through glob handles). */
+    auto emitFhArg = [&](const Node &a, Value **pv, Value **np) {
+        *pv = emitExpr(a);
+        if (a.kind == NK::Typeglob)
+            *np = perlStr("*" + currentPackage_ + "::" + a.name);
+        else if (a.kind == NK::StringLit)
+            *np = perlStr(a.sval);
+        else
+            *np = perlUndef();
+    };
+    if (n.name == "File::Copy::copy" || n.name == "copy" ||
+        n.name == "File::Copy::syscopy" || n.name == "syscopy" ||
+        n.name == "File::Copy::cp" || n.name == "cp") {
+        Value *a, *an, *b, *bn;
+        emitFhArg(*n.args[0], &a, &an);
+        emitFhArg(*n.args[1], &b, &bn);
+        Value *c = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+        auto *i32TyF = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32TyF, n.line)});
+        Value *r = callRT("perl_fcopy", {a, b, c, an, bn});
+        callRT("perl_pop_call_frame", {});
+        return r;
+    }
+    if (n.name == "File::Copy::move" || n.name == "move" ||
+        n.name == "File::Copy::mv" || n.name == "mv") {
+        Value *a, *an, *b, *bn;
+        emitFhArg(*n.args[0], &a, &an);
+        emitFhArg(*n.args[1], &b, &bn);
+        auto *i32TyM = Type::getInt32Ty(ctx_);
+        callRT("perl_push_call_frame",
+            {builder_.CreateGlobalStringPtr(currentPackage_),
+             builder_.CreateGlobalStringPtr(sourceFile_),
+             ConstantInt::get(i32TyM, n.line)});
+        Value *r = callRT("perl_fmove", {a, b, an, bn});
+        callRT("perl_pop_call_frame", {});
+        return r;
     }
     /* ── Cwd (Tier 1, native) ──
        getcwd()/cwd()/fastcwd()/fastgetcwd() — all the same getcwd(3) call

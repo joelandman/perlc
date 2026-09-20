@@ -378,6 +378,26 @@ PerlValue *perl_shutdown_fh(PerlValue *fh, PerlValue *how);
 PerlValue *perl_getsockname_fh(PerlValue *fh);
 PerlValue *perl_getpeername_fh(PerlValue *fh);
 PerlValue *perl_sysopen_fh(PerlValue *fh, PerlValue *path, PerlValue *mode, PerlValue *perms);
+void perl_fpath_collect(PerlArray *dirs, PerlValue *pv);
+PerlValue *perl_file_find(PerlValue *wanted, PerlArray *dirs, int depth_first);
+PerlValue *perl_file_temp_template(PerlArray *args, int kind, int ctx);
+PerlValue *perl_file_temp(PerlArray *args, int is_tempfile, int ctx);
+PerlValue *perl_file_temp_tmpnam(void);
+PerlValue *perl_storable_dclone(PerlValue *pv);
+PerlValue *perl_text_wrap(PerlValue *ip, PerlValue *xp, PerlArray *texts,
+                          PerlValue *columns, PerlValue *sep, PerlValue *sep2,
+                          PerlValue *huge, PerlValue *unexpand);
+PerlValue *perl_text_fill(PerlValue *ip, PerlValue *xp, PerlArray *texts,
+                          PerlValue *columns, PerlValue *sep, PerlValue *sep2,
+                          PerlValue *huge, PerlValue *unexpand);
+PerlValue *perl_make_path(PerlArray *dirs, PerlValue *opts, int ctx);
+PerlValue *perl_remove_tree(PerlArray *dirs, PerlValue *opts, int ctx);
+PerlValue *perl_fcopy(PerlValue *from, PerlValue *to, PerlValue *bufsize,
+                      PerlValue *fromname, PerlValue *toname);
+PerlValue *perl_fsyscopy(PerlValue *from, PerlValue *to, PerlValue *bufsize,
+                         PerlValue *fromname, PerlValue *toname);
+PerlValue *perl_fmove(PerlValue *from, PerlValue *to,
+                      PerlValue *fromname, PerlValue *toname);
 PerlValue *perl_sysseek_fh(PerlValue *fh, PerlValue *off, PerlValue *whence);
 PerlValue *perl_sysread_fh(PerlValue *fh, PerlValue *buf, PerlValue *len, PerlValue *off);
 PerlValue *perl_syswrite_fh(PerlValue *fh, PerlValue *buf, PerlValue *len, PerlValue *off);

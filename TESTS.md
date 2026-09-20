@@ -68,6 +68,7 @@ eval STRING and eval-defined subs see outer `my`).
 | ID | Status | Notes |
 |----|--------|-------|
 | D54 | OPEN (tooling) | `perlc_tsan` hangs compiling `tests/threads.pl` (TSan+fork of clang-18). `TSAN_OPTIONS=die_after_fork=0` works around it. Not a generated-code bug. |
+| D138 | **FIXED 2026-09-19** | `\&name == \&name` / `__SUB__ == \&name` (CODE-ref identity via `==`) was unreliable — `perl_num_eq`/`perl_num_ne` compared the freshly-`malloc`'d `PerlClosure` wrapper's own address instead of the wrapped sub. See below. |
 | D101 | **FIXED 2026-09-11** | `each %hash` in scalar context returned the pair length (0/1/2), not the key. See below. |
 | D102 | **FIXED** (2026-09-10) | `die REF` / `die $blessed_obj` lost the reference — `$@` became a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Broke OO exception handling. See below. |
 | D103 | **FIXED 2026-09-11** | Integer overflow used wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently went wrong or printed in scientific notation instead of exact digits. See below. |
@@ -2745,6 +2746,50 @@ next silently didn't). Restored verbatim.
 
 Tests: `tests/parse_gaps_{smoke,deep}.pl`, `tests/inmem_fh_{smoke,deep}.pl`,
 `tests/w30_sub_eval_{smoke,deep}.pl`, `tests/or_next_{smoke,deep}.pl`.
+
+### D138 — CODE-ref `==` identity compared the wrapper, not the sub — **FIXED 2026-09-19**
+
+Found by a `make test-all` run on top of new File::Copy/File::Find/
+File::Path/File::Temp/Storable::dclone/Text::Wrap work: `d124_current_sub_deep.pl`
+(`__SUB__ == \&in_named ? "same" : "diff"`) started printing `"diff"`.
+Bisected with `git stash` — the pre-existing committed binary reproduced
+it too, so the new module code didn't cause it; it only changed
+`runtime.c`'s heap layout enough to stop a lucky `malloc` coincidence
+from masking a real bug.
+
+Root cause (`src/runtime.c`): `make_code_ref_impl()` (used by both
+`\&name` and `__SUB__` inside a named sub) `malloc`s a brand-new
+`PerlClosure` wrapper struct on *every* call — two code-refs to the very
+same sub get two different wrapper addresses. `perl_num_eq`/
+`perl_num_ne`'s ref-identity branch compared `a->pval == b->pval`
+directly, i.e. the wrapper address, not the wrapped `PerlSubFnCtx fn`
+pointer — so `\&foo == \&foo` was false in general, and had only ever
+"passed" in the test suite because two short-lived allocations happened
+to get the same just-freed address back from `malloc`.
+
+Fixed with a small `perl_ref_identity()` helper: for `PERL_CODE_REF` it
+unwraps to `((PerlClosure*)pval)->fn`; every other ref tag keeps
+comparing `pval` directly (unchanged). Applied at both compare sites.
+Verified stable across 10 repeated runs of `d124_current_sub_deep.pl`
+post-fix (previously flaky depending on allocator state). Note:
+CODE-ref *stringification* (`"$coderef"` → `"CODE"`, no address) still
+doesn't expose an address at all — untouched, out of scope here since
+nothing exercises it.
+
+### File::Temp test regexes assumed an alnum-only random alphabet — **FIXED 2026-09-19**
+
+`tests/file_temp_{smoke,deep}.pl`'s own assertions (e.g. `^/tmp/
+perlc_ftmks_[A-Za-z0-9]{6}$`, `tmpnam_ok`'s `[A-Za-z0-9]{10}`) assumed
+`File::Temp`'s random filename suffix is drawn from a 62-character
+alnum alphabet. Real `File::Temp` actually draws from a 63-character
+alphabet that includes `_`, so **real Perl's own output** legitimately
+failed the test's regex roughly 1 run in 7 (confirmed empirically: `perl
+-MFile::Temp=tmpnam -e 'print tmpnam()'` produces underscores routinely)
+while perlc's `ftemp_rand` (alnum-only) never did — a test-authoring bug
+disguised as harness flakiness, not a perlc functional defect. Fixed by
+widening every affected character class to `[A-Za-z0-9_]`; confirmed
+25 consecutive clean diffs against real Perl on both files post-fix
+(previously flaky within a handful of runs).
 
 ## Source layout
 

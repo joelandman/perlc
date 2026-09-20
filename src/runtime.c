@@ -2650,7 +2650,33 @@ static int perl_bigint_cmp_exact(const PerlValue *a, const PerlValue *b) {
     return c < 0 ? -1 : (c > 0 ? 1 : 0);
 }
 
+/* D138: identity key for ref == / != comparisons. For everything but
+   CODE_REF this is just pval (the referenced container's address). A
+   CODE_REF's pval is a PerlClosure wrapper that make_code_ref_impl()
+   freshly mallocs on EVERY `\&name` / __SUB__ evaluation — two refs to
+   the very same sub get two different wrapper addresses, so comparing
+   pval directly made `\&foo == \&foo` false in general (it only
+   "passed" before when malloc happened to reuse a just-freed wrapper's
+   address). Real Perl's ref identity is the underlying sub (CV), so
+   compare the wrapped function pointer instead. */
+static const void *perl_ref_identity(const PerlValue *v) {
+    if (v->tag == PERL_CODE_REF && v->pval)
+        return (const void *)((const PerlClosure *)v->pval)->fn;
+    return v->pval;
+}
+
 HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
+    /* ref == ref compares the referenced object's identity (real Perl:
+       the numeric value of a ref is its address). FLAT_ARRAY counts as
+       ref-like (an arrayref value). */
+    if (a && b &&
+        (a->tag == PERL_REF_ARRAY || a->tag == PERL_REF_HASH ||
+         a->tag == PERL_REF_SCALAR || a->tag == PERL_CODE_REF ||
+         a->tag == PERL_FLAT_ARRAY) &&
+        (b->tag == PERL_REF_ARRAY || b->tag == PERL_REF_HASH ||
+         b->tag == PERL_REF_SCALAR || b->tag == PERL_CODE_REF ||
+         b->tag == PERL_FLAT_ARRAY))
+        return perl_alloc_bool(perl_ref_identity(a) == perl_ref_identity(b));
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
         if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
@@ -2663,6 +2689,14 @@ HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_bool(perl_to_float(a) == perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
+    if (a && b &&
+        (a->tag == PERL_REF_ARRAY || a->tag == PERL_REF_HASH ||
+         a->tag == PERL_REF_SCALAR || a->tag == PERL_CODE_REF ||
+         a->tag == PERL_FLAT_ARRAY) &&
+        (b->tag == PERL_REF_ARRAY || b->tag == PERL_REF_HASH ||
+         b->tag == PERL_REF_SCALAR || b->tag == PERL_CODE_REF ||
+         b->tag == PERL_FLAT_ARRAY))
+        return perl_alloc_bool(perl_ref_identity(a) != perl_ref_identity(b));
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
         if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
@@ -6239,6 +6273,1100 @@ PerlValue *perl_mkdir_op(PerlValue *path, PerlValue *mode) {
     return perl_alloc_int(r == 0 ? 1 : 0);
 }
 
+/* ---- Storable::dclone ---- */
+
+/* deep clone of a reference (hash/array/scalar ref, preserving blessing)
+   with cycle detection via an original-pointer memo table */
+struct DCloneMemo { void *orig; PerlValue *clone; };
+
+struct DCloneCtx {
+    struct DCloneMemo memo[256];
+    int               n;
+};
+
+/* *owned tells the caller whether the result must be perl_free'd:
+   a memo hit (cycle back-reference) returns a pv the caller must NOT
+   free (it is the container itself, returned to the top-level caller). */
+static PerlValue *storable_dclone_pv(struct DCloneCtx *ctx, PerlValue *pv,
+                                     int *owned);
+
+static PerlValue *storable_memo_lookup(struct DCloneCtx *ctx, void *orig) {
+    for (int i = 0; i < ctx->n; i++) {
+        if (ctx->memo[i].orig == orig) {
+            return ctx->memo[i].clone;
+        }
+    }
+    return NULL;
+}
+
+static void storable_memo_add(struct DCloneCtx *ctx, void *orig,
+                              PerlValue *clone) {
+    if (ctx->n < 256) {
+        ctx->memo[ctx->n].orig  = orig;
+        ctx->memo[ctx->n].clone = clone;
+        ctx->n++;
+    }
+}
+
+static PerlValue *storable_clone_container(struct DCloneCtx *ctx,
+                                           PerlValue *pv, int is_hash) {
+    void *orig = pv->pval;
+    PerlValue *memo = storable_memo_lookup(ctx, orig);
+    if (memo) return memo;
+    PerlValue *out = pv_alloc();
+    out->tag = pv->tag;
+    out->flags = pv->flags;
+    out->matchpos = pv->matchpos;
+    if (pv->blessed_class) out->blessed_class = strdup(pv->blessed_class);
+    /* allocate the container FIRST and memo it before recursing: a
+       self-referential value clones `out` while its pval must already
+       be the new container, or the stored clone keeps pval=NULL */
+    PerlHash *dstHash = NULL;
+    PerlArray *dstArr = NULL;
+    if (is_hash) {
+        dstHash = perl_anon_hash_new();
+        out->pval = dstHash;
+    } else {
+        dstArr = perl_anon_array_new(); /* refcount=1: memo/backrefs own it */
+        out->pval = dstArr;
+    }
+    storable_memo_add(ctx, orig, out);
+    /* the memo + cycle back-references share the container: claim a
+       reference so an intermediate free of the memo'd pv can't drop the
+       underlying hash/array while a back-reference still points at it */
+    if (is_hash) dstHash->refcount++;
+    else        dstArr->refcount++;
+    if (is_hash) {
+        PerlHash *src = (PerlHash *)orig;
+        for (int b = 0; b < PERL_HASH_BUCKETS; b++) {
+            for (PerlHashEntry *e = src->buckets[b]; e; e = e->next) {
+                int owned = 1;
+                PerlValue *cl = storable_dclone_pv(ctx, e->val, &owned);
+                perl_hash_set_str(dstHash, e->key, cl);
+                if (owned) perl_free(cl);
+            }
+        }
+    } else {
+        PerlArray *src = (PerlArray *)orig;
+        for (long long i = 0; i < src->len; i++) {
+            int owned = 1;
+            PerlValue *cl = storable_dclone_pv(ctx, src->elems[i], &owned);
+            perl_array_push(dstArr, cl);
+            if (owned) perl_free(cl);
+        }
+    }
+    return out;
+}
+
+static PerlValue *storable_dclone_pv(struct DCloneCtx *ctx, PerlValue *pv,
+                                     int *owned) {
+    if (!pv || pv->tag == PERL_UNDEF) { *owned = 1; return perl_alloc_undef(); }
+    if (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR) {
+        /* Stage 22/23 compact numeric row — promote to a real REF_ARRAY
+           (D105) so the clone is a proper independent array ref. Memo on
+           the original buffer pointer: two hash entries sharing one FLAT
+           row must share the promoted clone too. */
+        void *orig = pv->pval;
+        PerlValue *memo = storable_memo_lookup(ctx, orig);
+        if (memo) { *owned = 0; return memo; }
+        PerlValue *copy = perl_clone(pv);
+        perl_promote_ref_array(copy);
+        storable_memo_add(ctx, orig, copy);
+        *owned = 0; /* memo'd — freed only with the whole clone graph */
+        return copy;
+    }
+    if (pv->tag == PERL_REF_HASH || pv->tag == PERL_REF_ARRAY) {
+        void *orig = pv->pval;
+        PerlValue *memo = storable_memo_lookup(ctx, orig);
+        if (memo) { *owned = 0; return memo; } /* cycle back-reference */
+        /* container clones stay in the memo for the whole dclone (cycle
+           back-references point at them) — the caller must not free */
+        *owned = 0;
+        return storable_clone_container(ctx, pv,
+                                        pv->tag == PERL_REF_HASH);
+    }
+    if (pv->tag == PERL_REF_SCALAR) {
+        void *orig = pv->pval;
+        PerlValue *memo = storable_memo_lookup(ctx, orig);
+        if (memo) { *owned = 0; return memo; }
+        PerlValue *out = pv_alloc();
+        out->tag = PERL_REF_SCALAR;
+        out->flags = pv->flags;
+        if (pv->blessed_class) out->blessed_class = strdup(pv->blessed_class);
+        storable_memo_add(ctx, orig, out);
+        PerlValue *inner = (PerlValue *)pv->pval;
+        int innerOwned = 1;
+        out->pval = storable_dclone_pv(ctx, inner, &innerOwned);
+        *owned = 0; /* memo'd */
+        return out;
+    }
+    /* scalars (strings/ints/floats/bigints/code refs) — plain clone */
+    *owned = 1;
+    return perl_clone(pv);
+}
+
+PerlValue *perl_storable_dclone(PerlValue *pv) {
+    struct DCloneCtx ctx = { .n = 0 };
+    int owned = 1;
+    return storable_dclone_pv(&ctx, pv, &owned);
+}
+
+/* ---- Text::Wrap ---- */
+
+/* expand tabs to spaces (Text::Tabs::expand, tabstop 8) */
+static char *tw_expand_tabs(const char *t) {
+    size_t cap = strlen(t) * 8 + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    size_t o = 0;
+    int col = 0;
+    for (const char *p = t; *p; p++) {
+        if (*p == '\t') {
+            do { out[o++] = ' '; col++; } while (col % 8 != 0);
+        } else {
+            out[o++] = *p;
+            if (*p == '\n') col = 0; else col++;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/* Text::Tabs::unexpand for one line: expand, split into tabstop (8)
+   chunks; every chunk but the last gets its trailing space-run (>=2)
+   replaced with a tab; a last chunk of exactly 8 spaces becomes a tab. */
+static char *tw_unexpand_line(const char *line) {
+    char *exp = tw_expand_tabs(line);
+    if (!exp) return NULL;
+    size_t len = strlen(exp);
+    char *out = (char *)malloc(len + 8);
+    if (!out) { free(exp); return NULL; }
+    size_t oo = 0, i = 0;
+    int ts = 8;
+    while (i < len) {
+        /* Text::Tabs::unexpand splits on exactly-ts chunks; every chunk
+           that is followed by more data (i.e. NOT the true remainder)
+           gets s/  +$/\t/. When len % ts == 0 the split still emits a
+           trailing empty lastbit, so the last full chunk also counts as
+           non-final. */
+        size_t chunkEnd = (i + (size_t)ts <= len) ? i + (size_t)ts : len;
+        int isRemainder = (chunkEnd < len) ? 0
+                        : (len % (size_t)ts != 0); /* short chunk = remainder */
+        size_t cs = i, ce = chunkEnd;
+        if (!isRemainder) {
+            size_t run = ce;
+            while (run > cs && exp[run - 1] == ' ') run--;
+            if (run < ce && ce - run >= 2) {
+                memcpy(out + oo, exp + cs, run - cs); oo += run - cs;
+                out[oo++] = '\t';
+                i = chunkEnd;
+                continue;
+            }
+            memcpy(out + oo, exp + cs, ce - cs); oo += ce - cs;
+            i = chunkEnd;
+        } else {
+            memcpy(out + oo, exp + cs, ce - cs); oo += ce - cs;
+            i = chunkEnd;
+        }
+    }
+    out[oo] = '\0';
+    free(exp);
+    return out;
+}
+
+static int tw_is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == '\f' || c == '\v';
+}
+
+/* the wrap core over one pre-expanded text; returns the wrapped string.
+   nl_prefix is the separator+lead for subsequent lines (handled via the
+   nl/lead locals inside). huge_die_msg: when huge='die' and the chunking
+   fails, die. */
+static char *tw_wrap_one(const char *t, const char *ip, const char *xp,
+                         long long columns, const char *separator,
+                         const char *separator2, const char *huge,
+                         int unexpand) {
+    size_t cap = strlen(t) * 2 + strlen(ip) + strlen(xp) + 64;
+    char *r = (char *)malloc(cap);
+    if (!r) return NULL;
+    size_t ro = 0;
+    long long xplen = (long long)strlen(xp);
+    long long iplen = (long long)strlen(ip);
+    long long nll = columns - xplen - 1;
+    if (nll <= 0 && xplen > 0) {
+        columns = xplen + 2;
+        nll = 1;
+    }
+    long long ll = columns - iplen - 1;
+    if (ll < 0) ll = 0;
+    const char *lead = ip;
+    const char *nl = "";
+    long long pos = 0;
+    size_t tlen = strlen(t);
+
+    while (pos < (long long)tlen) {
+        /* skip leading break chars (the /(?:$break)*\Z/ loop condition) */
+        long long look = pos;
+        while (look < (long long)tlen && tw_is_space(t[look])) look++;
+        if (look >= (long long)tlen) { pos = look; break; }
+
+        long long chunkEnd = -1;
+        long long remainderStart = -1;
+        /* greedy: largest k <= ll with t[pos+k] being a break start */
+        long long maxk = (ll < (long long)(tlen - pos)) ? ll : (long long)(tlen - pos);
+        for (long long k = maxk; k >= 0; k--) {
+            if (pos + k == (long long)tlen || tw_is_space(t[pos + k])) {
+                chunkEnd = pos + k;
+                /* consume the whole whitespace run */
+                long long rem = chunkEnd;
+                while (rem < (long long)tlen && tw_is_space(t[rem])) rem++;
+                remainderStart = rem;
+                break;
+            }
+        }
+        if (chunkEnd < 0) {
+            /* no break within ll chars: overlong word */
+            if (strcmp(huge, "die") == 0) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "couldn't wrap '%.60s'", t);
+                perl_die(perl_alloc_string(msg), "-", 0);
+                free(r);
+                return NULL;
+            }
+            /* huge=overflow (default) and huge=wrap both hard-chunk at ll */
+            chunkEnd = pos + maxk;
+            remainderStart = chunkEnd;
+        }
+        /* r .= unexpand(nl . lead . t[pos..chunkEnd)) — real wrap applies
+           unexpand() per line when $unexpand (default 1). nl is "\n" or a
+           custom separator: only the lead+chunk part is unexpanded; a
+           custom separator is NOT a "\n" so unexpand sees "lead chunk". */
+        {
+            char *piece = (char *)malloc((size_t)(chunkEnd - pos) +
+                                         strlen(lead) + strlen(nl) + 2);
+            size_t po = 0;
+            { size_t l2 = strlen(nl); memcpy(piece + po, nl, l2); po += l2; }
+            { size_t l2 = strlen(lead); memcpy(piece + po, lead, l2); po += l2; }
+            { size_t l2 = (size_t)(chunkEnd - pos); memcpy(piece + po, t + pos, l2); po += l2; }
+            piece[po] = '\0';
+            char *final = piece;
+            const char *prefix = "";
+            if (unexpand) {
+                if (nl[0] == '\n' && nl[1] == '\0') {
+                    /* nl = "\n": unexpand(line) where line = lead+chunk;
+                       the "\n" separator is written back separately */
+                    char *u = tw_unexpand_line(piece + 1);
+                    if (u) { final = u; prefix = "\n"; }
+                } else {
+                    char *u = tw_unexpand_line(piece);
+                    if (u) final = u;
+                }
+            }
+            { size_t l2 = strlen(prefix) + strlen(final); if (ro + l2 + 1 > cap) { cap = (ro + l2 + 1) * 2; r = (char *)realloc(r, cap); }
+              size_t l3 = strlen(prefix); memcpy(r + ro, prefix, l3); ro += l3;
+              l3 = strlen(final); memcpy(r + ro, final, l3); ro += l3; }
+            if (final != piece) free(final);
+            free(piece);
+        }
+        pos = remainderStart > chunkEnd ? remainderStart : chunkEnd;
+
+        lead = xp;
+        ll = nll;
+        if (separator2 && *separator2) {
+            nl = (chunkEnd < (long long)tlen && t[chunkEnd] == '\n')
+                 ? "\n" : separator2;
+        } else {
+            nl = separator;
+        }
+    }
+    /* tail: remainder after the last break (real wrap appends $remainder
+       of the last match then any unconsumed text) */
+    if (pos < (long long)tlen) {
+        const char *rest = t + pos;
+        size_t l2 = strlen(rest);
+        if (ro + strlen(nl) + strlen(lead) + l2 + 1 > cap) {
+            cap = ro + strlen(nl) + strlen(lead) + l2 + 1;
+            r = (char *)realloc(r, cap);
+        }
+        size_t l3 = strlen(nl); memcpy(r + ro, nl, l3); ro += l3;
+        l3 = strlen(lead); memcpy(r + ro, lead, l3); ro += l3;
+        memcpy(r + ro, rest, l2); ro += l2;
+        r[ro] = '\0';
+    } else {
+        r[ro] = '\0';
+    }
+    return r;
+}
+
+/* wrap(IP, XP, @texts...) — real Text::Wrap::wrap joins the texts with
+   a space between each pair (unless a text ends with whitespace), then
+   runs the greedy chunker with $columns/$separator/$huge. */
+PerlValue *perl_text_wrap(PerlValue *ip_pv, PerlValue *xp_pv,
+                          PerlArray *texts, PerlValue *columns_pv,
+                          PerlValue *sep_pv, PerlValue *sep2_pv,
+                          PerlValue *huge_pv, PerlValue *unexpand_pv) {
+    char *ip = ip_pv ? perl_to_string_dup(ip_pv) : strdup("");
+    char *xp = xp_pv ? perl_to_string_dup(xp_pv) : strdup("");
+    long long columns = 76;
+    if (columns_pv && columns_pv->tag != PERL_UNDEF)
+        columns = perl_to_int(columns_pv);
+    const char *separator = "\n";
+    static char sep_hold[256];
+    if (sep_pv && sep_pv->tag == PERL_STRING) {
+        snprintf(sep_hold, sizeof(sep_hold), "%s", sep_pv->sval ? sep_pv->sval : "");
+        separator = sep_hold;
+    }
+    static char sep2_hold[256];
+    const char *separator2 = NULL;
+    if (sep2_pv && sep2_pv->tag == PERL_STRING && sep2_pv->sval)
+        { snprintf(sep2_hold, sizeof(sep2_hold), "%s", sep2_pv->sval); separator2 = sep2_hold; }
+    char huge_hold[16];
+    const char *huge = "overflow";
+    if (huge_pv && huge_pv->tag == PERL_STRING && huge_pv->sval)
+        { snprintf(huge_hold, sizeof(huge_hold), "%s", huge_pv->sval); huge = huge_hold; }
+
+    /* join: interleave a single space between texts unless the left one
+       ends with whitespace; last text is the tail */
+    char *joined = NULL;
+    {
+        size_t cap = 16;
+        for (long long i = 0; i < texts->len; i++) {
+            char *s = perl_to_string_dup(texts->elems[i]);
+            if (s) cap += strlen(s) + 2;
+            free(s);
+        }
+        joined = (char *)malloc(cap);
+        joined[0] = '\0';
+        for (long long i = 0; i < texts->len; i++) {
+            char *s = perl_to_string_dup(texts->elems[i]);
+            if (!s) continue;
+            size_t jlen = strlen(joined);
+            if (i + 1 < texts->len && jlen > 0 &&
+                !tw_is_space(joined[jlen - 1]) && !tw_is_space(s[0]))
+                strcat(joined, " ");
+            strcat(joined, s);
+            free(s);
+        }
+    }
+    char *t = tw_expand_tabs(joined);
+    free(joined);
+    if (!t) { free(ip); free(xp); return perl_alloc_undef(); }
+    int unexp = 1;
+    if (unexpand_pv && unexpand_pv->tag != PERL_UNDEF)
+        unexp = perl_is_true(unexpand_pv) ? 1 : 0;
+    char *r = tw_wrap_one(t, ip, xp, columns, separator, separator2, huge,
+                          unexp);
+    free(t); free(ip); free(xp);
+    return r ? perl_alloc_string(r) : perl_alloc_undef();
+}
+
+/* fill(IP, XP, @lines) — paragraph-aware: split on /\n\s+/, squeeze
+   internal whitespace runs, wrap each paragraph; paragraphs joined with
+   "\n\n" when IP eq XP else "\n". */
+PerlValue *perl_text_fill(PerlValue *ip_pv, PerlValue *xp_pv,
+                          PerlArray *texts, PerlValue *columns_pv,
+                          PerlValue *sep_pv, PerlValue *sep2_pv,
+                          PerlValue *huge_pv, PerlValue *unexpand_pv) {
+    char *ip = ip_pv ? perl_to_string_dup(ip_pv) : strdup("");
+    char *xp = xp_pv ? perl_to_string_dup(xp_pv) : strdup("");
+    long long columns = 76;
+    if (columns_pv && columns_pv->tag != PERL_UNDEF)
+        columns = perl_to_int(columns_pv);
+    const char *separator = "\n";
+    static char fsep_hold[256];
+    if (sep_pv && sep_pv->tag == PERL_STRING) {
+        snprintf(fsep_hold, sizeof(fsep_hold), "%s", sep_pv->sval ? sep_pv->sval : "");
+        separator = fsep_hold;
+    }
+    static char fsep2_hold[256];
+    const char *separator2 = NULL;
+    if (sep2_pv && sep2_pv->tag == PERL_STRING && sep2_pv->sval)
+        { snprintf(fsep2_hold, sizeof(fsep2_hold), "%s", sep2_pv->sval); separator2 = fsep2_hold; }
+    char fhuge_hold[16];
+    const char *huge = "overflow";
+    if (huge_pv && huge_pv->tag == PERL_STRING && huge_pv->sval)
+        { snprintf(fhuge_hold, sizeof(fhuge_hold), "%s", huge_pv->sval); huge = fhuge_hold; }
+    int funexp = 1;
+    if (unexpand_pv && unexpand_pv->tag != PERL_UNDEF)
+        funexp = perl_is_true(unexpand_pv) ? 1 : 0;
+
+    /* join the texts with "\n" */
+    size_t jcap = 16;
+    for (long long i = 0; i < texts->len; i++) {
+        char *s = perl_to_string_dup(texts->elems[i]);
+        if (s) jcap += strlen(s) + 1;
+        free(s);
+    }
+    char *joined = (char *)malloc(jcap);
+    joined[0] = '\0';
+    for (long long i = 0; i < texts->len; i++) {
+        char *s = perl_to_string_dup(texts->elems[i]);
+        if (!s) continue;
+        strcat(joined, s);
+        free(s);
+    }
+
+    const char *ps = (strcmp(ip, xp) == 0) ? "\n\n" : "\n";
+    size_t pcap = strlen(joined) * 4 + strlen(ip) + strlen(xp) + 64;
+    char *out = (char *)malloc(pcap);
+    out[0] = '\0';
+    size_t oo = 0;
+
+    /* split on /\n\s+/ — a newline followed by whitespace = paragraph break */
+    char *cur = (char *)malloc(strlen(joined) + 2);
+    size_t cl = 0;
+    for (size_t i = 0; i <= strlen(joined); i++) {
+        char c = joined[i];
+        if (c == '\n') {
+            /* peek: newline followed by whitespace? */
+            size_t k = i + 1;
+            while (joined[k] && tw_is_space(joined[k]) && joined[k] != '\n') k++;
+            if (i + 1 < strlen(joined) && tw_is_space(joined[i + 1])) {
+                cur[cl] = '\0';
+                /* squeeze whitespace runs to single spaces */
+                char *sq = (char *)malloc(cl + 1);
+                size_t so = 0;
+                for (size_t x = 0; x < cl; x++) {
+                    if (tw_is_space(cur[x])) {
+                        sq[so++] = ' ';
+                        while (x + 1 < cl && tw_is_space(cur[x + 1])) x++;
+                    } else sq[so++] = cur[x];
+                }
+                sq[so] = '\0';
+                char *et = tw_expand_tabs(sq);
+                char *w = tw_wrap_one(et, ip, xp, columns, separator,
+                                      separator2, huge, funexp);
+                if (w) {
+                    while (oo + strlen(w) + strlen(ps) + 1 > pcap) {
+                        pcap *= 2; out = (char *)realloc(out, pcap);
+                    }
+                    if (oo) { size_t l3 = strlen(ps); memcpy(out + oo, ps, l3); oo += l3; }
+                    size_t l4 = strlen(w); memcpy(out + oo, w, l4); oo += l4;
+                    free(w);
+                }
+                free(sq); free(et); cl = 0;
+                i = k - 1;
+                continue;
+            }
+        }
+        if (c) cur[cl++] = c;
+        else {
+            cur[cl] = '\0';
+            char *sq = (char *)malloc(cl + 1);
+            size_t so = 0;
+            for (size_t x = 0; x < cl; x++) {
+                if (tw_is_space(cur[x])) {
+                    sq[so++] = ' ';
+                    while (x + 1 < cl && tw_is_space(cur[x + 1])) x++;
+                } else sq[so++] = cur[x];
+            }
+            sq[so] = '\0';
+            char *et = tw_expand_tabs(sq);
+            char *w = tw_wrap_one(et, ip, xp, columns, separator,
+                                  separator2, huge, funexp);
+            if (w) {
+                while (oo + strlen(w) + strlen(ps) + 1 > pcap) {
+                    pcap *= 2; out = (char *)realloc(out, pcap);
+                }
+                if (oo) { size_t l3 = strlen(ps); memcpy(out + oo, ps, l3); oo += l3; }
+                size_t l4 = strlen(w); memcpy(out + oo, w, l4); oo += l4;
+                free(w);
+            }
+            free(sq); free(et); cl = 0;
+        }
+    }
+    free(cur); free(joined); free(ip); free(xp);
+    out[oo] = '\0';
+    return perl_alloc_string(out);
+}
+
+/* ---- File::Temp ---- */
+
+static void ftemp_rand(char *out, int n) {
+    static unsigned long long ftemp_state = 0;
+    if (!ftemp_state) {
+        ftemp_state = (unsigned long long)time(NULL) ^
+                      ((unsigned long long)getpid() << 32) ^
+                      (unsigned long long)(intptr_t)&errno;
+        if (!ftemp_state) ftemp_state = 88172645463325252ULL;
+    }
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (int i = 0; i < n; i++) {
+        ftemp_state ^= ftemp_state << 13;
+        ftemp_state ^= ftemp_state >> 7;
+        ftemp_state ^= ftemp_state << 17;
+        out[i] = alphabet[ftemp_state % (sizeof(alphabet) - 1)];
+    }
+    out[n] = '\0';
+}
+
+/* replace the TRAILING run of X's (real File::Temp semantics) with
+   random chars. template must live long enough; writes back in place. */
+static void ftemp_fill(char *tpl) {
+    size_t len = strlen(tpl);
+    size_t end = len;
+    while (end > 0 && tpl[end-1] == 'X') end--;
+    int nx = (int)(len - end);
+    if (nx > 0) {
+        char rnd[64];
+        if (nx > 64) nx = 64;
+        ftemp_rand(rnd, nx);
+        memcpy(tpl + end, rnd, nx);
+    }
+}
+
+/* find options in a flat key/value arg list ("DIR" => path, ...) */
+static PerlValue *ftemp_opt(PerlArray *args, const char *key) {
+    for (long long i = 0; i + 1 < args->len; i += 2) {
+        char *k = perl_to_string_dup(args->elems[i]);
+        if (k && strcmp(k, key) == 0) {
+            free(k);
+            return args->elems[i + 1];
+        }
+        free(k);
+    }
+    return NULL;
+}
+
+/* mkstemp(TEMPLATE) / mkdtemp(TEMPLATE) / mktemp(TEMPLATE):
+   ctx==1 (list): mkstemp returns (fh, name); others (name). ctx==0: the
+   fh for mkstemp, the name for the rest. */
+PerlValue *perl_file_temp_template(PerlArray *args, int kind, int ctx) {
+    if (args->len < 1) return perl_alloc_undef();
+    char *tpl = perl_to_string_dup(args->elems[0]);
+    if (!tpl) return perl_alloc_undef();
+    char filled[4096];
+    snprintf(filled, sizeof(filled), "%s", tpl);
+    free(tpl);
+    ftemp_fill(filled);
+
+    if (kind == 0) { /* mkstemp */
+        for (int attempt = 0; attempt < 256; attempt++) {
+            int fd = open(filled, O_CREAT | O_EXCL | O_RDWR, 0600);
+            if (fd >= 0) {
+                FILE *fp = fdopen(fd, "rb+");
+                if (!fp) { close(fd); unlink(filled); return perl_alloc_undef(); }
+                PerlValue *fh = perl_alloc_undef();
+                fh->tag = PERL_FILEHANDLE;
+                fh->pval = fp;
+                PerlValue *namepv = perl_alloc_string(filled);
+                if (ctx == 1) {
+                    PerlArray *out = perl_array_new();
+                    perl_array_push(out, fh);
+                    perl_array_push(out, namepv);
+                    /* raw PerlArray* — the emitArrayPtr convention (RT
+                       ret=av); the list assignment replaces the LHS
+                       storage with it */
+                    return (PerlValue *)out;
+                }
+                /* scalar ctx: real mkstemp returns the GLOB (fh) */
+                return fh;
+            }
+            if (errno != EEXIST) return perl_alloc_undef();
+            ftemp_fill(filled);
+        }
+        return perl_alloc_undef();
+    }
+    if (kind == 1) { /* mkdtemp */
+        for (int attempt = 0; attempt < 256; attempt++) {
+            if (mkdir(filled, 0700) == 0) return perl_alloc_string(filled);
+            if (errno != EEXIST) return perl_alloc_undef();
+            ftemp_fill(filled);
+        }
+        return perl_alloc_undef();
+    }
+    /* mktemp: name only, nothing created */
+    return perl_alloc_string(filled);
+}
+
+/* tempdir / tempfile: flat key/value opts. ctx decides list vs scalar
+   for tempfile; tempdir is always scalar. */
+PerlValue *perl_file_temp(PerlArray *args, int is_tempfile, int ctx) {
+    /* template as the bare positional first arg (tempdir "/tmp/xxx") */
+    PerlValue *opt_dir   = ftemp_opt(args, "DIR");
+    PerlValue *opt_tmpl  = ftemp_opt(args, "TEMPLATE");
+    PerlValue *opt_suf   = ftemp_opt(args, "SUFFIX");
+    char base[4096];
+    if (is_tempfile) {
+        if (opt_dir) {
+            char *d = perl_to_string_dup(opt_dir);
+            if (!d) return perl_alloc_undef();
+            snprintf(base, sizeof(base), "%s/", d);
+            free(d);
+        } else {
+            snprintf(base, sizeof(base), "/tmp/");
+        }
+        char rnd[16];
+        ftemp_rand(rnd, 10);
+        size_t bl = strlen(base);
+        snprintf(base + bl, sizeof(base) - bl, "%s", rnd);
+        if (opt_suf) {
+            char *suf = perl_to_string_dup(opt_suf);
+            if (suf) {
+                bl = strlen(base);
+                snprintf(base + bl, sizeof(base) - bl, "%s", suf);
+                free(suf);
+            }
+        }
+        (void)opt_tmpl;
+    } else {
+        /* tempdir: TEMPLATE opt, bare template arg, or no args →
+           /tmp/ + 10 random chars */
+        if (opt_dir) {
+            char *d = perl_to_string_dup(opt_dir);
+            if (!d) return perl_alloc_undef();
+            snprintf(base, sizeof(base), "%s/", d);
+            free(d);
+            char rnd[16];
+            ftemp_rand(rnd, 10);
+            size_t bl = strlen(base);
+            snprintf(base + bl, sizeof(base) - bl, "%s", rnd);
+        } else if (opt_tmpl) {
+            char *t = perl_to_string_dup(opt_tmpl);
+            if (!t) return perl_alloc_undef();
+            snprintf(base, sizeof(base), "%s", t);
+            free(t);
+            ftemp_fill(base);
+        } else if (args->len >= 1) {
+            char *t = perl_to_string_dup(args->elems[0]);
+            if (!t) return perl_alloc_undef();
+            snprintf(base, sizeof(base), "%s", t);
+            free(t);
+            ftemp_fill(base);
+        } else {
+            snprintf(base, sizeof(base), "/tmp/");
+            char rnd[16];
+            ftemp_rand(rnd, 10);
+            size_t bl = strlen(base);
+            snprintf(base + bl, sizeof(base) - bl, "%s", rnd);
+        }
+        for (int attempt = 0; attempt < 256; attempt++) {
+            if (mkdir(base, 0700) == 0) return perl_alloc_string(base);
+            if (errno != EEXIST) return perl_alloc_undef();
+            if (opt_tmpl || (!opt_dir && args->len >= 1)) ftemp_fill(base);
+            else {
+                char rnd[16];
+                ftemp_rand(rnd, 10);
+                char *slash = strrchr(base, '/');
+                if (slash) snprintf(slash + 1, 16, "%s", rnd);
+            }
+        }
+        return perl_alloc_undef();
+    }
+
+    /* tempfile: create + open the file */
+    for (int attempt = 0; attempt < 256; attempt++) {
+        int fd = open(base, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd >= 0) {
+            FILE *fp = fdopen(fd, "rb+");
+            if (!fp) { close(fd); unlink(base); return perl_alloc_undef(); }
+            PerlValue *fh = perl_alloc_undef();
+            fh->tag = PERL_FILEHANDLE;
+            fh->pval = fp;
+            PerlValue *namepv = perl_alloc_string(base);
+            if (ctx == 1) {
+                PerlArray *out = perl_array_new();
+                perl_array_push(out, fh);
+                perl_array_push(out, namepv);
+                /* raw PerlArray* — the emitArrayPtr convention (RT
+                   ret=av); the list assignment replaces the LHS
+                   storage with it */
+                return (PerlValue *)out;
+            }
+            return fh; /* scalar ctx: the fh (real tempfile returns GLOB) */
+        }
+        if (errno != EEXIST) return perl_alloc_undef();
+        /* name taken — regenerate */
+        if (opt_dir) {
+            size_t bl = strlen(base);
+            char *slash = strrchr(base, '/');
+            (void)bl;
+            if (slash) {
+                char rnd[16];
+                ftemp_rand(rnd, 10);
+                snprintf(slash + 1, 16, "%s", rnd);
+            }
+        } else {
+            char *slash = strrchr(base, '/');
+            if (slash) {
+                char rnd[16];
+                ftemp_rand(rnd, 10);
+                snprintf(slash + 1, 16, "%s", rnd);
+            }
+        }
+        if (opt_suf) {
+            char *suf = perl_to_string_dup(opt_suf);
+            if (suf) {
+                strcat(base, suf);
+                free(suf);
+            }
+        }
+    }
+    return perl_alloc_undef();
+}
+
+/* POSIX tmpnam equivalent: /tmp/ + 10 random chars (name only) */
+PerlValue *perl_file_temp_tmpnam(void) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "/tmp/");
+    char rnd[16];
+    ftemp_rand(rnd, 10);
+    strncat(buf, rnd, 15);
+    return perl_alloc_string(buf);
+}
+
+/* ---- File::Find ---- */
+
+/* write a $File::Find::* global through the same PerlGlob registry the
+   qualified-var read path (D110) uses — the read resolves via
+   perl_glob_get_scalar(name) → g->scalar, so the cell must live there. */
+static void ff_set_global(const char *key, PerlValue *v) {
+    PerlGlob *g = glob_get_or_create(key);
+    if (!g->scalar) g->scalar = perl_alloc_undef();
+    perl_assign(g->scalar, v);
+}
+
+/* one traversal: preorder when depth_first==0 (find), postorder ==1
+   (finddepth). no_chdir: $_ is the full path (real File::Find), else
+   the basename. The wanted sub reads $_ (global cell — the sub's
+   lexical shadow seeds from it at entry, W29 machinery),
+   $File::Find::name / ::dir / ::fullname via the D110 qualified-global
+   registry, and sets $File::Find::prune to stop descending. */
+/* emulate real File::Find's chdir-per-directory CWD contract: when the
+   wanted sub runs for an entry, the process CWD is the containing dir
+   (the root dir's own CWD is the root itself, hence $_ = "." there).
+   Returns the previous CWD string the caller must chdir back to. */
+static void ff_set_under(PerlValue *wanted, const char *path,
+                         const char *base, int no_chdir) {
+    PerlValue *under = perl_get_dollar_under();
+    perl_assign(under, perl_alloc_string(no_chdir ? path : base));
+    (void)wanted;
+}
+
+static void ff_walk(PerlValue *wanted, const char *path,
+                    const char *parentdir, int depth_first, int no_chdir,
+                    int is_root) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    ff_set_global("File::Find::name", perl_alloc_string(path));
+    ff_set_global("File::Find::dir",  perl_alloc_string(parentdir));
+    ff_set_global("File::Find::fullname", perl_alloc_string(path));
+
+    struct stat st;
+    int isdir = (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+
+    /* chdir into this dir if it's one (root or any dir we're about to
+       enumerate); children of it run with CWD == path, matching real
+       File::Find. The callback for a plain FILE runs with the CWD of
+       its containing dir (already set by the parent's chdir). */
+    char *prevCwd = NULL;
+    if (is_root && isdir && !no_chdir) {
+        /* Only the traversal ROOT is chdir'd into before its own
+           callback (real File::Find chdir's there to start, so the
+           root's $_ is "."). Non-root dir entries keep the parent's
+           CWD during their callback (real behavior), and are chdir'd
+           into only implicitly by the recursion below. */
+        char cwdbuf[4096];
+        if (getcwd(cwdbuf, sizeof(cwdbuf))) prevCwd = strdup(cwdbuf);
+        if (chdir(path) != 0) { free(prevCwd); prevCwd = NULL; }
+        base = ".";
+    }
+    PerlValue *under = perl_get_dollar_under();
+    perl_assign(under, perl_alloc_string(no_chdir ? path : base));
+
+    if (!depth_first || !isdir) {
+        PerlValue *r = perl_call_code_ref(wanted, perl_array_new());
+        if (r) perl_free(r);
+    }
+
+    /* prune check AFTER the callback (real File::Find reads the flag
+       the wanted sub just set) */
+    PerlGlob *pg = glob_get_or_create("File::Find::prune");
+    if (!pg->scalar) pg->scalar = perl_alloc_undef();
+    int pruned = pg->scalar && perl_is_true(pg->scalar);
+    if (pg->scalar) perl_assign(pg->scalar, perl_alloc_int(0));
+
+    if (!pruned && isdir) {
+        /* chdir into this dir to enumerate it (children callbacks run
+           with CWD = this dir, matching real File::Find); restore after. */
+        char *enumCwd = NULL;
+        if (!no_chdir && !is_root) {
+            char cwdbuf[4096];
+            if (getcwd(cwdbuf, sizeof(cwdbuf))) enumCwd = strdup(cwdbuf);
+            if (chdir(path) != 0) { free(enumCwd); enumCwd = NULL; }
+        }
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (strcmp(ent->d_name, ".") == 0 ||
+                    strcmp(ent->d_name, "..") == 0)
+                    continue;
+                char *child = (char *)malloc(strlen(path) + 1 +
+                                             strlen(ent->d_name) + 1);
+                if (!child) continue;
+                sprintf(child, "%s/%s",
+                        (path[strlen(path)-1] == '/') ? "" : path,
+                        ent->d_name);
+                ff_walk(wanted, child, path, depth_first, no_chdir, 0);
+                free(child);
+            }
+            closedir(d);
+        }
+        if (enumCwd) {
+            chdir(enumCwd);
+            free(enumCwd);
+        }
+    }
+
+    if (depth_first && isdir && !pruned) {
+        /* re-point the globals at THIS dir — the last child's walk
+           overwrote them (finddepth visits the dir after its contents) */
+        ff_set_global("File::Find::name", perl_alloc_string(path));
+        ff_set_global("File::Find::dir",  perl_alloc_string(parentdir));
+        ff_set_global("File::Find::fullname", perl_alloc_string(path));
+        {
+            const char *b2 = strrchr(path, '/');
+            b2 = b2 ? b2 + 1 : path;
+            PerlValue *under = perl_get_dollar_under();
+            perl_assign(under, perl_alloc_string(no_chdir ? path : b2));
+        }
+        PerlValue *r = perl_call_code_ref(wanted, perl_array_new());
+        if (r) perl_free(r);
+    }
+
+    if (prevCwd) {
+        chdir(prevCwd);
+        free(prevCwd);
+    }
+}
+
+/* find(\&wanted, @dirs) / finddepth(\&wanted, @dirs) /
+   find({wanted=>..., no_chdir=>..., bydepth=>...}, @dirs).
+   Returns undef (real find returns nothing useful). */
+PerlValue *perl_file_find(PerlValue *wanted, PerlArray *dirs, int depth_first) {
+    if (!wanted) return perl_alloc_undef();
+    int no_chdir = 0;
+    if (wanted->tag == PERL_REF_HASH && wanted->pval) {
+        PerlHash *opts = (PerlHash *)wanted->pval;
+        PerlValue *w = perl_hash_get_str_ref(opts, "wanted");
+        if (!w || w->tag != PERL_CODE_REF) return perl_alloc_undef();
+        PerlValue *nc = perl_hash_get_str_ref(opts, "no_chdir");
+        no_chdir = nc && perl_is_true(nc);
+        PerlValue *bd = perl_hash_get_str_ref(opts, "bydepth");
+        if (bd && perl_is_true(bd)) depth_first = 1;
+        wanted = w;
+    }
+    if (wanted->tag != PERL_CODE_REF)
+        return perl_alloc_undef();
+    for (long long i = 0; i < dirs->len; i++) {
+        char *d = perl_to_string_dup(dirs->elems[i]);
+        if (!d) continue;
+        ff_walk(wanted, d, d, depth_first, no_chdir, 1);
+        free(d);
+    }
+    return perl_alloc_undef();
+}
+
+/* ---- File::Path ---- */
+
+/* ctx==1 → the raw PerlArray* (emitArrayPtr consumers expect a bare
+   PerlArray*, same convention as uniq's RT(av) — list assignment
+   replaces the LHS storage with it); ctx==0/2 → count PV (real
+   make_path's scalar context is the number of created dirs;
+   remove_tree's is the total count of removed entries). */
+static PerlValue *fpath_list_or_count(PerlArray *av, long long total,
+                                      int ctx) {
+    if (ctx == 1) return (PerlValue *)av;
+    perl_array_free(av);
+    return perl_alloc_int(total);
+}
+
+static PerlHash *s_fpath_opts = NULL;   /* new-style {opts} hash */
+static int       s_fpath_verbose = 0;   /* old-style verbose flag */
+
+static void fpath_verbose(const char *fmt, const char *arg) {
+    if (s_fpath_verbose) {
+        printf(fmt, arg);
+        fflush(stdout);
+        return;
+    }
+    if (!s_fpath_opts) return;
+    PerlValue *v = perl_hash_get_str_ref(s_fpath_opts, "verbose");
+    if (!v || v->tag == PERL_UNDEF) return;
+    if (!perl_is_true(v)) return;
+    printf(fmt, arg);
+    fflush(stdout);
+}
+
+/* collect DIRS args: an arrayref pv spreads into per-dir strings; a
+   string pv is one dir. Old-style mkpath([$a, $b], 1) relies on this. */
+void perl_fpath_collect(PerlArray *dirs, PerlValue *pv) {
+    if (!pv) return;
+    if (pv->tag == PERL_REF_ARRAY && pv->pval) {
+        PerlArray *av = (PerlArray *)pv->pval;
+        for (long long i = 0; i < av->len; i++)
+            perl_array_push(dirs, perl_clone(av->elems[i]));
+        return;
+    }
+    if (pv->tag == PERL_LIST_RESULT && pv->pval) {
+        PerlArray *av = (PerlArray *)pv->pval;
+        for (long long i = 0; i < av->len; i++)
+            perl_array_push(dirs, perl_clone(av->elems[i]));
+        return;
+    }
+    perl_array_push(dirs, perl_clone(pv));
+}
+
+/* make_path/mkpath core: mkdir each missing component; verbose prints
+   "mkdir <path>\n" per component (real File::Path). Returns the array
+   of created component paths in creation order. */
+static void fpath_make_one(PerlArray *created, const char *dir) {
+    char *tmp = strdup(dir);
+    if (!tmp) return;
+    size_t len = strlen(tmp);
+    while (len > 1 && tmp[len-1] == '/') tmp[--len] = '\0';
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            struct stat st;
+            if (stat(tmp, &st) != 0) {
+                mode_t mode = 0777;
+                PerlValue *mv = s_fpath_opts
+                    ? perl_hash_get_str_ref(s_fpath_opts, "mode") : NULL;
+                if (mv && mv->tag != PERL_UNDEF) mode = (mode_t)perl_to_int(mv);
+                if (mkdir(tmp, mode) == 0) {
+                    fpath_verbose("mkdir %s\n", tmp);
+                    perl_array_push(created, perl_alloc_string(tmp));
+                }
+                errno = 0;
+            }
+            *p = '/';
+        }
+    }
+    struct stat st;
+    if (stat(tmp, &st) != 0) {
+        mode_t mode = 0777;
+        PerlValue *mv = s_fpath_opts
+                    ? perl_hash_get_str_ref(s_fpath_opts, "mode") : NULL;
+        if (mv && mv->tag != PERL_UNDEF) mode = (mode_t)perl_to_int(mv);
+        if (mkdir(tmp, mode) == 0) {
+            fpath_verbose("mkdir %s\n", tmp);
+            perl_array_push(created, perl_alloc_string(tmp));
+        }
+        errno = 0;
+    }
+    free(tmp);
+}
+
+/* returns PerlValue*: PERL_LIST_RESULT-tagged array of created paths (list
+   ctx) — codegen wraps scalar context by taking the count */
+PerlValue *perl_make_path(PerlArray *dirs, PerlValue *opts_pv, int ctx) {
+    PerlArray *created = perl_array_new();
+    s_fpath_opts = NULL; s_fpath_verbose = 0;
+    /* compile-time can't tell (dir, {opts}) from (dir, dir): the trailing
+       arg is opts only if it's a hashref (new style) or an int (old-style
+       verbose/mode) — otherwise everything is a dir. */
+    if (dirs->len >= 1) {
+        PerlValue *last = dirs->elems[dirs->len - 1];
+        if (last->tag == PERL_REF_HASH && last->pval) {
+            s_fpath_opts = (PerlHash *)last->pval;
+            perl_array_pop(dirs);
+        } else if (last->tag == PERL_INT) {
+            /* old-style mkpath(dirs..., VERBOSE[, MODE]) — the verbose
+               flag is an int; an additional trailing int is the mode */
+            s_fpath_verbose = perl_to_int(last) != 0;
+            perl_array_pop(dirs);
+            if (dirs->len >= 1 && dirs->elems[dirs->len - 1]->tag == PERL_INT)
+                perl_array_pop(dirs); /* MODE — default 0777&~umask is fine */
+        }
+    }
+    for (long long i = 0; i < dirs->len; i++) {
+        char *d = perl_to_string_dup(dirs->elems[i]);
+        if (d) { fpath_make_one(created, d); free(d); }
+    }
+    s_fpath_opts = NULL; s_fpath_verbose = 0;
+    long long cnt = created->len;
+    return fpath_list_or_count(created, cnt, ctx);
+}
+
+/* recursively remove a directory tree; returns count of removed entries
+   (files + dirs). verbose prints "unlink <path>\n" / "rmdir <name>\n"
+   exactly like real File::Path (basename for non-root dirs, full path
+   for files and the root). */
+static long long fpath_remove_one(const char *dir, int is_root) {
+    long long count = 0;
+    DIR *d = opendir(dir);
+    if (!d) {
+        errno = 0;
+        return 0;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        char *full = (char *)malloc(strlen(dir) + 1 + strlen(ent->d_name) + 1);
+        if (!full) continue;
+        sprintf(full, "%s/%s", (dir[strlen(dir)-1] == '/') ? "" : dir,
+                ent->d_name);
+        struct stat st;
+        if (lstat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            count += fpath_remove_one(full, 0);
+        } else {
+            if (unlink(full) == 0) {
+                fpath_verbose("unlink %s\n", full);
+                count++;
+            }
+            errno = 0;
+        }
+        free(full);
+    }
+    closedir(d);
+    if (rmdir(dir) == 0) {
+        if (is_root) fpath_verbose("rmdir %s\n", dir);
+        else {
+            const char *base = strrchr(dir, '/');
+            base = base ? base + 1 : dir;
+            fpath_verbose("rmdir %s\n", base);
+        }
+        count++;
+    }
+    errno = 0;
+    return count;
+}
+
+PerlValue *perl_remove_tree(PerlArray *dirs, PerlValue *opts_pv, int ctx) {
+    PerlArray *counts = perl_array_new();
+    s_fpath_opts = NULL; s_fpath_verbose = 0;
+    if (opts_pv && opts_pv->tag == PERL_REF_HASH && opts_pv->pval)
+        s_fpath_opts = (PerlHash *)opts_pv->pval;
+    else if (opts_pv && opts_pv->tag != PERL_UNDEF)
+        s_fpath_verbose = perl_to_int(opts_pv) != 0;
+    /* trailing hashref in the dirs list = new-style opts */
+    if (dirs->len >= 1) {
+        PerlValue *last = dirs->elems[dirs->len - 1];
+        if (last->tag == PERL_REF_HASH && last->pval) {
+            s_fpath_opts = (PerlHash *)last->pval;
+            perl_array_pop(dirs);
+        }
+    }
+    long long total = 0;
+    for (long long i = 0; i < dirs->len; i++) {
+        char *d = perl_to_string_dup(dirs->elems[i]);
+        if (!d) continue;
+        long long n = fpath_remove_one(d, 1);
+        total += n;
+        free(d);
+    }
+    /* real File::Path::remove_tree returns ONE total count in BOTH
+       contexts (list ctx = (TOTAL), scalar ctx = TOTAL) — probed. */
+    perl_array_push(counts, perl_alloc_int(total));
+    s_fpath_opts = NULL; s_fpath_verbose = 0;
+    return fpath_list_or_count(counts, total, ctx);
+}
+
 PerlValue *perl_rmdir_op(PerlValue *path) {
     char *p = perl_to_string_dup(path);
     int r = rmdir(p); free(p);
@@ -8178,6 +9306,219 @@ static int pv_as_fd(PerlValue *pv) {
     return fp ? fileno(fp) : -1;
 }
 
+/* ---- File::Copy ---- */
+
+/* Stream copy from `src` FILE* to `dst` FILE* using raw fd I/O (matches
+   real File::Copy's syscopy-style buffered loop; 64 KiB chunks). Both
+   must be open; returns 0 on any failure (errno preserved), 1 on
+   success, like real copy(). */
+static long long fcopy_stream(FILE *src, FILE *dst) {
+    if (!src || !dst) { return 0; }
+    int sfd = fileno(src), dfd = fileno(dst);
+    char buf[65536];
+    for (;;) {
+        ssize_t got = read(sfd, buf, sizeof(buf));
+        if (got < 0) return 0;
+        if (got == 0) break;
+        ssize_t off = 0;
+        while (off < got) {
+            ssize_t put = write(dfd, buf + off, (size_t)(got - off));
+            if (put < 0) return 0;
+            off += put;
+        }
+    }
+    return 1;
+}
+
+/* open a path read-only ("rb") — errno untouched on failure so $!
+   reports the real cause. */
+static FILE *fcopy_open_read(const char *path) {
+    return fopen(path, "rb");
+}
+
+/* File::Copy::copy(FROM, TO[, BUFFSIZE]) — FROM/TO may each be a path
+   string or a filehandle. Stream copy TO an existing write-handle;
+   open/fclose when TO (or FROM) is a path. Returns 1 / 0 (errno set,
+   matching real File::Copy's `return 0` + `$!` on failure). */
+static char *fcopy_display_name(PerlValue *namepv, const char *path) {
+    if (namepv) return perl_to_string_dup(namepv);
+    return path ? strdup(path) : NULL;
+}
+
+static void fcopy_carped_warn(const char *msg) {
+    /* carp-style: message + " at FILE line N." from the pushed call frame */
+    const char *file = NULL; int line = 0;
+    perl_current_call_frame(&file, &line);
+    PerlValue *pv = perl_alloc_string(msg);
+    perl_warn(pv, file ? file : "-", line);
+    perl_free(pv);
+}
+
+/* real File::Copy::_eq + the stat-based identity check: same string, or
+   same dev+ino (and not a pipe) → "'A' and 'A' are identical (not
+   copied)" warning and a 0 return with the target untouched. */
+static int fcopy_identical(PerlValue *from, PerlValue *to,
+                           const char *fp, const char *tp) {
+    if (fp && tp && strcmp(fp, tp) == 0) return 1;
+    if (fp && tp) {
+        struct stat fs, ts;
+        if (stat(fp, &fs) == 0 && stat(tp, &ts) == 0 &&
+            fs.st_dev == ts.st_dev && fs.st_ino == ts.st_ino &&
+            !S_ISFIFO(fs.st_mode)) return 1;
+    }
+    (void)from; (void)to;
+    return 0;
+}
+
+PerlValue *perl_fcopy(PerlValue *from, PerlValue *to, PerlValue *bufsize,
+                      PerlValue *fromname, PerlValue *toname) {
+    (void)bufsize; /* chunk size is fixed here; real perl uses it only as a hint */
+    errno = 0;
+    if (!from || !to) return perl_alloc_int(0);
+    /* identity checks BEFORE any truncation (real File::Copy does this
+       first — a self-copy must warn and leave the target intact) */
+    if (!pv_as_fp(from) && !pv_as_fp(to)) {
+        char *fp = perl_to_string_dup(from);
+        char *tp = perl_to_string_dup(to);
+        if (!fp || !tp) { free(fp); free(tp); errno = ENOENT; return perl_alloc_int(0); }
+        if (fcopy_identical(from, to, fp, tp)) {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "'%s' and '%s' are identical (not copied)", fp, tp);
+            fcopy_carped_warn(msg);
+            free(fp); free(tp);
+            return perl_alloc_int(0);
+        }
+        /* copy() into an existing directory appends basename(FROM)
+           (real File::Copy's _catname; move() does the same) */
+        struct stat tst;
+        if (stat(tp, &tst) == 0 && S_ISDIR(tst.st_mode)) {
+            const char *base = strrchr(fp, '/');
+            base = base ? base + 1 : fp;
+            size_t tl = strlen(tp);
+            char *joined = (char *)malloc(tl + 1 + strlen(base) + 1);
+            if (!joined) { free(fp); free(tp); return perl_alloc_int(0); }
+            sprintf(joined, "%s/%s", (tp[tl-1] == '/') ? "" : tp, base);
+            free(tp);
+            tp = joined;
+        }
+        FILE *src = fcopy_open_read(fp);
+        if (!src) { int e = errno; free(fp); free(tp); errno = e; return perl_alloc_int(0); }
+        FILE *dst = fopen(tp, "wb");
+        if (!dst) { int e = errno; fclose(src); free(fp); free(tp); errno = e; return perl_alloc_int(0); }
+        long long ok = fcopy_stream(src, dst);
+        int saved = errno;
+        fclose(src); fclose(dst);
+        errno = saved;
+        free(fp); free(tp);
+        return perl_alloc_int(ok ? 1 : 0);
+    }
+    FILE *src = pv_as_fp(from);
+    FILE *dst = pv_as_fp(to);
+    FILE *opened_src = NULL, *opened_dst = NULL;
+    if (!src) {
+        char *p = perl_to_string_dup(from);
+        if (!p) return perl_alloc_int(0);
+        src = opened_src = fcopy_open_read(p);
+        free(p);
+    }
+    if (src && !dst) {
+        char *p = perl_to_string_dup(to);
+        if (!p) { if (opened_src) fclose(opened_src); return perl_alloc_int(0); }
+        dst = opened_dst = fopen(p, "wb");
+        free(p);
+    }
+    if (!src || !dst) {
+        if (opened_src) fclose(opened_src);
+        if (opened_dst) fclose(opened_dst);
+        if (!errno) errno = ENOENT;
+        return perl_alloc_int(0);
+    }
+    /* handle-involved stat identity check: stat/fstat on both sides —
+       real File::Copy's stat($from)/stat($to) also sees through handles
+       (e.g. copy(*A, *B) with both opened on the same file) */
+    {
+        struct stat fs, ts;
+        int havef = (fstat(fileno(src), &fs) == 0);
+        int havet = (fstat(fileno(dst), &ts) == 0);
+        if (havef && havet && fs.st_dev == ts.st_dev &&
+            fs.st_ino == ts.st_ino && !S_ISFIFO(fs.st_mode)) {
+            char *fn = fcopy_display_name(fromname,
+                          pv_as_fp(from) ? NULL : perl_to_string_dup(from));
+            char *tn = fcopy_display_name(toname,
+                          pv_as_fp(to)   ? NULL : perl_to_string_dup(to));
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "'%s' and '%s' are identical (not copied)",
+                     fn ? fn : "*", tn ? tn : "*");
+            fcopy_carped_warn(msg);
+            free(fn); free(tn);
+            if (opened_src) fclose(opened_src);
+            if (opened_dst) fclose(opened_dst);
+            return perl_alloc_int(0);
+        }
+    }
+    long long ok = fcopy_stream(src, dst);
+    int saved = errno;
+    if (opened_src) fclose(opened_src);
+    if (opened_dst) fclose(opened_dst);
+    errno = saved;
+    return perl_alloc_int(ok ? 1 : 0);
+}
+
+/* syscopy is the same as copy on Unix (real File::Copy uses the same
+   buffered read/write loop for the unix flavor). */
+PerlValue *perl_fsyscopy(PerlValue *from, PerlValue *to, PerlValue *bufsize,
+                         PerlValue *fromname, PerlValue *toname) {
+    return perl_fcopy(from, to, bufsize, fromname, toname);
+}
+
+/* File::Copy::move(FROM, TO) — rename(2) first; on failure, fall back to
+   copy + unlink (real File::Copy). If TO is an existing directory, the
+   basename of FROM is appended (real move() semantics — copy() does NOT
+   do this). Returns 1 / 0. */
+PerlValue *perl_fmove(PerlValue *from, PerlValue *to,
+                      PerlValue *fromname, PerlValue *toname) {
+    (void)fromname; (void)toname; /* move's rename path never warns */
+    errno = 0;
+    if (!from || !to) return perl_alloc_int(0);
+    char *src = perl_to_string_dup(from);
+    char *dst = perl_to_string_dup(to);
+    if (!src || !dst) { free(src); free(dst); return perl_alloc_int(0); }
+    /* TO is an existing directory? append basename(FROM). */
+    struct stat st;
+    if (stat(dst, &st) == 0 && S_ISDIR(st.st_mode)) {
+        const char *base = strrchr(src, '/');
+        base = base ? base + 1 : src;
+        size_t dl = strlen(dst);
+        char *joined = (char *)malloc(dl + 1 + strlen(base) + 1);
+        if (!joined) { free(src); free(dst); return perl_alloc_int(0); }
+        sprintf(joined, "%s/%s", (dst[dl-1] == '/') ? "" : dst, base);
+        free(dst);
+        dst = joined;
+    }
+    if (rename(src, dst) == 0) { free(src); free(dst); return perl_alloc_int(1); }
+    /* fall back: copy + unlink (real File::Copy's move does this when
+       rename can't, e.g. cross-device) */
+    FILE *in = fcopy_open_read(src);
+    if (!in) { int e = errno; free(src); free(dst); errno = e; return perl_alloc_int(0); }
+    FILE *out = fopen(dst, "wb");
+    if (!out) { int e = errno; fclose(in); free(src); free(dst); errno = e; return perl_alloc_int(0); }
+    long long ok = fcopy_stream(in, out);
+    int saved = errno;
+    fclose(in); fclose(out);
+    errno = saved;
+    if (!ok) { free(src); free(dst); return perl_alloc_int(0); }
+    if (unlink(src) != 0) {
+        /* real File::Copy still reports the move as failed if the
+           unlink of the source fails */
+        free(src); free(dst);
+        return perl_alloc_int(0);
+    }
+    free(src); free(dst);
+    return perl_alloc_int(1);
+}
+
 static PerlValue *perl_bool_sys(int ok) {
     return ok ? perl_alloc_int(1) : perl_alloc_undef();
 }
@@ -9003,17 +10344,19 @@ PerlValue *perl_filetest(int op, PerlValue *path_pv) {
     struct stat st;
     PerlValue *result;
     switch (op) {
-        case 'e': result = perl_alloc_int(access(path, F_OK) == 0); break;
-        case 'f': result = perl_alloc_int(stat(path, &st) == 0 && S_ISREG(st.st_mode)); break;
-        case 'd': result = perl_alloc_int(stat(path, &st) == 0 && S_ISDIR(st.st_mode)); break;
-        case 'r': result = perl_alloc_int(access(path, R_OK) == 0); break;
-        case 'w': result = perl_alloc_int(access(path, W_OK) == 0); break;
-        case 'x': result = perl_alloc_int(access(path, X_OK) == 0); break;
-        case 'z': result = perl_alloc_int(stat(path, &st) == 0 && st.st_size == 0); break;
+        /* real Perl: boolean filetests stringify as 1 / "" (false-bool),
+           not 1 / 0 */
+        case 'e': result = perl_alloc_bool(access(path, F_OK) == 0); break;
+        case 'f': result = perl_alloc_bool(stat(path, &st) == 0 && S_ISREG(st.st_mode)); break;
+        case 'd': result = perl_alloc_bool(stat(path, &st) == 0 && S_ISDIR(st.st_mode)); break;
+        case 'r': result = perl_alloc_bool(access(path, R_OK) == 0); break;
+        case 'w': result = perl_alloc_bool(access(path, W_OK) == 0); break;
+        case 'x': result = perl_alloc_bool(access(path, X_OK) == 0); break;
+        case 'z': result = perl_alloc_bool(stat(path, &st) == 0 && st.st_size == 0); break;
         case 's': result = (stat(path, &st) == 0) ? perl_alloc_int(st.st_size) : perl_alloc_undef(); break;
-        case 'l': result = perl_alloc_int(lstat(path, &st) == 0 && S_ISLNK(st.st_mode)); break;
-        case 'p': result = perl_alloc_int(stat(path, &st) == 0 && S_ISFIFO(st.st_mode)); break;
-        default:  result = perl_alloc_int(0); break;
+        case 'l': result = perl_alloc_bool(lstat(path, &st) == 0 && S_ISLNK(st.st_mode)); break;
+        case 'p': result = perl_alloc_bool(stat(path, &st) == 0 && S_ISFIFO(st.st_mode)); break;
+        default:  result = perl_alloc_bool(0); break;
     }
     free(path);
     return result;

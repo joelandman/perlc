@@ -18,9 +18,21 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-16, re-verified after parser-gaps + in-mem-fh +
-or-next — 372/372 PASS,
-0 FAIL; `make test` 47/47):** New this session:
+**Harness (2026-09-19, re-verified after Tier-1 file/data modules +
+D138 — 384/384 PASS,
+0 FAIL; `make test` 47/47):** New this session: `File::Copy`
+(`copy`/`move`), `File::Find` (`find`), `File::Path`
+(`make_path`/`remove_tree`), `File::Temp`
+(`tempfile`/`tempdir`/`mkstemp`/`mkdtemp`/`mktemp`/`tmpnam`),
+`Storable::dclone`, and `Text::Wrap` (`wrap`/`fill`) as native modules
+— `tests/file_copy_{smoke,deep}.pl`, `tests/file_find_{smoke,deep}.pl`,
+`tests/file_path_{smoke,deep}.pl`, `tests/file_temp_{smoke,deep}.pl`,
+`tests/storable_dclone_{smoke,deep}.pl`,
+`tests/text_wrap_{smoke,deep}.pl`. Also found and fixed **D138** (see
+below) while running the full harness against this new work, plus a
+test-authoring bug in `file_temp_{smoke,deep}.pl`'s own regexes (too
+narrow an alphabet for `File::Temp`'s real random suffix — see
+TESTS.md). Previous session (2026-09-16):
 `d113_undefined_sub_die_{smoke,deep}.pl`,
 `d111_hash_flatten_{smoke,deep}.pl`,
 `d112_module_scope_{smoke,deep}.pl` (+ `tests/lib/D112Leaky.pm`),
@@ -76,8 +88,24 @@ D116, D117, D118, D119, D127, D129, D102, D115, D130, D131, D101,
 D103, D104, D106, D108, D125, D126, D132, D133, and D134 are now fixed
 (D115/D102/D129/D127/D119/D118/D117/D116/D121/D122/D113/D111/D112/
 D114/D109 detailed just below; D99/D105/D100/D107 write-ups follow;
-D130/D131/D101/D103/D104/D106/D108/D125/D126/D132/D133/D134 write-ups
+D130/D131/D101/D103/D104/D106/D108/D125/D126/D132/D133/D134/D138 write-ups
 are in TESTS.md):**
+- D138 (2026-09-19): `\&name == \&name` / `__SUB__ == \&name` (CODE-ref
+  identity via `==`) was unreliable — `perl_num_eq`/`perl_num_ne`
+  (`src/runtime.c`) compared the address of the freshly-`malloc`'d
+  `PerlClosure` wrapper each `\&name`/`__SUB__` evaluation allocates,
+  not the wrapped sub itself, so two refs to the same sub were `==`
+  only when `malloc` happened to reuse a just-freed wrapper's address.
+  Pre-existing (confirmed via `git stash` bisection against the prior
+  commit), unmasked — not caused — by this session's new module work
+  shifting `runtime.c`'s heap allocation pattern. Fixed with a
+  `perl_ref_identity()` helper that unwraps `PERL_CODE_REF` to its
+  `PerlClosure->fn` pointer before comparing; every other ref tag is
+  unchanged. See TESTS.md for detail, including a companion
+  test-authoring bug found the same way (`file_temp_{smoke,deep}.pl`'s
+  own regexes assumed an alnum-only random alphabet; real `File::Temp`
+  includes `_`, so real Perl's own output legitimately failed the
+  test ~1 run in 7).
 - D125/D126/D132/D133/D134 (2026-09-12, two-agent parallel session):
   see TESTS.md for full write-ups. Summary: D125 is `use`/`no` pragmas
   now parsing inside any nested scope (the whole handling extracted
@@ -510,7 +538,8 @@ encoding; diamond `<>` / `<ARGV>` / `$ARGV`; `__DATA__`/`__END__` + `<DATA>`;
 with FETCH/STORE; file I/O, file tests, `stat`/`glob`; List::Util, POSIX
 floor/ceil/fmod/strftime, Scalar::Util, Carp, Time::HiRes, `pack`/`unpack`;
 Getopt::Long, Data::Dumper, File::Basename (2026-09-09 — see TESTS.md's
-"Real-world module survey");
+"Real-world module survey"); File::Copy, File::Find, File::Path,
+File::Temp, Storable::dclone, Text::Wrap (2026-09-19);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`
