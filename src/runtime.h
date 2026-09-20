@@ -384,6 +384,10 @@ PerlValue *perl_file_temp_template(PerlArray *args, int kind, int ctx);
 PerlValue *perl_file_temp(PerlArray *args, int is_tempfile, int ctx);
 PerlValue *perl_file_temp_tmpnam(void);
 PerlValue *perl_storable_dclone(PerlValue *pv);
+PerlValue *perl_json_encode(PerlValue *pv, long long canonical, long long pretty);
+PerlValue *perl_json_decode(PerlValue *json_str);
+PerlValue *perl_json_true(void);
+PerlValue *perl_json_false(void);
 PerlValue *perl_text_wrap(PerlValue *ip, PerlValue *xp, PerlArray *texts,
                           PerlValue *columns, PerlValue *sep, PerlValue *sep2,
                           PerlValue *huge, PerlValue *unexpand);

@@ -782,6 +782,10 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_file_temp",        av, av, i32, i32);
     RT("perl_file_temp_tmpnam", pv);
     RT("perl_storable_dclone",  pv, pv);
+    RT("perl_json_encode",      pv, pv, i64, i64);
+    RT("perl_json_decode",      pv, pv);
+    RT("perl_json_true",        pv);
+    RT("perl_json_false",       pv);
     RT("perl_text_wrap",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_text_fill",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_make_path",        av, av, pv, i32);
@@ -11739,6 +11743,28 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_storable_dclone",
                       {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef()});
     }
+    /* ── JSON::PP (Tier 2, native) ──
+       Functional encode_json/decode_json (real @EXPORT, so the bare
+       unqualified name always works — same looseness Storable::dclone's
+       comment above documents). Not canonical/pretty by default, matching
+       real encode_json's signature; the ->canonical/->pretty chain lives
+       in perl_dispatch_method (src/runtime.c) since it's genuinely
+       stateful OO, not a pure function. JSON::PP::true/false are the
+       bare constant forms (`use JSON::PP qw(true false)`). */
+    if (n.name == "JSON::PP::encode_json" || n.name == "JSON::encode_json" ||
+        n.name == "encode_json") {
+        auto *i64Ty = Type::getInt64Ty(ctx_);
+        return callRT("perl_json_encode",
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(),
+                       ConstantInt::get(i64Ty, 0), ConstantInt::get(i64Ty, 0)});
+    }
+    if (n.name == "JSON::PP::decode_json" || n.name == "JSON::decode_json" ||
+        n.name == "decode_json") {
+        return callRT("perl_json_decode",
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef()});
+    }
+    if (n.name == "JSON::PP::true" || n.name == "JSON::true") return callRT("perl_json_true", {});
+    if (n.name == "JSON::PP::false" || n.name == "JSON::false") return callRT("perl_json_false", {});
     /* ── Text::Wrap (Tier 1, native) ──
        wrap(IP, XP, @texts) / fill(IP, XP, @lines) with the live package
        vars $Text::Wrap::columns / $separator / $separator2 / $huge read

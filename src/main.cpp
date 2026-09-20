@@ -130,6 +130,8 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "constant",
         "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
+        "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
+        "Storable","JSON::PP","JSON",
     };
 
     std::set<std::string> modulesToInstall;
@@ -387,7 +389,7 @@ static std::vector<Token> inlineModules(
         "Cwd","Sys::Hostname","Time::Local",
         "File::Spec","File::Spec::Unix","File::Spec::Functions",
         "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
-        "Storable",
+        "Storable","JSON::PP","JSON",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -782,7 +784,8 @@ static std::vector<Token> inlineModules(
             modName == "Time::Local" || modName == "File::Spec::Functions" ||
             modName == "File::Copy" || modName == "File::Path" ||
             modName == "File::Find" || modName == "File::Temp" ||
-            modName == "Text::Wrap" || modName == "Storable") {
+            modName == "Text::Wrap" || modName == "Storable" ||
+            modName == "JSON::PP" || modName == "JSON") {
             /* File::Spec::Functions' real %EXPORT_TAGS defines
                ALL => [@EXPORT_OK, @EXPORT] — expand :ALL to that union.
                (Real File::Spec::Functions' %EXPORT_TAGS has only ALL.) */

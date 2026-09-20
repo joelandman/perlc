@@ -4669,6 +4669,18 @@ NodePtr Parser::parsePrimary() {
                                     !isdigit((unsigned char)c))
                                     { constQual = false; break; }
                         }
+                        /* JSON::PP::true / JSON::PP::false (and the
+                           JSON:: shorthand) — bareword constants, always
+                           calls regardless of import, same reasoning as
+                           the Fcntl/POSIX/Errno constants above (they're
+                           the entire point of a name like `active =>
+                           JSON::PP::true,`; auto-quoting them as the
+                           literal string "JSON::PP::true" is silently
+                           wrong, not a parse error, so this needs the
+                           same always-a-call treatment). */
+                        if ((pkg == "JSON::PP" || pkg == "JSON") &&
+                            (bare == "true" || bare == "false"))
+                            constQual = true;
                     }
                     if (constQual) {
                         auto n = std::make_unique<Node>(); n->kind = NK::Call;

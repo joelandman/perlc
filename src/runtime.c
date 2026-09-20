@@ -5643,6 +5643,49 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
         }
     }
 
+    /* JSON::PP OO surface: JSON::PP->new (class method) and the
+       canonical/pretty/utf8/encode/decode chain (instance methods) on
+       the blessed hashref it returns. Other setters real JSON::PP has
+       (ascii/allow_nonref/indent/space_before/space_after/...) are
+       accepted and chain but are no-ops beyond canonical/pretty — see
+       TESTS.md's JSON::PP scoping write-up. */
+    if (obj && obj->tag == PERL_STRING && obj->sval &&
+        (strcmp(obj->sval, "JSON::PP") == 0 || strcmp(obj->sval, "JSON") == 0)) {
+        if (strcmp(method, "new") == 0) {
+            PerlHash *h = perl_anon_hash_new();
+            perl_hash_set_str(h, "canonical", perl_alloc_int(0));
+            perl_hash_set_str(h, "pretty", perl_alloc_int(0));
+            PerlValue *r = perl_ref_hash(h);
+            r->blessed_class = strdup("JSON::PP");
+            return r;
+        }
+    }
+    if (obj && obj->tag == PERL_REF_HASH && obj->blessed_class &&
+        strcmp(obj->blessed_class, "JSON::PP") == 0) {
+        PerlHash *h = (PerlHash *)obj->pval;
+        if (strcmp(method, "encode") == 0) {
+            PerlValue *cf = perl_hash_get_str_ref(h, "canonical");
+            PerlValue *pf = perl_hash_get_str_ref(h, "pretty");
+            PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+            return perl_json_encode(arg0, cf ? perl_to_int(cf) : 0, pf ? perl_to_int(pf) : 0);
+        }
+        if (strcmp(method, "decode") == 0) {
+            PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+            return perl_json_decode(arg0);
+        }
+        if (strcmp(method, "canonical") == 0 || strcmp(method, "pretty") == 0 ||
+            strcmp(method, "indent") == 0) {
+            long long v = (!args || args->len == 0) ? 1 : (perl_to_int(args->elems[0]) ? 1 : 0);
+            perl_hash_set_str(h, strcmp(method, "indent") == 0 ? "pretty" : method, perl_alloc_int(v));
+            return obj; /* chainable */
+        }
+        if (strcmp(method, "utf8") == 0 || strcmp(method, "ascii") == 0 ||
+            strcmp(method, "allow_nonref") == 0 || strcmp(method, "space_before") == 0 ||
+            strcmp(method, "space_after") == 0 || strcmp(method, "relaxed") == 0) {
+            return obj; /* accepted, no-op, chainable */
+        }
+    }
+
     const char *class_name = NULL;
     if (obj && obj->tag == PERL_STRING && obj->sval)
         class_name = obj->sval;
@@ -6409,6 +6452,392 @@ PerlValue *perl_storable_dclone(PerlValue *pv) {
     struct DCloneCtx ctx = { .n = 0 };
     int owned = 1;
     return storable_dclone_pv(&ctx, pv, &owned);
+}
+
+/* ---- JSON::PP ----
+   Native encode_json/decode_json + a minimal OO surface (new/canonical/
+   pretty/utf8/encode/decode) — see TESTS.md for the scoping write-up.
+   Deliberately NOT implemented: allow_nonref, relaxed, filter_json_object,
+   convert_blessed, indent/space_before/space_after fine-tuning beyond
+   "pretty" — see TESTS.md.
+
+   Booleans: JSON::PP::true/false are real objects (blessed scalar REFS)
+   in real Perl so that overloaded ""/0+/bool make them stringify/act
+   like 1/"" everywhere. This codebase's `use overload` support only
+   covers arithmetic/comparison operators (see perl_dispatch_overload's
+   call sites above) — there is no stringification-overload hook print()
+   goes through. Rather than build that machinery for one feature, we
+   reuse the SAME representation this project's own comparison operators
+   already use for "a Perl boolean" (perl_alloc_bool: IV 1 / empty PV, the
+   W1 convention) and just stamp blessed_class="JSON::PP::Boolean" on top
+   for ref()/blessed() introspection — every observable behavior (print,
+   numeric context, boolify, `if (...)`) is then correct by construction
+   with zero new overload plumbing, at the cost of `\(1==1) == \JSON::PP::true`
+   (referential identity) not holding — a divergence judged acceptable
+   for this project's sysadmin/CLI-script target. */
+
+static PerlValue *json_bool(int truthy) {
+    PerlValue *v = perl_alloc_bool(truthy);
+    v->blessed_class = strdup("JSON::PP::Boolean");
+    return v;
+}
+
+PerlValue *perl_json_true(void)  { return json_bool(1); }
+PerlValue *perl_json_false(void) { return json_bool(0); }
+
+typedef struct {
+    char  *buf;
+    size_t cap, pos;
+    int    canonical;
+    int    pretty;
+    /* cycle guard: stack of container pointers currently being encoded
+       on the path from the root (NOT a persistent memo — a DAG where the
+       same container is reachable via two different sibling paths is
+       legal JSON, real JSON::PP only rejects an actual cycle back to an
+       ancestor). Fixed depth cap mirrors Storable::dclone's DCloneCtx. */
+    void  *stack[256];
+    int    depth;
+} JsonBuf;
+
+static void jb_ensure(JsonBuf *b, size_t n) {
+    while (b->pos + n + 1 > b->cap) { b->cap = b->cap ? b->cap * 2 : 256; b->buf = realloc(b->buf, b->cap); }
+}
+static void jb_puts(JsonBuf *b, const char *s, size_t l) {
+    jb_ensure(b, l);
+    memcpy(b->buf + b->pos, s, l);
+    b->pos += l;
+}
+static void jb_putstr(JsonBuf *b, const char *s) { jb_puts(b, s, strlen(s)); }
+static void jb_newline(JsonBuf *b, int indent) {
+    if (!b->pretty) return;
+    jb_puts(b, "\n", 1);
+    for (int i = 0; i < indent * 3; i++) jb_puts(b, " ", 1);
+}
+
+/* JSON string escaping: " \ and control chars (\n \r \t \b \f, \u00XX for
+   the rest); everything else (including raw UTF-8 continuation bytes) is
+   copied through unchanged, matching real JSON::PP's non-ASCII default
+   (`->ascii` forcing \uXXXX for the whole string is out of scope). */
+static void json_escape_string(JsonBuf *b, const char *s, size_t len) {
+    jb_puts(b, "\"", 1);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"':  jb_putstr(b, "\\\""); break;
+            case '\\': jb_putstr(b, "\\\\"); break;
+            case '\n': jb_putstr(b, "\\n"); break;
+            case '\r': jb_putstr(b, "\\r"); break;
+            case '\t': jb_putstr(b, "\\t"); break;
+            case '\b': jb_putstr(b, "\\b"); break;
+            case '\f': jb_putstr(b, "\\f"); break;
+            default:
+                if (c < 0x20) {
+                    char esc[8];
+                    snprintf(esc, sizeof esc, "\\u%04x", c);
+                    jb_putstr(b, esc);
+                } else {
+                    jb_puts(b, (const char *)&c, 1);
+                }
+        }
+    }
+    jb_puts(b, "\"", 1);
+}
+
+static void json_encode_value(JsonBuf *b, PerlValue *v, int depth);
+
+static void json_push_cycle_guard(JsonBuf *b, void *container) {
+    for (int i = 0; i < b->depth; i++)
+        if (b->stack[i] == container)
+            perl_die_croak("JSON::PP::encode_json/encode: encountered a cycle");
+    if (b->depth < 256) b->stack[b->depth++] = container;
+}
+
+static void json_encode_array(JsonBuf *b, PerlArray *a, int depth) {
+    if (!a || a->len == 0) { jb_putstr(b, "[]"); return; }
+    json_push_cycle_guard(b, a);
+    jb_putstr(b, "[");
+    for (long long i = 0; i < a->len; i++) {
+        jb_newline(b, depth + 1);
+        json_encode_value(b, a->elems[i], depth + 1);
+        if (i + 1 < a->len) jb_putstr(b, ",");
+    }
+    jb_newline(b, depth);
+    jb_putstr(b, "]");
+    b->depth--;
+}
+
+static void json_encode_hash(JsonBuf *b, PerlHash *h, int depth) {
+    if (!h || h->size == 0) { jb_putstr(b, "{}"); return; }
+    json_push_cycle_guard(b, h);
+    char **keys = malloc(sizeof(char *) * (size_t)h->size);
+    PerlValue **vals = malloc(sizeof(PerlValue *) * (size_t)h->size);
+    long long n = 0;
+    for (int i = 0; i < PERL_HASH_BUCKETS; i++)
+        for (PerlHashEntry *e = h->buckets[i]; e; e = e->next) {
+            keys[n] = e->key; vals[n] = e->val; n++;
+        }
+    if (b->canonical) {
+        for (long long i = 1; i < n; i++) {
+            char *k = keys[i]; PerlValue *v = vals[i];
+            long long j = i - 1;
+            while (j >= 0 && strcmp(keys[j], k) > 0) {
+                keys[j+1] = keys[j]; vals[j+1] = vals[j]; j--;
+            }
+            keys[j+1] = k; vals[j+1] = v;
+        }
+    }
+    jb_putstr(b, "{");
+    for (long long i = 0; i < n; i++) {
+        jb_newline(b, depth + 1);
+        json_escape_string(b, keys[i], strlen(keys[i]));
+        jb_putstr(b, b->pretty ? " : " : ":");
+        json_encode_value(b, vals[i], depth + 1);
+        if (i + 1 < n) jb_putstr(b, ",");
+    }
+    jb_newline(b, depth);
+    jb_putstr(b, "}");
+    free(keys); free(vals);
+    b->depth--;
+}
+
+static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
+    if (!v || v->tag == PERL_UNDEF) { jb_putstr(b, "null"); return; }
+    perl_promote_ref_array(v); /* D105: FLAT_ARRAY/FLOAT_PAIR -> real REF_ARRAY */
+    if (v->blessed_class && strcmp(v->blessed_class, "JSON::PP::Boolean") == 0) {
+        jb_putstr(b, perl_is_true(v) ? "true" : "false");
+        return;
+    }
+    switch (v->tag) {
+        case PERL_INT: {
+            char tmp[32];
+            snprintf(tmp, sizeof tmp, "%lld", (long long)v->ival);
+            jb_putstr(b, tmp);
+            break;
+        }
+        case PERL_FLOAT: {
+            const char *s = perl_to_string(v);
+            jb_putstr(b, s);
+            break;
+        }
+        case PERL_STRING:
+            json_escape_string(b, v->sval, (size_t)v->slen);
+            break;
+        case PERL_REF_ARRAY:
+            json_encode_array(b, (PerlArray *)v->pval, depth);
+            break;
+        case PERL_REF_HASH:
+            json_encode_hash(b, (PerlHash *)v->pval, depth);
+            break;
+        case PERL_REF_SCALAR:
+            /* JSON has no scalar-ref concept: encode the referent. */
+            json_encode_value(b, (PerlValue *)v->pval, depth);
+            break;
+        default: {
+            /* code refs, globs, etc. — real JSON::PP dies on these
+               without allow_nonref; best-effort stringify instead. */
+            const char *s = perl_to_string(v);
+            json_escape_string(b, s, strlen(s));
+            break;
+        }
+    }
+}
+
+PerlValue *perl_json_encode(PerlValue *pv, long long canonical, long long pretty) {
+    JsonBuf b = { .canonical = (int)canonical, .pretty = (int)pretty };
+    json_encode_value(&b, pv, 0);
+    if (b.pretty) jb_puts(&b, "\n", 1);
+    PerlValue *r = perl_alloc_string_len(b.buf ? b.buf : "", (long long)b.pos);
+    free(b.buf);
+    return r;
+}
+
+/* ---- JSON::PP decode ---- */
+
+typedef struct { const char *s; size_t len, pos; } JsonParser;
+
+static void jp_skip_ws(JsonParser *p) {
+    while (p->pos < p->len) {
+        char c = p->s[p->pos];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') p->pos++;
+        else break;
+    }
+}
+static int jp_peek(JsonParser *p) { return p->pos < p->len ? (unsigned char)p->s[p->pos] : -1; }
+
+static void jp_die(JsonParser *p, const char *msg) {
+    perl_die_croak("malformed JSON string, %s at character offset %lld",
+                   msg, (long long)p->pos);
+}
+
+static PerlValue *jp_parse_value(JsonParser *p);
+
+static PerlValue *jp_parse_string_raw(JsonParser *p) {
+    /* caller has already checked s[pos]=='"' */
+    p->pos++;
+    size_t cap = 32, len = 0;
+    char *out = malloc(cap);
+    while (1) {
+        if (p->pos >= p->len) { free(out); jp_die(p, "unterminated string"); }
+        unsigned char c = (unsigned char)p->s[p->pos++];
+        if (c == '"') break;
+        if (c == '\\') {
+            if (p->pos >= p->len) { free(out); jp_die(p, "unterminated escape"); }
+            char e = p->s[p->pos++];
+            char rep = 0;
+            switch (e) {
+                case '"': rep = '"'; break;
+                case '\\': rep = '\\'; break;
+                case '/': rep = '/'; break;
+                case 'n': rep = '\n'; break;
+                case 't': rep = '\t'; break;
+                case 'r': rep = '\r'; break;
+                case 'b': rep = '\b'; break;
+                case 'f': rep = '\f'; break;
+                case 'u': {
+                    if (p->pos + 4 > p->len) { free(out); jp_die(p, "bad \\u escape"); }
+                    unsigned int cp = 0;
+                    for (int i = 0; i < 4; i++) {
+                        char h = p->s[p->pos++];
+                        cp <<= 4;
+                        if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                        else { free(out); jp_die(p, "bad \\u escape"); }
+                    }
+                    /* Encode as UTF-8. Surrogate pairs (astral plane,
+                       U+10000+) are out of scope — codepoints in the
+                       surrogate range are emitted as their raw 3-byte
+                       UTF-8 form rather than combined, a documented
+                       limitation (see TESTS.md). */
+                    if (len + 4 > cap) { cap *= 2; out = realloc(out, cap); }
+                    if (cp < 0x80) {
+                        out[len++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        out[len++] = (char)(0xC0 | (cp >> 6));
+                        out[len++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out[len++] = (char)(0xE0 | (cp >> 12));
+                        out[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[len++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                    continue;
+                }
+                default: free(out); jp_die(p, "bad backslash escape");
+            }
+            if (len + 1 > cap) { cap *= 2; out = realloc(out, cap); }
+            out[len++] = rep;
+        } else {
+            if (len + 1 > cap) { cap *= 2; out = realloc(out, cap); }
+            out[len++] = (char)c;
+        }
+    }
+    PerlValue *r = perl_alloc_string_len(out, (long long)len);
+    free(out);
+    return r;
+}
+
+static PerlValue *jp_parse_number(JsonParser *p) {
+    size_t start = p->pos;
+    if (jp_peek(p) == '-') p->pos++;
+    while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
+    int isFloat = 0;
+    if (jp_peek(p) == '.') {
+        isFloat = 1; p->pos++;
+        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
+    }
+    if (jp_peek(p) == 'e' || jp_peek(p) == 'E') {
+        isFloat = 1; p->pos++;
+        if (jp_peek(p) == '+' || jp_peek(p) == '-') p->pos++;
+        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
+    }
+    if (p->pos == start) jp_die(p, "malformed number");
+    char *tmp = strndup(p->s + start, p->pos - start);
+    PerlValue *r;
+    if (!isFloat) {
+        errno = 0;
+        long long iv = strtoll(tmp, NULL, 10);
+        if (errno == ERANGE) r = perl_alloc_float(strtod(tmp, NULL));
+        else r = perl_alloc_int(iv);
+    } else {
+        r = perl_alloc_float(strtod(tmp, NULL));
+    }
+    free(tmp);
+    return r;
+}
+
+static PerlValue *jp_parse_array(JsonParser *p) {
+    p->pos++; /* [ */
+    PerlArray *av = perl_anon_array_new();
+    jp_skip_ws(p);
+    if (jp_peek(p) == ']') { p->pos++; return perl_ref_array(av); }
+    while (1) {
+        jp_skip_ws(p);
+        PerlValue *v = jp_parse_value(p);
+        perl_array_push(av, v);
+        jp_skip_ws(p);
+        int c = jp_peek(p);
+        if (c == ',') { p->pos++; continue; }
+        if (c == ']') { p->pos++; break; }
+        jp_die(p, "expected ',' or ']'");
+    }
+    return perl_ref_array(av);
+}
+
+static PerlValue *jp_parse_object(JsonParser *p) {
+    p->pos++; /* { */
+    PerlHash *h = perl_anon_hash_new();
+    jp_skip_ws(p);
+    if (jp_peek(p) == '}') { p->pos++; return perl_ref_hash(h); }
+    while (1) {
+        jp_skip_ws(p);
+        if (jp_peek(p) != '"') jp_die(p, "expected string key");
+        PerlValue *key = jp_parse_string_raw(p);
+        jp_skip_ws(p);
+        if (jp_peek(p) != ':') jp_die(p, "expected ':'");
+        p->pos++;
+        jp_skip_ws(p);
+        PerlValue *val = jp_parse_value(p);
+        perl_hash_set_str(h, key->sval ? key->sval : "", val);
+        perl_free(key);
+        jp_skip_ws(p);
+        int c = jp_peek(p);
+        if (c == ',') { p->pos++; continue; }
+        if (c == '}') { p->pos++; break; }
+        jp_die(p, "expected ',' or '}'");
+    }
+    return perl_ref_hash(h);
+}
+
+static PerlValue *jp_parse_value(JsonParser *p) {
+    jp_skip_ws(p);
+    int c = jp_peek(p);
+    if (c == '"') return jp_parse_string_raw(p);
+    if (c == '{') return jp_parse_object(p);
+    if (c == '[') return jp_parse_array(p);
+    if (c == '-' || (c >= '0' && c <= '9')) return jp_parse_number(p);
+    if (c == 't' && p->pos + 4 <= p->len && strncmp(p->s + p->pos, "true", 4) == 0) {
+        p->pos += 4; return json_bool(1);
+    }
+    if (c == 'f' && p->pos + 5 <= p->len && strncmp(p->s + p->pos, "false", 5) == 0) {
+        p->pos += 5; return json_bool(0);
+    }
+    if (c == 'n' && p->pos + 4 <= p->len && strncmp(p->s + p->pos, "null", 4) == 0) {
+        p->pos += 4; return perl_alloc_undef();
+    }
+    jp_die(p, "unexpected character");
+    return perl_alloc_undef(); /* unreachable */
+}
+
+PerlValue *perl_json_decode(PerlValue *json_str) {
+    char *s = perl_to_string_dup(json_str);
+    JsonParser p = { .s = s, .len = strlen(s), .pos = 0 };
+    jp_skip_ws(&p);
+    if (p.pos >= p.len) { free(s); jp_die(&p, "unexpected end of input"); }
+    PerlValue *v = jp_parse_value(&p);
+    jp_skip_ws(&p);
+    if (p.pos != p.len) { free(s); jp_die(&p, "garbage after JSON value"); }
+    free(s);
+    return v;
 }
 
 /* ---- Text::Wrap ---- */

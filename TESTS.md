@@ -2791,6 +2791,88 @@ widening every affected character class to `[A-Za-z0-9_]`; confirmed
 25 consecutive clean diffs against real Perl on both files post-fix
 (previously flaky within a handful of runs).
 
+### JSON::PP (Tier 2, native) — 2026-09-20
+
+Native `encode_json`/`decode_json` (real `@EXPORT`, so bare unqualified
+names always work) plus a minimal OO surface: `JSON::PP->new`,
+`->canonical`, `->pretty`, `->encode`, `->decode`, with `->utf8`/
+`->ascii`/`->allow_nonref`/`->space_before`/`->space_after`/`->relaxed`
+accepted as no-op chain methods. `JSON::PP::true`/`JSON::PP::false`
+(and the bare `JSON::` shorthand) are the boolean constants.
+
+**Wiring** follows the established native-module pattern (`main.cpp`'s
+two PRAGMAS allowlists + the `modName ==` dispatch block; `codegen.cpp`'s
+`RT()` registrations + `emitCall` dispatch chain; `runtime.c`/`runtime.h`
+implementation) with one addition: the OO `->canonical`/`->pretty`/
+`->encode`/`->decode` chain is genuinely stateful, so it's intercepted in
+`perl_dispatch_method()` (`src/runtime.c`, right before the generic
+`class_name` resolution) rather than in codegen — `JSON::PP->new` returns
+a blessed anonymous hashref carrying `canonical`/`pretty` flags, and each
+setter mutates it and returns `self` for chaining.
+
+**Encoder** (`json_encode_value`/`json_encode_array`/`json_encode_hash`,
+`src/runtime.c`) mirrors `perl_dumper`'s traversal/hash-iteration shape
+almost exactly (bucket walk + optional `canonical`-triggered strcmp-sort,
+same as Dumper's `Sortkeys`), with a JSON-specific string escaper
+(`json_escape_string`: `"` `\` control chars `\n \r \t \b \f`, `\u00XX`
+for the rest) modeled on but distinct from Dumper's Perl-literal escaper
+(`dumper_quoted`) — JSON and Perl quoting rules are different enough
+that sharing one function would have been a false economy. Cycle
+detection is a **stack of container pointers on the current path**
+(`JsonBuf.stack`), not a persistent memo like Storable::dclone's
+`DCloneCtx` — a DAG (the same sub-structure reachable via two different
+sibling keys) is legal JSON and must **not** be rejected, only a true
+cycle back to an ancestor may die; this is the opposite of dclone's
+semantics and was deliberately not reused despite the superficial
+resemblance. Verified against real Perl: a cycle dies catchably (`eval
+{ encode_json(\%h) }`), a DAG encodes fine (duplicated, not shared, since
+JSON can't express sharing).
+
+**Decoder** (`perl_json_decode` + `jp_*` functions) is a from-scratch
+recursive-descent parser — no prior JSON code existed in the codebase.
+Numbers route through `strtod`/`strtoll` (int when the literal has no
+`.`/`e` and fits int64, float otherwise); `\uXXXX` escapes are decoded to
+UTF-8 bytes for the Basic Multilingual Plane only — surrogate pairs
+(astral plane, U+10000+) are NOT combined, a documented scope limit (see
+"Known limitations" below).
+
+**Booleans**: real JSON::PP's `true`/`false` are blessed *scalar refs*
+so that `use overload`'s `""`/`0+`/`bool` make them act like 1/"" in
+every context. This codebase's `use overload` support only covers
+arithmetic/comparison operators (`perl_dispatch_overload`'s call sites
+are all `+ - * / ** <=> ...`) — there's no stringification-overload hook
+`print` goes through. Building that machinery for one feature wasn't
+justified, so JSON booleans instead reuse this project's own existing
+"a Perl boolean" representation (`perl_alloc_bool`: IV 1 / empty PV —
+the W1 convention already used by `==`/`defined`/etc.) with
+`blessed_class="JSON::PP::Boolean"` stamped on top for `ref()`
+introspection. Every *observable* behavior (print, numeric context,
+`if (...)`, `ref($x) eq 'JSON::PP::Boolean'`) is correct by construction
+with zero new overload plumbing — confirmed all of these byte-for-byte
+against real Perl. The one thing that does NOT hold (and isn't
+observable in the sysadmin/CLI scripts this project targets): referential
+identity — `\JSON::PP::true == \JSON::PP::true` would be false here
+since each call mints a fresh value, whereas real Perl's `true`/`false`
+are singletons.
+
+**Known limitations** (deliberately out of scope, see MVP_ROADMAP.md's
+"explicitly out of scope" reasoning for the same class of decision):
+`allow_nonref`, `relaxed`, `filter_json_object`, `convert_blessed`,
+fine-grained `indent`/`space_before`/`space_after` control beyond the
+single `pretty` on/off, the functional `to_json`/`from_json` forms (only
+`encode_json`/`decode_json` and the OO chain), and **non-ASCII/`\u`
+decode produces a raw UTF-8 *byte* string, not a Unicode *character*
+string** — `length(decode_json('"café"'))` is 5 here vs. real
+Perl's 4, since this codebase has no internal utf8-flag/character-string
+model (consistent with the project's existing `use utf8`/
+`:encoding(UTF-8)`-layer-only approach to Unicode elsewhere). The deep
+test deliberately avoids any non-ASCII content so this permanent,
+deterministic divergence never shows up as a byte-for-byte diff — unlike
+D138/File::Temp's nondeterminism, this is a scope decision, not a bug to
+chase.
+
+Tests: `tests/json_pp_{smoke,deep}.pl`.
+
 ## Source layout
 
 | File | Role |

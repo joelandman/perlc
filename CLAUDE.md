@@ -18,9 +18,16 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-19, re-verified after Tier-1 file/data modules +
-D138 — 384/384 PASS,
-0 FAIL; `make test` 47/47):** New this session: `File::Copy`
+**Harness (2026-09-20, re-verified after JSON::PP — 386/386 PASS,
+0 FAIL; `make test` 47/47):** New this session: `JSON::PP`
+(`encode_json`/`decode_json`, OO `new`/`canonical`/`pretty`/`encode`/
+`decode`, `JSON::PP::true`/`false`) as a native module —
+`tests/json_pp_{smoke,deep}.pl`. Also fixed a parser gap found while
+building it: a bareword constant like `JSON::PP::true` used as a hash
+value before a comma (`active => JSON::PP::true,`) was silently
+auto-quoted as the literal string `"JSON::PP::true"` instead of being
+called — see TESTS.md's JSON::PP write-up. Previous session
+(2026-09-19, Tier-1 file/data modules + D138 — 384/384 PASS): `File::Copy`
 (`copy`/`move`), `File::Find` (`find`), `File::Path`
 (`make_path`/`remove_tree`), `File::Temp`
 (`tempfile`/`tempdir`/`mkstemp`/`mkdtemp`/`mktemp`/`tmpnam`),
@@ -539,7 +546,8 @@ with FETCH/STORE; file I/O, file tests, `stat`/`glob`; List::Util, POSIX
 floor/ceil/fmod/strftime, Scalar::Util, Carp, Time::HiRes, `pack`/`unpack`;
 Getopt::Long, Data::Dumper, File::Basename (2026-09-09 — see TESTS.md's
 "Real-world module survey"); File::Copy, File::Find, File::Path,
-File::Temp, Storable::dclone, Text::Wrap (2026-09-19);
+File::Temp, Storable::dclone, Text::Wrap (2026-09-19); JSON::PP
+(2026-09-20);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`
