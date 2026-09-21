@@ -4013,6 +4013,21 @@ NodePtr Parser::parsePrimary() {
         if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier())
             n->left = parseExpr();
         if (hp) consume(TK::RPAREN, ")");
+        /* Time::Piece: unlike Time::HiRes's time()/sleep() override
+           (opt-in per explicit import), real Time::Piece's @EXPORT
+           unconditionally overrides localtime/gmtime in SCALAR context
+           the moment `use Time::Piece;` appears, with no import list
+           needed (confirmed against real Perl) — list context is
+           untouched either way (emitArrayPtr's LocaltimeFunc/GmtimeFunc
+           case doesn't consult n->name). main.cpp's inlineModules()
+           populates importMap_["localtime"/"gmtime"] unconditionally for
+           any `use Time::Piece;`, so this checks the map the same way
+           Time::HiRes does but doesn't require it to come from an
+           explicit qw(...) list. */
+        auto itLt = importMap_.find(isGm ? "gmtime" : "localtime");
+        if (itLt != importMap_.end() &&
+            itLt->second == (isGm ? "Time::Piece::gmtime" : "Time::Piece::localtime"))
+            n->name = "Time::Piece";
         return n;
     }
 

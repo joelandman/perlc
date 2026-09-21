@@ -1827,6 +1827,12 @@ char *perl_to_string_dup(const PerlValue *v) {
                 perl_free(r);
                 return s;
             }
+            if (strcmp(method, "perl_tp_ovl_str") == 0) {
+                PerlValue *r = perl_tp_ovl_str((PerlValue*)v);
+                char *s = perl_to_string_dup(r);
+                perl_free(r);
+                return s;
+            }
             PerlArray *args = perl_array_new();
             PerlValue *clone = perl_clone((PerlValue*)v);
             perl_array_push(args, clone);
@@ -2263,6 +2269,21 @@ int perl_is_bigint_pv(const PerlValue *v) {
     return v && v->tag == PERL_BIGINT;
 }
 
+/* Found via Time::Piece testing: perl_is_bigint_pv only catches
+   Math::BigInt (its own dedicated tag numifies correctly regardless of
+   blessed_class, which is why the comment above could claim "blessed
+   operands are also covered" — true only for BigInt specifically). Any
+   OTHER blessed ref-shaped value (Time::Piece, a blessed REF_ARRAY) has
+   no numeric-native tag, so emitF64BinOpWithBigIntGuard's native-double
+   fast path silently discarded blessed_class and skipped overload
+   dispatch entirely for e.g. `$t2 - 200` after a prior `$t1 + 500`
+   chain. This predicate generalizes the same runtime tag-check pattern
+   to "any blessed value, regardless of tag" so the codegen guard can OR
+   it in alongside perl_is_bigint_pv. */
+int perl_is_blessed_pv(const PerlValue *v) {
+    return v && v->blessed_class != NULL;
+}
+
 /* D103: a decimal integer literal beyond INT64_MAX (parser.cpp's
    std::stoll overflow catch previously always fell to a plain double
    here — silently losing exactness for any such literal beyond ~2^53,
@@ -2666,6 +2687,21 @@ static const void *perl_ref_identity(const PerlValue *v) {
 }
 
 HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
+    /* Found via Time::Piece testing: the ref-identity fast path below
+       used to run UNCONDITIONALLY, before the blessed-overload check —
+       so `$t1 == $t2` for two DIFFERENT Time::Piece objects with the
+       SAME epoch compared object pointers (false) instead of dispatching
+       "<=>" (which would correctly say true). A blessed ref checks its
+       overload first; only an unblessed ref (or a blessed one with no
+       "<=>" registered) falls through to plain pointer identity. */
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
+    }
     /* ref == ref compares the referenced object's identity (real Perl:
        the numeric value of a ref is its address). FLAT_ARRAY counts as
        ref-like (an arrayref value). */
@@ -2677,18 +2713,19 @@ HOTX PerlValue *perl_num_eq(const PerlValue *a, const PerlValue *b) {
          b->tag == PERL_REF_SCALAR || b->tag == PERL_CODE_REF ||
          b->tag == PERL_FLAT_ARRAY))
         return perl_alloc_bool(perl_ref_identity(a) == perl_ref_identity(b));
-    if (a && a->blessed_class) {
-        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
-    }
-    if (b && b->blessed_class) {
-        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c == 0); }
-    }
     { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c == 0); }
     return perl_alloc_bool(perl_to_float(a) == perl_to_float(b));
 }
 HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
+    /* See perl_num_eq's identical note just above. */
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
+        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
+    }
     if (a && b &&
         (a->tag == PERL_REF_ARRAY || a->tag == PERL_REF_HASH ||
          a->tag == PERL_REF_SCALAR || a->tag == PERL_CODE_REF ||
@@ -2697,14 +2734,6 @@ HOTX PerlValue *perl_num_ne(const PerlValue *a, const PerlValue *b) {
          b->tag == PERL_REF_SCALAR || b->tag == PERL_CODE_REF ||
          b->tag == PERL_FLAT_ARRAY))
         return perl_alloc_bool(perl_ref_identity(a) != perl_ref_identity(b));
-    if (a && a->blessed_class) {
-        PerlValue *r = perl_dispatch_overload(a, "<=>", (PerlValue*)a, (PerlValue*)b);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
-    }
-    if (b && b->blessed_class) {
-        PerlValue *r = perl_dispatch_overload(b, "<=>", (PerlValue*)b, (PerlValue*)a);
-        if (r) { long long c = perl_to_int(r); perl_free(r); return perl_alloc_bool(c != 0); }
-    }
     { int c = perl_bigint_cmp_exact(a, b); if (c != -2) return perl_alloc_bool(c != 0); }
     return perl_alloc_bool(perl_to_float(a) != perl_to_float(b));
 }
@@ -5190,6 +5219,17 @@ static PerlValue *perl_dispatch_overload(const PerlValue *obj, const char *op,
             result = perl_bigint_ovl_neg(lhs_clone);
         else
             result = NULL;
+    } else if (strncmp(method, "perl_tp_ovl_", 12) == 0) {
+        if (strcmp(method, "perl_tp_ovl_add") == 0)
+            result = perl_tp_ovl_add(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_tp_ovl_sub") == 0)
+            result = perl_tp_ovl_sub(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_tp_ovl_cmp") == 0)
+            result = perl_tp_ovl_cmp(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_tp_ovl_str") == 0)
+            result = perl_tp_ovl_str(lhs_clone);
+        else
+            result = NULL;
     } else {
         int saved = perl_push_wantarray(0);  /* scalar context */
         result = perl_call_named_sub(method, args, 0);
@@ -5685,6 +5725,37 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
             return obj; /* accepted, no-op, chainable */
         }
     }
+
+    /* Time::Piece / Time::Seconds class + instance methods. Class methods
+       (obj is the PERL_STRING "Time::Piece"/"Time::Seconds") only need
+       `new`/`strptime`; every instance method (obj blessed into either
+       class) routes through the shared dispatcher functions above, same
+       shape as the JSON::PP block just above. */
+    if (obj && obj->tag == PERL_STRING && obj->sval && strcmp(obj->sval, "Time::Piece") == 0) {
+        if (strcmp(method, "new") == 0)
+            return perl_time_piece_new((args && args->len > 0) ? args->elems[0] : NULL, 1);
+        if (strcmp(method, "strptime") == 0) {
+            PerlValue *str = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+            PerlValue *fmt = (args && args->len > 1) ? args->elems[1] : perl_alloc_undef();
+            return perl_time_piece_strptime(str, fmt);
+        }
+        if (strcmp(method, "localtime") == 0)
+            return perl_time_piece_new((args && args->len > 0) ? args->elems[0] : NULL, 1);
+        if (strcmp(method, "gmtime") == 0)
+            return perl_time_piece_new((args && args->len > 0) ? args->elems[0] : NULL, 0);
+    }
+    if (obj && obj->tag == PERL_STRING && obj->sval && strcmp(obj->sval, "Time::Seconds") == 0) {
+        if (strcmp(method, "new") == 0) {
+            double s = (args && args->len > 0) ? perl_to_float(args->elems[0]) : 0.0;
+            return perl_ts_new(s);
+        }
+    }
+    if (obj && obj->tag == PERL_REF_ARRAY && obj->blessed_class &&
+        strcmp(obj->blessed_class, "Time::Piece") == 0)
+        return perl_time_piece_method(obj, method, args);
+    if (obj && obj->tag == PERL_FLOAT && obj->blessed_class &&
+        strcmp(obj->blessed_class, "Time::Seconds") == 0)
+        return perl_time_seconds_method(obj, method, args);
 
     const char *class_name = NULL;
     if (obj && obj->tag == PERL_STRING && obj->sval)
@@ -8674,8 +8745,24 @@ PerlValue *perl_reverse_str(PerlValue *v) {
 
 /* ── sort with comparator ────────────────────────────────────────────────── */
 static int cmp_num_asc(const void *a, const void *b) {
-    double da = perl_to_float(*(PerlValue**)a);
-    double db = perl_to_float(*(PerlValue**)b);
+    /* Found via Time::Piece testing: the parser fast-paths the literal
+       `sort { $a <=> $b }` shape straight to this qsort comparator,
+       bypassing perl_spaceship entirely (and its overload check — see
+       perl_spaceship's own comment) — so a blessed REF_ARRAY/REF_HASH/
+       REF_SCALAR object with a registered "<=>" (Time::Piece) sorted
+       pointer addresses, not epochs. Math::BigInt was never affected
+       (its own PERL_BIGINT tag numifies correctly regardless), which is
+       why this stayed unnoticed until an object without a numeric-native
+       tag needed it. */
+    PerlValue *pa = *(PerlValue**)a, *pb = *(PerlValue**)b;
+    if ((pa && pa->blessed_class) || (pb && pb->blessed_class)) {
+        PerlValue *r = perl_spaceship(pa, pb);
+        int c = (int)perl_to_int(r);
+        perl_free(r);
+        return c;
+    }
+    double da = perl_to_float(pa);
+    double db = perl_to_float(pb);
     return (da > db) - (da < db);
 }
 static int cmp_num_desc(const void *a, const void *b) { return cmp_num_asc(b, a); }
@@ -8702,6 +8789,21 @@ PerlArray *perl_sort_str_desc(PerlArray *a) { return sort_copy_with(a, cmp_str_d
 
 /* ── spaceship and cmp ───────────────────────────────────────────────────── */
 PerlValue *perl_spaceship(PerlValue *a, PerlValue *b) {
+    /* Found via Time::Piece testing: unlike perl_add/perl_sub/etc., this
+       never checked for a registered "<=>" overload — harmless for
+       Math::BigInt (its own PERL_BIGINT tag numifies correctly via
+       perl_to_float regardless of overload dispatch) but wrong for any
+       blessed REF_ARRAY/REF_HASH/REF_SCALAR object like Time::Piece,
+       where perl_to_float falls back to "ref's address as a double" —
+       `$t1 <=> $t2` compared pointers, not epochs. */
+    if (a && a->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(a, "<=>", a, b);
+        if (r) return r;
+    }
+    if (b && b->blessed_class) {
+        PerlValue *r = perl_dispatch_overload(b, "<=>", a, b);
+        if (r) return r;
+    }
     double da = perl_to_float(a), db = perl_to_float(b);
     return perl_alloc_int((da > db) - (da < db));
 }
@@ -12779,6 +12881,307 @@ PerlValue *perl_timelocal_posix(PerlArray *args) {
     long long year = args->len > 5 ? (long long)perl_to_int(args->elems[5]) : 0;
     long long refT = tl_timegm_impl(sec, min, hour, mday, mon, year, 0, 1, 0);
     return perl_alloc_int(tl_locate_local(refT, sec, min, hour));
+}
+
+/* ── Time::Piece / Time::Seconds (Tier 2, native) ────────────────────────────
+   Object layout (this codebase's own choice, NOT real Time::Piece's actual
+   internal array shape — nothing here relies on raw `$t->[N]` access, which
+   real scripts essentially never do): a blessed PERL_REF_ARRAY of
+   [0]=sec [1]=min [2]=hour [3]=mday [4]=mon(0-based) [5]=year(full, e.g.
+   2024) [6]=wday(0=Sun) [7]=yday(0-based) [8]=isdst [9]=epoch
+   [10]=islocal(0/1, which of localtime/gmtime built this).
+   Time::Seconds is simpler: a blessed PERL_FLOAT carrying the seconds
+   count directly — stringification/numeric context already do the right
+   thing via PERL_FLOAT's existing cases with zero new code (see the
+   perl_to_string comment below for why Time::Piece itself needs a special
+   case but Time::Seconds does not). */
+
+static const char *tp_month_full[] = {
+    "January","February","March","April","May","June",
+    "July","August","September","October","November","December"};
+static const char *tp_month_abbr[] = {
+    "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+static const char *tp_day_full[] = {
+    "Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+static const char *tp_day_abbr[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+static long long tp_field(const PerlValue *obj, int idx) {
+    if (!obj || obj->tag != PERL_REF_ARRAY || !obj->pval) return 0;
+    PerlArray *a = (PerlArray *)obj->pval;
+    if (idx < 0 || idx >= a->len) return 0;
+    return perl_to_int(a->elems[idx]);
+}
+
+static void tp_fill_tm(const PerlValue *obj, struct tm *tm) {
+    memset(tm, 0, sizeof *tm);
+    tm->tm_sec   = (int)tp_field(obj, 0);
+    tm->tm_min   = (int)tp_field(obj, 1);
+    tm->tm_hour  = (int)tp_field(obj, 2);
+    tm->tm_mday  = (int)tp_field(obj, 3);
+    tm->tm_mon   = (int)tp_field(obj, 4);
+    tm->tm_year  = (int)tp_field(obj, 5) - 1900;
+    tm->tm_wday  = (int)tp_field(obj, 6);
+    tm->tm_yday  = (int)tp_field(obj, 7);
+    tm->tm_isdst = (int)tp_field(obj, 8);
+}
+
+static PerlValue *tp_new_from_epoch(time_t epoch, int is_local) {
+    struct tm tmbuf;
+    struct tm *tm = is_local ? localtime_r(&epoch, &tmbuf) : gmtime_r(&epoch, &tmbuf);
+    PerlArray *a = perl_anon_array_new();
+    perl_array_push(a, perl_alloc_int(tm->tm_sec));
+    perl_array_push(a, perl_alloc_int(tm->tm_min));
+    perl_array_push(a, perl_alloc_int(tm->tm_hour));
+    perl_array_push(a, perl_alloc_int(tm->tm_mday));
+    perl_array_push(a, perl_alloc_int(tm->tm_mon));
+    perl_array_push(a, perl_alloc_int(tm->tm_year + 1900));
+    perl_array_push(a, perl_alloc_int(tm->tm_wday));
+    perl_array_push(a, perl_alloc_int(tm->tm_yday));
+    perl_array_push(a, perl_alloc_int(tm->tm_isdst));
+    perl_array_push(a, perl_alloc_int((long long)epoch));
+    perl_array_push(a, perl_alloc_int(is_local));
+    PerlValue *r = perl_ref_array(a);
+    r->blessed_class = strdup("Time::Piece");
+    return r;
+}
+
+PerlValue *perl_time_piece_new(PerlValue *epoch_pv, long long is_local) {
+    time_t epoch = (epoch_pv && epoch_pv->tag != PERL_UNDEF)
+        ? (time_t)perl_to_int(epoch_pv) : time(NULL);
+    return tp_new_from_epoch(epoch, (int)is_local);
+}
+
+/* Time::Piece->strptime(STRING, FORMAT): real Time::Piece always parses
+   as UTC (confirmed against real Perl: the epoch it computes matches
+   timegm of the parsed fields, regardless of local TZ) and returns a
+   gmtime-flavored object. */
+PerlValue *perl_time_piece_strptime(PerlValue *str_pv, PerlValue *fmt_pv) {
+    char *str = perl_to_string_dup(str_pv);
+    char *fmt = perl_to_string_dup(fmt_pv);
+    struct tm tm = {0};
+    char *end = strptime(str, fmt, &tm);
+    if (!end) {
+        free(str); free(fmt);
+        perl_die_croak("Time::Piece::strptime: '%s' did not match '%s'",
+                       str_pv ? perl_to_string(str_pv) : "", fmt_pv ? perl_to_string(fmt_pv) : "");
+    }
+    free(str); free(fmt);
+    time_t epoch = timegm(&tm);
+    return tp_new_from_epoch(epoch, 0);
+}
+
+static PerlValue *tp_name_with_override(const char *dflt, PerlArray *args, int idx) {
+    /* real Time::Piece: $t->monname(qw(a b c ... l)) / ->day(qw(...))
+       replace the whole name table and re-look-up; we only need to
+       return the idx'th override when one was given. */
+    if (args && idx >= 0 && idx < args->len)
+        return perl_alloc_string(perl_to_string(args->elems[idx]));
+    return perl_alloc_string(dflt);
+}
+
+PerlValue *perl_time_piece_method(PerlValue *obj, const char *m, PerlArray *args) {
+    struct tm tm;
+    tp_fill_tm(obj, &tm);
+    long long epoch = tp_field(obj, 9);
+    int is_local = (int)tp_field(obj, 10);
+    long long a0 = (args && args->len > 0) ? perl_to_int(args->elems[0]) : -1;
+
+    if (!strcmp(m, "sec") || !strcmp(m, "second"))   return perl_alloc_int(tm.tm_sec);
+    if (!strcmp(m, "min") || !strcmp(m, "minute"))   return perl_alloc_int(tm.tm_min);
+    if (!strcmp(m, "hour"))                          return perl_alloc_int(tm.tm_hour);
+    if (!strcmp(m, "mday") || !strcmp(m, "day_of_month")) return perl_alloc_int(tm.tm_mday);
+    if (!strcmp(m, "mon"))   return perl_alloc_int(tm.tm_mon + 1);
+    if (!strcmp(m, "_mon"))  return perl_alloc_int(tm.tm_mon);
+    if (!strcmp(m, "year"))  return perl_alloc_int(tm.tm_year + 1900);
+    if (!strcmp(m, "_year")) return perl_alloc_int(tm.tm_year);
+    if (!strcmp(m, "yy")) {
+        int y2 = (tm.tm_year + 1900) % 100;
+        return perl_alloc_int(y2);
+    }
+    if (!strcmp(m, "wday"))                       return perl_alloc_int(tm.tm_wday + 1);
+    if (!strcmp(m, "_wday") || !strcmp(m, "day_of_week")) return perl_alloc_int(tm.tm_wday);
+    if (!strcmp(m, "yday") || !strcmp(m, "day_of_year"))  return perl_alloc_int(tm.tm_yday);
+    if (!strcmp(m, "isdst") || !strcmp(m, "daylight_savings"))
+        return perl_alloc_int(tm.tm_isdst > 0 ? 1 : 0);
+    if (!strcmp(m, "epoch")) return perl_alloc_int(epoch);
+    if (!strcmp(m, "monname") || !strcmp(m, "month"))
+        return tp_name_with_override(tp_month_abbr[tm.tm_mon], args, tm.tm_mon);
+    if (!strcmp(m, "fullmonth"))
+        return tp_name_with_override(tp_month_full[tm.tm_mon], args, tm.tm_mon);
+    if (!strcmp(m, "wdayname") || !strcmp(m, "day"))
+        return tp_name_with_override(tp_day_abbr[tm.tm_wday], args, tm.tm_wday);
+    if (!strcmp(m, "fullday"))
+        return tp_name_with_override(tp_day_full[tm.tm_wday], args, tm.tm_wday);
+    if (!strcmp(m, "hms") || !strcmp(m, "time")) {
+        char buf[16];
+        snprintf(buf, sizeof buf, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+        return perl_alloc_string(buf);
+    }
+    if (!strcmp(m, "ymd") || !strcmp(m, "date")) {
+        char buf[16];
+        snprintf(buf, sizeof buf, "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        return perl_alloc_string(buf);
+    }
+    if (!strcmp(m, "mdy")) {
+        char buf[16];
+        snprintf(buf, sizeof buf, "%02d-%02d-%04d", tm.tm_mon + 1, tm.tm_mday, tm.tm_year + 1900);
+        return perl_alloc_string(buf);
+    }
+    if (!strcmp(m, "dmy")) {
+        char buf[16];
+        snprintf(buf, sizeof buf, "%02d-%02d-%04d", tm.tm_mday, tm.tm_mon + 1, tm.tm_year + 1900);
+        return perl_alloc_string(buf);
+    }
+    if (!strcmp(m, "datetime")) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        return perl_alloc_string(buf);
+    }
+    if (!strcmp(m, "cdate")) return perl_tp_ovl_str((PerlValue *)obj);
+    if (!strcmp(m, "is_leap_year")) {
+        long long y = tm.tm_year + 1900;
+        return perl_alloc_int((y % 4 == 0 && y % 100 != 0) || y % 400 == 0 ? 1 : 0);
+    }
+    if (!strcmp(m, "strftime")) {
+        char *fmt = (args && args->len > 0) ? perl_to_string_dup(args->elems[0])
+                                            : strdup("%a, %d %b %Y %H:%M:%S %Z");
+        struct tm tmz = tm;
+        time_t e = (time_t)epoch;
+        if (!is_local) {
+            /* gmtime()-derived object: glibc's strftime needs
+               tm_gmtoff/tm_zone populated for %Z/%z, which tp_fill_tm
+               doesn't carry — re-derive via gmtime_r, then force
+               tm_zone to "UTC" (glibc's own gmtime_r names it "GMT";
+               real Time::Piece's default-format output says "UTC"). */
+            gmtime_r(&e, &tmz);
+            tmz.tm_zone = "UTC";
+        } else {
+            localtime_r(&e, &tmz);
+        }
+        char buf[256];
+        strftime(buf, sizeof buf, fmt, &tmz);
+        free(fmt);
+        return perl_alloc_string(buf);
+    }
+    if (!strcmp(m, "localtime")) return perl_time_piece_new(args && args->len > 0 ? args->elems[0] : NULL, 1);
+    if (!strcmp(m, "gmtime"))    return perl_time_piece_new(args && args->len > 0 ? args->elems[0] : NULL, 0);
+    if (!strcmp(m, "new")) {
+        if (args && args->len > 0 && args->elems[0]->tag != PERL_UNDEF)
+            return perl_time_piece_new(args->elems[0], is_local);
+        return perl_time_piece_new(NULL, is_local);
+    }
+    (void)a0;
+    perl_die_croak("Can't locate object method \"%s\" via package \"Time::Piece\"", m);
+    return perl_alloc_undef();
+}
+
+/* ---- overloads (registered lazily on first object construction via
+   perl_time_piece_new's caller — actually simplest to just register at
+   process start; see perl_dispatch_overload's strncmp("perl_tp_ovl_",...)
+   arm for the direct-C-function dispatch, mirroring Math::BigInt's
+   perl_bigint_ovl_* mechanism). ---- */
+
+PerlValue *perl_tp_ovl_str(PerlValue *a) {
+    struct tm tm;
+    tp_fill_tm(a, &tm);
+    char buf[32];
+    snprintf(buf, sizeof buf, "%s %s %2d %02d:%02d:%02d %04d",
+             tp_day_abbr[tm.tm_wday], tp_month_abbr[tm.tm_mon], tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_year + 1900);
+    return perl_alloc_string(buf);
+}
+
+PerlValue *perl_ts_new(double secs) {
+    PerlValue *v = perl_alloc_float(secs);
+    v->blessed_class = strdup("Time::Seconds");
+    return v;
+}
+
+/* Time::Piece +/-: `TP - TP` -> Time::Seconds; `TP - N` / `TP + N` -> TP
+   (N seconds added/subtracted from the epoch). Real Time::Piece also
+   accepts a Time::Seconds on the right of +/-, which just reduces to the
+   same "N seconds" case since Time::Seconds IS-A plain number here. */
+PerlValue *perl_tp_ovl_add(PerlValue *a, PerlValue *b) {
+    long long epoch = tp_field(a, 9);
+    int is_local = (int)tp_field(a, 10);
+    double delta = perl_to_float(b);
+    return tp_new_from_epoch((time_t)(epoch + (long long)delta), is_local);
+}
+
+PerlValue *perl_tp_ovl_sub(PerlValue *a, PerlValue *b) {
+    long long epoch = tp_field(a, 9);
+    int is_local = (int)tp_field(a, 10);
+    if (b && b->tag == PERL_REF_ARRAY && b->blessed_class &&
+        strcmp(b->blessed_class, "Time::Piece") == 0) {
+        long long epoch2 = tp_field(b, 9);
+        return perl_ts_new((double)(epoch - epoch2));
+    }
+    double delta = perl_to_float(b);
+    return tp_new_from_epoch((time_t)(epoch - (long long)delta), is_local);
+}
+
+PerlValue *perl_tp_ovl_cmp(PerlValue *a, PerlValue *b) {
+    long long ea = tp_field(a, 9);
+    long long eb = (b && b->tag == PERL_REF_ARRAY && b->blessed_class &&
+                    strcmp(b->blessed_class, "Time::Piece") == 0)
+                       ? tp_field(b, 9) : (long long)perl_to_float(b);
+    return perl_alloc_int(ea < eb ? -1 : (ea > eb ? 1 : 0));
+}
+
+/* Time::Seconds: seconds/minutes/hours/days/weeks/months/years + pretty.
+   Object is just a blessed PERL_FLOAT (see the layout comment above) —
+   `v->fval` IS the seconds count, so no field-unwrapping helper needed. */
+#define TS_MINUTE 60.0
+#define TS_HOUR   3600.0
+#define TS_DAY    86400.0
+#define TS_WEEK   (7.0 * TS_DAY)
+#define TS_MONTH  2629744.0   /* real Time::Seconds' own ONE_MONTH */
+#define TS_YEAR 31556930.0  /* real Time::Seconds' own ONE_YEAR */
+
+static void ts_pretty_parts(long long total, long long *d, long long *h, long long *mi, long long *s) {
+    *d = total / 86400; total %= 86400;
+    *h = total / 3600;  total %= 3600;
+    *mi = total / 60;   *s = total % 60;
+}
+
+PerlValue *perl_time_seconds_method(PerlValue *obj, const char *m, PerlArray *args) {
+    double secs = perl_to_float(obj);
+    (void)args;
+    if (!strcmp(m, "seconds") || !strcmp(m, "sec"))  return perl_alloc_float(secs);
+    if (!strcmp(m, "minutes") || !strcmp(m, "min"))  return perl_alloc_float(secs / TS_MINUTE);
+    if (!strcmp(m, "hours"))                         return perl_alloc_float(secs / TS_HOUR);
+    if (!strcmp(m, "days"))                          return perl_alloc_float(secs / TS_DAY);
+    if (!strcmp(m, "weeks"))                         return perl_alloc_float(secs / TS_WEEK);
+    if (!strcmp(m, "months"))                        return perl_alloc_float(secs / TS_MONTH);
+    if (!strcmp(m, "years"))                         return perl_alloc_float(secs / TS_YEAR);
+    if (!strcmp(m, "pretty")) {
+        int neg = secs < 0;
+        long long total = (long long)(neg ? -secs : secs);
+        long long d, h, mi, s;
+        ts_pretty_parts(total, &d, &h, &mi, &s);
+        char buf[128];
+        if (total == 0) {
+            snprintf(buf, sizeof buf, "0 seconds");
+        } else if (total < 60) {
+            snprintf(buf, sizeof buf, "%lld second%s", s, s == 1 ? "" : "s");
+        } else if (total < 3600) {
+            snprintf(buf, sizeof buf, "%lld minute%s, %lld second%s",
+                      mi, mi == 1 ? "" : "s", s, s == 1 ? "" : "s");
+        } else if (total < 86400) {
+            snprintf(buf, sizeof buf, "%lld hour%s, %lld minute%s, %lld second%s",
+                      h, h == 1 ? "" : "s", mi, mi == 1 ? "" : "s", s, s == 1 ? "" : "s");
+        } else {
+            snprintf(buf, sizeof buf, "%lld day%s, %lld hour%s, %lld minute%s, %lld second%s",
+                      d, d == 1 ? "" : "s", h, h == 1 ? "" : "s",
+                      mi, mi == 1 ? "" : "s", s, s == 1 ? "" : "s");
+        }
+        char out[136];
+        snprintf(out, sizeof out, "%s%s", neg ? "minus " : "", buf);
+        return perl_alloc_string(out);
+    }
+    perl_die_croak("Can't locate object method \"%s\" via package \"Time::Seconds\"", m);
+    return perl_alloc_undef();
 }
 
 /* ── File I/O ─────────────────────────────────────────────────────────────── */

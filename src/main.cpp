@@ -131,7 +131,7 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
         "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
-        "Storable","JSON::PP","JSON",
+        "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
     };
 
     std::set<std::string> modulesToInstall;
@@ -389,7 +389,7 @@ static std::vector<Token> inlineModules(
         "Cwd","Sys::Hostname","Time::Local",
         "File::Spec","File::Spec::Unix","File::Spec::Functions",
         "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
-        "Storable","JSON::PP","JSON",
+        "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -675,6 +675,37 @@ static std::vector<Token> inlineModules(
         if (modName == "Time::HiRes") {
             for (auto &name : explicitImports)
                 importMap[name] = "Time::HiRes::" + name;
+            continue;
+        }
+
+        /* Time::Piece — unlike Time::HiRes above, real Time::Piece's
+           @EXPORT unconditionally overrides localtime/gmtime the moment
+           `use Time::Piece;` appears (confirmed against real Perl: no
+           import list needed) — so, unlike Time::HiRes, these two map
+           regardless of explicitImports. The parser's KW_LOCALTIME/
+           KW_GMTIME site checks importMap_ for exactly this pair to
+           decide whether scalar-context localtime/gmtime should return a
+           blessed Time::Piece object instead of the ctime()-style string;
+           list context is unaffected either way. Time::Seconds' 8
+           ONE_* constants are @EXPORT too (real module has no
+           @EXPORT_OK gate on them). */
+        if (modName == "Time::Piece") {
+            importMap["localtime"] = "Time::Piece::localtime";
+            importMap["gmtime"] = "Time::Piece::gmtime";
+            for (auto &name : explicitImports) {
+                if (name == "localtime" || name == "gmtime") continue;
+                importMap[name] = "Time::Piece::" + name;
+            }
+            continue;
+        }
+        if (modName == "Time::Seconds") {
+            /* real @Time::Seconds::EXPORT (probed from the host perl,
+               v1.41) — all 9 are default-exported, no import list needed. */
+            static const char *oneConsts[] = {
+                "ONE_MINUTE","ONE_HOUR","ONE_DAY","ONE_WEEK","ONE_MONTH",
+                "ONE_YEAR","ONE_FINANCIAL_MONTH","LEAP_YEAR","NON_LEAP_YEAR",
+            };
+            for (const char *c : oneConsts) importMap[c] = std::string("Time::Seconds::") + c;
             continue;
         }
 

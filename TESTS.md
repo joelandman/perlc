@@ -69,6 +69,10 @@ eval STRING and eval-defined subs see outer `my`).
 |----|--------|-------|
 | D54 | OPEN (tooling) | `perlc_tsan` hangs compiling `tests/threads.pl` (TSan+fork of clang-18). `TSAN_OPTIONS=die_after_fork=0` works around it. Not a generated-code bug. |
 | D138 | **FIXED 2026-09-19** | `\&name == \&name` / `__SUB__ == \&name` (CODE-ref identity via `==`) was unreliable — `perl_num_eq`/`perl_num_ne` compared the freshly-`malloc`'d `PerlClosure` wrapper's own address instead of the wrapped sub. See below. |
+| D139 | **FIXED 2026-09-20** | `perl_num_eq`/`perl_num_ne` checked ref-identity BEFORE checking for a registered `<=>` overload — any blessed REF_ARRAY/REF_HASH/REF_SCALAR/CODE_REF class with an overloaded `<=>` (e.g. Time::Piece) had `==`/`!=` compare object pointers instead of dispatching. See below. |
+| D140 | **FIXED 2026-09-20** | `perl_spaceship` (the `<=>` operator) and `sort { $a <=> $b }`'s fast-path comparator (`cmp_num_asc`, which the parser recognizes textually and routes around the general comparator machinery) never checked for a registered `<=>` overload at all — silently numified a blessed ref-shaped object as its pointer address. Math::BigInt was unaffected only because its own dedicated tag numifies correctly regardless. See below. |
+| D141 | **FIXED 2026-09-20** | `emitBinOp`'s F64-fast-path BigInt guard (`emitF64BinOpWithBigIntGuard`, D132) only checked for the BigInt tag specifically, not blessed_class generically — a chained `+`/`-`/`*` on a blessed ref-shaped variable (`my $t2 = $t1 + 500; my $t3 = $t2 - 200;`) silently discarded the class on the second operation. See below. |
+| D142 | **FIXED 2026-09-20** | `emitArrayPtr`'s `NK::LocaltimeFunc`/`GmtimeFunc` case ignored the `sval == "scalar_ctx"` marker the parser stamps for an explicit `scalar localtime(...)`/`scalar gmtime(...)` — `push @a, scalar gmtime(0)` (or the same shape inside `map`) wrongly flattened the 9-element list-context array instead of pushing the single scalar-context value. Pre-existing, independent of Time::Piece. See below. |
 | D101 | **FIXED 2026-09-11** | `each %hash` in scalar context returned the pair length (0/1/2), not the key. See below. |
 | D102 | **FIXED** (2026-09-10) | `die REF` / `die $blessed_obj` lost the reference — `$@` became a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Broke OO exception handling. See below. |
 | D103 | **FIXED 2026-09-11** | Integer overflow used wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently went wrong or printed in scientific notation instead of exact digits. See below. |
@@ -2872,6 +2876,141 @@ D138/File::Temp's nondeterminism, this is a scope decision, not a bug to
 chase.
 
 Tests: `tests/json_pp_{smoke,deep}.pl`.
+
+### Time::Piece / Time::Seconds (Tier 2, native) + D139/D140/D141/D142 — 2026-09-20
+
+Native `Time::Piece`: `localtime`/`gmtime` (scalar context returns a
+blessed object once `use Time::Piece;` is in scope — real Perl's
+unconditional `@EXPORT` override, no import list needed; list context is
+untouched, still the plain 9-element array), `->new`, `->strptime`
+(always UTC, matching real Perl), accessors (`sec`/`min`/`hour`/`mday`/
+`mon`/`_mon`/`year`/`_year`/`wday`/`_wday`/`yday`/`isdst`/`epoch`/
+`monname`/`fullmonth`/`wdayname`/`fullday` with the real name-table-
+override form/`hms`/`ymd`/`mdy`/`dmy`/`date`/`datetime`/`cdate`/
+`strftime`/`is_leap_year`), and overloads (`+`/`-`/`<=>`/`""`). Native
+`Time::Seconds`: `->new`, `seconds`/`minutes`/`hours`/`days`/`weeks`/
+`months`/`years`/`pretty` (matched against real Perl's exact pluralization
+and unit-cascade rules, including the `"minus "` prefix for negative
+durations), and the 9 real `@Time::Seconds::EXPORT` constants (probed
+from the host perl v1.41: `ONE_MINUTE`/`ONE_HOUR`/`ONE_DAY`/`ONE_WEEK`/
+`ONE_MONTH`/`ONE_YEAR`/`ONE_FINANCIAL_MONTH`/`LEAP_YEAR`/`NON_LEAP_YEAR`
+— note this is a different, larger set than an earlier revision of
+MVP_ROADMAP.md's scoping guess, which named nonexistent
+`ONE_REAL_MONTH`/`ONE_REAL_YEAR`; corrected against the actually-
+installed module).
+
+**Object representation**: Time::Piece is a blessed `PERL_REF_ARRAY`
+(11 ints: sec/min/hour/mday/mon/year/wday/yday/isdst/epoch/islocal —
+this codebase's own layout choice, not real Time::Piece's actual
+internal array shape, since nothing exercises raw `$t->[N]` access).
+Time::Seconds is simply a blessed `PERL_FLOAT` — `v->fval` IS the
+seconds count, so stringification/numeric-context already do the right
+thing via `PERL_FLOAT`'s existing cases with zero new code.
+
+**Wiring** follows the established native-module pattern with one
+addition needed for the parser: `localtime`/`gmtime` are lexer
+*keywords* (`KW_LOCALTIME`/`KW_GMTIME`), never `NK::Call` nodes, so
+there's no name-based `emitCall` dispatch to hook — instead
+`main.cpp`'s `inlineModules()` populates `importMap_["localtime"/
+"gmtime"] = "Time::Piece::localtime"/"...::gmtime"` **unconditionally**
+for any `use Time::Piece;` (unlike Time::HiRes's opt-in-per-explicit-
+import precedent for the same two keywords — confirmed against real
+Perl that Time::Piece's override needs no import list), and the
+parser's `KW_LOCALTIME`/`KW_GMTIME` site stamps `n->name =
+"Time::Piece"` on the node when it sees that mapping. Every downstream
+consumer of the node (scalar-context codegen, the two "might this
+variable hold a blessed value" unbox guards) keys off `n.name ==
+"Time::Piece"`; list-context codegen (`emitArrayPtr`) never looks at
+`n.name` at all, so it stays the plain 9-element array unconditionally,
+matching real Perl.
+
+**Overloads** reuse the exact `perl_bigint_ovl_*`-prefix direct-C-
+function-dispatch mechanism Math::BigInt already established in
+`perl_dispatch_overload` (`src/runtime.c`) — a parallel `perl_tp_ovl_*`
+arm, plus a new special case in `perl_to_string_dup`'s existing blessed-
+`""`-overload check (which is *not* in `perl_to_string` itself, since
+that function is `__attribute__((pure))` and can't dispatch methods —
+this is the mechanism `print`/interpolation actually go through for any
+blessed value, discovered by tracing why Math::BigInt's stringify
+overload registration, at first glance, looked like dead code). The
+overloads are registered unconditionally at program-init time (same
+"always registered, harmless when unused" pattern as Math::BigInt's own
+registration block in codegen's generated `main()`).
+
+**Four generic (non-Time::Piece-specific) defects found and fixed while
+testing this, all in code paths that predate this session and are not
+about Time::Piece per se — Time::Piece was simply the first blessed
+class this project shipped whose comparison/arithmetic operators are
+exercised without a numeric-native storage tag backing them (Math::BigInt's
+own `PERL_BIGINT` tag happens to numify correctly by accident of its own
+representation, which is why none of these four were caught by BigInt's
+existing test coverage):**
+
+- **D139** (`perl_num_eq`/`perl_num_ne`, `src/runtime.c`): the
+  ref-identity fast path (`a->pval == b->pval` for two ref-shaped
+  values) ran *before* the blessed-class `<=>`-overload check below it,
+  so it was unreachable for any blessed ref — `$t1 == $t2` for two
+  *different* Time::Piece objects holding the *same* epoch compared
+  object pointers (false) instead of dispatching (which says true).
+  Fixed by swapping the order: blessed-overload dispatch first, ref
+  identity only as the fallback for unblessed refs (or blessed ones
+  with no `<=>` registered).
+- **D140** (`perl_spaceship`, `cmp_num_asc`, `src/runtime.c`): neither
+  ever checked for a registered `<=>` overload at all. `perl_spaceship`
+  is the direct `<=>` operator; `cmp_num_asc` is what the parser's
+  *literal-text* recognition of `sort { $a <=> $b }`/`{ $b <=> $a }`
+  (`src/parser.cpp`, computing `sortMode`) routes straight to, entirely
+  bypassing the general per-element comparator/PerlValue call machinery
+  as a performance optimization — so even after fixing `perl_spaceship`
+  itself, `sort { $a <=> $b } @time_pieces` was still broken through
+  this separate fast path. Both now check `blessed_class` and dispatch
+  to `perl_spaceship`/the overload before falling back to raw
+  `perl_to_float` numification.
+- **D141** (`emitF64BinOpWithBigIntGuard`, `src/codegen.cpp`, generalizing
+  D132): D132's runtime tag-check guard (added so the F64 "stay
+  unboxed" fast path doesn't truncate a BigInt-tagged variable) only
+  ever checked `perl_is_bigint_pv` — a new, parallel `perl_is_blessed_pv`
+  runtime predicate (`v->blessed_class != NULL`, tag-independent) is now
+  OR'd into the same runtime branch condition, so `my $t2 = $t1 + 500;
+  my $t3 = $t2 - 200;` no longer silently discards the blessed class on
+  the second statement (the first statement happened to still work,
+  since `$t1` itself — a fresh `LocaltimeFunc`/`GmtimeFunc` result, not
+  yet a `ScalarVar` operand — isn't the operand this guard inspects;
+  it's `$t2`, a `ScalarVar`, that needed the runtime check).
+- **D142** (`emitArrayPtr`'s `NK::LocaltimeFunc`/`GmtimeFunc` case,
+  `src/codegen.cpp`): didn't check the `sval == "scalar_ctx"` marker the
+  parser already stamps for an explicit `scalar localtime(...)`/`scalar
+  gmtime(...)` (parsePrimary's generic "scalar EXPR" case) — so
+  `push @a, scalar gmtime(0)` (and the identical shape inside `map`, the
+  form that actually surfaced this while writing the deep test) wrongly
+  flattened the 9-element list-context array instead of pushing the
+  single scalar-context value. Confirmed this is **not** Time::Piece-
+  specific: `push @b, scalar localtime(0);` was already wrong (pushing 9
+  raw ints instead of the one ctime-string) before any of this session's
+  work, on plain core `localtime`.
+
+**Nondeterminism avoided in the deep test** (the D138/File::Temp class
+of mistake, called out explicitly so it isn't repeated): the test uses
+`gmtime`/`strptime` exclusively, never `localtime` or a no-argument
+"now" call — `localtime`'s `%Z`/`tzoffset`/`isdst` are host-timezone-
+dependent and a no-arg call is wall-clock-dependent, either of which
+would make a byte-for-byte comparison fail on a different machine or a
+different second, not because of a perlc bug.
+
+**Known limitations** (deliberately out of scope for this pass, see
+MVP_ROADMAP.md's "explicitly out of scope" reasoning for the same class
+of decision): `add_months`/`add_years`, `julian_day`/`mjd`/`week`/
+`month_last_day`/`tzoffset`, `->truncate` (confirmed broken/garbage
+output in the real, installed Time::Piece 1.41 itself — deliberately
+not implemented to match), `Time::Seconds` arithmetic (`$ts + 5` returns
+a plain number here, not a new blessed `Time::Seconds`, since
+`PERL_FLOAT`'s existing fallback path already handles the common
+"read `->seconds`/`->pretty` off a diff" case correctly without needing
+overload registration), and string `cmp`/`eq`/`lt` on Time::Piece
+objects (this codebase has no `cmp`-overload dispatch at all yet, for
+any blessed class — a pre-existing gap, not new).
+
+Tests: `tests/time_piece_{smoke,deep}.pl`.
 
 ## Source layout
 

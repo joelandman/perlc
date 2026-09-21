@@ -144,6 +144,7 @@ char       *perl_to_string_dup(const PerlValue *v); /* always heap-allocated (ca
 int        perl_defined(const PerlValue *v);
 int        perl_is_true(const PerlValue *v);
 int        perl_is_bigint_pv(const PerlValue *v); /* D132: cheap tag check for codegen's F64 fast path */
+int        perl_is_blessed_pv(const PerlValue *v); /* generalizes perl_is_bigint_pv to any blessed_class */
 
 /* assignment: dst = src  (manages dst's old string if any) */
 void perl_assign(PerlValue *dst, const PerlValue *src);
@@ -388,6 +389,17 @@ PerlValue *perl_json_encode(PerlValue *pv, long long canonical, long long pretty
 PerlValue *perl_json_decode(PerlValue *json_str);
 PerlValue *perl_json_true(void);
 PerlValue *perl_json_false(void);
+
+/* Time::Piece / Time::Seconds (Tier 2, native) */
+PerlValue *perl_time_piece_new(PerlValue *epoch_pv, long long is_local);
+PerlValue *perl_time_piece_strptime(PerlValue *str_pv, PerlValue *fmt_pv);
+PerlValue *perl_time_piece_method(PerlValue *obj, const char *m, PerlArray *args);
+PerlValue *perl_tp_ovl_str(PerlValue *a);
+PerlValue *perl_tp_ovl_add(PerlValue *a, PerlValue *b);
+PerlValue *perl_tp_ovl_sub(PerlValue *a, PerlValue *b);
+PerlValue *perl_tp_ovl_cmp(PerlValue *a, PerlValue *b);
+PerlValue *perl_ts_new(double secs);
+PerlValue *perl_time_seconds_method(PerlValue *obj, const char *m, PerlArray *args);
 PerlValue *perl_text_wrap(PerlValue *ip, PerlValue *xp, PerlArray *texts,
                           PerlValue *columns, PerlValue *sep, PerlValue *sep2,
                           PerlValue *huge, PerlValue *unexpand);

@@ -349,6 +349,7 @@ void CodeGen::declareRuntime() {
     RT("perl_to_float",      Type::getDoubleTy(ctx_), pv);
     RT("perl_is_true",       Type::getInt32Ty(ctx_), pv);
     RT("perl_is_bigint_pv",  Type::getInt32Ty(ctx_), pv);   /* D132 */
+    RT("perl_is_blessed_pv", Type::getInt32Ty(ctx_), pv);   /* generalizes D132 to any blessed value */
     RT("perl_print",         voidTy, pv);
     RT("perl_say",           voidTy, pv);
     RT("perl_print_string",  voidTy, i8p);
@@ -786,6 +787,7 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_json_decode",      pv, pv);
     RT("perl_json_true",        pv);
     RT("perl_json_false",       pv);
+    RT("perl_time_piece_new",   pv, pv, i64);
     RT("perl_text_wrap",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_text_fill",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_make_path",        av, av, pv, i32);
@@ -1331,12 +1333,19 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     /* localtime / gmtime in list context → 9-element array.
        No-arg localtime()/gmtime() means "now" — pass undef so the runtime
        uses time(NULL); a plain perlUndef() constant evaluated at compile
-       time as the argument would freeze this call's epoch. */
-    if (n.kind == NK::LocaltimeFunc) {
+       time as the argument would freeze this call's epoch. Found while
+       testing Time::Piece: an explicit `scalar localtime(...)`/`scalar
+       gmtime(...)` (parser stamps sval="scalar_ctx" on this same node,
+       see the generic "scalar EXPR" case in parsePrimary) must NOT be
+       treated as a list here — e.g. `push @a, scalar gmtime(0)` was
+       wrongly flattening the 9-element broken-time array (or, with
+       Time::Piece in use, silently discarding the blessed object)
+       instead of pushing the single ctime-string/Time::Piece scalar. */
+    if (n.kind == NK::LocaltimeFunc && n.sval != "scalar_ctx") {
         Value *t = n.left ? emitExpr(*n.left) : perlUndef();
         return callRT("perl_localtime_val", {t});
     }
-    if (n.kind == NK::GmtimeFunc) {
+    if (n.kind == NK::GmtimeFunc && n.sval != "scalar_ctx") {
         Value *t = n.left ? emitExpr(*n.left) : perlUndef();
         return callRT("perl_gmtime_val", {t});
     }
@@ -4161,6 +4170,26 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             }
         }
 
+        /* Time::Piece built-in overloads — same always-registered pattern
+           as Math::BigInt just above (harmless when Time::Piece is never
+           used: perl_dispatch_overload only fires for a matching
+           blessed_class, which nothing else can produce). */
+        {
+            auto *tpStr = builder_.CreateGlobalStringPtr("Time::Piece");
+            struct TpOvlEntry { const char *op; const char *method; };
+            static const TpOvlEntry tpOverloads[] = {
+                {"+",    "perl_tp_ovl_add"},
+                {"-",    "perl_tp_ovl_sub"},
+                {"<=>",  "perl_tp_ovl_cmp"},
+                {"\"\"", "perl_tp_ovl_str"},
+            };
+            for (auto &e : tpOverloads) {
+                Value *opStr = builder_.CreateGlobalStringPtr(e.op);
+                Value *methStr = builder_.CreateGlobalStringPtr(e.method);
+                callRT("perl_register_overload", {tpStr, opStr, methStr});
+            }
+        }
+
         /* set up @ARGV and $0 from command-line arguments */
         {
             Value *argc_v = mainFn->getArg(0);
@@ -5201,10 +5230,17 @@ void CodeGen::emitStmt(const Node &n) {
                  if (n.right && n.right->kind == NK::IntLit &&
                      (n.right->ival > 9007199254740992LL || n.right->ival < -9007199254740992LL))
                      fileScalarLargeInt_.insert(nm);
-                 /* D97: track file-scope vars that may hold blessed objects */
+                 /* D97: track file-scope vars that may hold blessed objects.
+                    Time::Piece: `localtime`/`gmtime` in scalar context
+                    return a blessed Time::Piece object when the module is
+                    in use (n.name == "Time::Piece", stamped by the
+                    parser) — without this the object would be silently
+                    int/float-unboxed and destroyed. */
                  if (n.right &&
                      (n.right->kind == NK::MethodCall ||
-                      n.right->kind == NK::BlessFunc))
+                      n.right->kind == NK::BlessFunc ||
+                      ((n.right->kind == NK::LocaltimeFunc || n.right->kind == NK::GmtimeFunc) &&
+                       n.right->name == "Time::Piece")))
                      fileScalarBlessed_.insert(nm);
                  /* D112: always register the package-qualified key (not
                     just when non-main) so lookupVar's qualified-first
@@ -5284,10 +5320,13 @@ void CodeGen::emitStmt(const Node &n) {
                  /* D97: track file-scope vars that may hold blessed objects
                     (assigned from MethodCall or BlessFunc) so canEmitF64
                     excludes them and arithmetic goes through the overload
-                    dispatch path in perl_add/perl_mul/etc. */
+                    dispatch path in perl_add/perl_mul/etc. Time::Piece:
+                    see the identical LocaltimeFunc/GmtimeFunc note above. */
                  if (n.right &&
                      (n.right->kind == NK::MethodCall ||
-                      n.right->kind == NK::BlessFunc))
+                      n.right->kind == NK::BlessFunc ||
+                      ((n.right->kind == NK::LocaltimeFunc || n.right->kind == NK::GmtimeFunc) &&
+                       n.right->name == "Time::Piece")))
                      fileScalarBlessed_.insert(nm);
                  /* D112: register both the bare name (last-declared-wins
                     fallback slot, unchanged prior behavior for lookups
@@ -5320,7 +5359,13 @@ void CodeGen::emitStmt(const Node &n) {
                 bool rhsMayBeBlessed = n.right &&
                     (n.right->kind == NK::MethodCall ||
                      n.right->kind == NK::BlessFunc ||
-                     n.right->kind == NK::Call);
+                     n.right->kind == NK::Call ||
+                     /* Time::Piece: scalar-context localtime/gmtime
+                        returns a blessed object when the module is in
+                        use (n.name == "Time::Piece", stamped by the
+                        parser) — must not be int/float-unboxed. */
+                     ((n.right->kind == NK::LocaltimeFunc || n.right->kind == NK::GmtimeFunc) &&
+                      n.right->name == "Time::Piece"));
                 bool mayBeCaptured = allNamesCaptured_ ||
                     capturedNamesInCurrentFn_.count(nm) != 0 ||
                     capturedNamesInCurrentFn_.count("$" + nm) != 0;
@@ -8928,14 +8973,28 @@ Value *CodeGen::emitExpr(const Node &n) {
         return r;
     }
     /* localtime / gmtime in scalar context return a ctime()-style string
-       ("Thu Jan  1 00:00:00 1970"); list context is intercepted in
-       emitArrayPtr and returns the 9-element list. */
+       ("Thu Jan  1 00:00:00 1970") — UNLESS Time::Piece is in use
+       (n.name == "Time::Piece", stamped by the parser only when it saw
+       importMap_["localtime"/"gmtime"] == "Time::Piece::..."), in which
+       case scalar context returns a blessed Time::Piece object instead
+       (real Time::Piece's @EXPORT override, unconditional on `use
+       Time::Piece;` — no import list needed). List context is
+       intercepted in emitArrayPtr and always returns the plain
+       9-element list either way (real Perl: only scalar context
+       changes). */
     case NK::LocaltimeFunc:
     case NK::GmtimeFunc: {
         Value *t = n.left ? emitExpr(*n.left) : perlUndef();
-        Value *r = n.kind == NK::GmtimeFunc
-            ? callRT("perl_scalar_gmtime", {t})
-            : callRT("perl_scalar_localtime", {t});
+        Value *r;
+        if (n.name == "Time::Piece") {
+            auto *i64Ty = Type::getInt64Ty(ctx_);
+            r = callRT("perl_time_piece_new",
+                       {t, ConstantInt::get(i64Ty, n.kind == NK::GmtimeFunc ? 0 : 1)});
+        } else {
+            r = n.kind == NK::GmtimeFunc
+                ? callRT("perl_scalar_gmtime", {t})
+                : callRT("perl_scalar_localtime", {t});
+        }
         if (n.left) freeIfOwned(t);
         return r;
     }
@@ -11059,8 +11118,19 @@ Value *CodeGen::emitF64BinOpWithBigIntGuard(const Node &n) {
     Value *rPv = rVar ? pvOf(*n.right) : nullptr;
     if ((lVar && !lPv) || (rVar && !rPv)) return nullptr;
 
-    Value *lBig = lPv ? callRT("perl_is_bigint_pv", {lPv}) : nullptr;
-    Value *rBig = rPv ? callRT("perl_is_bigint_pv", {rPv}) : nullptr;
+    /* Found via Time::Piece testing: the BigInt-only tag check missed
+       any OTHER blessed value with an overloaded "+"/"-"/"*" (Time::Piece
+       arithmetic returning a new blessed object) — perl_is_blessed_pv
+       generalizes the same runtime predicate pattern; OR both checks so
+       either condition routes to the boxed (overload-aware) path. */
+    auto orBigOrBlessed = [&](Value *pvv) -> Value * {
+        if (!pvv) return nullptr;
+        Value *big = callRT("perl_is_bigint_pv", {pvv});
+        Value *blessed = callRT("perl_is_blessed_pv", {pvv});
+        return builder_.CreateOr(big, blessed, "big.or.blessed");
+    };
+    Value *lBig = orBigOrBlessed(lPv);
+    Value *rBig = orBigOrBlessed(rPv);
     Value *anyBig;
     auto *i32Ty = Type::getInt32Ty(ctx_);
     if (lBig && rBig)
@@ -11765,6 +11835,21 @@ Value *CodeGen::emitCall(const Node &n) {
     }
     if (n.name == "JSON::PP::true" || n.name == "JSON::true") return callRT("perl_json_true", {});
     if (n.name == "JSON::PP::false" || n.name == "JSON::false") return callRT("perl_json_false", {});
+    /* ── Time::Seconds ONE_* constants (Tier 2, native) ──
+       All 9 are plain compile-time-known numbers (real @Time::Seconds::
+       EXPORT, v1.41) — no runtime call needed. */
+    {
+        static const std::map<std::string, long long> tsConsts = {
+            {"Time::Seconds::ONE_MINUTE", 60}, {"Time::Seconds::ONE_HOUR", 3600},
+            {"Time::Seconds::ONE_DAY", 86400}, {"Time::Seconds::ONE_WEEK", 604800},
+            {"Time::Seconds::ONE_MONTH", 2629744}, {"Time::Seconds::ONE_YEAR", 31556930},
+            {"Time::Seconds::ONE_FINANCIAL_MONTH", 2592000},
+            {"Time::Seconds::LEAP_YEAR", 31622400}, {"Time::Seconds::NON_LEAP_YEAR", 31536000},
+        };
+        auto it = tsConsts.find(n.name);
+        if (it != tsConsts.end())
+            return callRT("perl_alloc_int", {ConstantInt::get(Type::getInt64Ty(ctx_), it->second)});
+    }
     /* ── Text::Wrap (Tier 1, native) ──
        wrap(IP, XP, @texts) / fill(IP, XP, @lines) with the live package
        vars $Text::Wrap::columns / $separator / $separator2 / $huge read
