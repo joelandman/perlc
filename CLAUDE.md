@@ -18,9 +18,40 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-20, re-verified after Time::Piece/Time::Seconds —
-388/388 PASS, 0 FAIL; `make test` 47/47):** New this session:
-`Time::Piece` (`localtime`/`gmtime` scalar-context override,
+**Harness (2026-09-20, remaining Tier-2 surface + Tier-3 modules —
+408/408 PASS, 0 FAIL):** New this session: remaining scoped-out surface on
+Hash::Util (hashref variants, `lock_hash_recurse`, slice-assign checks),
+JSON::PP (`allow_nonref`, `space_before`/`space_after`, `convert_blessed`,
+`\u` decode as character strings, surrogate pairs), Text::CSV
+(`quote_char => undef`, `csv()`, EOF diag 2012), Storable
+(`freeze`/`thaw`/`nfreeze`/`store`/`nstore`/`retrieve` round-trip), plus
+Tier-3 native modules `Try::Tiny`, `List::MoreUtils`, `Term::ANSIColor`,
+`Encode`. Tests: `tests/hash_util_ref_{smoke,deep}.pl`,
+`tests/json_pp_opts_{smoke,deep}.pl`, `tests/storable_freeze_{smoke,deep}.pl`,
+`tests/text_csv_extra_{smoke,deep}.pl`, `tests/try_tiny_{smoke,deep}.pl`,
+`tests/list_moreutils_{smoke,deep}.pl`, `tests/term_ansicolor_{smoke,deep}.pl`,
+`tests/encode_{smoke,deep}.pl`. Previous session: `Text::CSV`/
+`Text::CSV_PP`/`Text::CSV_XS` (all three alias one native
+implementation) — `->new`, `parse`/`fields`/`combine`/`string`/
+`status`, `getline`/`getline_all`/`getline_hr`/`getline_hr_all`/
+`column_names`, `print`/`say`, `error_diag`/`error_input`/`SetDiag`,
+and the `sep_char`/`quote_char`/`escape_char`/`eol`/`binary`/
+`always_quote`/`quote_space`/`allow_whitespace`/`allow_loose_quotes`/
+`blank_is_undef`/`empty_is_undef` accessors — `tests/text_csv_
+{smoke,deep}.pl`. Also found and fixed **D143/D144** (see TESTS.md):
+D143 is a broad, pre-existing codegen gap — OO method calls never
+propagated list/scalar context into `perl_dispatch_method`, so any
+context-sensitive method (Text::CSV's `fields`, DBI's
+`fetchrow_array`) silently misbehaved in list context
+(`join("|", $csv->fields)`, `my @f = $csv->fields;`); the fix (a new
+`NK::MethodCall` case in `emitArrayPtr`) initially broke
+`d75_multi_inherit.pl` by not excluding `isa`/`can`/`SUPER::`/
+Math::BigInt/threads' bespoke codegen paths — caught by `make
+test-all`, fixed same-day. D144 is in-memory filehandles only syncing
+their backing scalar on `close()` instead of on every write (a plain
+`print $fh "x"; print "[$out]";` with no close reproduces it, nothing
+CSV-specific). Previous session (2026-09-20, Time::Piece/Time::Seconds
+— 388/388 PASS): `Time::Piece` (`localtime`/`gmtime` scalar-context override,
 `->new`/`->strptime`, accessors, `strftime`, `+`/`-`/`<=>`/`""`
 overloads) and `Time::Seconds` (`->new`, `seconds`/`minutes`/`hours`/
 `days`/`weeks`/`months`/`years`/`pretty`, the 9 `ONE_*`/`LEAP_YEAR`
@@ -560,7 +591,9 @@ floor/ceil/fmod/strftime, Scalar::Util, Carp, Time::HiRes, `pack`/`unpack`;
 Getopt::Long, Data::Dumper, File::Basename (2026-09-09 — see TESTS.md's
 "Real-world module survey"); File::Copy, File::Find, File::Path,
 File::Temp, Storable::dclone, Text::Wrap (2026-09-19); JSON::PP,
-Time::Piece, Time::Seconds (2026-09-20);
+Time::Piece, Time::Seconds, Text::CSV, Text::CSV_PP, Text::CSV_XS,
+Hash::Util (2026-09-20); Storable freeze/thaw, Try::Tiny, List::MoreUtils,
+Term::ANSIColor, Encode (2026-09-20);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`

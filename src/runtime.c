@@ -32,6 +32,7 @@
 #include <limits.h>
 #include <time.h>
 #include <stdarg.h>
+#include <iconv.h>
 
 /* D97: mini-gmp for Math::BigInt — compiled into the runtime (zero external
    dependency).  Included early so mpz_t is available in perl_clone/perl_free. */
@@ -3619,6 +3620,11 @@ void perl_hash_free(PerlHash *h) {
         }
     }
     if (h->mu) { pthread_mutex_destroy(h->mu); free(h->mu); }
+    if (h->lock) {
+        for (long long i = 0; i < h->lock->n; i++) free(h->lock->legal[i]);
+        free(h->lock->legal);
+        free(h->lock);
+    }
     free(h);
 }
 
@@ -3654,6 +3660,41 @@ void perl_lock_hash(PerlHash *h) {
     }
 }
 
+/* ── Hash::Util enforcement (checked at every read/write choke point
+   below; a NULL h->lock, the universal case, costs one pointer compare) ── */
+static int hu_is_legal(const PerlHash *h, const char *key) {
+    if (!h->lock) return 1;
+    for (long long i = 0; i < h->lock->n; i++)
+        if (strcmp(h->lock->legal[i], key) == 0) return 1;
+    return 0;
+}
+static void hu_die_disallowed(const char *key) {
+    perl_die_croak("Attempt to access disallowed key '%s' in a restricted hash", key);
+}
+static void hu_die_readonly(void) {
+    perl_die_croak("Modification of a read-only value attempted");
+}
+/* Read-side guard: dies for a key that was never made legal. Read of an
+   absent-but-legal ("hidden", i.e. deleted) key returns undef, same as
+   an ordinary unrestricted hash — only illegality dies, not absence. */
+static void hu_check_read(const PerlHash *h, const char *key) {
+    if (h->lock && h->lock->keys_locked && !hu_is_legal(h, key)) hu_die_disallowed(key);
+}
+/* Write-side guard: dies for a disallowed key regardless of e (only when
+   keys are actually locked — a hash touched only by lock_value() has a
+   PerlHashLock but keys_locked==0, so this half is a no-op for it), or
+   for a write to an EXISTING entry (e non-NULL) that's read-only —
+   either the whole hash's values are locked (lock_hash) or this specific
+   value was (lock_value). A fresh/hidden legal key (e is NULL) is always
+   still writable even under values_locked — confirmed against real Perl
+   (delete then re-add on a lock_hash'd hash succeeds). */
+static void hu_check_write(const PerlHash *h, const char *key, const PerlHashEntry *e) {
+    if (!h->lock) return;
+    if (h->lock->keys_locked && !hu_is_legal(h, key)) hu_die_disallowed(key);
+    if (e && (h->lock->values_locked || (e->val && (e->val->flags & PV_FLAG_READONLY))))
+        hu_die_readonly();
+}
+
 static PerlHashEntry *hash_find(PerlHash *h, const char *key) {
     unsigned int b = hash_str(key);
     for (PerlHashEntry *e = h->buckets[b]; e; e = e->next)
@@ -3663,6 +3704,7 @@ static PerlHashEntry *hash_find(PerlHash *h, const char *key) {
 
 PerlValue *perl_hash_get_sv(PerlHash *h, PerlValue *key) {
     char *ks = perl_to_string_dup(key);
+    if (h->lock) hu_check_read(h, ks);
     PerlHashEntry *e = hash_find(h, ks);
     free(ks);
     return e ? perl_clone(e->val) : perl_alloc_undef();
@@ -3672,6 +3714,7 @@ PerlValue *perl_hash_get_sv(PerlHash *h, PerlValue *key) {
  * Valid until the hash is next modified. Never call perl_free on the result. */
 HOTX PerlValue *perl_hash_get_sv_ref(PerlHash *h, PerlValue *key) {
     char *ks = perl_to_string_dup(key);
+    if (h->lock) hu_check_read(h, ks);
     PerlHashEntry *e = hash_find(h, ks);
     free(ks);
     return e ? e->val : &pv_undef_sentinel_;
@@ -3679,6 +3722,7 @@ HOTX PerlValue *perl_hash_get_sv_ref(PerlHash *h, PerlValue *key) {
 
 /* Constant-key variants: key is a C string literal — no strdup/free needed. */
 HOTX PerlValue *perl_hash_get_str_ref(PerlHash *h, const char *key) {
+    if (h->lock) hu_check_read(h, key);
     PerlHashEntry *e = hash_find(h, key);
     return e ? e->val : &pv_undef_sentinel_;
 }
@@ -3687,6 +3731,7 @@ void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
     char *ks = perl_to_string_dup(key);
     unsigned int b = hash_str(ks);
     PerlHashEntry *e = hash_find(h, ks);
+    if (h->lock) hu_check_write(h, ks, e);
     if (e) {
         /* Self-assignment ($h{k} = $h{k}) must be a no-op — see the
            identical fix/comment in perl_array_set. */
@@ -3714,6 +3759,7 @@ void perl_hash_set_sv(PerlHash *h, PerlValue *key, PerlValue *val) {
 HOTX void perl_hash_set_str(PerlHash *h, const char *key, PerlValue *val) {
     unsigned int b = hash_str(key);
     PerlHashEntry *e = hash_find(h, key);
+    if (h->lock) hu_check_write(h, key, e);
     if (e) {
         /* Self-assignment ($h{k} = $h{k}) must be a no-op — see the
            identical fix/comment in perl_array_set. */
@@ -3747,6 +3793,7 @@ HOTX int perl_hash_exists_str(PerlHash *h, const char *key) {
    Unlike perl_hash_get_str_ref, never returns the read-only sentinel. */
 PerlValue *perl_hash_lvalue_str(PerlHash *h, const char *key) {
     PerlHashEntry *e = hash_find(h, key);
+    if (h->lock) hu_check_write(h, key, e);
     if (e) return e->val;
     PerlValue *v = perl_alloc_undef();
     unsigned int b = hash_str(key);
@@ -4126,6 +4173,15 @@ PerlValue *perl_deref_array_auto(PerlValue *ref_pv, long long idx) {
 /* Lvalue hash-slice assignment: @h{@keys} = @vals  (zip keys→vals) */
 void perl_hash_assign_slice(PerlHash *h, PerlArray *keys, PerlArray *vals) {
     long long n = keys->len < vals->len ? keys->len : vals->len;
+    /* Check every key first so a restricted-hash death leaves the hash
+       unchanged (real Hash::Util: `@h{qw(a c)} = ...` on a lock_keys hash
+       does not write the legal keys before dying on the illegal one). */
+    for (long long i = 0; i < n; i++) {
+        char *key = perl_to_string_dup(keys->elems[i]);
+        PerlHashEntry *e = hash_find(h, key);
+        if (h->lock) hu_check_write(h, key, e);
+        free(key);
+    }
     for (long long i = 0; i < n; i++) {
         char *key = perl_to_string_dup(keys->elems[i]);
         perl_hash_set_str(h, key, vals->elems[i]);
@@ -5695,6 +5751,14 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
             PerlHash *h = perl_anon_hash_new();
             perl_hash_set_str(h, "canonical", perl_alloc_int(0));
             perl_hash_set_str(h, "pretty", perl_alloc_int(0));
+            perl_hash_set_str(h, "ascii", perl_alloc_int(0));
+            perl_hash_set_str(h, "utf8", perl_alloc_int(0));
+            perl_hash_set_str(h, "allow_nonref", perl_alloc_int(1));
+            perl_hash_set_str(h, "relaxed", perl_alloc_int(0));
+            perl_hash_set_str(h, "convert_blessed", perl_alloc_int(0));
+            perl_hash_set_str(h, "space_before", perl_alloc_int(0));
+            perl_hash_set_str(h, "space_after", perl_alloc_int(0));
+            perl_hash_set_str(h, "indent", perl_alloc_int(0));
             PerlValue *r = perl_ref_hash(h);
             r->blessed_class = strdup("JSON::PP");
             return r;
@@ -5704,26 +5768,55 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
         strcmp(obj->blessed_class, "JSON::PP") == 0) {
         PerlHash *h = (PerlHash *)obj->pval;
         if (strcmp(method, "encode") == 0) {
-            PerlValue *cf = perl_hash_get_str_ref(h, "canonical");
-            PerlValue *pf = perl_hash_get_str_ref(h, "pretty");
             PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
-            return perl_json_encode(arg0, cf ? perl_to_int(cf) : 0, pf ? perl_to_int(pf) : 0);
+            return perl_json_encode(arg0, obj);
         }
         if (strcmp(method, "decode") == 0) {
             PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
-            return perl_json_decode(arg0);
+            return perl_json_decode(arg0, obj);
         }
         if (strcmp(method, "canonical") == 0 || strcmp(method, "pretty") == 0 ||
-            strcmp(method, "indent") == 0) {
-            long long v = (!args || args->len == 0) ? 1 : (perl_to_int(args->elems[0]) ? 1 : 0);
-            perl_hash_set_str(h, strcmp(method, "indent") == 0 ? "pretty" : method, perl_alloc_int(v));
-            return obj; /* chainable */
+            strcmp(method, "indent") == 0 || strcmp(method, "utf8") == 0 ||
+            strcmp(method, "ascii") == 0 || strcmp(method, "allow_nonref") == 0 ||
+            strcmp(method, "space_before") == 0 || strcmp(method, "space_after") == 0 ||
+            strcmp(method, "relaxed") == 0 || strcmp(method, "convert_blessed") == 0 ||
+            strcmp(method, "allow_blessed") == 0) {
+            long long v = (!args || args->len == 0) ? 1 : (perl_is_true(args->elems[0]) ? 1 : 0);
+            const char *key = method;
+            if (strcmp(method, "indent") == 0) {
+                if (args && args->len > 0 && args->elems[0]->tag == PERL_INT &&
+                    perl_to_int(args->elems[0]) > 1) {
+                    perl_hash_set_str(h, "indent", perl_alloc_int(perl_to_int(args->elems[0])));
+                    perl_hash_set_str(h, "pretty", perl_alloc_int(1));
+                    return obj;
+                }
+                key = "pretty";
+            }
+            perl_hash_set_str(h, key, perl_alloc_int(v));
+            if (strcmp(method, "pretty") == 0 && v) {
+                perl_hash_set_str(h, "space_before", perl_alloc_int(1));
+                perl_hash_set_str(h, "space_after", perl_alloc_int(1));
+                if (!perl_hash_get_str_ref(h, "indent") ||
+                    perl_hash_get_str_ref(h, "indent")->tag == PERL_UNDEF)
+                    perl_hash_set_str(h, "indent", perl_alloc_int(3));
+            }
+            return obj;
         }
-        if (strcmp(method, "utf8") == 0 || strcmp(method, "ascii") == 0 ||
-            strcmp(method, "allow_nonref") == 0 || strcmp(method, "space_before") == 0 ||
-            strcmp(method, "space_after") == 0 || strcmp(method, "relaxed") == 0) {
-            return obj; /* accepted, no-op, chainable */
+        if (strcmp(method, "filter_json_object") == 0) {
+            PerlValue *cb = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+            perl_hash_set_str(h, "filter_json_object", cb);
+            return obj;
         }
+    }
+
+    if (obj && obj->tag == PERL_REF_HASH && obj->blessed_class &&
+        strcmp(obj->blessed_class, "Encode::Encoding") == 0)
+        return perl_encode_method(obj, method, args);
+    if (obj && obj->tag == PERL_STRING && obj->sval &&
+        (strcmp(obj->sval, "Encode") == 0)) {
+        if (strcmp(method, "find_encoding") == 0 || strcmp(method, "encode") == 0 ||
+            strcmp(method, "decode") == 0 || strcmp(method, "encodings") == 0)
+            return perl_encode_call(method, args);
     }
 
     /* Time::Piece / Time::Seconds class + instance methods. Class methods
@@ -5756,6 +5849,23 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
     if (obj && obj->tag == PERL_FLOAT && obj->blessed_class &&
         strcmp(obj->blessed_class, "Time::Seconds") == 0)
         return perl_time_seconds_method(obj, method, args);
+
+    /* Text::CSV / Text::CSV_PP / Text::CSV_XS class + instance methods.
+       Real Text::CSV is a thin loader that blesses into whichever of
+       Text::CSV_XS/_PP is available; here all three names just alias the
+       one native implementation, and `->new` blesses into whichever
+       class name the invocant string actually was, matching ref($csv). */
+    if (obj && obj->tag == PERL_STRING && obj->sval &&
+        (strcmp(obj->sval, "Text::CSV") == 0 || strcmp(obj->sval, "Text::CSV_PP") == 0 ||
+         strcmp(obj->sval, "Text::CSV_XS") == 0)) {
+        if (strcmp(method, "new") == 0)
+            return perl_csv_new(obj, (args && args->len > 0) ? args->elems[0] : NULL);
+    }
+    if (obj && obj->tag == PERL_REF_HASH && obj->blessed_class &&
+        (strcmp(obj->blessed_class, "Text::CSV") == 0 ||
+         strcmp(obj->blessed_class, "Text::CSV_PP") == 0 ||
+         strcmp(obj->blessed_class, "Text::CSV_XS") == 0))
+        return perl_csv_method(obj, method, args);
 
     const char *class_name = NULL;
     if (obj && obj->tag == PERL_STRING && obj->sval)
@@ -5912,11 +6022,15 @@ static ssize_t pmf_write(void *c, const char *data, size_t n) {
     memcpy(m->buf + m->len, data, n);
     m->len += n;
     m->buf[m->len] = '\0';
-    return (ssize_t)n;
-}
-
-static int pmf_close(void *c) {
-    PerlMemFile *m = (PerlMemFile *)c;
+    /* Found via Text::CSV testing (though it reproduces with a plain
+       `print $fh "x"; print "[$scalar]"` too — nothing CSV-specific):
+       real Perl's PerlIO::scalar layer for `open $fh, ">", \$scalar`
+       updates the backing scalar SYNCHRONOUSLY on every write — a
+       script that reads $scalar without closing $fh first (very common
+       for in-memory filehandles, which usually exist precisely to
+       inspect output without a round trip through the filesystem) saw
+       it stay empty here, since only pmf_close synced target->sval.
+       Sync it here too; pmf_close no longer needs to (see below). */
     if (m->rw && m->target) {
         char *nb = (char *)malloc(m->len + 1);
         if (nb) {
@@ -5927,6 +6041,11 @@ static int pmf_close(void *c) {
             m->target->slen = (long long)m->len;
         }
     }
+    return (ssize_t)n;
+}
+
+static int pmf_close(void *c) {
+    PerlMemFile *m = (PerlMemFile *)c;
     free(m->buf);
     free(m);
     return 0;
@@ -5995,7 +6114,18 @@ static FILE *perl_open_in_memory(PerlValue *target, const char *mode,
         m->cap = 1;
     }
     FILE *fp = fopencookie(m, readwr ? "r+" : "w", pmf_funcs);
-    if (!fp) { free(m->buf); free(m); }
+    if (!fp) { free(m->buf); free(m); return fp; }
+    /* Found via Text::CSV testing (a plain `print $ofh "x"; print "[$out]"`
+       with no close() already reproduced this on its own — nothing to do
+       with CSV specifically): fopencookie's FILE* is fully buffered by
+       default, so writes sit in libc's buffer until an explicit close/
+       flush, while real Perl's PerlIO::scalar layer for `open $fh, ">",
+       \$scalar` updates the backing scalar synchronously on every write.
+       Unbuffered I/O matches that observable behavior; the memory-cookie
+       write callback (pmf_funcs) already does its own buffer growth, so
+       this doesn't add real per-byte overhead beyond extra write() calls
+       into perl_open_in_memory's own in-process cookie, not a real fd. */
+    setvbuf(fp, NULL, _IONBF, 0);
     return fp;
 }
 
@@ -6561,6 +6691,15 @@ typedef struct {
     size_t cap, pos;
     int    canonical;
     int    pretty;
+    int    ascii;
+    int    utf8;
+    int    allow_nonref;
+    int    convert_blessed;
+    int    space_before;
+    int    space_after;
+    int    indent;
+    int    relaxed;
+    PerlValue *filter;
     /* cycle guard: stack of container pointers currently being encoded
        on the path from the root (NOT a persistent memo — a DAG where the
        same container is reachable via two different sibling paths is
@@ -6569,6 +6708,42 @@ typedef struct {
     void  *stack[256];
     int    depth;
 } JsonBuf;
+
+static int json_opt_bool(PerlValue *opts, const char *key, int dflt) {
+    if (!opts || opts->tag != PERL_REF_HASH || !opts->pval) return dflt;
+    PerlValue *v = perl_hash_get_str_ref((PerlHash *)opts->pval, key);
+    if (!v || v->tag == PERL_UNDEF) return dflt;
+    return perl_is_true(v) ? 1 : 0;
+}
+static int json_opt_int(PerlValue *opts, const char *key, int dflt) {
+    if (!opts || opts->tag != PERL_REF_HASH || !opts->pval) return dflt;
+    PerlValue *v = perl_hash_get_str_ref((PerlHash *)opts->pval, key);
+    if (!v || v->tag == PERL_UNDEF) return dflt;
+    return (int)perl_to_int(v);
+}
+static void json_load_opts(JsonBuf *b, PerlValue *opts) {
+    b->canonical      = json_opt_bool(opts, "canonical", 0);
+    b->pretty         = json_opt_bool(opts, "pretty", 0);
+    b->ascii          = json_opt_bool(opts, "ascii", 0);
+    b->utf8           = json_opt_bool(opts, "utf8", 0);
+    b->allow_nonref   = json_opt_bool(opts, "allow_nonref", 1);
+    b->convert_blessed= json_opt_bool(opts, "convert_blessed", 0);
+    b->space_before   = json_opt_bool(opts, "space_before", 0);
+    b->space_after    = json_opt_bool(opts, "space_after", 0);
+    b->indent         = json_opt_int(opts, "indent", b->pretty ? 3 : 0);
+    b->relaxed        = json_opt_bool(opts, "relaxed", 0);
+    b->filter         = NULL;
+    if (opts && opts->tag == PERL_REF_HASH && opts->pval) {
+        PerlValue *f = perl_hash_get_str_ref((PerlHash *)opts->pval, "filter_json_object");
+        if (f && f->tag == PERL_CODE_REF) b->filter = f;
+    }
+    if (b->pretty) {
+        if (!b->space_before && !b->space_after) {
+            b->space_before = 1; b->space_after = 1;
+        }
+        if (b->indent <= 0) b->indent = 3;
+    }
+}
 
 static void jb_ensure(JsonBuf *b, size_t n) {
     while (b->pos + n + 1 > b->cap) { b->cap = b->cap ? b->cap * 2 : 256; b->buf = realloc(b->buf, b->cap); }
@@ -6580,15 +6755,19 @@ static void jb_puts(JsonBuf *b, const char *s, size_t l) {
 }
 static void jb_putstr(JsonBuf *b, const char *s) { jb_puts(b, s, strlen(s)); }
 static void jb_newline(JsonBuf *b, int indent) {
-    if (!b->pretty) return;
+    if (!b->pretty && b->indent <= 0) return;
     jb_puts(b, "\n", 1);
-    for (int i = 0; i < indent * 3; i++) jb_puts(b, " ", 1);
+    int n = indent * (b->indent > 0 ? b->indent : 3);
+    for (int i = 0; i < n; i++) jb_puts(b, " ", 1);
+}
+static void jb_colon(JsonBuf *b) {
+    if (b->space_before) jb_puts(b, " ", 1);
+    jb_puts(b, ":", 1);
+    if (b->space_after) jb_puts(b, " ", 1);
 }
 
 /* JSON string escaping: " \ and control chars (\n \r \t \b \f, \u00XX for
-   the rest); everything else (including raw UTF-8 continuation bytes) is
-   copied through unchanged, matching real JSON::PP's non-ASCII default
-   (`->ascii` forcing \uXXXX for the whole string is out of scope). */
+   the rest). `->ascii` emits \uXXXX for every non-ASCII byte. */
 static void json_escape_string(JsonBuf *b, const char *s, size_t len) {
     jb_puts(b, "\"", 1);
     for (size_t i = 0; i < len; i++) {
@@ -6602,7 +6781,7 @@ static void json_escape_string(JsonBuf *b, const char *s, size_t len) {
             case '\b': jb_putstr(b, "\\b"); break;
             case '\f': jb_putstr(b, "\\f"); break;
             default:
-                if (c < 0x20) {
+                if (c < 0x20 || (b->ascii && c >= 0x80)) {
                     char esc[8];
                     snprintf(esc, sizeof esc, "\\u%04x", c);
                     jb_putstr(b, esc);
@@ -6661,7 +6840,7 @@ static void json_encode_hash(JsonBuf *b, PerlHash *h, int depth) {
     for (long long i = 0; i < n; i++) {
         jb_newline(b, depth + 1);
         json_escape_string(b, keys[i], strlen(keys[i]));
-        jb_putstr(b, b->pretty ? " : " : ":");
+        jb_colon(b);
         json_encode_value(b, vals[i], depth + 1);
         if (i + 1 < n) jb_putstr(b, ",");
     }
@@ -6671,12 +6850,37 @@ static void json_encode_hash(JsonBuf *b, PerlHash *h, int depth) {
     b->depth--;
 }
 
+static int json_is_ref_value(PerlValue *v) {
+    if (!v) return 0;
+    perl_promote_ref_array(v);
+    return v->tag == PERL_REF_ARRAY || v->tag == PERL_REF_HASH ||
+           v->tag == PERL_REF_SCALAR || v->tag == PERL_FLAT_ARRAY ||
+           v->tag == PERL_FLOAT_PAIR;
+}
+
 static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
-    if (!v || v->tag == PERL_UNDEF) { jb_putstr(b, "null"); return; }
-    perl_promote_ref_array(v); /* D105: FLAT_ARRAY/FLOAT_PAIR -> real REF_ARRAY */
-    if (v->blessed_class && strcmp(v->blessed_class, "JSON::PP::Boolean") == 0) {
+    if (v && v->blessed_class && strcmp(v->blessed_class, "JSON::PP::Boolean") == 0) {
         jb_putstr(b, perl_is_true(v) ? "true" : "false");
         return;
+    }
+    if (!v || v->tag == PERL_UNDEF) {
+        if (depth == 0 && !b->allow_nonref)
+            perl_die_croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
+        jb_putstr(b, "null"); return;
+    }
+    perl_promote_ref_array(v); /* D105: FLAT_ARRAY/FLOAT_PAIR -> real REF_ARRAY */
+    if (depth == 0 && !b->allow_nonref && !json_is_ref_value(v)) {
+        perl_die_croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
+    }
+    if (v->blessed_class && strcmp(v->blessed_class, "JSON::PP::Boolean") != 0 &&
+        (v->tag == PERL_REF_HASH || v->tag == PERL_REF_ARRAY || v->tag == PERL_REF_SCALAR)) {
+        if (b->convert_blessed) {
+            PerlValue *converted = perl_dispatch_method(v, "TO_JSON", NULL);
+            if (converted && converted != v) {
+                json_encode_value(b, converted, depth);
+                return;
+            }
+        }
     }
     switch (v->tag) {
         case PERL_INT: {
@@ -6713,8 +6917,9 @@ static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
     }
 }
 
-PerlValue *perl_json_encode(PerlValue *pv, long long canonical, long long pretty) {
-    JsonBuf b = { .canonical = (int)canonical, .pretty = (int)pretty };
+PerlValue *perl_json_encode(PerlValue *pv, PerlValue *opts) {
+    JsonBuf b = {0};
+    json_load_opts(&b, opts);
     json_encode_value(&b, pv, 0);
     if (b.pretty) jb_puts(&b, "\n", 1);
     PerlValue *r = perl_alloc_string_len(b.buf ? b.buf : "", (long long)b.pos);
@@ -6724,13 +6929,28 @@ PerlValue *perl_json_encode(PerlValue *pv, long long canonical, long long pretty
 
 /* ---- JSON::PP decode ---- */
 
-typedef struct { const char *s; size_t len, pos; } JsonParser;
+typedef struct {
+    const char *s; size_t len, pos;
+    int relaxed, allow_nonref, utf8;
+    PerlValue *filter;
+} JsonParser;
 
 static void jp_skip_ws(JsonParser *p) {
     while (p->pos < p->len) {
         char c = p->s[p->pos];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') p->pos++;
-        else break;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { p->pos++; continue; }
+        if (!p->relaxed) break;
+        if (c == '#') { while (p->pos < p->len && p->s[p->pos] != '\n') p->pos++; continue; }
+        if (c == '/' && p->pos + 1 < p->len && p->s[p->pos + 1] == '/') {
+            p->pos += 2; while (p->pos < p->len && p->s[p->pos] != '\n') p->pos++; continue;
+        }
+        if (c == '/' && p->pos + 1 < p->len && p->s[p->pos + 1] == '*') {
+            p->pos += 2;
+            while (p->pos + 1 < p->len && !(p->s[p->pos] == '*' && p->s[p->pos + 1] == '/')) p->pos++;
+            if (p->pos + 1 < p->len) p->pos += 2;
+            continue;
+        }
+        break;
     }
 }
 static int jp_peek(JsonParser *p) { return p->pos < p->len ? (unsigned char)p->s[p->pos] : -1; }
@@ -6775,19 +6995,37 @@ static PerlValue *jp_parse_string_raw(JsonParser *p) {
                         else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
                         else { free(out); jp_die(p, "bad \\u escape"); }
                     }
-                    /* Encode as UTF-8. Surrogate pairs (astral plane,
-                       U+10000+) are out of scope — codepoints in the
-                       surrogate range are emitted as their raw 3-byte
-                       UTF-8 form rather than combined, a documented
-                       limitation (see TESTS.md). */
+                    /* Surrogate pair: high (D800–DBFF) followed by \u low (DC00–DFFF)
+                       combines into a single astral codepoint. */
+                    if (cp >= 0xD800 && cp <= 0xDBFF &&
+                        p->pos + 6 <= p->len && p->s[p->pos] == '\\' && p->s[p->pos + 1] == 'u') {
+                        unsigned int lo = 0; int ok = 1;
+                        for (int i = 0; i < 4; i++) {
+                            char h = p->s[p->pos + 2 + i];
+                            lo <<= 4;
+                            if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
+                            else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
+                            else { ok = 0; break; }
+                        }
+                        if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            p->pos += 6;
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        }
+                    }
                     if (len + 4 > cap) { cap *= 2; out = realloc(out, cap); }
                     if (cp < 0x80) {
                         out[len++] = (char)cp;
                     } else if (cp < 0x800) {
                         out[len++] = (char)(0xC0 | (cp >> 6));
                         out[len++] = (char)(0x80 | (cp & 0x3F));
-                    } else {
+                    } else if (cp < 0x10000) {
                         out[len++] = (char)(0xE0 | (cp >> 12));
+                        out[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[len++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out[len++] = (char)(0xF0 | (cp >> 18));
+                        out[len++] = (char)(0x80 | ((cp >> 12) & 0x3F));
                         out[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                         out[len++] = (char)(0x80 | (cp & 0x3F));
                     }
@@ -6803,6 +7041,8 @@ static PerlValue *jp_parse_string_raw(JsonParser *p) {
         }
     }
     PerlValue *r = perl_alloc_string_len(out, (long long)len);
+    for (size_t i = 0; i < len; i++)
+        if ((unsigned char)out[i] >= 0x80) { r->flags |= PV_FLAG_UTF8; break; }
     free(out);
     return r;
 }
@@ -6843,6 +7083,7 @@ static PerlValue *jp_parse_array(JsonParser *p) {
     if (jp_peek(p) == ']') { p->pos++; return perl_ref_array(av); }
     while (1) {
         jp_skip_ws(p);
+        if (p->relaxed && jp_peek(p) == ']') { p->pos++; break; }
         PerlValue *v = jp_parse_value(p);
         perl_array_push(av, v);
         jp_skip_ws(p);
@@ -6861,6 +7102,7 @@ static PerlValue *jp_parse_object(JsonParser *p) {
     if (jp_peek(p) == '}') { p->pos++; return perl_ref_hash(h); }
     while (1) {
         jp_skip_ws(p);
+        if (p->relaxed && jp_peek(p) == '}') { p->pos++; break; }
         if (jp_peek(p) != '"') jp_die(p, "expected string key");
         PerlValue *key = jp_parse_string_raw(p);
         jp_skip_ws(p);
@@ -6876,7 +7118,15 @@ static PerlValue *jp_parse_object(JsonParser *p) {
         if (c == '}') { p->pos++; break; }
         jp_die(p, "expected ',' or '}'");
     }
-    return perl_ref_hash(h);
+    PerlValue *href = perl_ref_hash(h);
+    if (p->filter) {
+        PerlArray *fa = perl_array_new();
+        perl_array_push(fa, href);
+        PerlValue *out = perl_call_code_ref(p->filter, fa);
+        perl_array_free(fa);
+        if (out) return out;
+    }
+    return href;
 }
 
 static PerlValue *jp_parse_value(JsonParser *p) {
@@ -6899,15 +7149,25 @@ static PerlValue *jp_parse_value(JsonParser *p) {
     return perl_alloc_undef(); /* unreachable */
 }
 
-PerlValue *perl_json_decode(PerlValue *json_str) {
+PerlValue *perl_json_decode(PerlValue *json_str, PerlValue *opts) {
     char *s = perl_to_string_dup(json_str);
-    JsonParser p = { .s = s, .len = strlen(s), .pos = 0 };
+    JsonParser p = { .s = s, .len = strlen(s), .pos = 0,
+                     .relaxed = json_opt_bool(opts, "relaxed", 0),
+                     .allow_nonref = json_opt_bool(opts, "allow_nonref", 1),
+                     .utf8 = json_opt_bool(opts, "utf8", 0) };
+    if (opts && opts->tag == PERL_REF_HASH && opts->pval) {
+        PerlValue *f = perl_hash_get_str_ref((PerlHash *)opts->pval, "filter_json_object");
+        if (f && f->tag == PERL_CODE_REF) p.filter = f;
+    }
     jp_skip_ws(&p);
     if (p.pos >= p.len) { free(s); jp_die(&p, "unexpected end of input"); }
     PerlValue *v = jp_parse_value(&p);
     jp_skip_ws(&p);
     if (p.pos != p.len) { free(s); jp_die(&p, "garbage after JSON value"); }
     free(s);
+    if (!p.allow_nonref && !json_is_ref_value(v) &&
+        !(v && v->blessed_class && strcmp(v->blessed_class, "JSON::PP::Boolean") == 0))
+        perl_die_croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
     return v;
 }
 
@@ -13181,6 +13441,1704 @@ PerlValue *perl_time_seconds_method(PerlValue *obj, const char *m, PerlArray *ar
         return perl_alloc_string(out);
     }
     perl_die_croak("Can't locate object method \"%s\" via package \"Time::Seconds\"", m);
+    return perl_alloc_undef();
+}
+
+/* ── Text::CSV / Text::CSV_PP / Text::CSV_XS (Tier 2, native) ────────────────
+   Object = blessed anonymous PerlHash (bare attributes + a few internal
+   `_`-prefixed fields: _fields, _string, _error_code, _error_str,
+   _error_pos, _column_names) — matches real Text::CSV_PP's own
+   implementation shape closely enough that nothing here needed new
+   PerlValue machinery. `Text::CSV_XS`/`Text::CSV` both alias this same
+   native implementation (real `Text::CSV` is a thin loader that blesses
+   into whichever backend is available); `ref($csv)` reflects whichever
+   class `->new` was actually called on, matching real Perl.
+   Scope: see TESTS.md for the full list of what's deliberately not
+   implemented (bind_columns, types, callbacks, meta_info, encoding
+   layers, the functional csv() helper, quote_char=>undef "no quoting"
+   mode). Diagnostic codes are implemented for exactly the 3 error
+   conditions the deep test exercises (2110/2021/2034, probed against
+   the real, installed Text::CSV_PP 2.06) — not the full ~30-code table. */
+
+typedef struct {
+    char sep, quote, escape;
+    int has_quote;
+    int binary, always_quote, quote_space, allow_whitespace, allow_loose_quotes;
+    int blank_is_undef, empty_is_undef;
+} CsvOpts;
+
+static char csv_opt_char(PerlHash *h, const char *key, char dflt) {
+    PerlValue *v = perl_hash_get_str_ref(h, key);
+    if (!v || v->tag == PERL_UNDEF) return 0;
+    const char *s = perl_to_string(v);
+    return s[0] ? s[0] : dflt;
+}
+static int csv_opt_bool(PerlHash *h, const char *key, int dflt) {
+    PerlValue *v = perl_hash_get_str_ref(h, key);
+    if (!v || v->tag == PERL_UNDEF) return dflt;
+    return perl_is_true(v);
+}
+static void csv_load_opts(PerlHash *h, CsvOpts *o) {
+    PerlValue *qv = perl_hash_get_str_ref(h, "quote_char");
+    o->sep               = csv_opt_char(h, "sep_char", ',');
+    if (!o->sep) o->sep = ',';
+    if (!qv || qv->tag == PERL_UNDEF) { o->quote = 0; o->has_quote = 0; }
+    else { o->quote = csv_opt_char(h, "quote_char", '"'); o->has_quote = o->quote != 0; }
+    o->escape            = csv_opt_char(h, "escape_char", o->has_quote ? o->quote : '"');
+    o->binary            = csv_opt_bool(h, "binary", 0);
+    o->always_quote      = csv_opt_bool(h, "always_quote", 0);
+    o->quote_space       = csv_opt_bool(h, "quote_space", 1);
+    o->allow_whitespace  = csv_opt_bool(h, "allow_whitespace", 0);
+    o->allow_loose_quotes = csv_opt_bool(h, "allow_loose_quotes", 0);
+    o->blank_is_undef     = csv_opt_bool(h, "blank_is_undef", 0);
+    o->empty_is_undef     = csv_opt_bool(h, "empty_is_undef", 0);
+}
+
+/* perl_hash_set_str CLONES its value argument (never takes ownership) —
+   this helper is for the common "build a fresh temporary just to store
+   it" shape so the temporary doesn't leak; never call it with a
+   borrowed value (e.g. an args->elems[i]) since it frees what it's given. */
+static void csv_hset(PerlHash *h, const char *key, PerlValue *owned_tmp) {
+    perl_hash_set_str(h, key, owned_tmp);
+    perl_free(owned_tmp);
+}
+/* Same shape as csv_hset but for perl_array_push (also clone-on-push). */
+static void csv_apush(PerlArray *a, PerlValue *owned_tmp) {
+    perl_array_push(a, owned_tmp);
+    perl_free(owned_tmp);
+}
+
+/* Real Text::CSV_PP's error sentinel for "no error" is code 0 / empty
+   message (confirmed: a fresh, never-used object's `0+error_diag` is 0
+   and scalar `error_diag` is the literal string "00000" — i.e. code=0,
+   msg="", pos=0,0,0 concatenated — NOT a "2000/EOF - No error" code as
+   an earlier draft of this assumed). `status` is a separate tri-state:
+   undef (never parsed/combined yet) / 1 (last call succeeded) / 0 (last
+   call failed) — also confirmed empirically, not derivable from the
+   error code alone since both "never used" and "succeeded" share code 0. */
+static void csv_set_error(PerlHash *h, int code, const char *msg, long long pos) {
+    csv_hset(h, "_error_code", perl_alloc_int(code));
+    csv_hset(h, "_error_str", perl_alloc_string(msg));
+    csv_hset(h, "_error_pos", perl_alloc_int(pos));
+    csv_hset(h, "_status", perl_alloc_int(0));
+}
+static void csv_clear_error(PerlHash *h) {
+    csv_hset(h, "_error_code", perl_alloc_int(0));
+    csv_hset(h, "_error_str", perl_alloc_string(""));
+    csv_hset(h, "_error_pos", perl_alloc_int(0));
+    csv_hset(h, "_status", perl_alloc_int(1));
+}
+/* Object construction only — NOT the same as csv_clear_error: a fresh,
+   never-parsed/combined object's `status` is undef (empty string), not
+   1, so this deliberately leaves "_status" unset. */
+static void csv_init_error(PerlHash *h) {
+    csv_hset(h, "_error_code", perl_alloc_int(0));
+    csv_hset(h, "_error_str", perl_alloc_string(""));
+    csv_hset(h, "_error_pos", perl_alloc_int(0));
+}
+
+enum { CSV_OK = 0, CSV_ERR = 1, CSV_INCOMPLETE = 2 };
+
+/* A single-pass char-by-char field-splitting state machine. Appends one
+   PerlValue string per field to `out`; on CSV_ERR sets err_code/err_pos
+   and leaves `out` however far it got (caller discards). CSV_INCOMPLETE
+   means "still inside a quoted field at end of input" — the caller (only
+   getline does this) may read another physical line and retry the WHOLE
+   buffer from scratch when `binary` is set; parse() (single fixed string,
+   never grows) treats CSV_INCOMPLETE as a hard error (2021), matching
+   real Text::CSV_PP's own behavior verified against the installed module. */
+static int csv_parse_line(const CsvOpts *o, const char *buf, long long len,
+                          PerlArray *out, int *err_code, long long *err_pos,
+                          PerlArray *quoted_flags) {
+    enum { ST_START, ST_UNQ, ST_Q, ST_AFTERQ } state = ST_START;
+    char *field = malloc((size_t)len + 1);
+    long long flen = 0;
+    long long i = 0;
+    int field_quoted = 0;
+    while (i <= len) {
+        int is_end = (i == len);
+        char c = is_end ? '\0' : buf[i];
+        switch (state) {
+        case ST_START:
+            if (is_end) {
+                perl_array_push(out, perl_alloc_string_len(field, flen));
+                if (quoted_flags) perl_array_push(quoted_flags, perl_alloc_int(field_quoted));
+                i++; break;
+            }
+            if (o->has_quote && c == o->quote) { state = ST_Q; field_quoted = 1; i++; break; }
+            if (o->allow_whitespace && (c == ' ' || c == '\t')) { i++; break; }
+            if (c == o->sep) { perl_array_push(out, perl_alloc_string_len(field, flen)); flen = 0; i++; break; }
+            state = ST_UNQ; field[flen++] = c; i++; break;
+        case ST_UNQ:
+            if (is_end || c == o->sep) {
+                long long pushlen = flen;
+                if (o->allow_whitespace)
+                    while (pushlen > 0 && (field[pushlen - 1] == ' ' || field[pushlen - 1] == '\t'))
+                        pushlen--;
+                perl_array_push(out, perl_alloc_string_len(field, pushlen));
+                if (quoted_flags) perl_array_push(quoted_flags, perl_alloc_int(field_quoted));
+                flen = 0; field_quoted = 0; state = ST_START; i++; break;
+            }
+            if (o->has_quote && c == o->quote && !o->allow_loose_quotes) {
+                *err_code = 2034; *err_pos = i; free(field); return CSV_ERR;
+            }
+            field[flen++] = c; i++; break;
+        case ST_Q:
+            if (is_end) {
+                *err_code = 2021; *err_pos = i;
+                free(field);
+                return o->binary ? CSV_INCOMPLETE : CSV_ERR;
+            }
+            if (o->escape != o->quote && c == o->escape && i + 1 < len) {
+                field[flen++] = buf[i + 1]; i += 2; break;
+            }
+            if (c == o->quote) {
+                if (i + 1 < len && buf[i + 1] == o->quote) { field[flen++] = o->quote; i += 2; break; }
+                state = ST_AFTERQ; i++; break;
+            }
+            field[flen++] = c; i++; break;
+        case ST_AFTERQ:
+            if (is_end || c == o->sep) {
+                perl_array_push(out, perl_alloc_string_len(field, flen));
+                if (quoted_flags) perl_array_push(quoted_flags, perl_alloc_int(field_quoted));
+                flen = 0; field_quoted = 0; state = ST_START; i++; break;
+            }
+            if (o->allow_whitespace && (c == ' ' || c == '\t')) { i++; break; }
+            if (!o->allow_loose_quotes) { *err_code = 2034; *err_pos = i; free(field); return CSV_ERR; }
+            field[flen++] = c; state = ST_UNQ; i++; break;
+        }
+    }
+    free(field);
+    return CSV_OK;
+}
+
+static int csv_field_needs_quote(const CsvOpts *o, const char *s, long long len) {
+    if (!o->has_quote) return 0;
+    if (o->always_quote) return 1;
+    for (long long i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == o->sep || c == o->quote || c == '\n' || c == '\r') return 1;
+        if (o->quote_space && c == ' ') return 1;
+    }
+    return 0;
+}
+static int csv_field_has_binary_char(const char *s, long long len) {
+    for (long long i = 0; i < len; i++) if (s[i] == '\n' || s[i] == '\r') return 1;
+    return 0;
+}
+
+/* Builds the combined record body (no eol) into a fresh malloc'd buffer.
+   Returns 1 on success, 0 on failure (2110: an embedded newline/CR in a
+   field when `binary` isn't set — matches real Text::CSV_PP). */
+static int csv_combine(const CsvOpts *o, PerlArray *fields, char **out, long long *outlen, int *err_code) {
+    size_t cap = 256, pos = 0;
+    char *buf = malloc(cap);
+#define CSV_ENSURE(n) do { if (pos + (size_t)(n) + 1 > cap) { while (pos + (size_t)(n) + 1 > cap) cap *= 2; buf = realloc(buf, cap); } } while (0)
+    for (long long i = 0; i < fields->len; i++) {
+        PerlValue *v = fields->elems[i];
+        long long flen = 0;
+        char *s = (v && v->tag != PERL_UNDEF) ? perl_to_string_dup_len(v, &flen) : strdup("");
+        if (csv_field_has_binary_char(s, flen) && !o->binary) {
+            free(s); free(buf);
+            *err_code = 2110;
+            return 0;
+        }
+        if (i > 0) { CSV_ENSURE(1); buf[pos++] = o->sep; }
+        if (csv_field_needs_quote(o, s, flen)) {
+            CSV_ENSURE(1); buf[pos++] = o->quote;
+            for (long long j = 0; j < flen; j++) {
+                if (s[j] == o->quote) { CSV_ENSURE(2); buf[pos++] = o->escape; buf[pos++] = o->quote; }
+                else { CSV_ENSURE(1); buf[pos++] = s[j]; }
+            }
+            CSV_ENSURE(1); buf[pos++] = o->quote;
+        } else {
+            CSV_ENSURE(flen);
+            memcpy(buf + pos, s, (size_t)flen);
+            pos += (size_t)flen;
+        }
+        free(s);
+    }
+#undef CSV_ENSURE
+    *out = buf;
+    *outlen = (long long)pos;
+    return 1;
+}
+
+static PerlArray *csv_fields_array(PerlHash *h) {
+    PerlValue *fv = perl_hash_get_str_ref(h, "_fields");
+    if (!fv || fv->tag != PERL_REF_ARRAY) return NULL;
+    return (PerlArray *)fv->pval;
+}
+
+/* Strips a trailing \r\n / \n / \r (the physical line terminator
+   perl_readline leaves on) — CSV field content never includes it. */
+static long long csv_strip_eol(const char *s, long long len) {
+    if (len >= 2 && s[len - 2] == '\r' && s[len - 1] == '\n') return len - 2;
+    if (len >= 1 && (s[len - 1] == '\n' || s[len - 1] == '\r')) return len - 1;
+    return len;
+}
+
+PerlValue *perl_csv_new(PerlValue *class_pv, PerlValue *opts) {
+    PerlHash *h = perl_anon_hash_new();
+    csv_hset(h, "sep_char", perl_alloc_string(","));
+    csv_hset(h, "quote_char", perl_alloc_string("\""));
+    csv_hset(h, "escape_char", perl_alloc_string("\""));
+    csv_hset(h, "eol", perl_alloc_string(""));
+    csv_hset(h, "binary", perl_alloc_int(0));
+    csv_hset(h, "always_quote", perl_alloc_int(0));
+    csv_hset(h, "quote_space", perl_alloc_int(1));
+    csv_hset(h, "allow_whitespace", perl_alloc_int(0));
+    csv_hset(h, "allow_loose_quotes", perl_alloc_int(0));
+    csv_hset(h, "blank_is_undef", perl_alloc_int(0));
+    csv_hset(h, "empty_is_undef", perl_alloc_int(0));
+    csv_init_error(h);
+    if (opts && opts->tag == PERL_REF_HASH && opts->pval) {
+        PerlHash *oh = (PerlHash *)opts->pval;
+        for (int b = 0; b < PERL_HASH_BUCKETS; b++)
+            for (PerlHashEntry *e = oh->buckets[b]; e; e = e->next)
+                perl_hash_set_str(h, e->key, e->val);
+    }
+    PerlValue *r = perl_ref_hash(h);
+    r->blessed_class = strdup(class_pv && class_pv->sval ? class_pv->sval : "Text::CSV_PP");
+    return r;
+}
+
+PerlValue *perl_csv_method(PerlValue *self, const char *m, PerlArray *args) {
+    PerlHash *h = (PerlHash *)self->pval;
+    CsvOpts o; csv_load_opts(h, &o);
+
+    if (!strcmp(m, "sep_char") || !strcmp(m, "quote_char") || !strcmp(m, "escape_char") ||
+        !strcmp(m, "eol")) {
+        if (args && args->len > 0) perl_hash_set_str(h, m, args->elems[0]);
+        PerlValue *v = perl_hash_get_str_ref(h, m);
+        return v ? perl_clone(v) : perl_alloc_undef();
+    }
+    if (!strcmp(m, "binary") || !strcmp(m, "always_quote") || !strcmp(m, "quote_space") ||
+        !strcmp(m, "allow_whitespace") || !strcmp(m, "allow_loose_quotes") ||
+        !strcmp(m, "blank_is_undef") || !strcmp(m, "empty_is_undef")) {
+        if (args && args->len > 0) csv_hset(h, m, perl_alloc_int(perl_is_true(args->elems[0])));
+        PerlValue *v = perl_hash_get_str_ref(h, m);
+        return perl_alloc_int(v ? perl_to_int(v) : 0);
+    }
+    if (!strcmp(m, "status")) {
+        PerlValue *v = perl_hash_get_str_ref(h, "_status");
+        return v ? perl_clone(v) : perl_alloc_undef();
+    }
+    if (!strcmp(m, "error_input")) {
+        PerlValue *v = perl_hash_get_str_ref(h, "_error_input");
+        return v ? perl_clone(v) : perl_alloc_undef();
+    }
+    if (!strcmp(m, "error_diag")) {
+        PerlValue *code = perl_hash_get_str_ref(h, "_error_code");
+        PerlValue *str  = perl_hash_get_str_ref(h, "_error_str");
+        PerlValue *pos  = perl_hash_get_str_ref(h, "_error_pos");
+        long long codeV = code ? perl_to_int(code) : 2000;
+        if (perl_current_wantarray_ctx()) {
+            PerlArray *av = perl_array_new();
+            csv_apush(av, perl_alloc_int(codeV));
+            if (str) perl_array_push(av, str); else csv_apush(av, perl_alloc_string("EOF - No error"));
+            if (pos) perl_array_push(av, pos); else csv_apush(av, perl_alloc_int(0));
+            csv_apush(av, perl_alloc_int(0));
+            csv_apush(av, perl_alloc_int(0));
+            csv_apush(av, perl_alloc_int(0));
+            return perl_array_to_list_return(av);
+        }
+        /* scalar context: "CODEmessage" concatenated, matching real
+           Text::CSV_PP's scalar-context error_diag (numeric context on
+           that same value, via 0+$csv->error_diag, yields just the
+           code — Perl's normal string/number dual nature of an IV). */
+        char buf[256];
+        snprintf(buf, sizeof buf, "%lld%s", codeV, str ? perl_to_string(str) : "EOF - No error");
+        return perl_alloc_string(buf);
+    }
+    if (!strcmp(m, "SetDiag")) {
+        long long code = (args && args->len > 0) ? perl_to_int(args->elems[0]) : 0;
+        if (code == 0) csv_clear_error(h); else csv_set_error(h, (int)code, "", 0);
+        return perl_alloc_int(1);
+    }
+    if (!strcmp(m, "parse") || !strcmp(m, "combine")) {
+        int isParse = !strcmp(m, "parse");
+        csv_clear_error(h);
+        if (isParse) {
+            PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+            long long len = 0;
+            char *s = perl_to_string_dup_len(arg0, &len);
+            PerlArray *fields = perl_anon_array_new();
+            int err_code = 0; long long err_pos = 0;
+            PerlArray *qflags = perl_anon_array_new();
+            int rc = csv_parse_line(&o, s, len, fields, &err_code, &err_pos, qflags);
+            free(s);
+            if (rc != CSV_OK) {
+                perl_array_free(fields);
+                perl_array_free(qflags);
+                const char *msg = err_code == 2021 ? "EIQ - NL char inside quotes, binary off"
+                                 : err_code == 2034 ? "EIF - Loose unescaped quote"
+                                 : err_code == 2023 ? "EIQ - Quoted field not terminated"
+                                 : "EIQ - Parse error";
+                csv_set_error(h, err_code, msg, err_pos);
+                perl_hash_set_str(h, "_error_input", arg0);
+                return perl_alloc_int(0);
+            }
+            if (o.blank_is_undef || o.empty_is_undef) {
+                for (long long i = 0; i < fields->len; i++) {
+                    PerlValue *fv = fields->elems[i];
+                    if (fv->tag == PERL_STRING && fv->slen == 0) {
+                        perl_free(fields->elems[i]);
+                        fields->elems[i] = perl_alloc_undef();
+                    }
+                }
+            }
+            csv_hset(h, "_fields", perl_ref_array(fields));
+            csv_hset(h, "_quoted", perl_ref_array(qflags));
+            return perl_alloc_int(1);
+        } else {
+            PerlArray *fields = perl_array_new();
+            for (long long i = 0; i < args->len; i++) perl_array_push_nc(fields, args->elems[i]);
+            char *out = NULL; long long outlen = 0; int err_code = 0;
+            int ok = csv_combine(&o, fields, &out, &outlen, &err_code);
+            perl_array_free_nc(fields);
+            if (!ok) {
+                csv_set_error(h, err_code, "ECB - Binary character in Combine, binary off", 0);
+                csv_hset(h, "_string", perl_alloc_string(""));
+                return perl_alloc_int(0);
+            }
+            PerlValue *eolv = perl_hash_get_str_ref(h, "eol");
+            const char *eol = (eolv && eolv->tag == PERL_STRING) ? eolv->sval : "";
+            long long eollen = eolv ? eolv->slen : 0;
+            char *full = malloc((size_t)(outlen + eollen) + 1);
+            memcpy(full, out, (size_t)outlen);
+            memcpy(full + outlen, eol, (size_t)eollen);
+            csv_hset(h, "_string", perl_alloc_string_len(full, outlen + eollen));
+            free(out); free(full);
+            return perl_alloc_int(1);
+        }
+    }
+    if (!strcmp(m, "fields")) {
+        PerlArray *fields = csv_fields_array(h);
+        if (!fields) return perl_alloc_undef();
+        /* real Text::CSV_PP's fields() explicitly returns the field COUNT
+           in scalar context (confirmed: `scalar($csv->fields)` after a
+           2-field parse is 2) — NOT perl_array_to_list_return's generic
+           "last element of the list" default, which would say the last
+           field's own value instead. */
+        if (!perl_current_wantarray_ctx()) return perl_alloc_int(fields->len);
+        PerlArray *copy = perl_anon_array_new();
+        for (long long i = 0; i < fields->len; i++) perl_array_push(copy, fields->elems[i]);
+        return perl_array_to_list_return(copy);
+    }
+    if (!strcmp(m, "string")) {
+        PerlValue *v = perl_hash_get_str_ref(h, "_string");
+        return v ? perl_clone(v) : perl_alloc_undef();
+    }
+    if (!strcmp(m, "column_names")) {
+        /* real Text::CSV_PP's documented idiom is `$csv->column_names(
+           $csv->getline($fh))` — a SINGLE arrayref argument, whose
+           contents become the names list (not a 1-element list holding
+           the arrayref itself). */
+        PerlArray *names = perl_anon_array_new();
+        if (args->len == 1 && args->elems[0]->tag == PERL_REF_ARRAY && args->elems[0]->pval) {
+            PerlArray *src = (PerlArray *)args->elems[0]->pval;
+            for (long long i = 0; i < src->len; i++) perl_array_push(names, src->elems[i]);
+        } else {
+            for (long long i = 0; i < args->len; i++) perl_array_push(names, args->elems[i]);
+        }
+        csv_hset(h, "_column_names", perl_ref_array(names));
+        return perl_alloc_int(1);
+    }
+    if (!strcmp(m, "getline") || !strcmp(m, "getline_hr")) {
+        PerlValue *fh = (args && args->len > 0) ? args->elems[0] : NULL;
+        if (!fh || fh->tag != PERL_FILEHANDLE) return perl_alloc_undef();
+        char *acc = NULL; long long acclen = 0;
+        int rc = CSV_ERR;
+        PerlArray *fields = NULL;
+        for (int tries = 0; tries < 1000; tries++) {
+            PerlValue *line = perl_readline(fh);
+            if (line->tag == PERL_UNDEF) {
+                perl_free(line);
+                if (!acc) csv_set_error(h, 2012, "EOF", 0);
+                break;
+            }
+            long long llen = 0;
+            char *ltxt = perl_to_string_dup_len(line, &llen);
+            perl_free(line);
+            llen = csv_strip_eol(ltxt, llen);
+            long long newlen = acclen + (acc ? 1 : 0) + llen;
+            char *nbuf = malloc((size_t)newlen + 1);
+            if (acc) { memcpy(nbuf, acc, (size_t)acclen); nbuf[acclen] = '\n'; }
+            memcpy(nbuf + (acc ? acclen + 1 : 0), ltxt, (size_t)llen);
+            free(acc); free(ltxt);
+            acc = nbuf; acclen = newlen;
+            if (fields) perl_array_free(fields);
+            fields = perl_anon_array_new();
+            int err_code = 0; long long err_pos = 0;
+            rc = csv_parse_line(&o, acc, acclen, fields, &err_code, &err_pos, NULL);
+            if (rc != CSV_INCOMPLETE) {
+                if (rc == CSV_ERR) csv_set_error(h, err_code, "EIQ - Parse error", err_pos);
+                break;
+            }
+        }
+        free(acc);
+        if (rc != CSV_OK) { if (fields) perl_array_free(fields); return perl_alloc_undef(); }
+        if (!strcmp(m, "getline")) return perl_ref_array(fields);
+        PerlValue *namesv = perl_hash_get_str_ref(h, "_column_names");
+        PerlHash *rowh = perl_anon_hash_new();
+        if (namesv && namesv->tag == PERL_REF_ARRAY) {
+            PerlArray *names = (PerlArray *)namesv->pval;
+            for (long long i = 0; i < names->len && i < fields->len; i++)
+                perl_hash_set_str(rowh, perl_to_string(names->elems[i]), fields->elems[i]);
+        }
+        perl_array_free(fields);
+        return perl_ref_hash(rowh);
+    }
+    if (!strcmp(m, "getline_all") || !strcmp(m, "getline_hr_all")) {
+        PerlValue *fh = (args && args->len > 0) ? args->elems[0] : NULL;
+        PerlArray *rows = perl_anon_array_new();
+        const char *sub = !strcmp(m, "getline_all") ? "getline" : "getline_hr";
+        while (fh) {
+            PerlArray *a1 = perl_array_new(); perl_array_push_nc(a1, fh);
+            PerlValue *row = perl_csv_method(self, sub, a1);
+            perl_array_free_nc(a1);
+            if (!row || row->tag == PERL_UNDEF) { if (row) perl_free(row); break; }
+            perl_array_push(rows, row);
+            perl_free(row);
+        }
+        return perl_ref_array(rows);
+    }
+    if (!strcmp(m, "print") || !strcmp(m, "say")) {
+        /* Calls csv_combine() directly rather than dispatching through
+           this function's own "combine" branch — confirmed against real
+           Text::CSV_PP that print/say do NOT touch status()/error_diag()
+           the way a direct ->combine() call does (`$csv->say(...);
+           $csv->status` stays undef, whereas `$csv->combine(...);
+           $csv->status` is 1). */
+        PerlValue *fh = (args && args->len > 0) ? args->elems[0] : NULL;
+        PerlValue *rowref = (args && args->len > 1) ? args->elems[1] : NULL;
+        if (!fh || fh->tag != PERL_FILEHANDLE || !rowref) return perl_alloc_int(0);
+        PerlArray *fields = perl_array_new();
+        if (rowref->tag == PERL_REF_ARRAY && rowref->pval) {
+            PerlArray *src = (PerlArray *)rowref->pval;
+            for (long long i = 0; i < src->len; i++) perl_array_push_nc(fields, src->elems[i]);
+        }
+        char *out = NULL; long long outlen = 0; int err_code = 0;
+        int ok = csv_combine(&o, fields, &out, &outlen, &err_code);
+        perl_array_free_nc(fields);
+        if (!ok) return perl_alloc_int(0);
+        PerlValue *eolv = perl_hash_get_str_ref(h, "eol");
+        int hasEol = eolv && eolv->tag == PERL_STRING && eolv->slen > 0;
+        FILE *fp = (FILE *)fh->pval;
+        fwrite(out, 1, (size_t)outlen, fp);
+        if (hasEol) fwrite(eolv->sval, 1, (size_t)eolv->slen, fp);
+        free(out);
+        /* say only supplies its own "\n" when eol is empty — confirmed
+           against real Text::CSV_PP: with a custom eol set, say's output
+           is byte-identical to print's (no extra newline on top). */
+        if (!strcmp(m, "say") && !hasEol) fputc('\n', fp);
+        return perl_alloc_int(1);
+    }
+    if (!strcmp(m, "is_quoted")) {
+        long long i = (args && args->len > 0) ? perl_to_int(args->elems[0]) : 0;
+        PerlValue *qv = perl_hash_get_str_ref(h, "_quoted");
+        if (!qv || qv->tag != PERL_REF_ARRAY) return perl_alloc_bool(0);
+        PerlArray *qa = (PerlArray *)qv->pval;
+        if (i < 0 || i >= qa->len) return perl_alloc_bool(0);
+        return perl_alloc_bool(perl_to_int(qa->elems[i]) ? 1 : 0);
+    }
+    if (!strcmp(m, "is_binary")) {
+        PerlArray *fields = csv_fields_array(h);
+        long long i = (args && args->len > 0) ? perl_to_int(args->elems[0]) : 0;
+        if (!fields || i < 0 || i >= fields->len) return perl_alloc_bool(0);
+        PerlValue *fv = fields->elems[i];
+        if (!fv || fv->tag != PERL_STRING) return perl_alloc_bool(0);
+        for (long long k = 0; k < fv->slen; k++)
+            if ((unsigned char)fv->sval[k] < 0x20 && fv->sval[k] != '\t')
+                return perl_alloc_bool(1);
+        return perl_alloc_bool(0);
+    }
+    if (!strcmp(m, "meta_info")) {
+        PerlValue *qv = perl_hash_get_str_ref(h, "_quoted");
+        PerlArray *fields = csv_fields_array(h);
+        if (!perl_current_wantarray_ctx())
+            return perl_alloc_int(fields ? fields->len : 0);
+        PerlArray *out = perl_anon_array_new();
+        long long n = fields ? fields->len : 0;
+        PerlArray *qa = (qv && qv->tag == PERL_REF_ARRAY) ? (PerlArray *)qv->pval : NULL;
+        for (long long i = 0; i < n; i++) {
+            long long bits = 0;
+            if (qa && i < qa->len && perl_to_int(qa->elems[i])) bits |= 0x0001;
+            csv_apush(out, perl_alloc_int(bits));
+        }
+        return perl_array_to_list_return(out);
+    }
+    perl_die_croak("Can't locate object method \"%s\" via package \"%s\"", m,
+                   self->blessed_class ? self->blessed_class : "Text::CSV_PP");
+    return perl_alloc_undef();
+}
+
+/* ── Hash::Util (Tier 2, native) ──────────────────────────────────────────
+   Enforcement itself lives in hu_check_read/hu_check_write and the
+   PerlHashLock struct (runtime.h), checked at every hash read/write choke
+   point (perl_hash_get_sv/get_sv_ref/get_str_ref/set_sv/set_str/
+   lvalue_str) — one `if (h->lock)` pointer check when unused, the
+   universal case. This section is just the public lock_ / unlock_ /
+   hash_locked / legal_keys / hidden_keys API building/reading that struct.
+   Scope: see TESTS.md — lock_hash_recurse/unlock_hash_recurse and the
+   hash-internals introspection family (hash_seed/bucket_info/all_keys/etc,
+   non-reproducible even between two runs of real Perl itself) are
+   deliberately not implemented. */
+
+static void hu_add_legal(PerlHashLock *l, const char *key) {
+    for (long long i = 0; i < l->n; i++) if (strcmp(l->legal[i], key) == 0) return;
+    if (l->n >= l->cap) { l->cap = l->cap ? l->cap * 2 : 8; l->legal = realloc(l->legal, sizeof(char *) * (size_t)l->cap); }
+    l->legal[l->n++] = strdup(key);
+}
+static void hu_ensure_lock(PerlHash *h) {
+    if (h->lock) return;
+    h->lock = calloc(1, sizeof(PerlHashLock));
+    for (int b = 0; b < PERL_HASH_BUCKETS; b++)
+        for (PerlHashEntry *e = h->buckets[b]; e; e = e->next)
+            hu_add_legal(h->lock, e->key);
+}
+static char *hu_pv_str(PerlValue *v) { return perl_to_string_dup(v); }
+
+void perl_hu_lock_keys(PerlHash *h, PerlArray *names) {
+    /* A given LIST replaces the legal set entirely and must be a
+       superset of every currently-live key (real Perl dies immediately
+       — "Hash has key 'X' which is not in the new key set" — otherwise);
+       a bare call (no LIST) makes the legal set exactly the current
+       keys. Confirmed against real Perl: NOT additive to current keys
+       the way lock_keys_plus is. */
+    if (names && names->len > 0) {
+        for (int b = 0; b < PERL_HASH_BUCKETS; b++)
+            for (PerlHashEntry *e = h->buckets[b]; e; e = e->next) {
+                int found = 0;
+                for (long long i = 0; i < names->len && !found; i++) {
+                    char *ns = hu_pv_str(names->elems[i]);
+                    if (strcmp(ns, e->key) == 0) found = 1;
+                    free(ns);
+                }
+                if (!found)
+                    perl_die_croak("Hash has key '%s' which is not in the new key set", e->key);
+            }
+    }
+    if (!h->lock) h->lock = calloc(1, sizeof(PerlHashLock));
+    else { for (long long i = 0; i < h->lock->n; i++) free(h->lock->legal[i]); h->lock->n = 0; }
+    h->lock->keys_locked = 1;
+    if (names && names->len > 0) {
+        for (long long i = 0; i < names->len; i++) {
+            char *ns = hu_pv_str(names->elems[i]);
+            hu_add_legal(h->lock, ns);
+            free(ns);
+        }
+    } else {
+        for (int b = 0; b < PERL_HASH_BUCKETS; b++)
+            for (PerlHashEntry *e = h->buckets[b]; e; e = e->next)
+                hu_add_legal(h->lock, e->key);
+    }
+}
+
+void perl_hu_lock_keys_plus(PerlHash *h, PerlArray *names) {
+    hu_ensure_lock(h);
+    h->lock->keys_locked = 1;
+    if (!names) return;
+    for (long long i = 0; i < names->len; i++) {
+        char *ns = hu_pv_str(names->elems[i]);
+        hu_add_legal(h->lock, ns);
+        free(ns);
+    }
+}
+
+void perl_hu_unlock_keys(PerlHash *h) {
+    if (!h->lock) return;
+    for (long long i = 0; i < h->lock->n; i++) free(h->lock->legal[i]);
+    free(h->lock->legal);
+    free(h->lock);
+    h->lock = NULL;
+}
+
+void perl_hu_lock_hash(PerlHash *h) {
+    hu_ensure_lock(h);
+    h->lock->keys_locked = 1;
+    h->lock->values_locked = 1;
+}
+
+/* Real Perl's unlock_hash() fully unlocks (keys AND values), same as
+   unlock_keys() — this codebase keeps both under one PerlHashLock, so
+   both entry points just tear it down; the finer-grained "keys still
+   locked but values now writable" state real Perl's separate internal
+   flags could in principle distinguish is not reachable via the public
+   API these two functions expose anyway. */
+void perl_hu_unlock_hash(PerlHash *h) { perl_hu_unlock_keys(h); }
+
+void perl_hu_lock_value(PerlHash *h, const char *key) {
+    hu_ensure_lock(h);
+    PerlHashEntry *e = hash_find(h, key);
+    if (e && e->val) e->val->flags |= PV_FLAG_READONLY;
+}
+void perl_hu_unlock_value(PerlHash *h, const char *key) {
+    PerlHashEntry *e = hash_find(h, key);
+    if (e && e->val) e->val->flags &= ~(unsigned)PV_FLAG_READONLY;
+}
+
+PerlValue *perl_hu_hash_locked(PerlHash *h) { return perl_alloc_bool(h->lock && h->lock->keys_locked); }
+
+PerlArray *perl_hu_legal_keys(PerlHash *h) {
+    PerlArray *a = perl_array_new();
+    if (!h->lock || !h->lock->keys_locked) {
+        for (int b = 0; b < PERL_HASH_BUCKETS; b++)
+            for (PerlHashEntry *e = h->buckets[b]; e; e = e->next) {
+                PerlValue *tmp = perl_alloc_string(e->key);
+                perl_array_push(a, tmp);
+                perl_free(tmp);
+            }
+        return a;
+    }
+    for (long long i = 0; i < h->lock->n; i++) {
+        PerlValue *tmp = perl_alloc_string(h->lock->legal[i]);
+        perl_array_push(a, tmp);
+        perl_free(tmp);
+    }
+    return a;
+}
+
+PerlArray *perl_hu_hidden_keys(PerlHash *h) {
+    PerlArray *a = perl_array_new();
+    if (!h->lock || !h->lock->keys_locked) return a;
+    for (long long i = 0; i < h->lock->n; i++) {
+        if (!hash_find(h, h->lock->legal[i])) {
+            PerlValue *tmp = perl_alloc_string(h->lock->legal[i]);
+            perl_array_push(a, tmp);
+            perl_free(tmp);
+        }
+    }
+    return a;
+}
+
+PerlHash *perl_hu_hash_of(PerlValue *pv) {
+    if (!pv) perl_die_croak("Not a HASH reference");
+    perl_promote_ref_array(pv);
+    if (pv->tag == PERL_REF_HASH && pv->pval) return (PerlHash *)pv->pval;
+    perl_die_croak("Not a HASH reference");
+    return perl_hash_new();
+}
+
+static void hu_walk_recurse(PerlHash *h, PerlHash **seen, int *nseen, int do_lock) {
+    if (!h) return;
+    for (int i = 0; i < *nseen; i++) if (seen[i] == h) return;
+    if (*nseen < 256) seen[(*nseen)++] = h;
+    if (do_lock) perl_hu_lock_hash(h);
+    for (int b = 0; b < PERL_HASH_BUCKETS; b++) {
+        for (PerlHashEntry *e = h->buckets[b]; e; e = e->next) {
+            if (e->val && e->val->tag == PERL_REF_HASH && e->val->pval)
+                hu_walk_recurse((PerlHash *)e->val->pval, seen, nseen, do_lock);
+        }
+    }
+    if (!do_lock) perl_hu_unlock_hash(h);
+}
+
+void perl_hu_lock_hash_recurse(PerlHash *h) {
+    PerlHash *seen[256]; int n = 0;
+    hu_walk_recurse(h, seen, &n, 1);
+}
+void perl_hu_unlock_hash_recurse(PerlHash *h) {
+    PerlHash *seen[256]; int n = 0;
+    hu_walk_recurse(h, seen, &n, 0);
+}
+
+/* ── Storable freeze / thaw / store / retrieve ───────────────────────────── */
+enum {
+    ST_UNDEF = 0, ST_INT, ST_NV, ST_PV, ST_AV, ST_HV, ST_RV, ST_BLESS, ST_BACK, ST_BOOL
+};
+typedef struct {
+    char *buf; size_t cap, pos;
+    void *seen[512]; int nseen;
+} StBuf;
+static void st_put(StBuf *b, const void *p, size_t n) {
+    while (b->pos + n > b->cap) { b->cap = b->cap ? b->cap * 2 : 256; b->buf = realloc(b->buf, b->cap); }
+    memcpy(b->buf + b->pos, p, n); b->pos += n;
+}
+static void st_u8(StBuf *b, unsigned char v) { st_put(b, &v, 1); }
+static void st_i32(StBuf *b, int32_t v) { st_put(b, &v, 4); }
+static void st_i64(StBuf *b, int64_t v) { st_put(b, &v, 8); }
+static void st_f64(StBuf *b, double v) { st_put(b, &v, 8); }
+static int st_find(StBuf *b, void *p) {
+    for (int i = 0; i < b->nseen; i++) if (b->seen[i] == p) return i;
+    return -1;
+}
+static void st_enc(StBuf *b, PerlValue *v);
+
+static void st_enc(StBuf *b, PerlValue *v) {
+    if (!v || v->tag == PERL_UNDEF) { st_u8(b, ST_UNDEF); return; }
+    perl_promote_ref_array(v);
+    if (v->blessed_class && strcmp(v->blessed_class, "JSON::PP::Boolean") == 0) {
+        st_u8(b, ST_BOOL); st_u8(b, perl_is_true(v) ? 1 : 0); return;
+    }
+    if (v->blessed_class && (v->tag == PERL_REF_HASH || v->tag == PERL_REF_ARRAY ||
+                             v->tag == PERL_REF_SCALAR)) {
+        st_u8(b, ST_BLESS);
+        int32_t clen = (int32_t)strlen(v->blessed_class);
+        st_i32(b, clen); st_put(b, v->blessed_class, (size_t)clen);
+        char *save = v->blessed_class; v->blessed_class = NULL;
+        st_enc(b, v);
+        v->blessed_class = save;
+        return;
+    }
+    switch (v->tag) {
+    case PERL_INT: st_u8(b, ST_INT); st_i64(b, v->ival); break;
+    case PERL_FLOAT: st_u8(b, ST_NV); st_f64(b, v->fval); break;
+    case PERL_STRING: {
+        st_u8(b, ST_PV);
+        int32_t n = (int32_t)v->slen;
+        st_i32(b, n);
+        st_u8(b, (v->flags & PV_FLAG_UTF8) ? 1 : 0);
+        if (n > 0) st_put(b, v->sval, (size_t)n);
+        break;
+    }
+    case PERL_REF_ARRAY: {
+        int id = st_find(b, v->pval);
+        if (id >= 0) { st_u8(b, ST_BACK); st_i32(b, id); break; }
+        if (b->nseen < 512) b->seen[b->nseen++] = v->pval;
+        PerlArray *a = (PerlArray *)v->pval;
+        st_u8(b, ST_AV); st_i32(b, (int32_t)(a ? a->len : 0));
+        if (a) for (long long i = 0; i < a->len; i++) st_enc(b, a->elems[i]);
+        break;
+    }
+    case PERL_REF_HASH: {
+        int id = st_find(b, v->pval);
+        if (id >= 0) { st_u8(b, ST_BACK); st_i32(b, id); break; }
+        if (b->nseen < 512) b->seen[b->nseen++] = v->pval;
+        PerlHash *h = (PerlHash *)v->pval;
+        st_u8(b, ST_HV); st_i32(b, (int32_t)(h ? h->size : 0));
+        if (h) for (int i = 0; i < PERL_HASH_BUCKETS; i++)
+            for (PerlHashEntry *e = h->buckets[i]; e; e = e->next) {
+                int32_t n = (int32_t)strlen(e->key);
+                st_i32(b, n); st_put(b, e->key, (size_t)n);
+                st_enc(b, e->val);
+            }
+        break;
+    }
+    case PERL_REF_SCALAR: {
+        int id = st_find(b, v->pval);
+        if (id >= 0) { st_u8(b, ST_BACK); st_i32(b, id); break; }
+        if (b->nseen < 512) b->seen[b->nseen++] = v->pval;
+        st_u8(b, ST_RV); st_enc(b, (PerlValue *)v->pval);
+        break;
+    }
+    default: {
+        char *s = perl_to_string_dup(v);
+        st_u8(b, ST_PV); int32_t n = (int32_t)strlen(s);
+        st_i32(b, n); st_u8(b, 0); st_put(b, s, (size_t)n);
+        free(s);
+        break;
+    }
+    }
+}
+
+PerlValue *perl_storable_freeze(PerlValue *pv, int network) {
+    (void)network;
+    StBuf b = {0};
+    st_put(&b, "PCST", 4);
+    st_enc(&b, pv);
+    PerlValue *r = perl_alloc_string_len(b.buf ? b.buf : "", (long long)b.pos);
+    free(b.buf);
+    return r;
+}
+
+typedef struct {
+    const unsigned char *s; size_t len, pos;
+    PerlValue *objs[512]; int nobjs;
+} StIn;
+static unsigned char st_gu8(StIn *in) {
+    if (in->pos >= in->len) perl_die_croak("Storable::thaw: truncated data");
+    return in->s[in->pos++];
+}
+static int32_t st_gi32(StIn *in) {
+    if (in->pos + 4 > in->len) perl_die_croak("Storable::thaw: truncated data");
+    int32_t v; memcpy(&v, in->s + in->pos, 4); in->pos += 4; return v;
+}
+static int64_t st_gi64(StIn *in) {
+    if (in->pos + 8 > in->len) perl_die_croak("Storable::thaw: truncated data");
+    int64_t v; memcpy(&v, in->s + in->pos, 8); in->pos += 8; return v;
+}
+static double st_gf64(StIn *in) {
+    if (in->pos + 8 > in->len) perl_die_croak("Storable::thaw: truncated data");
+    double v; memcpy(&v, in->s + in->pos, 8); in->pos += 8; return v;
+}
+static PerlValue *st_dec(StIn *in);
+
+static PerlValue *st_dec(StIn *in) {
+    unsigned char t = st_gu8(in);
+    switch (t) {
+    case ST_UNDEF: return perl_alloc_undef();
+    case ST_INT: return perl_alloc_int(st_gi64(in));
+    case ST_NV: return perl_alloc_float(st_gf64(in));
+    case ST_BOOL: return json_bool(st_gu8(in) ? 1 : 0);
+    case ST_PV: {
+        int32_t n = st_gi32(in);
+        int utf8 = st_gu8(in);
+        if (in->pos + (size_t)n > in->len) perl_die_croak("Storable::thaw: truncated string");
+        PerlValue *r = perl_alloc_string_len((const char *)in->s + in->pos, n);
+        in->pos += (size_t)n;
+        if (utf8) r->flags |= PV_FLAG_UTF8;
+        return r;
+    }
+    case ST_BACK: {
+        int32_t id = st_gi32(in);
+        if (id < 0 || id >= in->nobjs) perl_die_croak("Storable::thaw: bad backref");
+        return in->objs[id];
+    }
+    case ST_AV: {
+        int32_t n = st_gi32(in);
+        PerlArray *a = perl_anon_array_new();
+        PerlValue *r = perl_ref_array(a);
+        if (in->nobjs < 512) in->objs[in->nobjs++] = r;
+        for (int32_t i = 0; i < n; i++) perl_array_push(a, st_dec(in));
+        return r;
+    }
+    case ST_HV: {
+        int32_t n = st_gi32(in);
+        PerlHash *h = perl_anon_hash_new();
+        PerlValue *r = perl_ref_hash(h);
+        if (in->nobjs < 512) in->objs[in->nobjs++] = r;
+        for (int32_t i = 0; i < n; i++) {
+            int32_t kn = st_gi32(in);
+            if (in->pos + (size_t)kn > in->len) perl_die_croak("Storable::thaw: truncated key");
+            char *key = malloc((size_t)kn + 1);
+            memcpy(key, in->s + in->pos, (size_t)kn); key[kn] = 0; in->pos += (size_t)kn;
+            PerlValue *val = st_dec(in);
+            perl_hash_set_str(h, key, val);
+            free(key);
+        }
+        return r;
+    }
+    case ST_RV: {
+        PerlValue *r = pv_alloc();
+        r->tag = PERL_REF_SCALAR;
+        if (in->nobjs < 512) in->objs[in->nobjs++] = r;
+        r->pval = st_dec(in);
+        return r;
+    }
+    case ST_BLESS: {
+        int32_t n = st_gi32(in);
+        if (in->pos + (size_t)n > in->len) perl_die_croak("Storable::thaw: truncated class");
+        char *cls = malloc((size_t)n + 1);
+        memcpy(cls, in->s + in->pos, (size_t)n); cls[n] = 0; in->pos += (size_t)n;
+        PerlValue *inner = st_dec(in);
+        inner->blessed_class = cls;
+        return inner;
+    }
+    default:
+        perl_die_croak("Storable::thaw: unknown tag %d", (int)t);
+        return perl_alloc_undef();
+    }
+}
+
+PerlValue *perl_storable_thaw(PerlValue *blob) {
+    if (!blob || blob->tag != PERL_STRING)
+        perl_die_croak("Storable::thaw: not a frozen string");
+    if (blob->slen < 4 || memcmp(blob->sval, "PCST", 4) != 0)
+        perl_die_croak("Storable::thaw: magic number not compatible");
+    StIn in = { .s = (const unsigned char *)blob->sval, .len = (size_t)blob->slen, .pos = 4 };
+    return st_dec(&in);
+}
+
+PerlValue *perl_storable_store(PerlValue *pv, PerlValue *path, int network) {
+    char *fn = perl_to_string_dup(path);
+    PerlValue *blob = perl_storable_freeze(pv, network);
+    FILE *fp = fopen(fn, "wb");
+    free(fn);
+    if (!fp) { perl_free(blob); return perl_alloc_undef(); }
+    fwrite(blob->sval, 1, (size_t)blob->slen, fp);
+    fclose(fp);
+    perl_free(blob);
+    return perl_alloc_int(1);
+}
+
+PerlValue *perl_storable_retrieve(PerlValue *path) {
+    char *fn = perl_to_string_dup(path);
+    FILE *fp = fopen(fn, "rb");
+    free(fn);
+    if (!fp) return perl_alloc_undef();
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp); rewind(fp);
+    char *buf = malloc((size_t)n);
+    if (fread(buf, 1, (size_t)n, fp) != (size_t)n) { free(buf); fclose(fp); return perl_alloc_undef(); }
+    fclose(fp);
+    PerlValue *blob = perl_alloc_string_len(buf, n);
+    free(buf);
+    PerlValue *r = perl_storable_thaw(blob);
+    perl_free(blob);
+    return r;
+}
+
+/* ── Text::CSV::csv() ────────────────────────────────────────────────────── */
+PerlValue *perl_csv_function(PerlArray *args) {
+    PerlValue *in = NULL, *class_pv = perl_alloc_string("Text::CSV_PP");
+    PerlHash *opts = perl_anon_hash_new();
+    if (args) {
+        for (long long i = 0; i + 1 < args->len; i += 2) {
+            char *k = perl_to_string_dup(args->elems[i]);
+            if (!strcmp(k, "in")) in = args->elems[i + 1];
+            else perl_hash_set_str(opts, k, args->elems[i + 1]);
+            free(k);
+        }
+    }
+    PerlValue *optref = perl_ref_hash(opts);
+    PerlValue *csv = perl_csv_new(class_pv, optref);
+    PerlArray *rows = perl_anon_array_new();
+    if (in && in->tag == PERL_FILEHANDLE) {
+        PerlArray *a1 = perl_array_new(); perl_array_push_nc(a1, in);
+        PerlValue *all = perl_csv_method(csv, "getline_all", a1);
+        perl_array_free_nc(a1);
+        if (all && all->tag == PERL_REF_ARRAY) return all;
+        return perl_ref_array(rows);
+    }
+    if (in && in->tag == PERL_REF_ARRAY && in->pval) {
+        PerlArray *lines = (PerlArray *)in->pval;
+        for (long long i = 0; i < lines->len; i++) {
+            PerlArray *a1 = perl_array_new(); perl_array_push_nc(a1, lines->elems[i]);
+            PerlValue *ok = perl_csv_method(csv, "parse", a1);
+            perl_array_free_nc(a1);
+            if (ok && perl_is_true(ok)) {
+                PerlValue *fld = perl_csv_method(csv, "fields", NULL);
+                if (fld && fld->tag == PERL_LIST_RESULT && fld->pval) {
+                    PerlArray *copy = perl_anon_array_new();
+                    PerlArray *src = (PerlArray *)fld->pval;
+                    for (long long k = 0; k < src->len; k++) perl_array_push(copy, src->elems[k]);
+                    perl_array_push(rows, perl_ref_array(copy));
+                } else if (fld && fld->tag == PERL_REF_ARRAY) {
+                    perl_array_push(rows, fld);
+                }
+            }
+        }
+    } else if (in && in->tag == PERL_STRING) {
+        const char *s = in->sval ? in->sval : "";
+        long long n = in->slen, start = 0;
+        for (long long i = 0; i <= n; i++) {
+            if (i == n || s[i] == '\n') {
+                long long ln = i - start;
+                if (ln > 0 && s[start + ln - 1] == '\r') ln--;
+                PerlValue *line = perl_alloc_string_len(s + start, ln);
+                PerlArray *a1 = perl_array_new(); perl_array_push(a1, line); perl_free(line);
+                PerlValue *ok = perl_csv_method(csv, "parse", a1);
+                perl_array_free(a1);
+                if (ok && perl_is_true(ok)) {
+                    PerlArray *fa = csv_fields_array((PerlHash *)csv->pval);
+                    if (fa) {
+                        PerlArray *copy = perl_anon_array_new();
+                        for (long long k = 0; k < fa->len; k++) perl_array_push(copy, fa->elems[k]);
+                        perl_array_push(rows, perl_ref_array(copy));
+                    }
+                }
+                start = i + 1;
+            }
+        }
+    }
+    if (perl_current_wantarray_ctx()) return perl_array_to_list_return(rows);
+    return perl_ref_array(rows);
+}
+
+/* ── Try::Tiny ───────────────────────────────────────────────────────────── */
+PerlValue *perl_try_tiny_tag(PerlValue *block, const char *cls, PerlArray *rest, int wantarray) {
+    /* Bless the code-ref itself (real Try::Tiny blesses a scalar-ref to
+       it). Cloning a CODE_REF preserves blessed_class and bumps the
+       closure refcount, so the tag survives perl_array_push into try(). */
+    if (block) {
+        if (block->blessed_class) free(block->blessed_class);
+        block->blessed_class = strdup(cls);
+    }
+    if (wantarray && rest && rest->len > 0) {
+        PerlArray *a = perl_anon_array_new();
+        perl_array_push(a, block);
+        for (long long i = 0; i < rest->len; i++) perl_array_push(a, rest->elems[i]);
+        return perl_array_to_list_return(a);
+    }
+    return block ? block : perl_alloc_undef();
+}
+
+static PerlValue *tt_deref_block(PerlValue *tagged) {
+    if (!tagged) return NULL;
+    if (tagged->tag == PERL_REF_SCALAR && tagged->pval) return (PerlValue *)tagged->pval;
+    if (tagged->tag == PERL_CODE_REF) return tagged;
+    return NULL;
+}
+
+PerlValue *perl_try_tiny(PerlArray *args, int wantarray) {
+    if (!args || args->len == 0) return perl_alloc_undef();
+    PerlValue *try_cv = args->elems[0];
+    PerlArray *catches = perl_array_new();
+    PerlArray *finallies = perl_array_new();
+    for (long long i = 1; i < args->len; i++) {
+        PerlValue *a = args->elems[i];
+        if (a && a->blessed_class && !strcmp(a->blessed_class, "Try::Tiny::Catch"))
+            perl_array_push_nc(catches, a);
+        else if (a && a->blessed_class && !strcmp(a->blessed_class, "Try::Tiny::Finally"))
+            perl_array_push_nc(finallies, a);
+    }
+    jmp_buf jb;
+    PerlValue *result = NULL;
+    int failed = 0;
+    if (setjmp(jb) == 0) {
+        perl_eval_push(&jb);
+        PerlArray *empty = perl_array_new();
+        result = perl_call_code_ref(try_cv, empty);
+        perl_array_free(empty);
+        perl_eval_pop();
+        PerlValue emptystr = { .tag = PERL_STRING, .sval = "", .slen = 0 };
+        perl_assign(&s_dollar_at, &emptystr);
+    } else {
+        perl_eval_pop();
+        failed = 1;
+        result = perl_alloc_undef();
+    }
+    if (failed && catches->len > 0) {
+        PerlValue *err = perl_clone(&s_dollar_at);
+        PerlValue *under = perl_get_dollar_under();
+        PerlValue *old = perl_clone(under);
+        perl_assign(under, err);
+        PerlArray *empty = perl_array_new();
+        PerlValue *cv = tt_deref_block(catches->elems[0]);
+        if (cv) {
+            perl_free(result);
+            result = perl_call_code_ref(cv, empty);
+            failed = 0;
+            PerlValue emptystr = { .tag = PERL_STRING, .sval = "", .slen = 0 };
+            perl_assign(&s_dollar_at, &emptystr);
+        }
+        perl_array_free(empty);
+        perl_assign(under, old);
+        perl_free(old);
+        perl_free(err);
+    }
+    for (long long i = 0; i < finallies->len; i++) {
+        PerlValue *cv = tt_deref_block(finallies->elems[i]);
+        if (cv) {
+            PerlArray *empty = perl_array_new();
+            PerlValue *ign = perl_call_code_ref(cv, empty);
+            if (ign) perl_free(ign);
+            perl_array_free(empty);
+        }
+    }
+    perl_array_free_nc(catches);
+    perl_array_free_nc(finallies);
+    (void)wantarray;
+    /* Try::Tiny 0.32: a failing try() with no catch() returns undef and
+       does not rethrow (it restores the previous $@). */
+    return result ? result : perl_alloc_undef();
+}
+
+/* ── List::MoreUtils ─────────────────────────────────────────────────────── */
+static PerlValue *lmu_natatime_next(PerlArray *args, int ctx) {
+    (void)args;
+    PerlValue *st = perl_get_capture(0);
+    if (!st || st->tag != PERL_REF_ARRAY || !st->pval) return perl_alloc_undef();
+    PerlArray *state = (PerlArray *)st->pval;
+    if (state->len < 3) return perl_alloc_undef();
+    long long idx = perl_to_int(state->elems[0]);
+    long long n = perl_to_int(state->elems[1]);
+    PerlValue *srcpv = state->elems[2];
+    if (!srcpv || srcpv->tag != PERL_REF_ARRAY) return perl_alloc_undef();
+    PerlArray *src = (PerlArray *)srcpv->pval;
+    if (idx >= src->len) {
+        if (ctx) return perl_array_to_list_return(perl_array_new());
+        return perl_alloc_undef();
+    }
+    PerlArray *chunk = perl_anon_array_new();
+    long long i;
+    for (i = 0; i < n && idx < src->len; i++, idx++)
+        perl_array_push(chunk, src->elems[idx]);
+    perl_free(state->elems[0]);
+    state->elems[0] = perl_alloc_int(idx);
+    if (ctx) return perl_array_to_list_return(chunk);
+    return perl_alloc_int(chunk->len);
+}
+
+static PerlValue *lmu_call_block(PerlValue *cv, PerlValue *elem) {
+    PerlValue *under = perl_get_dollar_under();
+    PerlValue *old = perl_clone(under);
+    perl_assign(under, elem);
+    PerlArray *empty = perl_array_new();
+    PerlValue *r = perl_call_code_ref(cv, empty);
+    perl_array_free(empty);
+    perl_assign(under, old);
+    perl_free(old);
+    return r;
+}
+
+PerlValue *perl_list_moreutils(const char *name, PerlArray *args) {
+    const char *bare = name;
+    const char *sc = strrchr(name, ':');
+    if (sc && sc > name && *(sc - 1) == ':') bare = sc + 1;
+    int wa = perl_current_wantarray_ctx();
+    PerlValue *block = (args && args->len > 0) ? args->elems[0] : NULL;
+    long long start = 1;
+    /* names that take a leading scalar, not a block */
+    int scalar_first = !strcmp(bare, "natatime") || !strcmp(bare, "mesh") ||
+                       !strcmp(bare, "zip") || !strcmp(bare, "uniq") ||
+                       !strcmp(bare, "distinct") || !strcmp(bare, "minmax") ||
+                       !strcmp(bare, "minmaxstr") || !strcmp(bare, "singleton") ||
+                       !strcmp(bare, "duplicates") || !strcmp(bare, "true") ||
+                       !strcmp(bare, "false");
+    if (!strcmp(bare, "mesh") || !strcmp(bare, "zip")) {
+        /* args are arrayrefs (or we'll treat remaining as one list of refs) */
+        long long max = 0, n = args ? args->len : 0;
+        PerlArray **avs = calloc((size_t)n, sizeof(PerlArray *));
+        for (long long i = 0; i < n; i++) {
+            PerlValue *v = args->elems[i];
+            perl_promote_ref_array(v);
+            if (v->tag == PERL_REF_ARRAY) avs[i] = (PerlArray *)v->pval;
+            if (avs[i] && avs[i]->len > max) max = avs[i]->len;
+        }
+        PerlArray *out = perl_anon_array_new();
+        for (long long i = 0; i < max; i++)
+            for (long long a = 0; a < n; a++) {
+                if (avs[a] && i < avs[a]->len) perl_array_push(out, avs[a]->elems[i]);
+                else perl_array_push(out, perl_alloc_undef());
+            }
+        free(avs);
+        if (wa) return perl_array_to_list_return(out);
+        return perl_alloc_int(out->len);
+    }
+    if (!strcmp(bare, "natatime")) {
+        long long n = (args && args->len > 0) ? perl_to_int(args->elems[0]) : 1;
+        if (n < 1) n = 1;
+        PerlArray *src = perl_anon_array_new();
+        for (long long i = 1; args && i < args->len; i++) perl_array_push(src, args->elems[i]);
+        PerlArray *state = perl_anon_array_new();
+        perl_array_push(state, perl_alloc_int(0));
+        perl_array_push(state, perl_alloc_int(n));
+        perl_array_push(state, perl_ref_array(src));
+        PerlValue *stref = perl_ref_array(state);
+        PerlArray *caps = perl_array_new();
+        perl_array_push_nc(caps, stref);
+        return perl_make_closure(lmu_natatime_next, caps);
+    }
+    if (!strcmp(bare, "uniq") || !strcmp(bare, "distinct")) {
+        PerlArray *in = perl_array_new();
+        for (long long i = 0; args && i < args->len; i++) perl_array_push(in, args->elems[i]);
+        PerlArray *u = perl_uniq_list(in);
+        perl_array_free(in);
+        if (wa) return perl_array_to_list_return(u);
+        return perl_alloc_int(u->len);
+    }
+    if (!strcmp(bare, "minmax") || !strcmp(bare, "minmaxstr")) {
+        if (!args || args->len == 0) return perl_alloc_undef();
+        PerlValue *mn = args->elems[0], *mx = args->elems[0];
+        for (long long i = 1; i < args->len; i++) {
+            PerlValue *c;
+            if (!strcmp(bare, "minmaxstr"))
+                c = perl_str_lt(args->elems[i], mn);
+            else
+                c = perl_num_lt(args->elems[i], mn);
+            if (perl_is_true(c)) mn = args->elems[i];
+            perl_free(c);
+            if (!strcmp(bare, "minmaxstr"))
+                c = perl_str_gt(args->elems[i], mx);
+            else
+                c = perl_num_gt(args->elems[i], mx);
+            if (perl_is_true(c)) mx = args->elems[i];
+            perl_free(c);
+        }
+        PerlArray *out = perl_anon_array_new();
+        perl_array_push(out, mn); perl_array_push(out, mx);
+        if (wa) return perl_array_to_list_return(out);
+        return perl_clone(mx);
+    }
+    if (!strcmp(bare, "true") || !strcmp(bare, "false")) {
+        /* true { BLOCK } LIST  OR  true LIST (truth of elements) */
+        long long count = 0;
+        int has_block = block && block->tag == PERL_CODE_REF;
+        long long from = has_block ? 1 : 0;
+        for (long long i = from; args && i < args->len; i++) {
+            int t;
+            if (has_block) {
+                PerlValue *r = lmu_call_block(block, args->elems[i]);
+                t = perl_is_true(r); if (r) perl_free(r);
+            } else t = perl_is_true(args->elems[i]);
+            if (!strcmp(bare, "true") ? t : !t) count++;
+        }
+        return perl_alloc_int(count);
+    }
+    if (!strcmp(bare, "singleton") || !strcmp(bare, "duplicates")) {
+        PerlArray *out = perl_anon_array_new();
+        for (long long i = 0; args && i < args->len; i++) {
+            char *si = perl_to_string_dup(args->elems[i]);
+            int n = 0;
+            for (long long j = 0; j < args->len; j++) {
+                char *sj = perl_to_string_dup(args->elems[j]);
+                if (!strcmp(si, sj)) n++;
+                free(sj);
+            }
+            free(si);
+            int want = !strcmp(bare, "singleton") ? (n == 1) : (n > 1);
+            if (want) {
+                /* duplicates: emit first occurrence only */
+                if (!strcmp(bare, "duplicates")) {
+                    int seen = 0;
+                    for (long long k = 0; k < i; k++) {
+                        char *sk = perl_to_string_dup(args->elems[k]);
+                        char *si2 = perl_to_string_dup(args->elems[i]);
+                        if (!strcmp(sk, si2)) seen = 1;
+                        free(sk); free(si2);
+                    }
+                    if (seen) continue;
+                }
+                perl_array_push(out, args->elems[i]);
+            }
+        }
+        if (wa) return perl_array_to_list_return(out);
+        return perl_alloc_int(out->len);
+    }
+    (void)scalar_first; (void)start;
+    /* block + list */
+    if (!block) return perl_alloc_undef();
+    if (!strcmp(bare, "firstidx") || !strcmp(bare, "first_index")) {
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            int t = perl_is_true(r); if (r) perl_free(r);
+            if (t) return perl_alloc_int(i - 1);
+        }
+        return perl_alloc_int(-1);
+    }
+    if (!strcmp(bare, "lastidx") || !strcmp(bare, "last_index")) {
+        long long found = -1;
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            int t = perl_is_true(r); if (r) perl_free(r);
+            if (t) found = i - 1;
+        }
+        return perl_alloc_int(found);
+    }
+    if (!strcmp(bare, "onlyidx") || !strcmp(bare, "only_index")) {
+        long long found = -1, n = 0;
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            int t = perl_is_true(r); if (r) perl_free(r);
+            if (t) { n++; found = i - 1; }
+        }
+        return perl_alloc_int(n == 1 ? found : -1);
+    }
+    if (!strcmp(bare, "indexes")) {
+        PerlArray *out = perl_anon_array_new();
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            int t = perl_is_true(r); if (r) perl_free(r);
+            if (t) perl_array_push(out, perl_alloc_int(i - 1));
+        }
+        if (wa) return perl_array_to_list_return(out);
+        return perl_alloc_int(out->len);
+    }
+    if (!strcmp(bare, "firstval") || !strcmp(bare, "first_value") ||
+        !strcmp(bare, "firstres") || !strcmp(bare, "first_result")) {
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            if (perl_is_true(r))
+                return (!strcmp(bare, "firstres") || !strcmp(bare, "first_result")) ? r : (perl_free(r), perl_clone(args->elems[i]));
+            if (r) perl_free(r);
+        }
+        return perl_alloc_undef();
+    }
+    if (!strcmp(bare, "lastval") || !strcmp(bare, "last_value") ||
+        !strcmp(bare, "lastres") || !strcmp(bare, "last_result")) {
+        PerlValue *found = perl_alloc_undef();
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            if (perl_is_true(r)) {
+                perl_free(found);
+                found = (!strcmp(bare, "lastres") || !strcmp(bare, "last_result")) ? r : perl_clone(args->elems[i]);
+                if (found != r && r) perl_free(r);
+            } else if (r) perl_free(r);
+        }
+        return found;
+    }
+    if (!strcmp(bare, "apply")) {
+        /* Real apply aliases $_ to a copy, runs the block for side
+           effects, then yields the (possibly mutated) copy — the block's
+           return value is ignored (`apply { $_ * 2 }` still returns the
+           originals). */
+        PerlArray *out = perl_anon_array_new();
+        PerlValue *under = perl_get_dollar_under();
+        PerlValue *old = perl_clone(under);
+        for (long long i = 1; args && i < args->len; i++) {
+            perl_assign(under, args->elems[i]);
+            PerlArray *empty = perl_array_new();
+            PerlValue *r = perl_call_code_ref(block, empty);
+            if (r) perl_free(r);
+            perl_array_free(empty);
+            perl_array_push(out, under);
+        }
+        perl_assign(under, old);
+        perl_free(old);
+        if (wa) return perl_array_to_list_return(out);
+        return perl_alloc_int(out->len);
+    }
+    if (!strcmp(bare, "after") || !strcmp(bare, "after_incl") ||
+        !strcmp(bare, "before") || !strcmp(bare, "before_incl")) {
+        int after = !strncmp(bare, "after", 5);
+        int incl = strstr(bare, "incl") != NULL;
+        int seen = 0;
+        PerlArray *out = perl_anon_array_new();
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            int t = perl_is_true(r); if (r) perl_free(r);
+            if (!seen && t) { seen = 1; if (incl && after) perl_array_push(out, args->elems[i]); if (!after && incl) perl_array_push(out, args->elems[i]); continue; }
+            if (after) { if (seen) perl_array_push(out, args->elems[i]); }
+            else { if (!seen) perl_array_push(out, args->elems[i]); }
+        }
+        if (wa) return perl_array_to_list_return(out);
+        return perl_alloc_int(out->len);
+    }
+    if (!strcmp(bare, "part")) {
+        /* returns list of arrayrefs, index = block result */
+        PerlArray *buckets = perl_anon_array_new();
+        for (long long i = 1; args && i < args->len; i++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            long long idx = r ? perl_to_int(r) : 0;
+            if (r) perl_free(r);
+            if (idx < 0) continue;
+            while (buckets->len <= idx) perl_array_push(buckets, perl_ref_array(perl_anon_array_new()));
+            PerlArray *bkt = (PerlArray *)buckets->elems[idx]->pval;
+            perl_array_push(bkt, args->elems[i]);
+        }
+        if (wa) return perl_array_to_list_return(buckets);
+        return perl_alloc_int(buckets->len);
+    }
+    if (!strcmp(bare, "any") || !strcmp(bare, "all") || !strcmp(bare, "none") ||
+        !strcmp(bare, "notall") || !strcmp(bare, "one")) {
+        int ntrue = 0, n = 0;
+        for (long long i = 1; args && i < args->len; i++, n++) {
+            PerlValue *r = lmu_call_block(block, args->elems[i]);
+            if (perl_is_true(r)) ntrue++;
+            if (r) perl_free(r);
+        }
+        int ok = 0;
+        if (!strcmp(bare, "any")) ok = ntrue > 0;
+        else if (!strcmp(bare, "all")) ok = ntrue == n && n > 0;
+        else if (!strcmp(bare, "none")) ok = ntrue == 0;
+        else if (!strcmp(bare, "notall")) ok = ntrue < n;
+        else ok = ntrue == 1;
+        return perl_alloc_bool(ok);
+    }
+    if (!strcmp(bare, "pairwise")) {
+        /* block, then two lists already flattened is wrong; treat remaining as two halves if even? */
+        /* args: block, arrayref, arrayref  (codegen will pass refs) */
+        PerlArray *a = NULL, *b = NULL;
+        if (args->len >= 3 && args->elems[1]->tag == PERL_REF_ARRAY)
+            a = (PerlArray *)args->elems[1]->pval;
+        if (args->len >= 3 && args->elems[2]->tag == PERL_REF_ARRAY)
+            b = (PerlArray *)args->elems[2]->pval;
+        long long n = 0;
+        if (a && a->len > n) n = a->len;
+        if (b && b->len > n) n = b->len;
+        PerlArray *out = perl_anon_array_new();
+        PerlValue *va_cell = perl_get_or_create_global_scalar("main::a");
+        PerlValue *vb_cell = perl_get_or_create_global_scalar("main::b");
+        for (long long i = 0; i < n; i++) {
+            perl_assign(va_cell, (a && i < a->len) ? a->elems[i] : perl_alloc_undef());
+            perl_assign(vb_cell, (b && i < b->len) ? b->elems[i] : perl_alloc_undef());
+            PerlArray *empty = perl_array_new();
+            PerlValue *r = perl_call_code_ref(block, empty);
+            perl_array_free(empty);
+            perl_array_push(out, r ? r : perl_alloc_undef());
+            if (r) perl_free(r);
+        }
+        if (wa) return perl_array_to_list_return(out);
+        return perl_alloc_int(out->len);
+    }
+    if (!strcmp(bare, "insert_after") || !strcmp(bare, "insert_after_string")) {
+        /* insert_after { BLOCK } $val, @array — mutates @array, returns true/false */
+        PerlValue *val = (args && args->len > 1) ? args->elems[1] : perl_alloc_undef();
+        PerlArray *list = NULL;
+        if (args && args->len > 2 && args->elems[2]->tag == PERL_REF_ARRAY)
+            list = (PerlArray *)args->elems[2]->pval;
+        int done = 0;
+        if (list) {
+            PerlArray *out = perl_anon_array_new();
+            for (long long i = 0; i < list->len; i++) {
+                perl_array_push(out, list->elems[i]);
+                int hit = 0;
+                if (!strcmp(bare, "insert_after_string")) {
+                    char *want = perl_to_string_dup(block);
+                    char *have = perl_to_string_dup(list->elems[i]);
+                    hit = !strcmp(want, have);
+                    free(want); free(have);
+                } else {
+                    PerlValue *r = lmu_call_block(block, list->elems[i]);
+                    hit = perl_is_true(r); if (r) perl_free(r);
+                }
+                if (hit && !done) { perl_array_push(out, val); done = 1; }
+            }
+            /* replace list contents */
+            while (list->len > 0) { list->len--; }
+            for (long long i = 0; i < out->len; i++) perl_array_push(list, out->elems[i]);
+            perl_array_free(out);
+        }
+        return perl_alloc_bool(done);
+    }
+    perl_die_croak("Undefined subroutine &List::MoreUtils::%s called", bare);
+    return perl_alloc_undef();
+}
+
+/* ── Term::ANSIColor ─────────────────────────────────────────────────────── */
+static const char *ansi_code_for(const char *n) {
+    if (!n) return NULL;
+    struct { const char *n; const char *c; } t[] = {
+        {"clear","0"},{"reset","0"},{"bold","1"},{"dark","2"},{"faint","2"},
+        {"italic","3"},{"underline","4"},{"underscore","4"},{"blink","5"},
+        {"reverse","7"},{"concealed","8"},
+        {"black","30"},{"red","31"},{"green","32"},{"yellow","33"},
+        {"blue","34"},{"magenta","35"},{"cyan","36"},{"white","37"},
+        {"bright_black","90"},{"bright_red","91"},{"bright_green","92"},
+        {"bright_yellow","93"},{"bright_blue","94"},{"bright_magenta","95"},
+        {"bright_cyan","96"},{"bright_white","97"},
+        {"on_black","40"},{"on_red","41"},{"on_green","42"},{"on_yellow","43"},
+        {"on_blue","44"},{"on_magenta","45"},{"on_cyan","46"},{"on_white","47"},
+        {"on_bright_black","100"},{"on_bright_red","101"},{"on_bright_green","102"},
+        {"on_bright_yellow","103"},{"on_bright_blue","104"},{"on_bright_magenta","105"},
+        {"on_bright_cyan","106"},{"on_bright_white","107"},
+        {NULL,NULL}
+    };
+    char tmp[64]; size_t L = strlen(n);
+    if (L >= sizeof tmp) return NULL;
+    for (size_t i = 0; i < L; i++) tmp[i] = (char)tolower((unsigned char)n[i]);
+    tmp[L] = 0;
+    for (int i = 0; t[i].n; i++) if (!strcmp(tmp, t[i].n)) return t[i].c;
+    return NULL;
+}
+static PerlValue *ansi_seq_from_spec(const char *spec) {
+    char *dup = strdup(spec ? spec : "");
+    char *save = NULL;
+    char buf[128]; size_t p = 0;
+    buf[p++] = '\033'; buf[p++] = '[';
+    int any = 0;
+    for (char *tok = strtok_r(dup, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
+        const char *c = ansi_code_for(tok);
+        if (!c) continue;
+        if (any) buf[p++] = ';';
+        size_t cl = strlen(c);
+        memcpy(buf + p, c, cl); p += cl;
+        any = 1;
+    }
+    free(dup);
+    if (!any) { buf[0] = 0; p = 0; }
+    else buf[p++] = 'm';
+    return perl_alloc_string_len(buf, (long long)p);
+}
+static int ansi_disabled(void) {
+    const char *n = getenv("NO_COLOR");
+    if (n && n[0]) return 1;
+    const char *d = getenv("ANSI_COLORS_DISABLED");
+    return d && d[0];
+}
+PerlValue *perl_ansi_color(PerlArray *args, int colored) {
+    if (ansi_disabled()) {
+        if (!colored) return perl_alloc_string("");
+        if (args && args->len > 0 && args->elems[0]->tag == PERL_REF_ARRAY && args->elems[0]->pval) {
+            PerlArray *a = (PerlArray *)args->elems[0]->pval;
+            if (perl_current_wantarray_ctx()) {
+                PerlArray *out = perl_anon_array_new();
+                for (long long i = 0; i < a->len; i++) perl_array_push(out, a->elems[i]);
+                return perl_array_to_list_return(out);
+            }
+            return perl_join(perl_alloc_string(""), a);
+        }
+        if (args && args->len > 0) return perl_clone(args->elems[0]);
+        return perl_alloc_string("");
+    }
+    if (!args || args->len == 0) return perl_alloc_string("");
+    if (!colored) {
+        /* color("red bold") or color("red","bold") */
+        size_t cap = 1; char *spec = strdup("");
+        for (long long i = 0; i < args->len; i++) {
+            char *s = perl_to_string_dup(args->elems[i]);
+            size_t ns = strlen(spec) + 1 + strlen(s) + 1;
+            spec = realloc(spec, ns);
+            if (spec[0]) strcat(spec, " ");
+            strcat(spec, s);
+            free(s);
+        }
+        PerlValue *r = ansi_seq_from_spec(spec);
+        free(spec);
+        return r;
+    }
+    /* colored($text, @colors)  OR  colored(\@list, @colors) */
+    PerlValue *text = args->elems[0];
+    size_t cap = 1; char *spec = strdup("");
+    for (long long i = 1; i < args->len; i++) {
+        char *s = perl_to_string_dup(args->elems[i]);
+        spec = realloc(spec, strlen(spec) + 2 + strlen(s));
+        if (spec[0]) strcat(spec, " ");
+        strcat(spec, s);
+        free(s);
+    }
+    PerlValue *pre = ansi_seq_from_spec(spec);
+    PerlValue *reset = ansi_seq_from_spec("reset");
+    free(spec);
+    if (text->tag == PERL_REF_ARRAY && text->pval) {
+        PerlArray *a = (PerlArray *)text->pval;
+        PerlArray *out = perl_anon_array_new();
+        for (long long i = 0; i < a->len; i++) {
+            PerlValue *c1 = perl_concat(pre, a->elems[i]);
+            PerlValue *c2 = perl_concat(c1, reset);
+            perl_array_push(out, c2);
+            perl_free(c1); perl_free(c2);
+        }
+        perl_free(pre); perl_free(reset);
+        if (perl_current_wantarray_ctx()) return perl_array_to_list_return(out);
+        return perl_join(perl_alloc_string(""), out);
+    }
+    PerlValue *c1 = perl_concat(pre, text);
+    PerlValue *c2 = perl_concat(c1, reset);
+    perl_free(pre); perl_free(reset); perl_free(c1);
+    return c2;
+}
+PerlValue *perl_ansi_color_const(const char *name) {
+    if (ansi_disabled()) return perl_alloc_string("");
+    return ansi_seq_from_spec(name);
+}
+
+/* ── Encode ──────────────────────────────────────────────────────────────── */
+static PerlValue *enc_iconv(const char *tocode, const char *fromcode,
+                            PerlValue *str, int check) {
+    long long slen = 0;
+    char *in = perl_to_string_dup_len(str, &slen);
+    iconv_t cd = iconv_open(tocode, fromcode);
+    if (cd == (iconv_t)-1) {
+        free(in);
+        perl_die_croak("Unknown encoding '%s'", tocode);
+    }
+    size_t inleft = (size_t)slen;
+    char *inptr = in;
+    size_t outcap = inleft * 4 + 8, outleft = outcap;
+    char *out = malloc(outcap), *outptr = out;
+    size_t n = iconv(cd, &inptr, &inleft, &outptr, &outleft);
+    int failed = (n == (size_t)-1) || inleft != 0;
+    iconv_close(cd);
+    if (failed && check) {
+        free(in); free(out);
+        perl_die_croak("%s: argument does not map to %s", "encode", tocode);
+    }
+    PerlValue *r = perl_alloc_string_len(out, (long long)(outptr - out));
+    free(in); free(out);
+    return r;
+}
+static const char *enc_canon(const char *n) {
+    if (!n) return "UTF-8";
+    if (!strcasecmp(n, "utf8") || !strcasecmp(n, "utf-8")) return "UTF-8";
+    if (!strcasecmp(n, "latin1") || !strcasecmp(n, "iso-8859-1") ||
+        !strcasecmp(n, "iso8859-1")) return "ISO-8859-1";
+    if (!strcasecmp(n, "ascii") || !strcasecmp(n, "us-ascii")) return "ASCII";
+    if (!strcasecmp(n, "utf16") || !strcasecmp(n, "utf-16")) return "UTF-16";
+    if (!strcasecmp(n, "utf16le") || !strcasecmp(n, "utf-16le")) return "UTF-16LE";
+    if (!strcasecmp(n, "utf16be") || !strcasecmp(n, "utf-16be")) return "UTF-16BE";
+    return n;
+}
+PerlValue *perl_encode_call(const char *name, PerlArray *args) {
+    const char *bare = name;
+    const char *sc = strrchr(name, ':');
+    if (sc && sc > name && *(sc - 1) == ':') bare = sc + 1;
+    if (!strcmp(bare, "encode_utf8")) {
+        PerlValue *s = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+        PerlValue *r = perl_clone(s);
+        if (r->tag == PERL_STRING) r->flags &= ~(unsigned)PV_FLAG_UTF8;
+        return r;
+    }
+    if (!strcmp(bare, "decode_utf8")) {
+        PerlValue *s = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+        PerlValue *r = perl_clone(s);
+        if (r->tag == PERL_STRING) r->flags |= PV_FLAG_UTF8;
+        return r;
+    }
+    if (!strcmp(bare, "encode")) {
+        const char *enc = (args && args->len > 0) ? perl_to_string(args->elems[0]) : "UTF-8";
+        PerlValue *s = (args && args->len > 1) ? args->elems[1] : perl_alloc_undef();
+        int check = (args && args->len > 2) ? (int)perl_to_int(args->elems[2]) : 0;
+        PerlValue *r = enc_iconv(enc_canon(enc), "UTF-8", s, check);
+        if (r->tag == PERL_STRING) r->flags &= ~(unsigned)PV_FLAG_UTF8;
+        return r;
+    }
+    if (!strcmp(bare, "decode")) {
+        const char *enc = (args && args->len > 0) ? perl_to_string(args->elems[0]) : "UTF-8";
+        PerlValue *s = (args && args->len > 1) ? args->elems[1] : perl_alloc_undef();
+        int check = (args && args->len > 2) ? (int)perl_to_int(args->elems[2]) : 0;
+        PerlValue *r = enc_iconv("UTF-8", enc_canon(enc), s, check);
+        if (r->tag == PERL_STRING) r->flags |= PV_FLAG_UTF8;
+        return r;
+    }
+    if (!strcmp(bare, "from_to")) {
+        /* from_to($str, $from, $to) mutates $_[0] — we return the converted string;
+           codegen assigns back when possible. */
+        PerlValue *s = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
+        const char *from = (args && args->len > 1) ? perl_to_string(args->elems[1]) : "UTF-8";
+        const char *to   = (args && args->len > 2) ? perl_to_string(args->elems[2]) : "UTF-8";
+        PerlValue *r = enc_iconv(enc_canon(to), enc_canon(from), s, 0);
+        if (s && s->tag == PERL_STRING) perl_assign(s, r);
+        return perl_length(r);
+    }
+    if (!strcmp(bare, "encodings")) {
+        PerlArray *a = perl_anon_array_new();
+        const char *encs[] = {"utf8","UTF-8","ascii","US-ASCII","iso-8859-1","latin1",
+                              "UTF-16","UTF-16LE","UTF-16BE","UTF-32", NULL};
+        for (int i = 0; encs[i]; i++) perl_array_push(a, perl_alloc_string(encs[i]));
+        if (perl_current_wantarray_ctx()) return perl_array_to_list_return(a);
+        return perl_alloc_int(a->len);
+    }
+    if (!strcmp(bare, "is_utf8")) {
+        PerlValue *s = (args && args->len > 0) ? args->elems[0] : NULL;
+        return perl_alloc_bool(s && s->tag == PERL_STRING && (s->flags & PV_FLAG_UTF8));
+    }
+    if (!strcmp(bare, "_utf8_on")) {
+        PerlValue *s = (args && args->len > 0) ? args->elems[0] : NULL;
+        if (s && s->tag == PERL_STRING) s->flags |= PV_FLAG_UTF8;
+        return s ? perl_clone(s) : perl_alloc_undef();
+    }
+    if (!strcmp(bare, "_utf8_off")) {
+        PerlValue *s = (args && args->len > 0) ? args->elems[0] : NULL;
+        if (s && s->tag == PERL_STRING) s->flags &= ~(unsigned)PV_FLAG_UTF8;
+        return s ? perl_clone(s) : perl_alloc_undef();
+    }
+    if (!strcmp(bare, "find_encoding") || !strcmp(bare, "find_mime_encoding")) {
+        const char *enc = (args && args->len > 0) ? perl_to_string(args->elems[0]) : "";
+        PerlHash *h = perl_anon_hash_new();
+        perl_hash_set_str(h, "Name", perl_alloc_string(enc && enc[0] ? enc : "utf8"));
+        PerlValue *r = perl_ref_hash(h);
+        r->blessed_class = strdup("Encode::Encoding");
+        return r;
+    }
+    if (!strcmp(bare, "FB_CROAK")) return perl_alloc_int(1);
+    if (!strcmp(bare, "FB_WARN") || !strcmp(bare, "WARN_ON_ERR")) return perl_alloc_int(2);
+    if (!strcmp(bare, "FB_PERLQQ") || !strcmp(bare, "PERLQQ")) return perl_alloc_int(0x100);
+    if (!strcmp(bare, "FB_HTMLCREF") || !strcmp(bare, "HTMLCREF")) return perl_alloc_int(0x200);
+    if (!strcmp(bare, "FB_XMLCREF") || !strcmp(bare, "XMLCREF")) return perl_alloc_int(0x400);
+    if (!strcmp(bare, "FB_DEFAULT") || !strcmp(bare, "FB_QUIET")) return perl_alloc_int(0);
+    if (!strcmp(bare, "DIE_ON_ERR")) return perl_alloc_int(1);
+    if (!strcmp(bare, "LEAVE_SRC") || !strcmp(bare, "RETURN_ON_ERR") ||
+        !strcmp(bare, "STOP_AT_PARTIAL")) return perl_alloc_int(0);
+    perl_die_croak("Undefined subroutine &Encode::%s called", bare);
+    return perl_alloc_undef();
+}
+
+PerlValue *perl_encode_method(PerlValue *obj, const char *m, PerlArray *args) {
+    if (!obj || obj->tag != PERL_REF_HASH) return perl_alloc_undef();
+    PerlValue *namev = perl_hash_get_str_ref((PerlHash *)obj->pval, "Name");
+    const char *enc = namev ? perl_to_string(namev) : "UTF-8";
+    if (!strcmp(m, "name") || !strcmp(m, "Name"))
+        return perl_alloc_string(enc);
+    if (!strcmp(m, "encode")) {
+        PerlArray *a = perl_array_new();
+        perl_array_push(a, perl_alloc_string(enc));
+        if (args && args->len > 0) perl_array_push_nc(a, args->elems[0]);
+        PerlValue *r = perl_encode_call("encode", a);
+        perl_array_free_nc(a);
+        return r;
+    }
+    if (!strcmp(m, "decode")) {
+        PerlArray *a = perl_array_new();
+        perl_array_push(a, perl_alloc_string(enc));
+        if (args && args->len > 0) perl_array_push_nc(a, args->elems[0]);
+        PerlValue *r = perl_encode_call("decode", a);
+        perl_array_free_nc(a);
+        return r;
+    }
     return perl_alloc_undef();
 }
 

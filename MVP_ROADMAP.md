@@ -176,25 +176,20 @@ gap, not a correctness bug, but one that will bite more often as more
 real modules get pulled in). Full table: `TESTS.md` → "CPAN-module
 compile survey #2".
 
-**Tier 2 — high frequency, moderate cost:** `Time::Piece` (OO wrapper
-over already-working `localtime`/`gmtime`/`strftime` primitives —
-bigger surface than Time::Local for related value), `Storable::dclone`
-only (not full `freeze`/`thaw` binary-format compatibility — needs a
-genuinely new recursive deep-clone-with-cycle-detection primitive, but
-the pattern already exists in `perl_dumper`'s `seen`-hash cycle guard to
-copy from), `JSON::PP`-equivalent (encoder is feasible now — Perl's
-`%.15g`-style float stringification already matches; needs new
-string-escaping and a small recursive-descent decoder — moderate,
-high-payoff), `Text::CSV_PP`-equivalent (needs a real quoted-field state
-machine, not a naive `split`-based approach), `Hash::Util`.
+**Tier 2 — high frequency, moderate cost:** ~~`Time::Piece`~~ (IMPLEMENTED
+2026-09-20), ~~`Storable::dclone`~~ plus `freeze`/`thaw`/`store`/`retrieve`
+(IMPLEMENTED 2026-09-20 — internal PCST format, round-trip tested; not
+byte-compatible with real Storable's nfreeze stream), ~~`JSON::PP`~~
+(IMPLEMENTED 2026-09-20, flags expanded same day), ~~`Text::CSV_PP`~~
+(IMPLEMENTED 2026-09-20, `quote_char=>undef`/`csv()`/EOF 2012 same day),
+~~`Hash::Util`~~ (IMPLEMENTED 2026-09-20, hashref + recurse + slice-assign
+same day).
 
 **Tier 3 — lower priority for this project's sysadmin/CLI use case (vs.
-web/app-framework modules):** `Try::Tiny` (mostly expressible with
-existing `eval {}` — but fix D102 first, since Try::Tiny's whole point
-is structured exception objects), `List::MoreUtils` (List::Util already
-covers `uniq`; narrower marginal value), `Encode` (broad charset-table
-surface; `use utf8`/`:encoding(UTF-8)` already cover the highest-frequency
-case), `Term::ANSIColor` (cosmetic only).
+web/app-framework modules):** ~~`Try::Tiny`~~ (IMPLEMENTED 2026-09-20),
+~~`List::MoreUtils`~~ (IMPLEMENTED 2026-09-20), ~~`Encode`~~ (IMPLEMENTED
+2026-09-20 via iconv: encode/decode/from_to/utf8/find_encoding/FB_CROAK),
+~~`Term::ANSIColor`~~ (IMPLEMENTED 2026-09-20; honors `NO_COLOR`).
 
 **Explicitly out of scope:** anything web-framework-shaped (Moose/Moo,
 Mojolicious/Dancer/Plack), `Digest::MD5`/`Digest::SHA`, non-SQLite DBI

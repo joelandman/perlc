@@ -1202,6 +1202,8 @@ NodePtr Parser::parseSignaturePrefix(int line) {
 }
 
 NodePtr Parser::parseAmpBlockCall(std::string name, const std::string &proto, int line) {
+    auto iit = importMap_.find(name);
+    if (iit != importMap_.end()) name = iit->second;
     NodeList args;
     args.push_back(parseAnonSubBody(line, ""));
     match(TK::COMMA);
@@ -4557,7 +4559,9 @@ NodePtr Parser::parsePrimary() {
                 /* sub foo () — bare foo is a call, foo() too. */
                 if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
                 auto n = std::make_unique<Node>(); n->kind = NK::Call;
-                n->name = nm; n->line = line; n->sval = *pr; n->ival = 0;
+                auto iit = importMap_.find(nm);
+                n->name = (iit != importMap_.end()) ? iit->second : nm;
+                n->line = line; n->sval = *pr; n->ival = 0;
                 return n;
             }
             if ((*pr)[0] == '&' && check(TK::LBRACE))

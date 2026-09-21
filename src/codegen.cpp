@@ -783,11 +783,36 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_file_temp",        av, av, i32, i32);
     RT("perl_file_temp_tmpnam", pv);
     RT("perl_storable_dclone",  pv, pv);
-    RT("perl_json_encode",      pv, pv, i64, i64);
-    RT("perl_json_decode",      pv, pv);
+    RT("perl_storable_freeze",  pv, pv, i32);
+    RT("perl_storable_thaw",    pv, pv);
+    RT("perl_storable_store",   pv, pv, pv, i32);
+    RT("perl_storable_retrieve",pv, pv);
+    RT("perl_json_encode",      pv, pv, pv);
+    RT("perl_json_decode",      pv, pv, pv);
     RT("perl_json_true",        pv);
     RT("perl_json_false",       pv);
     RT("perl_time_piece_new",   pv, pv, i64);
+    /* Hash::Util */
+    RT("perl_hu_lock_keys",      voidTy, av /*PerlHash* — shares the PerlArray* IR type*/, av);
+    RT("perl_hu_lock_keys_plus", voidTy, av, av);
+    RT("perl_hu_unlock_keys",    voidTy, av);
+    RT("perl_hu_lock_hash",      voidTy, av);
+    RT("perl_hu_unlock_hash",    voidTy, av);
+    RT("perl_hu_lock_value",     voidTy, av, i8p);
+    RT("perl_hu_unlock_value",   voidTy, av, i8p);
+    RT("perl_hu_hash_locked",    pv, av);
+    RT("perl_hu_legal_keys",     av, av);
+    RT("perl_hu_hidden_keys",    av, av);
+    RT("perl_hu_hash_of",        av, pv);
+    RT("perl_hu_lock_hash_recurse",   voidTy, av);
+    RT("perl_hu_unlock_hash_recurse", voidTy, av);
+    RT("perl_csv_function",      pv, av);
+    RT("perl_try_tiny",          pv, av, i32);
+    RT("perl_try_tiny_tag",      pv, pv, strPtrTy, av, i32);
+    RT("perl_list_moreutils",    pv, strPtrTy, av);
+    RT("perl_ansi_color",        pv, av, i32);
+    RT("perl_ansi_color_const",  pv, strPtrTy);
+    RT("perl_encode_call",       pv, strPtrTy, av);
     RT("perl_text_wrap",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_text_fill",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_make_path",        av, av, pv, i32);
@@ -2140,6 +2165,23 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
          n.name == "path")) {
         return callRT("perl_fspec_path", {});
     }
+    /* Hash::Util legal_keys/hidden_keys in list context. */
+    if (n.kind == NK::Call && !n.args.empty()) {
+        std::string huBare = n.name;
+        auto huSc2 = huBare.rfind("::");
+        if (huSc2 != std::string::npos) huBare = huBare.substr(huSc2 + 2);
+        if (huBare == "legal_ref_keys") huBare = "legal_keys";
+        if (huBare == "hidden_ref_keys") huBare = "hidden_keys";
+        if (huBare == "legal_keys" || huBare == "hidden_keys") {
+            Value *hv = nullptr;
+            if (n.args[0]->kind == NK::HashVar) hv = lookupHash(n.args[0]->name);
+            else if (n.args[0]->kind == NK::DerefHash && n.args[0]->left)
+                hv = callRT("perl_deref_hash", {emitExpr(*n.args[0]->left)});
+            else hv = callRT("perl_hu_hash_of", {emitExpr(*n.args[0])});
+            if (!hv) return callRT("perl_array_new", {});
+            return callRT(huBare == "legal_keys" ? "perl_hu_legal_keys" : "perl_hu_hidden_keys", {hv});
+        }
+    }
     /* File::Path in list context (@dirs = make_path(...)) — the created
        paths / per-dir removal counts reach emitArrayPtr, which must
        return the PerlArray itself (same reasoning as uniq below). */
@@ -2213,6 +2255,27 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         }
         return callRT("perl_uniq_list", {av});
     }
+    if (n.kind == NK::Call) {
+        std::string bare = n.name;
+        auto sc = bare.rfind("::");
+        if (sc != std::string::npos) bare = bare.substr(sc + 2);
+        static const std::unordered_set<std::string> listNative = {
+            "indexes","apply","after","after_incl","before","before_incl","part",
+            "mesh","zip","pairwise","uniq","distinct","minmax","minmaxstr",
+            "singleton","duplicates","insert_after","insert_after_string",
+            "encodings","colored","csv","legal_keys","hidden_keys",
+            "legal_ref_keys","hidden_ref_keys",
+            "catch","finally",
+        };
+        if (listNative.count(bare) || n.name.rfind("List::MoreUtils::", 0) == 0 ||
+            n.name.rfind("Encode::", 0) == 0 || n.name == "csv") {
+            int saved = callCtx_;
+            callCtx_ = 1;
+            Value *pv = emitExpr(n);
+            callCtx_ = saved;
+            return callRT("perl_unwrap_list_return", {pv});
+        }
+    }
     /* eval EXPR / eval { BLOCK } in list context: force wantarray, unwrap. */
     if (n.kind == NK::EvalBlock || (n.kind == NK::Call && n.name == "eval")) {
         int saved = callCtx_;
@@ -2248,6 +2311,65 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *result = callRT("perl_call_code_ref", {ref, av});
         callRT("perl_pop_wantarray", {});
         callRT("perl_array_free", {av});
+        return callRT("perl_unwrap_list_return", {result});
+    }
+    /* Generic method call in list context — found via Text::CSV testing:
+       `join("|", $csv->fields)` (and any other builtin that flattens a
+       single remaining arg via emitArrayPtr, e.g. push/print) fell
+       through to the `!av` branch below with NO case for NK::MethodCall
+       at all, so it called emitExpr in whatever scalar-ish context
+       happened to be left on the wantarray stack — a method whose
+       return depends on wantarray (Text::CSV's `fields`) silently
+       returned just its last element instead of the full list.
+       File::Spec's methods, isa/can (UNIVERSAL, handled by name in
+       emitExpr before it ever reaches the generic perl_dispatch_method
+       call), SUPER:: dispatch, and the Math::BigInt/threads
+       class-string-invocant special forms are all deliberately excluded
+       here — they have their own bespoke codegen in emitExpr (some
+       keyed on `callCtx_` directly, like File::Spec's `adaptList`; some
+       just don't go through perl_dispatch_method's generic runtime
+       dispatch table at all, like isa/can/SUPER::) and must keep
+       reaching that existing logic via the ordinary `!av` scalar-wrap
+       fallback in the caller, not this new generic list-context path
+       (which would otherwise call perl_dispatch_method with a method
+       name — "isa", "SUPER::foo" — the runtime dispatch table has never
+       heard of, a regression this exact shape caught in
+       tests/d75_multi_inherit.pl: "Can't locate object method 'isa'"). */
+    static const std::unordered_set<std::string> specialInvocants = {
+        "File::Spec", "File::Spec::Unix", "Math::BigInt", "threads",
+    };
+    if (n.kind == NK::MethodCall &&
+        n.sval != "isa" && n.sval != "can" &&
+        n.sval != "bmul" && n.sval != "badd" && n.sval != "bsub" &&
+        !(n.sval.size() > 7 && n.sval.substr(0, 7) == "SUPER::") &&
+        !(n.left && n.left->kind == NK::StringLit &&
+          specialInvocants.count(n.left->sval))) {
+        Value *obj = emitExpr(*n.left);
+        Value *argsArr = callRT("perl_array_new", {});
+        for (auto &arg : n.args) {
+            if (arg->kind == NK::ArrayVar) {
+                Value *avArg = lookupArray(arg->name);
+                if (avArg) { callRT("perl_array_extend", {argsArr, avArg}); continue; }
+            }
+            callRT("perl_array_push", {argsArr, emitExpr(*arg)});
+        }
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *one = ConstantInt::get(i32Ty, 1);
+        callRT("perl_push_call_frame",
+              {builder_.CreateGlobalStringPtr(currentPackage_),
+               builder_.CreateGlobalStringPtr(sourceFile_),
+               ConstantInt::get(i32Ty, n.line)});
+        callRT("perl_push_wantarray", {one});
+        Value *result;
+        if (n.sval.empty() && n.right) {
+            Value *methodStr = emitExpr(*n.right);
+            result = callRT("perl_dispatch_method_sv", {obj, methodStr, argsArr});
+        } else {
+            Value *methodStr = builder_.CreateGlobalStringPtr(n.sval);
+            result = callRT("perl_dispatch_method", {obj, methodStr, argsArr});
+        }
+        callRT("perl_pop_wantarray", {});
+        callRT("perl_pop_call_frame", {});
         return callRT("perl_unwrap_list_return", {result});
     }
     return nullptr;
@@ -10648,7 +10770,24 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_);
             Value *lineVal = ConstantInt::get(i32Ty, n.line);
             callRT("perl_push_call_frame", {pkgStr, fileStr, lineVal});
+            /* Found while testing Text::CSV: this generic dispatch never
+               pushed a wantarray frame at all — a method whose return
+               value depends on wantarray (Text::CSV's `fields`/
+               `error_diag`, via perl_array_to_list_return /
+               perl_current_wantarray_ctx) inherited whatever context
+               happened to be left on the runtime stack by an unrelated
+               outer caller instead of the caller's actual context.
+               `callCtx_` is this function's own compile-time record of
+               that context (the same field File::Spec's `adaptList`
+               above reads) — push it onto the runtime stack the same
+               way, so `my @f = $csv->fields;` (which sets callCtx_=1
+               around this very call, see case NK::My's array-RHS
+               fallback) sees list context and `my $x = $csv->fields;`
+               sees scalar. */
+            int ctxInt = (callCtx_ == 1 || callCtx_ == 2) ? 1 : 0;
+            callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, ctxInt)});
             Value *r = callRT("perl_dispatch_method", {obj, methodStr, argsArr});
+            callRT("perl_pop_wantarray", {});
             callRT("perl_pop_call_frame", {});
             return r;
         }
@@ -11813,6 +11952,29 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_storable_dclone",
                       {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef()});
     }
+    if (n.name == "Storable::freeze" || n.name == "freeze" ||
+        n.name == "Storable::nfreeze" || n.name == "nfreeze") {
+        int net = (n.name == "Storable::nfreeze" || n.name == "nfreeze") ? 1 : 0;
+        return callRT("perl_storable_freeze",
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), net)});
+    }
+    if (n.name == "Storable::thaw" || n.name == "thaw") {
+        return callRT("perl_storable_thaw",
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef()});
+    }
+    if (n.name == "Storable::store" || n.name == "store" ||
+        n.name == "Storable::nstore" || n.name == "nstore") {
+        int net = (n.name.find("nstore") != std::string::npos) ? 1 : 0;
+        return callRT("perl_storable_store",
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(),
+                       n.args.size() >= 2 ? emitExpr(*n.args[1]) : perlUndef(),
+                       ConstantInt::get(Type::getInt32Ty(ctx_), net)});
+    }
+    if (n.name == "Storable::retrieve" || n.name == "retrieve") {
+        return callRT("perl_storable_retrieve",
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef()});
+    }
     /* ── JSON::PP (Tier 2, native) ──
        Functional encode_json/decode_json (real @EXPORT, so the bare
        unqualified name always works — same looseness Storable::dclone's
@@ -11822,19 +11984,266 @@ Value *CodeGen::emitCall(const Node &n) {
        stateful OO, not a pure function. JSON::PP::true/false are the
        bare constant forms (`use JSON::PP qw(true false)`). */
     if (n.name == "JSON::PP::encode_json" || n.name == "JSON::encode_json" ||
-        n.name == "encode_json") {
-        auto *i64Ty = Type::getInt64Ty(ctx_);
+        n.name == "encode_json" || n.name == "JSON::PP::to_json" ||
+        n.name == "to_json" || n.name == "JSON::to_json") {
+        Value *opts = n.args.size() >= 2 ? emitExpr(*n.args[1]) : perlUndef();
         return callRT("perl_json_encode",
-                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(),
-                       ConstantInt::get(i64Ty, 0), ConstantInt::get(i64Ty, 0)});
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(), opts});
     }
     if (n.name == "JSON::PP::decode_json" || n.name == "JSON::decode_json" ||
-        n.name == "decode_json") {
+        n.name == "decode_json" || n.name == "JSON::PP::from_json" ||
+        n.name == "from_json" || n.name == "JSON::from_json") {
+        Value *opts = n.args.size() >= 2 ? emitExpr(*n.args[1]) : perlUndef();
         return callRT("perl_json_decode",
-                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef()});
+                      {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(), opts});
     }
     if (n.name == "JSON::PP::true" || n.name == "JSON::true") return callRT("perl_json_true", {});
     if (n.name == "JSON::PP::false" || n.name == "JSON::false") return callRT("perl_json_false", {});
+    /* ── Hash::Util (Tier 2, native) ──
+       All of these take the target %hash BY REFERENCE (real Hash::Util's
+       `\%` prototype) — arg 0 must be a literal NK::HashVar node
+       (bareword %h), resolved via lookupHash the same way NK::KeysFunc
+       does just above; the generic argument-flattening a plain Call
+       would otherwise apply to a %hash argument never gets the chance
+       to run since this intercepts before that. The `_ref_`/`hashref`
+       variants (taking a hashref instead of a bareword %hash) are
+       deliberately not implemented — see TESTS.md. */
+    {
+        static const std::unordered_set<std::string> huNames = {
+            "lock_keys", "unlock_keys", "lock_keys_plus", "lock_hash", "unlock_hash",
+            "lock_value", "unlock_value", "hash_locked", "hash_unlocked",
+            "legal_keys", "hidden_keys",
+            "lock_ref_keys", "unlock_ref_keys", "lock_ref_keys_plus",
+            "lock_ref_hash", "unlock_ref_hash", "lock_hashref", "unlock_hashref",
+            "lock_ref_value", "unlock_ref_value",
+            "hashref_locked", "hashref_unlocked", "legal_ref_keys", "hidden_ref_keys",
+            "lock_hash_recurse", "unlock_hash_recurse",
+            "lock_hashref_recurse", "unlock_hashref_recurse",
+        };
+        std::string bare = n.name;
+        auto huSc = bare.rfind("::");
+        if (huSc != std::string::npos) bare = bare.substr(huSc + 2);
+        auto huNorm = [&](std::string s) {
+            if (s.rfind("lock_ref_", 0) == 0) s.replace(0, 9, "lock_");
+            if (s.rfind("unlock_ref_", 0) == 0) s.replace(0, 11, "unlock_");
+            if (s == "lock_hashref") s = "lock_hash";
+            if (s == "unlock_hashref") s = "unlock_hash";
+            if (s == "hashref_locked") s = "hash_locked";
+            if (s == "hashref_unlocked") s = "hash_unlocked";
+            if (s == "legal_ref_keys") s = "legal_keys";
+            if (s == "hidden_ref_keys") s = "hidden_keys";
+            if (s == "lock_hashref_recurse") s = "lock_hash_recurse";
+            if (s == "unlock_hashref_recurse") s = "unlock_hash_recurse";
+            return s;
+        };
+        if (huNames.count(bare) && !n.args.empty()) {
+            std::string op = huNorm(bare);
+            Value *hv = nullptr;
+            if (n.args[0]->kind == NK::HashVar) hv = lookupHash(n.args[0]->name);
+            else if (n.args[0]->kind == NK::DerefHash && n.args[0]->left)
+                hv = callRT("perl_deref_hash", {emitExpr(*n.args[0]->left)});
+            else hv = callRT("perl_hu_hash_of", {emitExpr(*n.args[0])});
+            if (!hv) return perlUndef();
+            if (op == "lock_hash_recurse") { callRT("perl_hu_lock_hash_recurse", {hv}); return perlUndef(); }
+            if (op == "unlock_hash_recurse") { callRT("perl_hu_unlock_hash_recurse", {hv}); return perlUndef(); }
+            if (op == "lock_keys" || op == "lock_keys_plus") {
+                /* A multi-word `qw(a b)` argument arrives as one
+                   flatten-able node (unlike a single-word qw or a plain
+                   string literal, indistinguishable from an atom) — use
+                   emitArrayPtr the same way every other native module's
+                   arg-spreading loop does, not a plain emitExpr push,
+                   or `lock_keys_plus(%h, qw(b c))` silently only ever
+                   saw one combined/garbled element instead of two. */
+                Value *namesArr = callRT("perl_array_new", {});
+                for (size_t i = 1; i < n.args.size(); i++) {
+                    Value *sub = emitArrayPtr(*n.args[i]);
+                    if (sub) callRT("perl_array_extend", {namesArr, sub});
+                    else     callRT("perl_array_push",   {namesArr, emitExpr(*n.args[i])});
+                }
+                callRT(op == "lock_keys" ? "perl_hu_lock_keys" : "perl_hu_lock_keys_plus",
+                      {hv, namesArr});
+                callRT("perl_array_free", {namesArr});
+                return perlUndef();
+            }
+            if (op == "unlock_keys") { callRT("perl_hu_unlock_keys", {hv}); return perlUndef(); }
+            if (op == "lock_hash")   { callRT("perl_hu_lock_hash",   {hv}); return perlUndef(); }
+            if (op == "unlock_hash") { callRT("perl_hu_unlock_hash", {hv}); return perlUndef(); }
+            if (op == "lock_value" || op == "unlock_value") {
+                Value *key = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+                Value *keyStr = callRT("perl_to_string_dup", {key});
+                callRT(op == "lock_value" ? "perl_hu_lock_value" : "perl_hu_unlock_value",
+                      {hv, keyStr});
+                freeIfOwned(key);
+                return perlUndef();
+            }
+            if (op == "hash_locked")   return callRT("perl_hu_hash_locked", {hv});
+            if (op == "hash_unlocked") return callRT("perl_not", {callRT("perl_hu_hash_locked", {hv})});
+            if (op == "legal_keys" || op == "hidden_keys") {
+                Value *av = callRT(op == "legal_keys" ? "perl_hu_legal_keys" : "perl_hu_hidden_keys", {hv});
+                return callRT("perl_array_len", {av});
+            }
+        }
+    }
+    /* ── Try::Tiny ── */
+    {
+        std::string bare = n.name;
+        auto sc = bare.rfind("::");
+        if (sc != std::string::npos) bare = bare.substr(sc + 2);
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        int wa = (callCtx_ == 1) ? 1 : 0;
+        if (n.name == "Try::Tiny::try") {
+            Value *av = callRT("perl_array_new", {});
+            for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+            Value *r = callRT("perl_try_tiny", {av, ConstantInt::get(i32Ty, wa)});
+            callRT("perl_array_free", {av});
+            return r;
+        }
+        if (n.name == "Try::Tiny::catch") {
+            if (!n.args.empty() && n.args[0]->kind == NK::AnonSub) {
+                Value *blk = emitExpr(*n.args[0]);
+                Value *rest = callRT("perl_array_new", {});
+                for (size_t i = 1; i < n.args.size(); i++)
+                    callRT("perl_array_push", {rest, emitExpr(*n.args[i])});
+                Value *r = callRT("perl_try_tiny_tag",
+                    {blk, builder_.CreateGlobalStringPtr("Try::Tiny::Catch"),
+                     rest, ConstantInt::get(i32Ty, wa)});
+                callRT("perl_array_free", {rest});
+                return r;
+            }
+        }
+        if (n.name == "Try::Tiny::finally" && !n.args.empty()) {
+            Value *blk = emitExpr(*n.args[0]);
+            Value *rest = callRT("perl_array_new", {});
+            for (size_t i = 1; i < n.args.size(); i++)
+                callRT("perl_array_push", {rest, emitExpr(*n.args[i])});
+            Value *r = callRT("perl_try_tiny_tag",
+                {blk, builder_.CreateGlobalStringPtr("Try::Tiny::Finally"),
+                 rest, ConstantInt::get(i32Ty, wa)});
+            callRT("perl_array_free", {rest});
+            return r;
+        }
+    }
+    /* ── List::MoreUtils ── */
+    {
+        static const std::unordered_set<std::string> lmu = {
+            "firstidx","first_index","lastidx","last_index","onlyidx","only_index",
+            "indexes","firstval","first_value","lastval","last_value",
+            "firstres","first_result","lastres","last_result","onlyval","only_value",
+            "apply","after","after_incl","before","before_incl","part",
+            "any","all","none","notall","one","true","false",
+            "mesh","zip","natatime","pairwise","uniq","distinct",
+            "minmax","minmaxstr","singleton","duplicates",
+            "insert_after","insert_after_string",
+        };
+        std::string bare = n.name;
+        auto sc = bare.rfind("::");
+        if (sc != std::string::npos) bare = bare.substr(sc + 2);
+        bool qual = n.name.rfind("List::MoreUtils::", 0) == 0;
+        if (lmu.count(bare) && qual) {
+            Value *av = callRT("perl_array_new", {});
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, callCtx_ == 1 ? 1 : 0)});
+            for (size_t i = 0; i < n.args.size(); i++) {
+                /* mesh/zip/pairwise: pass array vars as array refs */
+                if ((bare == "mesh" || bare == "zip" || bare == "pairwise" ||
+                     bare == "insert_after" || bare == "insert_after_string") &&
+                    n.args[i]->kind == NK::ArrayVar) {
+                    Value *arr = lookupArray(n.args[i]->name);
+                    if (arr) callRT("perl_array_push", {av, callRT("perl_ref_array", {arr})});
+                    else callRT("perl_array_push", {av, emitExpr(*n.args[i])});
+                } else if (bare == "natatime" && i > 0) {
+                    Value *sub = emitArrayPtr(*n.args[i]);
+                    if (sub) callRT("perl_array_extend", {av, sub});
+                    else callRT("perl_array_push", {av, emitExpr(*n.args[i])});
+                } else if (bare != "mesh" && bare != "zip" && bare != "pairwise" &&
+                           n.args[i]->kind != NK::AnonSub) {
+                    Value *sub = emitArrayPtr(*n.args[i]);
+                    if (sub) callRT("perl_array_extend", {av, sub});
+                    else callRT("perl_array_push", {av, emitExpr(*n.args[i])});
+                } else {
+                    callRT("perl_array_push", {av, emitExpr(*n.args[i])});
+                }
+            }
+            Value *r = callRT("perl_list_moreutils",
+                              {builder_.CreateGlobalStringPtr(bare), av});
+            callRT("perl_pop_wantarray", {});
+            callRT("perl_array_free", {av});
+            return r;
+        }
+    }
+    /* ── Term::ANSIColor ── */
+    {
+        std::string bare = n.name;
+        auto sc = bare.rfind("::");
+        if (sc != std::string::npos) bare = bare.substr(sc + 2);
+        if (n.name.rfind("Term::ANSIColor::", 0) == 0) {
+            if (bare == "color" || bare == "colored") {
+                Value *av = callRT("perl_array_new", {});
+                for (auto &a : n.args) {
+                    Value *sub = emitArrayPtr(*a);
+                    if (sub) callRT("perl_array_extend", {av, sub});
+                    else callRT("perl_array_push", {av, emitExpr(*a)});
+                }
+                Value *r = callRT("perl_ansi_color",
+                    {av, ConstantInt::get(Type::getInt32Ty(ctx_), bare == "colored" ? 1 : 0)});
+                callRT("perl_array_free", {av});
+                return r;
+            }
+            if (bare != "colorvalid" && bare != "uncolor" && bare != "color" && bare != "colored") {
+                return callRT("perl_ansi_color_const", {builder_.CreateGlobalStringPtr(bare)});
+            }
+        }
+        static const std::unordered_set<std::string> ansiConsts = {
+            "CLEAR","RESET","BOLD","DARK","FAINT","ITALIC","UNDERLINE","UNDERSCORE",
+            "BLINK","REVERSE","CONCEALED",
+            "BLACK","RED","GREEN","YELLOW","BLUE","MAGENTA","CYAN","WHITE",
+            "BRIGHT_BLACK","BRIGHT_RED","BRIGHT_GREEN","BRIGHT_YELLOW",
+            "BRIGHT_BLUE","BRIGHT_MAGENTA","BRIGHT_CYAN","BRIGHT_WHITE",
+            "ON_BLACK","ON_RED","ON_GREEN","ON_YELLOW","ON_BLUE","ON_MAGENTA",
+            "ON_CYAN","ON_WHITE",
+        };
+        if (ansiConsts.count(bare) && n.name.rfind("Term::ANSIColor::", 0) == 0)
+            return callRT("perl_ansi_color_const", {builder_.CreateGlobalStringPtr(bare)});
+    }
+    /* ── Encode ── */
+    {
+        std::string bare = n.name;
+        auto sc = bare.rfind("::");
+        if (sc != std::string::npos) bare = bare.substr(sc + 2);
+        static const std::unordered_set<std::string> encNames = {
+            "encode","decode","encode_utf8","decode_utf8","from_to","encodings",
+            "find_encoding","find_mime_encoding","is_utf8","_utf8_on","_utf8_off",
+            "FB_CROAK","FB_WARN","FB_PERLQQ","FB_HTMLCREF","FB_XMLCREF","FB_DEFAULT",
+            "FB_QUIET","DIE_ON_ERR","WARN_ON_ERR","PERLQQ","HTMLCREF","XMLCREF",
+            "LEAVE_SRC","RETURN_ON_ERR","STOP_AT_PARTIAL",
+        };
+        if (encNames.count(bare) && n.name.rfind("Encode::", 0) == 0) {
+            Value *av = callRT("perl_array_new", {});
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, callCtx_ == 1 ? 1 : 0)});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub && bare == "encodings") callRT("perl_array_extend", {av, sub});
+                else callRT("perl_array_push", {av, emitExpr(*a)});
+            }
+            Value *r = callRT("perl_encode_call", {builder_.CreateGlobalStringPtr(bare), av});
+            callRT("perl_pop_wantarray", {});
+            callRT("perl_array_free", {av});
+            return r;
+        }
+    }
+    if (n.name == "csv" || n.name == "Text::CSV::csv" || n.name == "Text::CSV_PP::csv" ||
+        n.name == "Text::CSV_XS::csv") {
+        Value *av = callRT("perl_array_new", {});
+        for (auto &a : n.args) {
+            Value *sub = emitArrayPtr(*a);
+            if (sub) callRT("perl_array_extend", {av, sub});
+            else callRT("perl_array_push", {av, emitExpr(*a)});
+        }
+        Value *r = callRT("perl_csv_function", {av});
+        callRT("perl_array_free", {av});
+        return r;
+    }
     /* ── Time::Seconds ONE_* constants (Tier 2, native) ──
        All 9 are plain compile-time-known numbers (real @Time::Seconds::
        EXPORT, v1.41) — no runtime call needed. */

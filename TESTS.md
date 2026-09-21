@@ -73,6 +73,8 @@ eval STRING and eval-defined subs see outer `my`).
 | D140 | **FIXED 2026-09-20** | `perl_spaceship` (the `<=>` operator) and `sort { $a <=> $b }`'s fast-path comparator (`cmp_num_asc`, which the parser recognizes textually and routes around the general comparator machinery) never checked for a registered `<=>` overload at all — silently numified a blessed ref-shaped object as its pointer address. Math::BigInt was unaffected only because its own dedicated tag numifies correctly regardless. See below. |
 | D141 | **FIXED 2026-09-20** | `emitBinOp`'s F64-fast-path BigInt guard (`emitF64BinOpWithBigIntGuard`, D132) only checked for the BigInt tag specifically, not blessed_class generically — a chained `+`/`-`/`*` on a blessed ref-shaped variable (`my $t2 = $t1 + 500; my $t3 = $t2 - 200;`) silently discarded the class on the second operation. See below. |
 | D142 | **FIXED 2026-09-20** | `emitArrayPtr`'s `NK::LocaltimeFunc`/`GmtimeFunc` case ignored the `sval == "scalar_ctx"` marker the parser stamps for an explicit `scalar localtime(...)`/`scalar gmtime(...)` — `push @a, scalar gmtime(0)` (or the same shape inside `map`) wrongly flattened the 9-element list-context array instead of pushing the single scalar-context value. Pre-existing, independent of Time::Piece. See below. |
+| D143 | **FIXED 2026-09-20** | The generic OO method-call dispatch (`case NK::MethodCall` in `emitExpr`, and `emitArrayPtr` — which had no case for `NK::MethodCall` at all) never pushed a wantarray frame around `perl_dispatch_method` — a method whose return value depends on context (e.g. Text::CSV's `fields`, DBI's `fetchrow_array`) inherited whatever was left on the runtime stack by an unrelated caller instead of the actual calling context; `join("|", $csv->fields)` and `my @f = $csv->fields;` both silently lost data. Pre-existing, independent of Text::CSV. See below. |
+| D144 | **FIXED 2026-09-20** | An in-memory filehandle's backing scalar (`open my $fh, ">", \$out`) only synced on `close()` — `pmf_write`'s accumulated buffer was copied to the target scalar solely in `pmf_close`, so `print $fh "x"; print "[$out]";` with no intervening `close` showed `$out` still empty, unlike real Perl's synchronous-on-every-write `PerlIO::scalar`. Pre-existing, independent of Text::CSV (reproduces with a plain `print`, no module involved). See below. |
 | D101 | **FIXED 2026-09-11** | `each %hash` in scalar context returned the pair length (0/1/2), not the key. See below. |
 | D102 | **FIXED** (2026-09-10) | `die REF` / `die $blessed_obj` lost the reference — `$@` became a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Broke OO exception handling. See below. |
 | D103 | **FIXED 2026-09-11** | Integer overflow used wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently went wrong or printed in scientific notation instead of exact digits. See below. |
@@ -3011,6 +3013,269 @@ objects (this codebase has no `cmp`-overload dispatch at all yet, for
 any blessed class — a pre-existing gap, not new).
 
 Tests: `tests/time_piece_{smoke,deep}.pl`.
+
+### Text::CSV / Text::CSV_PP / Text::CSV_XS (Tier 2, native) + D143/D144 — 2026-09-20
+
+Native CSV parsing/combining: `->new({opts})`, `parse`/`fields`/`combine`/
+`string`/`status`, `getline`/`getline_all`/`getline_hr`/`getline_hr_all`/
+`column_names`, `print`/`say`, `error_diag`/`error_input`/`SetDiag`, and
+the `sep_char`/`quote_char`/`escape_char`/`eol`/`binary`/`always_quote`/
+`quote_space`/`allow_whitespace`/`allow_loose_quotes`/`blank_is_undef`/
+`empty_is_undef` accessors. `Text::CSV`/`Text::CSV_XS` both alias the
+same implementation as `Text::CSV_PP` (matching real Perl: `Text::CSV`
+is a thin loader that blesses into whichever backend is available) —
+`ref($csv)` reflects whichever class name `->new` was actually called
+through.
+
+**Object representation**: a blessed anonymous `PerlHash` (bare
+attribute keys + a few internal `_`-prefixed fields: `_fields`,
+`_string`, `_error_code`/`_error_str`/`_error_pos`/`_status`,
+`_column_names`) — no new PerlValue machinery needed, same as
+JSON::PP's `new`-returned object.
+
+**Parser**: a hand-written character-by-character state machine
+(`csv_parse_line`, 4 states: start-of-field / unquoted / quoted /
+after-quote) rather than a naive `split`-based approach, since quoted
+fields can contain the separator, embedded newlines, and doubled or
+escaped quote characters. `combine` (`csv_combine`) is the inverse:
+quotes a field when it contains the separator, the quote character, a
+newline/CR, or (when `quote_space` — on by default) a plain space.
+Diagnostic codes are implemented for exactly the 3 error conditions the
+deep test exercises (2110 embedded-newline-without-`binary` in combine,
+2021 unterminated-quote-at-EOF in parse, 2034 a loose/unescaped quote
+mid-field) — probed against the real, installed Text::CSV_PP 2.06, not
+the full ~30-code table real Text::CSV documents.
+
+**Two real-behavior corrections found only by testing against the
+actual installed module**, both now matched exactly:
+- `status()` is a *tri-state*, not derived from the error code: `undef`
+  before the object's first `parse`/`combine`/`getline` call, `1` after
+  one succeeds, `0` after one fails — and a fresh, never-used object's
+  `error_diag` is code `0`/empty message (`"00000"` when stringified in
+  scalar context — a 6-element list `(code, msg, pos, 0, 0, 0)`
+  concatenated), not a "2000/EOF - No error" sentinel an earlier
+  assumption in this write-up's own draft had guessed. Also: `print`/
+  `say` do **not** update `status()`/`error_diag()` at all, even though
+  they call `combine()` internally — confirmed empirically (`$csv->say
+  (...); $csv->status` stays `undef`, whereas a direct `$csv->combine
+  (...); $csv->status` is `1`) — so `print`/`say` call the internal
+  `csv_combine()` C function directly rather than dispatching back
+  through this module's own "combine" method branch.
+- `say`'s trailing `"\n"` is conditional: real Perl only supplies it
+  when `eol` is empty (the default) — with a custom `eol` set, `say`'s
+  output is byte-identical to `print`'s, no extra newline on top.
+
+**Two more corrections needed for the documented `->column_names($csv->
+getline($fh))` idiom and `allow_whitespace` to actually work**:
+`column_names` auto-derefs a single arrayref argument into the names
+list (rather than storing a 1-element list holding the arrayref itself
+— the canonical real-Perl idiom passes `getline`'s return value
+directly, never a spread list); `allow_whitespace` trims *trailing* as
+well as leading whitespace from unquoted fields (only leading was
+implemented at first — `" a , b "` must parse to `("a", "b")`).
+
+**Three generic (non-Text::CSV-specific) defects found and fixed while
+building this, all pre-existing and independent of Text::CSV** — same
+pattern as Time::Piece's D139–D142 just above (a new Tier-2 module
+exercising a code path nothing had exercised quite this way before):
+- **D143** (`case NK::MethodCall` in `emitExpr`, and a wholly missing
+  `NK::MethodCall` case in `emitArrayPtr`, `src/codegen.cpp`): the
+  generic OO dispatch never pushed a wantarray frame around
+  `perl_dispatch_method` at all — a method whose result depends on
+  context (Text::CSV's `fields`, and this should also help DBI's
+  `fetchrow_array`, which already had matching wantarray-aware code
+  that could never have been exercised via this path) silently used
+  whatever context an *unrelated* earlier caller had left on the
+  runtime stack. Concretely, `join("|", $csv->fields)` returned only
+  the last field, and `my @f = $csv->fields;` returned a 1-element
+  array — both because `emitArrayPtr` had no `NK::MethodCall` case to
+  flatten a list-returning method call at all, only the narrower `case
+  NK::My`'s array-RHS fallback (which sets the compile-time `callCtx_`
+  member directly) happened to work correctly. Fixed by adding a
+  generic `NK::MethodCall` case to `emitArrayPtr` (pushing wantarray=1,
+  dispatching, unwrapping via the same `perl_unwrap_list_return`
+  `CallCodeRef` already used just above it) and by making the
+  scalar-context `emitExpr` dispatch push wantarray from `callCtx_`
+  instead of leaving the stack untouched. File::Spec's methods are
+  deliberately excluded from the new `emitArrayPtr` case, alongside
+  `isa`/`can` (UNIVERSAL — resolved by `n.sval` before ever reaching
+  `perl_dispatch_method`'s runtime table, which has never heard of
+  either name), `SUPER::` dispatch, and the Math::BigInt in-place
+  mutators (`bmul`/`badd`/`bsub`) and class-string-invocant forms
+  (`Math::BigInt`/`threads`) — all of these have their own bespoke
+  codegen in `emitExpr` and must keep reaching it via the ordinary `!av`
+  scalar-wrap fallback, not the new generic list-context path. The first
+  version of this fix missed the `isa`/`can`/`SUPER::`/Math::BigInt
+  exclusions and briefly broke `tests/d75_multi_inherit.pl` ("Can't
+  locate object method \"isa\"") before `make test-all` caught it —
+  a reminder that "add a case to emitArrayPtr" is never as narrow as it
+  looks in a codegen this size, given how many method-call shapes
+  already have their own special-cased codegen entirely outside the
+  generic runtime dispatch table.
+- **D144** (`pmf_write`/`pmf_close`, `src/runtime.c`): an in-memory
+  filehandle's backing scalar (`open my $fh, ">", \$out`) was only
+  synced to the target scalar in `pmf_close` — found because
+  `$csv->say($fh, [...]); print "[$out]";` (no intervening `close`)
+  showed `$out` still empty, and confirmed with a plain `print $fh "x";
+  print "[$out]";` (no CSV involved at all) reproducing identically.
+  Real Perl's `PerlIO::scalar` layer updates the backing scalar
+  synchronously on every write. Fixed by moving the sync into
+  `pmf_write` itself (so it runs on every write, not just close) and
+  adding `setvbuf(fp, NULL, _IONBF, 0)` right after `fopencookie`
+  creates the FILE* so libc's own default full buffering doesn't delay
+  `pmf_write` from being invoked in the first place. Verified
+  `tests/inmem_fh_{smoke,deep}.pl` (the existing in-memory-filehandle
+  regression tests) still pass unchanged.
+
+**Known limitations** (deliberately out of scope, see MVP_ROADMAP.md's
+"explicitly out of scope" reasoning for the same class of decision):
+`bind_columns`, `types`/IV-NV-PV coercion, `callbacks`, `is_quoted`/
+`is_binary`/`meta_info`, `decode_utf8`/encoding layers, the functional
+`csv()` helper, `quote_char => undef` ("no quoting") mode,
+`lock_hash_recurse`-style deep operations (n/a here, that's Hash::Util),
+and the full ~30-entry diagnostic-code table (only 3 implemented, see
+above). Also two narrower, deliberately-untested real-Perl quirks
+found but not chased, since they're orthogonal to Text::CSV's own
+correctness: `eof($fh)` immediately after a `getline` that exactly
+consumed the last record doesn't match real Perl's `eof()` semantics on
+the same in-memory filehandle (a possible pre-existing `eof()` builtin
+quirk, not confirmed Text::CSV-specific); and `error_diag()` after a
+`getline`/`getline_all` run to natural EOF sets a real, specific
+diagnostic code (2012) in real Text::CSV_PP that this implementation
+doesn't replicate (only genuine parse/combine *failures* set an error
+code here — natural end-of-stream does not).
+
+Tests: `tests/text_csv_{smoke,deep}.pl`.
+
+### Hash::Util (Tier 2, native) — 2026-09-20
+
+Native `lock_keys`/`unlock_keys`/`lock_keys_plus`/`lock_hash`/
+`unlock_hash`/`lock_value`/`unlock_value`/`hash_locked`/`hash_unlocked`/
+`legal_keys`/`hidden_keys`, all taking the target `%hash` **by
+reference** (real Hash::Util's `\%` prototype) — resolved the same way
+`NK::KeysFunc` resolves a bareword `%hash` argument (`lookupHash`),
+intercepted before the generic argument-flattening a plain `NK::Call`
+would otherwise apply to a `%hash` argument ever gets a chance to run.
+
+**New PerlValue/PerlHash machinery** (the only one of the three Tier-2
+modules this session that needed it): a `PerlHashLock` struct
+(`legal` key-name list + `keys_locked`/`values_locked` flags) hung off
+a new `PerlHash.lock` pointer (`src/runtime.h`) — `NULL` in the
+universal unrestricted case, so every hash read/write pays one pointer
+compare when Hash::Util is unused. Enforcement (`hu_check_read`/
+`hu_check_write` in `src/runtime.c`) is checked at the actual read/write
+choke points — `perl_hash_get_sv`/`get_sv_ref`/`get_str_ref` (reads) and
+`perl_hash_set_sv`/`set_str`/`lvalue_str` (writes) — not gated behind a
+per-program "is Hash::Util in use" prepass the way an early draft of
+this module's scoping considered; a hash never touched by Hash::Util
+always has `lock == NULL`; hash slices and `%h = (...)`-from-list bulk
+assignment are not instrumented (see "Known limitations" below).
+`lock_value`'s per-value read-only marking reuses a new `PerlValue`
+flag bit, `PV_FLAG_READONLY` (bit 23, the next free one after D90's
+`PV_FLAG_UTF8`) — `perl_clone` already drops flags for non-string tags,
+so `my $x = $h{locked}; $x = 5;` is unaffected with zero extra code,
+confirmed against real Perl.
+
+**Two real-behavior subtleties, both confirmed against real Perl and
+easy to get wrong:**
+- `delete` on a locked-keys hash **succeeds** and the key becomes
+  "hidden" (still legal, just not currently present) rather than fully
+  forgotten — `exists` on it is false, but writing it again succeeds
+  and it reappears in `keys`. `legal_keys`/`hidden_keys` distinguish
+  these two: `legal` is the full allowed-name list Hash::Util itself
+  tracks (independent of what's currently live), `hidden` is `legal`
+  minus whatever's currently present.
+- `hash_locked`/`hash_unlocked` reflect **only** whether *keys* are
+  restricted (`lock_keys`/`lock_keys_plus`/`lock_hash`), never whether
+  any individual *value* is read-only — a hash touched only by
+  `lock_value()` (never `lock_keys`) is still "unlocked". This needed a
+  `PerlHashLock.keys_locked` flag distinct from "does `h->lock` exist at
+  all", since `lock_value()` alone still allocates the struct (as the
+  natural home for its enforcement path) without setting it — collapsing
+  the two very nearly shipped a byte-for-byte-wrong `hash_unlocked()`.
+
+**One implementation bug found and fixed before it ever reached a
+committed test** (not a pre-existing generic defect like D139–D144 —
+purely local to this session's own new arg-building code, so no
+D-number): the loop building `lock_keys`/`lock_keys_plus`'s extra-names
+array pushed each `n.args[i]` via a plain `emitExpr`, which is correct
+for a single-word `qw(b)` or a plain string literal but not for a
+multi-word `qw(b c)` — that arrives as one flatten-able node, and every
+*other* native module's arg-spreading loop already handles this via
+`emitArrayPtr` (extend when it flattens, push when it doesn't); this
+one didn't, so `lock_keys_plus(%h, qw(b c))` silently mishandled the
+list. Fixed by using the same `emitArrayPtr`-checking pattern the rest
+of the codebase already establishes.
+
+**Nondeterminism note, not chased (a deliberate scope decision, not a
+bug)**: real Perl's die messages here carry `" at FILE line N."`, but
+producing an accurate line number would need per-statement source-line
+tracking threaded through every hash access (a real, if narrow,
+codegen change — recall D138/D142's whole "found while testing a Tier-2
+module" pattern this session, except this one was scoped out rather
+than fixed). This implementation's messages carry `" at line 0."`
+instead. The deep test never compares `$@` verbatim — every assertion
+is a `$@ =~ /^Attempt to access disallowed key '...'/`-style prefix
+match, which both engines evaluate to the identical boolean, so the
+test's own *printed output* is still genuinely byte-for-byte identical;
+only the underlying (never-printed) exception text differs.
+
+**Known limitations** (deliberately out of scope): `lock_hash_recurse`/
+`unlock_hash_recurse`/`lock_hashref_recurse` (would need a cycle guard,
+same shape as Storable::dclone's memo — deferred, not attempted); the
+`_ref_`/`hashref` variants (`lock_ref_keys`, `hashref_locked`, etc. —
+same functions, a hashref argument instead of a bareword `%hash`; not
+wired into codegen this pass); `fieldhash`/`fieldhashes`
+(Hash::Util::FieldHash — metaprogramming-heavy, matches
+MVP_ROADMAP.md's "explicitly out of scope" reasoning); the hash-internals
+introspection family (`hash_seed`, `hash_value`, `bucket_info` and
+friends, `all_keys`) — these expose real Perl's own randomized internal
+hash implementation and are **not reproducible even between two runs of
+real Perl itself**, so no byte-for-byte test could exist for them
+regardless of implementation effort; hash slices (`@h{...}`) now go through `perl_hash_assign_slice`, which
+pre-checks every key so a restricted-hash death leaves the hash
+unchanged. `%h = (...)`-from-list already used `perl_hash_set_sv`.
+`lock_hash_recurse` / `lock_hashref_recurse` and the `_ref_`/`hashref`
+variants are implemented (2026-09-20). FieldHash and hash-internals
+introspection remain out of scope.
+
+Tests: `tests/hash_util_{smoke,deep}.pl`, `tests/hash_util_ref_{smoke,deep}.pl`.
+
+### Remaining Tier-2 surface + Tier-3 modules — 2026-09-20
+
+**Storable freeze/thaw:** `freeze`/`nfreeze`/`thaw`/`store`/`nstore`/
+`retrieve` round-trip via an internal `PCST` tagged format (cycles,
+blessing, scalar refs). Not byte-compatible with real Storable's
+on-the-wire nfreeze; tests print thawed values, never freeze bytes.
+Tests: `tests/storable_freeze_{smoke,deep}.pl`.
+
+**JSON::PP flags:** `allow_nonref` (including `allow_nonref(0)`),
+`space_before`/`space_after`/`indent`, `convert_blessed` (`TO_JSON`),
+`\uXXXX` decode as a UTF-8-flagged character string (including
+surrogate pairs). `relaxed` exists but is not in the deep test (a
+method-`decode` interaction after prior encodes is still crashy —
+functional `decode_json` is fine). Tests: `tests/json_pp_opts_{smoke,deep}.pl`.
+
+**Text::CSV:** `quote_char => undef` (no quoting), functional
+`csv(in => $fh)`, getline-at-EOF diagnostic 2012. Tests:
+`tests/text_csv_extra_{smoke,deep}.pl`.
+
+**Try::Tiny:** native `try`/`catch`/`finally` with `&;@` prototypes.
+A failing `try` with no `catch` returns undef without rethrowing
+(Try::Tiny 0.32). Tests: `tests/try_tiny_{smoke,deep}.pl`.
+
+**List::MoreUtils:** `firstidx`/`lastidx`/`indexes`/`firstval`/`lastval`/
+`apply`/`after`/`before`/`part`/`mesh`/`zip`/`natatime`/`uniq`/`minmax`/
+`singleton`/`duplicates`/`insert_after` plus `any`/`all`/`none`/`notall`/
+`one`/`true`/`false`. Tests: `tests/list_moreutils_{smoke,deep}.pl`.
+
+**Term::ANSIColor:** `color`/`colored` and the named constants; honors
+`NO_COLOR` / `ANSI_COLORS_DISABLED`. Tests:
+`tests/term_ansicolor_{smoke,deep}.pl`.
+
+**Encode:** `encode`/`decode`/`encode_utf8`/`decode_utf8`/`from_to`/
+`encodings`/`find_encoding`/`is_utf8`/`FB_CROAK` via iconv. Tests:
+`tests/encode_{smoke,deep}.pl`.
 
 ## Source layout
 

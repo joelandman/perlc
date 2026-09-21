@@ -132,6 +132,8 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
         "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
         "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
+        "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
+        "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
     };
 
     std::set<std::string> modulesToInstall;
@@ -390,6 +392,8 @@ static std::vector<Token> inlineModules(
         "File::Spec","File::Spec::Unix","File::Spec::Functions",
         "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
         "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
+        "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
+        "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -808,6 +812,37 @@ static std::vector<Token> inlineModules(
             if (getenv("PERLC_DEBUG_IMPORTS")) {
                 fprintf(stderr, "FcntlImport: %s -> %zu names\n", modName.c_str(), names.size());
                 for (auto &name : names) fprintf(stderr, "  [%s]\n", name.c_str());
+            }
+            continue;
+        }
+        if (modName == "Try::Tiny") {
+            std::vector<std::string> names = explicitImports;
+            if (names.empty()) names = {"try","catch","finally"};
+            for (auto &name : names) {
+                if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (name.empty() || name[0] == ':') continue;
+                importMap[name] = "Try::Tiny::" + name;
+            }
+            continue;
+        }
+        if (modName == "List::MoreUtils" || modName == "Term::ANSIColor" ||
+            modName == "Encode" || modName == "Hash::Util") {
+            std::vector<std::string> names = explicitImports;
+            if (names.empty() && modName == "Term::ANSIColor")
+                names = {"color","colored"};
+            if (names.empty() && modName == "Encode")
+                names = {"decode","decode_utf8","encode","encode_utf8",
+                         "str2bytes","bytes2str","encodings","find_encoding",
+                         "find_mime_encoding","clone_encoding"};
+            if (names.size() == 1 && (names[0] == ":all" || names[0] == ":DEFAULT")) {
+                if (modName == "Encode")
+                    names = {"decode","decode_utf8","encode","encode_utf8",
+                             "encodings","find_encoding","from_to","is_utf8"};
+            }
+            for (auto &name : names) {
+                if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (name.empty() || name[0] == ':') continue;
+                importMap[name] = modName + "::" + name;
             }
             continue;
         }
@@ -1261,6 +1296,45 @@ int main(int argc, char **argv) {
 
         /* parse */
         parser = Parser(std::move(expanded));
+        {
+            std::map<std::string,std::string> protoMap;
+            auto seedProto = [&](const std::string &shortN, const std::string &qual) {
+                auto amp = [](const std::string &b) {
+                    static const std::set<std::string> a = {
+                        "try","catch","finally",
+                        "firstidx","first_index","lastidx","last_index",
+                        "onlyidx","only_index","indexes","apply",
+                        "after","after_incl","before","before_incl",
+                        "firstval","first_value","lastval","last_value",
+                        "firstres","first_result","lastres","last_result",
+                        "onlyval","only_value","part","any","all","none",
+                        "notall","one","pairwise","insert_after","true","false",
+                    };
+                    return a.count(b);
+                };
+                std::string bare = shortN;
+                if (amp(bare)) {
+                    protoMap[shortN] = (bare == "try" || bare == "catch" || bare == "finally") ? "&;@" : "&@";
+                    protoMap[qual] = protoMap[shortN];
+                }
+            };
+            for (auto &kv : importMap) seedProto(kv.first, kv.second);
+            static const char *ansiConsts[] = {
+                "CLEAR","RESET","BOLD","DARK","FAINT","ITALIC","UNDERLINE",
+                "BLACK","RED","GREEN","YELLOW","BLUE","MAGENTA","CYAN","WHITE",
+                "BRIGHT_RED","BRIGHT_GREEN","BRIGHT_YELLOW","BRIGHT_BLUE",
+                "ON_BLACK","ON_RED","ON_GREEN","ON_YELLOW","ON_BLUE","ON_MAGENTA",
+                "ON_CYAN","ON_WHITE", NULL
+            };
+            for (int i = 0; ansiConsts[i]; i++) {
+                auto it = importMap.find(ansiConsts[i]);
+                if (it != importMap.end()) {
+                    protoMap[it->first] = "";
+                    protoMap[it->second] = "";
+                }
+            }
+            parser.setProtoMap(std::move(protoMap));
+        }
         parser.setImportMap(std::move(importMap));
         parser.setConstMap(std::move(constMap));
         /* D128: parse errors keep the legacy main-script format only when

@@ -50,6 +50,12 @@ typedef enum {
    count code points when set; otherwise they count raw bytes (binary /
    pack output, byte strings). Bits 0-21 used by shared/capture above. */
 #define PV_FLAG_UTF8              (1u << 22)
+/* Hash::Util's lock_value/lock_hash: this scalar is a hash VALUE marked
+   read-only — write attempts die "Modification of a read-only value
+   attempted". perl_clone drops flags for non-string tags (and only
+   copies PV_FLAG_UTF8 for strings), so `my $x = $h{locked}; $x = 5;`
+   is unaffected — matches real Perl (the copy is a plain scalar). */
+#define PV_FLAG_READONLY          (1u << 23)
 
 typedef struct PerlValue {
     PerlTag      tag;
@@ -268,11 +274,33 @@ typedef struct PerlHashEntry {
     struct PerlHashEntry *next;
 } PerlHashEntry;
 
+/* Hash::Util's lock_keys()/lock_keys_plus(): the set of key names allowed
+   to exist, independent of which are currently present — deleting a
+   legal key removes it from the live hash but NOT from `legal` (it
+   becomes a "hidden" key, still writable to bring it back — confirmed
+   against real Perl). `values_locked` is lock_hash()'s "every CURRENT
+   value is also read-only" (separate from lock_value()'s per-value
+   PV_FLAG_READONLY, which survives independently of this). */
+typedef struct PerlHashLock {
+    char    **legal;
+    long long n, cap;
+    int       values_locked;
+    /* real Perl's hash_locked()/hash_unlocked() reflect ONLY whether keys
+       are restricted (lock_keys/lock_keys_plus/lock_hash) — confirmed a
+       hash with only lock_value() called on it (no key restriction) is
+       still "unlocked". lock_value() alone still needs a PerlHashLock to
+       exist (see hu_ensure_lock in runtime.c) purely as a place to seed
+       `legal` for if key-locking is added later, so "the struct exists"
+       and "keys are actually locked" must be tracked separately. */
+    int       keys_locked;
+} PerlHashLock;
+
 typedef struct PerlHash {
     PerlHashEntry   *buckets[PERL_HASH_BUCKETS];
     long long        size;
     int              refcount; /* 0 = scope-managed (named %hash), >0 = anonymous refcounted ({}) */
     pthread_mutex_t *mu;       /* non-NULL when declared : shared */
+    PerlHashLock    *lock;     /* NULL = unrestricted (the universal case) */
 } PerlHash;
 
 PerlHash *perl_hash_new(void);
@@ -385,8 +413,12 @@ PerlValue *perl_file_temp_template(PerlArray *args, int kind, int ctx);
 PerlValue *perl_file_temp(PerlArray *args, int is_tempfile, int ctx);
 PerlValue *perl_file_temp_tmpnam(void);
 PerlValue *perl_storable_dclone(PerlValue *pv);
-PerlValue *perl_json_encode(PerlValue *pv, long long canonical, long long pretty);
-PerlValue *perl_json_decode(PerlValue *json_str);
+PerlValue *perl_storable_freeze(PerlValue *pv, int network);
+PerlValue *perl_storable_thaw(PerlValue *blob);
+PerlValue *perl_storable_store(PerlValue *pv, PerlValue *path, int network);
+PerlValue *perl_storable_retrieve(PerlValue *path);
+PerlValue *perl_json_encode(PerlValue *pv, PerlValue *opts);
+PerlValue *perl_json_decode(PerlValue *json_str, PerlValue *opts);
 PerlValue *perl_json_true(void);
 PerlValue *perl_json_false(void);
 
@@ -400,6 +432,33 @@ PerlValue *perl_tp_ovl_sub(PerlValue *a, PerlValue *b);
 PerlValue *perl_tp_ovl_cmp(PerlValue *a, PerlValue *b);
 PerlValue *perl_ts_new(double secs);
 PerlValue *perl_time_seconds_method(PerlValue *obj, const char *m, PerlArray *args);
+
+/* Text::CSV / Text::CSV_PP / Text::CSV_XS (Tier 2, native) */
+PerlValue *perl_csv_new(PerlValue *class_pv, PerlValue *opts);
+PerlValue *perl_csv_method(PerlValue *self, const char *m, PerlArray *args);
+
+/* Hash::Util (Tier 2, native) */
+void       perl_hu_lock_keys(PerlHash *h, PerlArray *names);
+void       perl_hu_lock_keys_plus(PerlHash *h, PerlArray *names);
+void       perl_hu_unlock_keys(PerlHash *h);
+void       perl_hu_lock_hash(PerlHash *h);
+void       perl_hu_unlock_hash(PerlHash *h);
+void       perl_hu_lock_value(PerlHash *h, const char *key);
+void       perl_hu_unlock_value(PerlHash *h, const char *key);
+PerlValue *perl_hu_hash_locked(PerlHash *h);
+PerlArray *perl_hu_legal_keys(PerlHash *h);
+PerlArray *perl_hu_hidden_keys(PerlHash *h);
+PerlHash  *perl_hu_hash_of(PerlValue *pv); /* hashref → PerlHash*; dies if not */
+void       perl_hu_lock_hash_recurse(PerlHash *h);
+void       perl_hu_unlock_hash_recurse(PerlHash *h);
+PerlValue *perl_csv_function(PerlArray *args); /* Text::CSV::csv() */
+PerlValue *perl_try_tiny(PerlArray *args, int wantarray);
+PerlValue *perl_try_tiny_tag(PerlValue *block, const char *cls, PerlArray *rest, int wantarray);
+PerlValue *perl_list_moreutils(const char *name, PerlArray *args);
+PerlValue *perl_ansi_color(PerlArray *args, int colored);
+PerlValue *perl_ansi_color_const(const char *name);
+PerlValue *perl_encode_call(const char *name, PerlArray *args);
+PerlValue *perl_encode_method(PerlValue *obj, const char *m, PerlArray *args);
 PerlValue *perl_text_wrap(PerlValue *ip, PerlValue *xp, PerlArray *texts,
                           PerlValue *columns, PerlValue *sep, PerlValue *sep2,
                           PerlValue *huge, PerlValue *unexpand);

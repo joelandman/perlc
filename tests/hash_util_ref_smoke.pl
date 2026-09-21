@@ -1,0 +1,11 @@
+use Hash::Util qw(lock_ref_keys hashref_locked legal_ref_keys lock_hash_recurse);
+my $h = {a => 1, b => {c => 2}};
+lock_ref_keys($h);
+eval { $h->{z} = 1; };
+print "ref_lock_died=", ($@ ne "" ? 1 : 0), "\n";
+print "ref_locked=", (hashref_locked($h) ? 1 : 0), "\n";
+print "legal=", join(",", sort(legal_ref_keys($h))), "\n";
+lock_hash_recurse(%$h);
+eval { $h->{b}{c} = 9; };
+print "recurse_died=", ($@ =~ /^Modification of a read-only value attempted/ ? 1 : 0), "\n";
+print "done\n";

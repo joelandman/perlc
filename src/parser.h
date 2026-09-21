@@ -12,6 +12,12 @@ public:
     /* importMap: short_name → qualified Module::name for re-exported symbols */
     void setImportMap(std::map<std::string, std::string> m) { importMap_ = std::move(m); }
     void setConstMap(std::map<std::string, NodePtr> m)      { constMap_  = std::move(m); }
+    /* Native modules with `&` prototypes (Try::Tiny, List::MoreUtils)
+       seed protoMap_ so `try { } catch { }` / `firstidx { } @list`
+       parse as block-form calls. */
+    void setProtoMap(std::map<std::string, std::string> m) {
+        for (auto &kv : m) protoMap_[kv.first] = kv.second;
+    }
     /* W19: non-owning view for parseExprFromTokens' throwaway parser —
        constMap_ entries are cloned at each use (parsePrimary), so sharing
        the map without transferring ownership is safe for the parse's
