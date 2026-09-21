@@ -568,6 +568,10 @@ void CodeGen::declareRuntime() {
     RT("perl_env_get",    pv, pv);
     RT("perl_env_set",    voidTy, pv, pv);
     RT("perl_system",     pv, pv);
+    RT("perl_system_list", pv, av);
+    RT("perl_quotemeta_str", pv, pv);
+    RT("perl_get_perl_version", pv);
+    RT("perl_pod2usage", pv, av);
     RT("perl_syscall",    pv, pv);
     RT("perl_fork",              pv);
     RT("perl_wait_pid",          pv);
@@ -1902,7 +1906,14 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return phi;
     }
     if (n.kind == NK::SpliceFunc) {
-        Value *av = lookupArray(n.name);
+        Value *av = nullptr;
+        if (n.left) {
+            Value *ref = emitExpr(*n.left);
+            av = callRT("perl_deref_array", {ref});
+            freeIfOwned(ref);
+        } else {
+            av = lookupArray(n.name);
+        }
         if (!av) return callRT("perl_array_new", {});
         Value *off = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
         Value *len = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
@@ -2535,6 +2546,8 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_alloc_flat_array", "perl_alloc_float_pair",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
         "perl_uc_str", "perl_lc_str", "perl_ucfirst_str", "perl_lcfirst_str",
+        "perl_quotemeta_str", "perl_system_list", "perl_get_perl_version",
+        "perl_pod2usage",
         "perl_chr_val", "perl_ord_val",
         "perl_length", "perl_substr2", "perl_substr3",
         "perl_chop", "perl_index_str", "perl_rindex_str",
@@ -7219,6 +7232,7 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::GetpidFunc: {
         if (n.sval == "osname") return callRT("perl_get_os_name", {});
+        if (n.sval == "perl_version") return callRT("perl_get_perl_version", {});
         return callRT("perl_getpid", {});
     }
 
@@ -7260,6 +7274,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RequireStmt: {
+        if (n.sval.empty()) return perlInt(1); /* require VERSION */
         Value *modStr = builder_.CreateGlobalStringPtr(n.sval);
         return callRT("perl_runtime_require", {modStr});
     }
@@ -8680,14 +8695,53 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_alloc_bool", {i64});
     }
 
+    case NK::UndefFunc: {
+        /* undef $s / undef @a / undef %h — clear the target in place.
+           Desugaring scalar `undef $s` through Assign($s, undef) reuses
+           unboxed-int/float teardown. Arrays/hashes are cleared (real
+           Perl: `undef @a` empties, `@a = undef` is a 1-element list). */
+        if (!n.left) return perlUndef();
+        if (n.left->kind == NK::ArrayVar) {
+            Value *av = lookupArray(n.left->name);
+            if (av) callRT("perl_array_clear", {av});
+            return perlUndef();
+        }
+        if (n.left->kind == NK::HashVar) {
+            Value *hv = lookupHash(n.left->name);
+            if (hv) callRT("perl_hash_clear", {hv});
+            return perlUndef();
+        }
+        auto asg = std::make_unique<Node>();
+        asg->kind = NK::Assign;
+        asg->left = n.left->clone();
+        asg->right = std::make_unique<Node>();
+        asg->right->kind = NK::UndefLit;
+        asg->line = n.line;
+        return emitExpr(*asg);
+    }
+
     case NK::PopExpr: {
-        Value *av = lookupArray(n.name);
+        Value *av = nullptr;
+        if (n.left) {
+            Value *ref = emitExpr(*n.left);
+            av = callRT("perl_deref_array", {ref});
+            freeIfOwned(ref);
+        } else {
+            av = lookupArray(n.name);
+        }
         if (!av) return perlUndef();
         return callRT("perl_array_pop", {av});
     }
 
     case NK::ShiftExpr: {
-        Value *av = lookupArray(n.name);
+        Value *av = nullptr;
+        if (n.left) {
+            Value *ref = emitExpr(*n.left);
+            av = callRT("perl_deref_array", {ref});
+            freeIfOwned(ref);
+        } else {
+            av = lookupArray(n.name);
+        }
         if (!av) return perlUndef();
         return callRT("perl_array_shift", {av});
     }
@@ -8896,8 +8950,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left) {
             Value *ref = emitExpr(*n.left);
             Value *h   = callRT("perl_deref_hash", {ref});
+            Value *sz  = callRT("perl_hash_size", {h});
             freeIfOwned(ref);
-            return callRT("perl_hash_size", {h});
+            return sz;
         }
         if (n.name == "+") {
             Value *av = callRT("perl_plus_hash_keys", {});
@@ -8915,8 +8970,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left) {
             Value *ref = emitExpr(*n.left);
             Value *h   = callRT("perl_deref_hash", {ref});
+            Value *sz  = callRT("perl_hash_size", {h});
             freeIfOwned(ref);
-            return callRT("perl_hash_size", {h});
+            return sz;
         }
         Value *hv = lookupHash(n.name);
         return hv ? callRT("perl_hash_size", {hv}) : perlInt(0);
@@ -8927,6 +8983,21 @@ Value *CodeGen::emitExpr(const Node &n) {
             return callRT("perl_alloc_int",
                 {builder_.CreateSExt(i32v, Type::getInt64Ty(ctx_))});
         };
+        if (n.sval == "expr" && n.left && n.left->kind == NK::ArrowDeref) {
+            Value *base = emitExpr(*n.left->left);
+            if (n.left->sval == "array") {
+                Value *av = callRT("perl_deref_array", {base});
+                Value *idx = emitIdx(*n.left->right);
+                Value *elem = callRT("perl_array_get", {av, idx});
+                Value *r = existsI32(callRT("perl_defined", {elem}));
+                freeIfOwned(base);
+                return r;
+            }
+            Value *hv = callRT("perl_deref_hash", {base});
+            Value *r = existsI32(emitHashExists(hv, *n.left->right));
+            freeIfOwned(base);
+            return r;
+        }
         /* exists $Config{...} / exists $ENV{...} — native special hashes */
         if (n.left &&
             (n.name == "Config" || n.name == "Config::Config" ||
@@ -9009,6 +9080,20 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *av = emitArrayPtr(n);
             if (!av) return perlUndef();
             return callRT("perl_array_last", {av});
+        }
+        if (n.sval == "expr" && n.left && n.left->kind == NK::ArrowDeref) {
+            Value *base = emitExpr(*n.left->left);
+            if (n.left->sval == "array") {
+                Value *av = callRT("perl_deref_array", {base});
+                Value *idx = emitIdx(*n.left->right);
+                Value *r = callRT("perl_array_delete", {av, idx});
+                freeIfOwned(base);
+                return r;
+            }
+            Value *hv = callRT("perl_deref_hash", {base});
+            Value *r = emitHashDelete(hv, *n.left->right);
+            freeIfOwned(base);
+            return r;
         }
         if (n.sval == "array") {
             Value *av = lookupArray(n.name);
@@ -9559,12 +9644,21 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
             Value *av = callRT("perl_deref_array", {base});
+            /* Clone the element BEFORE freeIfOwned(base): a temporary
+               (e.g. `$csv->getline($fh)->[0]`, `$json->decode($s)->{k}`)
+               is a REF_* whose perl_free drops the container refcount to
+               0 and frees the array/hash. get_ref/get_str_ref borrow
+               pointers into that storage — use-after-free. */
+            Value *elem = callRT("perl_array_get", {av, emitIdx(*n.right)});
             freeIfOwned(base);
-            return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
+            return elem;
         } else {
             Value *hv = callRT("perl_deref_hash", {base});
+            Value *key = emitExpr(*n.right);
+            Value *elem = callRT("perl_hash_get_sv", {hv, key});
+            freeIfOwned(key);
             freeIfOwned(base);
-            return emitHashGetRef(hv, *n.right);
+            return elem;
         }
     }
 
@@ -9887,8 +9981,19 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::SystemFunc: {
-        Value *cmd = n.left ? emitExpr(*n.left) : perlStr("");
-        return callRT("perl_system", {cmd});
+        Value *av = callRT("perl_array_new", {});
+        auto pushSys = [&](const Node &e) {
+            if (Value *sub = emitArrayPtr(e))
+                callRT("perl_array_extend", {av, sub});
+            else {
+                Value *v = emitExpr(e);
+                callRT("perl_array_push", {av, v});
+                freeIfOwned(v);
+            }
+        };
+        if (n.left) pushSys(*n.left);
+        for (auto &a : n.args) pushSys(*a);
+        return callRT("perl_system_list", {av});
     }
 
     case NK::BacktickExpr: {
@@ -11889,6 +11994,15 @@ Value *CodeGen::emitCall(const Node &n) {
        script calling Getopt::Long::Configure (xsubpp, dirsplit's
        qw(:config ...) import path, ...) died "Undefined subroutine
        &Getopt::Long::Configure". Returns 1 like real Configure. */
+    if (n.name == "quotemeta") {
+        Value *a = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *r = callRT("perl_quotemeta_str", {a});
+        if (!n.args.empty()) freeIfOwned(a);
+        return r;
+    }
+    if (n.name == "pod2usage" || n.name == "Pod::Usage::pod2usage") {
+        return callRT("perl_pod2usage", {buildArgArray()});
+    }
     if (n.name == "Configure" || n.name == "Getopt::Long::Configure") {
         return perlInt(1);
     }

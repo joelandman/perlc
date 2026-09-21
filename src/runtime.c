@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <malloc.h>
 #include <string.h>
+#include <strings.h>
 #include <math.h>
 #include <ctype.h>
 #include <stdint.h>
@@ -32,6 +33,7 @@
 #include <limits.h>
 #include <time.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <iconv.h>
 
 /* D97: mini-gmp for Math::BigInt — compiled into the runtime (zero external
@@ -8277,6 +8279,26 @@ PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
 
         char tmp[512];
         switch (conv) {
+        case 'v': {
+            /* %vd / %vX — vector. A string (e.g. $^V as "5.42.0") is
+               copied through; integers emit byte-separated decimals. */
+            char vconv = *p ? *p++ : 'd';
+            (void)vconv;
+            char *s = perl_to_string_dup(arg);
+            if (s && s[0] && strchr(s, '.')) {
+                OUT_PUTS(s, strlen(s));
+            } else {
+                unsigned long long uv = (unsigned long long)perl_to_int(arg);
+                char vbuf[64];
+                int vn = snprintf(vbuf, sizeof(vbuf), "%u.%u.%u",
+                                  (unsigned)((uv >> 16) & 0xff),
+                                  (unsigned)((uv >> 8) & 0xff),
+                                  (unsigned)(uv & 0xff));
+                if (vn > 0) OUT_PUTS(vbuf, (size_t)vn);
+            }
+            free(s);
+            continue;
+        }
         case 's': {
             char *s = perl_to_string_dup(arg);
             size_t needed = strlen(s) + (size_t)(si + 16);
@@ -10001,14 +10023,228 @@ PerlValue *perl_system(PerlValue *cmd) {
     char *s = perl_to_string_dup(cmd);
     int ret = system(s);
     free(s);
-    /* Real Perl's system() returns the raw wait(2) status word, not the
-       unwrapped exit code — the documented idiom is `$rc >> 8` to recover
-       the exit code (matching $?'s convention, though $? itself is not
-       yet implemented). Returning WEXITSTATUS(ret) directly here silently
-       broke that idiom for any caller following it. -1 (system() itself
-       failed to launch a child at all) is returned as-is, matching Perl. */
-    if (ret == -1) return perl_alloc_int(-1);
+    /* Real Perl's system() returns the raw wait(2) status word. */
+    if (ret == -1) {
+        perl_set_dollar_question(-1);
+        return perl_alloc_int(-1);
+    }
+    perl_set_dollar_question(ret);
     return perl_alloc_int(ret);
+}
+
+PerlValue *perl_system_list(PerlArray *args) {
+    if (!args || args->len < 1) {
+        perl_set_dollar_question(-1);
+        return perl_alloc_int(-1);
+    }
+    if (args->len == 1)
+        return perl_system(args->elems[0]);
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        perl_set_dollar_question(-1);
+        return perl_alloc_int(-1);
+    }
+    if (pid == 0) {
+        char **argv = (char **)calloc((size_t)args->len + 1, sizeof(char *));
+        if (!argv) _exit(127);
+        for (long long i = 0; i < args->len; i++)
+            argv[i] = perl_to_string_dup(args->elems[i]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perl_set_dollar_question(-1);
+        return perl_alloc_int(-1);
+    }
+    perl_set_dollar_question(status);
+    perl_sig_poll();
+    return perl_alloc_int(status);
+}
+
+PerlValue *perl_quotemeta_str(PerlValue *v) {
+    char *s = perl_to_string_dup(v);
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n * 2 + 1);
+    if (!out) { free(s); return perl_alloc_string(""); }
+    size_t j = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!(isalnum(c) || c == '_')) out[j++] = '\\';
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+    PerlValue *r = perl_alloc_string_len(out, (long long)j);
+    free(s);
+    free(out);
+    return r;
+}
+
+static void podu_canon_key(char *k) {
+    if (!k) return;
+    char *s = k;
+    while (*s == '-') s++;
+    if (s != k) memmove(k, s, strlen(s) + 1);
+    for (char *p = k; *p; p++) *p = (char)tolower((unsigned char)*p);
+    if (strcmp(k, "msg") == 0) strcpy(k, "message");
+    if (strcmp(k, "exit") == 0) strcpy(k, "exitval");
+}
+
+static PerlHash *podu_opts_from_args(PerlArray *args) {
+    PerlHash *h = perl_hash_new();
+    if (!args || args->len < 1) return h;
+    PerlValue *a0 = args->elems[0];
+    if (args->len == 1 && a0 && a0->tag == PERL_REF_HASH) {
+        PerlHash *src = perl_deref_hash(a0);
+        if (src) {
+            for (int b = 0; b < PERL_HASH_BUCKETS; b++) {
+                for (PerlHashEntry *e = src->buckets[b]; e; e = e->next) {
+                    char *ck = e->key ? strdup(e->key) : strdup("");
+                    podu_canon_key(ck);
+                    PerlValue *key = perl_alloc_string(ck);
+                    perl_hash_set_sv(h, key, e->val);
+                    perl_free(key);
+                    free(ck);
+                }
+            }
+        }
+        return h;
+    }
+    if (args->len == 1) {
+        char *s = perl_to_string_dup(a0);
+        int isnum = s && s[0] && (isdigit((unsigned char)s[0]) ||
+                     ((s[0] == '-' || s[0] == '+') && isdigit((unsigned char)s[1])));
+        if (isnum) {
+            for (char *p = s + 1; *p; p++)
+                if (!isdigit((unsigned char)*p)) { isnum = 0; break; }
+        }
+        PerlValue *key = perl_alloc_string(isnum ? "exitval" : "message");
+        perl_hash_set_sv(h, key, a0);
+        perl_free(key);
+        free(s);
+        return h;
+    }
+    for (long long i = 0; i + 1 < args->len; i += 2) {
+        char *ks = perl_to_string_dup(args->elems[i]);
+        podu_canon_key(ks);
+        PerlValue *key = perl_alloc_string(ks);
+        perl_hash_set_sv(h, key, args->elems[i + 1]);
+        perl_free(key);
+        free(ks);
+    }
+    return h;
+}
+
+static int podu_section_wanted(const char *title, int verbose) {
+    while (*title == ' ' || *title == '\t') title++;
+    if (verbose >= 2 && verbose != 99) return 1;
+    if (!strncasecmp(title, "SYNOPSIS", 8) || !strncasecmp(title, "USAGE", 5))
+        return 1;
+    if (verbose >= 1 &&
+        (!strncasecmp(title, "OPTIONS", 7) || !strncasecmp(title, "ARGUMENTS", 9)))
+        return 1;
+    return 0;
+}
+
+static int podu_is_synopsis(const char *title) {
+    while (*title == ' ' || *title == '\t') title++;
+    return !strncasecmp(title, "SYNOPSIS", 8) || !strncasecmp(title, "USAGE", 5);
+}
+
+static void podu_emit_file(FILE *out, const char *path, int verbose) {
+    if (!path || !path[0] || !out) return;
+    FILE *in = fopen(path, "r");
+    if (!in) return;
+    char line[4096];
+    int want = 0, in_pod = 0, wrote_usage = 0, skip_blanks = 0;
+    while (fgets(line, sizeof(line), in)) {
+        if (strncmp(line, "=head1", 6) == 0) {
+            in_pod = 1;
+            const char *title = line + 6;
+            want = podu_section_wanted(title, verbose);
+            skip_blanks = want;
+            if (want && verbose < 2 && podu_is_synopsis(title) && !wrote_usage) {
+                fputs("Usage:\n", out);
+                wrote_usage = 1;
+            }
+            continue;
+        }
+        if (strncmp(line, "=cut", 4) == 0) { want = 0; in_pod = 0; continue; }
+        if (line[0] == '=' && in_pod) continue;
+        if (!want) continue;
+        if (skip_blanks && (line[0] == '\n' || line[0] == '\0')) continue;
+        skip_blanks = 0;
+        if (verbose < 2) {
+            if (line[0] == '\n' || line[0] == '\0') fputc('\n', out);
+            else {
+                fputs("    ", out);
+                fputs(line, out);
+            }
+        } else {
+            fputs(line, out);
+        }
+    }
+    fclose(in);
+}
+
+PerlValue *perl_pod2usage(PerlArray *args) {
+    PerlHash *opts = podu_opts_from_args(args);
+    PerlValue *msg_v = perl_hash_get_str_ref(opts, "message");
+    PerlValue *ex_v  = perl_hash_get_str_ref(opts, "exitval");
+    PerlValue *vb_v  = perl_hash_get_str_ref(opts, "verbose");
+    PerlValue *in_v  = perl_hash_get_str_ref(opts, "input");
+    PerlValue *out_v = perl_hash_get_str_ref(opts, "output");
+
+    int verbose = 0;
+    int noexit = 0;
+    int exitval = 2;
+    if (vb_v && vb_v->tag != PERL_UNDEF) verbose = (int)perl_to_int(vb_v);
+    if (ex_v && ex_v->tag != PERL_UNDEF) {
+        char *es = perl_to_string_dup(ex_v);
+        if (es && strcasecmp(es, "noexit") == 0) noexit = 1;
+        else exitval = (int)perl_to_int(ex_v);
+        free(es);
+    } else if (verbose == 0) {
+        exitval = 2;
+    } else if (verbose > 0) {
+        exitval = 1;
+    }
+
+    FILE *out = stdout;
+    if (out_v && out_v->tag == PERL_FILEHANDLE && out_v->pval)
+        out = (FILE *)out_v->pval;
+    else if (out_v && out_v->tag == PERL_REF_SCALAR && out_v->pval) {
+        PerlValue *inner = (PerlValue *)out_v->pval;
+        if (inner && inner->tag == PERL_FILEHANDLE && inner->pval)
+            out = (FILE *)inner->pval;
+    } else if (!noexit && exitval >= 2) {
+        out = stderr;
+    }
+
+    if (msg_v && msg_v->tag != PERL_UNDEF) {
+        char *m = perl_to_string_dup(msg_v);
+        if (m && m[0]) { fputs(m, out); fputc('\n', out); }
+        free(m);
+    }
+
+    char *inpath = NULL;
+    if (in_v && in_v->tag != PERL_UNDEF && in_v->tag != PERL_REF_SCALAR &&
+        in_v->tag != PERL_FILEHANDLE)
+        inpath = perl_to_string_dup(in_v);
+    if (!inpath) {
+        PerlValue *d0 = perl_get_dollar0();
+        inpath = perl_to_string_dup(d0);
+    }
+    if (inpath && inpath[0])
+        podu_emit_file(out, inpath, verbose);
+    free(inpath);
+    fflush(out);
+
+    perl_hash_free(opts);
+    if (!noexit) perl_exit_n(perl_alloc_int(exitval));
+    return perl_alloc_int(1);
 }
 
 /* D70: syscall() builtin - call system call with arguments */
@@ -14144,9 +14380,15 @@ void perl_hu_unlock_hash_recurse(PerlHash *h) {
     hu_walk_recurse(h, seen, &n, 0);
 }
 
-/* ── Storable freeze / thaw / store / retrieve ───────────────────────────── */
+/* ── Storable freeze / thaw / store / retrieve ─────────────────────────────
+   Wire format matches real Storable nfreeze (network order), magic 0x05 0x0b
+   as produced by Storable 3.41 on this host. freeze() emits the same
+   network form so thaw() is endian-portable and perl's thaw() can read
+   perlc nfreeze (and vice versa) for the types we encode. */
 enum {
-    ST_UNDEF = 0, ST_INT, ST_NV, ST_PV, ST_AV, ST_HV, ST_RV, ST_BLESS, ST_BACK, ST_BOOL
+    SX_OBJECT = 0, SX_LSCALAR = 1, SX_ARRAY = 2, SX_HASH = 3, SX_REF = 4,
+    SX_UNDEF = 5, SX_BYTE = 8, SX_NETINT = 9, SX_SCALAR = 10, SX_SV_UNDEF = 14,
+    SX_BLESS = 17
 };
 typedef struct {
     char *buf; size_t cap, pos;
@@ -14157,76 +14399,100 @@ static void st_put(StBuf *b, const void *p, size_t n) {
     memcpy(b->buf + b->pos, p, n); b->pos += n;
 }
 static void st_u8(StBuf *b, unsigned char v) { st_put(b, &v, 1); }
-static void st_i32(StBuf *b, int32_t v) { st_put(b, &v, 4); }
-static void st_i64(StBuf *b, int64_t v) { st_put(b, &v, 8); }
-static void st_f64(StBuf *b, double v) { st_put(b, &v, 8); }
+static void st_be32(StBuf *b, uint32_t v) {
+    unsigned char p[4] = { (unsigned char)(v >> 24), (unsigned char)(v >> 16),
+                           (unsigned char)(v >> 8), (unsigned char)v };
+    st_put(b, p, 4);
+}
 static int st_find(StBuf *b, void *p) {
     for (int i = 0; i < b->nseen; i++) if (b->seen[i] == p) return i;
     return -1;
 }
 static void st_enc(StBuf *b, PerlValue *v);
 
-static void st_enc(StBuf *b, PerlValue *v) {
-    if (!v || v->tag == PERL_UNDEF) { st_u8(b, ST_UNDEF); return; }
-    perl_promote_ref_array(v);
-    if (v->blessed_class && strcmp(v->blessed_class, "JSON::PP::Boolean") == 0) {
-        st_u8(b, ST_BOOL); st_u8(b, perl_is_true(v) ? 1 : 0); return;
+static void st_enc_int(StBuf *b, long long v) {
+    if (v >= -128 && v <= 127) {
+        st_u8(b, SX_BYTE);
+        st_u8(b, (unsigned char)(v + 128));
+    } else {
+        st_u8(b, SX_NETINT);
+        st_be32(b, (uint32_t)(int32_t)v);
     }
-    if (v->blessed_class && (v->tag == PERL_REF_HASH || v->tag == PERL_REF_ARRAY ||
-                             v->tag == PERL_REF_SCALAR)) {
-        st_u8(b, ST_BLESS);
-        int32_t clen = (int32_t)strlen(v->blessed_class);
-        st_i32(b, clen); st_put(b, v->blessed_class, (size_t)clen);
+}
+static void st_enc_pv(StBuf *b, const char *s, size_t n) {
+    if (n < 256) {
+        st_u8(b, SX_SCALAR); st_u8(b, (unsigned char)n);
+    } else {
+        st_u8(b, SX_LSCALAR); st_be32(b, (uint32_t)n);
+    }
+    if (n) st_put(b, s, n);
+}
+
+static void st_enc(StBuf *b, PerlValue *v) {
+    if (!v || v->tag == PERL_UNDEF) { st_u8(b, SX_SV_UNDEF); return; }
+    perl_promote_ref_array(v);
+    if (v->blessed_class && v->blessed_class[0] &&
+        (v->tag == PERL_REF_HASH || v->tag == PERL_REF_ARRAY || v->tag == PERL_REF_SCALAR)) {
+        size_t clen = strlen(v->blessed_class);
+        st_u8(b, SX_BLESS);
+        st_u8(b, clen < 256 ? (unsigned char)clen : 255);
+        st_put(b, v->blessed_class, clen < 256 ? clen : 255);
         char *save = v->blessed_class; v->blessed_class = NULL;
         st_enc(b, v);
         v->blessed_class = save;
         return;
     }
     switch (v->tag) {
-    case PERL_INT: st_u8(b, ST_INT); st_i64(b, v->ival); break;
-    case PERL_FLOAT: st_u8(b, ST_NV); st_f64(b, v->fval); break;
-    case PERL_STRING: {
-        st_u8(b, ST_PV);
-        int32_t n = (int32_t)v->slen;
-        st_i32(b, n);
-        st_u8(b, (v->flags & PV_FLAG_UTF8) ? 1 : 0);
-        if (n > 0) st_put(b, v->sval, (size_t)n);
+    case PERL_INT: st_enc_int(b, v->ival); break;
+    case PERL_FLOAT: {
+        char tmp[64];
+        snprintf(tmp, sizeof tmp, "%.15g", v->fval);
+        st_enc_pv(b, tmp, strlen(tmp));
         break;
     }
+    case PERL_STRING:
+        st_enc_pv(b, v->sval ? v->sval : "", (size_t)v->slen);
+        break;
     case PERL_REF_ARRAY: {
         int id = st_find(b, v->pval);
-        if (id >= 0) { st_u8(b, ST_BACK); st_i32(b, id); break; }
+        if (id >= 0) { st_u8(b, SX_REF); st_be32(b, (uint32_t)id); return; }
+        st_u8(b, SX_REF);
         if (b->nseen < 512) b->seen[b->nseen++] = v->pval;
         PerlArray *a = (PerlArray *)v->pval;
-        st_u8(b, ST_AV); st_i32(b, (int32_t)(a ? a->len : 0));
+        st_u8(b, SX_ARRAY);
+        st_be32(b, (uint32_t)(a ? a->len : 0));
         if (a) for (long long i = 0; i < a->len; i++) st_enc(b, a->elems[i]);
         break;
     }
     case PERL_REF_HASH: {
         int id = st_find(b, v->pval);
-        if (id >= 0) { st_u8(b, ST_BACK); st_i32(b, id); break; }
+        if (id >= 0) { st_u8(b, SX_REF); st_be32(b, (uint32_t)id); return; }
+        st_u8(b, SX_REF);
         if (b->nseen < 512) b->seen[b->nseen++] = v->pval;
         PerlHash *h = (PerlHash *)v->pval;
-        st_u8(b, ST_HV); st_i32(b, (int32_t)(h ? h->size : 0));
+        st_u8(b, SX_HASH);
+        st_be32(b, (uint32_t)(h ? h->size : 0));
         if (h) for (int i = 0; i < PERL_HASH_BUCKETS; i++)
             for (PerlHashEntry *e = h->buckets[i]; e; e = e->next) {
-                int32_t n = (int32_t)strlen(e->key);
-                st_i32(b, n); st_put(b, e->key, (size_t)n);
+                /* nfreeze stores VALUE then KEY (u32be len + bytes) */
                 st_enc(b, e->val);
+                uint32_t n = (uint32_t)strlen(e->key);
+                st_be32(b, n);
+                st_put(b, e->key, n);
             }
         break;
     }
     case PERL_REF_SCALAR: {
         int id = st_find(b, v->pval);
-        if (id >= 0) { st_u8(b, ST_BACK); st_i32(b, id); break; }
+        if (id >= 0) { st_u8(b, SX_REF); st_be32(b, (uint32_t)id); return; }
         if (b->nseen < 512) b->seen[b->nseen++] = v->pval;
-        st_u8(b, ST_RV); st_enc(b, (PerlValue *)v->pval);
+        st_u8(b, SX_REF);
+        st_enc(b, (PerlValue *)v->pval);
         break;
     }
     default: {
         char *s = perl_to_string_dup(v);
-        st_u8(b, ST_PV); int32_t n = (int32_t)strlen(s);
-        st_i32(b, n); st_u8(b, 0); st_put(b, s, (size_t)n);
+        st_enc_pv(b, s, strlen(s));
         free(s);
         break;
     }
@@ -14236,8 +14502,50 @@ static void st_enc(StBuf *b, PerlValue *v) {
 PerlValue *perl_storable_freeze(PerlValue *pv, int network) {
     (void)network;
     StBuf b = {0};
-    st_put(&b, "PCST", 4);
-    st_enc(&b, pv);
+    /* Storable 3.41 nfreeze magic */
+    unsigned char mag[2] = { 0x05, 0x0b };
+    st_put(&b, mag, 2);
+    /* Top-level: freeze(\$x) stores $x; freeze(\@a) / freeze(\%h) store
+       the container WITHOUT an extra SX_REF (nested refs still get one). */
+    perl_promote_ref_array(pv);
+    if (pv && pv->blessed_class && pv->blessed_class[0]) {
+        size_t clen = strlen(pv->blessed_class);
+        st_u8(&b, SX_BLESS);
+        st_u8(&b, clen < 256 ? (unsigned char)clen : 255);
+        st_put(&b, pv->blessed_class, clen < 256 ? clen : 255);
+        char *save = pv->blessed_class; pv->blessed_class = NULL;
+        PerlValue *blob = perl_storable_freeze(pv, network);
+        /* freeze() wrote magic+body; append body only */
+        if (blob && blob->tag == PERL_STRING && blob->slen >= 2)
+            st_put(&b, blob->sval + 2, (size_t)blob->slen - 2);
+        if (blob) perl_free(blob);
+        pv->blessed_class = save;
+        PerlValue *r = perl_alloc_string_len(b.buf ? b.buf : "", (long long)b.pos);
+        free(b.buf);
+        return r;
+    }
+    if (pv && pv->tag == PERL_REF_SCALAR && pv->pval)
+        st_enc(&b, (PerlValue *)pv->pval);
+    else if (pv && pv->tag == PERL_REF_ARRAY && pv->pval) {
+        if (b.nseen < 512) b.seen[b.nseen++] = pv->pval;
+        PerlArray *a = (PerlArray *)pv->pval;
+        st_u8(&b, SX_ARRAY);
+        st_be32(&b, (uint32_t)(a ? a->len : 0));
+        if (a) for (long long i = 0; i < a->len; i++) st_enc(&b, a->elems[i]);
+    } else if (pv && pv->tag == PERL_REF_HASH && pv->pval) {
+        if (b.nseen < 512) b.seen[b.nseen++] = pv->pval;
+        PerlHash *h = (PerlHash *)pv->pval;
+        st_u8(&b, SX_HASH);
+        st_be32(&b, (uint32_t)(h ? h->size : 0));
+        if (h) for (int i = 0; i < PERL_HASH_BUCKETS; i++)
+            for (PerlHashEntry *e = h->buckets[i]; e; e = e->next) {
+                st_enc(&b, e->val);
+                uint32_t n = (uint32_t)strlen(e->key);
+                st_be32(&b, n);
+                st_put(&b, e->key, n);
+            }
+    } else
+        st_enc(&b, pv);
     PerlValue *r = perl_alloc_string_len(b.buf ? b.buf : "", (long long)b.pos);
     free(b.buf);
     return r;
@@ -14251,77 +14559,80 @@ static unsigned char st_gu8(StIn *in) {
     if (in->pos >= in->len) perl_die_croak("Storable::thaw: truncated data");
     return in->s[in->pos++];
 }
-static int32_t st_gi32(StIn *in) {
+static uint32_t st_gbe32(StIn *in) {
     if (in->pos + 4 > in->len) perl_die_croak("Storable::thaw: truncated data");
-    int32_t v; memcpy(&v, in->s + in->pos, 4); in->pos += 4; return v;
-}
-static int64_t st_gi64(StIn *in) {
-    if (in->pos + 8 > in->len) perl_die_croak("Storable::thaw: truncated data");
-    int64_t v; memcpy(&v, in->s + in->pos, 8); in->pos += 8; return v;
-}
-static double st_gf64(StIn *in) {
-    if (in->pos + 8 > in->len) perl_die_croak("Storable::thaw: truncated data");
-    double v; memcpy(&v, in->s + in->pos, 8); in->pos += 8; return v;
+    uint32_t v = ((uint32_t)in->s[in->pos] << 24) | ((uint32_t)in->s[in->pos+1] << 16) |
+                 ((uint32_t)in->s[in->pos+2] << 8) | (uint32_t)in->s[in->pos+3];
+    in->pos += 4; return v;
 }
 static PerlValue *st_dec(StIn *in);
 
 static PerlValue *st_dec(StIn *in) {
     unsigned char t = st_gu8(in);
     switch (t) {
-    case ST_UNDEF: return perl_alloc_undef();
-    case ST_INT: return perl_alloc_int(st_gi64(in));
-    case ST_NV: return perl_alloc_float(st_gf64(in));
-    case ST_BOOL: return json_bool(st_gu8(in) ? 1 : 0);
-    case ST_PV: {
-        int32_t n = st_gi32(in);
-        int utf8 = st_gu8(in);
-        if (in->pos + (size_t)n > in->len) perl_die_croak("Storable::thaw: truncated string");
+    case SX_SV_UNDEF:
+    case SX_UNDEF: return perl_alloc_undef();
+    case SX_BYTE: return perl_alloc_int((long long)st_gu8(in) - 128);
+    case SX_NETINT: return perl_alloc_int((int32_t)st_gbe32(in));
+    case SX_SCALAR: {
+        unsigned char n = st_gu8(in);
+        if (in->pos + n > in->len) perl_die_croak("Storable::thaw: truncated string");
         PerlValue *r = perl_alloc_string_len((const char *)in->s + in->pos, n);
-        in->pos += (size_t)n;
-        if (utf8) r->flags |= PV_FLAG_UTF8;
+        in->pos += n;
         return r;
     }
-    case ST_BACK: {
-        int32_t id = st_gi32(in);
-        if (id < 0 || id >= in->nobjs) perl_die_croak("Storable::thaw: bad backref");
-        return in->objs[id];
+    case SX_LSCALAR: {
+        uint32_t n = st_gbe32(in);
+        if (in->pos + n > in->len) perl_die_croak("Storable::thaw: truncated string");
+        PerlValue *r = perl_alloc_string_len((const char *)in->s + in->pos, (long long)n);
+        in->pos += n;
+        return r;
     }
-    case ST_AV: {
-        int32_t n = st_gi32(in);
+    case SX_ARRAY: {
+        uint32_t n = st_gbe32(in);
         PerlArray *a = perl_anon_array_new();
         PerlValue *r = perl_ref_array(a);
         if (in->nobjs < 512) in->objs[in->nobjs++] = r;
-        for (int32_t i = 0; i < n; i++) perl_array_push(a, st_dec(in));
+        for (uint32_t i = 0; i < n; i++) perl_array_push(a, st_dec(in));
         return r;
     }
-    case ST_HV: {
-        int32_t n = st_gi32(in);
+    case SX_HASH: {
+        uint32_t n = st_gbe32(in);
         PerlHash *h = perl_anon_hash_new();
         PerlValue *r = perl_ref_hash(h);
         if (in->nobjs < 512) in->objs[in->nobjs++] = r;
-        for (int32_t i = 0; i < n; i++) {
-            int32_t kn = st_gi32(in);
-            if (in->pos + (size_t)kn > in->len) perl_die_croak("Storable::thaw: truncated key");
-            char *key = malloc((size_t)kn + 1);
-            memcpy(key, in->s + in->pos, (size_t)kn); key[kn] = 0; in->pos += (size_t)kn;
+        for (uint32_t i = 0; i < n; i++) {
             PerlValue *val = st_dec(in);
+            uint32_t kn = st_gbe32(in);
+            if (in->pos + kn > in->len) perl_die_croak("Storable::thaw: truncated key");
+            char *key = malloc((size_t)kn + 1);
+            memcpy(key, in->s + in->pos, kn); key[kn] = 0; in->pos += kn;
             perl_hash_set_str(h, key, val);
             free(key);
         }
         return r;
     }
-    case ST_RV: {
+    case SX_REF: {
+        if (in->pos < in->len && in->s[in->pos] == 0) {
+            uint32_t id = st_gbe32(in);
+            if (id >= (uint32_t)in->nobjs) perl_die_croak("Storable::thaw: bad backref");
+            return in->objs[id];
+        }
+        PerlValue *inner = st_dec(in);
+        if (inner && (inner->tag == PERL_REF_ARRAY || inner->tag == PERL_REF_HASH ||
+                      inner->tag == PERL_REF_SCALAR))
+            return inner;
         PerlValue *r = pv_alloc();
         r->tag = PERL_REF_SCALAR;
+        r->pval = inner;
         if (in->nobjs < 512) in->objs[in->nobjs++] = r;
-        r->pval = st_dec(in);
         return r;
     }
-    case ST_BLESS: {
-        int32_t n = st_gi32(in);
-        if (in->pos + (size_t)n > in->len) perl_die_croak("Storable::thaw: truncated class");
+    case SX_BLESS: {
+        unsigned char n = st_gu8(in);
+        if (in->pos + n > in->len) perl_die_croak("Storable::thaw: truncated class");
         char *cls = malloc((size_t)n + 1);
-        memcpy(cls, in->s + in->pos, (size_t)n); cls[n] = 0; in->pos += (size_t)n;
+        memcpy(cls, in->s + in->pos, n); cls[n] = 0; in->pos += n;
         PerlValue *inner = st_dec(in);
         inner->blessed_class = cls;
         return inner;
@@ -14335,10 +14646,22 @@ static PerlValue *st_dec(StIn *in) {
 PerlValue *perl_storable_thaw(PerlValue *blob) {
     if (!blob || blob->tag != PERL_STRING)
         perl_die_croak("Storable::thaw: not a frozen string");
-    if (blob->slen < 4 || memcmp(blob->sval, "PCST", 4) != 0)
+    if (blob->slen < 2)
         perl_die_croak("Storable::thaw: magic number not compatible");
-    StIn in = { .s = (const unsigned char *)blob->sval, .len = (size_t)blob->slen, .pos = 4 };
-    return st_dec(&in);
+    const unsigned char *s = (const unsigned char *)blob->sval;
+    size_t pos = 0;
+    if (blob->slen >= 4 && memcmp(blob->sval, "PCST", 4) == 0)
+        perl_die_croak("Storable::thaw: legacy PCST image; re-freeze with nfreeze");
+    if (s[0] != 0x05 || s[1] != 0x0b)
+        perl_die_croak("Storable::thaw: magic number not compatible");
+    pos = 2;
+    StIn in = { .s = s, .len = (size_t)blob->slen, .pos = pos };
+    PerlValue *v = st_dec(&in);
+    /* freeze(\$x) stored the scalar: wrap it back into a scalar ref. */
+    if (v && v->tag != PERL_REF_ARRAY && v->tag != PERL_REF_HASH &&
+        v->tag != PERL_REF_SCALAR)
+        v = perl_ref_scalar(v);
+    return v;
 }
 
 PerlValue *perl_storable_store(PerlValue *pv, PerlValue *path, int network) {
@@ -15415,6 +15738,11 @@ PerlValue *perl_getpid(void) {
 
 PerlValue *perl_get_os_name(void) {
     return perl_alloc_string("linux");
+}
+
+PerlValue *perl_get_perl_version(void) {
+    /* $^V as a dotted version string. sprintf("%vd", $^V) uses this. */
+    return perl_alloc_string("5.42.0");
 }
 
 /* ── XS / FFI support ───────────────────────────────────────────────────── */

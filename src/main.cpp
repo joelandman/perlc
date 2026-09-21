@@ -134,6 +134,7 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
+        "Pod::Usage",
     };
 
     std::set<std::string> modulesToInstall;
@@ -394,6 +395,7 @@ static std::vector<Token> inlineModules(
         "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
+        "Pod::Usage",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -822,6 +824,17 @@ static std::vector<Token> inlineModules(
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
                 importMap[name] = "Try::Tiny::" + name;
+            }
+            continue;
+        }
+        if (modName == "Pod::Usage") {
+            std::vector<std::string> names = explicitImports;
+            if (names.empty()) names = {"pod2usage"};
+            for (auto &name : names) {
+                if (!name.empty() && name[0] == '&') name = name.substr(1);
+                if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (name.empty() || name[0] == ':') continue;
+                importMap[name] = "Pod::Usage::" + name;
             }
             continue;
         }

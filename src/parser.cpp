@@ -800,9 +800,15 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_REQUIRE)) {
         advance();
         std::string modname;
-        /* require Module::Name  or  require "file.pm" */
+        /* require Module::Name  or  require "file.pm"  or  require VERSION */
         if (check(TK::IDENT)) { modname = cur().text; advance(); }
         else if (check(TK::STRING)) { modname = cur().text; advance(); }
+        else if (check(TK::FLOAT) || check(TK::INT)) {
+            advance(); /* version check — no-op (host is new enough) */
+            auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
+            n->sval = ""; n->line = line;
+            return parseModifier(std::move(n), line);
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt; n->sval = modname; n->line = line;
         return parseModifier(std::move(n), line);
     }
@@ -829,8 +835,25 @@ NodePtr Parser::parseStmt() {
         return parseModifier(std::move(stmt), line);
     }
 
-    /* expression statement */
+    /* expression statement. A trailing `=>` / `,` continues as a list
+       (`lc($key) => $val` as the last statement of a map block — real
+       Pod::Usage.pm). */
     auto expr = parseExpr();
+    if (check(TK::FATARROW) || check(TK::COMMA)) {
+        NodeList elems;
+        elems.push_back(std::move(expr));
+        while (match(TK::COMMA) || match(TK::FATARROW)) {
+            if (check(TK::RBRACE) || check(TK::SEMI) || check(TK::EOF_TOK) ||
+                isModifier())
+                break;
+            elems.push_back(parseExpr());
+        }
+        auto lit = std::make_unique<Node>();
+        lit->kind = NK::ArrayLit;
+        lit->args = std::move(elems);
+        lit->line = line;
+        expr = std::move(lit);
+    }
     auto n = std::make_unique<Node>(); n->kind = NK::ExprStmt; n->left = std::move(expr); n->line = line;
     return parseModifier(std::move(n), line);
 }
@@ -1661,9 +1684,10 @@ NodePtr Parser::consumeLowOrChain(NodePtr init) {
 NodePtr Parser::parseModifier(NodePtr stmt, int line) {
     if (check(TK::KW_IF) || check(TK::KW_UNLESS)) {
         bool neg = check(TK::KW_UNLESS); advance();
-        bool hasParen = match(TK::LPAREN);
+        /* Don't treat a leading '(' as wrapping the whole condition —
+           `last if (-e $_) && $x` groups only the filetest. parseExpr
+           already handles parenthesised subexpressions. */
         auto cond = parseExpr();
-        if (hasParen) consume(TK::RPAREN, ")");
         if (neg) cond = makeUnary("!", std::move(cond), line);
         NodeList body; body.push_back(std::move(stmt));
         auto n = std::make_unique<Node>(); n->kind = NK::If; n->line = line;
@@ -1673,9 +1697,7 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
     }
     if (check(TK::KW_WHILE) || check(TK::KW_UNTIL)) {
         bool neg = check(TK::KW_UNTIL); advance();
-        bool hasParen = match(TK::LPAREN);
         auto cond = parseExpr();
-        if (hasParen) consume(TK::RPAREN, ")");
         if (neg) cond = makeUnary("!", std::move(cond), line);
         NodeList body; body.push_back(std::move(stmt));
         auto n = std::make_unique<Node>(); n->kind = NK::While; n->line = line;
@@ -2154,6 +2176,13 @@ NodePtr Parser::parseMul() {
 
 NodePtr Parser::parseUnary() {
     int line = cur().line;
+    /* `-name =>` is the string "-name" (Getopt/Pod::Usage option keys). */
+    if (check(TK::MINUS) && peek(1).kind == TK::IDENT &&
+        peek(2).kind == TK::FATARROW) {
+        advance(); /* - */
+        std::string nm = cur().text; advance();
+        return makeStr("-" + nm, line);
+    }
     if (check(TK::MINUS)) { advance(); return makeUnary("-", parsePow(), line); }
     if (check(TK::NOT))   { advance(); return makeUnary("!", parsePow(), line); }
     if (check(TK::TILDE)) { advance(); return makeUnary("~", parsePow(), line); }
@@ -2634,8 +2663,32 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* undef */
-    if (check(TK::KW_UNDEF)) { advance(); auto n = std::make_unique<Node>(); n->kind = NK::UndefLit; n->line = line; return n; }
+    /* undef  /  undef $var  /  undef @arr  /  undef %h
+       Bare `undef` is the undef value. With an argument it is the
+       named-unary that clears the target (real Perl: `undef $s` is
+       not the same as `$s = undef` for arrays/hashes, and for scalars
+       it is an lvalue undefine — pidigits.pl's `undef $s`). */
+    if (check(TK::KW_UNDEF)) {
+        advance();
+        bool hasParen = match(TK::LPAREN);
+        /* Bare `undef` is the undef value whenever the next token cannot
+           start a named-unary argument (`undef // t()`, `undef || 1`,
+           `undef if 1`). `undef()` is also the value. */
+        if (hasParen && check(TK::RPAREN)) {
+            consume(TK::RPAREN, ")");
+            auto n = std::make_unique<Node>(); n->kind = NK::UndefLit; n->line = line;
+            return n;
+        }
+        if (!hasParen && !looksLikeBareCallArg()) {
+            auto n = std::make_unique<Node>(); n->kind = NK::UndefLit; n->line = line;
+            return n;
+        }
+        NodePtr inner = hasParen ? parseExpr() : parseShift();
+        if (hasParen) consume(TK::RPAREN, ")");
+        auto n = std::make_unique<Node>(); n->kind = NK::UndefFunc;
+        n->left = std::move(inner); n->line = line;
+        return n;
+    }
 
     if (check(TK::KW_WANTARRAY)) {
         advance();
@@ -2941,6 +2994,10 @@ NodePtr Parser::parsePrimary() {
             if (ctrl == 'O') {
                 auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc;
                 n->sval = "osname"; n->line = line; return n;
+            }
+            if (ctrl == 'V') {
+                auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc;
+                n->sval = "perl_version"; n->line = line; return n;
             }
             return makeScalar(std::string("^") + ctrl, line);
         }
@@ -3292,9 +3349,16 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* %hash variable  or  %$ref */
+    /* %hash variable  or  %$ref  or  %{expr} */
     if (check(TK::HASH)) {
         advance(); /* skip % */
+        if (check(TK::LBRACE)) {
+            advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::DerefHash;
+            n->left = parseExpr(); n->line = line;
+            consume(TK::RBRACE, "}");
+            return n;
+        }
         if (check(TK::SCALAR)) {
             advance();
             std::string nm = cur().text; advance();
@@ -3380,6 +3444,15 @@ NodePtr Parser::parsePrimary() {
         std::string nm = cur().text; advance();
         auto n = std::make_unique<Node>(); n->kind = NK::ExistsFunc;
         n->name = nm; n->line = line;
+        /* exists $ref->{key} / exists $ref->[$i] */
+        if (check(TK::ARROW)) {
+            auto base = makeScalar(nm, line);
+            n->left = parseSubscript(std::move(base), line);
+            n->sval = "expr";
+            n->name = "";
+            if (hasParen) consume(TK::RPAREN, ")");
+            return n;
+        }
         if (check(TK::LBRACKET)) {
             advance();
             n->left = parseExpr();
@@ -3470,6 +3543,15 @@ NodePtr Parser::parsePrimary() {
         std::string nm = cur().text; advance();
         auto n = std::make_unique<Node>(); n->kind = NK::DeleteFunc;
         n->name = nm; n->line = line;
+        /* delete $ref->{key} / delete $ref->[$i] */
+        if (check(TK::ARROW)) {
+            auto base = makeScalar(nm, line);
+            n->left = parseSubscript(std::move(base), line);
+            n->sval = "expr";
+            n->name = "";
+            if (hasParen) consume(TK::RPAREN, ")");
+            return n;
+        }
         if (check(TK::LBRACKET)) {
             advance();
             n->left = parseExpr();
@@ -3616,14 +3698,28 @@ NodePtr Parser::parsePrimary() {
         bool isPop = check(TK::KW_POP); advance();
         bool hasParen = match(TK::LPAREN);
         std::string nm = subDepth_ > 0 ? "_" : "ARGV"; /* default: @_ in sub, @ARGV at top level */
+        NodePtr refExpr;
         if (check(TK::ARRAY)) {
             advance();
-            nm = cur().text; advance();
+            if (check(TK::LBRACE)) {
+                advance();
+                refExpr = parseExpr();
+                consume(TK::RBRACE, "}");
+                nm.clear();
+            } else if (check(TK::SCALAR)) {
+                advance();
+                std::string rnm = cur().text; advance();
+                refExpr = makeScalar(rnm, line);
+                nm.clear();
+            } else {
+                nm = cur().text; advance();
+            }
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>();
         n->kind = isPop ? NK::PopExpr : NK::ShiftExpr;
         n->name = nm; n->line = line;
+        if (refExpr) n->left = std::move(refExpr);
         return n;
     }
 
@@ -4148,13 +4244,13 @@ NodePtr Parser::parsePrimary() {
         n->kind = isMap ? NK::MapFunc : NK::GrepFunc; n->line = line;
         bool hp = match(TK::LPAREN);
         if (check(TK::LBRACE) && scanBraceHashLike()) {
-            /* `{ key => val, ... }` anon-hash-constructor transform (real
-               Perl's map/grep/sort hashref heuristic: a brace block whose
-               top level contains a fat comma — or is immediately empty —
-               is an anon-hash REF returned per element) */
-            n->left = parsePrimary(); /* LBRACE case builds NK::AnonHash */
+            /* Single-expression `{ k => v }` with no statements — the
+               map/grep hashref heuristic yields PAIRS via AnonHash
+               (`map { $_ => 1 } @k`). Nested `{ {k=>$_} }` is a block
+               whose inner brace is still a constructor (parseStmt). */
+            n->left = parsePrimary();
         } else if (check(TK::LBRACE)) {
-            n->body = parseBlock(); /* block form: map { BLOCK } LIST */
+            n->body = parseBlock();
         } else {
             n->left = parseExpr(); /* expr form: map EXPR, LIST */
         }
@@ -4223,13 +4319,23 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* splice(@arr, off[, len[, repl...]]) */
+    /* splice(@arr, off[, len[, repl...]])  /  splice(@{EXPR}, ...) */
     if (check(TK::KW_SPLICE)) {
         advance();
         bool hp = match(TK::LPAREN);
         consume(TK::ARRAY, "@");
-        std::string nm = cur().text; advance();
-        auto n = std::make_unique<Node>(); n->kind = NK::SpliceFunc; n->name = nm; n->line = line;
+        auto n = std::make_unique<Node>(); n->kind = NK::SpliceFunc; n->line = line;
+        if (check(TK::LBRACE)) {
+            advance();
+            n->left = parseExpr();
+            consume(TK::RBRACE, "}");
+        } else if (check(TK::SCALAR)) {
+            advance();
+            std::string nm = cur().text; advance();
+            n->left = makeScalar(nm, line);
+        } else {
+            n->name = cur().text; advance();
+        }
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (!match(TK::COMMA)) break;
             if ((hp && check(TK::RPAREN)) || check(TK::SEMI) || check(TK::EOF_TOK)) break;
@@ -4239,14 +4345,22 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* system("cmd") */
+    /* system(CMD) / system(LIST) — extra args after the first (and a
+       flattened array) are LIST-form, no shell. */
     if (check(TK::KW_SYSTEM)) {
         advance();
         bool hp = match(TK::LPAREN);
-        auto cmd = parseExpr();
+        auto n = std::make_unique<Node>(); n->kind = NK::SystemFunc; n->line = line;
+        if (!(hp && check(TK::RPAREN)) && !check(TK::SEMI) && !check(TK::EOF_TOK)
+            && !isModifier()) {
+            n->left = parseExpr();
+            while (match(TK::COMMA)) {
+                if (hp && check(TK::RPAREN)) break;
+                if (check(TK::SEMI) || check(TK::EOF_TOK) || isModifier()) break;
+                n->args.push_back(parseExpr());
+            }
+        }
         if (hp) consume(TK::RPAREN, ")");
-        auto n = std::make_unique<Node>(); n->kind = NK::SystemFunc;
-        n->left = std::move(cmd); n->line = line;
         return n;
     }
 

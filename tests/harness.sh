@@ -53,9 +53,6 @@ declare -A LONG_TIMEOUT=(
 # the whole suite if they are skipped or produce different "not loaded" output.
 SKIP_BY_DEFAULT=(
     dbi_sqlite.pl xs_dbi_test.pl xs_ffi.pl
-    # pidigits: Math::BigInt spigot still diverges from perl's Calc on
-    # extract_digit ($,/$\\ separators themselves work). Run explicitly.
-    pidigits.pl
 )
 
 # Self-checking tests: they already print "xxx=ok/FAIL" or die.

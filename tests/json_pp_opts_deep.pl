@@ -8,9 +8,12 @@ print "oo_disallow=", ($@ =~ /allow_nonref/ ? 1 : 0), "\n";
 print "oo_allow=", JSON::PP->new->allow_nonref->encode(42), "\n";
 
 print "from=", decode_json('{"a":2}')->{a}, "\n";
+print "meth=", JSON::PP->new->decode('{"a":2}')->{a}, "\n";
 
 my $u = decode_json('"\\u00e9"');
 print "u_len=", length($u), "\n";
+
+print "relaxed=", JSON::PP->new->relaxed->decode("[1,2,]")->[1], "\n";
 
 {
     package T;

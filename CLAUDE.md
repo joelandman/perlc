@@ -18,8 +18,13 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-20, remaining Tier-2 surface + Tier-3 modules —
-408/408 PASS, 0 FAIL):** New this session: remaining scoped-out surface on
+**Harness (2026-09-21, language leftovers — 413/413 PASS, 0 FAIL):**
+`undef $var` (pidigits was this, not mini-gmp; `undef //` is the value),
+JSON `->{k}` UAF on temporaries, Storable nfreeze wire format, `%{EXPR}`,
+modifier-`if &&`, `system LIST`, `-name =>` option keys, `delete`/`exists`
+on `$ref->{k}`, `splice`/`pop`/`shift @{EXPR}`, `require VERSION`,
+`quotemeta`, `$^V`, native `Pod::Usage::pod2usage`, D54 `test-tsan`
+`die_after_fork=0`. Previous session: remaining scoped-out surface on
 Hash::Util (hashref variants, `lock_hash_recurse`, slice-assign checks),
 JSON::PP (`allow_nonref`, `space_before`/`space_after`, `convert_blessed`,
 `\u` decode as character strings, surrogate pairs), Text::CSV
@@ -132,7 +137,7 @@ DynaLoader-compatible FFI, self-verifying, outside the harness corpus),
 2026-09-16), `local_glob_{smoke,deep}.pl` (W29 `local *_`/`local $_`),
 `false_bool_{smoke,deep}.pl` (booleans stringify as 1/"" like real
 perl).
-Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
+Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`.
 
 **D99, D105, D100, D107, D113, D111, D112, D114, D109, D121, D122,
 D116, D117, D118, D119, D127, D129, D102, D115, D130, D131, D101,
@@ -462,9 +467,9 @@ are in TESTS.md):**
   `/usr/bin/debconf-escape` script.
 
 **Open generated-code defects:** none — **D110, D120, and D124 were
-fixed 2026-09-13** (see TESTS.md). **D54**
-(tooling): `perlc_tsan` can hang compiling `tests/threads.pl`
-(TSan+`fork` of clang); workaround `TSAN_OPTIONS=die_after_fork=0`.
+fixed 2026-09-13** (see TESTS.md). **D54** (tooling) **FIXED 2026-09-21**:
+`make test-tsan` sets `TSAN_OPTIONS=die_after_fork=0` on the `perlc_tsan`
+compile step.
 
 **2026-09-10 real-module survey #2:** 11 more real system scripts,
 targeting `Pod::Usage`, `Encode`, `File::Copy`, `Storable`, and others
@@ -535,7 +540,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 |-----|-------|
 | Typeglob `{IO}`/`{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, and bare `open LOG` / `print LOG` work. `*FH{IO}` / FORMAT slots are not implemented. |
 | Full XS | DynaLoader-compatible FFI: `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load` (perlc `.so`/`.pl` modules + raw C via `XS::call` sig dispatch). Real perlguts XSUBs (SV* ABI) not implemented |
-| `pidigits.pl` vs perl | Skipped in harness: mini-gmp spigot `extract_digit` still diverges from Calc. `$,`/`$\` work. |
+| `pidigits.pl` vs perl | PASS — was `undef $s` not clearing the accumulator, not mini-gmp. |
 | Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |
 | eval/`do` at runtime | Needs `perlc` + `clang-18` on the target (`--eval-lib` / `--do-lib`). |
 
@@ -593,7 +598,7 @@ Getopt::Long, Data::Dumper, File::Basename (2026-09-09 — see TESTS.md's
 File::Temp, Storable::dclone, Text::Wrap (2026-09-19); JSON::PP,
 Time::Piece, Time::Seconds, Text::CSV, Text::CSV_PP, Text::CSV_XS,
 Hash::Util (2026-09-20); Storable freeze/thaw, Try::Tiny, List::MoreUtils,
-Term::ANSIColor, Encode (2026-09-20);
+Term::ANSIColor, Encode (2026-09-20); Pod::Usage (2026-09-21);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`

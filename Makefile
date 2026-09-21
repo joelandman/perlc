@@ -89,7 +89,7 @@ test-tsan: $(TSAN_TARGET)
 	for t in $(TSAN_TESTS); do \
 		out="/tmp/perlc_tsan_$$(basename $$t .pl)"; \
 		echo "=== TSan: $$t ==="; \
-		./$(TSAN_TARGET) $$t -o $$out >/tmp/perlc_tsan_compile.log 2>&1; \
+		TSAN_OPTIONS="die_after_fork=0" ./$(TSAN_TARGET) $$t -o $$out >/tmp/perlc_tsan_compile.log 2>&1; \
 		TSAN_OPTIONS="halt_on_error=1" $$out 2>&1; \
 	done
 
@@ -101,7 +101,7 @@ test-tsan-full: $(TSAN_TARGET)
 		case "$$base" in dbi_sqlite|xs_dbi_test|xs_ffi) echo "SKIP TSan $$base (external deps)"; continue;; esac \
 		out="/tmp/perlc_tsan_$${base}"; \
 		echo "=== TSan: $$t ==="; \
-		./$(TSAN_TARGET) $$t -o $$out >/tmp/perlc_tsan_compile.log 2>&1; \
+		TSAN_OPTIONS="die_after_fork=0" ./$(TSAN_TARGET) $$t -o $$out >/tmp/perlc_tsan_compile.log 2>&1; \
 		TSAN_OPTIONS="halt_on_error=1" $$out 2>&1; \
 	done
 

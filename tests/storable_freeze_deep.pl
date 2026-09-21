@@ -13,9 +13,6 @@ print "cyc=$c->{v} self_ok=", ($c->{self} == $c ? 1 : 0), "\n";
 my $sref = thaw(freeze(\(my $x = 11)));
 print "sref=$$sref\n";
 
-{
-    package B;
-}
 my $blessed = bless {k=>4}, "B";
 my $bb = thaw(freeze($blessed));
 print "bless=", ref($bb), " k=$bb->{k}\n";
@@ -30,4 +27,7 @@ unlink $tmp;
 
 my $n = thaw(nfreeze([1,2,3]));
 print "narr=@$n\n";
+sub hx { join("", map { sprintf("%02x", ord($_)) } split(//, $_[0])) }
+print "ihex=", hx(nfreeze(\42)), "\n";
+print "shex=", hx(nfreeze(\"hi")), "\n";
 print "done\n";

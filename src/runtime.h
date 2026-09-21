@@ -375,6 +375,9 @@ void       perl_warn(PerlValue *msg, const char *filename, int line);
 /* D49: process-wide %SIG hash ($SIG{__WARN__}, $SIG{__DIE__}, …) */
 PerlHash  *perl_get_sig_hash(void);
 PerlValue *perl_system(PerlValue *cmd);
+PerlValue *perl_system_list(PerlArray *args);
+PerlValue *perl_quotemeta_str(PerlValue *v);
+PerlValue *perl_pod2usage(PerlArray *args);
 PerlValue *perl_backtick(PerlValue *cmd);
 /* D70: syscall() builtin */
 PerlValue *perl_syscall(PerlValue *args);
@@ -774,6 +777,7 @@ PerlArray *perl_each_hash(PerlHash *h);        /* returns [key,val] or empty [] 
 PerlValue *perl_pos_str(PerlValue *pv);        /* pos($str) — last match pos */
 PerlValue *perl_getpid(void);                  /* getpid() */
 PerlValue *perl_get_os_name(void);             /* $^O — "linux" */
+PerlValue *perl_get_perl_version(void);        /* $^V stringified as 5.x.y */
 
 /* ── UNIVERSAL isa / can ──────────────────────────────────────────────────── */
 PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv);

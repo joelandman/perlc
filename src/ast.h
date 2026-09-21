@@ -38,7 +38,7 @@ enum class NK {
     UseStmt,
     /* builtins that look like functions */
     PushStmt, PopExpr, ShiftExpr, UnshiftStmt,
-    ScalarFunc, DefinedFunc,
+    ScalarFunc, DefinedFunc, UndefFunc, /* undef $var / undef @arr / undef %h */
     /* hash builtins */
     KeysFunc, ValuesFunc, ExistsFunc, DeleteFunc,
     SortFunc,

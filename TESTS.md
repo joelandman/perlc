@@ -14,8 +14,7 @@ make test-tsan    # threads.pl threads_atomic.pl destroy.pl
 `fibn.pl`, `arith.pl`) allow FP tolerance. `mbs.pl` gets a 300s timeout.
 
 **Skipped by default** (run explicitly if you have the deps):
-`dbi_sqlite.pl`, `xs_dbi_test.pl`, `xs_ffi.pl`, `pidigits.pl`
-(BigInt spigot still diverges from perl's Calc).
+`dbi_sqlite.pl`, `xs_dbi_test.pl`, `xs_ffi.pl`.
 
 **Policy:** every compiler fix ships a smoke test (`*_smoke.pl`) and a deep
 test, verified byte-for-byte against real Perl.
@@ -26,7 +25,7 @@ test, verified byte-for-byte against real Perl.
 after the D107 fix with no regression, plus 2 new D107 tests verified
 separately via the harness (265 total once counted together).
 
-Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`, `pidigits.pl`.
+Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`.
 
 New (2026-09-09/10): `Getopt::Long`, `Data::Dumper`, `File::Basename` —
 see "Real-world module survey" below. Plus the D99/D100/D105/D107 fix
@@ -39,7 +38,7 @@ Previously open compared failures, now closed:
 | `eval_string.pl` | Passes — `eval { BLOCK }`. String `eval EXPR` is in `eval_expr{,_smoke}.pl`. |
 | `syscall_smoke.pl` / `syscall_deep.pl` | Pass — tests no longer print raw PIDs (those differ across processes). |
 | `d66_hash_elem_string.pl` | Pass — `$h{s}` is no longer lexed as `s///` (closer delimiters `}` `]` `)` are not s/// openers). |
-| `pidigits.pl` | Skipped — `$,`/`$\` work; mini-gmp `extract_digit` still diverges. |
+| `pidigits.pl` | Pass — `undef $s` now clears the accumulator (2026-09-21). |
 
 New IPC tests: `ipc_process{,_smoke}.pl`, `ipc_socket{,_smoke}.pl`.
 
@@ -67,7 +66,7 @@ eval STRING and eval-defined subs see outer `my`).
 
 | ID | Status | Notes |
 |----|--------|-------|
-| D54 | OPEN (tooling) | `perlc_tsan` hangs compiling `tests/threads.pl` (TSan+fork of clang-18). `TSAN_OPTIONS=die_after_fork=0` works around it. Not a generated-code bug. |
+| D54 | **FIXED 2026-09-21** | `make test-tsan` now sets `TSAN_OPTIONS=die_after_fork=0` on the `perlc_tsan` compile step (TSan+`system(clang-18)`). |
 | D138 | **FIXED 2026-09-19** | `\&name == \&name` / `__SUB__ == \&name` (CODE-ref identity via `==`) was unreliable — `perl_num_eq`/`perl_num_ne` compared the freshly-`malloc`'d `PerlClosure` wrapper's own address instead of the wrapped sub. See below. |
 | D139 | **FIXED 2026-09-20** | `perl_num_eq`/`perl_num_ne` checked ref-identity BEFORE checking for a registered `<=>` overload — any blessed REF_ARRAY/REF_HASH/REF_SCALAR/CODE_REF class with an overloaded `<=>` (e.g. Time::Piece) had `==`/`!=` compare object pointers instead of dispatching. See below. |
 | D140 | **FIXED 2026-09-20** | `perl_spaceship` (the `<=>` operator) and `sort { $a <=> $b }`'s fast-path comparator (`cmp_num_asc`, which the parser recognizes textually and routes around the general comparator machinery) never checked for a registered `<=>` overload at all — silently numified a blessed ref-shaped object as its pointer address. Math::BigInt was unaffected only because its own dedicated tag numifies correctly regardless. See below. |
@@ -3276,6 +3275,19 @@ A failing `try` with no `catch` returns undef without rethrowing
 **Encode:** `encode`/`decode`/`encode_utf8`/`decode_utf8`/`from_to`/
 `encodings`/`find_encoding`/`is_utf8`/`FB_CROAK` via iconv. Tests:
 `tests/encode_{smoke,deep}.pl`.
+
+### Language leftovers (2026-09-21)
+
+- **`undef $var`**: was parsed as the undef *value* and ignored `$var`. Now `NK::UndefFunc` (scalars assign undef; `@a`/`%h` clear). This was the real pidigits divergence, not mini-gmp. Tests: `tests/undef_var_{smoke,deep}.pl`; `pidigits.pl` is in the harness.
+- **Temporary method result `->{k}` / `->[i]`**: `freeIfOwned` of the ref ran before the element borrow (`$json->decode($s)->{a}`). Clone then free. JSON method-decode and `relaxed` `[1,2,]` now pass.
+- **Storable nfreeze**: magic `0x05 0x0b` network format (SX_BYTE/NETINT/SCALAR/ARRAY/HASH/REF/BLESS) so hex of `nfreeze(\42)` / `nfreeze(\"hi")` matches real Storable 3.41. Hash key order is still insertion order (not comparable as hex).
+- **`%{EXPR}`** hash deref; statement-modifier `if` no longer swallows a grouping `(` as wrapping the whole condition (`last if (-e $_) && $x`).
+- **D54**: `make test-tsan` passes `die_after_fork=0` to the compiler process.
+- **`undef // EXPR`**: bare `undef` is the value whenever the next token cannot start a named-unary argument (`TK::DEFINED_OR` was missing from the first terminator list). Tests: `tests/undef_var_deep.pl`, `tests/d94_or_list_context.pl`.
+- **`system LIST`**: `system('more', $f)` / `system(@cmd)` — extra args (and a flattened array) go through `perl_system_list` (`fork`/`execvp` when arity > 1) and set `$?`.
+- **`-name =>`**: unary minus plus a bareword before `=>` is the string `"-name"` (Pod::Usage / Getopt option keys).
+- **`delete $ref->{k}` / `exists $ref->{k}`**, **`splice(@{EXPR}, …)`**, **`pop @{EXPR}` / `shift @{EXPR}`**, **`require VERSION`**, **`quotemeta`**, **`$^V`**.
+- **Pod::Usage** (native): `pod2usage` with hashref or `-key =>` list, `-message`/`-exitval`/`-verbose`/`-input`, `noexit`, SYNOPSIS → `Usage:` (4-space indent). Tests: `tests/pod_usage_{smoke,deep}.pl`. Real `Pod::Usage.pm` is not inlined (depends on Pod::Simple/Pod::Text).
 
 ## Source layout
 
