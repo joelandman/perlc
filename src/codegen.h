@@ -342,6 +342,12 @@ private:
     bool         canEmitI64(const Node &n);
     llvm::Value *emitExprI64(const Node &n);
     llvm::Value *boxI64(llvm::Value *iv);
+    /* Alloca in the current function's entry block. LLVM allocas that are
+       not in entry are dynamic stack allocations: at -O0 clang never
+       reuses the slot, so an alloca inside a hot loop grows the stack
+       every iteration (mbs fill_z inlined cplx: SIGSEGV in perl_mul). */
+    llvm::AllocaInst *createEntryAlloca(llvm::Type *ty, llvm::Value *arraySize,
+                                        const llvm::Twine &name);
     llvm::Value *emitFlooredMod(llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem */
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons, else nullptr */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */

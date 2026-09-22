@@ -1447,7 +1447,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 } else if (Value *ia = lookupIntVar(nm)) {
                     Value *ival = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
                     Value *boxed = boxI64(ival);
-                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    auto *pvAlloca = createEntryAlloca(perlPtrTy_, nullptr, nm + ".boxed");
                     builder_.CreateStore(boxed, pvAlloca);
                     sortCaptureNames.push_back(nm);
                     sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
@@ -1455,7 +1455,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 } else if (Value *fa = lookupFloatVar(nm)) {
                     Value *fval = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
                     Value *boxed = boxF64(fval);
-                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    auto *pvAlloca = createEntryAlloca(perlPtrTy_, nullptr, nm + ".boxed");
                     builder_.CreateStore(boxed, pvAlloca);
                     sortCaptureNames.push_back(nm);
                     sortCaptureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
@@ -1506,7 +1506,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             pushScope();
 
             auto *i32Ty = Type::getInt32Ty(ctx_);
-            localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+            localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
             /* D61: re-materialize the captures collected above via
@@ -1519,7 +1519,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 } else if (sortCaptureSigils[ci] == '%') {
                     declareHash(sortCaptureNames[ci], callRT("perl_deref_hash", {pv}));
                 } else {
-                    auto *capAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, sortCaptureNames[ci]);
+                    auto *capAlloca = createEntryAlloca(perlPtrTy_, nullptr, sortCaptureNames[ci]);
                     builder_.CreateStore(pv, capAlloca);
                     declareVar(sortCaptureNames[ci], capAlloca);
                 }
@@ -1551,8 +1551,8 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             bool bShadowed = fileScalarGlobals_.count("b") != 0;
             Value *argA = cmpFn->getArg(0); argA->setName("a");
             Value *argB = cmpFn->getArg(1); argB->setName("b");
-            auto *aAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "a");
-            auto *bAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "b");
+            auto *aAlloca = createEntryAlloca(perlPtrTy_, nullptr, "a");
+            auto *bAlloca = createEntryAlloca(perlPtrTy_, nullptr, "b");
             builder_.CreateStore(argA, aAlloca);
             builder_.CreateStore(argB, bAlloca);
             if (!aShadowed) declareVar("a", aAlloca);
@@ -1742,11 +1742,11 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *len   = callRT("perl_to_int", {lenPv});
 
         /* $_ alloca (hoisted before loop) */
-        auto *udAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        auto *udAlloca = createEntryAlloca(perlPtrTy_, nullptr, "$_");
         Value *udPv    = perlUndef();
         builder_.CreateStore(udPv, udAlloca);
 
-        auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "mg.i");
+        auto *iAlloca = createEntryAlloca(i64, nullptr, "mg.i");
         builder_.CreateStore(ConstantInt::get(i64, 0), iAlloca);
 
         auto *condBB = BasicBlock::Create(ctx_, isMap ? "map.cond" : "grep.cond", fn);
@@ -2017,7 +2017,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                        through one-by-one via a small unrolled helper: */
                     auto *i64Ty = Type::getInt64Ty(ctx_);
                     auto *fn = builder_.GetInsertBlock()->getParent();
-                    auto *idxA = builder_.CreateAlloca(i64Ty, nullptr, "del.i");
+                    auto *idxA = createEntryAlloca(i64Ty, nullptr, "del.i");
                     builder_.CreateStore(ConstantInt::get(i64Ty, 0), idxA);
                     auto *condBB = BasicBlock::Create(ctx_, "del.cond", fn);
                     auto *bodyBB = BasicBlock::Create(ctx_, "del.body", fn);
@@ -2061,7 +2061,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                     Value *lenV = callRT("perl_array_len", {iav});
                     Value *len = callRT("perl_to_int", {lenV});
                     freeIfOwned(lenV);
-                    auto *idxA = builder_.CreateAlloca(i64Ty, nullptr, "dela.i");
+                    auto *idxA = createEntryAlloca(i64Ty, nullptr, "dela.i");
                     builder_.CreateStore(ConstantInt::get(i64Ty, 0), idxA);
                     auto *condBB = BasicBlock::Create(ctx_, "dela.cond", fn);
                     auto *bodyBB = BasicBlock::Create(ctx_, "dela.body", fn);
@@ -2658,6 +2658,17 @@ void CodeGen::declareFlatRow(const std::string &outerVar, const std::string &idx
 
 Value *CodeGen::boxI64(Value *iv) {
     return callRT("perl_alloc_int", {iv});
+}
+
+AllocaInst *CodeGen::createEntryAlloca(Type *ty, Value *arraySize,
+                                       const Twine &name) {
+    auto *bb = builder_.GetInsertBlock();
+    Function *fn = bb ? bb->getParent() : currentFn_;
+    if (!fn)
+        return builder_.CreateAlloca(ty, arraySize, name);
+    BasicBlock &entry = fn->getEntryBlock();
+    IRBuilder<> eb(&entry, entry.begin());
+    return eb.CreateAlloca(ty, arraySize, name);
 }
 
 Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
@@ -4002,7 +4013,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
             Value *argVal = nullptr;
             if (n.args[i]->kind == NK::Call) argVal = tryEmitInline(*n.args[i]);
             if (!argVal) argVal = emitExpr(*n.args[i]);
-            auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+            auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
             builder_.CreateStore(argVal, slot);
             declareVar(is.params[i], slot);
             if (isOwnedTemp(argVal)) ownedArgs.push_back(argVal);
@@ -4339,7 +4350,7 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             }
 
             Value *dollar0 = callRT("perl_get_dollar0", {});
-            auto *slot0 = builder_.CreateAlloca(perlPtrTy_, nullptr, "$0");
+            auto *slot0 = createEntryAlloca(perlPtrTy_, nullptr, "$0");
             builder_.CreateStore(dollar0, slot0);
             declareVar("0", slot0);
 
@@ -4351,13 +4362,13 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             }
 
             Value *underscoreVal = callRT("perl_alloc_undef", {});
-            auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+            auto *slotUs = createEntryAlloca(perlPtrTy_, nullptr, "$_");
             builder_.CreateStore(underscoreVal, slotUs);
             declareVar("_", slotUs);
         }
 
         /* capture local() save depth at function entry */
-        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+        localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
         /* D64: same pre-scan as emitSub/AnonSub, for the top-level program body */
@@ -4434,7 +4445,7 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             }
         }
 
-        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+        localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
         /* D64: same pre-scan as the normal-main path above */
@@ -4656,7 +4667,7 @@ void CodeGen::emitSub(const Node &n) {
            $_ storage; the clone is freed on scope exit while the cell
            keeps its own contents. */
         Value *udv  = callRT("perl_clone", {cell});
-        auto *slotUs = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        auto *slotUs = createEntryAlloca(perlPtrTy_, nullptr, "$_");
         builder_.CreateStore(udv, slotUs);
         declareVar("_", slotUs);
         trackPv(udv);
@@ -4678,7 +4689,7 @@ void CodeGen::emitSub(const Node &n) {
             for (size_t i = 0; i < caps.size(); i++) {
                 Value *pv = callRT("perl_get_capture",
                                    {ConstantInt::get(i64Ty, (long long)i)});
-                auto *capSlot = builder_.CreateAlloca(perlPtrTy_, nullptr, caps[i] + ".cap");
+                auto *capSlot = createEntryAlloca(perlPtrTy_, nullptr, caps[i] + ".cap");
                 builder_.CreateStore(pv, capSlot);
                 declareVar(caps[i], capSlot);
             }
@@ -4695,7 +4706,7 @@ void CodeGen::emitSub(const Node &n) {
     bool subNeedsLocal = n.body && hasLocalStmt(*n.body);
     bool subNeedsReturn = n.body && hasReturnStmt(*n.body);
     if (subNeedsLocal || subNeedsReturn) {
-        localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+        localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
     } else {
         localDepthAlloca_ = nullptr;
@@ -4918,7 +4929,7 @@ Value *CodeGen::emitBlock(const Node &n) {
     bool needLocal = hasLocalStmt(n);
     llvm::Value *bdAlloca = nullptr;
     if (needLocal) {
-        bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
+        bdAlloca = createEntryAlloca(i32Ty, nullptr, "block.ldepth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     }
     pushScope();
@@ -4939,7 +4950,7 @@ Value *CodeGen::emitBlockLast(const Node &n) {
     bool needLocal = hasLocalStmt(n);
     llvm::Value *bdAlloca = nullptr;
     if (needLocal) {
-        bdAlloca = builder_.CreateAlloca(i32Ty, nullptr, "block.ldepth");
+        bdAlloca = createEntryAlloca(i32Ty, nullptr, "block.ldepth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     }
     pushScope();
@@ -5310,7 +5321,7 @@ void CodeGen::emitStmt(const Node &n) {
                     fileScalarGlobals_[qualKey] = gv;
                     declareVar(nm, gv);
                 } else {
-                    auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+                    auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
                     pv = callRT("perl_make_shared_scalar", {});
                     builder_.CreateStore(pv, alloca);
                     /* no trackPv — shared vars have program lifetime */
@@ -5354,7 +5365,7 @@ void CodeGen::emitStmt(const Node &n) {
                     ? ("main::" + nm) : (currentPackage_ + "::" + nm);
                 Value *keyStr = builder_.CreateGlobalStringPtr(qualKey);
                 Value *pv = callRT("perl_get_or_create_global_scalar", {keyStr});
-                auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "g." + nm);
+                auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "g." + nm);
                 builder_.CreateStore(pv, slot);
                  if (n.right) {
                      Value *init = emitExpr(*n.right);
@@ -5569,7 +5580,7 @@ void CodeGen::emitStmt(const Node &n) {
                      }
                     if (tryFloatPath) {
                         if (Value *fval = emitExprF64(*n.right)) {
-                            auto *falloca = builder_.CreateAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
+                            auto *falloca = createEntryAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
                             builder_.CreateStore(fval, falloca);
                             declareFloatVar(nm, falloca);
                             /* Stage 30: if this var was assigned sqrt(x), remember x.
@@ -5590,13 +5601,13 @@ void CodeGen::emitStmt(const Node &n) {
                         /* initializer not float-representable → boxed PV path */
                     } else if (!skipIntPromo) {
                     if (Value *ival = emitExprI64(*n.right)) {
-                        auto *ialloca = builder_.CreateAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
+                        auto *ialloca = createEntryAlloca(Type::getInt64Ty(ctx_), nullptr, n.name + ".i");
                         builder_.CreateStore(ival, ialloca);
                         declareIntVar(nm, ialloca);
                         break;
                     }
                     if (Value *fval = emitExprF64(*n.right)) {
-                        auto *falloca = builder_.CreateAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
+                        auto *falloca = createEntryAlloca(Type::getDoubleTy(ctx_), nullptr, n.name + ".f");
                         builder_.CreateStore(fval, falloca);
                         declareFloatVar(nm, falloca);
                         /* Stage 30: if this var was assigned sqrt(x), remember x.
@@ -5625,25 +5636,25 @@ void CodeGen::emitStmt(const Node &n) {
                         auto *i64Ty = Type::getInt64Ty(ctx_);
                         auto *f64Ty = Type::getDoubleTy(ctx_);
                         if (ppIt->second == PPKind::Float) {
-                            auto *fa = builder_.CreateAlloca(f64Ty, nullptr, nm + ".f");
+                            auto *fa = createEntryAlloca(f64Ty, nullptr, nm + ".f");
                             builder_.CreateStore(ConstantFP::get(f64Ty, 0.0), fa);
                             declareFloatVar(nm, fa);
                         } else if (ppIt->second == PPKind::Int) {
-                            auto *ia = builder_.CreateAlloca(i64Ty, nullptr, nm + ".i");
+                            auto *ia = createEntryAlloca(i64Ty, nullptr, nm + ".i");
                             builder_.CreateStore(ConstantInt::get(i64Ty, 0), ia);
                             declareIntVar(nm, ia);
                         } else { /* PPKind::DerefAV: Stage 27c — borrow @_ elem into PV slot.
                                     Create a perlPtrTy_ alloca in scopes_ (NOT trackPv'd) so
                                     emitExpr(ScalarVar) still finds a valid PerlValue*.
                                     The derefAV alloca (PerlArray*) is filled in the Assign handler. */
-                            auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm);
+                            auto *pvA = createEntryAlloca(perlPtrTy_, nullptr, nm);
                             builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), pvA);
                             declareVar(nm, pvA);  /* in scopes_, NOT trackPv */
                         }
                         break; /* done — no PV alloca, no trackPv */
                     }
                 }
-                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+                auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
                 /* allocate a stable PerlValue* that lives for this variable's lifetime */
                 Value *pv = perlUndef();
                 builder_.CreateStore(pv, alloca);
@@ -5876,7 +5887,7 @@ void CodeGen::emitStmt(const Node &n) {
         if (n.cond && n.cond->kind == NK::My &&
             !n.cond->name.empty() && n.cond->name[0] == '$') {
             std::string nm = n.cond->name.substr(1);
-            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.cond->name);
+            auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.cond->name);
             myCondPv = perlUndef();
             builder_.CreateStore(myCondPv, alloca);
             declareVar(nm, alloca);
@@ -5898,7 +5909,7 @@ void CodeGen::emitStmt(const Node &n) {
                 if (elem->kind != NK::My) continue;
                 std::string nm = elem->name;
                 if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
-                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + nm);
+                auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, "$" + nm);
                 builder_.CreateStore(perlUndef(), alloca);
                 declareVar(nm, alloca);
             }
@@ -6168,8 +6179,8 @@ void CodeGen::emitStmt(const Node &n) {
                iterAlloca: user-visible $VAR — refreshed from counter at each body entry.
                This mirrors Perl semantics: $i++ inside foreach body does not advance
                the loop; the loop always advances its own counter by exactly 1. */
-            auto *counterAlloca = builder_.CreateAlloca(i64, nullptr, loopNm + ".counter");
-            auto *iterAlloca    = builder_.CreateAlloca(i64, nullptr, loopNm + ".i");
+            auto *counterAlloca = createEntryAlloca(i64, nullptr, loopNm + ".counter");
+            auto *iterAlloca    = createEntryAlloca(i64, nullptr, loopNm + ".i");
             builder_.CreateStore(lo, counterAlloca);
 
             auto *condBB2 = BasicBlock::Create(ctx_, "foreach.cond", fn);
@@ -6216,7 +6227,7 @@ void CodeGen::emitStmt(const Node &n) {
                         Value *af_i64 = callRT("perl_array_is_all_flat", {outerArr});
                         Value *af_i1  = builder_.CreateICmpNE(af_i64,
                                             ConstantInt::get(i64_, 0), outerNm + ".af");
-                        auto *af_slot = builder_.CreateAlloca(i1Ty, nullptr,
+                        auto *af_slot = createEntryAlloca(i1Ty, nullptr,
                                                               outerNm + ".af.slot");
                         builder_.CreateStore(af_i1, af_slot);
                         avAllflatSlots_[outerNm] = af_slot;
@@ -6270,8 +6281,8 @@ void CodeGen::emitStmt(const Node &n) {
                         Value *rowRef     = builder_.CreateLoad(perlPtrTy_, rowRefPP, outerNm + "." + idxNm + ".rref");
                         setTBAA(rowRef, tbaaAvElemTag_);
                         Value *pvalPtr    = builder_.CreateConstInBoundsGEP1_64(i8TyRD, rowRef, 8, outerNm + "." + idxNm + ".pp");
-                        auto *fra = builder_.CreateAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".fra");
-                        auto *ra  = builder_.CreateAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".ra");
+                        auto *fra = createEntryAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".fra");
+                        auto *ra  = createEntryAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".ra");
                         builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), fra);
                         builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), ra);
                         auto *flatBBrd  = BasicBlock::Create(ctx_, outerNm + "." + idxNm + ".flat", fn);
@@ -6400,10 +6411,10 @@ void CodeGen::emitStmt(const Node &n) {
            in turn, so mutating it (or $_) writes back to the source array.
            The alloca's *contents* (which PerlValue* it points at) change every
            iteration to the array's own element cell — never a private copy. */
-        auto *loopVar = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+        auto *loopVar = createEntryAlloca(perlPtrTy_, nullptr, n.name);
 
         /* index counter */
-        auto *idxAlloca = builder_.CreateAlloca(i64, nullptr, "foreach.idx");
+        auto *idxAlloca = createEntryAlloca(i64, nullptr, "foreach.idx");
         builder_.CreateStore(ConstantInt::get(i64, 0), idxAlloca);
 
         auto *condBB = BasicBlock::Create(ctx_, "foreach.cond", fn);
@@ -6700,13 +6711,13 @@ void CodeGen::emitStmt(const Node &n) {
                     } else {
                         Value *qkey = builder_.CreateGlobalStringPtr(n.name);
                         Value *cell = callRT("perl_glob_get_scalar", {qkey});
-                        slot = builder_.CreateAlloca(perlPtrTy_, nullptr,
+                        slot = createEntryAlloca(perlPtrTy_, nullptr,
                                                      "gq." + n.name);
                         builder_.CreateStore(cell, slot);
                     }
                 } else {
                     Value *uv = callRT("perl_alloc_undef", {});
-                    slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
+                    slot = createEntryAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
                     builder_.CreateStore(uv, slot);
                     declareVar(n.name, slot);
                 }
@@ -6739,7 +6750,7 @@ void CodeGen::emitStmt(const Node &n) {
         auto *ginit = new GlobalVariable(*mod_, i8Ty, false,
             GlobalValue::InternalLinkage, ConstantInt::get(i8Ty, 0), gflag);
         /* local alloca holds the same PerlValue* as the global */
-        auto *slot = builder_.CreateAlloca(ptrTy, nullptr, ("$" + n.name).c_str());
+        auto *slot = createEntryAlloca(ptrTy, nullptr, ("$" + n.name).c_str());
         declareVar(n.name, slot);
         auto *initBB = BasicBlock::Create(ctx_, "state.init", fn);
         auto *doneBB = BasicBlock::Create(ctx_, "state.done", fn);
@@ -6850,7 +6861,7 @@ void CodeGen::emitStmt(const Node &n) {
         /* emit a simple C-style loop: for (i = len-1; i >= 0; i--) */
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *i64   = Type::getInt64Ty(ctx_);
-        auto *iA    = builder_.CreateAlloca(i64, nullptr, "us.i");
+        auto *iA    = createEntryAlloca(i64, nullptr, "us.i");
         builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(i64, 1)), iA);
         auto *condBB = BasicBlock::Create(ctx_, "us.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "us.body", fn);
@@ -6961,7 +6972,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                (s_dollar_at-style stable struct) — wrap it in a slot the
                generic load path can deref. */
             Value *cell = callRT("perl_get_dollar_under", {});
-            auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "global.under");
+            auto *hold = createEntryAlloca(perlPtrTy_, nullptr, "global.under");
             builder_.CreateStore(cell, hold);
             slot = hold;
         }
@@ -7107,7 +7118,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         } else {
             Value *slot = nullptr;
             if (n.sval == "my") {
-                slot = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+                slot = createEntryAlloca(perlPtrTy_, nullptr, n.name);
                 Value *pv = perlUndef();
                 builder_.CreateStore(pv, slot);
                 declareVar(n.name, slot);
@@ -7615,7 +7626,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                             Value *pvSlot = lookupVar(nm);
                             if (pvSlot) builder_.CreateStore(elem2, pvSlot);
                             Value *av = callRT("perl_deref_array", {elem2});
-                            auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
+                            auto *pa = createEntryAlloca(perlPtrTy_, nullptr, nm + ".av");
                             builder_.CreateStore(av, pa);
                             declareDerefAV(nm, pa);
                         }
@@ -7658,7 +7669,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
                     slot = lookupVar(nm);
                     if (!slot) {
-                        slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + nm);
+                        slot = createEntryAlloca(perlPtrTy_, nullptr, "$" + nm);
                         builder_.CreateStore(perlUndef(), slot);
                         declareVar(nm, slot);
                     }
@@ -7681,21 +7692,21 @@ Value *CodeGen::emitExpr(const Node &n) {
                             if (safe && needFP) {
                                 /* float promotion: var needs fractional precision */
                                 auto *f64 = Type::getDoubleTy(ctx_);
-                                auto *fa  = builder_.CreateAlloca(f64, nullptr, nm + ".f");
+                                auto *fa  = createEntryAlloca(f64, nullptr, nm + ".f");
                                 Value *dbl = callRT("perl_to_float", {pv});
                                 builder_.CreateStore(dbl, fa);
                                 declareFloatVar(nm, fa);
                             } else if (safe && !needFP && hasVar(*currentSubBody_, nm)) {
                                 /* int promotion: var only used in integer contexts */
                                 auto *i64 = Type::getInt64Ty(ctx_);
-                                auto *ia  = builder_.CreateAlloca(i64, nullptr, nm + ".i");
+                                auto *ia  = createEntryAlloca(i64, nullptr, nm + ".i");
                                 Value *ival = callRT("perl_to_int", {pv});
                                 builder_.CreateStore(ival, ia);
                                 declareIntVar(nm, ia);
                             } else if (!safe && isOnlyArrayRefDeref(*currentSubBody_, nm)) {
                                 /* array-ref arg: cache PerlArray* once at entry — eliminates
                                    repeated perl_deref_array_ro calls in hot loops (Stage 15) */
-                                auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
+                                auto *pa = createEntryAlloca(perlPtrTy_, nullptr, nm + ".av");
                                 Value *av = callRT("perl_deref_array_ro", {pv});
                                 builder_.CreateStore(av, pa);
                                 declareDerefAV(nm, pa);
@@ -8196,7 +8207,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     auto *phiAv = builder_.CreatePHI(perlPtrTy_, 2, "lva.av");
                     phiAv->addIncoming(dblPtr, fBB);
                     phiAv->addIncoming(av, nBB);
-                    auto *pa = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".av");
+                    auto *pa = createEntryAlloca(perlPtrTy_, nullptr, nm + ".av");
                     builder_.CreateStore(phiAv, pa);
                     declareDerefAV(nm, pa);
                     freeIfOwned(base);
@@ -8763,7 +8774,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *tmpLen = callRT("perl_to_int", {callRT("perl_array_len", {tmp})});
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *i64   = Type::getInt64Ty(ctx_);
-        auto *iA    = builder_.CreateAlloca(i64, nullptr, "us2.i");
+        auto *iA    = createEntryAlloca(i64, nullptr, "us2.i");
         builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(i64, 1)), iA);
         auto *condBB = BasicBlock::Create(ctx_, "us2.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "us2.body", fn);
@@ -9264,10 +9275,10 @@ Value *CodeGen::emitExpr(const Node &n) {
 
         Value *lenPv = callRT("perl_array_len", {inputArr});
         Value *len   = callRT("perl_to_int", {lenPv});
-        auto *udAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$_");
+        auto *udAlloca = createEntryAlloca(perlPtrTy_, nullptr, "$_");
         Value *udPv    = perlUndef();
         builder_.CreateStore(udPv, udAlloca);
-        auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "fan.i");
+        auto *iAlloca = createEntryAlloca(i64, nullptr, "fan.i");
         builder_.CreateStore(ConstantInt::get(i64, 0), iAlloca);
 
         auto *condBB = BasicBlock::Create(ctx_, "fan.cond", fn);
@@ -9348,21 +9359,21 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *len   = callRT("perl_to_int", {lenPv});
 
         /* $a and $b allocas */
-        auto *aAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$a");
-        auto *bAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "$b");
+        auto *aAlloca = createEntryAlloca(perlPtrTy_, nullptr, "$a");
+        auto *bAlloca = createEntryAlloca(perlPtrTy_, nullptr, "$b");
         Value *aPv    = perlUndef();
         Value *bPv    = perlUndef();
         builder_.CreateStore(aPv, aAlloca);
         builder_.CreateStore(bPv, bAlloca);
 
         /* accumulator starts as first element */
-        auto *accAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "red.acc");
+        auto *accAlloca = createEntryAlloca(perlPtrTy_, nullptr, "red.acc");
         Value *first    = callRT("perl_array_get_ref", {inputArr, ConstantInt::get(i64, 0)});
         Value *accCell  = callRT("perl_alloc_undef", {});
         callRT("perl_assign", {accCell, first});
         builder_.CreateStore(accCell, accAlloca);
 
-        auto *iAlloca = builder_.CreateAlloca(i64, nullptr, "red.i");
+        auto *iAlloca = createEntryAlloca(i64, nullptr, "red.i");
         builder_.CreateStore(ConstantInt::get(i64, 1), iAlloca); /* start from index 1 */
 
         auto *condBB = BasicBlock::Create(ctx_, "red.cond", fn);
@@ -9808,14 +9819,14 @@ Value *CodeGen::emitExpr(const Node &n) {
                     capSigils.push_back('$');
                 } else if (Value *ia = lookupIntVar(nm)) {
                     Value *boxed = boxI64(builder_.CreateLoad(Type::getInt64Ty(ctx_), ia));
-                    auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    auto *pvA = createEntryAlloca(perlPtrTy_, nullptr, nm + ".boxed");
                     builder_.CreateStore(boxed, pvA);
                     capNames.push_back(nm);
                     capVals.push_back(builder_.CreateLoad(perlPtrTy_, pvA));
                     capSigils.push_back('$');
                 } else if (Value *fa = lookupFloatVar(nm)) {
                     Value *boxed = boxF64(builder_.CreateLoad(Type::getDoubleTy(ctx_), fa));
-                    auto *pvA = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    auto *pvA = createEntryAlloca(perlPtrTy_, nullptr, nm + ".boxed");
                     builder_.CreateStore(boxed, pvA);
                     capNames.push_back(nm);
                     capVals.push_back(builder_.CreateLoad(perlPtrTy_, pvA));
@@ -9865,7 +9876,7 @@ Value *CodeGen::emitExpr(const Node &n) {
 
             auto *i32Ty = Type::getInt32Ty(ctx_);
             auto *i64Ty = Type::getInt64Ty(ctx_);
-            localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+            localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
 
             for (size_t ci = 0; ci < capNames.size(); ci++) {
@@ -9875,7 +9886,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 } else if (capSigils[ci] == '%') {
                     declareHash(capNames[ci], callRT("perl_deref_hash", {pv}));
                 } else {
-                    auto *a = builder_.CreateAlloca(perlPtrTy_, nullptr, capNames[ci]);
+                    auto *a = createEntryAlloca(perlPtrTy_, nullptr, capNames[ci]);
                     builder_.CreateStore(pv, a);
                     declareVar(capNames[ci], a);
                 }
@@ -10138,7 +10149,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *slot = lookupVar(n.name);
         if (!slot) {
             Value *uv = callRT("perl_alloc_undef", {});
-            slot = builder_.CreateAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
+            slot = createEntryAlloca(perlPtrTy_, nullptr, ("$" + n.name).c_str());
             builder_.CreateStore(uv, slot);
             declareVar(n.name, slot);
         }
@@ -10190,7 +10201,7 @@ Value *CodeGen::emitExpr(const Node &n) {
 
         /* allocate jmp_buf on stack (256 bytes, enough for any platform) */
         auto *i8Arr  = ArrayType::get(Type::getInt8Ty(ctx_), 256);
-        auto *jbAlloca = builder_.CreateAlloca(i8Arr, nullptr, "jmp_buf");
+        auto *jbAlloca = createEntryAlloca(i8Arr, nullptr, "jmp_buf");
         /* cast to ptr for setjmp/perl_eval_push */
         Value *jbPtr = builder_.CreateBitCast(jbAlloca, PointerType::getUnqual(ctx_));
         /* perl_eval_push(jbPtr) — register this jmp_buf */
@@ -10199,7 +10210,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* result alloca — must be BEFORE setjmp so it survives longjmp
            (longjmp restores stack pointer to setjmp's frame; alloca after
            setjmp would be outside the saved frame). */
-        auto *resultAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, "eval.result");
+        auto *resultAlloca = createEntryAlloca(perlPtrTy_, nullptr, "eval.result");
         /* Initialize with null so that if the body terminates early (die),
            the load returns a known value (not LLVM undef), allowing the
            longjmpMissed check to work correctly. */
@@ -10318,7 +10329,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 if (Value *ia = lookupIntVar(nm)) {
                     Value *ival = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
                     Value *boxed = boxI64(ival);
-                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    auto *pvAlloca = createEntryAlloca(perlPtrTy_, nullptr, nm + ".boxed");
                     builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
                     captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
@@ -10326,7 +10337,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 } else if (Value *fa = lookupFloatVar(nm)) {
                     Value *fval = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
                     Value *boxed = boxF64(fval);
-                    auto *pvAlloca = builder_.CreateAlloca(perlPtrTy_, nullptr, nm + ".boxed");
+                    auto *pvAlloca = createEntryAlloca(perlPtrTy_, nullptr, nm + ".boxed");
                     builder_.CreateStore(boxed, pvAlloca);
                     captureNames.push_back(nm);
                     captureVals.push_back(builder_.CreateLoad(perlPtrTy_, pvAlloca));
@@ -10416,7 +10427,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* fresh local() depth for this closure */
         {
             auto *i32Ty = Type::getInt32Ty(ctx_);
-            localDepthAlloca_ = builder_.CreateAlloca(i32Ty, nullptr, "local.depth");
+            localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
             builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
         }
         /* Phase 3: initialise captured variables in the closure's own scope */
@@ -10429,7 +10440,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             } else if (captureSigils[i] == '%') {
                 declareHash(captureNames[i], callRT("perl_deref_hash", {pv}));
             } else {
-                auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, captureNames[i]);
+                auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, captureNames[i]);
                 builder_.CreateStore(pv, alloca);
                 declareVar(captureNames[i], alloca);
             }
@@ -11083,7 +11094,7 @@ Value *CodeGen::emitLValue(const Node &n) {
            generic path as everything else. Plain `$@ = ...` is handled
            earlier in NK::Assign directly (this covers the rest). */
         Value *dollarAt = callRT("perl_get_dollar_at", {});
-        auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "dollarat.slot");
+        auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "dollarat.slot");
         builder_.CreateStore(dollarAt, slot);
         return slot;
     }
@@ -11107,7 +11118,7 @@ Value *CodeGen::emitLValue(const Node &n) {
         auto it = specialGlobals.find(n.name);
         if (it != specialGlobals.end()) {
             Value *gv = callRT(it->second, {});
-            auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr,
+            auto *slot = createEntryAlloca(perlPtrTy_, nullptr,
                                                 std::string("spec.") + n.name);
             builder_.CreateStore(gv, slot);
             return slot;
@@ -11125,19 +11136,19 @@ Value *CodeGen::emitLValue(const Node &n) {
                 if (git != fileScalarGlobals_.end()) return git->second;
                 Value *key = builder_.CreateGlobalStringPtr(n.name);
                 Value *cell = callRT("perl_glob_get_scalar", {key});
-                auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "gq." + n.name);
+                auto *hold = createEntryAlloca(perlPtrTy_, nullptr, "gq." + n.name);
                 builder_.CreateStore(cell, hold);
                 return hold;
             }
             if (isGlobName(n.name)) {
                 Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
                 Value *cell = callRT("perl_glob_get_scalar", {key});
-                auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "glob." + globBareName(n.name));
+                auto *hold = createEntryAlloca(perlPtrTy_, nullptr, "glob." + globBareName(n.name));
                 builder_.CreateStore(cell, hold);
                 return hold;
             }
             /* auto-vivify global-ish variable in current scope */
-            auto *alloca = builder_.CreateAlloca(perlPtrTy_, nullptr, n.name);
+            auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
             builder_.CreateStore(perlUndef(), alloca);
             declareVar(n.name, alloca);
             return alloca;
@@ -11176,7 +11187,7 @@ Value *CodeGen::emitLValue(const Node &n) {
            storage (a live PerlValue* in a temp alloca, same shape the
            generic assign path expects). */
         Value *refCell = callRT("perl_deref_scalar", {namePv});
-        auto *holdRef = builder_.CreateAlloca(perlPtrTy_, nullptr,
+        auto *holdRef = createEntryAlloca(perlPtrTy_, nullptr,
                                               "symderef.lval");
         builder_.CreateStore(refCell, holdRef);
         builder_.CreateBr(joinBB);
@@ -11187,7 +11198,7 @@ Value *CodeGen::emitLValue(const Node &n) {
            in a temp alloca, exactly like the isQualifiedName/isGlobName
            write paths just above. */
         Value *cell = emitSymbolicDeref(n);
-        auto *holdSym = builder_.CreateAlloca(perlPtrTy_, nullptr,
+        auto *holdSym = createEntryAlloca(perlPtrTy_, nullptr,
                                               "symderef.lval");
         builder_.CreateStore(cell, holdSym);
         builder_.CreateBr(joinBB);
@@ -11737,13 +11748,13 @@ Value *CodeGen::emitBinOp(const Node &n) {
     pushScope();
     auto *f64Ty = Type::getDoubleTy(ctx_);
     for (size_t i = 0; i < is.params.size(); i++) {
-        auto *slot = builder_.CreateAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
+        auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
         builder_.CreateStore(argVals[i], slot);
         declareVar(is.params[i], slot);
         /* If the original arg node is F64-capable, expose it as a float var too. */
         if (canEmitF64(*n.args[i])) {
             if (Value *fv = emitExprF64(*n.args[i])) {
-                auto *fslot = builder_.CreateAlloca(f64Ty, nullptr, "f$" + is.params[i]);
+                auto *fslot = createEntryAlloca(f64Ty, nullptr, "f$" + is.params[i]);
                 builder_.CreateStore(fv, fslot);
                 if (!floatScopes_.empty()) floatScopes_.back()[is.params[i]] = fslot;
             }
@@ -11848,7 +11859,7 @@ Value *CodeGen::emitCall(const Node &n) {
                     /* Materialize through an alloca so the result is a
                        stable load after setjmp (needed when eval STRING
                        is a Call used as a comparison operand). */
-                    auto *hold = builder_.CreateAlloca(perlPtrTy_, nullptr, "eval.hold");
+                    auto *hold = createEntryAlloca(perlPtrTy_, nullptr, "eval.hold");
                     builder_.CreateStore(r, hold);
                     return builder_.CreateLoad(perlPtrTy_, hold, "eval.val");
                 }

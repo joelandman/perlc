@@ -3288,6 +3288,7 @@ A failing `try` with no `catch` returns undef without rethrowing
 - **`-name =>`**: unary minus plus a bareword before `=>` is the string `"-name"` (Pod::Usage / Getopt option keys).
 - **`delete $ref->{k}` / `exists $ref->{k}`**, **`splice(@{EXPR}, …)`**, **`pop @{EXPR}` / `shift @{EXPR}`**, **`require VERSION`**, **`quotemeta`**, **`$^V`**.
 - **Pod::Usage** (native): `pod2usage` with hashref or `-key =>` list, `-message`/`-exitval`/`-verbose`/`-input`, `noexit`, SYNOPSIS → `Usage:` (4-space indent). Tests: `tests/pod_usage_{smoke,deep}.pl`. Real `Pod::Usage.pm` is not inlined (depends on Pod::Simple/Pod::Text).
+- **`-O0` stack overflow in `perl_mul` (mbs)**: LLVM `alloca` for inlined-sub params (`cplx`'s `$re`/`$im`) and nested `for (my $i …)` sat in the inner loop body. clang `-O0` never reuses those slots, so N≈512 of mbs `fill_z` blew the 8MB stack. All local allocas now go in the function entry block. Tests: `tests/o0_nested_for_alloca_{smoke,deep}.pl`.
 
 ## Source layout
 
