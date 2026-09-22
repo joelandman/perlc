@@ -242,6 +242,7 @@ PerlValue *perl_array_delete(PerlArray *a, long long idx);
 PerlValue *perl_array_lvalue(PerlArray *a, long long idx);
 PerlValue *perl_array_len(PerlArray *a);
 double perl_array_len_f64(PerlArray *a);
+long long  perl_array_len_i64(PerlArray *a); /* live length, no PV boxing */
 void perl_array_clear(PerlArray *a);
 void perl_array_replace(PerlArray *dst, PerlArray *src);
 PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n);
@@ -566,8 +567,12 @@ PerlArray *perl_range(PerlValue *from, PerlValue *to);
 
 /* ── regex (PCRE2) ───────────────────────────────────────────────────────── */
 PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags);
+int        perl_regex_match_bool(PerlValue *str, const char *pattern, const char *flags);
 PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags);
+int        perl_regex_match_g_bool(PerlValue *str, const char *pattern, const char *flags);
 PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char *flags);
+/* OR-in: amp=1 if this unit reads $&/`/', caps=1 if it reads $1.. or %+. */
+void       perl_set_match_globals_needed(int amp, int caps);
 long long  perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags);
 /* D38c: s///e — eval_fn is called once per match with $1/$& already set;
    returns a PerlValue* whose stringification becomes the replacement.
@@ -625,6 +630,7 @@ const char *perl_qr_flags(PerlValue *qr);
 /* $s =~ $var: QR-aware match dispatch (uses the QR's own pattern+flags;
    other operands are stringified). negate implements !~. */
 PerlValue *perl_regex_match_sv(PerlValue *str, PerlValue *pattern_pv, int negate);
+int        perl_regex_match_sv_bool(PerlValue *str, PerlValue *pattern_pv, int negate);
 /* List-context non-/g match: capture LIST (empty = no match); sets $&,$1.. */
 PerlArray *perl_regex_match_captures_list(PerlValue *str, const char *pattern,
                                           const char *flags);

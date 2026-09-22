@@ -425,6 +425,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_update_float", voidTy, av, i64, Type::getDoubleTy(ctx_));
     RT("perl_array_is_all_flat", i64, av);  /* used by Stage 23 all-flat pre-check */
      RT("perl_array_len",     pv,  av);
+     RT("perl_array_len_i64", i64, av);
      RT("perl_array_last",    pv,  av);
      RT("perl_array_clear",   voidTy, av);
     RT("perl_array_replace", voidTy, av, av);
@@ -645,8 +646,11 @@ void CodeGen::declareRuntime() {
     }
     /* regex */
     RT("perl_regex_match",     pv,  pv, i8p, i8p);
+    RT("perl_regex_match_bool", Type::getInt32Ty(ctx_), pv, i8p, i8p);
     RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
+    RT("perl_regex_match_g_bool", Type::getInt32Ty(ctx_), pv, i8p, i8p);
     RT("perl_regex_match_all", av,  pv, i8p, i8p);
+    RT("perl_set_match_globals_needed", voidTy, Type::getInt32Ty(ctx_), Type::getInt32Ty(ctx_));
     RT("perl_regex_subst",     i64, pv, i8p, i8p, i8p);
     RT("perl_regex_subst_e",   i64, pv, i8p, i8p, i8p, av);
     RT("perl_capture",         pv,  i64);
@@ -862,6 +866,7 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_sysseek_fh",       pv, pv, pv, pv);
     RT("perl_make_qr",          pv, i8p, i8p);
     RT("perl_regex_match_sv",   pv, pv, pv, Type::getInt32Ty(ctx_));
+    RT("perl_regex_match_sv_bool", Type::getInt32Ty(ctx_), pv, pv, Type::getInt32Ty(ctx_));
     RT("perl_value_is_qr",      Type::getInt32Ty(ctx_), pv);
     RT("perl_regex_match_captures_list", av, pv, i8p, i8p);
     RT("perl_get_dollar_under", pv);
@@ -2542,6 +2547,8 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_array_get", "perl_hash_get_sv",
         "perl_ref_type", "perl_ref_array", "perl_ref_scalar",
         "perl_clone", "perl_sprintf", "perl_array_len", "perl_array_len_f64",
+        "perl_regex_match", "perl_regex_match_g", "perl_regex_match_sv",
+        "perl_alloc_bool",
         /* single-arg math/string builtins */
         "perl_alloc_flat_array", "perl_alloc_float_pair",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
@@ -2884,7 +2891,68 @@ Value *CodeGen::emitExprI64(const Node &n) {
 }
 
 /* Returns an i1 for integer comparisons, nullptr if not applicable. */
+Value *CodeGen::emitRegexMatchBool(const Node &n) {
+    auto *i32 = Type::getInt32Ty(ctx_);
+    if (n.kind == NK::RegexMatch) {
+        Value *str = emitExpr(*n.left);
+        Value *pat = builder_.CreateGlobalStringPtr(n.sval, "re_pat");
+        Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
+        bool isG = n.name.find('g') != std::string::npos;
+        Value *hit = callRT(isG ? "perl_regex_match_g_bool" : "perl_regex_match_bool",
+                            {str, pat, flg});
+        if (n.ival)
+            hit = builder_.CreateXor(hit, ConstantInt::get(i32, 1), "re_not");
+        return hit;
+    }
+    if (n.kind == NK::RegexMatchInterp) {
+        Value *str = emitExpr(*n.left);
+        Value *patPv = emitExpr(*n.right);
+        if (!rtFuncs_.count("perl_to_string_dup"))
+            rtFuncs_["perl_to_string_dup"] = Function::Create(
+                makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
+        Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
+        Value *flg = builder_.CreateGlobalStringPtr(n.name, "rmi_flg");
+        Value *hit = callRT("perl_regex_match_bool", {str, patC, flg});
+        Function *freeFn = rtFuncs_.count("free")
+            ? rtFuncs_["free"]
+            : (rtFuncs_["free"] = Function::Create(
+                   makeRT(ctx_, Type::getVoidTy(ctx_),
+                          {PointerType::getUnqual(ctx_)}),
+                   Function::ExternalLinkage, "free", mod_.get()));
+        builder_.CreateCall(freeFn, {patC});
+        freeIfOwned(patPv);
+        freeIfOwned(str);
+        if (n.ival)
+            hit = builder_.CreateXor(hit, ConstantInt::get(i32, 1), "re_not");
+        return hit;
+    }
+    if (n.kind == NK::RegexMatchExpr) {
+        Value *str = emitExpr(*n.left);
+        int savedCtx = callCtx_;
+        callCtx_ = -1;
+        Value *patPv = emitExpr(*n.right);
+        callCtx_ = savedCtx;
+        Value *hit = callRT("perl_regex_match_sv_bool",
+            {str, patPv, ConstantInt::get(i32, n.ival ? 1 : 0)});
+        freeIfOwned(str);
+        freeIfOwned(patPv);
+        return hit;
+    }
+    return nullptr;
+}
+
 Value *CodeGen::tryEmitI1Cond(const Node &n) {
+    if (n.kind == NK::RegexMatch || n.kind == NK::RegexMatchInterp ||
+        n.kind == NK::RegexMatchExpr) {
+        Value *hit = emitRegexMatchBool(n);
+        if (!hit) return nullptr;
+        return builder_.CreateICmpNE(hit, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+    }
+    if (n.kind == NK::UnaryOp && n.sval == "!" && n.left) {
+        if (Value *inner = tryEmitI1Cond(*n.left))
+            return builder_.CreateNot(inner, "not.i1");
+    }
     if (n.kind != NK::BinOp || !n.left || !n.right) return nullptr;
     using P = llvm::CmpInst::Predicate;
     P pred;
@@ -4079,6 +4147,33 @@ static void collectSubDefs(const Node &n, std::vector<const Node*> &out) {
 /* D57: collect the names of every NK::Call found anywhere in an
    expression subtree — used to detect recursion cycles among candidate
    AST-inline subs (see below). */
+/* Which match globals this compilation unit actually reads. String eval
+   can mention $&/$1 at runtime, so it forces both on. */
+static void scanMatchGlobalUse(const Node &n, bool &amp, bool &caps, bool &dynEval) {
+    if (n.kind == NK::ScalarVar &&
+        (n.name == "&" || n.name == "`" || n.name == "'"))
+        amp = true;
+    if (n.kind == NK::CaptureVar)
+        caps = true;
+    if ((n.kind == NK::HashElem || n.kind == NK::HashVar || n.kind == NK::HashSlice)
+        && n.name == "+")
+        caps = true;
+    if (n.kind == NK::Call && n.name == "eval")
+        dynEval = true;
+    if (n.left)  scanMatchGlobalUse(*n.left,  amp, caps, dynEval);
+    if (n.right) scanMatchGlobalUse(*n.right, amp, caps, dynEval);
+    if (n.cond)  scanMatchGlobalUse(*n.cond,  amp, caps, dynEval);
+    if (n.body)  scanMatchGlobalUse(*n.body,  amp, caps, dynEval);
+    if (n.init)  scanMatchGlobalUse(*n.init,  amp, caps, dynEval);
+    if (n.step)  scanMatchGlobalUse(*n.step,  amp, caps, dynEval);
+    if (n.contBlock) scanMatchGlobalUse(*n.contBlock, amp, caps, dynEval);
+    for (auto &a : n.args) scanMatchGlobalUse(*a, amp, caps, dynEval);
+    for (auto &b : n.branches) {
+        if (b.cond) scanMatchGlobalUse(*b.cond, amp, caps, dynEval);
+        if (b.body) scanMatchGlobalUse(*b.body, amp, caps, dynEval);
+    }
+}
+
 static void collectCalls(const Node &n, std::vector<std::string> &out) {
     if (n.kind == NK::Call) out.push_back(n.name);
     if (n.left)  collectCalls(*n.left,  out);
@@ -4285,6 +4380,19 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         fileScopeDepth_ = (int)scopes_.size() + 1;
         inMainBody_ = true;
 
+        {
+            bool amp = false, caps = false, dynEval = false;
+            scanMatchGlobalUse(program, amp, caps, dynEval);
+            if (asEvalPad_ || dynEval) { amp = true; caps = true; }
+            if (amp || caps) {
+                auto *i32g = Type::getInt32Ty(ctx_);
+                callRT("perl_set_match_globals_needed", {
+                    ConstantInt::get(i32g, amp ? 1 : 0),
+                    ConstantInt::get(i32g, caps ? 1 : 0)
+                });
+            }
+        }
+
         /* register all subs in the method dispatch table (before user code runs) */
         for (auto *s : subs_) {
             if (s->name.find("::") != std::string::npos) {
@@ -4428,6 +4536,19 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         pushScope();
         fileScopeDepth_ = (int)scopes_.size() + 1;
         inMainBody_ = true;
+
+        {
+            bool amp = false, caps = false, dynEval = false;
+            scanMatchGlobalUse(program, amp, caps, dynEval);
+            if (asEvalPad_ || dynEval) { amp = true; caps = true; }
+            if (amp || caps) {
+                auto *i32g = Type::getInt32Ty(ctx_);
+                callRT("perl_set_match_globals_needed", {
+                    ConstantInt::get(i32g, amp ? 1 : 0),
+                    ConstantInt::get(i32g, caps ? 1 : 0)
+                });
+            }
+        }
 
         /* Register every sub — including unqualified names — so a string
            eval / do FILE that defines `sub foo {}` is callable afterwards
@@ -5828,11 +5949,14 @@ void CodeGen::emitStmt(const Node &n) {
                     builder_.CreateBr(merge);
                 break;
             }
-            Value *cond = emitExpr(*br.cond);
-            Value *b    = callRT("perl_is_true", {cond});
-            freeIfOwned(cond);
-            Value *bv   = builder_.CreateICmpNE(b,
+            Value *bv = tryEmitI1Cond(*br.cond);
+            if (!bv) {
+                Value *cond = emitExpr(*br.cond);
+                Value *b    = callRT("perl_is_true", {cond});
+                freeIfOwned(cond);
+                bv = builder_.CreateICmpNE(b,
                             ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+            }
             auto *thenBB = BasicBlock::Create(ctx_, "if.then", fn);
             auto *elseBB = BasicBlock::Create(ctx_, "if.else", fn);
             builder_.CreateCondBr(bv, thenBB, elseBB);
@@ -5980,11 +6104,14 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.CreateBr(cond);
 
         builder_.SetInsertPoint(cond);
-        Value *cv = emitExpr(*n.cond);
-        Value *bv = callRT("perl_is_true", {cv});
-        freeIfOwned(cv);
-        Value *b  = builder_.CreateICmpNE(bv,
+        Value *b = tryEmitI1Cond(*n.cond);
+        if (!b) {
+            Value *cv = emitExpr(*n.cond);
+            Value *bv = callRT("perl_is_true", {cv});
+            freeIfOwned(cv);
+            b  = builder_.CreateICmpNE(bv,
                         ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+        }
         builder_.CreateCondBr(b, body, exit);
 
         loopExits_.pop_back();
@@ -6435,9 +6562,7 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.SetInsertPoint(condBB);
 
         Value *idx  = builder_.CreateLoad(i64, idxAlloca);
-        Value *lenV = callRT("perl_array_len", {tmpArr});
-        Value *len  = callRT("perl_to_int", {lenV});
-        callRT("perl_free", {lenV});
+        Value *len  = callRT("perl_array_len_i64", {tmpArr});
         Value *cmp  = builder_.CreateICmpSLT(idx, len);
         builder_.CreateCondBr(cmp, bodyBB, exit);
 
@@ -11592,9 +11717,13 @@ Value *CodeGen::emitBinOp(const Node &n) {
          auto *thenBB = BasicBlock::Create(ctx_, "tern.then", fn);
          auto *elseBB = BasicBlock::Create(ctx_, "tern.else", fn);
          auto *endBB  = BasicBlock::Create(ctx_, "tern.end",  fn);
-         Value *cv   = emitExpr(*n.cond);
-         Value *cb   = callRT("perl_is_true", {cv});
-         Value *ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+         Value *ctrue = tryEmitI1Cond(*n.cond);
+         if (!ctrue) {
+             Value *cv   = emitExpr(*n.cond);
+             Value *cb   = callRT("perl_is_true", {cv});
+             freeIfOwned(cv);
+             ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+         }
          builder_.CreateCondBr(ctrue, thenBB, elseBB);
 
         /* Helper: emit a ternary branch. ArrayLit/list-producers need

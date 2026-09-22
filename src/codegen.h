@@ -349,7 +349,8 @@ private:
     llvm::AllocaInst *createEntryAlloca(llvm::Type *ty, llvm::Value *arraySize,
                                         const llvm::Twine &name);
     llvm::Value *emitFlooredMod(llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem */
-    llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons, else nullptr */
+    llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons / boolean =~, else nullptr */
+    llvm::Value *emitRegexMatchBool(const Node &n); /* i32 0/1; installs $&/$1 if needed */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
 
     /* D56: emit a warn call for use of an undef value at this location */

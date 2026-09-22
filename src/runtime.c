@@ -3143,6 +3143,10 @@ double perl_array_len_f64(PerlArray *a) {
     return (double)a->len;
 }
 
+long long perl_array_len_i64(PerlArray *a) {
+    return a ? a->len : 0;
+}
+
 void perl_array_extend(PerlArray *dst, PerlArray *src) {
     for (long long i = 0; i < src->len; i++)
         perl_array_push(dst, src->elems[i]);
@@ -4519,22 +4523,21 @@ PerlValue *perl_deref_if_ref(PerlValue *pv) {
    PERL_QR its own pattern+flags are used (no re-compile from stringified
    text); any other operand is stringified (already-compiled W28 behavior)
    and matched with empty flags. `negate` implements !~. */
-PerlValue *perl_regex_match_sv(PerlValue *str, PerlValue *pattern_pv, int negate) {
-    PerlValue *res;
+int perl_regex_match_sv_bool(PerlValue *str, PerlValue *pattern_pv, int negate) {
+    int hit;
     if (pattern_pv && pattern_pv->tag == PERL_QR && pattern_pv->pval) {
         PerlQrRegex *qr = (PerlQrRegex *)pattern_pv->pval;
-        res = perl_regex_match(str, qr->pattern, qr->flags);
+        hit = perl_regex_match_bool(str, qr->pattern, qr->flags);
     } else {
         char *pat = pattern_pv ? perl_to_string_dup(pattern_pv) : NULL;
-        res = perl_regex_match(str, pat ? pat : "", "");
+        hit = perl_regex_match_bool(str, pat ? pat : "", "");
         free(pat);
     }
-    if (negate) {
-        PerlValue *n = perl_not(res);
-        perl_free(res);
-        res = n;
-    }
-    return res;
+    return negate ? !hit : hit;
+}
+
+PerlValue *perl_regex_match_sv(PerlValue *str, PerlValue *pattern_pv, int negate) {
+    return perl_alloc_bool(perl_regex_match_sv_bool(str, pattern_pv, negate));
 }
 
 /* List-context non-/g match: returns the CAPTURE LIST as a new PerlArray
@@ -9116,9 +9119,17 @@ PerlArray *perl_range(PerlValue *from, PerlValue *to) {
 #define PERL_MAX_CAPTURES 10
 static PerlValue *perl_captures_[PERL_MAX_CAPTURES + 1];  /* $1..$10 */
 static PerlHash *perl_plus_hash = NULL;
+static int s_match_amp_needed = 0;   /* $& / $` / $' appear in this process */
+static int s_match_caps_needed = 0;  /* $1..$n or %+ appear in this process */
+
+void perl_set_match_globals_needed(int amp, int caps) {
+    if (amp) s_match_amp_needed = 1;
+    if (caps) s_match_caps_needed = 1;
+}
 
 static int pcre_flags(const char *flags) {
     int opts = 0;
+    if (!flags) return 0;
     for (; *flags; flags++) {
         switch (*flags) {
             case 'i': opts |= PCRE2_CASELESS;  break;
@@ -9136,12 +9147,18 @@ PerlValue *perl_capture(long long n) {
 }
 
 static void populate_named_captures(pcre2_match_data *md, const char *s, pcre2_code *re) {
+  uint32_t name_count = 0, name_entry_size = 0;
+  pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT, &name_count);
+  if (name_count == 0) {
+    if (perl_plus_hash) {
+      perl_hash_free(perl_plus_hash);
+      perl_plus_hash = NULL;
+    }
+    return;
+  }
   if (perl_plus_hash) perl_hash_free(perl_plus_hash);
   perl_plus_hash = perl_hash_new();
 
-  uint32_t name_count, name_entry_size;
-  pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT,     &name_count);
-  if (name_count == 0) return;
   pcre2_pattern_info(re, PCRE2_INFO_NAMEENTRYSIZE, &name_entry_size);
 
   PCRE2_SPTR name_table;
@@ -9185,6 +9202,8 @@ static __thread int regex_cache_len_ = 0;
 static pcre2_code *regex_cache_lookup(const char *pattern, const char *flags) {
     char key[128];
     int ki = 0;
+    if (!pattern) pattern = "";
+    if (!flags) flags = "";
     for (const char *p = pattern; *p && ki < 127; ki++, p++) key[ki] = *p;
     key[ki++] = '\x1f';   /* unit separator */
     for (const char *f = flags; *f && ki < 127; ki++, f++) key[ki] = *f;
@@ -9192,6 +9211,7 @@ static pcre2_code *regex_cache_lookup(const char *pattern, const char *flags) {
 
     for (int i = 0; i < regex_cache_len_; i++) {
         if (regex_cache_[i].compiled && strcmp(regex_cache_[i].key, key) == 0) {
+            if (i == 0) return regex_cache_[0].compiled;
             /* promote to front (LRU) */
             RegexCacheEntry tmp = regex_cache_[i];
             for (int j = i; j > 0; j--) regex_cache_[j] = regex_cache_[j-1];
@@ -9238,52 +9258,78 @@ static void regex_cache_insert(const char *pattern, const char *flags, pcre2_cod
     dst->compiled = compiled;
 }
 
-PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags) {
-    int errcode; PCRE2_SIZE erroffset;
+static pcre2_code *regex_compile_cached(const char *pattern, const char *flags) {
+    if (!pattern) pattern = "";
+    if (!flags) flags = "";
     pcre2_code *re = regex_cache_lookup(pattern, flags);
-    if (!re) {
-        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                           pcre_flags(flags), &errcode, &erroffset, NULL);
-        if (re) regex_cache_insert(pattern, flags, re);
+    if (re) return re;
+    int errcode;
+    PCRE2_SIZE erroffset;
+    re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                       pcre_flags(flags), &errcode, &erroffset, NULL);
+    if (re) {
+        (void)pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);
+        regex_cache_insert(pattern, flags, re);
     }
-    if (!re) return perl_alloc_int(0);
+    return re;
+}
 
-    char *s = perl_to_string_dup(str);
-    size_t slen = strlen(s);
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
-    int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, 0, 0, md, NULL);
-    if (rc > 0) populate_named_captures(md, s, re);
+typedef struct {
+    PCRE2_SPTR ptr;
+    PCRE2_SIZE len;
+    char *owned;
+} ReSubj;
 
-    if (rc > 0) {
-        PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
-        populate_named_captures(md, s, re);
-        /* store $& — full match (group 0) */
-        if (s_dollar_amp.tag == PERL_STRING && s_dollar_amp.sval) free(s_dollar_amp.sval);
-        { size_t ms = ov[0], me = ov[1];
-          char *ms_str = malloc(me - ms + 1);
-          memcpy(ms_str, s + ms, me - ms); ms_str[me-ms] = '\0';
-          s_dollar_amp.tag = PERL_STRING; s_dollar_amp.sval = ms_str;
-          s_dollar_amp.slen = (long long)(me - ms); }
-        for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
-            if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
-        }
-        for (int i = 1; i < rc && i <= PERL_MAX_CAPTURES; i++) {
-            size_t cstart = ov[2*i], cend = ov[2*i+1];
-            char *cap = malloc(cend - cstart + 1);
-            memcpy(cap, s + cstart, cend - cstart);
-            cap[cend - cstart] = '\0';
-            perl_captures_[i] = perl_alloc_string(cap);
-            free(cap);
-        }
+static ReSubj re_subject(const PerlValue *str) {
+    ReSubj s = { (PCRE2_SPTR)"", 0, NULL };
+    if (!str) return s;
+    if (str->tag == PERL_STRING) {
+        s.ptr = (PCRE2_SPTR)(str->sval ? str->sval : "");
+        s.len = str->slen > 0 ? (PCRE2_SIZE)str->slen : 0;
+        return s;
     }
+    long long n = 0;
+    s.owned = perl_to_string_dup_len(str, &n);
+    s.ptr = (PCRE2_SPTR)(s.owned ? s.owned : "");
+    s.len = n > 0 ? (PCRE2_SIZE)n : 0;
+    return s;
+}
 
-    free(s);
-    pcre2_match_data_free(md);
-    /* Do NOT free re — it comes from the shared cache. */
+static __thread pcre2_match_data *re_md_ = NULL;
+static __thread uint32_t re_md_pairs_ = 0;
+
+static pcre2_match_data *re_match_data(pcre2_code *re) {
+    uint32_t caps = 0;
+    pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &caps);
+    uint32_t need = caps + 1;
+    if (need < 32) need = 32;
+    if (!re_md_ || re_md_pairs_ < need) {
+        if (re_md_) pcre2_match_data_free(re_md_);
+        re_md_ = pcre2_match_data_create(need, NULL);
+        re_md_pairs_ = need;
+    }
+    return re_md_;
+}
+
+static void install_match_captures(pcre2_match_data *md, const char *s, int rc, pcre2_code *re);
+
+int perl_regex_match_bool(PerlValue *str, const char *pattern, const char *flags) {
+    pcre2_code *re = regex_compile_cached(pattern, flags);
+    if (!re) return 0;
+    ReSubj s = re_subject(str);
+    pcre2_match_data *md = re_match_data(re);
+    int rc = pcre2_match(re, s.ptr, s.len, 0, 0, md, NULL);
+    if (rc > 0 && (s_match_amp_needed || s_match_caps_needed))
+        install_match_captures(md, (const char *)s.ptr, rc, re);
+    if (s.owned) free(s.owned);
+    return rc > 0;
+}
+
+PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *flags) {
     /* Boolean PV: "1" or "" (real perl's =~ false stringifies as nothing,
        W1's convention) — but /g callers and numeric contexts see the same
        values through perl_to_int(""). */
-    return perl_alloc_bool(rc > 0 ? 1 : 0);
+    return perl_alloc_bool(perl_regex_match_bool(str, pattern, flags));
 }
 
 /* List-context non-/g match: returns the CAPTURE LIST as a new PerlArray
@@ -9293,52 +9339,40 @@ PerlValue *perl_regex_match(PerlValue *str, const char *pattern, const char *fla
 PerlArray *perl_regex_match_captures_list(PerlValue *str, const char *pattern, const char *flags) {
     PerlArray *out = perl_array_new();
     if (!str || !pattern || !*pattern) return out;
-    pcre2_code *re = regex_cache_lookup(pattern, flags);
-    if (!re) {
-        int errcode; PCRE2_SIZE erroffset;
-        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                           pcre_flags(flags), &errcode, &erroffset, NULL);
-        if (re) regex_cache_insert(pattern, flags, re);
-    }
+    pcre2_code *re = regex_compile_cached(pattern, flags);
     if (!re) return out;
-    char *s = perl_to_string_dup(str);
-    size_t slen = strlen(s);
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
-    int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, 0, 0, md, NULL);
+    ReSubj s = re_subject(str);
+    pcre2_match_data *md = re_match_data(re);
+    int rc = pcre2_match(re, s.ptr, s.len, 0, 0, md, NULL);
     if (rc > 0) {
+        install_match_captures(md, (const char *)s.ptr, rc, re);
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
-        populate_named_captures(md, s, re);
-        /* Store $& and $1..$N exactly like the scalar single-match path
-           (real perl's list-context match updates the capture globals). */
-        if (s_dollar_amp.tag == PERL_STRING && s_dollar_amp.sval) free(s_dollar_amp.sval);
-        { size_t ms = ov[0], me = ov[1];
-          char *ms_str = malloc(me - ms + 1);
-          memcpy(ms_str, s + ms, me - ms); ms_str[me-ms] = '\0';
-          s_dollar_amp.tag = PERL_STRING; s_dollar_amp.sval = ms_str;
-          s_dollar_amp.slen = (long long)(me - ms); }
-        for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
-            if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
-        }
         int pushed = 0;
         for (int i = 1; i < rc && i <= PERL_MAX_CAPTURES; i++) {
             size_t cstart = ov[2*i], cend = ov[2*i+1];
-            char *cap = malloc(cend - cstart + 1);
-            memcpy(cap, s + cstart, cend - cstart);
-            cap[cend - cstart] = '\0';
-            perl_captures_[i] = perl_alloc_string(cap);
-            perl_array_push(out, perl_alloc_string(cap));
-            free(cap);
+            if (cstart == PCRE2_UNSET || cend == PCRE2_UNSET || cend < cstart) {
+                PerlValue *uv = perl_alloc_undef();
+                perl_array_push(out, uv);
+                perl_free(uv);
+                pushed++;
+                continue;
+            }
+            size_t n = cend - cstart;
+            PerlValue *cv = perl_alloc_string_len((const char *)s.ptr + cstart, (long long)n);
+            perl_array_push(out, cv);
+            perl_free(cv);
             pushed++;
         }
         if (!pushed) {
             /* Real perl: a match with NO capture groups yields the truthy
                one-element list (1) in list context (`my $c = () = ($s =~
                /a/)` is 1, not 0). */
-            perl_array_push(out, perl_alloc_int(1));
+            PerlValue *one = perl_alloc_int(1);
+            perl_array_push(out, one);
+            perl_free(one);
         }
     }
-    free(s);
-    pcre2_match_data_free(md);
+    if (s.owned) free(s.owned);
     return out;
 }
 
@@ -9385,13 +9419,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     }
     clean[ci] = '\0';
 
-    pcre2_code *re = regex_cache_lookup(pattern, clean);
-    int errcode; PCRE2_SIZE erroffset;
-    if (!re) {
-        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                           pcre_flags(clean), &errcode, &erroffset, NULL);
-        if (re) regex_cache_insert(pattern, clean, re);
-    }
+    pcre2_code *re = regex_compile_cached(pattern, clean);
     if (!re) return 0;
 
     char *s = perl_to_string_dup(str);
@@ -9407,7 +9435,7 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     long long count = 0;
     size_t pos = 0;
 
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    pcre2_match_data *md = re_match_data(re);
     while (pos <= slen) {
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
         if (rc > 0) install_match_captures(md, s, rc, re);
@@ -9502,7 +9530,6 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     str->slen = (long long)out_len;
 
     free(s);
-    pcre2_match_data_free(md);
     return count;
 }
 
@@ -9518,13 +9545,7 @@ long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *fl
     }
     clean[ci] = '\0';
 
-    pcre2_code *re = regex_cache_lookup(pattern, clean);
-    int errcode; PCRE2_SIZE erroffset;
-    if (!re) {
-        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                           pcre_flags(clean), &errcode, &erroffset, NULL);
-        if (re) regex_cache_insert(pattern, clean, re);
-    }
+    pcre2_code *re = regex_compile_cached(pattern, clean);
     if (!re || !eval_fn) return 0;
 
     char *s = perl_to_string_dup(str);
@@ -9545,7 +9566,7 @@ long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *fl
     s_current_captures = (captures && captures->len > 0) ? captures->elems : NULL;
     s_ncaptures = captures ? (int)captures->len : 0;
 
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    pcre2_match_data *md = re_match_data(re);
     while (pos <= slen) {
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
         if (rc <= 0) {
@@ -9596,7 +9617,6 @@ long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *fl
     str->slen = (long long)out_len;
 
     free(s);
-    pcre2_match_data_free(md);
     return count;
 }
 
@@ -9651,20 +9671,15 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
         return arr;
     }
 
-    int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = regex_cache_lookup(pattern, flags);
-    if (!re) {
-        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                           pcre_flags(flags), &errcode, &erroffset, NULL);
-        if (re) regex_cache_insert(pattern, flags, re);
-    }
+    pcre2_code *re = regex_compile_cached(pattern, flags);
     if (!re) { free(s); return arr; }
     size_t pos = 0;
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
-    /* D126: ovector slots available in md (== 1 + number of capture
-       groups in the pattern, since match_data is created from the
-       pattern itself); a group `i` (1-based) occupies ov[2i]/ov[2i+1]. */
-    uint32_t ovec_count = pcre2_get_ovector_count(md);
+    pcre2_match_data *md = re_match_data(re);
+    /* D126: walk actual capture groups, not the (possibly oversized)
+       reused match_data ovector. A group `i` (1-based) occupies ov[2i]/ov[2i+1]. */
+    uint32_t capturecount = 0;
+    pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &capturecount);
+    uint32_t ovec_count = capturecount + 1;
 
     /* push s[start..slen] as one field */
 #define SPLIT_PUSH_FIELD(start)                                              \
@@ -9761,7 +9776,6 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
 #undef SPLIT_PUSH_CAPTURES
 
     free(s);
-    pcre2_match_data_free(md);
     /* Do NOT free re — it comes from the shared cache. */
     if (limit == 0) perl_split_trim_trailing_empty(arr);
     return arr;
@@ -9788,72 +9802,52 @@ void perl_clear_named_captures(void) {
   }
 }
 
-PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags) {
-    int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = regex_cache_lookup(pattern, flags);
+int perl_regex_match_g_bool(PerlValue *str, const char *pattern, const char *flags) {
+    pcre2_code *re = regex_compile_cached(pattern, flags);
     if (!re) {
-        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                           pcre_flags(flags), &errcode, &erroffset, NULL);
-        if (re) regex_cache_insert(pattern, flags, re);
+        if (str) str->matchpos = 0;
+        return 0;
     }
-    if (!re) { str->matchpos = 0; return perl_alloc_int(0); }
-
-    char *s = perl_to_string_dup(str);
-    size_t slen = strlen(s);
-    size_t startpos = (str->matchpos > 0 && (size_t)str->matchpos <= slen)
+    ReSubj s = re_subject(str);
+    size_t startpos = (str && str->matchpos > 0 && (PCRE2_SIZE)str->matchpos <= s.len)
                       ? (size_t)str->matchpos : 0;
-
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
-    int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, startpos, 0, md, NULL);
-    if (rc > 0) populate_named_captures(md, s, re);
-    if (rc > 0) populate_named_captures(md, s, re);
-
+    pcre2_match_data *md = re_match_data(re);
+    int rc = pcre2_match(re, s.ptr, s.len, startpos, 0, md, NULL);
     if (rc > 0) {
+        if (s_match_amp_needed || s_match_caps_needed)
+            install_match_captures(md, (const char *)s.ptr, rc, re);
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
         size_t mend = ov[1];
-        str->matchpos = (long long)(mend > startpos ? mend : mend + 1);
-        for (int i = 1; i <= PERL_MAX_CAPTURES; i++) {
-            if (perl_captures_[i]) { perl_free(perl_captures_[i]); perl_captures_[i] = NULL; }
-        }
-        for (int i = 1; i < rc && i <= PERL_MAX_CAPTURES; i++) {
-            size_t cs = ov[2*i], ce = ov[2*i+1];
-            char *cap = malloc(ce - cs + 1);
-            memcpy(cap, s + cs, ce - cs); cap[ce - cs] = '\0';
-            perl_captures_[i] = perl_alloc_string(cap); free(cap);
-        }
-        free(s); pcre2_match_data_free(md);
-        /* Do NOT free re — it comes from the shared cache. */
-        return perl_alloc_int(1);
-    } else {
-        str->matchpos = 0;
-        free(s); pcre2_match_data_free(md);
-        /* Do NOT free re — it comes from the shared cache. */
-        return perl_alloc_int(0);
+        if (str) str->matchpos = (long long)(mend > startpos ? mend : mend + 1);
+        if (s.owned) free(s.owned);
+        return 1;
     }
+    if (str) str->matchpos = 0;
+    if (s.owned) free(s.owned);
+    return 0;
+}
+
+PerlValue *perl_regex_match_g(PerlValue *str, const char *pattern, const char *flags) {
+    return perl_alloc_int(perl_regex_match_g_bool(str, pattern, flags));
 }
 
 PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char *flags) {
-    int errcode; PCRE2_SIZE erroffset;
-    pcre2_code *re = regex_cache_lookup(pattern, flags);
-    if (!re) {
-        re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
-                           pcre_flags(flags), &errcode, &erroffset, NULL);
-        if (re) regex_cache_insert(pattern, flags, re);
-    }
     PerlArray *arr = perl_array_new();
+    pcre2_code *re = regex_compile_cached(pattern, flags);
     if (!re) return arr;
 
     uint32_t capturecount = 0;
     pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &capturecount);
 
-    char *s = perl_to_string_dup(str);
-    size_t slen = strlen(s);
+    ReSubj s = re_subject(str);
+    size_t slen = (size_t)s.len;
     size_t pos = 0;
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    pcre2_match_data *md = re_match_data(re);
+    const char *sp = (const char *)s.ptr;
 
     while (pos <= slen) {
-        int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
-        if (rc > 0) populate_named_captures(md, s, re);
+        int rc = pcre2_match(re, s.ptr, s.len, pos, 0, md, NULL);
+        if (rc > 0) populate_named_captures(md, sp, re);
         if (rc <= 0) break;
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
         size_t mstart = ov[0], mend = ov[1];
@@ -9861,26 +9855,21 @@ PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char 
         if (capturecount == 0) {
             /* no captures: collect whole match */
             size_t mlen = mend - mstart;
-            char *m = malloc(mlen + 1);
-            memcpy(m, s + mstart, mlen); m[mlen] = '\0';
-            PerlValue *v = perl_alloc_string(m); free(m);
+            PerlValue *v = perl_alloc_string_len(sp + mstart, (long long)mlen);
             perl_array_push(arr, v); perl_free(v);
         } else {
             /* captures: collect each group */
             for (int i = 1; i < rc; i++) {
                 size_t cs = ov[2*i], ce = ov[2*i+1];
                 size_t clen = ce - cs;
-                char *m = malloc(clen + 1);
-                memcpy(m, s + cs, clen); m[clen] = '\0';
-                PerlValue *v = perl_alloc_string(m); free(m);
+                PerlValue *v = perl_alloc_string_len(sp + cs, (long long)clen);
                 perl_array_push(arr, v); perl_free(v);
             }
         }
         pos = (mend > mstart) ? mend : mend + 1;
     }
 
-    free(s); pcre2_match_data_free(md);
-    /* Do NOT free re — it comes from the shared cache. */
+    if (s.owned) free(s.owned);
     return arr;
 }
 
@@ -16708,6 +16697,11 @@ void perl_cleanup(void) {
         }
     }
     regex_cache_len_ = 0;
+    if (re_md_) {
+        pcre2_match_data_free(re_md_);
+        re_md_ = NULL;
+        re_md_pairs_ = 0;
+    }
 
 #ifdef PERL_ALLOC_DEBUG
     /* 4. PV leak check: iterate all slabs, report PVs with sentinel set. */
