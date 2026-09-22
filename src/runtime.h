@@ -56,6 +56,8 @@ typedef enum {
    copies PV_FLAG_UTF8 for strings), so `my $x = $h{locked}; $x = 5;`
    is unaffected — matches real Perl (the copy is a plain scalar). */
 #define PV_FLAG_READONLY          (1u << 23)
+/* Immortal interned PVs (perl_alloc_bool's 1 / ""). Never pooled; writes croak. */
+#define PV_FLAG_IMMORTAL          (1u << 24)
 
 typedef struct PerlValue {
     PerlTag      tag;

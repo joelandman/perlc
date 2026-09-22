@@ -1127,10 +1127,22 @@ HOTX PerlValue *perl_alloc_int(long long n) {
 
 /* W1: comparison operators return "1" (IV) or the empty string — real Perl's
    false comparison value is "", not IV 0: `print ($a < $b)` prints nothing,
-   and `defined ($a < $b)` is true. IV 0 would print "0" (byte-wrong). */
-PerlValue *perl_alloc_bool(long long b) {
-    if (b) return perl_alloc_int(1);
-    return perl_alloc_string_len("", 0);
+   and `defined ($a < $b)` is true. IV 0 would print "0" (byte-wrong).
+   Interned like perl's PL_sv_yes / PL_sv_no: one immortal cell each, never
+   returned to the PV pool. Callers that need a mutable/blessed copy
+   (JSON::PP::Boolean) must perl_clone first. */
+static char s_bool_false_bytes[1] = { '\0' };
+static PerlValue s_bool_true = {
+    .tag = PERL_INT, .flags = PV_FLAG_IMMORTAL, .ival = 1,
+    .matchpos = 0, .blessed_class = NULL, .slen = 0, ._pad_reserved = 0
+};
+static PerlValue s_bool_false = {
+    .tag = PERL_STRING, .flags = PV_FLAG_IMMORTAL, .sval = s_bool_false_bytes,
+    .matchpos = 0, .blessed_class = NULL, .slen = 0, ._pad_reserved = 0
+};
+
+HOTX PerlValue *perl_alloc_bool(long long b) {
+    return b ? &s_bool_true : &s_bool_false;
 }
 
 HOTX PerlValue *perl_alloc_float(double f) {
@@ -1304,7 +1316,7 @@ HOTX void perl_free(PerlValue *v) {
        itself, so we no longer skip a PerlSharedVar wrapper — but we still
        must not pool the cell, because shared scalars live for the entire
        program and the pool assumes the contents have been torn down.) */
-    if (v->flags & PV_FLAG_SHARED) return;
+    if (v->flags & (PV_FLAG_SHARED | PV_FLAG_IMMORTAL)) return;
     /* D62: still captured by a live closure/sort-comparator? Defer the
        real free — record that this release happened, and let whichever
        capture-holder's own release brings the count to 0 perform the
@@ -1398,7 +1410,7 @@ HOTX void perl_free(PerlValue *v) {
    perl_free(), which this time sees ccount==0 and falls through. */
 static void perl_release_capture(PerlValue *v) {
     if (!v) return;
-    if (v->flags & PV_FLAG_SHARED) return;   /* never tracked — matches capture-time skip */
+    if (v->flags & (PV_FLAG_SHARED | PV_FLAG_IMMORTAL)) return;
     unsigned n = pv_capture_count(v);
     if (n == 0 || n == PV_CAPTURE_MAX) return;  /* not tracked, or pinned/leaked on overflow */
     n--;
@@ -1418,7 +1430,7 @@ static __thread EvalPadEnt *s_epad;
 static __thread int s_epad_n, s_epad_cap;
 
 static void epad_bump_scalar(PerlValue *v) {
-    if (!v || (v->flags & PV_FLAG_SHARED)) return;
+    if (!v || (v->flags & (PV_FLAG_SHARED | PV_FLAG_IMMORTAL))) return;
     unsigned n = pv_capture_count(v);
     if (n < PV_CAPTURE_MAX) pv_capture_count_set(v, n + 1);
 }
@@ -2055,6 +2067,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
        Handling it here once, rather than case-by-case in every tag branch
        below, closes the whole class of ordering bugs at once. */
     if (dst == src) return;
+    if (dst->flags & PV_FLAG_IMMORTAL)
+        perl_die_croak("Modification of a read-only value attempted");
     /* D62: preserve every identity-persistent bit across the reassignment
        below, not just PV_FLAG_SHARED — dst's capture-count/released bits
        belong to the STABLE POINTER's identity (which closures may still
@@ -2882,6 +2896,8 @@ void perl_print_string(const char *s) {
 /* ── inc/dec ─────────────────────────────────────────────────────────────── */
 
 PerlValue *perl_inc(PerlValue *v) {
+    if (v && (v->flags & PV_FLAG_IMMORTAL))
+        perl_die_croak("Modification of a read-only value attempted");
     if (v->tag == PERL_FLOAT) { v->fval += 1.0; return v; }
     if (v->tag == PERL_INT)   { v->ival++; return v; }
     if (v->tag == PERL_STRING && v->sval) {
@@ -2932,6 +2948,8 @@ PerlValue *perl_inc(PerlValue *v) {
 }
 
 PerlValue *perl_dec(PerlValue *v) {
+    if (v && (v->flags & PV_FLAG_IMMORTAL))
+        perl_die_croak("Modification of a read-only value attempted");
     if (v->tag == PERL_FLOAT) { v->fval -= 1.0; }
     else { if (v->tag != PERL_INT) { v->tag = PERL_INT; v->ival = 0; } v->ival--; }
     return v;
@@ -3007,7 +3025,7 @@ void perl_array_push_capture(PerlArray *a, PerlValue *v) {
         a->cap *= 2;
         a->elems = realloc(a->elems, a->cap * sizeof(PerlValue *));
     }
-    if (v && !(v->flags & PV_FLAG_SHARED)) {
+    if (v && !(v->flags & (PV_FLAG_SHARED | PV_FLAG_IMMORTAL))) {
         unsigned n = pv_capture_count(v);
         if (n < PV_CAPTURE_MAX) pv_capture_count_set(v, n + 1);
     }
@@ -3241,6 +3259,8 @@ PerlValue *perl_chop_array(PerlArray *a) {
 
 long long perl_chomp(PerlValue *v) {
     if (!v) return 0;
+    if (v->flags & PV_FLAG_IMMORTAL)
+        perl_die_croak("Modification of a read-only value attempted");
     if (v->tag == PERL_STRING) {
         /* D85: use v->slen, not strlen() — an embedded NUL earlier in the
            string would otherwise make strlen() find a premature "end" and
@@ -6683,7 +6703,8 @@ PerlValue *perl_storable_dclone(PerlValue *pv) {
    for this project's sysadmin/CLI-script target. */
 
 static PerlValue *json_bool(int truthy) {
-    PerlValue *v = perl_alloc_bool(truthy);
+    /* Clone: interned 1/"" must not be blessed in place. */
+    PerlValue *v = perl_clone(perl_alloc_bool(truthy));
     v->blessed_class = strdup("JSON::PP::Boolean");
     return v;
 }
