@@ -124,6 +124,9 @@ private:
         if (name == "stage33" || name == "knowntag") {
             if (disabledStages_.count("stage33") || disabledStages_.count("knowntag")) return false;
         }
+        if (name == "stage34" || name == "loopvec") {
+            if (disabledStages_.count("stage34") || disabledStages_.count("loopvec")) return false;
+        }
         return true;
     }
 
@@ -350,6 +353,13 @@ private:
                                         const llvm::Twine &name);
     llvm::Value *emitFlooredMod(llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem */
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons / boolean =~, else nullptr */
+    /* Stage 34: llvm.loop.vectorize.width=4 hint on counted unboxed i64/f64
+       loops. innerUnroll keeps Stage 28's unroll+interleave on nested loops. */
+    void attachCountedLoopMD(llvm::Instruction *backBr, bool innerUnroll, bool vectorize);
+    bool stmtIsUnboxedNumeric(const Node &n);
+    bool cforIsCountedNumeric(const Node &n);
+    bool emitUnboxedNumericVoid(const Node &n); /* store-only; no boxI64/boxF64 */
+    llvm::Value *emitPromotedF64(const Node &n); /* emitExprF64, or SIToFP of i64 */
     llvm::Value *emitRegexMatchBool(const Node &n); /* i32 0/1; installs $&/$1 if needed */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
 

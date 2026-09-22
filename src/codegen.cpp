@@ -2942,6 +2942,198 @@ Value *CodeGen::emitRegexMatchBool(const Node &n) {
     return nullptr;
 }
 
+Value *CodeGen::emitPromotedF64(const Node &n) {
+    if (Value *fv = emitExprF64(n)) return fv;
+    if (canEmitI64(n)) {
+        Value *iv = emitExprI64(n);
+        if (iv)
+            return builder_.CreateSIToFP(iv, Type::getDoubleTy(ctx_), "i2f");
+    }
+    return nullptr;
+}
+
+void CodeGen::attachCountedLoopMD(Instruction *backBr, bool innerUnroll, bool vectorize) {
+    if (!backBr) return;
+    if (!innerUnroll && !vectorize) return;
+    auto *i32 = Type::getInt32Ty(ctx_);
+    SmallVector<Metadata *, 6> ops;
+    ops.push_back(nullptr);
+    if (innerUnroll) {
+        ops.push_back(MDNode::get(ctx_, {
+            MDString::get(ctx_, "llvm.loop.unroll.count"),
+            ConstantAsMetadata::get(ConstantInt::get(i32, 2))
+        }));
+        ops.push_back(MDNode::get(ctx_, {
+            MDString::get(ctx_, "llvm.loop.interleave.count"),
+            ConstantAsMetadata::get(ConstantInt::get(i32, 2))
+        }));
+    }
+    if (vectorize && isOptStageEnabled("loopvec")) {
+        /* Width is a hint (not llvm.loop.vectorize.enable). enable=true
+           warns when the cost model skips a short trip count. Clang
+           -march=native then vectorizes the store-only body. */
+        ops.push_back(MDNode::get(ctx_, {
+            MDString::get(ctx_, "llvm.loop.vectorize.width"),
+            ConstantAsMetadata::get(ConstantInt::get(i32, 4))
+        }));
+    }
+    if (ops.size() == 1) return;
+    auto *loopID = MDNode::getDistinct(ctx_, ops);
+    loopID->replaceOperandWith(0, loopID);
+    backBr->setMetadata("llvm.loop", loopID);
+}
+
+static std::string loopScalarNm(const Node &n) {
+    if (n.kind != NK::ScalarVar) return "";
+    std::string nm = n.name;
+    if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+    return nm;
+}
+
+bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
+    if (n.kind == NK::Block || n.kind == NK::FlatBlock) {
+        for (auto &s : n.args)
+            if (!stmtIsUnboxedNumeric(*s)) return false;
+        return true;
+    }
+    if (n.kind == NK::ExprStmt)
+        return n.left && stmtIsUnboxedNumeric(*n.left);
+    if (n.kind == NK::Assign) {
+        if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
+        std::string nm = loopScalarNm(*n.left);
+        if (lookupIntVar(nm)) return canEmitI64(*n.right);
+        if (lookupFloatVar(nm))
+            return canEmitF64(*n.right) || canEmitI64(*n.right);
+        return false;
+    }
+    if (n.kind == NK::CompoundAssign) {
+        if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
+        std::string nm = loopScalarNm(*n.left);
+        bool rhsOk = canEmitF64(*n.right) || canEmitI64(*n.right);
+        if (lookupIntVar(nm))
+            return rhsOk && (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%");
+        if (lookupFloatVar(nm))
+            return rhsOk && (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/");
+        return false;
+    }
+    if (n.kind == NK::UnaryOp) {
+        if (!n.left || n.left->kind != NK::ScalarVar) return false;
+        const std::string &sv = n.sval;
+        if (sv != "post++" && sv != "post--" && sv != "pre++" && sv != "pre--")
+            return false;
+        std::string nm = loopScalarNm(*n.left);
+        return lookupIntVar(nm) || lookupFloatVar(nm);
+    }
+    return false;
+}
+
+bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
+    if (n.kind == NK::Assign) {
+        if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
+        std::string nm = loopScalarNm(*n.left);
+        if (Value *ia = lookupIntVar(nm)) {
+            Value *rhs = emitExprI64(*n.right);
+            if (!rhs) return false;
+            builder_.CreateStore(rhs, ia);
+            return true;
+        }
+        if (Value *fa = lookupFloatVar(nm)) {
+            Value *rhs = emitPromotedF64(*n.right);
+            if (!rhs) return false;
+            builder_.CreateStore(rhs, fa);
+            return true;
+        }
+        return false;
+    }
+    if (n.kind == NK::CompoundAssign) {
+        if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
+        std::string nm = loopScalarNm(*n.left);
+        if (Value *ia = lookupIntVar(nm)) {
+            if (n.sval != "+" && n.sval != "-" && n.sval != "*" && n.sval != "%")
+                return false;
+            Value *lv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
+            Value *rv = emitExprI64(*n.right);
+            if (!rv) return false;
+            Value *res = nullptr;
+            if (n.sval == "+") res = builder_.CreateAdd(lv, rv);
+            else if (n.sval == "-") res = builder_.CreateSub(lv, rv);
+            else if (n.sval == "*") res = builder_.CreateMul(lv, rv);
+            else res = emitFlooredMod(lv, rv);
+            if (!res) return false;
+            builder_.CreateStore(res, ia);
+            return true;
+        }
+        if (Value *fa = lookupFloatVar(nm)) {
+            if (n.sval != "+" && n.sval != "-" && n.sval != "*" && n.sval != "/")
+                return false;
+            Value *lv = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
+            Value *rv = emitPromotedF64(*n.right);
+            if (!rv) return false;
+            Value *res = nullptr;
+            if (n.sval == "+") res = builder_.CreateFAdd(lv, rv);
+            else if (n.sval == "-") res = builder_.CreateFSub(lv, rv);
+            else if (n.sval == "*") res = builder_.CreateFMul(lv, rv);
+            else res = builder_.CreateFDiv(lv, rv);
+            if (!res) return false;
+            builder_.CreateStore(res, fa);
+            return true;
+        }
+        return false;
+    }
+    if (n.kind == NK::UnaryOp && n.left && n.left->kind == NK::ScalarVar) {
+        const std::string &sv = n.sval;
+        if (sv != "post++" && sv != "post--" && sv != "pre++" && sv != "pre--")
+            return false;
+        std::string nm = loopScalarNm(*n.left);
+        bool isInc = (sv == "post++" || sv == "pre++");
+        if (Value *ia = lookupIntVar(nm)) {
+            auto *i64 = Type::getInt64Ty(ctx_);
+            Value *cur = builder_.CreateLoad(i64, ia);
+            Value *next = builder_.CreateAdd(cur, ConstantInt::get(i64, isInc ? 1LL : -1LL));
+            builder_.CreateStore(next, ia);
+            return true;
+        }
+        if (Value *fa = lookupFloatVar(nm)) {
+            auto *f64 = Type::getDoubleTy(ctx_);
+            Value *cur = builder_.CreateLoad(f64, fa);
+            Value *next = isInc ? builder_.CreateFAdd(cur, ConstantFP::get(f64, 1.0))
+                                : builder_.CreateFSub(cur, ConstantFP::get(f64, 1.0));
+            builder_.CreateStore(next, fa);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CodeGen::cforIsCountedNumeric(const Node &n) {
+    if (!n.cond || !n.step || !n.body) return false;
+    if (n.contBlock && !stmtIsUnboxedNumeric(*n.contBlock)) return false;
+    if (!stmtIsUnboxedNumeric(*n.body)) return false;
+    /* counted: integer compare in the condition */
+    if (n.cond->kind != NK::BinOp || !n.cond->left || !n.cond->right) return false;
+    const std::string &op = n.cond->sval;
+    if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
+        op != "==" && op != "!=")
+        return false;
+    auto i64ish = [&](const Node &nd) {
+        if (canEmitI64(nd)) return true;
+        if (nd.kind == NK::ScalarVar) {
+            std::string nm = loopScalarNm(nd);
+            return fileScalarGlobals_.count(nm) != 0;
+        }
+        return false;
+    };
+    if (!i64ish(*n.cond->left) || !i64ish(*n.cond->right)) return false;
+    /* step: ++/-- on an unboxed int (or float) var */
+    const Node *st = n.step.get();
+    if (st->kind == NK::FlatBlock) {
+        for (auto &item : st->args)
+            if (!stmtIsUnboxedNumeric(*item)) return false;
+        return true;
+    }
+    return stmtIsUnboxedNumeric(*st);
+}
+
 Value *CodeGen::tryEmitI1Cond(const Node &n) {
     if (n.kind == NK::RegexMatch || n.kind == NK::RegexMatchInterp ||
         n.kind == NK::RegexMatchExpr) {
@@ -3603,7 +3795,16 @@ bool CodeGen::canEmitF64(const Node &n) {
             return n.left && canEmitF64(*n.left);
         static const char *arithOps[] = {"+", "-", "*", "/", nullptr};
         for (auto *p = arithOps; *p; p++) if (n.sval == *p) {
-            return n.left && n.right && canEmitF64(*n.left) && canEmitF64(*n.right);
+            if (!n.left || !n.right) return false;
+            bool lF = canEmitF64(*n.left), rF = canEmitF64(*n.right);
+            if (lF && rF) return true;
+            /* Mixed int-var × true-float (FloatLit / float-var / nested F64).
+               IntLit is also canEmitF64, but `$i + 1` must stay i64 (D78);
+               `$i * 1.0` and `$s + $i` take SIToFP. */
+            bool lI = canEmitI64(*n.left), rI = canEmitI64(*n.right);
+            bool lTrue = lF && n.left->kind != NK::IntLit;
+            bool rTrue = rF && n.right->kind != NK::IntLit;
+            return (lTrue && rI) || (rTrue && lI);
         }
         return false;
     }
@@ -3713,9 +3914,9 @@ Value *CodeGen::emitExprF64(const Node &n) {
             }
         }
         /* Check both children before emitting any IR to avoid double-emission */
-        if (!canEmitF64(*n.left) || !canEmitF64(*n.right)) return nullptr;
-        Value *lv = emitExprF64(*n.left);
-        Value *rv = emitExprF64(*n.right);
+        if (!canEmitF64(n)) return nullptr;
+        Value *lv = emitPromotedF64(*n.left);
+        Value *rv = emitPromotedF64(*n.right);
         if (!lv || !rv) return nullptr;
         if (n.sval == "+") return builder_.CreateFAdd(lv, rv, "fadd");
         if (n.sval == "-") return builder_.CreateFSub(lv, rv, "fsub");
@@ -5219,6 +5420,11 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::ExprStmt: {
+        /* Stage 34: unboxed i64/f64 assign/+= /++ as a statement is a store
+           only — boxing the result (perl_alloc_int) is a call that blocks
+           LLVM's loop vectorizer. */
+        if (n.left && emitUnboxedNumericVoid(*n.left))
+            break;
         /* D87: bare statement is void context for any top-level call */
         int savedCtx = callCtx_;
         if (n.left && isCallLikeForContext(*n.left)) callCtx_ = 2;
@@ -6133,6 +6339,7 @@ void CodeGen::emitStmt(const Node &n) {
         auto *bodyBB = BasicBlock::Create(ctx_, "for.body", fn);
         auto *stepBB = BasicBlock::Create(ctx_, "for.step", fn);
         auto *exit   = BasicBlock::Create(ctx_, "for.end",  fn);
+        bool isInnerLoop = !loopExits_.empty();
 
         /* `for (...) BLOCK continue BLOCK`: `next` runs the continue
            block, then the step expression, then re-checks. */
@@ -6252,7 +6459,14 @@ void CodeGen::emitStmt(const Node &n) {
             }
             if (!handledStep) freeIfOwned(emitExpr(*n.step));
         }
-        builder_.CreateBr(condBB);
+        {
+            auto *backBr = builder_.CreateBr(condBB);
+            /* Stage 34: vectorize only counted unboxed i64/f64 bodies (mbs's
+               boxed FLOAT_PAIR inner for stays scalar). Inner unroll only
+               when that body is also numeric — unrolling mbs would bloat IR. */
+            bool vec = cforIsCountedNumeric(n);
+            attachCountedLoopMD(backBr, isInnerLoop && vec, vec);
+        }
 
         loopExits_.pop_back();
         loopContinues_.pop_back();
@@ -6477,6 +6691,9 @@ void CodeGen::emitStmt(const Node &n) {
                 if (!builder_.GetInsertBlock()->getTerminator())
                     builder_.CreateBr(stepBB);
             }
+            /* Analyze while the loop var is still an int alloca. */
+            bool vec = n.body && stmtIsUnboxedNumeric(*n.body)
+                       && (!n.contBlock || stmtIsUnboxedNumeric(*n.contBlock));
             popScope();
             /* Clean up allflat slots added by this loop level. */
             for (auto &nm : newAllflatNames) avAllflatSlots_.erase(nm);
@@ -6487,26 +6704,10 @@ void CodeGen::emitStmt(const Node &n) {
                                  counterAlloca);
             {
                 auto *backBr = builder_.CreateBr(condBB2);
-                /* Stage 28: attach unroll+vectorize loop metadata to inner loops.
-                   Two unrolled j-iterations expose two independent sqrt chains so
-                   LLVM's SLP vectorizer can fuse them into sqrtpd (2×throughput). */
-                if (isInnerLoop) {
-                    /* Stage 28: unroll 2× + interleave 2× on inner loops.
-                       Two unrolled iterations expose independent sqrt chains; interleave
-                       hints the scheduler to overlap the ~20-cycle sqrt latencies. */
-                    auto *unrollMD = MDNode::get(ctx_, {
-                        MDString::get(ctx_, "llvm.loop.unroll.count"),
-                        ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ctx_), 2))
-                    });
-                    auto *interleaveMD = MDNode::get(ctx_, {
-                        MDString::get(ctx_, "llvm.loop.interleave.count"),
-                        ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ctx_), 2))
-                    });
-                    SmallVector<Metadata*, 3> loopArgs = {nullptr, unrollMD, interleaveMD};
-                    auto *loopID = MDNode::getDistinct(ctx_, loopArgs);
-                    loopID->replaceOperandWith(0, loopID);
-                    backBr->setMetadata("llvm.loop", loopID);
-                }
+                /* Stage 28: unroll+interleave on every inner integer-range
+                   foreach (n-body sqrtpd). Stage 34: also vectorize when the
+                   body is unboxed i64/f64 (no perl_* calls). */
+                attachCountedLoopMD(backBr, isInnerLoop, vec);
             }
 
             loopExits_.pop_back();
@@ -8231,7 +8432,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 return ret;
             }
             if (Value *fa = lookupFloatVar(nm)) {
-                Value *rhs = emitExprF64(*n.right);
+                Value *rhs = emitPromotedF64(*n.right);
                 if (rhs) {
                     builder_.CreateStore(rhs, fa);
                     return boxF64(rhs);
@@ -8457,7 +8658,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     return nullptr;
                 };
                 Value *lv = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
-                Value *rv = emitExprF64(*n.right);
+                Value *rv = emitPromotedF64(*n.right);
                 if (rv) {
                     Value *res = applyF64(lv, rv);
                     if (res) {
