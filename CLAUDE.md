@@ -18,7 +18,15 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-21, language leftovers — 413/413 PASS, 0 FAIL):**
+**Harness (2026-09-22, native stdlib waves 1–3 — 439/439 PASS, 0 FAIL):**
+`FindBin`, `Symbol`, `IPC::Open2`/`Open3`, `IO::Handle`/`IO::File`, `Socket`,
+`IO::Socket::INET`/`IP`, `MIME::Base64`, `Digest::MD5`/`SHA` as native
+modules (`src/native_stdlib.c`, linked with `-lcrypto`). Tests:
+`tests/findbin_{smoke,deep}.pl`, `tests/symbol_{smoke,deep}.pl`,
+`tests/ipc_open_{smoke,deep}.pl`, `tests/io_handle_{smoke,deep}.pl`,
+`tests/socket_native_{smoke,deep}.pl`, `tests/io_socket_{smoke,deep}.pl`,
+`tests/mime_base64_{smoke,deep}.pl`, `tests/digest_native_{smoke,deep}.pl`.
+Previous session (2026-09-21, language leftovers — 413/413 PASS, 0 FAIL):
 `undef $var` (pidigits was this, not mini-gmp; `undef //` is the value),
 JSON `->{k}` UAF on temporaries, Storable nfreeze wire format, `%{EXPR}`,
 modifier-`if &&`, `system LIST`, `-name =>` option keys, `delete`/`exists`
@@ -543,6 +551,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 | `pidigits.pl` vs perl | PASS — was `undef $s` not clearing the accumulator, not mini-gmp. |
 | Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |
 | eval/`do` at runtime | Needs `perlc` + `clang-18` on the target (`--eval-lib` / `--do-lib`). |
+| Auto-parallel `map`/`foreach` | Deferred 2026-09-22. Pthreads + known `map` length exist; no dependence analyzer. Gated pure-`$_` map is the only safe slice. See TESTS.md → "Future: auto-parallel `map` / counted loops". |
 
 ## Build & test
 
@@ -576,7 +585,7 @@ Every fix ships a **smoke + deep** test compared against real Perl.
   in-scope `my` cells into an eval pad so the compiled string aliases them.
 
 Source: `lexer.cpp` (785), `parser.cpp` (3.8k), `codegen.cpp` (~9k),
-`runtime.c` (~8.8k), `mini-gmp.c`, `main.cpp`.
+`runtime.c` (~8.8k), `native_stdlib.c`, `mini-gmp.c`, `main.cpp`.
 
 ## Implemented (summary)
 
@@ -599,6 +608,8 @@ File::Temp, Storable::dclone, Text::Wrap (2026-09-19); JSON::PP,
 Time::Piece, Time::Seconds, Text::CSV, Text::CSV_PP, Text::CSV_XS,
 Hash::Util (2026-09-20); Storable freeze/thaw, Try::Tiny, List::MoreUtils,
 Term::ANSIColor, Encode (2026-09-20); Pod::Usage (2026-09-21);
+FindBin, Symbol, IPC::Open2/Open3, IO::Handle/IO::File, Socket,
+IO::Socket::INET/IP, MIME::Base64, Digest::MD5/SHA (2026-09-22);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`

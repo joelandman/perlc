@@ -823,6 +823,20 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_ansi_color",        pv, av, i32);
     RT("perl_ansi_color_const",  pv, strPtrTy);
     RT("perl_encode_call",       pv, strPtrTy, av);
+    RT("perl_findbin_init",     voidTy, i8p);
+    RT("perl_findbin_get",      pv, i8p);
+    RT("perl_symbol_gensym",    pv);
+    RT("perl_symbol_qualify",   pv, pv, pv);
+    RT("perl_open3",            pv, pv, pv, pv, av, i32);
+    RT("perl_socket_const",     pv, i8p);
+    RT("perl_socket_call",      pv, i8p, av);
+    RT("perl_socket_unpack_in", av, pv);
+    RT("perl_socket_unpack_un", av, pv);
+    RT("perl_b64_encode",       pv, pv, pv);
+    RT("perl_b64_decode",       pv, pv);
+    RT("perl_b64_encode_url",   pv, pv);
+    RT("perl_b64_decode_url",   pv, pv);
+    RT("perl_digest_call",      pv, i8p, av);
     RT("perl_text_wrap",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_text_fill",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_make_path",        av, av, pv, i32);
@@ -2141,6 +2155,21 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::Call &&
         (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday")) {
         return callRT("perl_hires_gettimeofday_list", {});
+    }
+    /* Socket unpack_sockaddr_in/un and 1-arg sockaddr_in/un in list ctx. */
+    if (n.kind == NK::Call &&
+        (n.name == "Socket::unpack_sockaddr_in" || n.name == "unpack_sockaddr_in" ||
+         ((n.name == "Socket::sockaddr_in" || n.name == "sockaddr_in") &&
+          n.args.size() == 1))) {
+        Value *sa = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_socket_unpack_in", {sa});
+    }
+    if (n.kind == NK::Call &&
+        (n.name == "Socket::unpack_sockaddr_un" || n.name == "unpack_sockaddr_un" ||
+         ((n.name == "Socket::sockaddr_un" || n.name == "sockaddr_un") &&
+          n.args.size() == 1))) {
+        Value *sa = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_socket_unpack_un", {sa});
     }
     /* File::Basename::fileparse in list context: (name, path, suffix).
        Same reasoning as gettimeofday above — must be intercepted before
@@ -4977,6 +5006,19 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             auto *slotUs = createEntryAlloca(perlPtrTy_, nullptr, "$_");
             builder_.CreateStore(underscoreVal, slotUs);
             declareVar("_", slotUs);
+
+            /* FindBin: bake the compile-time .pl path (AOT $0 is the binary). */
+            callRT("perl_findbin_init",
+                   {builder_.CreateGlobalStringPtr(sourceFile_)});
+            auto setIsa = [&](const char *child, const char *parent) {
+                callRT("perl_set_isa",
+                       {builder_.CreateGlobalStringPtr(child),
+                        builder_.CreateGlobalStringPtr(parent)});
+            };
+            setIsa("IO::File", "IO::Handle");
+            setIsa("IO::Socket", "IO::Handle");
+            setIsa("IO::Socket::INET", "IO::Socket");
+            setIsa("IO::Socket::IP", "IO::Socket");
         }
 
         /* capture local() save depth at function entry */
@@ -11359,7 +11401,11 @@ Value *CodeGen::emitExpr(const Node &n) {
                 if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
             }
             Value *v = emitExpr(*arg);
-            callRT("perl_array_push", {argsArr, v});
+            /* read/sysread mutate the buffer scalar in place. */
+            if ((n.sval == "read" || n.sval == "sysread") && arg == n.args[0])
+                callRT("perl_array_push_nc", {argsArr, v});
+            else
+                callRT("perl_array_push", {argsArr, v});
         }
         /* isa / can — UNIVERSAL methods */
         if (n.sval == "isa") {
@@ -13542,6 +13588,155 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *r = callRT("perl_timelocal_posix", {av});
         callRT("perl_pop_call_frame", {});
         return r;
+    }
+    /* ── FindBin / Symbol / IPC::Open2/Open3 / Socket / MIME / Digest ── */
+    if (n.name == "FindBin::Bin" || n.name == "FindBin::Dir" ||
+        n.name == "FindBin::Script" || n.name == "FindBin::RealBin" ||
+        n.name == "FindBin::RealScript") {
+        std::string which = n.name.substr(n.name.rfind(':') + 1);
+        return callRT("perl_findbin_get", {builder_.CreateGlobalStringPtr(which)});
+    }
+    if (n.name == "gensym" || n.name == "Symbol::gensym")
+        return callRT("perl_symbol_gensym", {});
+    if (n.name == "qualify" || n.name == "Symbol::qualify") {
+        Value *nm = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *pkg = n.args.size() > 1 ? emitExpr(*n.args[1])
+                                       : perlStr(currentPackage_.empty() ? "main"
+                                                                        : currentPackage_);
+        return callRT("perl_symbol_qualify", {nm, pkg});
+    }
+    {
+        auto emitFhCell = [&](const Node &a) -> Value * {
+            if (a.kind == NK::Typeglob) {
+                Value *key = builder_.CreateGlobalStringPtr(a.name);
+                return callRT("perl_glob_get_scalar", {key});
+            }
+            return emitExpr(a);
+        };
+        if (n.name == "open2" || n.name == "IPC::Open2::open2") {
+            Value *rdr = n.args.size() > 0 ? emitFhCell(*n.args[0]) : perlUndef();
+            Value *wtr = n.args.size() > 1 ? emitFhCell(*n.args[1]) : perlUndef();
+            Value *cmd = callRT("perl_array_new", {});
+            for (size_t k = 2; k < n.args.size(); k++)
+                callRT("perl_array_push", {cmd, emitExpr(*n.args[k])});
+            return callRT("perl_open3",
+                {wtr, rdr, perlUndef(), cmd,
+                 ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+        }
+        if (n.name == "open3" || n.name == "IPC::Open3::open3") {
+            Value *wtr = n.args.size() > 0 ? emitFhCell(*n.args[0]) : perlUndef();
+            Value *rdr = n.args.size() > 1 ? emitFhCell(*n.args[1]) : perlUndef();
+            Value *err = n.args.size() > 2 ? emitFhCell(*n.args[2]) : perlUndef();
+            Value *cmd = callRT("perl_array_new", {});
+            for (size_t k = 3; k < n.args.size(); k++)
+                callRT("perl_array_push", {cmd, emitExpr(*n.args[k])});
+            return callRT("perl_open3",
+                {wtr, rdr, err, cmd,
+                 ConstantInt::get(Type::getInt32Ty(ctx_), 1)});
+        }
+    }
+    {
+        auto sockBare = n.name;
+        auto sc = sockBare.rfind("::");
+        if (sc != std::string::npos) sockBare = sockBare.substr(sc + 2);
+        bool sockQual = n.name.rfind("Socket::", 0) == 0;
+        static const std::unordered_set<std::string> sockFns = {
+            "inet_aton","inet_ntoa","inet_pton","inet_ntop",
+            "pack_sockaddr_in","sockaddr_in","pack_sockaddr_un","sockaddr_un",
+            "sockaddr_family",
+        };
+        if ((sockQual || sockFns.count(sockBare)) && sockFns.count(sockBare) &&
+            !(sockBare == "sockaddr_in" && n.args.size() == 1) &&
+            !(sockBare == "sockaddr_un" && n.args.size() == 1)) {
+            Value *av = callRT("perl_array_new", {});
+            for (auto &a : n.args)
+                callRT("perl_array_push", {av, emitExpr(*a)});
+            return callRT("perl_socket_call",
+                {builder_.CreateGlobalStringPtr(sockBare), av});
+        }
+        if ((sockQual || sockBare == "unpack_sockaddr_in") &&
+            sockBare == "unpack_sockaddr_in") {
+            Value *sa = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            Value *arr = callRT("perl_socket_unpack_in", {sa});
+            Value *elem = callRT("perl_array_get",
+                {arr, ConstantInt::get(Type::getInt64Ty(ctx_), 1)});
+            callRT("perl_array_free", {arr});
+            return elem;
+        }
+        if ((sockQual || sockBare == "unpack_sockaddr_un") &&
+            sockBare == "unpack_sockaddr_un") {
+            Value *sa = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            Value *arr = callRT("perl_socket_unpack_un", {sa});
+            Value *elem = callRT("perl_array_get",
+                {arr, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+            callRT("perl_array_free", {arr});
+            return elem;
+        }
+        if ((sockQual || sockBare == "sockaddr_in") &&
+            sockBare == "sockaddr_in" && n.args.size() == 1) {
+            Value *sa = emitExpr(*n.args[0]);
+            Value *arr = callRT("perl_socket_unpack_in", {sa});
+            Value *elem = callRT("perl_array_get",
+                {arr, ConstantInt::get(Type::getInt64Ty(ctx_), 1)});
+            callRT("perl_array_free", {arr});
+            return elem;
+        }
+        if ((sockQual || sockBare == "sockaddr_un") &&
+            sockBare == "sockaddr_un" && n.args.size() == 1) {
+            Value *sa = emitExpr(*n.args[0]);
+            Value *arr = callRT("perl_socket_unpack_un", {sa});
+            Value *elem = callRT("perl_array_get",
+                {arr, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+            callRT("perl_array_free", {arr});
+            return elem;
+        }
+        bool sockCaps = !sockBare.empty();
+        for (char c : sockBare)
+            if (!isupper((unsigned char)c) && c != '_' && !isdigit((unsigned char)c))
+                { sockCaps = false; break; }
+        if (sockCaps && n.args.empty() && sockQual) {
+            return callRT("perl_socket_const",
+                {builder_.CreateGlobalStringPtr(sockBare)});
+        }
+    }
+    if (n.name == "encode_base64" || n.name == "MIME::Base64::encode_base64") {
+        Value *d = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *e = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_b64_encode", {d, e});
+    }
+    if (n.name == "decode_base64" || n.name == "MIME::Base64::decode_base64") {
+        Value *d = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_b64_decode", {d});
+    }
+    if (n.name == "encode_base64url" || n.name == "MIME::Base64::encode_base64url") {
+        Value *d = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_b64_encode_url", {d});
+    }
+    if (n.name == "decode_base64url" || n.name == "MIME::Base64::decode_base64url") {
+        Value *d = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_b64_decode_url", {d});
+    }
+    {
+        static const std::unordered_set<std::string> digFns = {
+            "md5","md5_hex","md5_base64",
+            "sha1","sha1_hex","sha1_base64",
+            "sha224","sha224_hex","sha224_base64",
+            "sha256","sha256_hex","sha256_base64",
+            "sha384","sha384_hex","sha384_base64",
+            "sha512","sha512_hex","sha512_base64",
+        };
+        auto digBare = n.name;
+        auto dsc = digBare.rfind("::");
+        if (dsc != std::string::npos) digBare = digBare.substr(dsc + 2);
+        bool digQual = n.name.rfind("Digest::MD5::", 0) == 0 ||
+                       n.name.rfind("Digest::SHA::", 0) == 0;
+        if ((digQual || digFns.count(n.name)) && digFns.count(digBare)) {
+            Value *av = callRT("perl_array_new", {});
+            for (auto &a : n.args)
+                callRT("perl_array_push", {av, emitExpr(*a)});
+            return callRT("perl_digest_call",
+                {builder_.CreateGlobalStringPtr(digBare), av});
+        }
     }
     /* Native constants (Fcntl/POSIX/Errno): a zero-arg call whose name is
        an all-caps identifier in one of those packages resolves through the

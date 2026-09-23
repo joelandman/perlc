@@ -135,6 +135,9 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
         "Pod::Usage",
+        "FindBin","Symbol","IPC::Open2","IPC::Open3",
+        "IO::Handle","IO::File","IO::Socket","IO::Socket::INET","IO::Socket::IP",
+        "Socket","MIME::Base64","Digest::MD5","Digest::SHA",
     };
 
     std::set<std::string> modulesToInstall;
@@ -396,6 +399,9 @@ static std::vector<Token> inlineModules(
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
         "Pod::Usage",
+        "FindBin","Symbol","IPC::Open2","IPC::Open3",
+        "IO::Handle","IO::File","IO::Socket","IO::Socket::INET","IO::Socket::IP",
+        "Socket","MIME::Base64","Digest::MD5","Digest::SHA",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -891,6 +897,57 @@ static std::vector<Token> inlineModules(
             }
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (name.empty() || name[0] == ':') continue;
+                importMap[name] = modName + "::" + name;
+            }
+            continue;
+        }
+        if (modName == "Symbol" || modName == "IPC::Open2" ||
+            modName == "IPC::Open3" || modName == "MIME::Base64" ||
+            modName == "Digest::MD5" || modName == "Digest::SHA" ||
+            modName == "Socket" || modName == "FindBin") {
+            std::vector<std::string> names = explicitImports;
+            if (names.empty()) {
+                if (modName == "Symbol")
+                    names = {"gensym","qualify"};
+                else if (modName == "IPC::Open2")
+                    names = {"open2"};
+                else if (modName == "IPC::Open3")
+                    names = {"open3"};
+                else if (modName == "MIME::Base64")
+                    names = {"encode_base64","decode_base64"};
+                else if (modName == "Socket")
+                    names = {
+                        "AF_INET","AF_INET6","AF_UNIX","AF_UNSPEC",
+                        "PF_INET","PF_INET6","PF_UNIX",
+                        "SOCK_STREAM","SOCK_DGRAM","SOCK_RAW","SOCK_SEQPACKET",
+                        "SOL_SOCKET","SO_REUSEADDR","SO_KEEPALIVE","SO_LINGER",
+                        "SO_BROADCAST","SO_OOBINLINE","SO_SNDBUF","SO_RCVBUF",
+                        "SO_ERROR","SO_TYPE","SO_REUSEPORT",
+                        "SHUT_RD","SHUT_WR","SHUT_RDWR","SOMAXCONN",
+                        "MSG_NOSIGNAL","MSG_OOB","MSG_PEEK","MSG_DONTROUTE",
+                        "INADDR_ANY","INADDR_BROADCAST","INADDR_LOOPBACK","INADDR_NONE",
+                        "sockaddr_family","pack_sockaddr_in","unpack_sockaddr_in",
+                        "sockaddr_in","pack_sockaddr_un","unpack_sockaddr_un",
+                        "sockaddr_un","inet_aton","inet_ntoa",
+                    };
+                /* Digest::* and FindBin have empty @EXPORT */
+            }
+            if (names.size() == 1 && (names[0] == ":all" || names[0] == ":ALL")) {
+                if (modName == "MIME::Base64")
+                    names = {"encode_base64","decode_base64",
+                             "encode_base64url","decode_base64url"};
+                else if (modName == "Digest::MD5")
+                    names = {"md5","md5_hex","md5_base64"};
+                else if (modName == "Digest::SHA")
+                    names = {"sha1","sha1_hex","sha1_base64",
+                             "sha256","sha256_hex","sha256_base64",
+                             "sha384","sha384_hex","sha384_base64",
+                             "sha512","sha512_hex","sha512_base64"};
+            }
+            for (auto &name : names) {
+                if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (!name.empty() && name[0] == '$') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
                 importMap[name] = modName + "::" + name;
             }
@@ -1414,6 +1471,14 @@ int main(int argc, char **argv) {
         }
         if (mgmpSrc.empty() || access(mgmpSrc.c_str(), R_OK) != 0)
             mgmpSrc = "src/mini-gmp.c";  /* fallback: CWD */
+        std::string nstSrc;
+        {
+            auto sl = rtSrc.rfind('/');
+            std::string dir = (sl != std::string::npos) ? rtSrc.substr(0, sl) : ".";
+            nstSrc = dir + "/native_stdlib.c";
+        }
+        if (nstSrc.empty() || access(nstSrc.c_str(), R_OK) != 0)
+            nstSrc = "src/native_stdlib.c";
         if (selfPath.empty()) selfPath = "perlc";  /* fallback: hope it's on $PATH */
 
         if (doLib) {
@@ -1444,8 +1509,8 @@ int main(int argc, char **argv) {
                             " -Wno-atomic-alignment -rdynamic"
                             " -DPERLC_SELF_PATH=\"\\\"" + selfPath + "\\\"\"";
          if (debugSymbols) cmd += " -g";
-         cmd += " " + tmpIR + " " + rtSrc + " " + mgmpSrc;
-         cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic -ldl 2>&1";
+         cmd += " " + tmpIR + " " + rtSrc + " " + mgmpSrc + " " + nstSrc;
+         cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic -ldl -lcrypto 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";
 
         int rc = system(cmd.c_str());

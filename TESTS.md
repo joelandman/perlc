@@ -1007,6 +1007,12 @@ String `eval EXPR` sees outer `my`. Runtime `eval`/`do` still needs
 clang+perlc
 on the target.
 
+**Auto-parallel `map` / counted loops** (2026-09-22): explored, deferred.
+Pthreads + a fixed `map`/`grep` length exist; there is no loop-carried
+dependence analyzer. A gated pure-`$_` map (especially on `FLAT_ARRAY`)
+is the only subset that looks safe. Full write-up: "Future: auto-parallel
+`map` / counted loops" under Language leftovers above.
+
 **2026-09-09 note:** `src/runtime.c` (commit `706b478`, "updates") added
 `perl_glob_set_io`/`perl_glob_get_io`/`perl_glob_slot` — runtime support
 for `*FH{IO}` / `*FH{SCALAR}` / `*FH{FORMAT}` etc. — but nothing in
@@ -3294,6 +3300,57 @@ A failing `try` with no `catch` returns undef without rethrowing
 - **Stage 34 loop vectorize**: counted C-style `for` and integer-range `foreach` whose body is unboxed i64/f64 get a `llvm.loop.vectorize.width=4` hint. Statement-context `+=`/`++`/assign on int/float allocas store only (no `perl_alloc_int` box, which blocked LV). Mixed `$i * 1.0` SIToFPs the int; `$i + 1` stays i64 (D78). Inner foreach still gets Stage 28 unroll. Disable with `PERLC_OPT_DISABLE=loopvec`. Tests: `tests/loop_vec_{smoke,deep}.pl`.
 - **Stage 35 packed complex rows**: `$row->[$i] = [re,im]` (or `cplx`/`cadd`/`cmul` results) packs the row as `PERL_CPLX_ROW` — a refcounted interleaved `double[2N]` still observed as an ARRAY of 2-element arrayrefs. Codegen loads `$z->[0]`/`$z->[1]` and `$row->[$i][0|1]` from that buffer and stores pairs without `perl_alloc_float_pair` when the index is in bounds. A non-pair store, `@$row`, or `perl_promote_ref_array` unpacks to a real `REF_ARRAY` of `FLOAT_PAIR`s (D105). Disable IR fast paths with `PERLC_OPT_DISABLE=cplxrow` (runtime packing still happens). Tests: `tests/cplx_row_{smoke,deep}.pl`.
 
+### Future: auto-parallel `map` / counted loops (2026-09-22, deferred)
+
+Explored, **not implemented**. A pthread pool over a list whose length is known before the loop is feasible for a **narrow pure subset**; general `for`/`foreach`/`map` auto-parallel from dependence analysis is not something the compiler can do today.
+
+**Already in place**
+
+- `map`/`grep` snapshot `perl_array_len` once, then a counted `i` loop (`src/codegen.cpp`). Integer-range `foreach (LO..HI)` is a counted i64 loop (Stage 28/34).
+- `threads->create` is a **pthread** calling a compiled code-ref on the **same heap** (OpenMP-shaped, not Perl ithreads clone). `threads::shared` has acquire/release + CAS.
+- TLS: PV freelist, `wantarray`, `eval`/`$@`, `local`, regex JIT cache, `pcre2_match_data`.
+- AST walks (`hasVar`, D135 write scan, Stage 34 `stmtIsUnboxedNumeric`) are **purity** checks, not loop-carried dependence (`$a[$i]` vs `$a[$i+1]`).
+
+**What blocks a general transform**
+
+- `foreach (@a)` aliases the element (`perl_array_get_ref`); `$x++` writes the source array.
+- `map`/`grep` sequential `push`/`extend`; parallel needs per-chunk buffers then **ordered** concat. `map { @$_ }` has data-dependent output length. `foreach @arr` uses **live** `perl_array_len_i64` (`push` in the body is visible).
+- `last`/`next`/`redo`, outer-`my` writes, `print`, hashes, `die`.
+- `$&`/`$1` are process-wide (not TLS); parallel `=~` would race.
+- LLVM LoopParallel will not fire: bodies are full of `perl_*` calls.
+- `pv_slabs_` / `pv_slab_count_` is process-wide with no lock; a parallel map that cold-misses many TLS pools would race (small runtime fix if this ships).
+
+**If revisited:** conservative predicate on `map { EXPR } @list` (EXPR Stage-34-pure in `$_`, no stores/calls/regex/outer `my`), plus a packed `FLAT_ARRAY`/`CPLX_ROW` C worker over `double[]`. `grep` via per-thread vectors + prefix-sum concat. A small index-range pool (`nproc` workers), not `perl_threads_create` per element. Off by default (`PERLC_OPT_DISABLE` twin or `use perlc::parallel`) so the harness stays byte-for-byte. Do not auto-parallel arbitrary blocks.
+
+### Native stdlib waves 1–3 (2026-09-22)
+
+Native implementations in `src/native_stdlib.c` (generated binaries link it
+plus `-lcrypto`). `use` names are in both `PRAGMAS` allowlists; default
+`@EXPORT` is seeded in `inlineModules`.
+
+- **FindBin:** `$FindBin::Bin`/`Dir`/`Script`/`RealBin`/`RealScript` from
+  `realpath` of the compile-time `.pl` (AOT `$0` is the binary).
+- **Symbol:** `gensym` (anonymous FILEHANDLE glob), `qualify`.
+- **IPC::Open2/Open3:** `pipe`/`fork`/`exec`; one-arg cmd is `sh -c`.
+- **IO::Handle / IO::File:** `new`/`open`/`print`/`say`/`getline`/`read`/
+  `seek`/`tell`/`autoflush`/`close`/… ISA `IO::File` → `IO::Handle`.
+  `perl_io_method` only handles FILEHANDLE / `IO::*` invocants so
+  `Text::CSV->print` is untouched.
+- **Socket:** AF/PF/SOCK/SOL/SO/SHUT/INADDR_* plus `inet_aton`/`ntoa`/
+  `inet_pton`/`ntop`, `pack`/`unpack_sockaddr_in`/`un`, `sockaddr_in`.
+  `INADDR_*` are 4-byte packed strings.
+- **IO::Socket::INET/IP:** `new(Listen/PeerAddr/LocalPort/ReuseAddr/Proto)`,
+  `accept`/`peerhost`/`sockport`.
+- **MIME::Base64:** `encode_base64`/`decode_base64` (+ url variants).
+- **Digest::MD5/SHA:** functional `md5_hex`/`sha256_hex`/… and OO
+  `new`/`add`/`hexdigest` via OpenSSL EVP. Digest XS_PTR values are
+  refcounted through `perl_clone`/`perl_assign`/`perl_free`.
+
+Tests: `tests/findbin_{smoke,deep}.pl`, `tests/symbol_{smoke,deep}.pl`,
+`tests/ipc_open_{smoke,deep}.pl`, `tests/io_handle_{smoke,deep}.pl`,
+`tests/socket_native_{smoke,deep}.pl`, `tests/io_socket_{smoke,deep}.pl`,
+`tests/mime_base64_{smoke,deep}.pl`, `tests/digest_native_{smoke,deep}.pl`.
+
 ## Source layout
 
 | File | Role |
@@ -3302,5 +3359,6 @@ A failing `try` with no `catch` returns undef without rethrowing
 | `src/parser.cpp` | Recursive descent |
 | `src/codegen.cpp` | AST → LLVM IR |
 | `src/runtime.c` | PerlValue + builtins |
+| `src/native_stdlib.c` | FindBin/Symbol/IPC/IO/Socket/MIME/Digest |
 | `src/mini-gmp.c` | Math::BigInt |
 | `src/main.cpp` | Driver |

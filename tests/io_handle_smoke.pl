@@ -1,0 +1,13 @@
+use IO::File;
+my $path = "/tmp/perlc_iofile_smoke.txt";
+unlink $path;
+my $fh = IO::File->new($path, "w");
+$fh->print("hello\n");
+$fh->close;
+my $r = IO::File->new($path, "r");
+my $line = $r->getline;
+print "line=$line";
+print "class=", ref($r), "\n";
+$r->close;
+unlink $path;
+print "done\n";

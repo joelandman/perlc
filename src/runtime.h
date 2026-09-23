@@ -478,6 +478,27 @@ PerlValue *perl_ansi_color(PerlArray *args, int colored);
 PerlValue *perl_ansi_color_const(const char *name);
 PerlValue *perl_encode_call(const char *name, PerlArray *args);
 PerlValue *perl_encode_method(PerlValue *obj, const char *m, PerlArray *args);
+
+/* FindBin / Symbol / IPC::Open2/Open3 / IO::* / Socket / MIME::Base64 / Digest */
+void       perl_findbin_init(const char *script_path);
+PerlValue *perl_findbin_get(const char *which); /* Bin/Script/RealBin/RealScript/Dir */
+PerlValue *perl_symbol_gensym(void);
+PerlValue *perl_symbol_qualify(PerlValue *name, PerlValue *pkg);
+PerlValue *perl_open3(PerlValue *to_chld, PerlValue *from_chld, PerlValue *err_chld,
+                      PerlArray *cmd, int with_err);
+PerlValue *perl_io_method(PerlValue *obj, const char *method, PerlArray *args);
+PerlValue *perl_socket_const(const char *name);
+PerlValue *perl_socket_call(const char *name, PerlArray *args);
+PerlArray *perl_socket_unpack_in(PerlValue *sa);  /* (port, addr) */
+PerlArray *perl_socket_unpack_un(PerlValue *sa);  /* (path,) */
+PerlValue *perl_b64_encode(PerlValue *data, PerlValue *eol);
+PerlValue *perl_b64_decode(PerlValue *data);
+PerlValue *perl_b64_encode_url(PerlValue *data);
+PerlValue *perl_b64_decode_url(PerlValue *data);
+PerlValue *perl_digest_call(const char *name, PerlArray *args);
+PerlValue *perl_digest_method(PerlValue *obj, const char *method, PerlArray *args);
+void       perl_digest_free_pv(PerlValue *v);
+void       perl_digest_retain(PerlValue *v);
 PerlValue *perl_text_wrap(PerlValue *ip, PerlValue *xp, PerlArray *texts,
                           PerlValue *columns, PerlValue *sep, PerlValue *sep2,
                           PerlValue *huge, PerlValue *unexpand);

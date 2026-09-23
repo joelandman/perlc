@@ -1432,6 +1432,8 @@ PerlValue *perl_clone(const PerlValue *src) {
         ((PerlClosure *)src->pval)->refcount++;
     } else if (src->tag == PERL_QR && src->pval) {
         ((PerlQrRegex *)src->pval)->refcount++;
+    } else if (src->tag == PERL_XS_PTR) {
+        perl_digest_retain(v);
     }
     return v;
 }
@@ -1492,6 +1494,9 @@ HOTX void perl_free(PerlValue *v) {
         perl_dbi_statement_release((PerlDBIStatement *)v->pval);
     if (v->tag == PERL_DBI_DBH && v->pval)
         perl_dbi_handle_release((PerlDBIHandle *)v->pval);
+    if (v->tag == PERL_XS_PTR && v->blessed_class &&
+        strncmp(v->blessed_class, "Digest::", 8) == 0)
+        perl_digest_free_pv(v);
     if (v->tag == PERL_QR && v->pval) {
         PerlQrRegex *qr = (PerlQrRegex *)v->pval;
         if (qr->refcount > 0 && --qr->refcount == 0) {
@@ -2257,7 +2262,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         ((PerlQrRegex *)src->pval)->refcount++;
     } else if (src && src->tag == PERL_CPLX_ROW && src->pval) {
         ((PerlCplxRow *)src->pval)->refcount++;
-
+    } else if (src && src->tag == PERL_XS_PTR) {
+        perl_digest_retain((PerlValue *)src);
     }
     /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
@@ -2313,6 +2319,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         free(dst->pval);
         dst->pval = NULL;
     }
+    if (dst->tag == PERL_XS_PTR)
+        perl_digest_free_pv(dst);
     if (dst->blessed_class) { free(dst->blessed_class); dst->blessed_class = NULL; }
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
@@ -4655,6 +4663,7 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_REF_HASH:    return perl_alloc_string("HASH");
         case PERL_CODE_REF:    return perl_alloc_string("CODE");
         case PERL_QR:          return perl_alloc_string("Regexp");
+        case PERL_FILEHANDLE:  return perl_alloc_string("GLOB");
         case PERL_XS_PTR:      return perl_alloc_string("PTR");
         default:               return perl_alloc_string("");
     }
@@ -5820,6 +5829,12 @@ static PerlValue s_autoload_pv = { .tag = PERL_UNDEF };
 PerlValue *perl_get_autoload_name(void) { return &s_autoload_pv; }
 
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
+    {
+        PerlValue *io = perl_io_method(obj, method, args);
+        if (io) return io;
+        PerlValue *dg = perl_digest_method(obj, method, args);
+        if (dg) return dg;
+    }
     /* D97: Math::BigInt class methods — intercept before DBI/threads checks.
        `Math::BigInt->new(N)` and `Math::BigInt->config` are class methods
        (obj is a PERL_STRING holding "Math::BigInt"). */

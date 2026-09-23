@@ -1,0 +1,10 @@
+use Symbol;
+print "q_main=", qualify("alpha"), "\n";
+print "q_already=", qualify("Foo::bar"), "\n";
+print "q_pkg=", qualify("n", "Other"), "\n";
+print "q_empty=", qualify(""), "\n";
+my $g1 = gensym();
+my $g2 = gensym();
+print "two_defined=", ((defined $g1 && defined $g2) ? 1 : 0), "\n";
+print "q_qual=", Symbol::qualify("z"), "\n";
+print "done\n";
