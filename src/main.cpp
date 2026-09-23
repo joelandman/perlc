@@ -138,6 +138,9 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "FindBin","Symbol","IPC::Open2","IPC::Open3",
         "IO::Handle","IO::File","IO::Socket","IO::Socket::INET","IO::Socket::IP",
         "Socket","MIME::Base64","Digest::MD5","Digest::SHA",
+        "Getopt::Std","Text::ParseWords","File::Compare","File::stat",
+        "English","if","experimental","PerlIO::scalar",
+        "HTTP::Tiny","version","autodie",
     };
 
     std::set<std::string> modulesToInstall;
@@ -402,6 +405,9 @@ static std::vector<Token> inlineModules(
         "FindBin","Symbol","IPC::Open2","IPC::Open3",
         "IO::Handle","IO::File","IO::Socket","IO::Socket::INET","IO::Socket::IP",
         "Socket","MIME::Base64","Digest::MD5","Digest::SHA",
+        "Getopt::Std","Text::ParseWords","File::Compare","File::stat",
+        "English","if","experimental","PerlIO::scalar",
+        "HTTP::Tiny","version","autodie",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -504,7 +510,7 @@ static std::vector<Token> inlineModules(
 
         if (tokens[i].kind != TK::KW_USE ||
             i + 1 >= tokens.size() ||
-            tokens[i+1].kind != TK::IDENT) {
+            (tokens[i+1].kind != TK::IDENT && tokens[i+1].kind != TK::KW_IF)) {
             i++;
             continue;
         }
@@ -516,6 +522,27 @@ static std::vector<Token> inlineModules(
         while (j < tokens.size() && tokens[j].kind != TK::SEMI) j++;
         size_t useEnd = j;  /* index of SEMI */
         i = j < tokens.size() ? j + 1 : j;  /* advance past semicolon */
+
+        /* use if COND, MODULE, ARGS — compile-time conditional use */
+        if (modName == "if") {
+            size_t ui = useEnd;
+            while (ui > 0 && tokens[ui].kind != TK::KW_USE) ui--;
+            size_t p = ui + 2;
+            int truth = 0;
+            if (p < useEnd) {
+                if (tokens[p].kind == TK::INT)
+                    truth = strtoll(tokens[p].text.c_str(), nullptr, 10) != 0;
+                else if (tokens[p].kind == TK::FLOAT)
+                    truth = strtod(tokens[p].text.c_str(), nullptr) != 0.0;
+                else if (tokens[p].kind == TK::STRING)
+                    truth = !tokens[p].text.empty();
+                p++;
+                if (p < useEnd && tokens[p].kind == TK::COMMA) p++;
+            }
+            if (!truth || p >= useEnd) continue;
+            modName = tokens[p].text;
+            if (!modName.empty() && modName[0] == '\x01') modName = modName.substr(1);
+        }
 
         /* ── use constant NAME => VALUE  or  use constant { NAME => V, ... } */
         if (modName == "constant") {
@@ -534,6 +561,17 @@ static std::vector<Token> inlineModules(
             /* tokens[ui] = 'use', tokens[ui+1] = 'constant', tokens[ui+2..useEnd-1] = definition */
             size_t defStart = ui + 2;
             size_t defEnd   = useEnd; /* exclusive */
+            if (ui + 1 < tokens.size() && tokens[ui + 1].text == "if") {
+                size_t cp = ui + 2;
+                auto tname = [](const Token &t) {
+                    std::string s = t.text;
+                    if (!s.empty() && s[0] == '\x01') s = s.substr(1);
+                    return s;
+                };
+                while (cp < useEnd && tname(tokens[cp]) != "constant") cp++;
+                defStart = cp + 1;
+                if (defStart < useEnd && tokens[defStart].kind == TK::COMMA) defStart++;
+            }
 
             auto emitOneConstSub = [&](const std::string &subName, const std::vector<Token> &valTokens) {
                 /* inject: sub SUBNAME { return VALUE; } */
@@ -894,6 +932,27 @@ static std::vector<Token> inlineModules(
                     }
                 }
                 names = expanded;
+            }
+            for (auto &name : names) {
+                if (!name.empty() && name[0] == '\x01') name = name.substr(1);
+                if (name.empty() || name[0] == ':') continue;
+                importMap[name] = modName + "::" + name;
+            }
+            continue;
+        }
+        if (modName == "Getopt::Std" || modName == "Text::ParseWords" ||
+            modName == "File::Compare" || modName == "File::stat" ||
+            modName == "version" || modName == "HTTP::Tiny" ||
+            modName == "English" || modName == "experimental" ||
+            modName == "autodie" || modName == "PerlIO::scalar") {
+            std::vector<std::string> names = explicitImports;
+            if (names.empty()) {
+                if (modName == "Getopt::Std") names = {"getopt","getopts"};
+                else if (modName == "Text::ParseWords")
+                    names = {"shellwords","quotewords","parse_line"};
+                else if (modName == "File::Compare") names = {"compare"};
+                else if (modName == "File::stat") names = {"stat","lstat"};
+                else if (modName == "version") names = {"qv"};
             }
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
@@ -1416,6 +1475,8 @@ int main(int argc, char **argv) {
         /* codegen */
         CodeGen cg(debugSymbols, optLevel);
         if (lexer.hasDataSection()) cg.setDataSection(lexer.dataSection());
+        cg.setEnglishEnabled(parser.getEnglishEnabled());
+        cg.setAutodieEnabled(parser.getAutodieEnabled());
         cg.compile(*ast, inputFile, doLib, evalLib);
 
         if (emitIR) {

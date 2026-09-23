@@ -1,0 +1,10 @@
+use version;
+my $v = version->parse("1.2.3");
+print "str=$v\n";
+print "num=", $v->numify, "\n";
+print "norm=", $v->normal, "\n";
+print "qv=", qv("1.2.3"), "\n";
+my $w = version->parse("1.2.0");
+print "cmp=", ($v <=> $w), "\n";
+print "gt=", ($v > $w ? 1 : 0), "\n";
+print "done\n";

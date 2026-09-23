@@ -1,0 +1,13 @@
+use PerlIO::scalar;
+my $s = "one\ntwo\n";
+open my $fh, "<", \$s or die "open";
+my $a = <$fh>;
+my $b = <$fh>;
+print "a=$a";
+print "b=$b";
+my $w = "";
+open my $out, ">", \$w or die "wopen";
+print $out "xyz";
+close $out;
+print "w=$w\n";
+print "done\n";

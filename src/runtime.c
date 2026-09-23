@@ -2003,6 +2003,12 @@ char *perl_to_string_dup(const PerlValue *v) {
                 perl_free(r);
                 return s;
             }
+            if (strcmp(method, "perl_ver_ovl_str") == 0) {
+                PerlValue *r = perl_ver_ovl_str((PerlValue*)v);
+                char *s = perl_to_string_dup(r);
+                perl_free(r);
+                return s;
+            }
             PerlArray *args = perl_array_new();
             PerlValue *clone = perl_clone((PerlValue*)v);
             perl_array_push(args, clone);
@@ -5507,6 +5513,13 @@ static PerlValue *perl_dispatch_overload(const PerlValue *obj, const char *op,
             result = perl_tp_ovl_str(lhs_clone);
         else
             result = NULL;
+    } else if (strncmp(method, "perl_ver_ovl_", 13) == 0) {
+        if (strcmp(method, "perl_ver_ovl_cmp") == 0)
+            result = perl_ver_ovl_cmp(lhs_clone, rhs_clone);
+        else if (strcmp(method, "perl_ver_ovl_str") == 0)
+            result = perl_ver_ovl_str(lhs_clone);
+        else
+            result = NULL;
     } else {
         int saved = perl_push_wantarray(0);  /* scalar context */
         result = perl_call_named_sub(method, args, 0);
@@ -5834,6 +5847,8 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
         if (io) return io;
         PerlValue *dg = perl_digest_method(obj, method, args);
         if (dg) return dg;
+        PerlValue *w45 = perl_wave45_method(obj, method, args);
+        if (w45) return w45;
     }
     /* D97: Math::BigInt class methods — intercept before DBI/threads checks.
        `Math::BigInt->new(N)` and `Math::BigInt->config` are class methods
@@ -6379,6 +6394,11 @@ PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filena
     if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
     int utf8 = mode_wants_utf8(ms);
     FILE *fp = fopen(fs, mode_to_cmode(ms));
+    if (!fp && perl_autodie_enabled()) {
+        const char *how = "reading";
+        if (ms && (ms[0] == '>' || strstr(ms, ">"))) how = "writing";
+        perl_die_croak("Can't open '%s' for %s: '%s'", fs ? fs : "", how, strerror(errno));
+    }
     free(ms); free(fs);
     if (fp) {
         target->tag = PERL_FILEHANDLE; target->pval = fp;
@@ -6724,6 +6744,8 @@ PerlValue *perl_unlink_files(PerlArray *files) {
     for (long long i = 0; i < files->len; i++) {
         char *name = perl_to_string_dup(files->elems[i]);
         if (unlink(name) == 0) removed++;
+        else if (perl_autodie_enabled())
+            perl_die_croak("Can't unlink('%s'): %s", name, strerror(errno));
         free(name);
     }
     return perl_alloc_int(removed);
@@ -6733,14 +6755,20 @@ PerlValue *perl_unlink_files(PerlArray *files) {
 
 PerlValue *perl_chdir(PerlValue *path) {
     char *p = perl_to_string_dup(path);
-    int r = chdir(p); free(p);
+    int r = chdir(p);
+    if (r != 0 && perl_autodie_enabled())
+        perl_die_croak("Can't chdir('%s'): %s", p, strerror(errno));
+    free(p);
     return perl_alloc_int(r == 0 ? 1 : 0);
 }
 
 PerlValue *perl_mkdir_op(PerlValue *path, PerlValue *mode) {
     char *p = perl_to_string_dup(path);
     mode_t m = (mode && mode->tag != PERL_UNDEF) ? (mode_t)perl_to_int(mode) : 0777;
-    int r = mkdir(p, m); free(p);
+    int r = mkdir(p, m);
+    if (r != 0 && perl_autodie_enabled())
+        perl_die_croak("Can't mkdir('%s'): %s", p, strerror(errno));
+    free(p);
     return perl_alloc_int(r == 0 ? 1 : 0);
 }
 

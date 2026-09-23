@@ -1,0 +1,10 @@
+use File::Compare;
+my $a = "/tmp/perlc_fc_a.txt";
+my $b = "/tmp/perlc_fc_b.txt";
+open my $fa, ">", $a; print $fa "same\n"; close $fa;
+open my $fb, ">", $b; print $fb "same\n"; close $fb;
+print "same=", compare($a, $b), "\n";
+open my $fc, ">", $b; print $fc "diff\n"; close $fc;
+print "diff=", (compare($a, $b) == 0 ? 0 : 1), "\n";
+unlink $a, $b;
+print "done\n";

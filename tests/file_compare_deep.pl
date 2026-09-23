@@ -1,0 +1,11 @@
+use File::Compare;
+my $a = "/tmp/perlc_fc_da.txt";
+my $b = "/tmp/perlc_fc_db.txt";
+open my $fa, ">", $a; print $fa "hello\nworld\n"; close $fa;
+open my $fb, ">", $b; print $fb "hello\nworld\n"; close $fb;
+print "eq=", compare($a, $b), "\n";
+open my $fc, ">", $b; print $fc "hello\nWORLD\n"; close $fc;
+print "ne=", (compare($a, $b) == 0 ? 0 : 1), "\n";
+print "missing=", compare($a, "/tmp/perlc_fc_nope.txt"), "\n";
+unlink $a, $b;
+print "done\n";

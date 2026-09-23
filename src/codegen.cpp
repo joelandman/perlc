@@ -837,6 +837,13 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_b64_encode_url",   pv, pv);
     RT("perl_b64_decode_url",   pv, pv);
     RT("perl_digest_call",      pv, i8p, av);
+    RT("perl_autodie_enable",   voidTy, i64);
+    RT("perl_getopt_std",       pv, pv, pv, av, pv, i32);
+    RT("perl_parsewords",       av, pv, pv, av);
+    RT("perl_file_compare",     pv, pv, pv);
+    RT("perl_file_stat",        pv, pv, i32);
+    RT("perl_version_parse",    pv, pv);
+    RT("perl_http_tiny_new",    pv, av);
     RT("perl_text_wrap",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_text_fill",        pv, pv, pv, av, pv, pv, pv, pv, pv);
     RT("perl_make_path",        av, av, pv, i32);
@@ -2155,6 +2162,22 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::Call &&
         (n.name == "Time::HiRes::gettimeofday" || n.name == "gettimeofday")) {
         return callRT("perl_hires_gettimeofday_list", {});
+    }
+    if (n.kind == NK::Call &&
+        (n.name == "shellwords" || n.name == "Text::ParseWords::shellwords")) {
+        Value *texts = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {texts, emitExpr(*a)});
+        return callRT("perl_parsewords", {perlStr(" "), perlInt(0), texts});
+    }
+    if (n.kind == NK::Call &&
+        (n.name == "quotewords" || n.name == "Text::ParseWords::quotewords" ||
+         n.name == "parse_line" || n.name == "Text::ParseWords::parse_line")) {
+        Value *d = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlStr(" ");
+        Value *k = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        Value *texts = callRT("perl_array_new", {});
+        for (size_t i = 2; i < n.args.size(); i++)
+            callRT("perl_array_push", {texts, emitExpr(*n.args[i])});
+        return callRT("perl_parsewords", {d, k, texts});
     }
     /* Socket unpack_sockaddr_in/un and 1-arg sockaddr_in/un in list ctx. */
     if (n.kind == NK::Call &&
@@ -4976,6 +4999,19 @@ void CodeGen::compile(const Node &program, const std::string &modName,
                 callRT("perl_register_overload", {tpStr, opStr, methStr});
             }
         }
+        {
+            auto *verStr = builder_.CreateGlobalStringPtr("version");
+            struct VerOvlEntry { const char *op; const char *method; };
+            static const VerOvlEntry verOverloads[] = {
+                {"<=>",  "perl_ver_ovl_cmp"},
+                {"\"\"", "perl_ver_ovl_str"},
+            };
+            for (auto &e : verOverloads) {
+                Value *opStr = builder_.CreateGlobalStringPtr(e.op);
+                Value *methStr = builder_.CreateGlobalStringPtr(e.method);
+                callRT("perl_register_overload", {verStr, opStr, methStr});
+            }
+        }
 
         /* set up @ARGV and $0 from command-line arguments */
         {
@@ -5019,6 +5055,9 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             setIsa("IO::Socket", "IO::Handle");
             setIsa("IO::Socket::INET", "IO::Socket");
             setIsa("IO::Socket::IP", "IO::Socket");
+            if (autodieEnabled_)
+                callRT("perl_autodie_enable",
+                       {ConstantInt::get(Type::getInt64Ty(ctx_), 1)});
         }
 
         /* capture local() save depth at function entry */
@@ -7622,6 +7661,27 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* $AUTOLOAD — set by dispatch when AUTOLOAD is called */
         if (n.name == "AUTOLOAD") return callRT("perl_get_autoload_name", {});
         if (n.name == "ARGV") return callRT("perl_get_dollar_argv", {});
+        if (englishEnabled_) {
+            if (n.name == "PID" || n.name == "PROCESS_ID")
+                return callRT("perl_getpid", {});
+            if (n.name == "PROGRAM_NAME") return callRT("perl_get_dollar0", {});
+            if (n.name == "OS_ERROR" || n.name == "ERRNO")
+                return callRT("perl_get_dollar_bang", {});
+            if (n.name == "EVAL_ERROR") return callRT("perl_get_dollar_at", {});
+            if (n.name == "CHILD_ERROR") return callRT("perl_get_dollar_question", {});
+            if (n.name == "MATCH") return callRT("perl_get_dollar_amp", {});
+            if (n.name == "INPUT_LINE_NUMBER" || n.name == "NR")
+                return callRT("perl_get_dollar_dot", {});
+            if (n.name == "INPUT_RECORD_SEPARATOR" || n.name == "RS")
+                return callRT("perl_get_input_sep", {});
+            if (n.name == "OUTPUT_RECORD_SEPARATOR" || n.name == "ORS")
+                return callRT("perl_get_dollar_bsl", {});
+            if (n.name == "OUTPUT_FIELD_SEPARATOR" || n.name == "OFS")
+                return callRT("perl_get_dollar_comma", {});
+            if (n.name == "ARG") return callRT("perl_get_dollar_under", {});
+            if (n.name == "OSNAME") return callRT("perl_get_os_name", {});
+            if (n.name == "PERL_VERSION") return callRT("perl_get_perl_version", {});
+        }
         {
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
@@ -11814,9 +11874,29 @@ Value *CodeGen::emitLValue(const Node &n) {
             {"AUTOLOAD", "perl_get_autoload_name"},
             {"0",   "perl_get_dollar0"},
         };
-        auto it = specialGlobals.find(n.name);
-        if (it != specialGlobals.end()) {
-            Value *gv = callRT(it->second, {});
+        static const std::unordered_map<std::string, const char*> englishGlobals = {
+            {"PID", "perl_getpid"},
+            {"PROCESS_ID", "perl_getpid"},
+            {"PROGRAM_NAME", "perl_get_dollar0"},
+            {"OS_ERROR", "perl_get_dollar_bang"},
+            {"ERRNO", "perl_get_dollar_bang"},
+            {"EVAL_ERROR", "perl_get_dollar_at"},
+            {"CHILD_ERROR", "perl_get_dollar_question"},
+            {"MATCH", "perl_get_dollar_amp"},
+            {"OSNAME", "perl_get_os_name"},
+            {"PERL_VERSION", "perl_get_perl_version"},
+        };
+        const char *specFn = nullptr;
+        {
+            auto it = specialGlobals.find(n.name);
+            if (it != specialGlobals.end()) specFn = it->second;
+            else if (englishEnabled_) {
+                auto eit = englishGlobals.find(n.name);
+                if (eit != englishGlobals.end()) specFn = eit->second;
+            }
+        }
+        if (specFn) {
+            Value *gv = callRT(specFn, {});
             auto *slot = createEntryAlloca(perlPtrTy_, nullptr,
                                                 std::string("spec.") + n.name);
             builder_.CreateStore(gv, slot);
@@ -13737,6 +13817,55 @@ Value *CodeGen::emitCall(const Node &n) {
             return callRT("perl_digest_call",
                 {builder_.CreateGlobalStringPtr(digBare), av});
         }
+    }
+    if (n.name == "getopts" || n.name == "Getopt::Std::getopts" ||
+        n.name == "getopt" || n.name == "Getopt::Std::getopt") {
+        Value *spec = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *dest = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *argv = lookupArray("ARGV");
+        if (!argv) argv = callRT("perl_array_new", {});
+        Value *pkg = perlStr(currentPackage_.empty() ? "main" : currentPackage_);
+        int isGo = (n.name.find("getopts") != std::string::npos) ? 1 : 0;
+        return callRT("perl_getopt_std",
+            {spec, dest, argv, pkg, ConstantInt::get(Type::getInt32Ty(ctx_), isGo)});
+    }
+    if (n.name == "shellwords" || n.name == "Text::ParseWords::shellwords") {
+        Value *texts = callRT("perl_array_new", {});
+        for (auto &a : n.args) callRT("perl_array_push", {texts, emitExpr(*a)});
+        Value *arr = callRT("perl_parsewords",
+            {perlStr(" "), perlInt(0), texts});
+        Value *len = callRT("perl_array_len", {arr});
+        return callRT("perl_alloc_int", {len}); /* scalar: count */
+    }
+    if (n.name == "quotewords" || n.name == "Text::ParseWords::quotewords" ||
+        n.name == "parse_line" || n.name == "Text::ParseWords::parse_line") {
+        Value *d = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlStr(" ");
+        Value *k = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlInt(0);
+        Value *texts = callRT("perl_array_new", {});
+        for (size_t i = 2; i < n.args.size(); i++)
+            callRT("perl_array_push", {texts, emitExpr(*n.args[i])});
+        Value *arr = callRT("perl_parsewords", {d, k, texts});
+        Value *len = callRT("perl_array_len", {arr});
+        return callRT("perl_alloc_int", {len});
+    }
+    if (n.name == "compare" || n.name == "File::Compare::compare" ||
+        n.name == "File::Compare::cmp") {
+        Value *a = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *b = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_file_compare", {a, b});
+    }
+    if (n.name == "File::stat::stat") {
+        Value *p = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_file_stat", {p, ConstantInt::get(Type::getInt32Ty(ctx_), 0)});
+    }
+    if (n.name == "File::stat::lstat") {
+        Value *p = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_file_stat", {p, ConstantInt::get(Type::getInt32Ty(ctx_), 1)});
+    }
+    if (n.name == "qv" || n.name == "version::qv" ||
+        n.name == "version::parse" || n.name == "version::declare") {
+        Value *s = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_version_parse", {s});
     }
     /* Native constants (Fcntl/POSIX/Errno): a zero-arg call whose name is
        an all-caps identifier in one of those packages resolves through the

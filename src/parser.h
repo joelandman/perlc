@@ -47,6 +47,8 @@ public:
     /* D56: warnings state accessors for codegen */
     bool getWarningsEnabled() const      { return warningsEnabled_; }
     bool getWarningsUninitialized() const { return warningsUninitialized_; }
+    bool getEnglishEnabled() const       { return englishEnabled_; }
+    bool getAutodieEnabled() const       { return autodieEnabled_; }
     /* D128: tell the parser which registered source-file tag (Token::file)
        belongs to the main script. A parse error whose current token carries
        a different (or any, when this is unset) non-null tag is reported as
@@ -70,6 +72,8 @@ private:
     bool warningsUninitialized_ = false;
     bool signaturesEnabled_   = false; /* use v5.20+ / use feature 'signatures' */
     bool utf8Enabled_         = false; /* use utf8 — string lits are characters */
+    bool englishEnabled_      = false; /* use English — $PID, $OS_ERROR, … */
+    bool autodieEnabled_      = false; /* use autodie — builtins croak on fail */
     std::set<std::string>    knownBareFH_; /* open LOG, ... → print LOG */
     /* D128: registered Token::file tag of the main script (nullptr when
        unset — every non-null tag then reports as a foreign file). */

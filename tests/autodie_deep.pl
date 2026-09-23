@@ -1,0 +1,17 @@
+use autodie;
+eval { open my $fh, "<", "/no/such/perlc_autodie_d" };
+print "open_died=", ($@ ne "" ? 1 : 0), "\n";
+print "open_cant=", ($@ =~ /Can't open/ ? 1 : 0), "\n";
+eval { unlink "/no/such/perlc_autodie_unl" };
+print "unl_died=", ($@ ne "" ? 1 : 0), "\n";
+print "unl_cant=", ($@ =~ /Can't unlink/ ? 1 : 0), "\n";
+my $okf = "/tmp/perlc_autodie_ok.txt";
+open my $w, ">", $okf;
+print $w "x";
+close $w;
+open my $r, "<", $okf;
+my $got = <$r>;
+close $r;
+print "okread=$got";
+unlink $okf;
+print "done\n";

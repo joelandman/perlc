@@ -334,6 +334,37 @@ NodePtr Parser::parseUseNoStmt() {
                 stmts.push_back(std::move(n));
                 continue;
             }
+            /* use experimental 'signatures' — same as use feature 'signatures' */
+            if (check(TK::IDENT) && cur().text == "experimental") {
+                advance();
+                auto enableExp = [&](const std::string &f) {
+                    if (f == "signatures") signaturesEnabled_ = true;
+                };
+                if (check(TK::QWORDS)) {
+                    std::istringstream iss(cur().text); advance();
+                    std::string w;
+                    while (iss >> w) enableExp(w);
+                } else if (check(TK::STRING) || check(TK::IDENT)) {
+                    enableExp(cur().text); advance();
+                    while (match(TK::COMMA) && (check(TK::STRING) || check(TK::IDENT))) {
+                        enableExp(cur().text); advance();
+                    }
+                }
+                match(TK::SEMI);
+                continue;
+            }
+            if (check(TK::IDENT) && cur().text == "English") {
+                englishEnabled_ = true;
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
+                match(TK::SEMI);
+                continue;
+            }
+            if (check(TK::IDENT) && cur().text == "autodie") {
+                autodieEnabled_ = true;
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
+                match(TK::SEMI);
+                continue;
+            }
             /* use utf8 — subsequent string literals are character strings */
             if (check(TK::IDENT) && cur().text == "utf8") {
                 advance();
@@ -4487,11 +4518,18 @@ NodePtr Parser::parsePrimary() {
         n->left = std::move(fh); n->right = std::move(layer); return n;
     }
 
-    /* stat(EXPR) */
+    /* stat(EXPR) — File::stat overrides CORE::stat after `use File::stat` */
     if (check(TK::KW_STAT)) {
         advance(); bool hp = match(TK::LPAREN);
         auto path = parseExpr();
         if (hp) consume(TK::RPAREN, ")");
+        auto itSt = importMap_.find("stat");
+        if (itSt != importMap_.end() && itSt->second == "File::stat::stat") {
+            auto n = std::make_unique<Node>(); n->kind = NK::Call; n->line = line;
+            n->name = "File::stat::stat";
+            n->args.push_back(std::move(path));
+            return n;
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::StatFunc; n->line = line;
         n->left = std::move(path); return n;
     }
@@ -4501,6 +4539,13 @@ NodePtr Parser::parsePrimary() {
         advance(); bool hp = match(TK::LPAREN);
         auto path = parseExpr();
         if (hp) consume(TK::RPAREN, ")");
+        auto itLs = importMap_.find("lstat");
+        if (itLs != importMap_.end() && itLs->second == "File::stat::lstat") {
+            auto n = std::make_unique<Node>(); n->kind = NK::Call; n->line = line;
+            n->name = "File::stat::lstat";
+            n->args.push_back(std::move(path));
+            return n;
+        }
         auto n = std::make_unique<Node>(); n->kind = NK::LstatFunc; n->line = line;
         n->left = std::move(path); return n;
     }

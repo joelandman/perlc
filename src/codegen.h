@@ -26,6 +26,8 @@ public:
     void compile(const Node &program, const std::string &moduleName,
                  bool asDoLib = false, bool asEvalPad = false);
     void setDataSection(std::string s) { dataSection_ = std::move(s); hasDataSection_ = true; }
+    void setEnglishEnabled(bool v) { englishEnabled_ = v; }
+    void setAutodieEnabled(bool v) { autodieEnabled_ = v; }
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
@@ -172,6 +174,8 @@ private:
     int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */
     bool inMainBody_ = false;   /* true only while emitting the top-level program body */
     bool asDoLib_ = false;      /* D24/D58: compiling in --do-lib mode (see compile()) */
+    bool englishEnabled_ = false;
+    bool autodieEnabled_ = false;
     bool asEvalPad_ = false;    /* --eval-lib: bind outer `my` cells from the eval pad */
     bool hasDataSection_ = false;
     std::string dataSection_;   /* text after __DATA__/__END__ */

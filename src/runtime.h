@@ -499,6 +499,18 @@ PerlValue *perl_digest_call(const char *name, PerlArray *args);
 PerlValue *perl_digest_method(PerlValue *obj, const char *method, PerlArray *args);
 void       perl_digest_free_pv(PerlValue *v);
 void       perl_digest_retain(PerlValue *v);
+void       perl_autodie_enable(long long on);
+int        perl_autodie_enabled(void);
+PerlValue *perl_getopt_std(PerlValue *spec, PerlValue *dest, PerlArray *argv,
+                           PerlValue *pkg, int is_getopts);
+PerlArray *perl_parsewords(PerlValue *delim, PerlValue *keep, PerlArray *texts);
+PerlValue *perl_file_compare(PerlValue *a, PerlValue *b);
+PerlValue *perl_file_stat(PerlValue *path, int do_lstat);
+PerlValue *perl_version_parse(PerlValue *s);
+PerlValue *perl_ver_ovl_str(PerlValue *self);
+PerlValue *perl_ver_ovl_cmp(PerlValue *a, PerlValue *b);
+PerlValue *perl_http_tiny_new(PerlArray *args);
+PerlValue *perl_wave45_method(PerlValue *obj, const char *method, PerlArray *args);
 PerlValue *perl_text_wrap(PerlValue *ip, PerlValue *xp, PerlArray *texts,
                           PerlValue *columns, PerlValue *sep, PerlValue *sep2,
                           PerlValue *huge, PerlValue *unexpand);

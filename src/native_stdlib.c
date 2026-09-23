@@ -19,6 +19,8 @@
 #include <netdb.h>
 #include <limits.h>
 #include <libgen.h>
+#include <sys/time.h>
+#include <ctype.h>
 #include <openssl/evp.h>
 
 #define PV_FLAG_AUTOFLUSH (1u << 25)
@@ -1110,3 +1112,491 @@ PerlValue *perl_io_method(PerlValue *obj, const char *method, PerlArray *args) {
     }
     return NULL; /* not handled */
 }
+
+/* ── Wave 4/5: Getopt::Std, ParseWords, File::Compare/stat, version,
+   HTTP::Tiny, autodie ─────────────────────────────────────────────────── */
+
+static int s_autodie = 0;
+void perl_autodie_enable(long long on) { s_autodie = on ? 1 : 0; }
+int  perl_autodie_enabled(void) { return s_autodie; }
+
+static PerlHash *nst_href(PerlValue *v) {
+    if (!v) return NULL;
+    if (v->tag == PERL_REF_HASH) return (PerlHash *)v->pval;
+    return NULL;
+}
+
+static PerlValue *nst_hget(PerlValue *obj, const char *k) {
+    PerlHash *h = nst_href(obj);
+    if (!h) return perl_alloc_undef();
+    PerlValue *r = perl_hash_get_str_ref(h, k);
+    return r ? perl_clone(r) : perl_alloc_undef();
+}
+
+static void nst_hset(PerlHash *h, const char *k, PerlValue *v) {
+    perl_hash_set_str(h, k, v);
+}
+
+static void nst_opt_store(PerlValue *dest, const char *pkg, char letter, PerlValue *val) {
+    char key[8];
+    snprintf(key, sizeof key, "%c", letter);
+    if (dest && dest->tag == PERL_REF_HASH) {
+        nst_hset((PerlHash *)dest->pval, key, val);
+        return;
+    }
+    char glob[256];
+    snprintf(glob, sizeof glob, "%s::opt_%c", pkg && pkg[0] ? pkg : "main", letter);
+    PerlValue *cell = perl_glob_get_scalar(glob);
+    perl_assign(cell, val);
+}
+
+PerlValue *perl_getopt_std(PerlValue *spec_pv, PerlValue *dest, PerlArray *argv,
+                           PerlValue *pkg_pv, int is_getopts) {
+    char *spec = spec_pv ? perl_to_string_dup(spec_pv) : strdup("");
+    char *pkg = pkg_pv ? perl_to_string_dup(pkg_pv) : strdup("main");
+    int ok = 1;
+    long long idx = 0, n = argv ? argv->len : 0;
+    (void)is_getopts;
+    while (idx < n) {
+        char *tok = perl_to_string_dup(argv->elems[idx]);
+        if (!tok || tok[0] != '-' || tok[1] == '\0') { free(tok); break; }
+        if (strcmp(tok, "--") == 0) {
+            perl_free(argv->elems[idx]);
+            for (long long j = idx; j + 1 < n; j++) argv->elems[j] = argv->elems[j + 1];
+            argv->len--;
+            free(tok);
+            break;
+        }
+        const char *p = tok + 1;
+        int consumed_tok = 1, consumed_next = 0;
+        PerlValue *nextv = NULL;
+        while (*p) {
+            char letter = *p++;
+            const char *sp = strchr(spec, letter);
+            int needs_arg = 0;
+            if (sp && sp[1] == ':') needs_arg = 1;
+            else if (!sp) {
+                fprintf(stderr, "Unknown option: %c\n", letter);
+                ok = 0;
+                continue;
+            }
+            if (needs_arg) {
+                const char *raw = NULL;
+                if (*p) { raw = p; p += strlen(p); }
+                else if (idx + 1 < n) {
+                    raw = perl_to_string(argv->elems[idx + 1]);
+                    consumed_next = 1;
+                } else { ok = 0; break; }
+                PerlValue *v = perl_alloc_string(raw ? raw : "");
+                nst_opt_store(dest, pkg, letter, v);
+                perl_free(v);
+            } else {
+                PerlValue *v = perl_alloc_int(1);
+                nst_opt_store(dest, pkg, letter, v);
+                perl_free(v);
+            }
+        }
+        free(tok);
+        long long drop = consumed_tok + consumed_next;
+        for (long long k = 0; k < drop; k++) {
+            perl_free(argv->elems[idx]);
+            for (long long j = idx; j + 1 < n; j++) argv->elems[j] = argv->elems[j + 1];
+            argv->len--;
+            n = argv->len;
+        }
+        (void)nextv;
+    }
+    free(spec); free(pkg);
+    return perl_alloc_int(ok ? 1 : 0);
+}
+
+/* Text::ParseWords — whitespace or single-char delimiter, quoted fields. */
+static void nst_push_field(PerlArray *out, const char *s, size_t n, int keep) {
+    (void)keep;
+    char *buf = malloc(n + 1);
+    memcpy(buf, s, n); buf[n] = '\0';
+    PerlValue *v = perl_alloc_string_len(buf, (long long)n);
+    perl_array_push(out, v);
+    perl_free(v);
+    free(buf);
+}
+
+static int nst_is_delim(char c, const char *delim, int ws) {
+    if (ws) return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    return delim && strchr(delim, c) != NULL;
+}
+
+PerlArray *perl_parsewords(PerlValue *delim_pv, PerlValue *keep_pv, PerlArray *texts) {
+    char *delim = delim_pv ? perl_to_string_dup(delim_pv) : strdup(" ");
+    int keep = keep_pv ? (int)perl_to_int(keep_pv) : 0;
+    int ws = 0;
+    if (!delim[0] || strcmp(delim, " ") == 0 || strcmp(delim, "\\s+") == 0) ws = 1;
+    PerlArray *out = perl_array_new();
+    long long ti;
+    for (ti = 0; texts && ti < texts->len; ti++) {
+        long long ln = 0;
+        char *s = perl_to_string_dup_len(texts->elems[ti], &ln);
+        long long i = 0;
+        while (i < ln) {
+            while (i < ln && nst_is_delim(s[i], delim, ws)) i++;
+            if (i >= ln) break;
+            char quote = 0;
+            if (s[i] == '"' || s[i] == '\'') { quote = s[i]; i++; }
+            char buf[8192];
+            size_t b = 0;
+            if (keep && quote && b < sizeof(buf) - 1) buf[b++] = quote;
+            while (i < ln) {
+                if (quote) {
+                    if (s[i] == '\\' && i + 1 < ln) {
+                        i++;
+                        if (b < sizeof(buf) - 1) buf[b++] = s[i++];
+                        continue;
+                    }
+                    if (s[i] == quote) {
+                        if (keep && b < sizeof(buf) - 1) buf[b++] = s[i];
+                        i++;
+                        break;
+                    }
+                    if (b < sizeof(buf) - 1) buf[b++] = s[i++];
+                } else {
+                    if (nst_is_delim(s[i], delim, ws)) break;
+                    if (s[i] == '"' || s[i] == '\'') { quote = s[i]; i++; 
+                        if (keep && b < sizeof(buf) - 1) buf[b++] = quote;
+                        continue; }
+                    if (b < sizeof(buf) - 1) buf[b++] = s[i++];
+                }
+            }
+            nst_push_field(out, buf, b, keep);
+        }
+        free(s);
+    }
+    free(delim);
+    return out;
+}
+
+PerlValue *perl_file_compare(PerlValue *a, PerlValue *b) {
+    char *pa = perl_to_string_dup(a), *pb = perl_to_string_dup(b);
+    FILE *fa = fopen(pa, "rb"), *fb = fopen(pb, "rb");
+    int rc;
+    if (!fa || !fb) { rc = -1; goto done; }
+    for (;;) {
+        int ca = fgetc(fa), cb = fgetc(fb);
+        if (ca != cb) { rc = 1; goto done; }
+        if (ca == EOF) { rc = 0; goto done; }
+    }
+done:
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    free(pa); free(pb);
+    return perl_alloc_int(rc);
+}
+
+static PerlValue *nst_stat_obj(const char *path, int do_lstat) {
+    struct stat st;
+    PerlHash *h;
+    PerlValue *obj;
+    int r = do_lstat ? lstat(path, &st) : stat(path, &st);
+    if (r != 0) return perl_alloc_undef();
+    h = perl_anon_hash_new();
+#define STSET(k, v) do { PerlValue *_x = perl_alloc_int((long long)(v)); nst_hset(h, k, _x); perl_free(_x); } while (0)
+    STSET("dev", st.st_dev);
+    STSET("ino", st.st_ino);
+    STSET("mode", st.st_mode);
+    STSET("nlink", st.st_nlink);
+    STSET("uid", st.st_uid);
+    STSET("gid", st.st_gid);
+    STSET("rdev", st.st_rdev);
+    STSET("size", st.st_size);
+    STSET("atime", st.st_atime);
+    STSET("mtime", st.st_mtime);
+    STSET("ctime", st.st_ctime);
+    STSET("blksize", st.st_blksize);
+    STSET("blocks", st.st_blocks);
+#undef STSET
+    obj = perl_ref_hash(h);
+    if (obj->blessed_class) free(obj->blessed_class);
+    obj->blessed_class = strdup("File::stat");
+    return obj;
+}
+
+PerlValue *perl_file_stat(PerlValue *path, int do_lstat) {
+    char *p = perl_to_string_dup(path);
+    PerlValue *r = nst_stat_obj(p ? p : "", do_lstat);
+    free(p);
+    return r;
+}
+
+static PerlValue *nst_ver_from_str(const char *s) {
+    int qv = 0, a = 0, b = 0, c = 0;
+    const char *p = s ? s : "";
+    char orig[128], norm[64], numbuf[64];
+    PerlHash *h;
+    PerlValue *obj, *sv;
+    double num;
+    snprintf(orig, sizeof orig, "%s", p);
+    if (*p == 'v') { qv = 1; p++; }
+    sscanf(p, "%d.%d.%d", &a, &b, &c);
+    num = (double)a + (double)b / 1000.0 + (double)c / 1000000.0;
+    snprintf(norm, sizeof norm, "v%d.%d.%d", a, b, c);
+    snprintf(numbuf, sizeof numbuf, "%.6f", num);
+    h = perl_anon_hash_new();
+    sv = perl_alloc_string(orig); nst_hset(h, "s", sv); perl_free(sv);
+    sv = perl_alloc_string(norm); nst_hset(h, "nstr", sv); perl_free(sv);
+    sv = perl_alloc_float(num); nst_hset(h, "num", sv); perl_free(sv);
+    sv = perl_alloc_int(qv); nst_hset(h, "qv", sv); perl_free(sv);
+    obj = perl_ref_hash(h);
+    if (obj->blessed_class) free(obj->blessed_class);
+    obj->blessed_class = strdup("version");
+    return obj;
+}
+
+PerlValue *perl_version_parse(PerlValue *s) {
+    char *p = perl_to_string_dup(s);
+    PerlValue *r = nst_ver_from_str(p);
+    free(p);
+    return r;
+}
+
+PerlValue *perl_ver_ovl_str(PerlValue *self) {
+    return nst_hget(self, "s");
+}
+
+PerlValue *perl_ver_ovl_cmp(PerlValue *a, PerlValue *b) {
+    double na, nb;
+    PerlValue *va, *vb;
+    va = nst_hget(a, "num");
+    na = perl_to_float(va); perl_free(va);
+    if (b && b->blessed_class && strcmp(b->blessed_class, "version") == 0) {
+        vb = nst_hget(b, "num");
+        nb = perl_to_float(vb); perl_free(vb);
+    } else {
+        char *s = perl_to_string_dup(b);
+        PerlValue *tmp = nst_ver_from_str(s);
+        free(s);
+        vb = nst_hget(tmp, "num");
+        nb = perl_to_float(vb); perl_free(vb); perl_free(tmp);
+    }
+    if (na < nb) return perl_alloc_int(-1);
+    if (na > nb) return perl_alloc_int(1);
+    return perl_alloc_int(0);
+}
+
+/* HTTP::Tiny — HTTP/1.0 GET/HEAD/POST, no TLS. */
+static int nst_parse_url(const char *url, char *host, int *port, char *path, int *ssl) {
+    const char *p = url ? url : "";
+    *ssl = 0; *port = 80;
+    snprintf(path, 1024, "/");
+    host[0] = 0;
+    if (strncmp(p, "https://", 8) == 0) { *ssl = 1; *port = 443; p += 8; }
+    else if (strncmp(p, "http://", 7) == 0) p += 7;
+    {
+        const char *slash = strchr(p, '/');
+        const char *colon;
+        size_t hl;
+        if (!slash) slash = p + strlen(p);
+        colon = memchr(p, ':', (size_t)(slash - p));
+        if (colon) {
+            hl = (size_t)(colon - p);
+            *port = atoi(colon + 1);
+        } else hl = (size_t)(slash - p);
+        if (hl >= 255) hl = 254;
+        memcpy(host, p, hl); host[hl] = 0;
+        if (*slash) snprintf(path, 1024, "%s", slash);
+    }
+    return host[0] ? 1 : 0;
+}
+
+static PerlValue *nst_http_resp(int status, const char *reason, const char *content,
+                                const char *url) {
+    PerlHash *h = perl_anon_hash_new();
+    PerlValue *v, *obj;
+    PerlHash *hdr;
+    v = perl_alloc_int(status); nst_hset(h, "status", v); perl_free(v);
+    v = perl_alloc_string(reason ? reason : ""); nst_hset(h, "reason", v); perl_free(v);
+    v = perl_alloc_bool(status >= 200 && status < 300); nst_hset(h, "success", v); perl_free(v);
+    v = perl_alloc_string(content ? content : ""); nst_hset(h, "content", v); perl_free(v);
+    v = perl_alloc_string(url ? url : ""); nst_hset(h, "url", v); perl_free(v);
+    hdr = perl_anon_hash_new();
+    v = perl_ref_hash(hdr); nst_hset(h, "headers", v); perl_free(v);
+    obj = perl_ref_hash(h);
+    return obj;
+}
+
+static PerlValue *nst_http_request(PerlHash *self, const char *method, const char *url,
+                                   PerlValue *content) {
+    char host[256], path[1024], req[4096], buf[8192];
+    int port, ssl, fd, n, total = 0;
+    struct sockaddr_in sin;
+    struct hostent *he;
+    FILE *fp;
+    char *body = NULL;
+    int status = 599;
+    char reason[128] = "Internal Exception";
+    char resp[65536];
+    size_t resp_n = 0;
+    double timeout = 60;
+    PerlValue *tv;
+    (void)self;
+    if (!nst_parse_url(url, host, &port, path, &ssl) || ssl)
+        return nst_http_resp(599, "Internal Exception", "", url);
+    tv = self ? perl_hash_get_str_ref(self, "timeout") : NULL;
+    if (tv) timeout = perl_to_float(tv);
+    he = gethostbyname(host);
+    if (!he || !he->h_addr_list || !he->h_addr_list[0])
+        return nst_http_resp(599, "Internal Exception", "", url);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return nst_http_resp(599, "Internal Exception", "", url);
+    {
+        struct timeval tvt;
+        tvt.tv_sec = (long)timeout; tvt.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tvt, sizeof tvt);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tvt, sizeof tvt);
+    }
+    memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons((uint16_t)port);
+    memcpy(&sin.sin_addr, he->h_addr_list[0], 4);
+    if (connect(fd, (struct sockaddr *)&sin, sizeof sin) != 0) {
+        close(fd);
+        return nst_http_resp(599, "Internal Exception", "", url);
+    }
+    {
+        long long clen = 0;
+        char *cdata = NULL;
+        if (content) cdata = perl_to_string_dup_len(content, &clen);
+        if (cdata && clen > 0)
+            snprintf(req, sizeof req,
+                     "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: HTTP-Tiny/0.096\r\n"
+                     "Content-Length: %lld\r\nConnection: close\r\n\r\n",
+                     method, path, host, clen);
+        else
+            snprintf(req, sizeof req,
+                     "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: HTTP-Tiny/0.096\r\n"
+                     "Connection: close\r\n\r\n",
+                     method, path, host);
+        send(fd, req, strlen(req), 0);
+        if (cdata && clen > 0) send(fd, cdata, (size_t)clen, 0);
+        free(cdata);
+    }
+    while ((n = (int)recv(fd, buf, sizeof buf, 0)) > 0) {
+        if (resp_n + (size_t)n > sizeof(resp) - 1) n = (int)(sizeof(resp) - 1 - resp_n);
+        if (n <= 0) break;
+        memcpy(resp + resp_n, buf, (size_t)n);
+        resp_n += (size_t)n;
+        if (resp_n >= sizeof(resp) - 1) break;
+        total += n;
+    }
+    close(fd);
+    resp[resp_n] = 0;
+    {
+        char *hdr_end = strstr(resp, "\r\n\r\n");
+        char *line = resp;
+        if (sscanf(line, "HTTP/%*s %d %127[^\r\n]", &status, reason) < 1)
+            status = 599;
+        if (hdr_end) body = hdr_end + 4;
+        else body = resp;
+    }
+    return nst_http_resp(status, reason, body ? body : "", url);
+}
+
+PerlValue *perl_http_tiny_new(PerlArray *args) {
+    PerlHash *h = perl_anon_hash_new();
+    PerlValue *v, *obj;
+    long long i;
+    v = perl_alloc_string("HTTP-Tiny/0.096"); nst_hset(h, "agent", v); perl_free(v);
+    v = perl_alloc_int(60); nst_hset(h, "timeout", v); perl_free(v);
+    if (args) {
+        for (i = 0; i + 1 < args->len; i += 2) {
+            char *k = perl_to_string_dup(args->elems[i]);
+            nst_hset(h, k, args->elems[i + 1]);
+            free(k);
+        }
+    }
+    obj = perl_ref_hash(h);
+    if (obj->blessed_class) free(obj->blessed_class);
+    obj->blessed_class = strdup("HTTP::Tiny");
+    return obj;
+}
+
+PerlValue *perl_wave45_method(PerlValue *obj, const char *method, PerlArray *args) {
+    const char *cls = NULL;
+    if (!method) return NULL;
+    if (obj && obj->tag == PERL_STRING && obj->sval) cls = obj->sval;
+    else if (obj && obj->blessed_class) cls = obj->blessed_class;
+    if (!cls) return NULL;
+
+    if (strcmp(cls, "File::stat") == 0) {
+        static const char *fields[] = {
+            "dev","ino","mode","nlink","uid","gid","rdev","size",
+            "atime","mtime","ctime","blksize","blocks", NULL
+        };
+        int i;
+        if (obj->tag == PERL_STRING) return NULL;
+        for (i = 0; fields[i]; i++)
+            if (strcmp(method, fields[i]) == 0) return nst_hget(obj, method);
+        return NULL;
+    }
+    if (strcmp(cls, "version") == 0) {
+        if (obj->tag == PERL_STRING &&
+            (strcmp(method, "parse") == 0 || strcmp(method, "new") == 0 ||
+             strcmp(method, "declare") == 0 || strcmp(method, "qv") == 0)) {
+            PerlValue *s = args && args->len ? args->elems[0] : perl_alloc_string("0");
+            return perl_version_parse(s);
+        }
+        if (obj->tag != PERL_STRING) {
+            if (strcmp(method, "numify") == 0) return nst_hget(obj, "num");
+            if (strcmp(method, "normal") == 0) return nst_hget(obj, "nstr");
+            if (strcmp(method, "stringify") == 0) return nst_hget(obj, "s");
+            if (strcmp(method, "is_qv") == 0) return nst_hget(obj, "qv");
+        }
+        return NULL;
+    }
+    if (strcmp(cls, "HTTP::Tiny") == 0) {
+        if (obj->tag == PERL_STRING && strcmp(method, "new") == 0)
+            return perl_http_tiny_new(args);
+        if (obj->tag == PERL_STRING && strcmp(method, "can_ssl") == 0)
+            return perl_alloc_bool(0);
+        if (obj->tag != PERL_STRING) {
+            PerlHash *self = nst_href(obj);
+            const char *mth = method;
+            char *url;
+            PerlValue *content = NULL;
+            if (strcmp(method, "can_ssl") == 0) return perl_alloc_bool(0);
+            if (strcmp(method, "get") == 0 || strcmp(method, "head") == 0 ||
+                strcmp(method, "post") == 0 || strcmp(method, "put") == 0 ||
+                strcmp(method, "delete") == 0) {
+                if (strcmp(method, "get") == 0) mth = "GET";
+                else if (strcmp(method, "head") == 0) mth = "HEAD";
+                else if (strcmp(method, "post") == 0) mth = "POST";
+                else if (strcmp(method, "put") == 0) mth = "PUT";
+                else mth = "DELETE";
+                url = args && args->len ? perl_to_string_dup(args->elems[0]) : strdup("/");
+                if (args && args->len > 1 && nst_href(args->elems[1])) {
+                    PerlValue *c = perl_hash_get_str_ref(nst_href(args->elems[1]), "content");
+                    if (c) content = c;
+                }
+                {
+                    PerlValue *r = nst_http_request(self, mth, url, content);
+                    free(url);
+                    return r;
+                }
+            }
+            if (strcmp(method, "request") == 0) {
+                char *meth = args && args->len ? perl_to_string_dup(args->elems[0]) : strdup("GET");
+                url = args && args->len > 1 ? perl_to_string_dup(args->elems[1]) : strdup("/");
+                if (args && args->len > 2 && nst_href(args->elems[2])) {
+                    PerlValue *c = perl_hash_get_str_ref(nst_href(args->elems[2]), "content");
+                    if (c) content = c;
+                }
+                {
+                    PerlValue *r = nst_http_request(self, meth, url, content);
+                    free(meth); free(url);
+                    return r;
+                }
+            }
+        }
+        return NULL;
+    }
+    return NULL;
+}
+

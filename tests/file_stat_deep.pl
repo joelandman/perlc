@@ -1,0 +1,12 @@
+use File::stat;
+my $p = "/tmp/perlc_fstat_deep.txt";
+open my $fh, ">", $p; print $fh "xyz"; close $fh;
+my $s = stat($p);
+print "isa=", ref($s), "\n";
+print "size=", $s->size, "\n";
+print "mode_ok=", (($s->mode & 0777) > 0 ? 1 : 0), "\n";
+print "nlink=", $s->nlink, "\n";
+print "uid_def=", (defined $s->uid ? 1 : 0), "\n";
+print "missing=", (defined(stat("/tmp/perlc_fstat_nope.txt")) ? 1 : 0), "\n";
+unlink $p;
+print "done\n";

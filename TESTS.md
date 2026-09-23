@@ -3351,6 +3351,27 @@ Tests: `tests/findbin_{smoke,deep}.pl`, `tests/symbol_{smoke,deep}.pl`,
 `tests/socket_native_{smoke,deep}.pl`, `tests/io_socket_{smoke,deep}.pl`,
 `tests/mime_base64_{smoke,deep}.pl`, `tests/digest_native_{smoke,deep}.pl`.
 
+### Native stdlib waves 4–5 (2026-09-23)
+
+- **Getopt::Std:** `getopts`/`getopt` cluster flags into a hash or `$opt_*` globs; mutates `@ARGV`.
+- **Text::ParseWords:** `shellwords`/`quotewords`/`parse_line` (quoted fields, keep-quotes).
+- **File::Compare:** `compare` (0 same, 1 different, -1 missing).
+- **File::stat:** overrides `stat`/`lstat` after `use File::stat` to return a blessed object (`->size`/`->mode`/…).
+- **English:** `$PID`/`$OS_ERROR`/`$OSNAME`/… aliases gated on `use English`.
+- **if:** `use if LITERAL, MODULE, ARGS` (compile-time; `if` is `TK::KW_IF`; quoted module names strip the lexer `\x01` prefix).
+- **experimental:** `use experimental 'signatures'` enables the same signature parser as `use feature`.
+- **HTTP::Tiny:** `new`/`get`/`request` HTTP/1.0, no TLS (`can_ssl` is false). Response hash: status/reason/success/content/headers/url. 599 on connect failure.
+- **version:** `version->parse`/`qv`, `numify`/`normal`, `""` and `<=>` overloads.
+- **autodie:** `open`/`unlink`/`mkdir`/`chdir` croak via `perl_die_croak` when the pragma is on.
+- **PerlIO::scalar:** `use PerlIO::scalar` is a no-op pragma; in-memory `open $fh, '<', \$s` already existed.
+
+Tests: `tests/getopt_std_{smoke,deep}.pl`, `tests/parsewords_{smoke,deep}.pl`,
+`tests/file_compare_{smoke,deep}.pl`, `tests/file_stat_{smoke,deep}.pl`,
+`tests/english_{smoke,deep}.pl`, `tests/if_pragma_{smoke,deep}.pl`,
+`tests/experimental_{smoke,deep}.pl`, `tests/http_tiny_{smoke,deep}.pl`,
+`tests/version_mod_{smoke,deep}.pl`, `tests/autodie_{smoke,deep}.pl`,
+`tests/perlio_scalar_mod_{smoke,deep}.pl`.
+
 ## Source layout
 
 | File | Role |
