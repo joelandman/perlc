@@ -26,7 +26,18 @@ typedef enum {
     PERL_XS_PTR       = 16, /* opaque native pointer — pval=void* */
     PERL_BIGINT       = 17, /* Math::BigInt — pval=mpz_t* (GMP or mini-gmp), blessed_class="Math::BigInt" */
     PERL_QR           = 18, /* compiled regex — pval=PerlQrRegex* */
+    PERL_CPLX_ROW     = 19, /* packed complexes: pval=PerlCplxRow* (interleaved re,im) */
 } PerlTag;
+
+/* Stage 35: a row of N complex pairs as contiguous doubles, observed as
+   an ARRAY of N 2-element arrayrefs (`$row->[$i]` → (re,im)). Shared by
+   PV aliases (refcount); writes through any alias hit the same buffer. */
+typedef struct PerlCplxRow {
+    double    *data;     /* interleaved re,im — length 2*n */
+    long long  n;        /* number of complexes (Perl array length) */
+    long long  cap;      /* capacity in pairs */
+    int        refcount;
+} PerlCplxRow;
 
 /* PV_FLAG_SHARED: cell is a threads::shared variable (see SharedMutex below). */
 #define PV_FLAG_SHARED 1u
@@ -117,6 +128,8 @@ char      *perl_to_string_dup_len(const PerlValue *v, long long *out_len); /* D8
 PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] */
 PerlValue *perl_alloc_float_array(long long n); /* alloc FLAT_ARRAY with n zero doubles */
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
+PerlValue *perl_alloc_cplx_row(long long n); /* PERL_CPLX_ROW of n zero pairs */
+PerlValue *perl_cplx_elem(PerlValue *row, long long idx); /* $row->[$i] as FLOAT_PAIR (clone) */
 PerlValue *perl_alloc_xs_ptr(void *p);
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);
@@ -968,10 +981,10 @@ PerlValue *perl_glob_slot(const char *name, const char *slot);
    in the same loop body).  op: 0=+,1=-,2=*,3=/.  Returns the boxed result. */
  PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
                                     PerlValue *rhs_pv, int op);
- /* D98: set one element in a 2D row that may be FLAT_ARRAY or REF_ARRAY.
-    Keeps FLAT_ARRAY rows flat (writes the numified value into the backing
-    double[] in bounds) so the "all rows flat" read fast-path assumption stays
-    valid; otherwise falls back to the normal converting set.  Clones v. */
+ /* D98: set one element in a 2D row that may be FLAT_ARRAY, CPLX_ROW, or
+    REF_ARRAY.  Keeps FLAT_ARRAY rows flat (writes the numified value into
+    the backing double[] in bounds).  A FLOAT_PAIR store into an empty or
+    all-pair row packs it as CPLX_ROW.  Clones v. */
  PerlValue *perl_array_set_row(PerlValue *row_pv, long long idx, PerlValue *v);
  /* D98: ensure parent[idx] holds an array ref, creating one only if missing/
     undef — but (unlike perl_array_autoviv_array_idx) it does NOT convert an

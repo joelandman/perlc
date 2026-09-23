@@ -89,6 +89,9 @@ private:
     std::vector<std::unordered_map<std::string, llvm::Value *>> rowAVScopes_;
     /* per-loop flat row cache: "outerVar\x01indexVar" → ptr alloca (double*, null if not flat) */
     std::vector<std::unordered_map<std::string, llvm::Value *>> flatRowScopes_;
+    /* Stage 35: unboxed (re,im) for a local assigned from $row->[$i] */
+    struct CplxPairSlots { llvm::Value *re; llvm::Value *im; };
+    std::vector<std::unordered_map<std::string, CplxPairSlots>> pairScopes_;
     /* Stage 23: per-outer-loop allflat pre-check: outerVar → i1 alloca (1 if all rows flat) */
     std::unordered_map<std::string, llvm::Value *> avAllflatSlots_;
     /* Stage 30: for float vars assigned via sqrt(x), track x so that
@@ -126,6 +129,9 @@ private:
         }
         if (name == "stage34" || name == "loopvec") {
             if (disabledStages_.count("stage34") || disabledStages_.count("loopvec")) return false;
+        }
+        if (name == "stage35" || name == "cplxrow") {
+            if (disabledStages_.count("stage35") || disabledStages_.count("cplxrow")) return false;
         }
         return true;
     }
@@ -360,6 +366,17 @@ private:
     bool cforIsCountedNumeric(const Node &n);
     bool emitUnboxedNumericVoid(const Node &n); /* store-only; no boxI64/boxF64 */
     llvm::Value *emitPromotedF64(const Node &n); /* emitExprF64, or SIToFP of i64 */
+    /* Stage 35 packed complex rows */
+    const CplxPairSlots *lookupPairSlots(const std::string &name) const;
+    CplxPairSlots *ensurePairSlots(const std::string &name);
+    bool tryLoadCplxPairF64(llvm::Value *rowPv, llvm::Value *idx,
+                            llvm::Value *&re, llvm::Value *&im);
+    bool tryBindCplxPair(const std::string &nm, const Node &rhs);
+    bool tryStoreCplxPair(llvm::Value *rowPv, llvm::Value *idx,
+                          llvm::Value *re, llvm::Value *im);
+    bool isPackedPairRhs(const Node &n);
+    bool emitPackedPairComponents(const Node &n, llvm::Value *&re, llvm::Value *&im);
+    bool tryEmitPackedPairAssign(const Node &n);
     llvm::Value *emitRegexMatchBool(const Node &n); /* i32 0/1; installs $&/$1 if needed */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
 

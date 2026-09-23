@@ -404,6 +404,8 @@ void CodeGen::declareRuntime() {
     RT("perl_flat_row_op_assign", pv,     pv, i64, pv, Type::getInt32Ty(ctx_));
     RT("perl_array_set_row",      pv,     pv, i64, pv);
     RT("perl_array_ensure_slot",  voidTy, av, i64);
+    RT("perl_cplx_elem",          pv,     pv, i64);
+    RT("perl_alloc_cplx_row",     pv,     i64);
     /* D97: Math::BigInt built-in methods */
     RT("perl_bigint_new",         pv,     pv);
     RT("perl_bigint_bmul",        pv,     pv, pv);
@@ -968,6 +970,7 @@ void CodeGen::pushScope()  {
     floatScopes_.emplace_back(); intScopes_.emplace_back();
     derefAVScopes_.emplace_back(); rowAVScopes_.emplace_back();
     flatRowScopes_.emplace_back();
+    pairScopes_.emplace_back();
 }
 void CodeGen::popScope() {
     /* free stable PerlValue*s for my-vars going out of scope, unless in dead block */
@@ -981,6 +984,7 @@ void CodeGen::popScope() {
     floatScopes_.pop_back(); intScopes_.pop_back();
     derefAVScopes_.pop_back(); rowAVScopes_.pop_back();
     flatRowScopes_.pop_back();
+    pairScopes_.pop_back();
 }
 
 Value *CodeGen::lookupVar(const std::string &nm) {
@@ -2574,6 +2578,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_dispatch_method",
         /* reference constructors: each returns a freshly allocated PerlValue* */
         "perl_ref_hash", "perl_ref_array", "perl_ref_scalar",
+        "perl_cplx_elem", "perl_alloc_cplx_row", "perl_alloc_float_pair",
     };
     if (owned.count(nm.str()) > 0) return true;
     /* perl_bless returns its first argument unchanged.  It is owned (and therefore
@@ -2952,6 +2957,277 @@ Value *CodeGen::emitPromotedF64(const Node &n) {
     return nullptr;
 }
 
+const CodeGen::CplxPairSlots *CodeGen::lookupPairSlots(const std::string &name) const {
+    for (int i = (int)pairScopes_.size() - 1; i >= 0; i--) {
+        auto it = pairScopes_[i].find(name);
+        if (it != pairScopes_[i].end()) return &it->second;
+    }
+    return nullptr;
+}
+
+CodeGen::CplxPairSlots *CodeGen::ensurePairSlots(const std::string &name) {
+    if (pairScopes_.empty()) return nullptr;
+    auto it = pairScopes_.back().find(name);
+    if (it != pairScopes_.back().end()) return &it->second;
+    auto *f64 = Type::getDoubleTy(ctx_);
+    CplxPairSlots sl;
+    sl.re = createEntryAlloca(f64, nullptr, name + ".re");
+    sl.im = createEntryAlloca(f64, nullptr, name + ".im");
+    builder_.CreateStore(ConstantFP::get(f64, 0.0), sl.re);
+    builder_.CreateStore(ConstantFP::get(f64, 0.0), sl.im);
+    pairScopes_.back()[name] = sl;
+    return &pairScopes_.back()[name];
+}
+
+bool CodeGen::isPackedPairRhs(const Node &n) {
+    if (n.kind == NK::AnonArray && n.args.size() == 2 &&
+        n.args[0] && n.args[1] &&
+        (canEmitF64(*n.args[0]) || canEmitI64(*n.args[0])) &&
+        (canEmitF64(*n.args[1]) || canEmitI64(*n.args[1])))
+        return true;
+    if (n.kind == NK::Call) {
+        auto it = inlineSubs_.find(n.name);
+        if (it != inlineSubs_.end() && it->second.bodyExpr)
+            return isPackedPairRhs(*it->second.bodyExpr);
+    }
+    if (n.kind == NK::ScalarVar) {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        return lookupPairSlots(nm) != nullptr;
+    }
+    return false;
+}
+
+bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&im) {
+    if (!rowPv || !idx) return false;
+    auto *i8 = Type::getInt8Ty(ctx_);
+    auto *i32 = Type::getInt32Ty(ctx_);
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *f64 = Type::getDoubleTy(ctx_);
+    auto *curFn = builder_.GetInsertBlock()->getParent();
+    Value *tag = builder_.CreateLoad(i32, rowPv, "cplx.tag");
+    setTBAA(tag, tbaaPvTagTag_);
+    Value *isCplx = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 19), "iscplx");
+    auto *cBB = BasicBlock::Create(ctx_, "cplx.ld", curFn);
+    auto *pBB = BasicBlock::Create(ctx_, "cplx.fp", curFn);
+    auto *fBB = BasicBlock::Create(ctx_, "cplx.fb", curFn);
+    auto *mBB = BasicBlock::Create(ctx_, "cplx.m", curFn);
+    builder_.CreateCondBr(isCplx, cBB, pBB);
+
+    builder_.SetInsertPoint(cBB);
+    Value *hdrPtr = builder_.CreateConstInBoundsGEP1_64(i8, rowPv, 8, "cplx.hp");
+    Value *hdr = builder_.CreateLoad(perlPtrTy_, hdrPtr, "cplx.hdr");
+    Value *dataPtr = builder_.CreateLoad(perlPtrTy_, hdr, "cplx.data");
+    Value *nPtr = builder_.CreateConstInBoundsGEP1_64(i8, hdr, 8, "cplx.np");
+    Value *n = builder_.CreateLoad(i64, nPtr, "cplx.n");
+    Value *inRange = builder_.CreateAnd(
+        builder_.CreateICmpSGE(idx, ConstantInt::get(i64, 0)),
+        builder_.CreateICmpSLT(idx, n), "cplx.ir");
+    auto *okBB = BasicBlock::Create(ctx_, "cplx.ok", curFn);
+    builder_.CreateCondBr(inRange, okBB, fBB);
+    builder_.SetInsertPoint(okBB);
+    Value *two = ConstantInt::get(i64, 2);
+    Value *base = builder_.CreateMul(idx, two, "cplx.b");
+    Value *dataF = builder_.CreateBitCast(dataPtr, f64->getPointerTo());
+    Value *reP = builder_.CreateGEP(f64, dataF, base, "cplx.rep");
+    Value *imP = builder_.CreateGEP(f64, dataF,
+        builder_.CreateAdd(base, ConstantInt::get(i64, 1)), "cplx.imp");
+    Value *reC = builder_.CreateLoad(f64, reP, "cplx.re");
+    Value *imC = builder_.CreateLoad(f64, imP, "cplx.im");
+    setTBAA(reC, tbaaFlatDoubleTag_);
+    setTBAA(imC, tbaaFlatDoubleTag_);
+    builder_.CreateBr(mBB);
+    auto *okBBp = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(pBB);
+    Value *isPair = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 13), "ispairr");
+    auto *prBB = BasicBlock::Create(ctx_, "cplx.pr", curFn);
+    builder_.CreateCondBr(isPair, prBB, fBB);
+    builder_.SetInsertPoint(prBB);
+    /* Indexing a FLOAT_PAIR as a 1-element "row" is not a pair-of-pairs.
+       Fall through to boxed elem. */
+    builder_.CreateBr(fBB);
+
+    builder_.SetInsertPoint(fBB);
+    Value *elem = callRT("perl_cplx_elem", {rowPv, idx});
+    Value *reF2 = builder_.CreateLoad(f64,
+        builder_.CreateConstInBoundsGEP1_64(i8, elem, 8, "cplx.repv"), "cplx.ref");
+    Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(i8, elem, 16, "cplx.mp");
+    Value *mpBits = builder_.CreateLoad(i64, mpPtr, "cplx.imb");
+    Value *imF = builder_.CreateBitCast(mpBits, f64, "cplx.imf");
+    freeIfOwned(elem);
+    builder_.CreateBr(mBB);
+    auto *fBBp = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(mBB);
+    auto *rePhi = builder_.CreatePHI(f64, 2, "cplx.re.phi");
+    auto *imPhi = builder_.CreatePHI(f64, 2,  "cplx.im.phi");
+    rePhi->addIncoming(reC, okBBp);
+    imPhi->addIncoming(imC, okBBp);
+    rePhi->addIncoming(reF2, fBBp);
+    imPhi->addIncoming(imF, fBBp);
+    re = rePhi;
+    im = imPhi;
+    return true;
+}
+
+bool CodeGen::tryBindCplxPair(const std::string &nm, const Node &rhs) {
+    if (!isOptStageEnabled("cplxrow")) return false;
+    if (rhs.kind != NK::ArrowDeref || rhs.sval != "array" || !rhs.left || !rhs.right)
+        return false;
+    if (rhs.left->kind == NK::ArrowDeref) return false;
+    Value *base = emitExpr(*rhs.left);
+    Value *idx = emitIdx(*rhs.right);
+    Value *re = nullptr, *im = nullptr;
+    if (!tryLoadCplxPairF64(base, idx, re, im)) {
+        freeIfOwned(base);
+        return false;
+    }
+    CplxPairSlots *sl = ensurePairSlots(nm);
+    if (!sl) {
+        freeIfOwned(base);
+        return false;
+    }
+    builder_.CreateStore(re, sl->re);
+    builder_.CreateStore(im, sl->im);
+    freeIfOwned(base);
+    return true;
+}
+
+bool CodeGen::tryStoreCplxPair(Value *rowPv, Value *idx, Value *re, Value *im) {
+    if (!rowPv || !idx || !re || !im) return false;
+    auto *i8 = Type::getInt8Ty(ctx_);
+    auto *i32 = Type::getInt32Ty(ctx_);
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *f64 = Type::getDoubleTy(ctx_);
+    auto *curFn = builder_.GetInsertBlock()->getParent();
+    Value *tag = builder_.CreateLoad(i32, rowPv, "cplx.st.tag");
+    setTBAA(tag, tbaaPvTagTag_);
+    Value *isCplx = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 19), "iscplx.st");
+    auto *okBB = BasicBlock::Create(ctx_, "cplx.st.ok", curFn);
+    auto *fbBB = BasicBlock::Create(ctx_, "cplx.st.fb", curFn);
+    auto *mBB  = BasicBlock::Create(ctx_, "cplx.st.m", curFn);
+    auto *chkBB = BasicBlock::Create(ctx_, "cplx.st.chk", curFn);
+    builder_.CreateCondBr(isCplx, chkBB, fbBB);
+    builder_.SetInsertPoint(chkBB);
+    Value *hdrPtr = builder_.CreateConstInBoundsGEP1_64(i8, rowPv, 8, "cplx.st.hp");
+    Value *hdr = builder_.CreateLoad(perlPtrTy_, hdrPtr, "cplx.st.hdr");
+    Value *dataPtr = builder_.CreateLoad(perlPtrTy_, hdr, "cplx.st.data");
+    Value *nPtr = builder_.CreateConstInBoundsGEP1_64(i8, hdr, 8, "cplx.st.np");
+    Value *n = builder_.CreateLoad(i64, nPtr, "cplx.st.n");
+    Value *inRange = builder_.CreateAnd(
+        builder_.CreateICmpSGE(idx, ConstantInt::get(i64, 0)),
+        builder_.CreateICmpSLT(idx, n), "cplx.st.ir");
+    builder_.CreateCondBr(inRange, okBB, fbBB);
+    builder_.SetInsertPoint(okBB);
+    Value *two = ConstantInt::get(i64, 2);
+    Value *base = builder_.CreateMul(idx, two, "cplx.st.b");
+    Value *dataF = builder_.CreateBitCast(dataPtr, f64->getPointerTo());
+    Value *reP = builder_.CreateGEP(f64, dataF, base, "cplx.st.rep");
+    Value *imP = builder_.CreateGEP(f64, dataF,
+        builder_.CreateAdd(base, ConstantInt::get(i64, 1)), "cplx.st.imp");
+    auto *s1 = builder_.CreateStore(re, reP);
+    auto *s2 = builder_.CreateStore(im, imP);
+    if (tbaaFlatDoubleTag_) {
+        s1->setMetadata(LLVMContext::MD_tbaa, tbaaFlatDoubleTag_);
+        s2->setMetadata(LLVMContext::MD_tbaa, tbaaFlatDoubleTag_);
+    }
+    builder_.CreateBr(mBB);
+    builder_.SetInsertPoint(fbBB);
+    Value *pair = callRT("perl_alloc_float_pair", {re, im});
+    callRT("perl_array_set_row", {rowPv, idx, pair});
+    freeIfOwned(pair);
+    builder_.CreateBr(mBB);
+    builder_.SetInsertPoint(mBB);
+    return true;
+}
+
+bool CodeGen::emitPackedPairComponents(const Node &n, Value *&re, Value *&im) {
+    if (n.kind == NK::AnonArray && n.args.size() == 2 && n.args[0] && n.args[1]) {
+        re = emitPromotedF64(*n.args[0]);
+        im = emitPromotedF64(*n.args[1]);
+        return re && im;
+    }
+    if (n.kind == NK::ScalarVar) {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        if (const CplxPairSlots *sl = lookupPairSlots(nm)) {
+            auto *f64 = Type::getDoubleTy(ctx_);
+            re = builder_.CreateLoad(f64, sl->re, nm + ".re");
+            im = builder_.CreateLoad(f64, sl->im, nm + ".im");
+            return true;
+        }
+        return false;
+    }
+    if (n.kind == NK::ArrowDeref && n.sval == "array" && n.left && n.right &&
+        n.left->kind != NK::ArrowDeref) {
+        Value *base = emitExpr(*n.left);
+        Value *idx = emitIdx(*n.right);
+        bool ok = tryLoadCplxPairF64(base, idx, re, im);
+        freeIfOwned(base);
+        return ok;
+    }
+    if (n.kind == NK::Call) {
+        auto it = inlineSubs_.find(n.name);
+        if (it == inlineSubs_.end() || !it->second.bodyExpr) return false;
+        const Node &body = *it->second.bodyExpr;
+        if (body.kind != NK::AnonArray || body.args.size() != 2) return false;
+        if (n.args.size() != it->second.params.size()) return false;
+        pushScope();
+        auto *f64 = Type::getDoubleTy(ctx_);
+        for (size_t i = 0; i < it->second.params.size(); i++) {
+            const std::string &pn = it->second.params[i];
+            bool bound = false;
+            if (n.args[i]->kind == NK::ScalarVar) {
+                std::string an = n.args[i]->name;
+                if (!an.empty() && an[0] == '$') an = an.substr(1);
+                if (const CplxPairSlots *sl = lookupPairSlots(an)) {
+                    CplxPairSlots *ps = ensurePairSlots(pn);
+                    builder_.CreateStore(builder_.CreateLoad(f64, sl->re), ps->re);
+                    builder_.CreateStore(builder_.CreateLoad(f64, sl->im), ps->im);
+                    bound = true;
+                }
+            }
+            if (!bound && tryBindCplxPair(pn, *n.args[i]))
+                bound = true;
+            if (!bound) {
+                if (Value *fv = emitPromotedF64(*n.args[i])) {
+                    auto *fa = createEntryAlloca(f64, nullptr, "f$" + pn);
+                    builder_.CreateStore(fv, fa);
+                    declareFloatVar(pn, fa);
+                    bound = true;
+                }
+            }
+            if (!bound) {
+                popScope();
+                return false;
+            }
+        }
+        re = emitPromotedF64(*body.args[0]);
+        im = emitPromotedF64(*body.args[1]);
+        popScope();
+        return re && im;
+    }
+    return false;
+}
+
+bool CodeGen::tryEmitPackedPairAssign(const Node &n) {
+    if (!isOptStageEnabled("cplxrow")) return false;
+    if (n.kind != NK::Assign || !n.left || !n.right) return false;
+    if (n.left->kind != NK::ArrowDeref || n.left->sval != "array" ||
+        !n.left->left || !n.left->right)
+        return false;
+    if (n.left->left->kind == NK::ArrowDeref)
+        return false; /* 2D `$x->[$i][$k] =` stays on the existing set_row path */
+    Value *re = nullptr, *im = nullptr;
+    if (!emitPackedPairComponents(*n.right, re, im)) return false;
+    Value *base = emitExpr(*n.left->left);
+    Value *idx = emitIdx(*n.left->right);
+    bool ok = tryStoreCplxPair(base, idx, re, im);
+    freeIfOwned(base);
+    return ok;
+}
+
 void CodeGen::attachCountedLoopMD(Instruction *backBr, bool innerUnroll, bool vectorize) {
     if (!backBr) return;
     if (!innerUnroll && !vectorize) return;
@@ -2998,9 +3274,21 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
     }
     if (n.kind == NK::ExprStmt)
         return n.left && stmtIsUnboxedNumeric(*n.left);
+    if (n.kind == NK::My && n.right && !n.name.empty() && n.name[0] != '@' &&
+        n.name[0] != '%') {
+        if (n.right->kind == NK::ArrowDeref && n.right->sval == "array" &&
+            n.right->left && n.right->left->kind != NK::ArrowDeref)
+            return true;
+        return false;
+    }
     if (n.kind == NK::Assign) {
+        if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
+            n.right && isPackedPairRhs(*n.right))
+            return true;
         if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
         std::string nm = loopScalarNm(*n.left);
+        if (n.right->kind == NK::ArrowDeref && n.right->sval == "array")
+            return true;
         if (lookupIntVar(nm)) return canEmitI64(*n.right);
         if (lookupFloatVar(nm))
             return canEmitF64(*n.right) || canEmitI64(*n.right);
@@ -3028,6 +3316,8 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
 }
 
 bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
+    if (n.kind == NK::Assign && tryEmitPackedPairAssign(n))
+        return true;
     if (n.kind == NK::Assign) {
         if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
         std::string nm = loopScalarNm(*n.left);
@@ -3834,8 +4124,11 @@ bool CodeGen::canEmitF64(const Node &n) {
         return false;
     case NK::ArrowDeref:
         if (n.sval != "array" || !n.left) return false;
-        /* 2D subscript $ref->[$i][$j]: inner array always holds scalars */
-        if (n.left->kind == NK::ArrowDeref && n.left->sval == "array") return true;
+        /* 2D $ref->[$i][$k]: F64 only when $k is a constant (n-body field
+           or packed-pair re/im). `$z->[$j][$i]` with a variable last index
+           is a nested array/pair cell, not a double. */
+        if (n.left->kind == NK::ArrowDeref && n.left->sval == "array")
+            return n.right && n.right->kind == NK::IntLit;
         /* 1D $ref->[$i] where $ref is a DerefAV-cached param: elements are scalars */
         if (n.left->kind == NK::ScalarVar) {
             std::string nm = n.left->name;
@@ -3992,6 +4285,16 @@ Value *CodeGen::emitExprF64(const Node &n) {
     case NK::ArrowDeref: {
         /* $ref->[$i] or $ref->{k} read — unbox the element */
         if (n.sval == "array") {
+            /* Stage 35: $z->[0]/[1] from a pair-unboxed local. */
+            if (n.left && n.left->kind == NK::ScalarVar && n.right &&
+                n.right->kind == NK::IntLit &&
+                (n.right->ival == 0 || n.right->ival == 1)) {
+                std::string nm = n.left->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (const CplxPairSlots *sl = lookupPairSlots(nm))
+                    return builder_.CreateLoad(f64, n.right->ival == 0 ? sl->re : sl->im,
+                                               nm + (n.right->ival == 0 ? ".re" : ".im"));
+            }
             /* 2D pattern $arr->[$i][$k]: emit full readonly chain so GVN can CSE */
             if (n.left->kind == NK::ArrowDeref && n.left->sval == "array") {
                 /* Outer deref: use cached PerlArray* if available (Stage 15) */
@@ -5992,6 +6295,7 @@ void CodeGen::emitStmt(const Node &n) {
                     freeIfOwned(init);
                 }
                 declareVar(nm, alloca);
+                if (n.right) tryBindCplxPair(nm, *n.right);
             }
         }
         break;
@@ -8173,6 +8477,17 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* $ref->[i] = val  or  $ref->{k} = val  (with autovivification) */
         if (n.left->kind == NK::ArrowDeref) {
             if (n.left->sval == "array") {
+                if (isOptStageEnabled("cplxrow") && n.left->left && n.left->right) {
+                    Value *pre = nullptr, *pim = nullptr;
+                    if (n.left->left->kind != NK::ArrowDeref &&
+                        emitPackedPairComponents(*n.right, pre, pim)) {
+                        Value *base = emitExpr(*n.left->left);
+                        Value *pidx = emitIdx(*n.left->right);
+                        tryStoreCplxPair(base, pidx, pre, pim);
+                        freeIfOwned(base);
+                        return callRT("perl_alloc_float_pair", {pre, pim});
+                    }
+                }
                 Value *idx = emitIdx(*n.left->right);
                 Value *rhs = emitExpr(*n.right);
                 /* autovivify $h{k}[i] = val */
@@ -8501,6 +8816,11 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
         }
         Value *rhs = emitExpr(*n.right);
+        if (n.left->kind == NK::ScalarVar && n.right) {
+            std::string bnm = n.left->name;
+            if (!bnm.empty() && bnm[0] == '$') bnm = bnm.substr(1);
+            tryBindCplxPair(bnm, *n.right);
+        }
         /* DerefAV cache for local vars: when $local = $cached->[idx], cache the
            PerlArray* so inner-loop $local->[i] skips perl_deref_array_ro. */
         if (n.left->kind == NK::ScalarVar && n.right->kind == NK::ArrowDeref) {
@@ -8517,25 +8837,36 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *tag = builder_.CreateLoad(i32T, base, "tag");
                     Value *isFlat = builder_.CreateICmpEQ(tag,
                         ConstantInt::get(i32T, 10), "isflat");
+                    Value *isCplx = builder_.CreateICmpEQ(tag,
+                        ConstantInt::get(i32T, 19), "iscplx.lva");
                     auto *curFn = builder_.GetInsertBlock()->getParent();
+                    auto *chkBB = BasicBlock::Create(ctx_, "lva.chk", curFn);
                     auto *fBB = BasicBlock::Create(ctx_, "lva.f", curFn);
                     auto *nBB = BasicBlock::Create(ctx_, "lva.n", curFn);
                     auto *mBB = BasicBlock::Create(ctx_, "lva.m", curFn);
+                    auto *doneBB = BasicBlock::Create(ctx_, "lva.done", curFn);
+                    /* CPLX_ROW pval is PerlCplxRow*, not PerlArray* — skip DerefAV. */
+                    builder_.CreateCondBr(isCplx, doneBB, chkBB);
+                    builder_.SetInsertPoint(chkBB);
                     builder_.CreateCondBr(isFlat, fBB, nBB);
                     builder_.SetInsertPoint(fBB);
                     Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(i8T, base, 8, "lva.pv");
                     Value *dblPtr = builder_.CreateLoad(perlPtrTy_, pvalPtr, "lva.dp");
                     builder_.CreateBr(mBB);
+                    auto *fBBp = builder_.GetInsertBlock();
                     builder_.SetInsertPoint(nBB);
                     Value *av = callRT("perl_deref_array_ro", {base});
                     builder_.CreateBr(mBB);
+                    auto *nBBp = builder_.GetInsertBlock();
                     builder_.SetInsertPoint(mBB);
                     auto *phiAv = builder_.CreatePHI(perlPtrTy_, 2, "lva.av");
-                    phiAv->addIncoming(dblPtr, fBB);
-                    phiAv->addIncoming(av, nBB);
+                    phiAv->addIncoming(dblPtr, fBBp);
+                    phiAv->addIncoming(av, nBBp);
                     auto *pa = createEntryAlloca(perlPtrTy_, nullptr, nm + ".av");
                     builder_.CreateStore(phiAv, pa);
                     declareDerefAV(nm, pa);
+                    builder_.CreateBr(doneBB);
+                    builder_.SetInsertPoint(doneBB);
                     freeIfOwned(base);
                 }
             }
@@ -9980,13 +10311,9 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         Value *base = emitExpr(*n.left);
         if (n.sval == "array") {
-            Value *av = callRT("perl_deref_array", {base});
-            /* Clone the element BEFORE freeIfOwned(base): a temporary
-               (e.g. `$csv->getline($fh)->[0]`, `$json->decode($s)->{k}`)
-               is a REF_* whose perl_free drops the container refcount to
-               0 and frees the array/hash. get_ref/get_str_ref borrow
-               pointers into that storage — use-after-free. */
-            Value *elem = callRT("perl_array_get", {av, emitIdx(*n.right)});
+            /* Stage 35: $row->[$i] on CPLX_ROW/FLOAT_PAIR/FLAT without
+               promoting the packed row (perl_deref_array would unpack). */
+            Value *elem = callRT("perl_cplx_elem", {base, emitIdx(*n.right)});
             freeIfOwned(base);
             return elem;
         } else {
@@ -12088,6 +12415,18 @@ Value *CodeGen::emitBinOp(const Node &n) {
                 builder_.CreateStore(fv, fslot);
                 if (!floatScopes_.empty()) floatScopes_.back()[is.params[i]] = fslot;
             }
+        }
+        /* Stage 35: copy packed (re,im) into the inlined param. */
+        if (n.args[i]->kind == NK::ScalarVar) {
+            std::string an = n.args[i]->name;
+            if (!an.empty() && an[0] == '$') an = an.substr(1);
+            if (const CplxPairSlots *sl = lookupPairSlots(an)) {
+                CplxPairSlots *ps = ensurePairSlots(is.params[i]);
+                builder_.CreateStore(builder_.CreateLoad(f64Ty, sl->re), ps->re);
+                builder_.CreateStore(builder_.CreateLoad(f64Ty, sl->im), ps->im);
+            }
+        } else {
+            tryBindCplxPair(is.params[i], *n.args[i]);
         }
     }
 

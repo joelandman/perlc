@@ -1165,6 +1165,143 @@ PerlValue *perl_alloc_float_pair(double re, double im) {
     return v;
 }
 
+static PerlCplxRow *cplx_row_new(long long n, long long cap) {
+    if (cap < n) cap = n;
+    if (cap < 8) cap = 8;
+    PerlCplxRow *r = (PerlCplxRow *)calloc(1, sizeof(PerlCplxRow));
+    r->n = n < 0 ? 0 : n;
+    r->cap = cap;
+    r->refcount = 1;
+    r->data = (double *)calloc((size_t)cap * 2, sizeof(double));
+    return r;
+}
+
+static void cplx_row_release(PerlCplxRow *r) {
+    if (!r) return;
+    if (--r->refcount > 0) return;
+    free(r->data);
+    free(r);
+}
+
+static int cplx_row_ensure_idx(PerlCplxRow *r, long long idx) {
+    if (!r || idx < 0) return 0;
+    long long need = idx + 1;
+    if (need > r->cap) {
+        long long ncap = r->cap < 8 ? 8 : r->cap;
+        while (ncap < need) ncap *= 2;
+        double *p = (double *)realloc(r->data, (size_t)ncap * 2 * sizeof(double));
+        if (!p) return 0;
+        memset(p + r->cap * 2, 0, (size_t)(ncap - r->cap) * 2 * sizeof(double));
+        r->data = p;
+        r->cap = ncap;
+    }
+    if (need > r->n) r->n = need;
+    return 1;
+}
+
+PerlValue *perl_alloc_cplx_row(long long n) {
+    PerlValue *v = pv_alloc();
+    v->tag = PERL_CPLX_ROW;
+    v->pval = cplx_row_new(n, n);
+    v->matchpos = n < 0 ? 0 : n;
+    v->blessed_class = NULL;
+    return v;
+}
+
+static int perl_value_pair_xy(PerlValue *v, double *re, double *im) {
+    if (!v) return 0;
+    if (v->tag == PERL_FLOAT_PAIR) {
+        *re = v->fval;
+        memcpy(im, &v->matchpos, sizeof(double));
+        return 1;
+    }
+    if (v->tag == PERL_FLAT_ARRAY && v->matchpos >= 2 && v->pval) {
+        double *d = (double *)v->pval;
+        *re = d[0];
+        *im = d[1];
+        return 1;
+    }
+    if (v->tag == PERL_REF_ARRAY && v->pval) {
+        PerlArray *av = (PerlArray *)v->pval;
+        if (av->len >= 2) {
+            *re = perl_to_float(av->elems[0]);
+            *im = perl_to_float(av->elems[1]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Convert empty/all-pair REF_ARRAY or UNDEF in place into a CPLX_ROW. */
+static int cplx_row_maybe_convert(PerlValue *row) {
+    if (!row) return 0;
+    if (row->tag == PERL_CPLX_ROW) return 1;
+    if (row->tag == PERL_UNDEF) {
+        row->tag = PERL_CPLX_ROW;
+        row->pval = cplx_row_new(0, 8);
+        row->matchpos = 0;
+        row->blessed_class = NULL;
+        return 1;
+    }
+    if (row->tag != PERL_REF_ARRAY || !row->pval) return 0;
+    PerlArray *av = (PerlArray *)row->pval;
+    /* Other PVs may alias this PerlArray (refcount>1). Converting only
+       this PV would fork: the other alias would keep the old array. */
+    if (av->refcount > 1) return 0;
+    for (long long i = 0; i < av->len; i++) {
+        PerlValue *e = av->elems[i];
+        if (e && e->tag != PERL_UNDEF && e->tag != PERL_FLOAT_PAIR)
+            return 0;
+    }
+    long long n = av->len;
+    PerlCplxRow *r = cplx_row_new(n, n);
+    for (long long i = 0; i < n; i++) {
+        PerlValue *e = av->elems[i];
+        if (e && e->tag == PERL_FLOAT_PAIR) {
+            r->data[2 * i] = e->fval;
+            memcpy(&r->data[2 * i + 1], &e->matchpos, sizeof(double));
+        }
+    }
+    if (av->refcount > 0) {
+        if (--av->refcount == 0) perl_array_free(av);
+    } else {
+        perl_array_free(av);
+    }
+    row->tag = PERL_CPLX_ROW;
+    row->pval = r;
+    row->matchpos = n;
+    return 1;
+}
+
+HOTX PerlValue *perl_cplx_elem(PerlValue *row, long long idx) {
+    if (!row) return perl_alloc_undef();
+    if (row->tag == PERL_CPLX_ROW) {
+        PerlCplxRow *r = (PerlCplxRow *)row->pval;
+        if (!r) return perl_alloc_undef();
+        if (idx < 0) idx += r->n;
+        if (idx < 0 || idx >= r->n) return perl_alloc_undef();
+        return perl_alloc_float_pair(r->data[2 * idx], r->data[2 * idx + 1]);
+    }
+    if (row->tag == PERL_FLOAT_PAIR) {
+        if (idx < 0) idx += 2;
+        if (idx == 0) return perl_alloc_float(row->fval);
+        if (idx == 1) {
+            double im;
+            memcpy(&im, &row->matchpos, sizeof(double));
+            return perl_alloc_float(im);
+        }
+        return perl_alloc_undef();
+    }
+    if (row->tag == PERL_FLAT_ARRAY) {
+        if (idx < 0) idx += row->matchpos;
+        if (idx < 0 || idx >= row->matchpos) return perl_alloc_undef();
+        double *d = (double *)row->pval;
+        return perl_alloc_float(d ? d[idx] : 0.0);
+    }
+    PerlArray *av = perl_deref_array(row);
+    return perl_array_get(av, idx);
+}
+
 PerlValue *perl_alloc_flat_array(long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLAT_ARRAY;
@@ -1249,6 +1386,14 @@ PerlValue *perl_clone(const PerlValue *src) {
         if (n > 0) memcpy(v->pval, src->pval, sizeof(double) * (size_t)n);
         return v;
     }
+    if (src->tag == PERL_CPLX_ROW && src->pval) {
+        PerlValue *v = pv_alloc();
+        *v = *src;
+        v->flags = 0;
+        v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
+        ((PerlCplxRow *)src->pval)->refcount++;
+        return v;
+    }
     if (src->tag == PERL_BIGINT) {
         /* D97: deep-copy the mpz_t */
         PerlValue *v = pv_alloc();
@@ -1331,6 +1476,10 @@ HOTX void perl_free(PerlValue *v) {
     }
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
+    if (v->tag == PERL_CPLX_ROW && v->pval) {
+        cplx_row_release((PerlCplxRow *)v->pval);
+        v->pval = NULL;
+    }
     if (v->tag == PERL_BIGINT && v->pval) {
         mpz_clear(*(mpz_t*)v->pval);
         free(v->pval);
@@ -1739,6 +1888,7 @@ const char *perl_to_string(const PerlValue *v) {
                 snprintf(buf, sizeof buf, "SCALAR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
         case PERL_REF_ARRAY:
+        case PERL_CPLX_ROW:
             if (v->blessed_class)
                 snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
             else
@@ -1919,6 +2069,7 @@ char *perl_to_string_dup(const PerlValue *v) {
                 snprintf(buf, sizeof buf, "SCALAR(0x%llx)", (unsigned long long)(uintptr_t)v->pval);
             return strdup(buf);
         case PERL_REF_ARRAY:
+        case PERL_CPLX_ROW:
             if (v->blessed_class)
                 snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class, (unsigned long long)(uintptr_t)v->pval);
             else
@@ -2041,6 +2192,8 @@ int perl_is_true(const PerlValue *v) {
         case PERL_REF_ARRAY:
         case PERL_REF_HASH:
         case PERL_FLAT_ARRAY:
+        case PERL_FLOAT_PAIR:
+        case PERL_CPLX_ROW:
             return 1;
         case PERL_FILEHANDLE:
         case PERL_XS_PTR:
@@ -2102,10 +2255,17 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         ((PerlClosure *)src->pval)->refcount++;
     } else if (src && src->tag == PERL_QR && src->pval) {
         ((PerlQrRegex *)src->pval)->refcount++;
+    } else if (src && src->tag == PERL_CPLX_ROW && src->pval) {
+        ((PerlCplxRow *)src->pval)->refcount++;
+
     }
     /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
     if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { free(dst->pval); dst->pval = NULL; }
+    if (dst->tag == PERL_CPLX_ROW && dst->pval) {
+        cplx_row_release((PerlCplxRow *)dst->pval);
+        dst->pval = NULL;
+    }
     if (dst->tag == PERL_REF_ARRAY && dst->pval) {
         PerlArray *av = (PerlArray *)dst->pval;
         if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
@@ -2177,6 +2337,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         dst->pval = copy;
     } else if (src->tag == PERL_FLOAT_PAIR) {
         /* matchpos holds the imaginary part as double bits — must NOT be zeroed. */
+    } else if (src->tag == PERL_CPLX_ROW) {
+        /* pval is a shared PerlCplxRow; refcount already bumped above. */
     } else if (src->tag == PERL_BIGINT && src->pval) {
         /* D97: deep-copy the mpz_t so src and dst each own their own. */
         dst->pval = malloc(sizeof(mpz_t));
@@ -3070,9 +3232,10 @@ static PerlValue pv_undef_sentinel_ = { .tag = PERL_UNDEF };
 /* Borrow-read: returns raw pointer into the array (no clone, no alloc).
  * Valid until the array is next modified. Never call perl_free on the result. */
 __attribute__((pure)) HOTX PerlValue *perl_array_get_ref(PerlArray *a, long long idx) {
+    if (!a || !a->elems) return &pv_undef_sentinel_;
     if (idx < 0) idx += a->len;
     if (idx < 0 || idx >= a->len) return &pv_undef_sentinel_;
-    return a->elems[idx];
+    return a->elems[idx] ? a->elems[idx] : &pv_undef_sentinel_;
 }
 
 void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
@@ -4395,12 +4558,31 @@ PerlArray *perl_deref_array(PerlValue *ref) {
         ref->matchpos = 0;
         return av;
     }
+    if (ref->tag == PERL_CPLX_ROW) {
+        PerlCplxRow *r = (PerlCplxRow *)ref->pval;
+        PerlArray *av = perl_anon_array_new();
+        long long n = r ? r->n : 0;
+        for (long long i = 0; i < n; i++) {
+            PerlValue *p = perl_alloc_float_pair(r->data[2 * i], r->data[2 * i + 1]);
+            perl_array_push(av, p);
+            perl_free(p);
+        }
+        cplx_row_release(r);
+        ref->tag = PERL_REF_ARRAY;
+        ref->pval = av;
+        ref->matchpos = 0;
+        return av;
+    }
     if (ref->tag != PERL_REF_ARRAY) return perl_array_new();
     return (PerlArray *)ref->pval;
 }
 
-/* Fast read-only deref — caller guarantees ref is a valid REF_ARRAY */
-__attribute__((pure)) HOTX PerlArray *perl_deref_array_ro(PerlValue *ref) {
+/* Fast read-only deref — caller typically has a REF_ARRAY. CPLX_ROW
+   promotes; FLAT_ARRAY / FLOAT_PAIR must NOT (the 2D F64 path relies
+   on those tags staying packed). */
+HOTX PerlArray *perl_deref_array_ro(PerlValue *ref) {
+    if (ref && ref->tag == PERL_CPLX_ROW)
+        return perl_deref_array(ref);
     return (PerlArray *)ref->pval;
 }
 
@@ -4420,6 +4602,10 @@ __attribute__((pure)) HOTX PerlArray *perl_deref_array_ro(PerlValue *ref) {
    element (codegen.cpp), and copying a whole array's elements into
    another array (`my @b = @a;`, D99). A no-op for every other tag. */
 void perl_promote_ref_array(PerlValue *pv) {
+    /* CPLX_ROW aliases share a PerlCplxRow; promoting one PV would fork
+       it into a private REF_ARRAY (D105-style) while other aliases keep
+       the packed buffer. Leave CPLX_ROW packed; @$row still unpacks via
+       perl_deref_array. */
     if (pv && (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR))
         perl_deref_array(pv);
 }
@@ -4465,6 +4651,7 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_REF_ARRAY:   return perl_alloc_string("ARRAY");
         case PERL_FLAT_ARRAY:  return perl_alloc_string("ARRAY");
         case PERL_FLOAT_PAIR:  return perl_alloc_string("ARRAY");
+        case PERL_CPLX_ROW:    return perl_alloc_string("ARRAY");
         case PERL_REF_HASH:    return perl_alloc_string("HASH");
         case PERL_CODE_REF:    return perl_alloc_string("CODE");
         case PERL_QR:          return perl_alloc_string("Regexp");
@@ -6630,7 +6817,8 @@ static PerlValue *storable_clone_container(struct DCloneCtx *ctx,
 static PerlValue *storable_dclone_pv(struct DCloneCtx *ctx, PerlValue *pv,
                                      int *owned) {
     if (!pv || pv->tag == PERL_UNDEF) { *owned = 1; return perl_alloc_undef(); }
-    if (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR) {
+    if (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR ||
+        pv->tag == PERL_CPLX_ROW) {
         /* Stage 22/23 compact numeric row — promote to a real REF_ARRAY
            (D105) so the clone is a proper independent array ref. Memo on
            the original buffer pointer: two hash entries sharing one FLAT
@@ -6639,7 +6827,10 @@ static PerlValue *storable_dclone_pv(struct DCloneCtx *ctx, PerlValue *pv,
         PerlValue *memo = storable_memo_lookup(ctx, orig);
         if (memo) { *owned = 0; return memo; }
         PerlValue *copy = perl_clone(pv);
-        perl_promote_ref_array(copy);
+        if (copy->tag == PERL_CPLX_ROW)
+            perl_deref_array(copy);
+        else
+            perl_promote_ref_array(copy);
         storable_memo_add(ctx, orig, copy);
         *owned = 0; /* memo'd — freed only with the whole clone graph */
         return copy;
@@ -6881,7 +7072,7 @@ static int json_is_ref_value(PerlValue *v) {
     perl_promote_ref_array(v);
     return v->tag == PERL_REF_ARRAY || v->tag == PERL_REF_HASH ||
            v->tag == PERL_REF_SCALAR || v->tag == PERL_FLAT_ARRAY ||
-           v->tag == PERL_FLOAT_PAIR;
+           v->tag == PERL_FLOAT_PAIR || v->tag == PERL_CPLX_ROW;
 }
 
 static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
@@ -6895,6 +7086,7 @@ static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
         jb_putstr(b, "null"); return;
     }
     perl_promote_ref_array(v); /* D105: FLAT_ARRAY/FLOAT_PAIR -> real REF_ARRAY */
+    if (v->tag == PERL_CPLX_ROW) perl_deref_array(v);
     if (depth == 0 && !b->allow_nonref && !json_is_ref_value(v)) {
         perl_die_croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
     }
@@ -17120,6 +17312,25 @@ PerlValue *perl_array_set_row(PerlValue *row_pv, long long idx, PerlValue *v) {
         flat[idx] = perl_to_float(v);
         return v;
     }
+    /* Stage 35: storing a 2-float pair into an empty/all-pair row packs it
+       as CPLX_ROW (contiguous re,im). Non-pair stores promote. */
+    {
+        double re, im;
+        if (perl_value_pair_xy(v, &re, &im) && cplx_row_maybe_convert(row_pv) &&
+            row_pv && row_pv->tag == PERL_CPLX_ROW) {
+            PerlCplxRow *r = (PerlCplxRow *)row_pv->pval;
+            long long i = idx;
+            if (i < 0) i += r ? r->n : 0;
+            if (r && cplx_row_ensure_idx(r, i)) {
+                r->data[2 * i] = re;
+                r->data[2 * i + 1] = im;
+                row_pv->matchpos = r->n;
+                return v;
+            }
+        }
+    }
+    if (row_pv && row_pv->tag == PERL_CPLX_ROW)
+        perl_deref_array(row_pv);
     PerlArray *av = perl_deref_array(row_pv);
     perl_array_set(av, idx, v);
     return v;
@@ -17147,7 +17358,7 @@ void perl_array_ensure_slot(PerlArray *parent, long long idx) {
         perl_array_set(parent, i, ref);
         perl_free(ref);
     }
-    /* FLAT_ARRAY / REF_ARRAY / FLOAT_PAIR / other: leave untouched (no convert). */
+    /* FLAT_ARRAY / REF_ARRAY / FLOAT_PAIR / CPLX_ROW / other: leave untouched. */
 }
 
 /* ── Math::BigInt (D97) ───────────────────────────────────────────────────── */
