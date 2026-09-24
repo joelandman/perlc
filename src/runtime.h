@@ -511,6 +511,14 @@ PerlValue *perl_ver_ovl_str(PerlValue *self);
 PerlValue *perl_ver_ovl_cmp(PerlValue *a, PerlValue *b);
 PerlValue *perl_http_tiny_new(PerlArray *args);
 PerlValue *perl_wave45_method(PerlValue *obj, const char *method, PerlArray *args);
+PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *args);
+PerlValue *perl_encode_qp(PerlValue *data, PerlValue *eol);
+PerlValue *perl_decode_qp(PerlValue *data);
+PerlValue *perl_tabs_expand(PerlArray *texts);
+PerlValue *perl_tabs_unexpand(PerlArray *texts);
+void       perl_open_pragma_std_utf8(void);
+PerlValue *perl_cgi_new(PerlArray *args);
+PerlValue *perl_cgi_call(const char *name, PerlArray *args);
 PerlValue *perl_text_wrap(PerlValue *ip, PerlValue *xp, PerlArray *texts,
                           PerlValue *columns, PerlValue *sep, PerlValue *sep2,
                           PerlValue *huge, PerlValue *unexpand);

@@ -1530,8 +1530,8 @@ HOTX void perl_free(PerlValue *v) {
         /* call DESTROY before the hash is freed */
         if (hv->refcount == 1 && v->blessed_class && s_destroy_depth < 100) {
             PerlSubFnCtx fn = perl_find_method(v->blessed_class, "DESTROY");
+            s_destroy_depth++;
             if (fn) {
-                s_destroy_depth++;
                 PerlArray *args = perl_array_new();
                 PerlValue *self = perl_clone(v);
                 perl_array_push(args, self);
@@ -1540,8 +1540,8 @@ HOTX void perl_free(PerlValue *v) {
                 perl_free(ret);
                 perl_array_free(args);
                 perl_free(self);
-                s_destroy_depth--;
             }
+            s_destroy_depth--;
         }
         if (hv->refcount > 0 && --hv->refcount == 0) perl_hash_free(hv);
     }
@@ -6133,9 +6133,14 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
             s_autoload_pv.sval = strdup(autoload_name);
             s_autoload_pv.slen = (long long)strlen(autoload_name);
         } else {
+            /* Real perl WARNS and returns undef for a missing method — it does
+               not die. Emitting (not exit'ing) lets the caller return undef,
+               which is what makes DESTROY-on-a-blessed-object-without-DESTROY
+               and `$ref->undefined_method` survive instead of aborting the
+               program midway (the pre-fix exit(1) here truncated output). */
             fprintf(stderr, "Can't locate object method \"%s\" via package \"%s\"\n",
                     method, class_name);
-            exit(1);
+            return NULL;
         }
     }
     PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
@@ -15497,6 +15502,23 @@ static int ansi_disabled(void) {
     const char *d = getenv("ANSI_COLORS_DISABLED");
     return d && d[0];
 }
+/* Term::ANSIColor croaks "Invalid attribute name <token>" for any color
+   spec/attribute token that is not a known attribute. Validated by
+   perl_ansi_color before building the ANSI sequence. */
+static void check_ansi_attrs(PerlArray *args, long long start) {
+    if (!args) return;
+    char *save = NULL;
+    for (long long i = start; i < args->len; i++) {
+        char *s = args->elems[i] ? strdup(perl_to_string(args->elems[i])) : "";
+        char *tok = strtok_r(s, " ", &save);
+        while (tok) {
+            if (!ansi_code_for(tok))
+                perl_die_croak("Invalid attribute name %s", tok);
+            tok = strtok_r(NULL, " ", &save);
+        }
+    }
+}
+
 PerlValue *perl_ansi_color(PerlArray *args, int colored) {
     if (ansi_disabled()) {
         if (!colored) return perl_alloc_string("");
@@ -15524,6 +15546,7 @@ PerlValue *perl_ansi_color(PerlArray *args, int colored) {
             strcat(spec, s);
             free(s);
         }
+        check_ansi_attrs(args, 0);
         PerlValue *r = ansi_seq_from_spec(spec);
         free(spec);
         return r;
@@ -15538,6 +15561,7 @@ PerlValue *perl_ansi_color(PerlArray *args, int colored) {
         strcat(spec, s);
         free(s);
     }
+    check_ansi_attrs(args, 1);
     PerlValue *pre = ansi_seq_from_spec(spec);
     PerlValue *reset = ansi_seq_from_spec("reset");
     free(spec);
@@ -15823,6 +15847,8 @@ PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv) {
     const char *want = (class_pv->tag == PERL_STRING && class_pv->sval)
                        ? class_pv->sval : "";
     const char *got  = obj->blessed_class;
+    if (!got && obj->tag == PERL_STRING && obj->sval)
+        got = obj->sval;
     if (!got) {
         /* check tag-based type names */
         const char *tname = NULL;

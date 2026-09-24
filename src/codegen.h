@@ -28,6 +28,7 @@ public:
     void setDataSection(std::string s) { dataSection_ = std::move(s); hasDataSection_ = true; }
     void setEnglishEnabled(bool v) { englishEnabled_ = v; }
     void setAutodieEnabled(bool v) { autodieEnabled_ = v; }
+    void setOpenStdUtf8(bool v) { openStdUtf8_ = v; }
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
@@ -176,6 +177,7 @@ private:
     bool asDoLib_ = false;      /* D24/D58: compiling in --do-lib mode (see compile()) */
     bool englishEnabled_ = false;
     bool autodieEnabled_ = false;
+    bool openStdUtf8_ = false;
     bool asEvalPad_ = false;    /* --eval-lib: bind outer `my` cells from the eval pad */
     bool hasDataSection_ = false;
     std::string dataSection_;   /* text after __DATA__/__END__ */

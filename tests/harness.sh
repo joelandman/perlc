@@ -206,6 +206,9 @@ run_one() {
     return $rc
 }
 
+CORE_DIVISOR="${CORE_DIVISOR:-2}"   # tests run 1-per-2-cores by default
+RUN_IN_PARALLEL="${RUN_IN_PARALLEL:-1}"   # set to 0 to force serial execution
+
 main() {
     local tests=("$@")
     if [[ ${#tests[@]} -eq 0 ]]; then
@@ -215,31 +218,85 @@ main() {
 
     local total=0 pass=0 fail=0
 
-    for t in "${tests[@]}"; do
-        local base
-        base=$(basename "$t")
+    local t base s skip rfile verdict nworkers running
 
-        # Skip some heavy/external by default unless explicitly listed
-        local skip=0
+    ncpu=$(nproc)
+    nworkers=$(( ncpu / CORE_DIVISOR ))
+    [[ $RUN_IN_PARALLEL -eq 1 ]] || nworkers=1
+    if [[ $RUN_IN_PARALLEL -eq 1 ]]; then
+        [[ $nworkers -lt 1 ]] && nworkers=1
+    fi
+
+    # Each test writes its PASS/FAIL line (+ diagnostics) to its own result
+    # file; we aggregate them in sorted order below so the summary is stable
+    # regardless of completion order. res_dir is global so the EXIT trap can
+    # clean it up after main() returns.
+    res_dir=$(mktemp -d "${TMPDIR:-/tmp}/perlc_harness.XXXXXX")
+    trap 'rm -rf "${res_dir:-}"' EXIT
+
+    # 1) Print skip notices up-front (original serial ordering).
+    for t in "${tests[@]}"; do
+        base=$(basename "$t")
         for s in "${SKIP_BY_DEFAULT[@]}"; do
             if [[ "$base" == "$s" ]]; then
-                # Only skip if not explicitly passed on cmdline
                 if [[ ${#tests[@]} -eq 0 || "$*" != *"$base"* ]]; then
-                    skip=1
+                    printf 'SKIP %s (skipped by default — run explicitly if desired)\n' "$base"
                 fi
             fi
         done
-        if [[ $skip -eq 1 ]]; then
-            printf "SKIP %s (skipped by default — run explicitly if desired)\n" "$base"
+    done
+
+    # 2) Execute (parallel pool of nworkers, or serial when disabled),
+    # buffering every verdict so step 3 can aggregate deterministically.
+    running=0
+    for t in "${tests[@]}"; do
+        base=$(basename "$t")
+
+        # Skip heavy/external by default unless explicitly listed
+        skip=0
+        for s in "${SKIP_BY_DEFAULT[@]}"; do
+            if [[ "$base" == "$s" ]]; then
+                if [[ ${#tests[@]} -eq 0 || "$*" != *"$base"* ]]; then skip=1; fi
+            fi
+        done
+        [[ $skip -eq 1 ]] && continue
+
+        if [[ $RUN_IN_PARALLEL -eq 1 && $nworkers -ge 1 ]]; then
+            if (( running >= nworkers )); then wait -n; running=$((running-1)); fi
+            # run_one prints its PASS/FAIL (+diag) to its result file
+            ( run_one "$t" >"$res_dir/$base" 2>&1 ) &
+            running=$((running+1))
+        else
+            run_one "$t" >"$res_dir/$base" 2>&1
+        fi
+    done
+    [[ $RUN_IN_PARALLEL -eq 1 ]] && wait
+
+    # 3) Aggregate results in deterministic (sorted) order.
+    for t in "${tests[@]}"; do
+        base=$(basename "$t")
+
+        skip=0
+        for s in "${SKIP_BY_DEFAULT[@]}"; do
+            if [[ "$base" == "$s" ]]; then
+                if [[ ${#tests[@]} -eq 0 || "$*" != *"$base"* ]]; then skip=1; fi
+            fi
+        done
+        [[ $skip -eq 1 ]] && continue
+
+        rfile="$res_dir/$base"
+        if [[ ! -f "$rfile" ]]; then
+            printf 'FAIL %s (no result produced)\n' "$base"
+            fail=$((fail+1))
             continue
         fi
-
-        total=$((total+1))
-        if run_one "$t"; then
-            pass=$((pass+1))
-        else
-            fail=$((fail+1))
-        fi
+        verdict=$(head -n1 "$rfile")
+        case "$verdict" in
+            PASS*)     cat "$rfile";     total=$((total+1)); pass=$((pass+1));;
+            FAIL*)     cat "$rfile";     total=$((total+1)); fail=$((fail+1));;
+            SKIP*)     printf '%s\n' "$verdict";;
+            *)         cat "$rfile";     total=$((total+1)); fail=$((fail+1));;
+        esac
     done
 
     echo ""

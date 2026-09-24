@@ -49,6 +49,7 @@ public:
     bool getWarningsUninitialized() const { return warningsUninitialized_; }
     bool getEnglishEnabled() const       { return englishEnabled_; }
     bool getAutodieEnabled() const       { return autodieEnabled_; }
+    bool getOpenStdUtf8() const          { return openStdUtf8_; }
     /* D128: tell the parser which registered source-file tag (Token::file)
        belongs to the main script. A parse error whose current token carries
        a different (or any, when this is unset) non-null tag is reported as
@@ -74,6 +75,7 @@ private:
     bool utf8Enabled_         = false; /* use utf8 — string lits are characters */
     bool englishEnabled_      = false; /* use English — $PID, $OS_ERROR, … */
     bool autodieEnabled_      = false; /* use autodie — builtins croak on fail */
+    bool openStdUtf8_         = false; /* use open qw(:std :utf8) */
     std::set<std::string>    knownBareFH_; /* open LOG, ... → print LOG */
     /* D128: registered Token::file tag of the main script (nullptr when
        unset — every non-null tag then reports as a foreign file). */

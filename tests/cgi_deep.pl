@@ -1,0 +1,14 @@
+use CGI;
+my $q = CGI->new("a=1&b=hello+world&c=x&c=y");
+print "a=", scalar($q->param("a")), "\n";
+print "b=", scalar($q->param("b")), "\n";
+print "c=", join("|", $q->multi_param("c")), "\n";
+print "names=", join("|", $q->param), "\n";
+print "qs=", $q->query_string, "\n";
+print "hdr=[", $q->header("text/plain"), "]\n";
+print "esc=", CGI::escape("a b=<"), "\n";
+print "unesc=", CGI::unescape("a+b%3D%3C"), "\n";
+print "h1=", $q->h1("Hi"), "\n";
+print "p=", $q->p("x"), "\n";
+print "cookie=", $q->cookie(-name => "n", -value => "v"), "\n";
+print "done\n";

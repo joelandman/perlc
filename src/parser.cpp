@@ -365,6 +365,28 @@ NodePtr Parser::parseUseNoStmt() {
                 match(TK::SEMI);
                 continue;
             }
+            if (check(TK::IDENT) && cur().text == "Fatal") {
+                autodieEnabled_ = true;
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
+                match(TK::SEMI);
+                continue;
+            }
+            /* use open qw(:std :encoding(UTF-8)) / :utf8 */
+            if (check(TK::KW_OPEN) || (check(TK::IDENT) && cur().text == "open")) {
+                advance();
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                    if (check(TK::QWORDS) || check(TK::STRING) || check(TK::IDENT)) {
+                        std::string t = cur().text;
+                        if (t.find("utf8") != std::string::npos ||
+                            t.find("encoding") != std::string::npos ||
+                            t.find(":std") != std::string::npos)
+                            openStdUtf8_ = true;
+                    }
+                    advance();
+                }
+                match(TK::SEMI);
+                continue;
+            }
             /* use utf8 — subsequent string literals are character strings */
             if (check(TK::IDENT) && cur().text == "utf8") {
                 advance();

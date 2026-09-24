@@ -1,0 +1,10 @@
+use FileHandle;
+use IO::Seekable;
+use Fatal qw(open);
+use Digest;
+use MIME::QuotedPrint;
+use Text::Tabs;
+print "seek_set=", SEEK_SET, "\n";
+print "seek_cur=", SEEK_CUR, "\n";
+print "fh_isa=", (FileHandle->isa("IO::Handle") ? 1 : 0), "\n";
+print "done\n";

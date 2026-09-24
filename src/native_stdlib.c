@@ -20,10 +20,13 @@
 #include <limits.h>
 #include <libgen.h>
 #include <sys/time.h>
+#include <sys/select.h>
 #include <ctype.h>
 #include <openssl/evp.h>
 
 #define PV_FLAG_AUTOFLUSH (1u << 25)
+
+PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *args);
 
 static FILE *nst_fp(PerlValue *pv) {
     if (!pv) return NULL;
@@ -37,7 +40,8 @@ static int nst_is_io_class(const char *c) {
     if (!c) return 0;
     return strcmp(c, "IO::Handle") == 0 || strcmp(c, "IO::File") == 0 ||
            strcmp(c, "IO::Socket") == 0 || strcmp(c, "IO::Socket::INET") == 0 ||
-           strcmp(c, "IO::Socket::IP") == 0;
+           strcmp(c, "IO::Socket::IP") == 0 || strcmp(c, "IO::Socket::UNIX") == 0 ||
+           strcmp(c, "FileHandle") == 0 || strcmp(c, "IO::Seekable") == 0;
 }
 
 static void nst_bless_fh(PerlValue *fh, const char *cls) {
@@ -478,6 +482,12 @@ PerlValue *perl_digest_method(PerlValue *obj, const char *method, PerlArray *arg
                 if (args && args->len > 0) alg = perl_to_string(args->elems[0]);
                 return nst_digest_new(nst_md_by_name(alg), "Digest::SHA");
             }
+            if (strcmp(obj->sval, "Digest") == 0) {
+                const char *alg = args && args->len ? perl_to_string(args->elems[0]) : "SHA-256";
+                if (strcmp(alg, "MD5") == 0 || strcmp(alg, "md5") == 0)
+                    return nst_digest_new(EVP_md5(), "Digest::MD5");
+                return nst_digest_new(nst_md_by_name(alg), "Digest::SHA");
+            }
         }
     }
     d = nst_digest(obj);
@@ -834,6 +844,68 @@ static PerlValue *nst_sock_new(PerlArray *args, const char *cls) {
     return fh;
 }
 
+static PerlValue *nst_unix_new(PerlArray *args) {
+    PerlValue *local = nst_opt(args, "Local");
+    PerlValue *peer = nst_opt(args, "Peer");
+    PerlValue *listen_pv = nst_opt(args, "Listen");
+    int fd, type = SOCK_STREAM;
+    struct sockaddr_un un;
+    FILE *fp;
+    PerlValue *fh;
+    PerlValue *tp = nst_opt(args, "Type");
+    if (tp) type = (int)perl_to_int(tp);
+    fd = socket(AF_UNIX, type, 0);
+    if (fd < 0) return perl_alloc_undef();
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    if (local) {
+        char *p = perl_to_string_dup(local);
+        strncpy(un.sun_path, p ? p : "", sizeof(un.sun_path) - 1);
+        free(p);
+        unlink(un.sun_path);
+        if (bind(fd, (struct sockaddr *)&un, sizeof un) != 0) { close(fd); return perl_alloc_undef(); }
+        if (listen_pv) {
+            int bl = (int)perl_to_int(listen_pv);
+            if (bl <= 0) bl = SOMAXCONN;
+            if (listen(fd, bl) != 0) { close(fd); return perl_alloc_undef(); }
+        }
+    }
+    if (peer) {
+        char *p = perl_to_string_dup(peer);
+        memset(&un, 0, sizeof un);
+        un.sun_family = AF_UNIX;
+        strncpy(un.sun_path, p ? p : "", sizeof(un.sun_path) - 1);
+        free(p);
+        if (connect(fd, (struct sockaddr *)&un, sizeof un) != 0) { close(fd); return perl_alloc_undef(); }
+    }
+    fp = fdopen(fd, "r+");
+    if (!fp) { close(fd); return perl_alloc_undef(); }
+    setvbuf(fp, NULL, _IONBF, 0);
+    fh = nst_new_fh(fp, "IO::Socket::UNIX");
+    fh->flags |= PV_FLAG_AUTOFLUSH;
+    return fh;
+}
+
+static PerlValue *nst_pipe_new(void) {
+    int fds[2];
+    PerlHash *h;
+    PerlValue *obj, *r, *w;
+    FILE *rf, *wf;
+    if (pipe(fds) != 0) return perl_alloc_undef();
+    rf = fdopen(fds[0], "r");
+    wf = fdopen(fds[1], "w");
+    if (!rf || !wf) return perl_alloc_undef();
+    r = nst_new_fh(rf, "IO::Handle");
+    w = nst_new_fh(wf, "IO::Handle");
+    h = perl_anon_hash_new();
+    perl_hash_set_str(h, "r", r); perl_hash_set_str(h, "w", w);
+    perl_free(r); perl_free(w);
+    obj = perl_ref_hash(h);
+    if (obj->blessed_class) free(obj->blessed_class);
+    obj->blessed_class = strdup("IO::Pipe");
+    return obj;
+}
+
 static PerlValue *nst_sockname(PerlValue *obj, int peer, int want_port) {
     FILE *fp = nst_fp(obj);
     struct sockaddr_in sin;
@@ -885,11 +957,15 @@ PerlValue *perl_io_method(PerlValue *obj, const char *method, PerlArray *args) {
         if (strcmp(cls, "IO::Socket::INET") == 0 || strcmp(cls, "IO::Socket::IP") == 0 ||
             strcmp(cls, "IO::Socket") == 0)
             return nst_sock_new(args, cls[11] ? cls : "IO::Socket::INET");
-        if (strcmp(cls, "IO::File") == 0 || strcmp(cls, "IO::Handle") == 0) {
+        if (strcmp(cls, "IO::Socket::UNIX") == 0)
+            return nst_unix_new(args);
+        if (strcmp(cls, "IO::File") == 0 || strcmp(cls, "IO::Handle") == 0 ||
+            strcmp(cls, "FileHandle") == 0) {
             if (args && args->len >= 1)
-                return nst_io_open(args, "IO::File");
-            return nst_new_fh(NULL, "IO::File");
+                return nst_io_open(args, strcmp(cls, "FileHandle") == 0 ? "FileHandle" : "IO::File");
+            return nst_new_fh(NULL, strcmp(cls, "FileHandle") == 0 ? "FileHandle" : "IO::File");
         }
+        /* IO::Pipe is a hash object; handled in perl_wave45_method */
     }
     if (cls && strcmp(cls, "IO::File") == 0 && strcmp(method, "new_tmpfile") == 0) {
         FILE *t = tmpfile();
@@ -1597,6 +1673,775 @@ PerlValue *perl_wave45_method(PerlValue *obj, const char *method, PerlArray *arg
         }
         return NULL;
     }
+    {
+        PerlValue *extra = perl_stdlib_method(obj, method, args);
+        if (extra) return extra;
+    }
     return NULL;
 }
+
+/* ── MIME::QuotedPrint ───────────────────────────────────────────────────── */
+
+PerlValue *perl_encode_qp(PerlValue *data, PerlValue *eol) {
+    long long ln = 0;
+    char *s = data ? perl_to_string_dup_len(data, &ln) : strdup("");
+    const char *nl = "\n";
+    size_t cap = (size_t)ln * 3 + 8, o = 0, col = 0;
+    char *out = malloc(cap ? cap : 8);
+    long long i;
+    if (eol && eol->tag != PERL_UNDEF) {
+        const char *e = perl_to_string(eol);
+        if (e && e[0]) nl = e;
+    }
+    for (i = 0; i < ln; i++) {
+        unsigned char c = (unsigned char)s[i];
+        int enc = 0;
+        if (c == '\n') {
+            out[o++] = '\n'; col = 0;
+            continue;
+        }
+        if (c == '=' || c < 33 || c > 126 || c == 127) enc = 1;
+        if (i + 1 < ln && s[i+1] == '\n' && (c == ' ' || c == '\t')) enc = 1;
+        {
+            int need = enc ? 3 : 1;
+            if (col + need > 75 && col > 0) {
+                out[o++] = '=';
+                {
+                    const char *p;
+                    for (p = nl; *p; p++) out[o++] = *p;
+                }
+                col = 0;
+            }
+        }
+        if (enc) {
+            snprintf(out + o, 4, "=%02X", c);
+            o += 3; col += 3;
+        } else {
+            out[o++] = (char)c; col++;
+        }
+        if (o + 8 >= cap) { cap *= 2; out = realloc(out, cap); }
+    }
+    out[o] = 0;
+    {
+        PerlValue *r = perl_alloc_string_len(out, (long long)o);
+        free(out); free(s);
+        return r;
+    }
+}
+
+PerlValue *perl_decode_qp(PerlValue *data) {
+    long long ln = 0;
+    char *s = data ? perl_to_string_dup_len(data, &ln) : strdup("");
+    char *out = malloc((size_t)ln + 1);
+    long long i, o = 0;
+    for (i = 0; i < ln; i++) {
+        if (s[i] == '=' && i + 1 < ln && (s[i+1] == '\n' || s[i+1] == '\r')) {
+            i++;
+            if (i < ln && s[i] == '\r') i++;
+            if (i < ln && s[i] == '\n') { /* skip */ }
+            continue;
+        }
+        if (s[i] == '=' && i + 2 < ln && isxdigit((unsigned char)s[i+1]) &&
+            isxdigit((unsigned char)s[i+2])) {
+            int v = 0;
+            sscanf(s + i + 1, "%2x", &v);
+            out[o++] = (char)v;
+            i += 2;
+        } else {
+            out[o++] = s[i];
+        }
+    }
+    out[o] = 0;
+    {
+        PerlValue *r = perl_alloc_string_len(out, o);
+        free(out); free(s);
+        return r;
+    }
+}
+
+/* ── Text::Tabs ──────────────────────────────────────────────────────────── */
+
+static int nst_tabstop(void) {
+    PerlValue *c = perl_glob_get_scalar("Text::Tabs::tabstop");
+    long long n = c ? perl_to_int(c) : 8;
+    if (n <= 0) n = 8;
+    return (int)n;
+}
+
+PerlValue *perl_tabs_expand(PerlArray *texts) {
+    int ts = nst_tabstop();
+    PerlArray *out = perl_array_new();
+    long long ti;
+    for (ti = 0; texts && ti < texts->len; ti++) {
+        long long ln = 0, i, col = 0;
+        char *s = perl_to_string_dup_len(texts->elems[ti], &ln);
+        size_t cap = (size_t)ln * (size_t)ts + 8, o = 0;
+        char *b = malloc(cap);
+        for (i = 0; i < ln; i++) {
+            if (s[i] == '\n') { b[o++] = '\n'; col = 0; }
+            else if (s[i] == '\t') {
+                int n = ts - (int)(col % ts);
+                if (n <= 0) n = ts;
+                while (n--) { b[o++] = ' '; col++; if (o + 2 >= cap) { cap *= 2; b = realloc(b, cap); } }
+            } else { b[o++] = s[i]; col++; }
+            if (o + 8 >= cap) { cap *= 2; b = realloc(b, cap); }
+        }
+        {
+            PerlValue *v = perl_alloc_string_len(b, (long long)o);
+            perl_array_push(out, v); perl_free(v);
+        }
+        free(b); free(s);
+    }
+    return perl_array_to_list_return(out);
+}
+
+PerlValue *perl_tabs_unexpand(PerlArray *texts) {
+    /* keep simple: return expand inverse is hard; pass through spaces of tabstop */
+    int ts = nst_tabstop();
+    PerlArray *out = perl_array_new();
+    long long ti;
+    for (ti = 0; texts && ti < texts->len; ti++) {
+        long long ln = 0, i, col = 0, sp = 0;
+        char *s = perl_to_string_dup_len(texts->elems[ti], &ln);
+        size_t cap = (size_t)ln + 8, o = 0;
+        char *b = malloc(cap);
+        for (i = 0; i < ln; i++) {
+            if (s[i] == ' ') { sp++; col++;
+                if (col % ts == 0 && sp > 1) { b[o++] = '\t'; sp = 0; }
+            } else {
+                while (sp--) b[o++] = ' ';
+                sp = 0;
+                b[o++] = s[i];
+                if (s[i] == '\n') col = 0; else col++;
+            }
+            if (o + 8 >= cap) { cap *= 2; b = realloc(b, cap); }
+        }
+        while (sp--) b[o++] = ' ';
+        {
+            PerlValue *v = perl_alloc_string_len(b, (long long)o);
+            perl_array_push(out, v); perl_free(v);
+        }
+        free(b); free(s);
+    }
+    return perl_array_to_list_return(out);
+}
+
+void perl_open_pragma_std_utf8(void) {
+    PerlValue *in = perl_get_stdin();
+    PerlValue *out = perl_get_stdout();
+    PerlValue *err = perl_get_stderr();
+    if (in) in->flags |= PV_FLAG_UTF8;
+    if (out) out->flags |= PV_FLAG_UTF8;
+    if (err) err->flags |= PV_FLAG_UTF8;
+}
+
+/* ── CGI ─────────────────────────────────────────────────────────────────── */
+
+static PerlValue *s_cgi_default = NULL;
+
+static int cgi_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+static char *cgi_unescape(const char *s) {
+    size_t n = s ? strlen(s) : 0, o = 0, i;
+    char *out = malloc(n + 1);
+    for (i = 0; i < n; i++) {
+        if (s[i] == '+') out[o++] = ' ';
+        else if (s[i] == '%' && i + 2 < n) {
+            out[o++] = (char)((cgi_hex(s[i+1]) << 4) | cgi_hex(s[i+2]));
+            i += 2;
+        } else out[o++] = s[i];
+    }
+    out[o] = 0;
+    return out;
+}
+
+static char *cgi_escape(const char *s, long long ln) {
+    size_t cap = (size_t)ln * 3 + 1, o = 0;
+    long long i;
+    char *out = malloc(cap);
+    for (i = 0; i < ln; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
+            out[o++] = (char)c;
+        else {
+            snprintf(out + o, 4, "%%%02X", c);
+            o += 3;
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+static void cgi_add_param(PerlHash *h, PerlArray *names, const char *k, const char *v) {
+    PerlValue *slot = perl_hash_get_str_ref(h, k);
+    PerlArray *av;
+    PerlValue *sv, *r;
+    if (slot && slot->tag == PERL_REF_ARRAY) av = (PerlArray *)slot->pval;
+    else {
+        av = perl_anon_array_new();
+        r = perl_ref_array(av);
+        perl_hash_set_str(h, k, r);
+        perl_free(r);
+        if (names) {
+            PerlValue *nk = perl_alloc_string(k);
+            perl_array_push(names, nk);
+            perl_free(nk);
+        }
+    }
+    sv = perl_alloc_string(v ? v : "");
+    perl_array_push(av, sv);
+    perl_free(sv);
+}
+
+static void cgi_parse_qs(PerlHash *h, PerlArray *names, const char *qs) {
+    char *dup, *save, *tok;
+    if (!qs || !qs[0]) return;
+    dup = strdup(qs);
+    for (tok = strtok_r(dup, "&;", &save); tok; tok = strtok_r(NULL, "&;", &save)) {
+        char *eq = strchr(tok, '=');
+        char *k, *v;
+        if (eq) { *eq = 0; k = cgi_unescape(tok); v = cgi_unescape(eq + 1); }
+        else { k = cgi_unescape(tok); v = strdup(""); }
+        cgi_add_param(h, names, k, v);
+        free(k); free(v);
+    }
+    free(dup);
+}
+
+static PerlValue *cgi_opt(PerlArray *args, const char *key) {
+    long long i;
+    if (!args) return NULL;
+    for (i = 0; i + 1 < args->len; i += 2) {
+        char *k = perl_to_string_dup(args->elems[i]);
+        int hit = 0;
+        if (k) {
+            const char *p = k;
+            if (*p == '-') p++;
+            hit = strcasecmp(p, key) == 0;
+        }
+        free(k);
+        if (hit) return args->elems[i + 1];
+    }
+    return NULL;
+}
+
+static PerlValue *nst_cgi_new(PerlArray *args) {
+    PerlHash *h = perl_anon_hash_new();
+    PerlHash *params = perl_anon_hash_new();
+    PerlArray *names = perl_anon_array_new();
+    PerlValue *obj, *pr, *nr, *v;
+    const char *qs = getenv("QUERY_STRING");
+    const char *rm = getenv("REQUEST_METHOD");
+    if (args && args->len == 1 && args->elems[0]->tag == PERL_STRING) {
+        char *s = perl_to_string_dup(args->elems[0]);
+        cgi_parse_qs(params, names, s);
+        free(s);
+    } else if (qs) {
+        cgi_parse_qs(params, names, qs);
+    }
+    pr = perl_ref_hash(params);
+    perl_hash_set_str(h, "params", pr);
+    perl_free(pr);
+    nr = perl_ref_array(names);
+    perl_hash_set_str(h, "names", nr);
+    perl_free(nr);
+    v = perl_alloc_string(rm ? rm : "");
+    perl_hash_set_str(h, "method", v); perl_free(v);
+    obj = perl_ref_hash(h);
+    if (obj->blessed_class) free(obj->blessed_class);
+    obj->blessed_class = strdup("CGI");
+    s_cgi_default = obj;
+    return obj;
+}
+
+static PerlHash *cgi_params(PerlValue *obj) {
+    PerlHash *h = nst_href(obj);
+    PerlValue *p;
+    if (!h) return NULL;
+    p = perl_hash_get_str_ref(h, "params");
+    return nst_href(p);
+}
+
+static PerlValue *cgi_header(PerlArray *args) {
+    const char *type = "text/html";
+    const char *charset = "ISO-8859-1";
+    PerlValue *tv = cgi_opt(args, "type");
+    PerlValue *cv = cgi_opt(args, "charset");
+    PerlValue *cookie = cgi_opt(args, "cookie");
+    char buf[1024];
+    size_t n = 0;
+    if (!tv && args && args->len == 1 && args->elems[0]->tag == PERL_STRING)
+        tv = args->elems[0];
+    if (tv) type = perl_to_string(tv);
+    if (cv) charset = perl_to_string(cv);
+    if (cookie) {
+        char *cs = perl_to_string_dup(cookie);
+        n += (size_t)snprintf(buf + n, sizeof buf - n, "Set-Cookie: %s\r\n", cs);
+        free(cs);
+    }
+    n += (size_t)snprintf(buf + n, sizeof buf - n,
+                          "Content-Type: %s; charset=%s\r\n\r\n", type, charset);
+    return perl_alloc_string_len(buf, (long long)n);
+}
+
+static PerlValue *cgi_tag(const char *tag, PerlArray *args, int empty) {
+    char buf[4096];
+    size_t n = 0;
+    long long i = 0;
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "<%s", tag);
+    if (args) {
+        while (i + 1 < args->len) {
+            char *k = perl_to_string_dup(args->elems[i]);
+            if (k && k[0] == '-') {
+                char *v = perl_to_string_dup(args->elems[i + 1]);
+                n += (size_t)snprintf(buf + n, sizeof buf - n, " %s=\"%s\"", k + 1, v ? v : "");
+                free(v);
+                i += 2;
+                free(k);
+                continue;
+            }
+            free(k);
+            break;
+        }
+    }
+    if (empty) {
+        n += (size_t)snprintf(buf + n, sizeof buf - n, " />");
+        return perl_alloc_string_len(buf, (long long)n);
+    }
+    n += (size_t)snprintf(buf + n, sizeof buf - n, ">");
+    for (; args && i < args->len; i++) {
+        char *v = perl_to_string_dup(args->elems[i]);
+        n += (size_t)snprintf(buf + n, sizeof buf - n, "%s", v ? v : "");
+        free(v);
+    }
+    n += (size_t)snprintf(buf + n, sizeof buf - n, "</%s>", tag);
+    return perl_alloc_string_len(buf, (long long)n);
+}
+
+static PerlValue *nst_cgi_method(PerlValue *obj, const char *method, PerlArray *args) {
+    PerlHash *ph;
+    if (!obj) obj = s_cgi_default;
+    if (!obj && strcmp(method, "new") != 0) {
+        PerlArray *empty = perl_array_new();
+        obj = nst_cgi_new(empty);
+        perl_array_free_nc(empty);
+    }
+    ph = cgi_params(obj);
+    if (strcmp(method, "param") == 0 || strcmp(method, "multi_param") == 0) {
+        int wa = perl_current_wantarray_ctx();
+        if (!args || args->len == 0) {
+            /* names */
+            PerlArray *names = perl_anon_array_new();
+            /* iterate keys via perl_hash - use a simple known approach */
+            if (ph) {
+                /* fall back: we don't have a public keys iterator in a small API;
+                   store names as we parse... use perl_hash keys if available */
+            }
+            (void)names;
+            /* Use perl_env? Walk isn't available. Keep names in "names" array on obj. */
+            {
+                PerlValue *nv = perl_hash_get_str_ref(nst_href(obj), "names");
+                if (nv && nv->tag == PERL_REF_ARRAY) {
+                    if (wa) return perl_array_to_list_return((PerlArray *)nv->pval);
+                    {
+                        PerlArray *av = (PerlArray *)nv->pval;
+                        return av->len ? perl_clone(av->elems[av->len - 1]) : perl_alloc_undef();
+                    }
+                }
+            }
+            return wa ? perl_array_to_list_return(perl_anon_array_new()) : perl_alloc_undef();
+        }
+        {
+            char *k = perl_to_string_dup(args->elems[0]);
+            PerlValue *slot = ph ? perl_hash_get_str_ref(ph, k) : NULL;
+            free(k);
+            if (slot && slot->tag == PERL_REF_ARRAY) {
+                PerlArray *av = (PerlArray *)slot->pval;
+                if (wa) return perl_array_to_list_return(av);
+                return av->len ? perl_clone(av->elems[0]) : perl_alloc_undef();
+            }
+            return perl_alloc_undef();
+        }
+    }
+    if (strcmp(method, "header") == 0) return cgi_header(args);
+    if (strcmp(method, "request_method") == 0) return nst_hget(obj, "method");
+    if (strcmp(method, "query_string") == 0) {
+        /* rebuild with ; */
+        PerlValue *nv = perl_hash_get_str_ref(nst_href(obj), "names");
+        char buf[4096];
+        size_t n = 0;
+        if (nv && nv->tag == PERL_REF_ARRAY && ph) {
+            PerlArray *names = (PerlArray *)nv->pval;
+            long long i;
+            for (i = 0; i < names->len; i++) {
+                char *k = perl_to_string_dup(names->elems[i]);
+                PerlValue *slot = perl_hash_get_str_ref(ph, k);
+                if (slot && slot->tag == PERL_REF_ARRAY) {
+                    PerlArray *av = (PerlArray *)slot->pval;
+                    long long j;
+                    for (j = 0; j < av->len; j++) {
+                        char *v = perl_to_string_dup(av->elems[j]);
+                        char *ek = cgi_escape(k, (long long)strlen(k));
+                        char *ev = cgi_escape(v, (long long)strlen(v));
+                        n += (size_t)snprintf(buf + n, sizeof buf - n, "%s%s=%s",
+                                              n ? ";" : "", ek, ev);
+                        free(ek); free(ev); free(v);
+                    }
+                }
+                free(k);
+            }
+        }
+        buf[n] = 0;
+        return perl_alloc_string_len(buf, (long long)n);
+    }
+    if (strcmp(method, "escape") == 0) {
+        long long ln = 0;
+        char *s = args && args->len ? perl_to_string_dup_len(args->elems[0], &ln) : strdup("");
+        char *e = cgi_escape(s, ln);
+        PerlValue *r = perl_alloc_string(e);
+        free(s); free(e);
+        return r;
+    }
+    if (strcmp(method, "unescape") == 0) {
+        char *s = args && args->len ? perl_to_string_dup(args->elems[0]) : strdup("");
+        char *u = cgi_unescape(s);
+        PerlValue *r = perl_alloc_string(u);
+        free(s); free(u);
+        return r;
+    }
+    if (strcmp(method, "escapeHTML") == 0) {
+        long long ln = 0, i;
+        char *s = args && args->len ? perl_to_string_dup_len(args->elems[0], &ln) : strdup("");
+        size_t cap = (size_t)ln * 6 + 1, o = 0;
+        char *b = malloc(cap);
+        for (i = 0; i < ln; i++) {
+            if (s[i] == '&') { memcpy(b+o, "&amp;", 5); o += 5; }
+            else if (s[i] == '<') { memcpy(b+o, "&lt;", 4); o += 4; }
+            else if (s[i] == '>') { memcpy(b+o, "&gt;", 4); o += 4; }
+            else if (s[i] == '"') { memcpy(b+o, "&quot;", 6); o += 6; }
+            else b[o++] = s[i];
+        }
+        b[o] = 0;
+        {
+            PerlValue *r = perl_alloc_string_len(b, (long long)o);
+            free(b); free(s);
+            return r;
+        }
+    }
+    if (strcmp(method, "cookie") == 0) {
+        PerlValue *name = cgi_opt(args, "name");
+        PerlValue *val = cgi_opt(args, "value");
+        char buf[256];
+        char *n = name ? perl_to_string_dup(name) : strdup("");
+        char *v = val ? perl_to_string_dup(val) : strdup("");
+        snprintf(buf, sizeof buf, "%s=%s; path=/", n, v);
+        free(n); free(v);
+        return perl_alloc_string(buf);
+    }
+    if (strcmp(method, "redirect") == 0) {
+        PerlValue *uri = cgi_opt(args, "uri");
+        if (!uri && args && args->len) uri = args->elems[0];
+        char *u = uri ? perl_to_string_dup(uri) : strdup("/");
+        char buf[512];
+        snprintf(buf, sizeof buf, "Status: 302 Found\r\nLocation: %s\r\n\r\n", u);
+        free(u);
+        return perl_alloc_string(buf);
+    }
+    if (strcmp(method, "url") == 0 || strcmp(method, "self_url") == 0) {
+        const char *host = getenv("SERVER_NAME");
+        const char *script = getenv("SCRIPT_NAME");
+        const char *port = getenv("SERVER_PORT");
+        char buf[512];
+        int abs = cgi_opt(args, "absolute") || cgi_opt(args, "full") ? 1 : 0;
+        (void)abs;
+        {
+            char pb[16] = "";
+            if (port && strcmp(port, "80") && strcmp(port, "443"))
+                snprintf(pb, sizeof pb, ":%s", port);
+            snprintf(buf, sizeof buf, "http://%s%s%s",
+                     host ? host : "localhost", pb, script ? script : "");
+        }
+        if (strcmp(method, "self_url") == 0) {
+            PerlValue *qs = nst_cgi_method(obj, "query_string", NULL);
+            char *q = perl_to_string_dup(qs);
+            if (q && q[0]) { strcat(buf, "?"); strcat(buf, q); }
+            free(q); perl_free(qs);
+        }
+        return perl_alloc_string(buf);
+    }
+    if (strcmp(method, "script_name") == 0) {
+        const char *s = getenv("SCRIPT_NAME");
+        return perl_alloc_string(s ? s : "");
+    }
+    if (strcmp(method, "path_info") == 0) {
+        const char *s = getenv("PATH_INFO");
+        return perl_alloc_string(s ? s : "");
+    }
+    {
+        static const char *tags[] = {
+            "h1","h2","h3","h4","h5","h6","p","b","i","u","em","strong","tt","pre",
+            "div","span","li","ul","ol","tr","td","th","table","a","blockquote",
+            "address","html","head","title","body","style", NULL
+        };
+        static const char *emptyt[] = { "br","hr","img","meta", NULL };
+        int t;
+        for (t = 0; tags[t]; t++)
+            if (strcmp(method, tags[t]) == 0) return cgi_tag(method, args, 0);
+        for (t = 0; emptyt[t]; t++)
+            if (strcmp(method, emptyt[t]) == 0) return cgi_tag(method, args, 1);
+    }
+    if (strcmp(method, "start_html") == 0) {
+        PerlValue *title = cgi_opt(args, "title");
+        char *t = title ? perl_to_string_dup(title) : strdup("Untitled");
+        char buf[512];
+        snprintf(buf, sizeof buf,
+                 "<!DOCTYPE html>\n<html><head><title>%s</title></head><body>", t);
+        free(t);
+        return perl_alloc_string(buf);
+    }
+    if (strcmp(method, "end_html") == 0)
+        return perl_alloc_string("</body></html>");
+    if (strcmp(method, "start_form") == 0) {
+        PerlValue *act = cgi_opt(args, "action");
+        PerlValue *m = cgi_opt(args, "method");
+        char *a = act ? perl_to_string_dup(act) : strdup("");
+        char *mm = m ? perl_to_string_dup(m) : strdup("POST");
+        char buf[256];
+        snprintf(buf, sizeof buf, "<form method=\"%s\" action=\"%s\">", mm, a);
+        free(a); free(mm);
+        return perl_alloc_string(buf);
+    }
+    if (strcmp(method, "end_form") == 0) return perl_alloc_string("</form>");
+    if (strcmp(method, "textfield") == 0 || strcmp(method, "password_field") == 0 ||
+        strcmp(method, "hidden") == 0 || strcmp(method, "submit") == 0 ||
+        strcmp(method, "textarea") == 0) {
+        PerlValue *name = cgi_opt(args, "name");
+        PerlValue *val = cgi_opt(args, "value");
+        PerlValue *sz = cgi_opt(args, "size");
+        char *n = name ? perl_to_string_dup(name) : strdup("");
+        char *v = val ? perl_to_string_dup(val) : strdup("");
+        char buf[512];
+        const char *typ = "text";
+        if (strcmp(method, "password_field") == 0) typ = "password";
+        if (strcmp(method, "hidden") == 0) typ = "hidden";
+        if (strcmp(method, "submit") == 0) typ = "submit";
+        if (strcmp(method, "textarea") == 0)
+            snprintf(buf, sizeof buf, "<textarea name=\"%s\">%s</textarea>", n, v);
+        else if (sz)
+            snprintf(buf, sizeof buf, "<input type=\"%s\" name=\"%s\" value=\"%s\" size=\"%lld\" />",
+                     typ, n, v, perl_to_int(sz));
+        else
+            snprintf(buf, sizeof buf, "<input type=\"%s\" name=\"%s\" value=\"%s\" />", typ, n, v);
+        free(n); free(v);
+        return perl_alloc_string(buf);
+    }
+    return NULL;
+}
+
+PerlValue *perl_cgi_new(PerlArray *args) {
+    return nst_cgi_new(args);
+}
+
+/* Fix names: wrap cgi_add_param to also push unique names. Redefine via
+   recording at parse time. We'll patch cgi_parse to also fill names — see
+   nst_cgi_new: after parse, we don't have keys. Add names array during parse. */
+
+PerlValue *perl_cgi_call(const char *name, PerlArray *args) {
+    const char *bare = name ? strrchr(name, ':') : NULL;
+    if (bare && bare[1]) name = bare + 1;
+    if (strcmp(name, "new") == 0) return perl_cgi_new(args);
+    if (!s_cgi_default) {
+        PerlArray *empty = perl_array_new();
+        perl_cgi_new(empty);
+        perl_array_free_nc(empty);
+    }
+    return nst_cgi_method(s_cgi_default, name, args);
+}
+
+/* ── Term::ReadLine / IO::Select / SelectSaver / IO::Pipe ─────────────── */
+
+static PerlValue *nst_readline_new(PerlArray *args) {
+    PerlHash *h = perl_anon_hash_new();
+    PerlValue *obj, *v, *hist;
+    const char *nm = args && args->len ? perl_to_string(args->elems[0]) : "perl";
+    v = perl_alloc_string(nm); perl_hash_set_str(h, "name", v); perl_free(v);
+    v = perl_alloc_string("Term::ReadLine::Stub");
+    perl_hash_set_str(h, "impl", v); perl_free(v);
+    hist = perl_ref_array(perl_anon_array_new());
+    perl_hash_set_str(h, "hist", hist); perl_free(hist);
+    obj = perl_ref_hash(h);
+    if (obj->blessed_class) free(obj->blessed_class);
+    obj->blessed_class = strdup("Term::ReadLine::Stub");
+    return obj;
+}
+
+static PerlValue *nst_select_new(PerlArray *args) {
+    PerlHash *h = perl_anon_hash_new();
+    PerlArray *hs = perl_anon_array_new();
+    PerlValue *obj, *hr;
+    long long i;
+    for (i = 0; args && i < args->len; i++)
+        perl_array_push(hs, args->elems[i]);
+    hr = perl_ref_array(hs);
+    perl_hash_set_str(h, "h", hr); perl_free(hr);
+    obj = perl_ref_hash(h);
+    if (obj->blessed_class) free(obj->blessed_class);
+    obj->blessed_class = strdup("IO::Select");
+    return obj;
+}
+
+PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *args) {
+    const char *cls = NULL;
+    if (!method) return NULL;
+    if (obj && obj->tag == PERL_STRING && obj->sval) cls = obj->sval;
+    else if (obj && obj->blessed_class) cls = obj->blessed_class;
+
+    if (cls && strcmp(cls, "CGI") == 0) {
+        if (obj && obj->tag == PERL_STRING && strcmp(method, "new") == 0)
+            return perl_cgi_new(args);
+        return nst_cgi_method(obj && obj->tag == PERL_STRING ? s_cgi_default : obj, method, args);
+    }
+    if (cls && (strcmp(cls, "Term::ReadLine") == 0 ||
+                strcmp(cls, "Term::ReadLine::Stub") == 0)) {
+        if (obj && obj->tag == PERL_STRING && strcmp(method, "new") == 0)
+            return nst_readline_new(args);
+        if (strcmp(method, "ReadLine") == 0)
+            return perl_alloc_string("Term::ReadLine::Stub");
+        if (strcmp(method, "readline") == 0) {
+            {
+                PerlValue *pr = args && args->len ? args->elems[0] : NULL;
+                char *ps = pr ? perl_to_string_dup(pr) : strdup("");
+                /* Term::ReadLine writes cursor-positioning codes around the
+                   prompt even when it returns immediately in non-tty mode:
+                   "\e[4m<ps>\e[24m\e[1m\e[0m\e[0m". Match that so the prompt
+                   bytes (on stderr) match real perl. */
+                char buf[4200];
+                int bp = snprintf(buf, sizeof buf, "\033[4m%s\033[24m\033[1m\033[0m\033[0m", ps);
+                if (bp < 0) { free(ps); return perl_alloc_undef(); }
+                if (bp >= (int)sizeof buf) bp = (int)sizeof buf - 1;
+                buf[bp] = '\0';
+                fputs(buf, stderr);
+                fflush(stderr);
+                free(ps);
+                if (!isatty(0)) return perl_alloc_undef();
+                if (!fgets(buf, sizeof buf, stdin)) return perl_alloc_undef();
+                {
+                    size_t n = strlen(buf);
+                    if (n && buf[n-1] == '\n') buf[--n] = 0;
+                    if (n && buf[n-1] == '\r') buf[--n] = 0;
+                    return perl_alloc_string_len(buf, (long long)n);
+                }
+            }
+        }
+        if (strcmp(method, "addhistory") == 0) return perl_alloc_int(0);
+        if (strcmp(method, "IN") == 0) return perl_get_stdin();
+        if (strcmp(method, "OUT") == 0) return perl_get_stdout();
+        if (strcmp(method, "MinLine") == 0) return perl_alloc_int(1);
+        if (strcmp(method, "Attribs") == 0) {
+            PerlHash *h = perl_anon_hash_new();
+            return perl_ref_hash(h);
+        }
+        return NULL;
+    }
+    if (cls && strcmp(cls, "IO::Select") == 0) {
+        if (obj && obj->tag == PERL_STRING && strcmp(method, "new") == 0)
+            return nst_select_new(args);
+        {
+            PerlValue *hv = nst_hget(obj, "h");
+            PerlArray *hs = NULL;
+            if (hv && hv->tag == PERL_REF_ARRAY) hs = (PerlArray *)hv->pval;
+            perl_free(hv);
+            if (strcmp(method, "add") == 0) {
+                long long i;
+                for (i = 0; args && i < args->len; i++)
+                    if (hs) perl_array_push(hs, args->elems[i]);
+                return perl_alloc_int(1);
+            }
+            if (strcmp(method, "remove") == 0) return obj;
+            if (strcmp(method, "count") == 0)
+                return perl_alloc_int(hs ? hs->len : 0);
+            if (strcmp(method, "handles") == 0)
+                return hs ? perl_array_to_list_return(hs) : perl_array_to_list_return(perl_anon_array_new());
+            if (strcmp(method, "can_read") == 0 || strcmp(method, "can_write") == 0 ||
+                strcmp(method, "can_error") == 0) {
+                fd_set fds;
+                int maxfd = -1;
+                long long i;
+                struct timeval tv, *tvp = NULL;
+                PerlArray *ready = perl_anon_array_new();
+                FD_ZERO(&fds);
+                for (i = 0; hs && i < hs->len; i++) {
+                    FILE *fp = nst_fp(hs->elems[i]);
+                    int fd = fp ? fileno(fp) : -1;
+                    if (fd >= 0) { FD_SET(fd, &fds); if (fd > maxfd) maxfd = fd; }
+                }
+                if (args && args->len) {
+                    double t = perl_to_float(args->elems[0]);
+                    tv.tv_sec = (long)t;
+                    tv.tv_usec = (long)((t - (double)tv.tv_sec) * 1e6);
+                    tvp = &tv;
+                }
+                {
+                    int w = 0;
+                    if (strcmp(method, "can_read") == 0)
+                        w = select(maxfd + 1, &fds, NULL, NULL, tvp);
+                    else if (strcmp(method, "can_write") == 0)
+                        w = select(maxfd + 1, NULL, &fds, NULL, tvp);
+                    else
+                        w = select(maxfd + 1, NULL, NULL, &fds, tvp);
+                    (void)w;
+                }
+                for (i = 0; hs && i < hs->len; i++) {
+                    FILE *fp = nst_fp(hs->elems[i]);
+                    int fd = fp ? fileno(fp) : -1;
+                    if (fd >= 0 && FD_ISSET(fd, &fds))
+                        perl_array_push(ready, hs->elems[i]);
+                }
+                return perl_array_to_list_return(ready);
+            }
+        }
+        return NULL;
+    }
+    if (cls && strcmp(cls, "SelectSaver") == 0) {
+        fprintf(stderr, "DBG SelectSaver::new\n");
+        fflush(stderr);
+        if (strcmp(method, "new") == 0) {
+            PerlValue *fh = args && args->len ? args->elems[0] : NULL;
+            PerlValue *old = perl_select_fh(fh);
+            PerlHash *h = perl_anon_hash_new();
+            PerlValue *obj2;
+            perl_hash_set_str(h, "old", old);
+            perl_free(old);
+            obj2 = perl_ref_hash(h);
+            if (obj2->blessed_class) free(obj2->blessed_class);
+            obj2->blessed_class = strdup("SelectSaver");
+            return obj2;
+        }
+        if (strcmp(method, "DESTROY") == 0) {
+            fprintf(stderr, "DBG SelectSaver::DESTROY\n");
+            fflush(stderr);
+            PerlValue *old = nst_hget(obj, "old");
+            if (old) { perl_select_fh(old); perl_free(old); }
+            return perl_alloc_undef();
+        }
+        return NULL;
+    }
+    if (cls && strcmp(cls, "IO::Pipe") == 0) {
+        if (obj && obj->tag == PERL_STRING && strcmp(method, "new") == 0)
+            return nst_pipe_new();
+        if (strcmp(method, "reader") == 0) return nst_hget(obj, "r");
+        if (strcmp(method, "writer") == 0) return nst_hget(obj, "w");
+        return NULL;
+    }
+    return NULL;
+}
+
+
+
 

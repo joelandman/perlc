@@ -3372,6 +3372,24 @@ Tests: `tests/getopt_std_{smoke,deep}.pl`, `tests/parsewords_{smoke,deep}.pl`,
 `tests/version_mod_{smoke,deep}.pl`, `tests/autodie_{smoke,deep}.pl`,
 `tests/perlio_scalar_mod_{smoke,deep}.pl`.
 
+### CGI, Term::ReadLine, and missing `use` names (2026-09-23)
+
+- **Term::ReadLine:** Stub backend (`ReadLine`/`readline`/`addhistory`/`IN`/`OUT`). Prompt on stderr; non-tty `readline` is undef.
+- **CGI:** `new($qs)`, `param`/`multi_param`, `header`, `query_string`, `escape`/`unescape`, `cookie`, `h1`/`p`/other tags. Default charset `ISO-8859-1`. Functional `CGI::param` after `new`.
+- **MIME::QuotedPrint:** `encode_qp`/`decode_qp` with 76-column soft breaks.
+- **Digest:** `Digest->new("MD5"|"SHA-256")` front-end to the existing EVP objects.
+- **Text::Tabs:** `expand`/`unexpand`, `$Text::Tabs::tabstop` (default 8).
+- **FileHandle / IO::Seekable / IO::Pipe / IO::Select / IO::Socket::UNIX / SelectSaver:** `use` names plus SEEK_* ; SelectSaver DESTROY goes through `perl_dispatch_method` when no LLVM sub exists.
+- **Fatal:** same switch as `autodie`.
+- **`use open qw(:std :utf8)`:** marks STDIN/STDOUT/STDERR UTF-8.
+
+Also: class-method `FileHandle->isa("IO::Handle")` now walks `@ISA` (STRING invocant).
+
+Tests: `tests/term_readline_{smoke,deep}.pl`, `tests/cgi_{smoke,deep}.pl`,
+`tests/quotedprint_{smoke,deep}.pl`, `tests/text_tabs_{smoke,deep}.pl`,
+`tests/digest_front_{smoke,deep}.pl`, `tests/io_select_{smoke,deep}.pl`,
+`tests/use_aliases_{smoke,deep}.pl`, `tests/open_pragma_{smoke,deep}.pl`.
+
 ## Source layout
 
 | File | Role |

@@ -141,6 +141,9 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "Getopt::Std","Text::ParseWords","File::Compare","File::stat",
         "English","if","experimental","PerlIO::scalar",
         "HTTP::Tiny","version","autodie",
+        "Term::ReadLine","CGI","MIME::QuotedPrint","Digest","Text::Tabs",
+        "FileHandle","IO::Seekable","IO::Pipe","IO::Select","IO::Socket::UNIX",
+        "SelectSaver","Fatal","open",
     };
 
     std::set<std::string> modulesToInstall;
@@ -408,6 +411,9 @@ static std::vector<Token> inlineModules(
         "Getopt::Std","Text::ParseWords","File::Compare","File::stat",
         "English","if","experimental","PerlIO::scalar",
         "HTTP::Tiny","version","autodie",
+        "Term::ReadLine","CGI","MIME::QuotedPrint","Digest","Text::Tabs",
+        "FileHandle","IO::Seekable","IO::Pipe","IO::Select","IO::Socket::UNIX",
+        "SelectSaver","Fatal","open",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -510,7 +516,8 @@ static std::vector<Token> inlineModules(
 
         if (tokens[i].kind != TK::KW_USE ||
             i + 1 >= tokens.size() ||
-            (tokens[i+1].kind != TK::IDENT && tokens[i+1].kind != TK::KW_IF)) {
+            (tokens[i+1].kind != TK::IDENT && tokens[i+1].kind != TK::KW_IF &&
+             tokens[i+1].kind != TK::KW_OPEN)) {
             i++;
             continue;
         }
@@ -944,8 +951,25 @@ static std::vector<Token> inlineModules(
             modName == "File::Compare" || modName == "File::stat" ||
             modName == "version" || modName == "HTTP::Tiny" ||
             modName == "English" || modName == "experimental" ||
-            modName == "autodie" || modName == "PerlIO::scalar") {
+            modName == "autodie" || modName == "PerlIO::scalar" ||
+            modName == "Term::ReadLine" || modName == "CGI" ||
+            modName == "MIME::QuotedPrint" || modName == "Digest" ||
+            modName == "Text::Tabs" || modName == "FileHandle" ||
+            modName == "IO::Seekable" || modName == "IO::Pipe" ||
+            modName == "IO::Select" || modName == "IO::Socket::UNIX" ||
+            modName == "SelectSaver" || modName == "Fatal" || modName == "open") {
             std::vector<std::string> names = explicitImports;
+            for (auto &n0 : names)
+                if (!n0.empty() && n0[0] == '\x01') n0 = n0.substr(1);
+            if (names.size() == 1 && (names[0] == ":standard" || names[0] == ":html" ||
+                                      names[0] == "standard" || names[0] == "html")) {
+                if (modName == "CGI")
+                    names = {"param","header","start_html","end_html","h1","h2","h3","p","br","hr",
+                             "escapeHTML","escape","unescape","redirect","cookie","url","self_url",
+                             "script_name","path_info","request_method","start_form","end_form",
+                             "textfield","submit","hidden","password_field","textarea","div","span",
+                             "b","i","ul","li","table","Tr","td","th","a","img"};
+            }
             if (names.empty()) {
                 if (modName == "Getopt::Std") names = {"getopt","getopts"};
                 else if (modName == "Text::ParseWords")
@@ -953,6 +977,9 @@ static std::vector<Token> inlineModules(
                 else if (modName == "File::Compare") names = {"compare"};
                 else if (modName == "File::stat") names = {"stat","lstat"};
                 else if (modName == "version") names = {"qv"};
+                else if (modName == "MIME::QuotedPrint") names = {"encode_qp","decode_qp"};
+                else if (modName == "Text::Tabs") names = {"expand","unexpand"};
+                else if (modName == "IO::Seekable") names = {"SEEK_SET","SEEK_CUR","SEEK_END"};
             }
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
@@ -1477,6 +1504,7 @@ int main(int argc, char **argv) {
         if (lexer.hasDataSection()) cg.setDataSection(lexer.dataSection());
         cg.setEnglishEnabled(parser.getEnglishEnabled());
         cg.setAutodieEnabled(parser.getAutodieEnabled());
+        cg.setOpenStdUtf8(parser.getOpenStdUtf8());
         cg.compile(*ast, inputFile, doLib, evalLib);
 
         if (emitIR) {

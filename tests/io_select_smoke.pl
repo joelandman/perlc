@@ -1,0 +1,10 @@
+use IO::Select;
+my ($R, $W);
+pipe($R, $W);
+my $s = IO::Select->new($R);
+print "count=", $s->count, "\n";
+print $W "x";
+close $W;
+my @r = $s->can_read(1);
+print "nread=", scalar(@r), "\n";
+print "done\n";

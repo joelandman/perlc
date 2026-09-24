@@ -18,7 +18,11 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-23, native stdlib waves 4–5 — 461/461 PASS, 0 FAIL):** `Getopt::Std`,
+**Harness (2026-09-23, CGI + Term::ReadLine + missing `use` names):**
+`Term::ReadLine` (Stub), `CGI` (param/header/html tags), `MIME::QuotedPrint`,
+`Digest` front-end, `Text::Tabs`, `FileHandle`, `IO::{Seekable,Pipe,Select,UNIX}`,
+`SelectSaver`, `Fatal`, `use open qw(:std :utf8)`.
+Previous session (2026-09-23, native stdlib waves 4–5 — 461/461 PASS, 0 FAIL): `Getopt::Std`,
 `Text::ParseWords`, `File::Compare`, `File::stat`, `English`, `if`,
 `experimental`, `HTTP::Tiny`, `version`, `autodie`, `PerlIO::scalar`.
 Previous session (2026-09-22, native stdlib waves 1–3 — 439/439 PASS):
@@ -610,6 +614,8 @@ FindBin, Symbol, IPC::Open2/Open3, IO::Handle/IO::File, Socket,
 IO::Socket::INET/IP, MIME::Base64, Digest::MD5/SHA (2026-09-22);
 Getopt::Std, Text::ParseWords, File::Compare, File::stat, English, if,
 experimental, HTTP::Tiny, version, autodie, PerlIO::scalar (2026-09-23);
+Term::ReadLine, CGI, MIME::QuotedPrint, Digest, Text::Tabs, FileHandle,
+IO::Seekable/Pipe/Select/UNIX, SelectSaver, Fatal, open pragma (2026-09-23);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`
