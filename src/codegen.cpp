@@ -354,6 +354,8 @@ void CodeGen::declareRuntime() {
     RT("perl_say",           voidTy, pv);
     RT("perl_print_string",  voidTy, i8p);
     RT("perl_print_array",   voidTy, av);
+    RT("perl_print_array_fh",   voidTy, pv, av);
+    RT("perl_print_string_fh",  voidTy, pv, i8p);
     RT("perl_current_wantarray_ctx", Type::getInt32Ty(ctx_));
     RT("perl_add",           pv,  pv, pv);
     RT("perl_sub",           pv,  pv, pv);
@@ -5055,6 +5057,8 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             setIsa("IO::Socket", "IO::Handle");
             setIsa("IO::Socket::INET", "IO::Socket");
             setIsa("IO::Socket::IP", "IO::Socket");
+            setIsa("IO::Socket::UNIX", "IO::Socket");
+            setIsa("FileHandle", "IO::Handle");
             if (autodieEnabled_)
                 callRT("perl_autodie_enable",
                        {ConstantInt::get(Type::getInt64Ty(ctx_), 1)});
@@ -6425,15 +6429,34 @@ void CodeGen::emitStmt(const Node &n) {
                    when the argument is itself call-like (see
                    isCallLikeForContext), or it would leak list context
                    through an enclosing operator like `eq`/`==` into a call
-                   nested inside it, which must see scalar context instead. */
+                   nested inside it, which must see scalar context instead.
+                   Real Perl also evaluates the *entire* argument list
+                   before printing anything, so a die/croak in a later
+                   argument leaves nothing half-printed; collecting into an
+                   array first (instead of streaming arg,print,arg,print)
+                   matches that. */
+                Value *av = callRT("perl_array_new", {});
                 for (size_t i = 0; i < n.args.size(); i++) {
-                    if (i > 0) callRT("perl_print_sep_fh", {fh});
-                    bool lastArg = (i + 1 == n.args.size());
+                    NK ak = n.args[i]->kind;
+                    bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
+                                            ak == NK::ArraySlice || ak == NK::HashSlice ||
+                                            (ak == NK::PostfixDeref && n.args[i]->sval == "all_array"));
                     if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
-                    Value *v = emitExpr(*n.args[i]);
-                    callCtx_ = 0;
-                    callRT(isSay && lastArg ? "perl_say_fh" : "perl_print_fh", {fh, v});
+                    Value *sub = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
+                    if (sub) {
+                        callCtx_ = 0;
+                        callRT("perl_array_extend", {av, sub});
+                    } else {
+                        Value *v = emitExpr(*n.args[i]);
+                        callCtx_ = 0;
+                        callRT("perl_array_push_list_or_scalar", {av, v});
+                    }
                 }
+                callRT("perl_print_array_fh", {fh, av});
+                callRT("perl_array_free", {av});
+                if (isSay)
+                    callRT("perl_print_string_fh",
+                           {fh, builder_.CreateGlobalStringPtr("\n")});
             }
             if (!isSay) callRT("perl_print_ors_fh", {fh});
         } else {
@@ -6466,26 +6489,29 @@ void CodeGen::emitStmt(const Node &n) {
                     callRT(isSay ? "perl_say" : "perl_print", {v});
                 }
             } else {
-                /* D12: see the filehandle-print loop above — callCtx_ must
-                   be set fresh per argument, not once before the loop, and
-                   only when the argument is itself call-like. */
+                /* D12 + collect-first: see the filehandle-print loop above —
+                   callCtx_ is set fresh per argument, and the whole list is
+                   evaluated before any output (real Perl semantics: a die
+                   in a later argument leaves nothing half-printed). */
+                Value *av = callRT("perl_array_new", {});
                 for (size_t i = 0; i < n.args.size(); i++) {
-                    if (i > 0) callRT("perl_print_sep", {});
                     NK ak = n.args[i]->kind;
                     bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
                                             ak == NK::ArraySlice || ak == NK::HashSlice ||
                                             (ak == NK::PostfixDeref && n.args[i]->sval == "all_array"));
                     if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
-                    Value *av = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
-                    if (av) {
+                    Value *sub = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
+                    if (sub) {
                         callCtx_ = 0;
-                        callRT("perl_print_array", {av});
+                        callRT("perl_array_extend", {av, sub});
                     } else {
                         Value *v = emitExpr(*n.args[i]);
                         callCtx_ = 0;
-                        callRT("perl_print", {v});
+                        callRT("perl_array_push_list_or_scalar", {av, v});
                     }
                 }
+                callRT("perl_print_array", {av});
+                callRT("perl_array_free", {av});
                 if (isSay) {
                     auto *nl = builder_.CreateGlobalString("\n", ".nl");
                     callRT("perl_print_string", {nl});
@@ -6512,7 +6538,7 @@ void CodeGen::emitStmt(const Node &n) {
             if (isCallLikeForContext(*a)) callCtx_ = 1;
             Value *v = emitExpr(*a);
             callCtx_ = 0;
-            callRT("perl_array_push", {av, v});
+            callRT("perl_array_push_list_or_scalar", {av, v});
         }
         if (n.name == "STDERR") {
             callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
@@ -9610,7 +9636,22 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::SprintfFunc: {
         Value *fmt = emitExpr(*n.left);
         Value *av  = callRT("perl_array_new", {});
-        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        for (auto &a : n.args) {
+            NK ak = a->kind;
+            bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
+                                    ak == NK::ArraySlice || ak == NK::HashSlice ||
+                                    (ak == NK::PostfixDeref && a->sval == "all_array"));
+            if (isCallLikeForContext(*a)) callCtx_ = 1;
+            if (isExplicitArray) {
+                Value *sub = emitArrayPtr(*a);
+                callCtx_ = 0;
+                callRT("perl_array_extend", {av, sub});
+            } else {
+                Value *v = emitExpr(*a);
+                callCtx_ = 0;
+                callRT("perl_array_push_list_or_scalar", {av, v});
+            }
+        }
         return callRT("perl_sprintf", {fmt, av});
     }
 
@@ -9624,9 +9665,16 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *fmt = emitExpr(*n.left);
         Value *av  = callRT("perl_array_new", {});
         for (auto &a : n.args) {
+            if (isCallLikeForContext(*a)) callCtx_ = 1;
             Value *src = emitArrayPtr(*a);
-            if (src) callRT("perl_array_extend", {av, src});
-            else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            if (src) {
+                callCtx_ = 0;
+                callRT("perl_array_extend", {av, src});
+            } else {
+                Value *v = emitExpr(*a);
+                callCtx_ = 0;
+                callRT("perl_array_push_list_or_scalar", {av, v});
+            }
         }
         return callRT("perl_pack", {fmt, av});
     }
@@ -10753,8 +10801,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 callRT("perl_array_extend", {av, sub});
             else {
                 Value *v = emitExpr(e);
-                callRT("perl_array_push", {av, v});
-                freeIfOwned(v);
+                callRT("perl_array_push_list_or_scalar", {av, v});
             }
         };
         if (n.left) pushSys(*n.left);
@@ -13104,8 +13151,15 @@ Value *CodeGen::emitCall(const Node &n) {
                     if (sub) callRT("perl_array_extend", {av, sub});
                     else callRT("perl_array_push", {av, emitExpr(*a)});
                 }
+                /* push the caller frame so color()/colored()'s
+                   "Invalid attribute name" croak reports the call site */
+                callRT("perl_push_call_frame",
+                    {builder_.CreateGlobalStringPtr(currentPackage_),
+                     builder_.CreateGlobalStringPtr(sourceFile_),
+                     ConstantInt::get(Type::getInt32Ty(ctx_), n.line)});
                 Value *r = callRT("perl_ansi_color",
                     {av, ConstantInt::get(Type::getInt32Ty(ctx_), bare == "colored" ? 1 : 0)});
+                callRT("perl_pop_call_frame", {});
                 callRT("perl_array_free", {av});
                 return r;
             }

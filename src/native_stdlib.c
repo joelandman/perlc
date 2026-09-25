@@ -1700,8 +1700,17 @@ PerlValue *perl_encode_qp(PerlValue *data, PerlValue *eol) {
             out[o++] = '\n'; col = 0;
             continue;
         }
-        if (c == '=' || c < 33 || c > 126 || c == 127) enc = 1;
-        if (i + 1 < ln && s[i+1] == '\n' && (c == ' ' || c == '\t')) enc = 1;
+        if (c == '=' || c < 32 || c > 126 || c == 127) enc = 1;
+        else if (c == ' ' || c == '\t') {
+            /* Trailing whitespace at line end (rest of the input line up to
+               the next \n or EOF is all spaces/tabs) is encoded — real QP
+               does this even at EOF, where the appended final soft break
+               creates the line end. An interior space stays literal. */
+            long long j = i + 1;
+            while (j < ln && s[j] != '\n' &&
+                   ((s[j] == ' ') || (s[j] == '\t'))) j++;
+            if (j >= ln || s[j] == '\n') enc = 1;
+        }
         {
             int need = enc ? 3 : 1;
             if (col + need > 75 && col > 0) {
@@ -1720,6 +1729,14 @@ PerlValue *perl_encode_qp(PerlValue *data, PerlValue *eol) {
             out[o++] = (char)c; col++;
         }
         if (o + 8 >= cap) { cap *= 2; out = realloc(out, cap); }
+    }
+    /* Real MIME::QuotedPrint appends a trailing soft break ("=" + eol)
+       when the input is non-empty and does not end in a newline
+       (encode_qp("c") → "c=\n"; encode_qp("") → ""). */
+    if (ln > 0 && s[ln - 1] != '\n') {
+        if (o + 8 >= cap) { cap *= 2; out = realloc(out, cap); }
+        out[o++] = '=';
+        for (const char *p = nl; *p; p++) out[o++] = *p;
     }
     out[o] = 0;
     {
@@ -2409,8 +2426,6 @@ PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *arg
         return NULL;
     }
     if (cls && strcmp(cls, "SelectSaver") == 0) {
-        fprintf(stderr, "DBG SelectSaver::new\n");
-        fflush(stderr);
         if (strcmp(method, "new") == 0) {
             PerlValue *fh = args && args->len ? args->elems[0] : NULL;
             PerlValue *old = perl_select_fh(fh);
@@ -2424,8 +2439,6 @@ PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *arg
             return obj2;
         }
         if (strcmp(method, "DESTROY") == 0) {
-            fprintf(stderr, "DBG SelectSaver::DESTROY\n");
-            fflush(stderr);
             PerlValue *old = nst_hget(obj, "old");
             if (old) { perl_select_fh(old); perl_free(old); }
             return perl_alloc_undef();
@@ -2437,6 +2450,34 @@ PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *arg
             return nst_pipe_new();
         if (strcmp(method, "reader") == 0) return nst_hget(obj, "r");
         if (strcmp(method, "writer") == 0) return nst_hget(obj, "w");
+        return NULL;
+    }
+    /* MIME::QuotedPrint functional form (encode_qp/decode_qp are @EXPORT). */
+    if (cls && strcmp(cls, "MIME::QuotedPrint") == 0) {
+        if (strcmp(method, "encode_qp") == 0) {
+            PerlValue *d = args && args->len > 0 ? args->elems[0] : NULL;
+            PerlValue *e = args && args->len > 1 ? args->elems[1] : NULL;
+            return perl_encode_qp(d, e);
+        }
+        if (strcmp(method, "decode_qp") == 0) {
+            PerlValue *d = args && args->len > 0 ? args->elems[0] : NULL;
+            return perl_decode_qp(d);
+        }
+        return NULL;
+    }
+    /* Text::Tabs functional form (expand/unexpand are @EXPORT). */
+    if (cls && strcmp(cls, "Text::Tabs") == 0) {
+        if (strcmp(method, "expand") == 0)
+            return perl_tabs_expand(args);
+        if (strcmp(method, "unexpand") == 0)
+            return perl_tabs_unexpand(args);
+        return NULL;
+    }
+    /* IO::Seekable SEEK_* constants (@EXPORT'd barewords). */
+    if (cls && strcmp(cls, "IO::Seekable") == 0) {
+        if (strcmp(method, "SEEK_SET") == 0) return perl_alloc_int(SEEK_SET);
+        if (strcmp(method, "SEEK_CUR") == 0) return perl_alloc_int(SEEK_CUR);
+        if (strcmp(method, "SEEK_END") == 0) return perl_alloc_int(SEEK_END);
         return NULL;
     }
     return NULL;

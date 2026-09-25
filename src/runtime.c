@@ -494,6 +494,19 @@ void perl_print_array(PerlArray *a) {
         perl_print(a->elems[i]);
     }
 }
+/* filehandle variant of perl_print_array — used by print/say FH LIST, which
+   evaluates the whole list before writing anything. */
+void perl_print_array_fh(PerlValue *fh, PerlArray *a) {
+    for (long long i = 0; i < a->len; i++) {
+        if (i > 0) perl_print_sep_fh(fh);
+        perl_print_fh(fh, a->elems[i]);
+    }
+}
+/* filehandle variant of perl_print_string (which targets the selected fh). */
+void perl_print_string_fh(PerlValue *fh, const char *s) {
+    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
+    fputs(s, (FILE *)fh->pval);
+}
 
 
 /* $! — errno as a string */
@@ -1454,6 +1467,24 @@ static inline void pv_capture_count_set(PerlValue *v, unsigned n) {
     v->flags = (unsigned)((v->flags & ~PV_CAPTURE_MASK) | ((n << PV_CAPTURE_SHIFT) & PV_CAPTURE_MASK));
 }
 
+/* Native-stdlib DESTROY dispatch for blessed objects that have no
+   compiled (LLVM) DESTROY sub — e.g. SelectSaver, whose DESTROY lives in
+   perl_stdlib_method. Real Perl silently does nothing when a blessed
+   object has no DESTROY at all, so this must NOT warn the way
+   perl_dispatch_method's miss path does. The caller passes an already-
+   cloned PV (its extra refcount keeps the object alive for the call and
+   stops this from re-entering perl_free's own DESTROY branch); the
+   returned value, if any, is owned by us and freed here. */
+static void perl_native_destroy_dispatch(PerlValue *self) {
+    PerlValue *r;
+    r = perl_io_method(self, "DESTROY", NULL);
+    if (r) { perl_free(r); return; }
+    r = perl_digest_method(self, "DESTROY", NULL);
+    if (r) { perl_free(r); return; }
+    r = perl_wave45_method(self, "DESTROY", NULL);
+    if (r) perl_free(r);
+}
+
 HOTX void perl_free(PerlValue *v) {
     if (!v) return;
     /* Shared vars are program-lifetime: never returned to the pv pool and
@@ -1521,6 +1552,12 @@ HOTX void perl_free(PerlValue *v) {
                 perl_array_free(args);
                 perl_free(self);
                 s_destroy_depth--;
+            } else {
+                s_destroy_depth++;
+                PerlValue *self = perl_clone(v);
+                perl_native_destroy_dispatch(self);
+                perl_free(self);
+                s_destroy_depth--;
             }
         }
         if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
@@ -1539,6 +1576,10 @@ HOTX void perl_free(PerlValue *v) {
                 perl_pop_wantarray();
                 perl_free(ret);
                 perl_array_free(args);
+                perl_free(self);
+            } else {
+                PerlValue *self = perl_clone(v);
+                perl_native_destroy_dispatch(self);
                 perl_free(self);
             }
             s_destroy_depth--;
@@ -2280,6 +2321,31 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     }
     if (dst->tag == PERL_REF_ARRAY && dst->pval) {
         PerlArray *av = (PerlArray *)dst->pval;
+        /* trigger DESTROY when the last reference is being released,
+           matching the hash-ref branch below and perl_free's own array
+           handling — reassigning a blessed array object must destroy the
+           old array if this was its final reference. */
+        if (av->refcount == 1 && dst->blessed_class && s_destroy_depth < 100) {
+            PerlSubFnCtx fn = perl_find_method(dst->blessed_class, "DESTROY");
+            if (fn) {
+                PerlValue *self = perl_clone(dst);
+                s_destroy_depth++;
+                PerlArray *args = perl_array_new();
+                perl_array_push(args, self);
+                PerlValue *ret = fn(args, perl_push_wantarray(0));
+                perl_pop_wantarray();
+                perl_free(ret);
+                perl_array_free(args);
+                perl_free(self);
+                s_destroy_depth--;
+            } else {
+                PerlValue *self = perl_clone(dst);
+                s_destroy_depth++;
+                perl_native_destroy_dispatch(self);
+                perl_free(self);
+                s_destroy_depth--;
+            }
+        }
         if (av->refcount > 0 && --av->refcount == 0) perl_array_free(av);
     }
     if (dst->tag == PERL_REF_HASH && dst->pval) {
@@ -2296,6 +2362,12 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
                 perl_pop_wantarray();
                 perl_free(ret);
                 perl_array_free(args);
+                perl_free(self);
+                s_destroy_depth--;
+            } else {
+                PerlValue *self = perl_clone(dst);
+                s_destroy_depth++;
+                perl_native_destroy_dispatch(self);
                 perl_free(self);
                 s_destroy_depth--;
             }
@@ -2636,7 +2708,7 @@ HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
         if (r) return r;
     }
     double bv = perl_to_float(b);
-    if (bv == 0.0) { fprintf(stderr, "Illegal division by zero\n"); exit(1); }
+    if (bv == 0.0) { fprintf(stderr, "Illegal division by zero\n"); exit(255); }
     if (both_int(a, b) && a->ival % b->ival == 0)
         return perl_alloc_int(a->ival / b->ival);
     return perl_alloc_float(perl_to_float(a) / bv);
@@ -3145,7 +3217,7 @@ PerlArray *perl_anon_array_new(void) {
 
 void perl_array_free(PerlArray *a) {
     if (!a) return;
-    for (long long i = 0; i < a->len; i++) perl_free(a->elems[i]);
+    for (long long i = a->len - 1; i >= 0; i--) perl_free(a->elems[i]);
     /* shared arrays have a mutex — clean it up then fall through to pool */
     if (a->mu) { pthread_mutex_destroy(a->mu); free(a->mu); a->mu = NULL; }
     pa_pool_push(a);
@@ -3153,7 +3225,7 @@ void perl_array_free(PerlArray *a) {
 
 void perl_array_clear(PerlArray *a) {
     if (!a) return;
-    for (long long i = 0; i < a->len; i++) perl_free(a->elems[i]);
+    for (long long i = a->len - 1; i >= 0; i--) perl_free(a->elems[i]);
     a->len = 0;
 }
 
@@ -3717,6 +3789,9 @@ PerlArray *perl_split(PerlValue *sep, PerlValue *str, long long limit) {
     char *s  = perl_to_string_dup(str);
     char *sp = perl_to_string_dup(sep);
     PerlArray *arr = perl_array_new();
+    /* Real perl: splitting an empty string yields an empty list —
+       regardless of pattern or LIMIT (see perl_split_regex). */
+    if (s[0] == '\0') { free(s); free(sp); return arr; }
     /* D118: LIMIT > 0 bounds the field count — the last field absorbs
        everything remaining unsplit, rather than being split further. */
     int bounded = limit > 0;
@@ -5562,7 +5637,7 @@ PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx) {
    (AUTOLOAD, stringification-overload probing, etc.) and keep calling
    the unchecked perl_call_named_sub above. */
 PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ctx,
-                                        const char *qualname, const char *file, int line) {
+                                         const char *qualname, const char *file, int line) {
     if (name) {
         for (int i = 0; i < s_method_count; i++) {
             if (strcmp(s_method_table[i].key, name) == 0) {
@@ -5577,6 +5652,30 @@ PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ct
                     return result;
                 }
                 break;
+            }
+        }
+        /* Native-stdlib functional form: a qualified name Pkg::func that has
+           no compiled sub may still be implemented natively (CGI::escape,
+           MIME::QuotedPrint::encode_qp, Text::Tabs::expand,
+           IO::Seekable::SEEK_SET, ...). Split at the LAST "::" so nested
+           package names (MIME::QuotedPrint) stay intact as the class.
+           perl_stdlib_method returns NULL for any class/method it does not
+           handle, in which case the D113 undefined-subroutine error below
+           still applies. */
+        {
+            const char *sc = NULL;
+            const char *colon = strstr(name, "::");
+            while (colon) { sc = colon; colon = strstr(sc + 1, "::"); }
+            if (sc) {
+                size_t clen = (size_t)(sc - name);
+                PerlValue *cls_pv = perl_alloc_string_len(name, (long long)clen);
+                perl_push_call_frame(file, file, line);
+                (void)perl_push_wantarray(ctx);
+                PerlValue *r = perl_stdlib_method(cls_pv, sc + 2, args);
+                (void)perl_pop_wantarray();
+                perl_pop_call_frame();
+                perl_free(cls_pv);
+                if (r) return r;
             }
         }
     }
@@ -6117,7 +6216,7 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
 
     if (!class_name) {
         fprintf(stderr, "Can't call method \"%s\" on unblessed reference\n", method);
-        exit(1);
+        exit(255);
     }
     PerlSubFnCtx fn = perl_find_method(class_name, method);
     if (!fn) {
@@ -6192,7 +6291,7 @@ PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
     if (np == 0) {
         fprintf(stderr, "Can't call SUPER::%s — no parent for package \"%s\"\n",
                 method, caller_pkg);
-        exit(1);
+        exit(255);
     }
     PerlSubFnCtx fn = NULL;
     for (int i = 0; i < np && !fn; i++)
@@ -6200,7 +6299,7 @@ PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
     if (!fn) {
         fprintf(stderr, "Can't locate SUPER method \"%s\" starting from \"%s\"\n",
                 method, caller_pkg);
-        exit(1);
+        exit(255);
     }
     PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
     perl_pop_wantarray();
@@ -6286,6 +6385,7 @@ static ssize_t pmf_write(void *c, const char *data, size_t n) {
             if (m->target->sval) free(m->target->sval);
             m->target->sval = nb;
             m->target->slen = (long long)m->len;
+            m->target->tag = PERL_STRING;
         }
     }
     return (ssize_t)n;
@@ -6741,7 +6841,9 @@ void perl_die(PerlValue *msg, const char *filename, int line) {
      }
      fputs(full, stderr);
      free(full);
-     exit(1);
+     /* Real perl exits 255 on an uncaught top-level die (verified:
+        `perl -e 'die "x"'` → 255). */
+     exit(255);
  }
 
 PerlValue *perl_unlink_files(PerlArray *files) {
@@ -9906,6 +10008,9 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     PerlArray *arr = perl_array_new();
     char *s = perl_to_string_dup(str);
     size_t slen = strlen(s);
+    /* Real perl: splitting an empty string yields an empty list —
+       regardless of pattern or LIMIT (split /\n/, "", -1 -> (), not ("")). */
+    if (slen == 0) { free(s); return arr; }
     /* D118: LIMIT > 0 bounds the FIELD count — the last field absorbs
        everything remaining unsplit, rather than being matched further.
        D126: captured-group texts are EXTRA elements interleaved after

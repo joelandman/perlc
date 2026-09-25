@@ -36,4 +36,11 @@ open(my $fh6, '<', \$b) or die "no6";
 local $/; my $slurp = <$fh6>;
 close $fh6;
 print "slurp=[$slurp]\n";
+# writing to an in-memory filehandle whose backing scalar is still undef
+# must turn that scalar into a string (real Perl semantics)
+my $v;
+open(my $fh7, '>', \$v) or die "no7";
+print $fh7 "p\n";
+close $fh7;
+print "v=[$v]\n";
 print "deep_done\n";

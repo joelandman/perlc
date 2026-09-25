@@ -267,6 +267,8 @@ void       perl_array_extend_from(PerlArray *dst, PerlArray *src, long long star
 PerlValue *perl_array_shift(PerlArray *a);
 void       perl_array_unshift(PerlArray *a, PerlValue *v);
 void       perl_print_array(PerlArray *a); /* print all elements with $, between them */
+void       perl_print_array_fh(PerlValue *fh, PerlArray *a); /* fh variant */
+void       perl_print_string_fh(PerlValue *fh, const char *s); /* fh variant of perl_print_string */
 
 /* ── string builtins ─────────────────────────────────────────────────────── */
 long long  perl_chomp(PerlValue *v);       /* remove trailing \n in-place, returns removed count */
