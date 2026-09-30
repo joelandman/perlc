@@ -781,13 +781,13 @@ NodePtr Parser::parseStmt() {
         }
         bool hasParen = check(TK::LPAREN);
         if (hasParen) advance();
-        NodePtr fmt = parseExpr();
+        NodePtr fmt = parseLowNot();
         NodeList args;
         while (match(TK::COMMA)) {
             if (!hasParen && isModifier()) break;
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            args.push_back(parseExpr());
+            args.push_back(parseLowNot());
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
@@ -1540,7 +1540,7 @@ NodePtr Parser::parsePrint(bool isSay) {
          NodeList args;
          while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
              if (check(TK::RPAREN)) break; /* for parenthesized form */
-             args.push_back(parseExpr());
+             args.push_back(parseLowNot());
              if (!match(TK::COMMA)) break;
          }
          n->args = std::move(args);
@@ -1597,7 +1597,7 @@ NodePtr Parser::parsePrint(bool isSay) {
     }
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
-        args.push_back(parseExpr());
+        args.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
     }
     if (hasParen) match(TK::RPAREN);
@@ -1789,6 +1789,24 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
     // act as statement-level operators (Perl precedence: below assignment).
     // Consume the chain and its RHS without emitting short-circuit code
     // — they are effectively no-ops after declarations/statements.
+    /* D147: `print LIST or/and RHS` — print's arguments stop at the low-
+       precedence operator (list-operator precedence), so the print itself is
+       the LHS. Build a real BinOp over `do { PRINT; 1 }` (perlc's print never
+       reports failure) instead of dropping the RHS, so `print ... and f()`
+       runs f() and `print $V and 1` prints $V, as in real Perl. */
+    if ((stmt->kind == NK::PrintStmt || stmt->kind == NK::SayStmt ||
+         stmt->kind == NK::PrintfStmt) &&
+        (check(TK::KW_OR) || check(TK::KW_AND) ||
+         (cur().kind == TK::IDENT && cur().text == "xor"))) {
+        auto one = std::make_unique<Node>(); one->kind = NK::ExprStmt;
+        one->left = makeInt(1, line); one->line = line;
+        NodeList body;
+        body.push_back(std::move(stmt));
+        body.push_back(std::move(one));
+        auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt; es->line = line;
+        es->left = consumeLowOrChain(makeBlock(std::move(body), line));
+        return parseModifier(std::move(es), line);
+    }
     if (check(TK::KW_OR) || check(TK::KW_AND) ||
         (cur().kind == TK::IDENT && cur().text == "xor")) {
         while (check(TK::KW_OR) || check(TK::KW_AND) ||
@@ -1882,13 +1900,13 @@ NodePtr Parser::parseOrRhs() {
         }
         bool hasParen = check(TK::LPAREN);
         if (hasParen) advance();
-        NodePtr fmt = parseExpr();
+        NodePtr fmt = parseLowNot();
         NodeList args;
         while (match(TK::COMMA)) {
             if (!hasParen && isModifier()) break;
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            args.push_back(parseExpr());
+            args.push_back(parseLowNot());
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
@@ -1898,8 +1916,16 @@ NodePtr Parser::parseOrRhs() {
     else {
         return parseLowNot();
     }
+    bool isPrint = (stmt->kind == NK::PrintStmt || stmt->kind == NK::SayStmt ||
+                    stmt->kind == NK::PrintfStmt);
     NodeList stmts;
     stmts.push_back(std::move(stmt));
+    if (isPrint) {
+        /* D147: a print RHS yields true, so `A and print B or C` skips C. */
+        auto one = std::make_unique<Node>(); one->kind = NK::ExprStmt;
+        one->left = makeInt(1, line); one->line = line;
+        stmts.push_back(std::move(one));
+    }
     return makeBlock(std::move(stmts), line);
 }
 

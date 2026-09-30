@@ -9941,6 +9941,18 @@ Value *CodeGen::emitExpr(const Node &n) {
         bool hasArrayArg = false;
         for (auto &a : n.args)
             if (a->kind == NK::ArrayVar || a->kind == NK::DerefArray) { hasArrayArg = true; break; }
+        if (hasScalarCtx && n.args.size() > 1) {
+            /* D148: scalar reverse LIST concatenates the whole list, then
+               reverses: `scalar reverse "ab", "cd"` is "dcba". */
+            Value *av = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            }
+            Value *cat = callRT("perl_join", {perlStr(""), av});
+            return callRT("perl_reverse_str", {cat});
+        }
         if (hasScalarCtx || (!hasArrayArg && n.args.size() == 1)) {
             return callRT("perl_reverse_str", {emitExpr(*n.args[0])});
         }
@@ -12065,11 +12077,11 @@ bool CodeGen::isExplicitListKind(const Node &n) {
        exactly the silent-wrong-data bug this fixes: real Perl's
        `print map {$_*10} (1,2,3)` prints "102030", but routing it through
        scalar emitExpr() printed "3".
-       ReverseFunc is deliberately EXCLUDED: `reverse` is context-dependent
-       (a single scalar operand reverses the string's characters, a list
-       operand reverses element order), so it is *not* unambiguously a list —
-       emitExpr() already dispatches on operand type and must stay the path
-       for it. The array forms (ArrayVar/DerefArray/slices/PostfixDeref) are
+       ReverseFunc is included: its context comes from the caller, not its
+       operand — every caller of this predicate is a list context, where real
+       Perl's `print reverse "abc"` prints "abc" (element reversal of a
+       1-element list) and `print reverse @a` reverses @a. Only an explicit
+       `scalar reverse` (sval "scalar_ctx") stays on the scalar path. The array forms (ArrayVar/DerefArray/slices/PostfixDeref) are
        retained so this stays a superset of the pre-existing per-site gate. */
     NK k = n.kind;
     return k == NK::ArrayVar        || k == NK::DerefArray     ||
@@ -12078,7 +12090,8 @@ bool CodeGen::isExplicitListKind(const Node &n) {
            k == NK::MapFunc        || k == NK::GrepFunc       ||
            k == NK::SortFunc       || k == NK::Range          ||
            k == NK::KeysFunc       || k == NK::ValuesFunc     ||
-           k == NK::HashVar;
+           k == NK::HashVar        ||
+           (k == NK::ReverseFunc   && n.sval != "scalar_ctx");
 }
 
 Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {

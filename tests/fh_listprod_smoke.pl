@@ -17,6 +17,7 @@ $o = ""; open my $H, ">", \$o; print $H sort @a;                close $H; print 
 $o = ""; open my $H, ">", \$o; print $H join(",", @a);          close $H; print "join : <$o>\n";
 $o = ""; open my $H, ">", \$o; print $H 1..3;                   close $H; print "range: <$o>\n";
 $o = ""; open my $H, ">", \$o; print $H @a;                     close $H; print "arr  : <$o>\n";
+$o = ""; open my $H, ">", \$o; print $H reverse @a;             close $H; print "revA : <$o>\n";
 
 # ===== Regression guards: $H is still detected for every existing shape =====
 # (These already worked before; they must keep working after the whitelist
@@ -33,5 +34,6 @@ $o = ""; open my $H, ">", \$o; print $H @a + 100;                 close $H; prin
 my $V = "VAL";
 print $V, " after value\n";              # comma: $V is a value
 print $V eq "VAL", "\n";                 # cmp op: $V is the LHS value
+print $V and 1; print "\n";              # low-prec op: $V is the LHS (D147)
 
 print "adjacent_done\n";
