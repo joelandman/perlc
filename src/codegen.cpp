@@ -509,7 +509,7 @@ void CodeGen::declareRuntime() {
     /* file I/O */
     RT("perl_open_fh",          pv,     pv, pv, pv);
     RT("perl_open2_fh",         pv,     pv, pv);
-    RT("perl_close_fh",         voidTy, pv);
+    RT("perl_close_fh",         i32,    pv);
     RT("perl_readline",         pv,     pv);
     RT("perl_readline_all",     av,     pv);
     RT("perl_readline_stdin",   pv);
@@ -727,7 +727,7 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_opendir_fh",       pv, pv, pv);
     RT("perl_readdir",          pv, pv);
     RT("perl_readdir_all",      av, pv);
-    RT("perl_closedir_fh",      voidTy, pv);
+    RT("perl_closedir_fh",      pv,     pv);
     /* time / randomness / sleep */
     RT("perl_rand_val",     pv,     pv);
     RT("perl_srand_val",    voidTy, pv);
@@ -2607,6 +2607,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_clone", "perl_sprintf", "perl_array_len", "perl_array_len_f64",
         "perl_regex_match", "perl_regex_match_g", "perl_regex_match_sv",
         "perl_alloc_bool",
+        "perl_open_fh", "perl_open2_fh", "perl_closedir_fh",  /* 1 / undef */
         /* single-arg math/string builtins */
         "perl_alloc_flat_array", "perl_alloc_float_pair",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
@@ -7894,8 +7895,8 @@ Value *CodeGen::emitExpr(const Node &n) {
 
     case NK::CloseFunc: {
         Value *fh = n.left ? emitExpr(*n.left) : perlUndef();
-        callRT("perl_close_fh", {fh});
-        return perlInt(1);
+        Value *ok = callRT("perl_close_fh", {fh});
+        return callRT("perl_alloc_bool", {builder_.CreateZExt(ok, Type::getInt64Ty(ctx_))});
     }
 
     case NK::EofFunc: {
@@ -10985,8 +10986,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *slot = lookupVar(n.name);
         if (!slot) return perlUndef();
         Value *dh = builder_.CreateLoad(perlPtrTy_, slot);
-        callRT("perl_closedir_fh", {dh});
-        return perlUndef();
+        return callRT("perl_closedir_fh", {dh});
     }
 
     case NK::TrOp: {

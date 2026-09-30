@@ -6490,7 +6490,7 @@ PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filena
             target->pval = mfp;
             target->matchpos = 0;
             target->flags &= ~PV_FLAG_UTF8;
-            return target;
+            return perl_alloc_bool(1);
         }
         /* not a usable ref → fall through to the regular file path */
     }
@@ -6513,7 +6513,8 @@ PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filena
         target->tag = PERL_UNDEF; target->pval = NULL; target->flags = 0;
     }
     target->matchpos = 0;
-    return target;
+    /* perl's open returns 1 on success, undef on failure — not the handle */
+    return target->tag == PERL_FILEHANDLE ? perl_alloc_bool(1) : perl_alloc_undef();
 }
 
 PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
@@ -6538,16 +6539,22 @@ PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
         target->tag = PERL_UNDEF; target->pval = NULL; target->flags = 0;
     }
     target->matchpos = 0;
-    return target;
+    /* perl's open returns 1 on success, undef on failure — not the handle */
+    return target->tag == PERL_FILEHANDLE ? perl_alloc_bool(1) : perl_alloc_undef();
 }
 
-void perl_close_fh(PerlValue *fh) {
+/* Returns 1 when an open handle was closed successfully; 0 for a handle
+   that is not open (never opened, failed open, already closed) or a failed
+   fclose — perl's close returns false ("") in all of those cases. */
+int perl_close_fh(PerlValue *fh) {
     if (fh && fh->tag == PERL_FILEHANDLE && fh->pval) {
-        fclose((FILE*)fh->pval);
+        int r = fclose((FILE*)fh->pval);
         fh->pval = NULL;
         fh->tag  = PERL_UNDEF;
         s_dollar_dot.ival = 0;  /* D32: real Perl resets $. on close() */
+        return r == 0;
     }
+    return 0;
 }
 
 PerlValue *perl_readline(PerlValue *fh) {
@@ -6867,7 +6874,7 @@ PerlValue *perl_chdir(PerlValue *path) {
     if (r != 0 && perl_autodie_enabled())
         perl_die_croak("Can't chdir('%s'): %s", p, strerror(errno));
     free(p);
-    return perl_alloc_int(r == 0 ? 1 : 0);
+    return perl_alloc_bool(r == 0);   /* perl: 1 or "" */
 }
 
 PerlValue *perl_mkdir_op(PerlValue *path, PerlValue *mode) {
@@ -8525,7 +8532,7 @@ PerlValue *perl_chmod_op(PerlValue *mode, PerlArray *files) {
 PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path) {
     char *p = perl_to_string_dup(path);
     DIR *d = opendir(p); free(p);
-    if (!d) return perl_alloc_int(0);
+    if (!d) return perl_alloc_undef();   /* perl: undef on failure */
     if (target->tag == PERL_DIRHANDLE && target->pval) closedir((DIR*)target->pval);
     if (target->tag == PERL_STRING && target->sval) free(target->sval);
     if (target->blessed_class) { free(target->blessed_class); target->blessed_class = NULL; }
@@ -8550,12 +8557,15 @@ PerlArray *perl_readdir_all(PerlValue *dh) {
     return a;
 }
 
-void perl_closedir_fh(PerlValue *dh) {
+/* perl's closedir: 1 on success, undef for a handle that is not open. */
+PerlValue *perl_closedir_fh(PerlValue *dh) {
     if (dh && dh->tag == PERL_DIRHANDLE && dh->pval) {
-        closedir((DIR*)dh->pval);
+        int r = closedir((DIR*)dh->pval);
         dh->pval = NULL;
         dh->tag  = PERL_UNDEF;
+        if (r == 0) return perl_alloc_bool(1);
     }
+    return perl_alloc_undef();
 }
 
 /* ── sprintf / printf ────────────────────────────────────────────────────── */

@@ -687,17 +687,9 @@ NodePtr Parser::parseStmt() {
         return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_IF))      return parseIf();
-    if (check(TK::KW_UNLESS)) {
-        /* desugar: unless(C) B  →  if(!C) B */
-        advance();
-        consume(TK::LPAREN, "(");
-        auto cond = makeUnary("!", parseExpr(), line);
-        consume(TK::RPAREN, ")");
-        auto body = parseBlock();
-        auto n = std::make_unique<Node>(); n->kind = NK::If; n->line = line;
-        n->branches.push_back({std::move(cond), std::move(body)});
-        return n;
-    }
+    /* desugar: unless(C) B [elsif ...] [else ...] → if(!C) B ... (D151:
+       elsif/else after unless used to be a parse error) */
+    if (check(TK::KW_UNLESS)) return parseIf();
     if (check(TK::KW_WHILE))   return parseWhile();
     /* LABEL: stmt — loops keep sval=label (last/next/redo); other
        statements wrap as LabelStmt so goto LABEL can find them. */
@@ -927,10 +919,12 @@ NodePtr Parser::parseStmt() {
 
 NodePtr Parser::parseIf() {
     int line = cur().line;
-    consume(TK::KW_IF);
+    bool isUnless = check(TK::KW_UNLESS);
+    advance(); /* if / unless */
     consume(TK::LPAREN, "(");
     auto cond = parseExpr();
     consume(TK::RPAREN, ")");
+    if (isUnless) cond = makeUnary("!", std::move(cond), line);
     auto body = parseBlock();
 
     auto n = std::make_unique<Node>(); n->kind = NK::If; n->line = line;

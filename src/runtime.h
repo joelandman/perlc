@@ -560,7 +560,7 @@ PerlValue *perl_filetest(int op, PerlValue *path);
 /* open($fh, mode, filename) or open($fh, "mode_and_filename") */
 PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode, PerlValue *filename);
 PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file);
-void       perl_close_fh(PerlValue *fh);
+int        perl_close_fh(PerlValue *fh);   /* 1 = closed an open handle */
 PerlValue *perl_readline(PerlValue *fh);
 PerlArray *perl_readline_all(PerlValue *fh);
 PerlValue *perl_readline_stdin(void);
@@ -884,7 +884,7 @@ PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures
 PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path);
 PerlValue *perl_readdir(PerlValue *dh);      /* scalar: one entry or undef */
 PerlArray *perl_readdir_all(PerlValue *dh);  /* list: all remaining entries */
-void       perl_closedir_fh(PerlValue *dh);
+PerlValue *perl_closedir_fh(PerlValue *dh);  /* 1 / undef */
 
 /* ── filesystem ops ──────────────────────────────────────────────────────── */
 PerlValue *perl_chdir(PerlValue *path);
