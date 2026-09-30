@@ -784,6 +784,12 @@ NodePtr Parser::parseStmt() {
         }
         bool hasParen = check(TK::LPAREN);
         if (hasParen) advance();
+        /* D153: printf(FH "fmt", ...) — a bareword directly followed by a
+           term (no comma) inside the parens is the filehandle. */
+        if (hasParen && fhname.empty() && check(TK::IDENT) &&
+            (peek(1).kind == TK::STRING || peek(1).kind == TK::SCALAR)) {
+            fhname = cur().text; advance();
+        }
         NodePtr fmt = parseLowNot();
         NodeList args;
         while (match(TK::COMMA)) {
@@ -1998,6 +2004,12 @@ NodePtr Parser::parseOrRhs() {
         }
         bool hasParen = check(TK::LPAREN);
         if (hasParen) advance();
+        /* D153: printf(FH "fmt", ...) — a bareword directly followed by a
+           term (no comma) inside the parens is the filehandle. */
+        if (hasParen && fhname.empty() && check(TK::IDENT) &&
+            (peek(1).kind == TK::STRING || peek(1).kind == TK::SCALAR)) {
+            fhname = cur().text; advance();
+        }
         NodePtr fmt = parseLowNot();
         NodeList args;
         while (match(TK::COMMA)) {

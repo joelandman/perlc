@@ -5788,6 +5788,8 @@ void CodeGen::emitStmt(const Node &n) {
     if (debug_ && n.line > 0) {
         builder_.SetCurrentDebugLocation(getDebugLoc(n.line, currentSP_));
     }
+    /* D153: `print NOPE "x"` — see emitBareFhPrintProbe. */
+    if (!inBareFhProbe_ && bareFhPrintCandidate(n)) { emitBareFhPrintProbe(n); return; }
     switch (n.kind) {
     case NK::Block: {
         /* Save local depth so lock() / local() inside bare { } blocks
@@ -6545,8 +6547,14 @@ void CodeGen::emitStmt(const Node &n) {
         } else if (!n.name.empty() && n.name != "STDOUT") {
             Value *fh = nullptr;
             if (auto *slot = lookupVar(n.name)) fh = builder_.CreateLoad(perlPtrTy_, slot);
-            if (fh) callRT("perl_printf_fh", {fh, fmt, av});
-            else    callRT("perl_printf",    {fmt, av});
+            else {
+                /* D153: a bareword handle (`printf LOG ...`) — it used to
+                   fall through to STDOUT; resolve it like print does. */
+                globNames_.insert(n.name);
+                Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
+                fh = callRT("perl_glob_get_scalar", {key});
+            }
+            callRT("perl_printf_fh", {fh, fmt, av});
         } else {
             callRT("perl_printf", {fmt, av});
         }
@@ -12072,6 +12080,72 @@ bool CodeGen::isCallLikeForContext(const Node &n) {
        call avoids extending that leak into print/printf without needing
        to fix callCtx_'s general design. */
     return n.kind == NK::Call || n.kind == NK::MethodCall || n.kind == NK::CallCodeRef;
+}
+
+/* D153: `print WORD ARGS` / `printf WORD FMT, ...` with no comma after WORD
+   parses as a bareword call WORD(ARGS). Real perl reads WORD as a filehandle
+   unless it names a sub — which only emitCall's full resolution (user subs,
+   native-module exports like Dumper, constants, ...) can decide. */
+const Node *CodeGen::bareFhPrintCandidate(const Node &n) {
+    const Node *c = nullptr;
+    if ((n.kind == NK::PrintStmt || n.kind == NK::SayStmt) &&
+        n.name.empty() && !n.left && n.args.size() == 1)
+        c = n.args[0].get();
+    else if (n.kind == NK::PrintfStmt && n.name.empty() && n.left && n.args.empty())
+        c = n.left.get();
+    if (c && c->kind == NK::Call && c->ival == 1 && !c->args.empty() &&
+        c->name.find("::") == std::string::npos)
+        return c;
+    return nullptr;
+}
+
+/* Emit the statement into a detached block. If it compiles, splice it in
+   (branch to it); if emitCall rejects WORD as an unknown bareword, drop the
+   probe blocks and emit `print WORD ARGS` to the bareword filehandle
+   instead (perl: prints nothing if WORD was never opened). */
+void CodeGen::emitBareFhPrintProbe(const Node &n) {
+    const Node *call = bareFhPrintCandidate(n);
+    std::string word = call->name;
+    llvm::BasicBlock *cur = builder_.GetInsertBlock();
+    llvm::Function *fn = cur->getParent();
+    auto *probe = llvm::BasicBlock::Create(ctx_, "barefh.probe", fn);
+    builder_.SetInsertPoint(probe);
+    inBareFhProbe_ = true;
+    try {
+        emitStmt(n);
+        inBareFhProbe_ = false;
+        llvm::BasicBlock *end = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(cur);
+        builder_.CreateBr(probe);
+        builder_.SetInsertPoint(end);
+        return;
+    } catch (const std::runtime_error &e) {
+        inBareFhProbe_ = false;
+        std::string want = "Do you need to predeclare \"" + word + "\"?)";
+        /* drop everything emitted from the probe block onward */
+        std::vector<llvm::BasicBlock *> dead;
+        bool on = false;
+        for (auto &bb : *fn) { if (&bb == probe) on = true; if (on) dead.push_back(&bb); }
+        for (auto *bb : dead) bb->dropAllReferences();
+        for (auto it = dead.rbegin(); it != dead.rend(); ++it) (*it)->eraseFromParent();
+        builder_.SetInsertPoint(cur);
+        callCtx_ = 0;
+        if (std::string(e.what()).find(want) == std::string::npos) throw;
+    }
+    NodePtr alt = n.clone();
+    if (alt->kind == NK::PrintfStmt) {
+        NodePtr c = std::move(alt->left);
+        alt->left = std::move(c->args[0]);
+        for (size_t i = 1; i < c->args.size(); i++) alt->args.push_back(std::move(c->args[i]));
+    } else {
+        NodePtr c = std::move(alt->args[0]);
+        alt->args = std::move(c->args);
+    }
+    alt->name = word;
+    globNames_.insert(word);
+    inBareFhProbe_ = true;   /* alt is no longer a candidate, but be safe */
+    emitStmt(*alt);
+    inBareFhProbe_ = false;
 }
 
 bool CodeGen::isExplicitListKind(const Node &n) {
