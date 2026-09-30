@@ -306,6 +306,7 @@ private:
     llvm::Value *emitF64BinOpWithBigIntGuard(const Node &n);
     llvm::Value *emitShortCircuitRhs(const Node &rhsNode); /* ||/&& RHS: real control-flow for `or return`/`and return` (D8a) */
     bool isCallLikeForContext(const Node &n); /* D12: safe to propagate outer list context into this node's own call */
+    bool isExplicitListKind(const Node &n);   /* unambiguously list-producing, so expand via emitArrayPtr in print/say/sprintf arg collection */
     llvm::Value *emitCall(const Node &n);
     void fillCallArgs(llvm::Value *argsArr, const Node &n);
     void flattenArgInto(llvm::Value *argsArr, const Node &arg);

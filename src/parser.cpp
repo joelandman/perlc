@@ -769,8 +769,11 @@ NodePtr Parser::parseStmt() {
         } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
             TK t2 = peek(2).kind;
             bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
-                            t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                            t2 == TK::LPAREN);
+                             t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
+                             t2 == TK::LPAREN
+                            || t2 == TK::KW_MAP    || t2 == TK::KW_GREP   || t2 == TK::KW_SORT
+                            || t2 == TK::KW_JOIN   || t2 == TK::KW_REVERSE
+                            || t2 == TK::KW_KEYS   || t2 == TK::KW_VALUES);
             if (!isFhCtx && t2 == TK::IDENT) {
                 isFhCtx = !isCmpOpWord(peek(2).text);
             }
@@ -1543,12 +1546,18 @@ NodePtr Parser::parsePrint(bool isSay) {
          n->args = std::move(args);
          n->line = line;
          return n;
-     } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
-        TK t2 = peek(2).kind;
-        /* LBRACKET/LBRACE excluded: $arr[i] and $hash{k} are subscripts, not fh */
-        bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
-                        t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                        t2 == TK::LPAREN);
+      } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
+         TK t2 = peek(2).kind;
+         /* LBRACKET/LBRACE excluded: $arr[i] and $hash{k} are subscripts, not fh.
+            KW_ list-producers (map/grep/sort/join/reverse/keys/values/each): real
+            Perl's `print $F map {...} (1,2), ...` treats $F as the filehandle;
+            including them here lets the parser recognise that association too. */
+          bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
+                          t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
+                          t2 == TK::LPAREN
+                          || t2 == TK::KW_MAP    || t2 == TK::KW_GREP  || t2 == TK::KW_SORT
+                          || t2 == TK::KW_JOIN   || t2 == TK::KW_REVERSE
+                          || t2 == TK::KW_KEYS   || t2 == TK::KW_VALUES);
         /* IDENT at t2 only if it's not a string-comparison or x operator */
         if (!isFhCtx && t2 == TK::IDENT) {
             isFhCtx = !isCmpOpWord(peek(2).text);
@@ -1861,8 +1870,11 @@ NodePtr Parser::parseOrRhs() {
         } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
             TK t2 = peek(2).kind;
             bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
-                            t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                            t2 == TK::LPAREN);
+                             t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
+                             t2 == TK::LPAREN
+                            || t2 == TK::KW_MAP    || t2 == TK::KW_GREP   || t2 == TK::KW_SORT
+                            || t2 == TK::KW_JOIN   || t2 == TK::KW_REVERSE
+                            || t2 == TK::KW_KEYS   || t2 == TK::KW_VALUES);
             if (!isFhCtx && t2 == TK::IDENT) {
                 isFhCtx = !isCmpOpWord(peek(2).text);
             }

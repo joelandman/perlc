@@ -73,7 +73,9 @@ eval STRING and eval-defined subs see outer `my`).
 | D141 | **FIXED 2026-09-20** | `emitBinOp`'s F64-fast-path BigInt guard (`emitF64BinOpWithBigIntGuard`, D132) only checked for the BigInt tag specifically, not blessed_class generically — a chained `+`/`-`/`*` on a blessed ref-shaped variable (`my $t2 = $t1 + 500; my $t3 = $t2 - 200;`) silently discarded the class on the second operation. See below. |
 | D142 | **FIXED 2026-09-20** | `emitArrayPtr`'s `NK::LocaltimeFunc`/`GmtimeFunc` case ignored the `sval == "scalar_ctx"` marker the parser stamps for an explicit `scalar localtime(...)`/`scalar gmtime(...)` — `push @a, scalar gmtime(0)` (or the same shape inside `map`) wrongly flattened the 9-element list-context array instead of pushing the single scalar-context value. Pre-existing, independent of Time::Piece. See below. |
 | D143 | **FIXED 2026-09-20** | The generic OO method-call dispatch (`case NK::MethodCall` in `emitExpr`, and `emitArrayPtr` — which had no case for `NK::MethodCall` at all) never pushed a wantarray frame around `perl_dispatch_method` — a method whose return value depends on context (e.g. Text::CSV's `fields`, DBI's `fetchrow_array`) inherited whatever was left on the runtime stack by an unrelated caller instead of the actual calling context; `join("|", $csv->fields)` and `my @f = $csv->fields;` both silently lost data. Pre-existing, independent of Text::CSV. See below. |
-| D144 | **FIXED 2026-09-20** | An in-memory filehandle's backing scalar (`open my $fh, ">", \$out`) only synced on `close()` — `pmf_write`'s accumulated buffer was copied to the target scalar solely in `pmf_close`, so `print $fh "x"; print "[$out]";` with no intervening `close` showed `$out` still empty, unlike real Perl's synchronous-on-every-write `PerlIO::scalar`. Pre-existing, independent of Text::CSV (reproduces with a plain `print`, no module involved). See below. |
+ | D144 | **FIXED 2026-09-20** | An in-memory filehandle's backing scalar (`open my $fh, ">", \$out`) only synced on `close()` — `pmf_write`'s accumulated buffer was copied to the target scalar solely in `pmf_close`, so `print $fh "x"; print "[$out]";` with no intervening `close` showed `$out` still empty, unlike real Perl's synchronous-on-every-write `PerlIO::scalar`. Pre-existing, independent of Text::CSV (reproduces with a plain `print`, no module involved). See below. |
+ | D145 | **FIXED 2026-09-28** | A list-producing expression (`map`, `grep`, `sort`, `keys`, `values`, a range, `@arr`) used as a `print`/`say` argument was collapsed to its *scalar* value — the element count (`perl_array_len`) or undef (`sort`) — instead of expanding to its elements. `print map {$_*10} (1,2,3);` printed `3` (real Perl: `102030`). Root cause: the `print`/`say` argument-collection branches and `SprintfFunc` only expanded `@arr`/`@$ref`/slices via `emitArrayPtr`; every other list-shape node fell through to `emitExpr()` (scalar context). See below. |
+| D146 | **FIXED 2026-09-29** | `print $fh map {...} LIST` (a filehandle scalar followed directly by a list-producing keyword: `map`/`grep`/`sort`/`join`/`reverse`/`keys`/`values`) parsed `$fh` as a value argument instead of the filehandle — output went to STDOUT as `GLOB(0x…)` and the file stayed empty. Fixed by adding those `KW_` tokens to the fh-context whitelist at all three `print`/`say` parse sites (`parseStmt`, `parsePrint`, `parseOrRhs`). Test: `tests/fh_listprod_smoke.pl`. |
 | D101 | **FIXED 2026-09-11** | `each %hash` in scalar context returned the pair length (0/1/2), not the key. See below. |
 | D102 | **FIXED** (2026-09-10) | `die REF` / `die $blessed_obj` lost the reference — `$@` became a stringified `TYPE(0xaddr)` plus a wrongly-appended `" at FILE line N."`. Broke OO exception handling. See below. |
 | D103 | **FIXED 2026-09-11** | Integer overflow used wrapping signed 64-bit arithmetic instead of Perl's IV→UV→NV promotion; values at/beyond the `2**63` boundary silently went wrong or printed in scientific notation instead of exact digits. See below. |
@@ -3387,10 +3389,80 @@ Also: class-method `FileHandle->isa("IO::Handle")` now walks `@ISA` (STRING invo
 
 Tests: `tests/term_readline_{smoke,deep}.pl`, `tests/cgi_{smoke,deep}.pl`,
 `tests/quotedprint_{smoke,deep}.pl`, `tests/text_tabs_{smoke,deep}.pl`,
-`tests/digest_front_{smoke,deep}.pl`, `tests/io_select_{smoke,deep}.pl`,
-`tests/use_aliases_{smoke,deep}.pl`, `tests/open_pragma_{smoke,deep}.pl`.
+ `tests/digest_front_{smoke,deep}.pl`, `tests/io_select_{smoke,deep}.pl`,
+ `tests/use_aliases_{smoke,deep}.pl`, `tests/open_pragma_{smoke,deep}.pl`.
 
-## Source layout
+ ### D145 — list-producing expressions as `print`/`say` arguments collapsed to their element count — **FIXED 2026-09-28**
+
+ A list-producing expression used as a `print`/`say` argument was routed
+ through the *scalar* path and printed its **element count** instead of its
+ elements — a silent-wrong-data bug in a very common Perl idiom:
+
+ ```perl
+ my @a = (3, 1, 2);
+ print map  {$_ * 10} (1, 2, 3);   # perl:  102030   perlc(was): 3
+ print grep {$_ > 1} (1..5);       # perl:  2345     perlc(was): 4
+ print sort @a;                    # perl:  123      perlc(was): ""
+ print 1..3;                       # perl:  123      perlc(was): 3
+ print @a;                         # perl:  312      (already correct — @arr was special)
+ ```
+
+ **Root cause.** `emitExpr` for `NK::MapFunc`/`NK::GrepFunc` returns
+ `perl_array_len(av)` in scalar context (the element count, per real Perl's
+ own `scalar(map ...)` semantics) — that is *correct* for scalar context but
+ *wrong* when the value is then fed as a single, list-expanding argument to
+ `print`/`say`. The `print`/`say` argument-collection branch and
+ `SprintfFunc` each held an `isExplicitArray` gate that only recognised
+ `NK::ArrayVar`/`NK::DerefArray`/`ArraySlice`/`HashSlice`/
+ `PostfixDeref(all_array)` — `map`/`grep`/`sort`/`keys`/`values`/`Range`/
+ bare `%hash` did **not** match, so they fell through to the scalar path and
+ collapsed to their count (or to `undef` for `sort @a`). In real Perl, the
+ whole argument list is evaluated in list context before printing, and any
+ list-shaped argument has to expand to its elements.
+
+ **Fix.** A new `CodeGen::isExplicitListKind(const Node&)` helper
+ (declaration in `src/codegen.h`, definition alongside
+ `isCallLikeForContext`) enumerates exactly the node kinds that are
+ unambiguously list-producing (i.e. whose list-context value
+ `emitArrayPtr()` materialises as a `PerlArray*`): `MapFunc`, `GrepFunc`,
+ `SortFunc`, `Range`, `KeysFunc`, `ValuesFunc`, `HashVar` — plus the
+ already-recognised array forms (`ArrayVar`/`DerefArray`/`ArraySlice`/
+ `HashSlice`/`PostfixDeref(all_array)`) so the three call-sites that used to
+ have an inline per-branch check now share one definition. `ReverseFunc` is
+ **deliberately excluded** because it is context-dependent in real Perl —
+ `reverse "abc"` reverses the string's characters (a scalar), `reverse @a`
+ reverses element order (a list) — so `emitExpr`'s existing runtime dispatch
+ on operand type is still the correct path for it, and routing it through
+ `emitArrayPtr` would change `print reverse "abc"` from `"abc"` to a 1-element
+ array printout. The three `print`/`say` arg-collection sites (fh multi-arg,
+ stdout single-arg, stdout multi-arg) and `SprintfFunc` now use
+ `isExplicitListKind(*arg)` in place of their local, narrower `ak == NK::...`
+ checks.
+
+ **Tests.** `tests/print_list_prod_{smoke,deep}.pl` — both verified
+ byte-for-byte against real Perl 5.42 and passing through the full harness
+ along with every pre-existing test (no regressions).
+
+ **Adjacent items found while verifying (neither is part of this fix; #1 is
+ a pre-existing defect present on the previous binary and unaffected by this
+ change, #2 is a real-Perl semantic that constrained the test shapes):**
+
+ 1. `print $fh map {…} (1,2,3);` (a list-producing expression as the **single**
+    argument to a **filehandle** `print`) leaks a typeglob string — it gets
+    parsed/associated into something the codegen then prints as
+    `GLOB(0x…)`. Reproduces on the pre-fix binary identically (arguably
+    worse there), independent of the stdout path this fix corrects.
+ 2. Greedy `map`/`grep` absorbing a *trailing* argument into their input
+    list — e.g. real Perl's `print "x", map {$_+1} (1,2), "y"` yields `x231`
+    (`"y"` becomes a third input element and stringifies to `"1"`), because
+    `map BLOCK LIST` takes *all* remaining arguments as its list. This is
+    real-Perl semantics, not a perlc bug — and it means the greedy forms can
+    only be tested with **no trailing scalar** (the list operator must be the
+    final argument). The tests therefore use `map`/`grep` only as the last
+    argument; the non-greedy forms (`sort`, `keys`, `values`, `@arr`,
+    `1..N`) are safe with a trailing label and are tested that way.
+
+ ## Source layout
 
 | File | Role |
 |------|------|

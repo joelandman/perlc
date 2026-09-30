@@ -6437,10 +6437,10 @@ void CodeGen::emitStmt(const Node &n) {
                    matches that. */
                 Value *av = callRT("perl_array_new", {});
                 for (size_t i = 0; i < n.args.size(); i++) {
-                    NK ak = n.args[i]->kind;
-                    bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
-                                            ak == NK::ArraySlice || ak == NK::HashSlice ||
-                                            (ak == NK::PostfixDeref && n.args[i]->sval == "all_array"));
+                    /* A list-producing argument (map/grep/sort/keys/values/range/
+                       @arr/%h/$ref) expands to its elements via emitArrayPtr —
+                       falling through to scalar emitExpr() would print its count. */
+                    bool isExplicitArray = isExplicitListKind(*n.args[i]);
                     if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
                     Value *sub = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
                     if (sub) {
@@ -6467,12 +6467,11 @@ void CodeGen::emitStmt(const Node &n) {
                     callRT(isSay ? "perl_say" : "perl_print", {v});
                 }
             } else if (n.args.size() == 1) {
-                /* Only expand @arr / @$ref / @{expr} — not function calls which may
-                   return scalars and must go through perl_say for the newline. */
-                NK ak = n.args[0]->kind;
-                bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
-                                        ak == NK::ArraySlice || ak == NK::HashSlice ||
-                                        (ak == NK::PostfixDeref && n.args[0]->sval == "all_array"));
+                /* Only expand unambiguous list-producing forms (@arr / @$ref /
+                   @{expr} and the map/grep/sort/keys/values/range/%h family) —
+                   not scalar-valued forms which must go through perl_say for
+                   the newline. */
+                bool isExplicitArray = isExplicitListKind(*n.args[0]);
                 /* D12: list context for the (possibly sole) print argument
                    — only when it's itself call-like, see
                    isCallLikeForContext. */
@@ -6495,10 +6494,10 @@ void CodeGen::emitStmt(const Node &n) {
                    in a later argument leaves nothing half-printed). */
                 Value *av = callRT("perl_array_new", {});
                 for (size_t i = 0; i < n.args.size(); i++) {
-                    NK ak = n.args[i]->kind;
-                    bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
-                                            ak == NK::ArraySlice || ak == NK::HashSlice ||
-                                            (ak == NK::PostfixDeref && n.args[i]->sval == "all_array"));
+                    /* A list-producing argument (map/grep/sort/keys/values/range/
+                       @arr/%h/$ref) expands to its elements via emitArrayPtr —
+                       falling through to scalar emitExpr() would print its count. */
+                    bool isExplicitArray = isExplicitListKind(*n.args[i]);
                     if (isCallLikeForContext(*n.args[i])) callCtx_ = 1;
                     Value *sub = isExplicitArray ? emitArrayPtr(*n.args[i]) : nullptr;
                     if (sub) {
@@ -9637,10 +9636,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *fmt = emitExpr(*n.left);
         Value *av  = callRT("perl_array_new", {});
         for (auto &a : n.args) {
-            NK ak = a->kind;
-            bool isExplicitArray = (ak == NK::ArrayVar || ak == NK::DerefArray ||
-                                    ak == NK::ArraySlice || ak == NK::HashSlice ||
-                                    (ak == NK::PostfixDeref && a->sval == "all_array"));
+            bool isExplicitArray = isExplicitListKind(*a);
             if (isCallLikeForContext(*a)) callCtx_ = 1;
             if (isExplicitArray) {
                 Value *sub = emitArrayPtr(*a);
@@ -12058,6 +12054,31 @@ bool CodeGen::isCallLikeForContext(const Node &n) {
        call avoids extending that leak into print/printf without needing
        to fix callCtx_'s general design. */
     return n.kind == NK::Call || n.kind == NK::MethodCall || n.kind == NK::CallCodeRef;
+}
+
+bool CodeGen::isExplicitListKind(const Node &n) {
+    /* Unambiguously list-producing expression kinds, i.e. ones whose list-
+       context value emitArrayPtr() turns into a PerlArray*. These are the
+       forms that must be *expanded* (perl_array_extend) when they appear as a
+       print/say/sprintf argument, rather than falling through to emitExpr()
+       (scalar context), which would collapse them to their element count —
+       exactly the silent-wrong-data bug this fixes: real Perl's
+       `print map {$_*10} (1,2,3)` prints "102030", but routing it through
+       scalar emitExpr() printed "3".
+       ReverseFunc is deliberately EXCLUDED: `reverse` is context-dependent
+       (a single scalar operand reverses the string's characters, a list
+       operand reverses element order), so it is *not* unambiguously a list —
+       emitExpr() already dispatches on operand type and must stay the path
+       for it. The array forms (ArrayVar/DerefArray/slices/PostfixDeref) are
+       retained so this stays a superset of the pre-existing per-site gate. */
+    NK k = n.kind;
+    return k == NK::ArrayVar        || k == NK::DerefArray     ||
+           k == NK::ArraySlice      || k == NK::HashSlice      ||
+           (k == NK::PostfixDeref  && n.sval == "all_array")   ||
+           k == NK::MapFunc        || k == NK::GrepFunc       ||
+           k == NK::SortFunc       || k == NK::Range          ||
+           k == NK::KeysFunc       || k == NK::ValuesFunc     ||
+           k == NK::HashVar;
 }
 
 Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
