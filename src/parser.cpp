@@ -17,6 +17,14 @@ static bool isCmpOpWord(const std::string &w) {
     return false;
 }
 
+/* Low-precedence logical xor: both operands are evaluated exactly once,
+   left to right, and the result is a real boolean (1 / ""), like perl's
+   `A xor B`. There is no xor op in codegen, so desugar to !( !A == !B ). */
+static NodePtr makeLogicalXor(NodePtr lhs, NodePtr rhs, int line) {
+    return makeUnary("!", makeBin("==", makeUnary("!", std::move(lhs), line),
+                                        makeUnary("!", std::move(rhs), line), line), line);
+}
+
 Parser::Parser(std::vector<Token> tokens) : toks_(std::move(tokens)) {}
 
 NodePtr Parser::parseExprFromTokens(std::vector<Token> tokens) {
@@ -1731,12 +1739,13 @@ NodePtr Parser::consumeLowOrChain(NodePtr init) {
     while (check(TK::KW_OR) || check(TK::KW_AND) ||
            (cur().kind == TK::IDENT && cur().text == "xor")) {
         int line = cur().line;
+        bool isXor = check(TK::IDENT);
         std::string op = check(TK::KW_AND) ? "&&" : "||";
         advance();
         NodePtr rhs = parseOrRhs();
-        if (cur().kind == TK::IDENT && cur().text == "xor") op = "xor";
-        if (!acc) acc = std::move(rhs);
-        else      acc = makeBin(op, std::move(acc), std::move(rhs), line);
+        if (!acc)       acc = std::move(rhs);
+        else if (isXor) acc = makeLogicalXor(std::move(acc), std::move(rhs), line);
+        else            acc = makeBin(op, std::move(acc), std::move(rhs), line);
     }
     return acc;
 }
@@ -1829,9 +1838,16 @@ NodePtr Parser::parseExpr()    { return parseLowOr(); }
 NodePtr Parser::parseLowOr() {
     auto lhs = parseLowAnd();
     while (check(TK::KW_OR) || (cur().kind == TK::IDENT && cur().text == "xor")) {
+        bool isXor = check(TK::IDENT);
         int line = cur().line; advance();
         NodePtr rhs = parseOrRhs();
-        lhs = makeBin("||", std::move(lhs), std::move(rhs), line);
+        /* `and` binds tighter than or/xor: `A or B and C` is A or (B and C). */
+        while (check(TK::KW_AND)) {
+            int aline = cur().line; advance();
+            rhs = makeBin("&&", std::move(rhs), parseOrRhs(), aline);
+        }
+        lhs = isXor ? makeLogicalXor(std::move(lhs), std::move(rhs), line)
+                    : makeBin("||", std::move(lhs), std::move(rhs), line);
     }
     return lhs;
 }
