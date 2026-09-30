@@ -131,7 +131,7 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
         "Math::BigRat","bignum","bigint","Math::BigInt::Calc",
         "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
-        "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
+        "Storable","JSON::PP","JSON","Cpanel::JSON::XS","Time::Piece","Time::Seconds",
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
         "Pod::Usage",
@@ -398,10 +398,10 @@ static std::vector<Token> inlineModules(
         "File::Basename","Getopt::Long","DBI","DBD::SQLite",
         "threads","threads::shared","UNIVERSAL","Time::HiRes",
         "DynaLoader","XSLoader",
-        "Cwd","Sys::Hostname","Time::Local",
+        "Cwd","Sys::Hostname","Time::Local","File::Which",
         "File::Spec","File::Spec::Unix","File::Spec::Functions",
         "File::Copy","File::Path","File::Find","File::Temp","Text::Wrap",
-        "Storable","JSON::PP","JSON","Time::Piece","Time::Seconds",
+        "Storable","JSON::PP","JSON","Cpanel::JSON::XS","Time::Piece","Time::Seconds",
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
         "Pod::Usage",
@@ -774,7 +774,8 @@ static std::vector<Token> inlineModules(
            above). A bare `use Cwd;` needs no importMap entries: Cwd's
            @EXPORT names (cwd/getcwd) are already in codegen's bare-name
            dispatch. */
-        if (modName == "Fcntl" || modName == "POSIX" || modName == "Errno") {
+        if (modName == "Fcntl" || modName == "POSIX" || modName == "Errno" ||
+            modName == "File::Glob") {
             /* Native constant modules (Fcntl/POSIX/Errno): the requested
                names map to qualified constant calls (codegen resolves
                them through the generated value table). Tag specs (:seek,
@@ -812,6 +813,11 @@ static std::vector<Token> inlineModules(
                     "EXIT_SUCCESS","EXIT_FAILURE",
                 }},
                 {"Errno", {}},
+                {"File::Glob", {
+                    /* real File::Glob's @EXPORT is empty — a bare `use
+                       File::Glob;` exports nothing; :bsd_glob/:glob (below)
+                       are the only tags real scripts actually use. */
+                }},
             };
             /* Tags per real module: Fcntl %EXPORT_TAGS
                (:seek => SEEK_*, :flock => LOCK_*, :DEFAULT => @EXPORT,
@@ -826,6 +832,23 @@ static std::vector<Token> inlineModules(
                 {"POSIX", {
                     {"all", {"LC_ALL","LC_COLLATE","LC_CTYPE","LC_NUMERIC",
                              "LC_MONETARY","LC_MESSAGES"}},
+                }},
+                {"File::Glob", {
+                    /* real %File::Glob::EXPORT_TAGS: :bsd_glob and :glob
+                       are identical (both export bsd_glob + every GLOB_*
+                       constant) — GLOB_ERROR ($File::Glob::ERROR, a
+                       scalar, not a constant sub) and csh_glob are
+                       deliberately not covered. */
+                    {"bsd_glob", {"bsd_glob","GLOB_ABEND","GLOB_ALPHASORT",
+                        "GLOB_ALTDIRFUNC","GLOB_BRACE","GLOB_CSH","GLOB_ERR",
+                        "GLOB_LIMIT","GLOB_MARK","GLOB_NOCASE","GLOB_NOCHECK",
+                        "GLOB_NOMAGIC","GLOB_NOSORT","GLOB_NOSPACE",
+                        "GLOB_QUOTE","GLOB_TILDE"}},
+                    {"glob", {"bsd_glob","GLOB_ABEND","GLOB_ALPHASORT",
+                        "GLOB_ALTDIRFUNC","GLOB_BRACE","GLOB_CSH","GLOB_ERR",
+                        "GLOB_LIMIT","GLOB_MARK","GLOB_NOCASE","GLOB_NOCHECK",
+                        "GLOB_NOMAGIC","GLOB_NOSORT","GLOB_NOSPACE",
+                        "GLOB_QUOTE","GLOB_TILDE"}},
                 }},
             };
             std::vector<std::string> names = explicitImports;
@@ -931,7 +954,8 @@ static std::vector<Token> inlineModules(
             modName == "File::Copy" || modName == "File::Path" ||
             modName == "File::Find" || modName == "File::Temp" ||
             modName == "Text::Wrap" || modName == "Storable" ||
-            modName == "JSON::PP" || modName == "JSON") {
+            modName == "JSON::PP" || modName == "JSON" ||
+            modName == "Cpanel::JSON::XS" || modName == "File::Which") {
             /* File::Spec::Functions' real %EXPORT_TAGS defines
                ALL => [@EXPORT_OK, @EXPORT] — expand :ALL to that union.
                (Real File::Spec::Functions' %EXPORT_TAGS has only ALL.) */

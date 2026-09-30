@@ -13,7 +13,8 @@ sub probe_value {
 }
 my %tables;
 my %tabs;
-my %realmod = (fcntl => 'Fcntl', posix => 'POSIX', errno => 'Errno');
+my %realmod = (fcntl => 'Fcntl', posix => 'POSIX', errno => 'Errno',
+               fileglob => 'File::Glob');
 my %want = (
     fcntl => [qw(SEEK_SET SEEK_CUR SEEK_END O_CREAT O_EXCL O_TRUNC O_APPEND
                  O_RDONLY O_WRONLY O_RDWR O_NONBLOCK O_BINARY O_TEXT O_NDELAY
@@ -36,6 +37,10 @@ my %want = (
     errno => [qw(ENOENT EBADF EINVAL EACCES EEXIST ENOEXEC EINTR EAGAIN
                  EISDIR ENOTDIR ENOSPC EPERM ESRCH ECHILD EPIPE EROFS
                  ENODEV ENOSYS EIO E2BIG EDOM ERANGE EDEADLK EWOULDBLOCK)],
+    fileglob => [qw(GLOB_ABEND GLOB_ALPHASORT GLOB_ALTDIRFUNC GLOB_BRACE
+                    GLOB_CSH GLOB_ERR GLOB_LIMIT GLOB_MARK GLOB_NOCASE
+                    GLOB_NOCHECK GLOB_NOMAGIC GLOB_NOSORT GLOB_NOSPACE
+                    GLOB_QUOTE GLOB_TILDE)],
 );
 for my $mod (sort keys %want) {
     for my $name (@{$want{$mod}}) {

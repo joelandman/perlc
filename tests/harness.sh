@@ -53,6 +53,7 @@ declare -A LONG_TIMEOUT=(
 # the whole suite if they are skipped or produce different "not loaded" output.
 SKIP_BY_DEFAULT=(
     dbi_sqlite.pl xs_dbi_test.pl xs_ffi.pl
+    cpanel_json_xs_smoke.pl cpanel_json_xs_deep.pl
 )
 
 # Self-checking tests: they already print "xxx=ok/FAIL" or die.

@@ -805,6 +805,8 @@ PerlValue *perl_getcwd(void);                  /* Cwd::getcwd / cwd / fastcwd   
 PerlValue *perl_abs_path(PerlValue *pathPV);   /* Cwd::abs_path / fast_abs_path */
 PerlValue *perl_realpath(PerlValue *pathPV);   /* Cwd::realpath (= abs_path)    */
 PerlValue *perl_hostname(void);                /* Sys::Hostname::hostname       */
+PerlValue *perl_which(PerlValue *name);        /* File::Which::which  (scalar: first match/undef) */
+PerlArray *perl_where(PerlValue *name);        /* File::Which::where  (list: every match)         */
 
 /* File::Spec (Unix semantics, faithful to File::Spec::Unix 3.95's
    pure-text algorithms) */
@@ -847,6 +849,7 @@ PerlValue *perl_binmode_fh(PerlValue *fh, PerlValue *layer);
 PerlArray *perl_stat_path(PerlValue *v);
 PerlArray *perl_lstat_path(PerlValue *v);
 PerlArray *perl_glob_val(PerlValue *pattern);
+PerlArray *perl_bsd_glob_val(PerlValue *pattern, PerlValue *flagsArg); /* D157: File::Glob::bsd_glob */
 
 /* ── Tier 3 file / misc builtins ────────────────────────────────────────── */
 PerlValue *perl_read_fh(PerlValue *fh, PerlValue *buf_pv, PerlValue *nbytes, PerlValue *offset);

@@ -790,6 +790,8 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_abs_path",         pv, pv);
     RT("perl_realpath",         pv, pv);
     RT("perl_hostname",         pv);
+    RT("perl_which",            pv, pv);
+    RT("perl_where",            av, pv);
     RT("perl_fpath_collect",    voidTy, av, pv);
     RT("perl_file_find",        pv, pv, av, i32);
     RT("perl_file_temp_template", pv, av, i32, i32);
@@ -907,6 +909,7 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_stat_path",        av, pv);
     RT("perl_lstat_path",       av, pv);
     RT("perl_glob_val",         av, pv);
+    RT("perl_bsd_glob_val",     av, pv, pv);
     /* UNIVERSAL */
     RT("perl_isa_check",        pv, pv, pv);
     RT("perl_can_check",        pv, pv, pv);
@@ -1355,7 +1358,15 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         return h ? callRT("perl_hash_values", {h}) : callRT("perl_array_new", {});
     }
     if (n.kind == NK::SplitFunc) {
-        Value *str = n.right ? emitExpr(*n.right) : perlUndef();
+        /* D158: split PATTERN with no 2nd arg splits $_ in real Perl —
+           this used to always pass perlUndef() instead, so `split m{/}`
+           (or any 1-arg split) silently split nothing/empty regardless
+           of what $_ held. See the identical fix in emitExpr's
+           NK::SplitFunc case below. */
+        Value *str;
+        if (n.right) str = emitExpr(*n.right);
+        else if (auto *slot = lookupVar("_")) str = builder_.CreateLoad(perlPtrTy_, slot);
+        else str = perlUndef();
         /* D118: optional 3rd LIMIT argument, stored in n.args[0] if given. */
         Value *limit = n.args.empty()
             ? ConstantInt::get(Type::getInt64Ty(ctx_), 0, true)
@@ -2288,6 +2299,27 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                        {dirs, opts, ConstantInt::get(i32TyP, 1)});
         callRT("perl_pop_call_frame", {});
         return r;
+    }
+    /* File::Which's which($n)/where($n) in list context — both return
+       EVERY PATH match (which() is genuinely context-sensitive in real
+       File::Which: only its *scalar*-context form, handled in emitCall,
+       is first-match-only; see the comment there for where()'s own
+       scalar-context count quirk, verified against the real module). */
+    if (n.kind == NK::Call &&
+        (n.name == "which" || n.name == "File::Which::which" ||
+         n.name == "where" || n.name == "File::Which::where")) {
+        Value *nm = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_where", {nm});
+    }
+    /* File::Glob's bsd_glob(PATTERN, [FLAGS]) in list context — see
+       perl_bsd_glob_val's comment (D157) for the flag-translation
+       rationale (Perl's own bundled BSD-glob flag values don't match
+       glibc's glob.h numbering). */
+    if (n.kind == NK::Call &&
+        (n.name == "bsd_glob" || n.name == "File::Glob::bsd_glob")) {
+        Value *pat   = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *flags = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_bsd_glob_val", {pat, flags});
     }
     /* File::Temp list context: my ($fh, $name) = tempfile(...) — the
        (fh, name) pair reaches emitArrayPtr, which must return the raw
@@ -7423,6 +7455,36 @@ void CodeGen::emitStmt(const Node &n) {
         /* save current value, optionally assign new one.
            D41: also local $h{key} / local $arr[idx] via element lvalues. */
         Value *pv = nullptr;
+        /* D160: `local $ENV{KEY} = VAL` used to be a complete, silent
+           no-op — %ENV has no real backing PerlHash under lookupHash()
+           at all (it's accessible only through perl_env_get/
+           perl_env_set), so the plain `if (!hv) break;` a few lines
+           below unconditionally bailed out before anything happened:
+           no save, no assign, nothing. Found while implementing
+           File::Which — which()/where() (and any other native code
+           calling getenv() directly) never saw a localized %ENV
+           override, because there was never any assignment at all,
+           not even an internal-hash-only one. Minimal fix: perform the
+           OS-environment set directly via perl_env_set, the same
+           runtime call plain (non-local) `$ENV{KEY} = VAL` already
+           uses (case NK::Assign's identical `n.left->name == "ENV"`
+           check). Known, deliberately-scoped-down remaining
+           limitation: this does NOT hook into the generic
+           perl_local_save/perl_local_restore_to dynamic-scope stack —
+           unlike every other `local` target, the environment variable
+           is not restored to its prior value when the enclosing block/
+           sub exits. A full fix needs a parallel save-stack keyed by
+           env name, hooked into the same depth counter subs already
+           use to unwind ordinary locals; `local $ENV{...}` is a niche
+           enough real-world pattern that this narrower fix (stopping
+           the complete no-op) was judged the right scope for now. */
+        if (n.sval == "hash_elem" && n.name == "ENV" && n.right) {
+            Value *key = emitExpr(*n.right);
+            Value *rhs = n.left ? emitExpr(*n.left) : perlUndef();
+            callRT("perl_env_set", {key, rhs});
+            freeIfOwned(key);
+            break;
+        }
         if (n.sval == "hash_elem" && n.right) {
             Value *hv = lookupHash(n.name);
             if (!hv) break;
@@ -9724,18 +9786,40 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::SplitFunc: {
-        Value *str = n.right ? emitExpr(*n.right) : perlUndef();
+        /* D158: see the identical fix/comment in emitArrayPtr's
+           NK::SplitFunc case above. */
+        Value *str;
+        if (n.right) str = emitExpr(*n.right);
+        else if (auto *slot = lookupVar("_")) str = builder_.CreateLoad(perlPtrTy_, slot);
+        else str = perlUndef();
         /* D118: optional 3rd LIMIT argument, stored in n.args[0] if given. */
         Value *limit = n.args.empty()
             ? ConstantInt::get(Type::getInt64Ty(ctx_), 0, true)
             : callRT("perl_to_int", {emitExpr(*n.args[0])});
+        /* D159: this is emitExpr's copy, reached in SCALAR context (e.g.
+           `my $n = split ...`). perl_split/perl_split_regex both return
+           a raw PerlArray* — returning that directly, type-punned as a
+           PerlValue*, was flatly wrong: perl_assign/perl_clone/etc. all
+           then read a PerlArray's fields as if they were a PerlValue's,
+           silently producing nothing (assigned inside a sub, where the
+           declaration's own codegen path happens not to crash) or
+           segfaulting outright (assigned to a *file-scope* global,
+           whose codegen path actually dereferences the "value"). Real
+           Perl's scalar-context split returns the field count — same
+           conversion `keys`/`values`'s scalar-context cases already do
+           via perl_array_len + perl_array_free just above. */
+        Value *arr;
         if (n.ival) {  /* regex split */
             Value *pat = builder_.CreateGlobalStringPtr(n.sval, "sp_pat");
             Value *flg = builder_.CreateGlobalStringPtr(n.name, "sp_flg");
-            return callRT("perl_split_regex", {pat, flg, str, limit});
+            arr = callRT("perl_split_regex", {pat, flg, str, limit});
+        } else {
+            Value *sep = n.left ? emitExpr(*n.left) : perlStr(" ");
+            arr = callRT("perl_split", {sep, str, limit});
         }
-        Value *sep = n.left  ? emitExpr(*n.left)  : perlStr(" ");
-        return callRT("perl_split", {sep, str, limit});
+        Value *count = callRT("perl_array_len", {arr});
+        callRT("perl_array_free", {arr});
+        return count;
     }
 
     case NK::HashVar: {
@@ -13082,20 +13166,26 @@ Value *CodeGen::emitCall(const Node &n) {
        bare constant forms (`use JSON::PP qw(true false)`). */
     if (n.name == "JSON::PP::encode_json" || n.name == "JSON::encode_json" ||
         n.name == "encode_json" || n.name == "JSON::PP::to_json" ||
-        n.name == "to_json" || n.name == "JSON::to_json") {
+        n.name == "to_json" || n.name == "JSON::to_json" ||
+        n.name == "Cpanel::JSON::XS::encode_json" ||
+        n.name == "Cpanel::JSON::XS::to_json") {
         Value *opts = n.args.size() >= 2 ? emitExpr(*n.args[1]) : perlUndef();
         return callRT("perl_json_encode",
                       {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(), opts});
     }
     if (n.name == "JSON::PP::decode_json" || n.name == "JSON::decode_json" ||
         n.name == "decode_json" || n.name == "JSON::PP::from_json" ||
-        n.name == "from_json" || n.name == "JSON::from_json") {
+        n.name == "from_json" || n.name == "JSON::from_json" ||
+        n.name == "Cpanel::JSON::XS::decode_json" ||
+        n.name == "Cpanel::JSON::XS::from_json") {
         Value *opts = n.args.size() >= 2 ? emitExpr(*n.args[1]) : perlUndef();
         return callRT("perl_json_decode",
                       {n.args.size() >= 1 ? emitExpr(*n.args[0]) : perlUndef(), opts});
     }
-    if (n.name == "JSON::PP::true" || n.name == "JSON::true") return callRT("perl_json_true", {});
-    if (n.name == "JSON::PP::false" || n.name == "JSON::false") return callRT("perl_json_false", {});
+    if (n.name == "JSON::PP::true" || n.name == "JSON::true" ||
+        n.name == "Cpanel::JSON::XS::true") return callRT("perl_json_true", {});
+    if (n.name == "JSON::PP::false" || n.name == "JSON::false" ||
+        n.name == "Cpanel::JSON::XS::false") return callRT("perl_json_false", {});
     /* ── Hash::Util (Tier 2, native) ──
        All of these take the target %hash BY REFERENCE (real Hash::Util's
        `\%` prototype) — arg 0 must be a literal NK::HashVar node
@@ -13493,6 +13583,21 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_file_find",
                       {w, dirs, ConstantInt::get(Type::getInt32Ty(ctx_), dfs)});
     }
+    /* ── File::Glob (Tier 1, native) ──
+       bsd_glob(PATTERN, [FLAGS]) in scalar context — mirrors the core
+       glob() builtin's own scalar-context handling (case NK::GlobFunc
+       in emitExpr): returns the first match, not a real per-call
+       iterator (matching this codebase's existing, already-accepted
+       simplification for plain glob() — not a new limitation this adds). */
+    if (n.name == "bsd_glob" || n.name == "File::Glob::bsd_glob") {
+        Value *pat   = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *flags = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        Value *av    = callRT("perl_bsd_glob_val", {pat, flags});
+        Value *v     = callRT("perl_array_get_ref", {av, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+        Value *res   = callRT("perl_clone", {v});
+        callRT("perl_array_free", {av});
+        return res;
+    }
     /* ── File::Path (Tier 1, native) ──
        make_path(dirs..., {opts}) / mkpath(dirs... | [$dirs], $verbose,
        $mode) — creates each missing component; list ctx returns the
@@ -13596,6 +13701,24 @@ Value *CodeGen::emitCall(const Node &n) {
     /* ── Sys::Hostname (Tier 1, native) ── */
     if (n.name == "Sys::Hostname::hostname" || n.name == "hostname") {
         return callRT("perl_hostname", {});
+    }
+    /* ── File::Which (Tier 1, native) — scalar context ──
+       which($n) is genuinely context-sensitive in real File::Which:
+       scalar ctx returns just the first PATH match (or undef); list
+       ctx (handled in emitArrayPtr) returns EVERY match, identically
+       to where(). where() itself in scalar context returns the match
+       COUNT, not a path — verified against the real installed module,
+       not guessed. */
+    if (n.name == "which" || n.name == "File::Which::which") {
+        Value *nm = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_which", {nm});
+    }
+    if (n.name == "where" || n.name == "File::Which::where") {
+        Value *nm  = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *arr = callRT("perl_where", {nm});
+        Value *cnt = callRT("perl_array_len", {arr});
+        callRT("perl_array_free", {arr});
+        return cnt;
     }
     /* ── File::Spec / File::Spec::Functions / File::Spec::Unix ──
        Method calls (File::Spec->catfile) are intercepted in the MethodCall
@@ -14095,7 +14218,8 @@ Value *CodeGen::emitCall(const Node &n) {
         if (allCaps && n.args.empty() &&
             (n.name.rfind("Fcntl::", 0) == 0 ||
              n.name.rfind("POSIX::", 0) == 0 ||
-             n.name.rfind("Errno::", 0) == 0)) {
+             n.name.rfind("Errno::", 0) == 0 ||
+             n.name.rfind("File::Glob::", 0) == 0)) {
             Value *r = callRT("perl_native_constant",
                 {builder_.CreateGlobalStringPtr(n.name)});
             return r;

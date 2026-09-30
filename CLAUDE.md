@@ -11,14 +11,40 @@ AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
                                       runtime.c
 ```
 
-## Current state (2026-09-11)
+## Current state (2026-09-30)
 
 Core language, OOP, regex (PCRE2 including `/x`), threads::shared, overload,
 Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-23, CGI + Term::ReadLine + missing `use` names):**
+**Harness (2026-09-30, File::Glob/File::Which/Cpanel::JSON::XS + D156-D161
+— 520/520 PASS, 0 FAIL, 2 more skipped-by-default):** Native `File::Glob`
+(`bsd_glob`, `:glob`/`:bsd_glob` tags, `GLOB_*` constants) and `File::Which`
+(`which`/`where`, with real Perl's non-obvious context-sensitivity: `which`
+itself returns every match in list context, not just the first; `where` in
+*scalar* context returns a match count, not a path — verified against the
+real installed modules, not guessed). `Cpanel::JSON::XS` aliases the
+existing native JSON::PP implementation (not installed on this dev machine
+— verified by cross-checking the identical script's output through the
+already-real-Perl-verified JSON::PP path instead; its two smoke/deep tests
+are in `tests/harness.sh`'s `SKIP_BY_DEFAULT` list and self-check rather
+than diff against a real-Perl run that would itself fail to load the
+module). Found and fixed six real, mostly pre-existing defects while
+building these (D156-D160; see TESTS.md for full write-ups) — most
+severe: **D159**, scalar-context `split()` (`my $n = split ...`) never
+worked at all (silent wrong data everywhere, an outright **segfault** at
+file scope) — and **D160**, `local $ENV{KEY} = VAL` was a complete,
+silent no-op (`%ENV` has no real backing hash under the codegen's usual
+lookup, so the generic local-element save/restore path bailed out before
+doing anything). Found, not fixed: **D161**, backtick/`qx()` string
+interpolation mishandles `\$`/`\@` escaping (narrow — logged for a future
+session). Tests: `tests/file_glob_{smoke,deep}.pl`,
+`tests/file_which_{smoke,deep}.pl`, `tests/cpanel_json_xs_{smoke,deep}.pl`,
+`tests/split_nul_{smoke,deep}.pl`, `tests/split_implicit_underscore_
+{smoke,deep}.pl`, `tests/split_scalar_context_{smoke,deep}.pl`,
+`tests/local_env_{smoke,deep}.pl`.
+Previous session (2026-09-23, CGI + Term::ReadLine + missing `use` names):
 `Term::ReadLine` (Stub), `CGI` (param/header/html tags), `MIME::QuotedPrint`,
 `Digest` front-end, `Text::Tabs`, `FileHandle`, `IO::{Seekable,Pipe,Select,UNIX}`,
 `SelectSaver`, `Fatal`, `use open qw(:std :utf8)`.
@@ -476,8 +502,9 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D110, D120, and D124 were
-fixed 2026-09-13** (see TESTS.md). **D54** (tooling) **FIXED 2026-09-21**:
+**Open generated-code defects:** **D161** (backtick/`qx()` `\$`/`\@`
+escaping — narrow, found 2026-09-30, see TESTS.md). D110/D120/D124 were
+fixed 2026-09-13 (see TESTS.md). **D54** (tooling) **FIXED 2026-09-21**:
 `make test-tsan` sets `TSAN_OPTIONS=die_after_fork=0` on the `perlc_tsan`
 compile step.
 
@@ -616,6 +643,9 @@ Getopt::Std, Text::ParseWords, File::Compare, File::stat, English, if,
 experimental, HTTP::Tiny, version, autodie, PerlIO::scalar (2026-09-23);
 Term::ReadLine, CGI, MIME::QuotedPrint, Digest, Text::Tabs, FileHandle,
 IO::Seekable/Pipe/Select/UNIX, SelectSaver, Fatal, open pragma (2026-09-23);
+File::Glob (`bsd_glob`, `GLOB_*` constants; 2026-09-30);
+File::Which (`which`/`where`; 2026-09-30);
+Cpanel::JSON::XS (aliases the native JSON::PP implementation — real Cpanel::JSON::XS isn't installed on this dev machine, so verified by cross-checking the identical script's output through the already-real-Perl-verified JSON::PP path instead; 2026-09-30);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`

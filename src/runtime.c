@@ -6126,8 +6126,19 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
        (ascii/allow_nonref/indent/space_before/space_after/...) are
        accepted and chain but are no-ops beyond canonical/pretty — see
        TESTS.md's JSON::PP scoping write-up. */
+    /* Cpanel::JSON::XS is a drop-in API-compatible replacement for
+       JSON::PP/JSON::XS (that's its entire purpose) — real Cpanel::
+       JSON::XS is NOT installed on this dev machine (no cpanm
+       available to install it), so this was verified by
+       cross-checking against the already-real-Perl-verified native
+       JSON::PP behavior rather than the actual module; documented in
+       TESTS.md. Blesses as the class actually invoked (`obj->sval`)
+       so `ref()` reports correctly, except "JSON" itself, which real
+       JSON.pm always proxies to "JSON::PP" (verified against real
+       Perl — `JSON->new` is blessed "JSON::PP", not "JSON"). */
     if (obj && obj->tag == PERL_STRING && obj->sval &&
-        (strcmp(obj->sval, "JSON::PP") == 0 || strcmp(obj->sval, "JSON") == 0)) {
+        (strcmp(obj->sval, "JSON::PP") == 0 || strcmp(obj->sval, "JSON") == 0 ||
+         strcmp(obj->sval, "Cpanel::JSON::XS") == 0)) {
         if (strcmp(method, "new") == 0) {
             PerlHash *h = perl_anon_hash_new();
             perl_hash_set_str(h, "canonical", perl_alloc_int(0));
@@ -6141,12 +6152,13 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
             perl_hash_set_str(h, "space_after", perl_alloc_int(0));
             perl_hash_set_str(h, "indent", perl_alloc_int(0));
             PerlValue *r = perl_ref_hash(h);
-            r->blessed_class = strdup("JSON::PP");
+            r->blessed_class = strdup(strcmp(obj->sval, "JSON") == 0 ? "JSON::PP" : obj->sval);
             return r;
         }
     }
     if (obj && obj->tag == PERL_REF_HASH && obj->blessed_class &&
-        strcmp(obj->blessed_class, "JSON::PP") == 0) {
+        (strcmp(obj->blessed_class, "JSON::PP") == 0 ||
+         strcmp(obj->blessed_class, "Cpanel::JSON::XS") == 0)) {
         PerlHash *h = (PerlHash *)obj->pval;
         if (strcmp(method, "encode") == 0) {
             PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
@@ -13025,6 +13037,85 @@ PerlValue *perl_hostname(void) {
     return perl_alloc_string(buf);
 }
 
+/* ── File::Which ──
+ * which($name) (scalar: first match or undef) / where($name) (list: every
+ * match), both in $ENV{PATH} order. A name already containing a '/' is
+ * checked directly (no PATH search), matching real File::Which. A match
+ * must exist AND be executable (X_OK) — a same-named non-executable file
+ * earlier in PATH is skipped, not returned. */
+static int perl_which_is_exec_file(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (!S_ISREG(st.st_mode)) return 0;
+    return access(path, X_OK) == 0;
+}
+
+/* Collects every PATH match for `name` into `out` (caller-owned strings,
+   caller frees each). Returns the count. If `stopAtFirst`, collects at
+   most one (used by perl_which to avoid scanning all of PATH). */
+static int perl_which_scan(const char *name, char ***out, int stopAtFirst) {
+    int cap = 8, n = 0;
+    char **results = malloc(sizeof(char *) * (size_t)cap);
+    if (strchr(name, '/')) {
+        if (perl_which_is_exec_file(name)) {
+            results[n++] = strdup(name);
+        }
+        *out = results;
+        return n;
+    }
+    const char *path = getenv("PATH");
+    if (!path) path = "";
+    char *pathCopy = strdup(path);
+    char *saveptr = NULL;
+    for (char *dir = strtok_r(pathCopy, ":", &saveptr); dir;
+         dir = strtok_r(NULL, ":", &saveptr)) {
+        if (*dir == '\0') dir = ".";
+        size_t dlen = strlen(dir), nlen = strlen(name);
+        char *candidate = malloc(dlen + 1 + nlen + 1);
+        memcpy(candidate, dir, dlen);
+        candidate[dlen] = '/';
+        memcpy(candidate + dlen + 1, name, nlen);
+        candidate[dlen + 1 + nlen] = '\0';
+        if (perl_which_is_exec_file(candidate)) {
+            if (n == cap) { cap *= 2; results = realloc(results, sizeof(char *) * (size_t)cap); }
+            results[n++] = candidate;
+            if (stopAtFirst) break;
+        } else {
+            free(candidate);
+        }
+    }
+    free(pathCopy);
+    *out = results;
+    return n;
+}
+
+PerlValue *perl_which(PerlValue *namePV) {
+    char *name = perl_to_string_dup(namePV);
+    char **results;
+    int n = perl_which_scan(name, &results, 1);
+    free(name);
+    PerlValue *r = (n > 0) ? perl_alloc_string(results[0]) : perl_alloc_undef();
+    for (int i = 0; i < n; i++) free(results[i]);
+    free(results);
+    return r;
+}
+
+PerlArray *perl_where(PerlValue *namePV) {
+    char *name = perl_to_string_dup(namePV);
+    char **results;
+    int n = perl_which_scan(name, &results, 0);
+    free(name);
+    PerlArray *arr = perl_array_new();
+    for (int i = 0; i < n; i++) {
+        PerlValue *v = perl_alloc_string(results[i]);
+        perl_array_push(arr, v);
+        perl_free(v);
+        free(results[i]);
+    }
+    free(results);
+    return arr;
+}
+
 /* ── Config (native module) ──
  * %Config / $Config::Config: special hash from the generated table in
  * src/config_data.h (tools/gen_config_data.pl, run once on the host perl;
@@ -16208,10 +16299,53 @@ PerlArray *perl_lstat_path(PerlValue *v) {
 #include <glob.h>
 
 PerlArray *perl_glob_val(PerlValue *pattern) {
+    /* D157: was GLOB_TILDE | GLOB_NOCHECK — GLOB_NOCHECK makes glob(3)
+       return the literal pattern string when nothing matches, but real
+       Perl's glob() returns an empty list on no match (verified against
+       real perl: `glob("*.nomatch")` gives `()`, not `("*.nomatch")`). */
     char *pat = perl_to_string_dup(pattern);
     PerlArray *res = perl_array_new();
     glob_t g;
-    if (glob(pat, GLOB_TILDE | GLOB_NOCHECK, NULL, &g) == 0) {
+    if (glob(pat, GLOB_TILDE, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++)
+            perl_array_push(res, perl_alloc_string(g.gl_pathv[i]));
+        globfree(&g);
+    }
+    free(pat);
+    return res;
+}
+
+/* D157: File::Glob::bsd_glob(PATTERN, FLAGS) — real File::Glob ships its
+   own bundled BSD-glob implementation with its own GLOB_* flag bit
+   values, which do NOT match glibc's glob.h numbering (verified: Perl's
+   GLOB_TILDE=2048 vs glibc's 1<<12=4096, GLOB_BRACE=128 vs glibc's
+   1<<10=1024, etc. — src/native_constants.h's GLOB_* values are the
+   real Perl-side ones, probed from the host perl). Translates the
+   subset of flags glibc's glob(3) actually implements (TILDE, BRACE,
+   MARK, NOSORT, ERR, NOCHECK, NOMAGIC); GLOB_NOCASE/ALPHASORT/
+   ALTDIRFUNC/LIMIT/QUOTE/CSH/ABEND are accepted (so scripts using them
+   still compile and run) but not honored — matching this codebase's
+   existing "accept extra options, no-op beyond the core behavior"
+   convention elsewhere (e.g. JSON::PP's untouched setters). */
+static int perl_bsd_glob_flags_to_libc(long long f) {
+    int libcFlags = 0;
+    if (f & 2048)  libcFlags |= GLOB_TILDE;    /* GLOB_TILDE */
+    if (f & 128)   libcFlags |= GLOB_BRACE;    /* GLOB_BRACE */
+    if (f & 8)     libcFlags |= GLOB_MARK;     /* GLOB_MARK */
+    if (f & 32)    libcFlags |= GLOB_NOSORT;   /* GLOB_NOSORT */
+    if (f & 4)     libcFlags |= GLOB_ERR;      /* GLOB_ERR */
+    if (f & 16)    libcFlags |= GLOB_NOCHECK;  /* GLOB_NOCHECK */
+    if (f & 512)   libcFlags |= GLOB_NOMAGIC;  /* GLOB_NOMAGIC */
+    return libcFlags;
+}
+
+PerlArray *perl_bsd_glob_val(PerlValue *pattern, PerlValue *flagsArg) {
+    char *pat = perl_to_string_dup(pattern);
+    PerlArray *res = perl_array_new();
+    long long f = flagsArg ? perl_to_int(flagsArg) : 0;
+    int libcFlags = perl_bsd_glob_flags_to_libc(f);
+    glob_t g;
+    if (glob(pat, libcFlags, NULL, &g) == 0) {
         for (size_t i = 0; i < g.gl_pathc; i++)
             perl_array_push(res, perl_alloc_string(g.gl_pathv[i]));
         globfree(&g);
@@ -16959,6 +17093,7 @@ PerlValue *perl_native_constant(const char *qualifiedName) {
     const char *pkg = "Fcntl";
     if (strncmp(qualifiedName, "POSIX::", 7) == 0) pkg = "POSIX";
     else if (strncmp(qualifiedName, "Errno::", 7) == 0) pkg = "Errno";
+    else if (strncmp(qualifiedName, "File::Glob::", 12) == 0) pkg = "File::Glob";
     perl_die_croak("%s is not a valid %s macro", name, pkg);
     return NULL; /* not reached */
 }
