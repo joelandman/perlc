@@ -3804,55 +3804,60 @@ static void perl_split_trim_trailing_empty(PerlArray *arr) {
 }
 
 PerlArray *perl_split(PerlValue *sep, PerlValue *str, long long limit) {
-    char *s  = perl_to_string_dup(str);
-    char *sp = perl_to_string_dup(sep);
+    /* NUL-safety fix: this used to fetch NUL-terminated copies via
+       perl_to_string_dup and scan them with strlen/strstr/isspace(*p)-
+       as-loop-condition — every one of those silently truncates at the
+       first embedded NUL byte, both in the string being split AND in
+       the separator itself. Now uses perl_to_string_dup_len's true
+       byte length throughout (index-bounded scanning, memmem instead
+       of strstr) so a NUL anywhere in either operand is just an
+       ordinary byte, matching real Perl. */
+    long long slen = 0, splen0 = 0;
+    char *s  = perl_to_string_dup_len(str, &slen);
+    char *sp = perl_to_string_dup_len(sep, &splen0);
     PerlArray *arr = perl_array_new();
     /* Real perl: splitting an empty string yields an empty list —
        regardless of pattern or LIMIT (see perl_split_regex). */
-    if (s[0] == '\0') { free(s); free(sp); return arr; }
+    if (slen == 0) { free(s); free(sp); return arr; }
     /* D118: LIMIT > 0 bounds the field count — the last field absorbs
        everything remaining unsplit, rather than being split further. */
     int bounded = limit > 0;
 
-    int ws_split = (strcmp(sp, " ") == 0 || strcmp(sp, "\\s+") == 0 ||
-                    strcmp(sp, "\\s") == 0);
+    int ws_split = (splen0 == 1 && sp[0] == ' ') ||
+                   (splen0 == 3 && memcmp(sp, "\\s+", 3) == 0) ||
+                   (splen0 == 2 && memcmp(sp, "\\s", 2) == 0);
     if (ws_split) {
         /* split on runs of whitespace, trimming leading */
-        char *p = s;
-        while (isspace((unsigned char)*p)) p++;
-        while (*p) {
+        long long i = 0;
+        while (i < slen && isspace((unsigned char)s[i])) i++;
+        while (i < slen) {
             if (bounded && (long long)arr->len == limit - 1) {
-                PerlValue *v = perl_alloc_string(p);
+                PerlValue *v = perl_alloc_string_len(s + i, slen - i);
                 perl_array_push(arr, v); perl_free(v);
-                p += strlen(p);
                 break;
             }
-            char *start = p;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            size_t len = (size_t)(p - start);
-            char *elem = malloc(len + 1);
-            memcpy(elem, start, len); elem[len] = '\0';
-            PerlValue *v = perl_alloc_string(elem); free(elem);
+            long long start = i;
+            while (i < slen && !isspace((unsigned char)s[i])) i++;
+            PerlValue *v = perl_alloc_string_len(s + start, i - start);
             perl_array_push(arr, v); perl_free(v);
-            while (isspace((unsigned char)*p)) p++;
+            while (i < slen && isspace((unsigned char)s[i])) i++;
         }
-    } else if (strlen(sp) == 0) {
+    } else if (splen0 == 0) {
         /* split each character */
-        for (char *p = s; *p; p++) {
+        for (long long i = 0; i < slen; i++) {
             if (bounded && (long long)arr->len == limit - 1) {
-                PerlValue *v = perl_alloc_string(p);
+                PerlValue *v = perl_alloc_string_len(s + i, slen - i);
                 perl_array_push(arr, v); perl_free(v);
                 break;
             }
-            char buf[2] = {*p, '\0'};
-            PerlValue *v = perl_alloc_string(buf);
+            PerlValue *v = perl_alloc_string_len(s + i, 1);
             perl_array_push(arr, v); perl_free(v);
         }
     } else {
-        /* handle simple escape sequences in the pattern */
+        /* handle simple escape sequences in the pattern, length-bounded */
         char real_sep[256]; size_t ri = 0;
-        for (size_t i = 0; sp[i] && ri < sizeof(real_sep) - 1; i++) {
-            if (sp[i] == '\\' && sp[i+1]) {
+        for (long long i = 0; i < splen0 && ri < sizeof(real_sep) - 1; i++) {
+            if (sp[i] == '\\' && i + 1 < splen0) {
                 i++;
                 switch (sp[i]) {
                     case 'n': real_sep[ri++] = '\n'; break;
@@ -3862,20 +3867,18 @@ PerlArray *perl_split(PerlValue *sep, PerlValue *str, long long limit) {
                 }
             } else { real_sep[ri++] = sp[i]; }
         }
-        real_sep[ri] = '\0';
-        size_t splen = strlen(real_sep);
-        char *p = s;
-        char *found;
+        size_t splen = ri;
+        long long pos = 0;
         while (splen > 0 && !(bounded && (long long)arr->len == limit - 1) &&
-               (found = strstr(p, real_sep)) != NULL) {
-            size_t len = (size_t)(found - p);
-            char *elem = malloc(len + 1);
-            memcpy(elem, p, len); elem[len] = '\0';
-            PerlValue *v = perl_alloc_string(elem); free(elem);
+               pos + (long long)splen <= slen) {
+            void *found = memmem(s + pos, (size_t)(slen - pos), real_sep, splen);
+            if (!found) break;
+            long long foundPos = (char *)found - s;
+            PerlValue *v = perl_alloc_string_len(s + pos, foundPos - pos);
             perl_array_push(arr, v); perl_free(v);
-            p = found + splen;
+            pos = foundPos + (long long)splen;
         }
-        PerlValue *v = perl_alloc_string(p);
+        PerlValue *v = perl_alloc_string_len(s + pos, slen - pos);
         perl_array_push(arr, v); perl_free(v);
     }
     if (limit == 0) perl_split_trim_trailing_empty(arr);
