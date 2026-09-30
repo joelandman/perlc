@@ -579,8 +579,9 @@ NodePtr Parser::parseStmt() {
             consume(TK::RPAREN, ")");
             NodePtr rhs;
             if (match(TK::ASSIGN)) rhs = parseLowNot();
-            rhs = consumeLowOrChain(std::move(rhs));
-            match(TK::SEMI);
+            if (!rhs) rhs = consumeLowOrChain(nullptr);
+            bool lowChain = rhs && atLowOrOp();   /* D150: (local (...) = X) or RHS */
+            if (!lowChain) match(TK::SEMI);
             NodeList stmts;
             for (auto &vd : allVars) {
                 auto decl = std::make_unique<Node>(); decl->line = line;
@@ -610,7 +611,9 @@ NodePtr Parser::parseStmt() {
                 auto asgn = std::make_unique<Node>(); asgn->kind = NK::Assign;
                 asgn->left = std::move(lhsArr); asgn->right = std::move(rhs); asgn->line = line;
                 auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt;
-                es->left = std::move(asgn); es->line = line;
+                es->left = lowChain ? consumeLowOrChain(std::move(asgn)) : std::move(asgn);
+                es->line = line;
+                if (lowChain) match(TK::SEMI);
                 stmts.push_back(std::move(es));
             }
             auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock;
@@ -1408,8 +1411,9 @@ NodePtr Parser::parseMy() {
         }
         NodePtr rhs;
         if (match(TK::ASSIGN)) rhs = parseLowNot();
-        rhs = consumeLowOrChain(std::move(rhs));
-        match(TK::SEMI);
+        if (!rhs) rhs = consumeLowOrChain(nullptr);
+        bool lowChain = rhs && atLowOrOp();   /* D150: (my (...) = X) or RHS */
+        if (!lowChain) match(TK::SEMI);
         /* emit as FlatBlock with multiple decls */
         NodeList stmts;
         for (auto &vd : allVars) {
@@ -1444,7 +1448,9 @@ NodePtr Parser::parseMy() {
             auto asgn = std::make_unique<Node>(); asgn->kind = NK::Assign;
             asgn->left = std::move(lhsArr); asgn->right = std::move(rhs); asgn->line = line;
             auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt;
-            es->left = std::move(asgn); es->line = line;
+            es->left = lowChain ? consumeLowOrChain(std::move(asgn)) : std::move(asgn);
+            es->line = line;
+            if (lowChain) match(TK::SEMI);
             stmts.push_back(std::move(es));
         }
         auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock;
@@ -1467,9 +1473,7 @@ NodePtr Parser::parseMy() {
         if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
         }
-        decl->right = consumeLowOrChain(std::move(decl->right));
-        match(TK::SEMI);
-        return decl;
+        return finishDeclLowOr(std::move(decl), makeScalar(nm, line), line);
     }
 
     /* my @arr / our @arr */
@@ -1487,9 +1491,7 @@ NodePtr Parser::parseMy() {
        if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
         }
-        decl->right = consumeLowOrChain(std::move(decl->right));
-        match(TK::SEMI);
-        return decl;
+        return finishDeclLowOr(std::move(decl), [&]{ auto v = std::make_unique<Node>(); v->kind = NK::ArrayVar; v->name = nm; v->line = line; return v; }(), line);
     }
 
     /* my %hash / our %hash */
@@ -1506,9 +1508,7 @@ NodePtr Parser::parseMy() {
         if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
         }
-        decl->right = consumeLowOrChain(std::move(decl->right));
-        match(TK::SEMI);
-        return decl;
+        return finishDeclLowOr(std::move(decl), [&]{ auto v = std::make_unique<Node>(); v->kind = NK::HashVar; v->name = nm; v->line = line; return v; }(), line);
     }
 
     /* fallback: expression statement */
@@ -1640,7 +1640,7 @@ NodePtr Parser::parsePush() {
     match(TK::COMMA);
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
-        vals.push_back(parseExpr());
+        vals.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
     }
     if (hasParen) match(TK::RPAREN);
@@ -1672,7 +1672,7 @@ NodePtr Parser::parseUnshift() {
     NodeList vals;
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
-        vals.push_back(parseExpr());
+        vals.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
     }
     if (hasParen) match(TK::RPAREN);
@@ -1686,7 +1686,7 @@ NodePtr Parser::parseReturn() {
     int line = cur().line;
     consume(TK::KW_RETURN);
     NodePtr val;
-    if (!check(TK::SEMI) && !isModifier()) val = parseExpr();
+    if (!check(TK::SEMI) && !isModifier()) val = parseLowNot();
     auto n = std::make_unique<Node>(); n->kind = NK::Return; n->line = line;
     n->left = std::move(val);
     return n;
@@ -1700,8 +1700,8 @@ NodePtr Parser::parseReturn() {
    that arises from invoking the full `parseStmt` recursively. */
 NodePtr Parser::parseDieWarnBody(bool isDie, int line) {
     NodePtr msg;
-    if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK))
-        msg = parseExpr();
+    if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK) && !check(TK::RBRACE))
+        msg = parseLowNot();
     auto n = std::make_unique<Node>();
     n->kind = isDie ? NK::DieStmt : NK::WarnStmt; n->line = line;
     n->left = std::move(msg);
@@ -1734,6 +1734,32 @@ bool Parser::isModifier() const {
    (`my $n = EXPR || next;` — pl2pm), discarding it changes program
    behavior, so the chain is now returned as a real BinOp node (nullptr
    when there was nothing). Callers fold it onto the declared RHS. */
+bool Parser::atLowOrOp() {
+    return check(TK::KW_OR) || check(TK::KW_AND) ||
+           (cur().kind == TK::IDENT && cur().text == "xor");
+}
+
+/* D150: `my $x = INIT or RHS` is `(my $x = INIT) or RHS` — the declaration's
+   assignment, not INIT alone, is the LHS (folding RHS into INIT put a list
+   initializer in scalar context: `my @r = reverse 1, 2 or ...` gave ("21")).
+   Split into `my $x; ($x = INIT) or RHS` in a scope-less FlatBlock. */
+NodePtr Parser::finishDeclLowOr(NodePtr decl, NodePtr var, int line) {
+    if (!decl->right || !atLowOrOp()) {
+        decl->right = consumeLowOrChain(std::move(decl->right));
+        match(TK::SEMI);
+        return decl;
+    }
+    auto asgn = std::make_unique<Node>(); asgn->kind = NK::Assign; asgn->line = line;
+    asgn->left = std::move(var); asgn->right = std::move(decl->right);
+    auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt; es->line = line;
+    es->left = consumeLowOrChain(std::move(asgn));
+    match(TK::SEMI);
+    auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock; fb->line = line;
+    fb->args.push_back(std::move(decl));
+    fb->args.push_back(std::move(es));
+    return fb;
+}
+
 NodePtr Parser::consumeLowOrChain(NodePtr init) {
     NodePtr acc = std::move(init);
     while (check(TK::KW_OR) || check(TK::KW_AND) ||
@@ -1752,6 +1778,55 @@ NodePtr Parser::consumeLowOrChain(NodePtr init) {
 
 /* Wrap stmt in an if/while/foreach node if a modifier keyword follows.
    Always consumes the trailing semicolon. */
+/* D150: the value a statement node evaluates to when used as the LHS of a
+   low-precedence or/and/xor, or nullptr when the statement never completes
+   normally (return/last/next/redo/goto/die), whose RHS is unreachable. */
+NodePtr Parser::stmtValueExpr(Node &stmt, int line) {
+    auto scalarOfArray = [&](const std::string &name, const Node *ref) {
+        auto sc = std::make_unique<Node>(); sc->kind = NK::ScalarFunc; sc->line = line;
+        if (ref) {
+            auto d = std::make_unique<Node>(); d->kind = NK::DerefArray;
+            d->left = ref->clone(); d->line = line;
+            sc->left = std::move(d);
+        } else {
+            sc->name = name;
+        }
+        return sc;
+    };
+    switch (stmt.kind) {
+    case NK::PrintStmt: case NK::SayStmt: case NK::PrintfStmt:
+    case NK::WarnStmt:  case NK::RequireStmt:
+        return makeInt(1, line);           /* perlc's print/warn never fail */
+    case NK::StateDecl:
+        return makeScalar(stmt.name, line);
+    case NK::LocalGlob:
+        if (stmt.name == "_") return makeScalar("_", line);
+        return makeInt(1, line);
+    case NK::LocalStmt: {
+        if (stmt.sval.empty()) return makeScalar(stmt.name, line);
+        if (!stmt.right) return nullptr;
+        auto e = std::make_unique<Node>();
+        e->kind = (stmt.sval == "hash_elem") ? NK::HashElem : NK::ArrayElem;
+        e->name = stmt.name; e->left = stmt.right->clone(); e->line = line;
+        return e;
+    }
+    case NK::LocalArray:
+        return scalarOfArray(stmt.name, nullptr);
+    case NK::LocalHash: {
+        auto k = std::make_unique<Node>(); k->kind = NK::KeysFunc;
+        k->name = stmt.name; k->line = line;
+        return k;
+    }
+    case NK::PushStmt: case NK::UnshiftStmt2:
+        return scalarOfArray(stmt.name, stmt.left.get());
+    case NK::ExprStmt:
+        if (stmt.left) return stmt.left->clone();
+        return nullptr;
+    default:
+        return nullptr;
+    }
+}
+
 NodePtr Parser::parseModifier(NodePtr stmt, int line) {
     if (check(TK::KW_IF) || check(TK::KW_UNLESS)) {
         bool neg = check(TK::KW_UNLESS); advance();
@@ -1793,38 +1868,31 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
         match(TK::SEMI);
         return n;
     }
-    // Handle or/and/xor chains (low-precedence statement separators).
-    // After a statement like `my $x = 0`, the `or`/`and`/`xor` keywords
-    // act as statement-level operators (Perl precedence: below assignment).
-    // Consume the chain and its RHS without emitting short-circuit code
-    // — they are effectively no-ops after declarations/statements.
-    /* D147: `print LIST or/and RHS` — print's arguments stop at the low-
-       precedence operator (list-operator precedence), so the print itself is
-       the LHS. Build a real BinOp over `do { PRINT; 1 }` (perlc's print never
-       reports failure) instead of dropping the RHS, so `print ... and f()`
-       runs f() and `print $V and 1` prints $V, as in real Perl. */
-    if ((stmt->kind == NK::PrintStmt || stmt->kind == NK::SayStmt ||
-         stmt->kind == NK::PrintfStmt) &&
-        (check(TK::KW_OR) || check(TK::KW_AND) ||
-         (cur().kind == TK::IDENT && cur().text == "xor"))) {
-        auto one = std::make_unique<Node>(); one->kind = NK::ExprStmt;
-        one->left = makeInt(1, line); one->line = line;
-        NodeList body;
-        body.push_back(std::move(stmt));
-        body.push_back(std::move(one));
-        auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt; es->line = line;
-        es->left = consumeLowOrChain(makeBlock(std::move(body), line));
-        return parseModifier(std::move(es), line);
-    }
+    /* `STMT or/and/xor RHS` (D147/D150). The statement's own arguments stop
+       at the low-precedence operator (list-operator precedence), so STMT is
+       the LHS. Rebuild it as `STMT; VALUE op RHS` in a scope-less FlatBlock
+       (a real block would end `local`'s dynamic scope and re-scope `state`),
+       where VALUE is what the statement evaluates to in perl — see
+       stmtValueExpr(). Statements that never complete normally (return,
+       last/next/redo, goto, die) have no value: their RHS is unreachable in
+       real Perl too, so it is parsed and dropped. */
     if (check(TK::KW_OR) || check(TK::KW_AND) ||
         (cur().kind == TK::IDENT && cur().text == "xor")) {
+        NodePtr value = stmtValueExpr(*stmt, line);
+        if (value) {
+            auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt; es->line = line;
+            es->left = consumeLowOrChain(std::move(value));
+            auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock; fb->line = line;
+            fb->args.push_back(std::move(stmt));
+            fb->args.push_back(std::move(es));
+            return parseModifier(std::move(fb), line);
+        }
         while (check(TK::KW_OR) || check(TK::KW_AND) ||
                (cur().kind == TK::IDENT && cur().text == "xor")) {
             advance();            /* consume or/and/xor */
-            parseOrRhs();         /* consume RHS */
+            parseOrRhs();         /* consume (unreachable) RHS */
         }
-        match(TK::SEMI);
-        return stmt;
+        return parseModifier(std::move(stmt), line);  /* `next or X if C` */
     }
     match(TK::SEMI);
     return stmt;
@@ -1833,6 +1901,12 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
 /* ── expressions ─────────────────────────────────────────────────────────── */
 
 NodePtr Parser::parseExpr()    { return parseLowOr(); }
+
+/* D150: one argument of a list operator (print, push, map, sort, a bareword
+   call, ...). Without parentheses a list operator's arguments stop at the
+   low-precedence and/or/xor (`push @a, 1 or die` is `(push @a, 1) or die`);
+   inside parentheses the full expression grammar applies. */
+NodePtr Parser::parseListOpArg(bool parens) { return parens ? parseExpr() : parseLowNot(); }
 
 /* low-precedence: or / xor (below assignment) */
 NodePtr Parser::parseLowOr() {
@@ -3788,11 +3862,23 @@ NodePtr Parser::parsePrimary() {
                `sort keys %h` / `sort @arr` already do — emitArrayPtr's
                existing GrepFunc/MapFunc/Call/etc. cases pick it up from
                there with no codegen changes needed. */
-            auto inner = parseExpr();
-            auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
-            n->left = std::move(inner); n->sval = sortMode; n->line = line;
-            n->body = std::move(sortBlock); n->name = sortSubName;
-            return n;
+            auto inner = parseLowNot();
+            if (check(TK::COMMA) || check(TK::FATARROW)) {
+                /* D150: `sort { ... } 1, 3, 2` — an unparenthesized
+                   comma list; collect it like the (LIST) form below. */
+                elems.push_back(std::move(inner));
+                while (match(TK::COMMA) || match(TK::FATARROW)) {
+                    if (check(TK::SEMI) || check(TK::RBRACE) || check(TK::RPAREN) ||
+                        check(TK::EOF_TOK) || isModifier())
+                        break;
+                    elems.push_back(parseLowNot());
+                }
+            } else {
+                auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
+                n->left = std::move(inner); n->sval = sortMode; n->line = line;
+                n->body = std::move(sortBlock); n->name = sortSubName;
+                return n;
+            }
         }
         auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
         n->args = std::move(elems); n->sval = sortMode; n->line = line;
@@ -3883,11 +3969,11 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_JOIN)) {
         advance();
         bool hasParen = match(TK::LPAREN);
-        NodePtr sep = parseExpr();
+        NodePtr sep = parseListOpArg(hasParen);
         match(TK::COMMA);
         NodeList rest;
         while (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
-            rest.push_back(parseExpr());
+            rest.push_back(parseListOpArg(hasParen));
             if (!match(TK::COMMA)) break;
         }
         if (hasParen) consume(TK::RPAREN, ")");
@@ -3926,7 +4012,7 @@ NodePtr Parser::parsePrimary() {
         while (true) {
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            args.push_back(parseExpr());
+            args.push_back(parseListOpArg(hasParen));
             if (!match(TK::COMMA)) break;
         }
         if (hasParen) consume(TK::RPAREN, ")");
@@ -3939,7 +4025,7 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_CLOSE)) {
         advance();
         bool hasParen = match(TK::LPAREN);
-        auto fh = parseExpr();
+        auto fh = parseListOpArg(hasParen);
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::CloseFunc; n->line = line;
         n->left = std::move(fh);
@@ -3966,7 +4052,7 @@ NodePtr Parser::parsePrimary() {
         auto n = std::make_unique<Node>(); n->kind = NK::UnlinkFunc; n->line = line;
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) &&
                !(hasParen && check(TK::RPAREN))) {
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hasParen));
             if (!match(TK::COMMA)) break;
         }
         if (hasParen) consume(TK::RPAREN, ")");
@@ -4040,13 +4126,13 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_SPRINTF)) {
         advance();
         bool hasParen = match(TK::LPAREN);
-        NodePtr fmt = parseExpr();
+        NodePtr fmt = parseListOpArg(hasParen);
         NodeList args;
         while (match(TK::COMMA)) {
             if (!hasParen && isModifier()) break;
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            args.push_back(parseExpr());
+            args.push_back(parseListOpArg(hasParen));
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::SprintfFunc; n->line = line;
@@ -4058,13 +4144,13 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_PACK)) {
         advance();
         bool hasParen = match(TK::LPAREN);
-        NodePtr fmt = parseExpr();
+        NodePtr fmt = parseListOpArg(hasParen);
         NodeList args;
         while (match(TK::COMMA)) {
             if (!hasParen && isModifier()) break;
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            args.push_back(parseExpr());
+            args.push_back(parseListOpArg(hasParen));
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::PackFunc; n->line = line;
@@ -4272,7 +4358,7 @@ NodePtr Parser::parsePrimary() {
         bool hp = match(TK::LPAREN);
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
         if (hp) consume(TK::RPAREN, ")");
@@ -4291,7 +4377,7 @@ NodePtr Parser::parsePrimary() {
         match(TK::COMMA);
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
         if (hp) consume(TK::RPAREN, ")");
@@ -4307,7 +4393,7 @@ NodePtr Parser::parsePrimary() {
         match(TK::COMMA);
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
         if (hp) consume(TK::RPAREN, ")");
@@ -4337,7 +4423,7 @@ NodePtr Parser::parsePrimary() {
         /* collect all args (array var, list, or scalar) */
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
         if (hp) consume(TK::RPAREN, ")");
@@ -4365,7 +4451,7 @@ NodePtr Parser::parsePrimary() {
         /* parse the input list (array, range, or explicit list) */
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
         if (hp) consume(TK::RPAREN, ")");
@@ -4446,7 +4532,7 @@ NodePtr Parser::parsePrimary() {
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (!match(TK::COMMA)) break;
             if ((hp && check(TK::RPAREN)) || check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hp));
         }
         if (hp) consume(TK::RPAREN, ")");
         return n;
@@ -4460,11 +4546,11 @@ NodePtr Parser::parsePrimary() {
         auto n = std::make_unique<Node>(); n->kind = NK::SystemFunc; n->line = line;
         if (!(hp && check(TK::RPAREN)) && !check(TK::SEMI) && !check(TK::EOF_TOK)
             && !isModifier()) {
-            n->left = parseExpr();
+            n->left = parseListOpArg(hp);
             while (match(TK::COMMA)) {
                 if (hp && check(TK::RPAREN)) break;
                 if (check(TK::SEMI) || check(TK::EOF_TOK) || isModifier()) break;
-                n->args.push_back(parseExpr());
+                n->args.push_back(parseListOpArg(hp));
             }
         }
         if (hp) consume(TK::RPAREN, ")");
@@ -4476,7 +4562,7 @@ NodePtr Parser::parsePrimary() {
         bool isDie = check(TK::KW_DIE); advance();
         bool hp = match(TK::LPAREN);
         NodePtr msg;
-        if (!check(TK::SEMI) && !check(TK::EOF_TOK) && !(hp && check(TK::RPAREN)))
+        if (!check(TK::SEMI) && !check(TK::EOF_TOK) && !check(TK::RBRACE) && !(hp && check(TK::RPAREN)))
             msg = parseExpr();
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>();
@@ -4488,41 +4574,41 @@ NodePtr Parser::parsePrimary() {
     /* ── filesystem ops ─────────────────────────────────────────────────── */
     if (check(TK::KW_CHDIR)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto path = parseExpr(); if (hp) consume(TK::RPAREN, ")");
+        auto path = parseListOpArg(hp); if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::ChdirFunc; n->line = line;
         n->left = std::move(path); return n;
     }
     if (check(TK::KW_MKDIR)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto path = parseExpr();
+        auto path = parseListOpArg(hp);
         NodePtr mode;
-        if (match(TK::COMMA) && !check(TK::RPAREN)) mode = parseExpr();
+        if (match(TK::COMMA) && !check(TK::RPAREN)) mode = parseListOpArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::MkdirFunc; n->line = line;
         n->left = std::move(path); n->right = std::move(mode); return n;
     }
     if (check(TK::KW_RMDIR)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto path = parseExpr(); if (hp) consume(TK::RPAREN, ")");
+        auto path = parseListOpArg(hp); if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::RmdirFunc; n->line = line;
         n->left = std::move(path); return n;
     }
     if (check(TK::KW_RENAME)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto oldp = parseExpr(); match(TK::COMMA); auto newp = parseExpr();
+        auto oldp = parseListOpArg(hp); match(TK::COMMA); auto newp = parseListOpArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::RenameFunc; n->line = line;
         n->left = std::move(oldp); n->right = std::move(newp); return n;
     }
     if (check(TK::KW_CHMOD)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto mode = parseExpr();
+        auto mode = parseListOpArg(hp);
         auto n = std::make_unique<Node>(); n->kind = NK::ChmodFunc; n->line = line;
         n->left = std::move(mode);
         while (match(TK::COMMA)) {
             if (hp && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            n->args.push_back(parseExpr());
+            n->args.push_back(parseListOpArg(hp));
         }
         if (hp) consume(TK::RPAREN, ")");
         return n;
@@ -4537,7 +4623,7 @@ NodePtr Parser::parsePrimary() {
         else if (check(TK::SCALAR)) { advance(); dhVar = cur().text; advance(); }
         else { dhVar = cur().text; advance(); } /* bare DH ident */
         match(TK::COMMA);
-        auto path = parseExpr(); if (hp) consume(TK::RPAREN, ")");
+        auto path = parseListOpArg(hp); if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::OpendirFunc; n->line = line;
         n->name = dhVar; n->left = std::move(path); return n;
     }
@@ -4563,9 +4649,9 @@ NodePtr Parser::parsePrimary() {
     /* seek($fh, offset, whence) */
     if (check(TK::KW_SEEK)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto fh = parseExpr(); consume(TK::COMMA, ",");
-        auto off = parseExpr(); consume(TK::COMMA, ",");
-        auto wh = parseExpr();
+        auto fh = parseListOpArg(hp); consume(TK::COMMA, ",");
+        auto off = parseListOpArg(hp); consume(TK::COMMA, ",");
+        auto wh = parseListOpArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::SeekFunc; n->line = line;
         n->args.push_back(std::move(fh));
@@ -4586,9 +4672,9 @@ NodePtr Parser::parsePrimary() {
     /* binmode($fh[, $layer]) */
     if (check(TK::KW_BINMODE)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto fh = parseExpr();
+        auto fh = parseListOpArg(hp);
         NodePtr layer;
-        if (match(TK::COMMA)) layer = parseExpr();
+        if (match(TK::COMMA)) layer = parseListOpArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::BinmodeFunc; n->line = line;
         n->left = std::move(fh); n->right = std::move(layer); return n;
@@ -4638,11 +4724,11 @@ NodePtr Parser::parsePrimary() {
     /* read($fh, $buf, $n [, $offset]) */
     if (check(TK::KW_READ)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto fh = parseExpr(); match(TK::COMMA);
-        auto buf = parseExpr(); match(TK::COMMA);
-        auto nb  = parseExpr();
+        auto fh = parseListOpArg(hp); match(TK::COMMA);
+        auto buf = parseListOpArg(hp); match(TK::COMMA);
+        auto nb  = parseListOpArg(hp);
         NodePtr off;
-        if (match(TK::COMMA)) off = parseExpr();
+        if (match(TK::COMMA)) off = parseListOpArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::ReadFunc; n->line = line;
         n->args.push_back(std::move(fh));
@@ -4664,8 +4750,8 @@ NodePtr Parser::parsePrimary() {
     /* truncate($fh_or_path, $len) */
     if (check(TK::KW_TRUNCATE)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto fh = parseExpr(); match(TK::COMMA);
-        auto len = parseExpr();
+        auto fh = parseListOpArg(hp); match(TK::COMMA);
+        auto len = parseListOpArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::TruncateFunc; n->line = line;
         n->left = std::move(fh); n->right = std::move(len); return n;
@@ -5058,11 +5144,11 @@ NodePtr Parser::parseBareCall(std::string name, int line) {
     if (it != importMap_.end()) name = it->second;
     const std::string *pr = lookupProto(name);
     NodeList args;
-    args.push_back(parseExpr());
+    args.push_back(parseLowNot());
     while (match(TK::COMMA) || match(TK::FATARROW)) {
         if (check(TK::SEMI) || check(TK::EOF_TOK) || isModifier()) break;
         if (check(TK::RPAREN) || check(TK::RBRACE) || check(TK::RBRACKET)) break;
-        args.push_back(parseExpr());
+        args.push_back(parseLowNot());
     }
     if (pr) checkProtoArity(name, *pr, (int)args.size(), line);
     auto n = std::make_unique<Node>(); n->kind = NK::Call;

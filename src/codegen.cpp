@@ -8530,6 +8530,10 @@ Value *CodeGen::emitExpr(const Node &n) {
                       }
                       callRT("perl_array_replace", {av_lhs, tmp});
                   }
+                /* D150: list assignment in scalar context is the RHS element
+                   count — for an array LHS that is its new length
+                   (`(@x = f()) or die`, `my $n = (@x = ...)`). */
+                return callRT("perl_array_len", {av_lhs});
             }
             return perlUndef();
         }
@@ -8548,7 +8552,9 @@ Value *CodeGen::emitExpr(const Node &n) {
                 else     callRT("perl_array_push", {listArr, emitExpr(*n.right)});
             }
             callRT("perl_hash_from_list", {hv, listArr});
-            return perlUndef();
+            /* D150: scalar value is the RHS element count (pairs * 2,
+               duplicates included), as in perl. */
+            return callRT("perl_array_len", {listArr});
         }
         /* $$ref = val */
         if (n.left->kind == NK::DerefScalar) {

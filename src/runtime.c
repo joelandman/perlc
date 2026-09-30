@@ -6813,7 +6813,8 @@ void perl_die(PerlValue *msg, const char *filename, int line) {
      if (isRef) {
          full = perl_to_string_dup(msg);  /* stderr/__DIE__-handler text only */
      } else {
-         char *s = msg ? perl_to_string_dup(msg) : strdup("Died");
+         char *s = msg ? perl_to_string_dup(msg) : NULL;
+         if (!s || !*s) { free(s); s = strdup("Died"); }  /* die "" too */
          full = appendDieLocation(s, filename, line);
          free(s);
      }
@@ -10335,7 +10336,8 @@ static int call_sig_handler(const char *name, PerlValue *msg_pv) {
 
 void perl_warn(PerlValue *msg, const char *filename, int line) {
     /* Default message matches real Perl when warn() is called with no args. */
-    char *s = msg ? perl_to_string_dup(msg) : strdup("Warning: something's wrong");
+    char *s = msg ? perl_to_string_dup(msg) : NULL;
+    if (!s || !*s) { free(s); s = strdup("Warning: something's wrong"); }  /* warn "" too */
     char *full = appendDieLocation(s, filename, line);
     free(s);
 

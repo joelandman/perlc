@@ -123,6 +123,10 @@ private:
 
     bool    isModifier() const;
     NodePtr parseModifier(NodePtr stmt, int line);
+    NodePtr parseListOpArg(bool parens);          /* D150: list-op argument: parseExpr in parens, else stops at and/or/xor */
+    NodePtr stmtValueExpr(Node &stmt, int line); /* D150: value of STMT as an or/and LHS; nullptr if STMT never completes */
+    bool atLowOrOp();                              /* next token is low-precedence or/and/xor */
+    NodePtr finishDeclLowOr(NodePtr decl, NodePtr var, int line); /* D150: (my $x = INIT) or RHS */
     NodePtr consumeLowOrChain(NodePtr init);  /* consume or/and/xor statement separators, folding onto init; returns the chain (or init) */
 
     NodePtr parseExpr();
