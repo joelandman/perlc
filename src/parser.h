@@ -123,6 +123,7 @@ private:
 
     bool    isModifier() const;
     NodePtr parseModifier(NodePtr stmt, int line);
+    NodePtr parseFhArg(bool parens);              /* D152: filehandle arg: bareword → Typeglob */
     NodePtr parseListOpArg(bool parens);          /* D150: list-op argument: parseExpr in parens, else stops at and/or/xor */
     NodePtr stmtValueExpr(Node &stmt, int line); /* D150: value of STMT as an or/and LHS; nullptr if STMT never completes */
     bool atLowOrOp();                              /* next token is low-precedence or/and/xor */

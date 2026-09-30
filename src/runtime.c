@@ -6784,7 +6784,13 @@ void perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
 
 PerlValue *perl_eof_fh(PerlValue *fh) {
      if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return perl_alloc_int(1);
-     return perl_alloc_int(feof((FILE*)fh->pval) ? 1 : 0);
+     /* D152: like perl, peek one char — feof() alone stays false right after
+        the last line was read, so `while (!eof($fh))` ran one extra time. */
+     FILE *fp = (FILE*)fh->pval;
+     int c = fgetc(fp);
+     if (c == EOF) return perl_alloc_bool(1);
+     ungetc(c, fp);
+     return perl_alloc_bool(0);
  }
 
 /* Append " at FILE line N." to a die message if it doesn't already end in \n.
@@ -15869,7 +15875,7 @@ PerlValue *perl_tell_fh(PerlValue *fh) {
 }
 
 PerlValue *perl_binmode_fh(PerlValue *fh, PerlValue *layer) {
-    if (!fh || fh->tag != PERL_FILEHANDLE) return perl_alloc_int(0);
+    if (!fh || fh->tag != PERL_FILEHANDLE) return perl_alloc_undef();  /* perl: undef when not open */
     if (!layer || layer->tag == PERL_UNDEF) {
         fh->flags &= ~PV_FLAG_UTF8;
         return perl_alloc_int(1);

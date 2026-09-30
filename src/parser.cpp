@@ -1902,6 +1902,20 @@ NodePtr Parser::parseExpr()    { return parseLowOr(); }
    inside parentheses the full expression grammar applies. */
 NodePtr Parser::parseListOpArg(bool parens) { return parens ? parseExpr() : parseLowNot(); }
 
+/* D152: the filehandle argument of close/eof/tell/binmode/fileno. A bareword
+   there is always a filehandle — even one never opened, or opened later in
+   the source — never a sub call (perl returns false/undef at runtime rather
+   than failing to compile). */
+NodePtr Parser::parseFhArg(bool parens) {
+    if (check(TK::IDENT) && peek(1).kind != TK::LPAREN && peek(1).kind != TK::ARROW) {
+        auto t = std::make_unique<Node>(); t->kind = NK::Typeglob;
+        t->name = cur().text; t->line = cur().line;
+        advance();
+        return t;
+    }
+    return parseListOpArg(parens);
+}
+
 /* low-precedence: or / xor (below assignment) */
 NodePtr Parser::parseLowOr() {
     auto lhs = parseLowAnd();
@@ -4019,7 +4033,7 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_CLOSE)) {
         advance();
         bool hasParen = match(TK::LPAREN);
-        auto fh = parseListOpArg(hasParen);
+        auto fh = parseFhArg(hasParen);
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::CloseFunc; n->line = line;
         n->left = std::move(fh);
@@ -4032,7 +4046,7 @@ NodePtr Parser::parsePrimary() {
         bool hasParen = match(TK::LPAREN);
         NodePtr fh;
         if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK))
-            fh = parseExpr();
+            fh = parseFhArg(hasParen);
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::EofFunc; n->line = line;
         n->left = std::move(fh);
@@ -4657,7 +4671,7 @@ NodePtr Parser::parsePrimary() {
     /* tell($fh) */
     if (check(TK::KW_TELL)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto fh = parseExpr();
+        auto fh = parseFhArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::TellFunc; n->line = line;
         n->left = std::move(fh); return n;
@@ -4666,7 +4680,7 @@ NodePtr Parser::parsePrimary() {
     /* binmode($fh[, $layer]) */
     if (check(TK::KW_BINMODE)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto fh = parseListOpArg(hp);
+        auto fh = parseFhArg(hp);
         NodePtr layer;
         if (match(TK::COMMA)) layer = parseListOpArg(hp);
         if (hp) consume(TK::RPAREN, ")");
@@ -4735,7 +4749,7 @@ NodePtr Parser::parsePrimary() {
     /* fileno($fh) */
     if (check(TK::KW_FILENO)) {
         advance(); bool hp = match(TK::LPAREN);
-        auto fh = parseExpr();
+        auto fh = parseFhArg(hp);
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::FilenofFunc; n->line = line;
         n->left = std::move(fh); return n;
