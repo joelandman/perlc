@@ -110,6 +110,9 @@ struct Token {
        parser or codegen itself (e.g. const-sub splices, interpolation
        fragments) — and keeps the legacy main-script error format. */
     const char *file = nullptr;
+    /* D154: a double-quoted string containing \x{...} above 0xFF — its
+       text is UTF-8 encoded and the literal is a character string. */
+    bool wide = false;
 };
 
 class Lexer {
@@ -146,6 +149,8 @@ private:
     void skipBlockComment();
     Token readNumber();
     Token readString(char delim, bool interpolates);
+    void appendEscape(char esc, std::string &raw, bool &wide); /* D154: shared "..." / qq{} escape handling */
+    static std::string processEscapes(const std::string &in, bool &wide); /* D154: heredoc bodies */
     Token readHeredoc();
     Token readIdent();
     Token readRegex();

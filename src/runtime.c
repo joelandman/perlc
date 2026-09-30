@@ -1397,6 +1397,7 @@ PerlValue *perl_clone(const PerlValue *src) {
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         v->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
         if (n > 0) memcpy(v->pval, src->pval, sizeof(double) * (size_t)n);
+        v->flags |= (src->flags & PV_FLAG_INT_ELEMS);   /* D154 */
         return v;
     }
     if (src->tag == PERL_CPLX_ROW && src->pval) {
@@ -1421,6 +1422,8 @@ PerlValue *perl_clone(const PerlValue *src) {
     v->flags = 0;      /* clones are never shared — that's a property of the slot, not the value */
     /* FLOAT_PAIR stores the imaginary part in matchpos — must NOT be zeroed. */
     if (src->tag != PERL_FLOAT_PAIR) v->matchpos = 0;
+    else v->flags |= (src->flags & PV_FLAG_INT_MASK);   /* D154 */
+    if (src->tag == PERL_FLOAT) v->flags |= (src->flags & PV_FLAG_IV_HINT);   /* D154 */
     v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
     if (src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
@@ -2281,6 +2284,11 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
        survive any number of perl_assign calls on that same pointer. */
     unsigned int preserved_flags = dst->flags & (PV_FLAG_SHARED | PV_CAPTURE_MASK | PV_FLAG_CAPTURE_RELEASED);
     unsigned int src_utf8 = (src && src->tag == PERL_STRING) ? (src->flags & PV_FLAG_UTF8) : 0;
+    /* D154: FLAT_ARRAY / FLOAT_PAIR "built from ints" is a value bit */
+    if (src && (src->tag == PERL_FLAT_ARRAY || src->tag == PERL_FLOAT_PAIR))
+        src_utf8 |= (src->flags & PV_FLAG_INT_MASK);
+    if (src && src->tag == PERL_FLOAT)
+        src_utf8 |= (src->flags & PV_FLAG_IV_HINT);
     /* No implicit mutex here — caller must hold lock() for concurrent safety.
        Locking inside perl_assign would deadlock when lock() is already held.
        Visibility for cross-thread write/read is now the responsibility of
@@ -3562,7 +3570,8 @@ static long long utf8_strlen_n(const char *s, long long n); /* D85: bounded, NUL
 static long long utf8_char_to_byte(const char *s, long long n);
 
 PerlValue *perl_length(PerlValue *v) {
-    if (!v || v->tag == PERL_UNDEF) return perl_alloc_int(0);
+    /* D155: length(undef) is undef (perl >= 5.12), not 0 */
+    if (!v || v->tag == PERL_UNDEF) return perl_alloc_undef();
     /* D85: NUL-safe via slen. D90: without PV_FLAG_UTF8, length is the
        raw byte count (binary/pack data). With the flag, count UTF-8
        code points — matching real Perl's SvUTF8 distinction. */
@@ -3740,27 +3749,36 @@ void perl_substr_replace(PerlValue *str, PerlValue *off_v, PerlValue *len_v, Per
 }
 
 PerlValue *perl_join(PerlValue *sep, PerlArray *arr) {
-    char *ssep = perl_to_string_dup(sep);
-    size_t seplen = strlen(ssep);
-    /* collect stringified parts */
+    /* D154: NUL-safe (explicit lengths — "a\0" joined used to lose the
+       NUL and everything after it), and a result containing any character
+       string (UTF-8 flagged part or separator) is itself flagged. */
+    long long seplen_ll = 0;
+    char *ssep = perl_to_string_dup_len(sep, &seplen_ll);
+    size_t seplen = (size_t)seplen_ll;
+    int u8 = sep && sep->tag == PERL_STRING && (sep->flags & PV_FLAG_UTF8);
     char **parts = arr->len ? malloc((size_t)arr->len * sizeof(char *)) : NULL;
+    size_t *lens = arr->len ? malloc((size_t)arr->len * sizeof(size_t)) : NULL;
     size_t total = 0;
     for (long long i = 0; i < arr->len; i++) {
-        parts[i] = perl_to_string_dup(arr->elems[i]);
-        total += strlen(parts[i]);
+        long long l = 0;
+        parts[i] = perl_to_string_dup_len(arr->elems[i], &l);
+        lens[i] = (size_t)l;
+        total += lens[i];
+        PerlValue *e = arr->elems[i];
+        if (e && e->tag == PERL_STRING && (e->flags & PV_FLAG_UTF8)) u8 = 1;
     }
     if (arr->len > 1) total += seplen * (size_t)(arr->len - 1);
     char *buf = malloc(total + 1);
     size_t cur = 0;
     for (long long i = 0; i < arr->len; i++) {
         if (i > 0) { memcpy(buf + cur, ssep, seplen); cur += seplen; }
-        size_t plen = strlen(parts[i]);
-        memcpy(buf + cur, parts[i], plen); cur += plen;
+        memcpy(buf + cur, parts[i], lens[i]); cur += lens[i];
         free(parts[i]);
     }
     buf[cur] = '\0';
-    PerlValue *r = perl_alloc_string(buf);
-    free(ssep); free(parts); free(buf);
+    PerlValue *r = perl_alloc_string_len(buf, (long long)cur);
+    if (u8) r->flags |= PV_FLAG_UTF8;
+    free(ssep); free(parts); free(lens); free(buf);
     return r;
 }
 
@@ -3778,7 +3796,7 @@ static void perl_split_trim_trailing_empty(PerlArray *arr) {
         PerlValue *last = arr->elems[arr->len - 1];
         int isEmpty = (last->tag == PERL_UNDEF) ||
                       ((last->tag == PERL_STRING) &&
-                       (!last->sval || last->sval[0] == '\0'));
+                       (!last->sval || last->slen == 0));   /* D154: "\0" is not empty */
         if (!isEmpty) break;
         PerlValue *popped = perl_array_pop(arr);
         perl_free(popped);
@@ -4616,6 +4634,20 @@ PerlValue *perl_deref_scalar(PerlValue *ref) {
     return (PerlValue *)ref->pval;
 }
 
+void perl_mark_int_elems(PerlValue *v, long long bits) {
+    if (!v) return;
+    if (bits & 1) v->flags |= PV_FLAG_INT_ELEMS;
+    if (bits & 2) v->flags |= PV_FLAG_INT_ELEM2;
+}
+
+/* D154: box one element of a FLAT_ARRAY/FLOAT_PAIR being promoted. */
+static PerlValue *flat_elem_box(double d, int intElems) {
+    PerlValue *v = perl_alloc_float(d);
+    if (intElems && d == (double)(long long)d && d > -9.2e18 && d < 9.2e18)
+        v->flags |= PV_FLAG_IV_HINT;
+    return v;
+}
+
 PerlArray *perl_deref_array(PerlValue *ref) {
     if (!ref) return perl_array_new();
     if (ref->tag == PERL_FLAT_ARRAY) {
@@ -4623,12 +4655,14 @@ PerlArray *perl_deref_array(PerlValue *ref) {
         long long n = ref->matchpos;
         double *dbl = (double *)ref->pval;
         PerlArray *av = perl_anon_array_new();
+        int ie = (ref->flags & PV_FLAG_INT_ELEMS) != 0;
         for (long long i = 0; i < n; i++) {
-            PerlValue *fv = perl_alloc_float(dbl[i]);
+            PerlValue *fv = flat_elem_box(dbl[i], ie);
             perl_array_push(av, fv);
             perl_free(fv);
         }
         free(dbl);
+        ref->flags &= ~PV_FLAG_INT_MASK;
         ref->tag   = PERL_REF_ARRAY;
         ref->pval  = av;
         ref->matchpos = 0;
@@ -4638,8 +4672,11 @@ PerlArray *perl_deref_array(PerlValue *ref) {
         /* Lazy conversion: expand inline (re,im) into a 2-element PerlArray. */
         double im; memcpy(&im, &ref->matchpos, sizeof(double));
         PerlArray *av = perl_anon_array_new();
-        PerlValue *re_pv = perl_alloc_float(ref->fval);
-        PerlValue *im_pv = perl_alloc_float(im);
+        int ie1 = (ref->flags & PV_FLAG_INT_ELEMS) != 0;
+        int ie2 = (ref->flags & PV_FLAG_INT_ELEM2) != 0;
+        ref->flags &= ~PV_FLAG_INT_MASK;
+        PerlValue *re_pv = flat_elem_box(ref->fval, ie1);
+        PerlValue *im_pv = flat_elem_box(im, ie2);
         perl_array_push(av, re_pv); perl_free(re_pv);
         perl_array_push(av, im_pv); perl_free(im_pv);
         ref->tag   = PERL_REF_ARRAY;
@@ -10021,10 +10058,24 @@ long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *fl
    pos whenever zero-width matches are skipped, and the bounded-LIMIT /
    no-match remainders must therefore be taken from fstart, not pos. */
 
+/* D154: one split() piece — explicit length (NUL-safe), keeping the
+   subject's UTF-8 (character string) flag. */
+static PerlValue *split_piece(const char *p, size_t n, int u8) {
+    PerlValue *v = perl_alloc_string_len(p, (long long)n);
+    if (u8) v->flags |= PV_FLAG_UTF8;
+    return v;
+}
+
 PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *str, long long limit) {
     PerlArray *arr = perl_array_new();
-    char *s = perl_to_string_dup(str);
-    size_t slen = strlen(s);
+    /* D154: NUL-safe (the subject may hold binary data) and UTF-8 aware —
+       pieces of a character string stay character strings, and `split //`
+       splits characters, not bytes. */
+    long long slen_ll = 0;
+    char *s = perl_to_string_dup_len(str, &slen_ll);
+    size_t slen = (size_t)slen_ll;
+    int u8 = str && str->tag == PERL_STRING && (str->flags & PV_FLAG_UTF8);
+#define SPLIT_STR(p_, n_) split_piece(p_, n_, u8)
     /* Real perl: splitting an empty string yields an empty list —
        regardless of pattern or LIMIT (split /\n/, "", -1 -> (), not ("")). */
     if (slen == 0) { free(s); return arr; }
@@ -10038,24 +10089,33 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
 
     /* empty pattern: split into individual characters (Perl semantics) */
     if (pattern[0] == '\0') {
-        for (size_t i = 0; i < slen; i++) {
+        for (size_t i = 0; i < slen; ) {
             if (bounded && fields == limit - 1) {
-                PerlValue *v = perl_alloc_string(s + i);
+                PerlValue *v = SPLIT_STR(s + i, slen - i);
                 perl_array_push(arr, v); perl_free(v);
                 break;
             }
-            char ch[2] = {s[i], '\0'};
-            PerlValue *v = perl_alloc_string(ch);
+            size_t w = 1;
+            if (u8) {
+                unsigned char c = (unsigned char)s[i];
+                w = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+                if (i + w > slen) w = slen - i;
+            }
+            PerlValue *v = SPLIT_STR(s + i, w);
             perl_array_push(arr, v); perl_free(v);
             fields++;
+            i += w;
         }
         free(s);
+#undef SPLIT_STR
         if (limit == 0) perl_split_trim_trailing_empty(arr);
         return arr;
     }
 
     pcre2_code *re = regex_compile_cached(pattern, flags);
     if (!re) { free(s); return arr; }
+#undef SPLIT_STR
+#define SPLIT_STR(p_, n_) split_piece(p_, n_, u8)
     size_t pos = 0;
     pcre2_match_data *md = re_match_data(re);
     /* D126: walk actual capture groups, not the (possibly oversized)
@@ -10067,7 +10127,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     /* push s[start..slen] as one field */
 #define SPLIT_PUSH_FIELD(start)                                              \
     do {                                                                     \
-        PerlValue *fv_ = perl_alloc_string(s + (start));                     \
+        PerlValue *fv_ = SPLIT_STR(s + (start), slen - (start));             \
         perl_array_push(arr, fv_); perl_free(fv_);                           \
         fields++;                                                            \
     } while (0)
@@ -10091,9 +10151,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
             continue;                                                        \
         }                                                                    \
         size_t clen_ = cen_ - cst_;                                          \
-        char *cap_ = malloc(clen_ + 1);                                      \
-        memcpy(cap_, s + cst_, clen_); cap_[clen_] = '\0';                   \
-        PerlValue *cv_ = perl_alloc_string(cap_); free(cap_);                \
+        PerlValue *cv_ = SPLIT_STR(s + cst_, clen_);                         \
         perl_array_push(arr, cv_); perl_free(cv_);                           \
     }
 
@@ -10124,9 +10182,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
                even when empty — real Perl produces leading empty fields,
                e.g. split(/(,)/, ",a,b") -> '', ',', 'a', ',', 'b') */
             size_t pre = mstart - fstart;
-            char *elem = malloc(pre + 1);
-            memcpy(elem, s + fstart, pre); elem[pre] = '\0';
-            PerlValue *v = perl_alloc_string(elem); free(elem);
+            PerlValue *v = SPLIT_STR(s + fstart, pre);
             perl_array_push(arr, v); perl_free(v);
             fields++;
             SPLIT_PUSH_CAPTURES(ov);
@@ -10140,9 +10196,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
                the previous char and the next, so the char at mstart
                belongs to the next field (split /x?/, "ab" -> 'a','b'). */
             size_t pre = mstart - fstart;
-            char *elem = malloc(pre + 1);
-            memcpy(elem, s + fstart, pre); elem[pre] = '\0';
-            PerlValue *v = perl_alloc_string(elem); free(elem);
+            PerlValue *v = SPLIT_STR(s + fstart, pre);
             perl_array_push(arr, v); perl_free(v);
             fields++;
             SPLIT_PUSH_CAPTURES(ov);
@@ -10157,6 +10211,7 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
     }
 #undef SPLIT_PUSH_FIELD
 #undef SPLIT_PUSH_CAPTURES
+#undef SPLIT_STR
 
     free(s);
     /* Do NOT free re — it comes from the shared cache. */
@@ -12410,6 +12465,11 @@ typedef struct {
     char  *buf;
     size_t cap, pos, col;
     int    sortKeys;
+    /* D154: $Data::Dumper::* configuration, read from the package globals */
+    int    indent;         /* 0, 1, 2 (default 2) */
+    int    terse, useqq, quotekeys, trailingcomma;
+    const char *pair;      /* default " => " */
+    int    level;          /* nesting depth, for Indent=1 */
 } DumperBuf;
 
 static void dumper_ensure(DumperBuf *b, size_t n) {
@@ -12426,13 +12486,72 @@ static void dumper_newline(DumperBuf *b, size_t indent) {
     dumper_puts(b, "\n", 1);
     for (size_t i = 0; i < indent; i++) dumper_puts(b, " ", 1);
 }
+/* Line break before an element / closing bracket. Indent=2 aligns to the
+   opening bracket's column (col), Indent=1 uses 2 spaces per nesting
+   level, Indent=0 stays on one line. */
+static void dumper_break(DumperBuf *b, size_t col) {
+    if (b->indent >= 2)      dumper_newline(b, col);
+    else if (b->indent == 1) dumper_newline(b, (size_t)b->level * 2);
+}
 static void dumper_quoted(DumperBuf *b, const char *s, size_t len) {
+    if (b->useqq) {
+        /* double-quoted, perl-style escapes; other control/high bytes as
+           octal (3 digits when a digit follows, like Data::Dumper's qquote) */
+        dumper_puts(b, "\"", 1);
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)s[i];
+            char esc[8];
+            switch (c) {
+                case '\\': dumper_putstr(b, "\\\\"); continue;
+                case '"':  dumper_putstr(b, "\\\""); continue;
+                case '$':  dumper_putstr(b, "\\$"); continue;
+                case '@':  dumper_putstr(b, "\\@"); continue;
+                case '\n': dumper_putstr(b, "\\n"); continue;
+                case '\t': dumper_putstr(b, "\\t"); continue;
+                case '\r': dumper_putstr(b, "\\r"); continue;
+                case '\f': dumper_putstr(b, "\\f"); continue;
+                case '\b': dumper_putstr(b, "\\b"); continue;
+                case '\a': dumper_putstr(b, "\\a"); continue;
+                case 27:   dumper_putstr(b, "\\e"); continue;
+            }
+            if (c < 0x20 || c >= 0x7f) {
+                int nextDigit = (i + 1 < len && isdigit((unsigned char)s[i + 1]));
+                snprintf(esc, sizeof esc, nextDigit ? "\\%03o" : "\\%o", c);
+                dumper_putstr(b, esc);
+                continue;
+            }
+            dumper_puts(b, (const char *)&s[i], 1);
+        }
+        dumper_puts(b, "\"", 1);
+        return;
+    }
     dumper_puts(b, "'", 1);
     for (size_t i = 0; i < len; i++) {
         if (s[i] == '\'' || s[i] == '\\') dumper_puts(b, "\\", 1);
         dumper_puts(b, s + i, 1);
     }
     dumper_puts(b, "'", 1);
+}
+/* /^(?:0|-?[1-9]\d{0,8})\z/ — the numbers Data::Dumper prints unquoted */
+static int dumper_safe_int(const char *s, size_t len) {
+    if (len == 1 && s[0] == '0') return 1;
+    size_t i = 0;
+    if (i < len && s[i] == '-') i++;
+    if (i >= len || s[i] < '1' || s[i] > '9') return 0;
+    size_t digits = len - i;
+    if (digits > 9) return 0;
+    for (; i < len; i++) if (!isdigit((unsigned char)s[i])) return 0;
+    return 1;
+}
+static void dumper_key(DumperBuf *b, const char *k) {
+    size_t len = strlen(k);
+    if (!b->quotekeys) {
+        int ident = len > 0 && (isalpha((unsigned char)k[0]) || k[0] == '_');
+        for (size_t i = 1; ident && i < len; i++)
+            if (!isalnum((unsigned char)k[i]) && k[i] != '_') ident = 0;
+        if (ident || dumper_safe_int(k, len)) { dumper_puts(b, k, len); return; }
+    }
+    dumper_quoted(b, k, len);
 }
 
 static void dumper_value(DumperBuf *b, PerlValue *v);
@@ -12441,13 +12560,14 @@ static void dumper_array(DumperBuf *b, PerlArray *a) {
     if (!a || a->len == 0) { dumper_putstr(b, "[]"); return; }
     size_t openCol = b->col;
     dumper_putstr(b, "[");
-    size_t indent = openCol + 2;
+    b->level++;
     for (long long i = 0; i < a->len; i++) {
-        dumper_newline(b, indent);
+        dumper_break(b, openCol + 2);
         dumper_value(b, a->elems[i]);
-        if (i + 1 < a->len) dumper_putstr(b, ",");
+        if (i + 1 < a->len || (b->trailingcomma && b->indent > 0)) dumper_putstr(b, ",");
     }
-    dumper_newline(b, openCol);
+    b->level--;
+    dumper_break(b, openCol);
     dumper_putstr(b, "]");
 }
 
@@ -12476,15 +12596,16 @@ static void dumper_hash(DumperBuf *b, PerlHash *h) {
     }
     size_t openCol = b->col;
     dumper_putstr(b, "{");
-    size_t indent = openCol + 2;
+    b->level++;
     for (long long i = 0; i < n; i++) {
-        dumper_newline(b, indent);
-        dumper_quoted(b, keys[i], strlen(keys[i]));
-        dumper_putstr(b, " => ");
+        dumper_break(b, openCol + 2);
+        dumper_key(b, keys[i]);
+        dumper_putstr(b, b->pair);
         dumper_value(b, vals[i]);
-        if (i + 1 < n) dumper_putstr(b, ",");
+        if (i + 1 < n || (b->trailingcomma && b->indent > 0)) dumper_putstr(b, ",");
     }
-    dumper_newline(b, openCol);
+    b->level--;
+    dumper_break(b, openCol);
     dumper_putstr(b, "}");
     free(keys); free(vals);
 }
@@ -12503,13 +12624,22 @@ static void dumper_value(DumperBuf *b, PerlValue *v) {
         }
         case PERL_FLOAT: {
             /* Real Dumper quotes NV-stored numbers (stringify then
-               quote) — only IV-stored integers print bare. */
+               quote) — only IV-stored integers print bare. Useqq (the
+               pure-Perl path) prints any safe-integer-looking value bare.
+               D154: an element promoted from an integer-literal FLAT_ARRAY
+               (PV_FLAG_IV_HINT) is an IV in perl. */
             const char *s = perl_to_string(v);
-            dumper_quoted(b, s, strlen(s));
+            int ivHint = (v->flags & PV_FLAG_IV_HINT) && v->fval == (double)(long long)v->fval;
+            if ((b->useqq || ivHint) && dumper_safe_int(s, strlen(s))) dumper_putstr(b, s);
+            else if (ivHint) dumper_putstr(b, s);
+            else dumper_quoted(b, s, strlen(s));
             break;
         }
         case PERL_STRING:
-            dumper_quoted(b, v->sval, (size_t)v->slen);
+            if (b->useqq && v->sval && dumper_safe_int(v->sval, (size_t)v->slen))
+                dumper_puts(b, v->sval, (size_t)v->slen);
+            else
+                dumper_quoted(b, v->sval, (size_t)v->slen);
             break;
         case PERL_REF_ARRAY:
             dumper_array(b, (PerlArray *)v->pval);
@@ -12519,7 +12649,9 @@ static void dumper_value(DumperBuf *b, PerlValue *v) {
             break;
         case PERL_REF_SCALAR:
             dumper_putstr(b, "\\");
+            b->level++;
             dumper_value(b, (PerlValue *)v->pval);
+            b->level--;
             break;
         default: {
             /* code refs, globs, DBI handles, etc. — best-effort */
@@ -12535,19 +12667,42 @@ static void dumper_value(DumperBuf *b, PerlValue *v) {
     }
 }
 
+/* D154: read one $Data::Dumper::NAME global; NULL when never set. */
+static PerlValue *dumper_cfg(const char *name) {
+    char key[64];
+    snprintf(key, sizeof key, "Data::Dumper::%s", name);
+    PerlValue *v = perl_glob_get_scalar(key);
+    return (v && v->tag != PERL_UNDEF) ? v : NULL;
+}
+
 PerlValue *perl_dumper(PerlArray *args, PerlValue *sortKeysFlag) {
     DumperBuf b;
-    b.cap = 256; b.pos = 0; b.col = 0;
+    b.cap = 256; b.pos = 0; b.col = 0; b.level = 0;
     b.buf = malloc(b.cap);
-    b.sortKeys = sortKeysFlag ? perl_is_true(sortKeysFlag) : 0;
+    PerlValue *c;
+    b.sortKeys = (sortKeysFlag && perl_is_true(sortKeysFlag)) ||
+                 ((c = dumper_cfg("Sortkeys")) && perl_is_true(c));
+    b.indent = (c = dumper_cfg("Indent")) ? (int)perl_to_int(c) : 2;
+    if (b.indent < 0) b.indent = 0;
+    b.terse = (c = dumper_cfg("Terse")) ? perl_is_true(c) : 0;
+    b.useqq = (c = dumper_cfg("Useqq")) ? perl_is_true(c) : 0;
+    b.quotekeys = (c = dumper_cfg("Quotekeys")) ? perl_is_true(c) : 1;
+    b.trailingcomma = (c = dumper_cfg("Trailingcomma")) ? perl_is_true(c) : 0;
+    char *pairStr = (c = dumper_cfg("Pair")) ? perl_to_string_dup(c) : strdup(" => ");
+    char *varname = (c = dumper_cfg("Varname")) ? perl_to_string_dup(c) : strdup("VAR");
+    b.pair = pairStr;
     long long count = args ? args->len : 0;
     for (long long i = 0; i < count; i++) {
-        char varname[32];
-        snprintf(varname, sizeof(varname), "$VAR%lld = ", i + 1);
-        dumper_putstr(&b, varname);
+        if (!b.terse) {
+            char prefix[160];
+            snprintf(prefix, sizeof(prefix), "$%.120s%lld = ", varname, i + 1);
+            dumper_putstr(&b, prefix);
+        }
         dumper_value(&b, args->elems[i]);
-        dumper_putstr(&b, ";\n");
+        if (!b.terse) dumper_putstr(&b, ";");
+        if (b.indent > 0) dumper_putstr(&b, "\n");
     }
+    free(pairStr); free(varname);
     PerlValue *result = perl_alloc_string_len(b.buf, (long long)b.pos);
     free(b.buf);
     return result;
@@ -15709,6 +15864,118 @@ PerlValue *perl_ansi_color(PerlArray *args, int colored) {
 PerlValue *perl_ansi_color_const(const char *name) {
     if (ansi_disabled()) return perl_alloc_string("");
     return ansi_seq_from_spec(name);
+}
+
+/* D154: uncolor / colorstrip / colorvalid (Term::ANSIColor 5.01 semantics
+   for the 16-color attribute set; 256-color/rgb/grey codes are not
+   supported). List-returning forms honour the caller's context. */
+static const char *ansi_name_for_code(long long c) {
+    /* the real %ATTRIBUTES_R keeps the alphabetically first name per code */
+    static const char *base[] = {"clear","bold","dark","italic","underline","blink",NULL,"reverse","concealed"};
+    static const char *col[]  = {"black","red","green","yellow","blue","magenta","cyan","white"};
+    static char buf[32];
+    if (c >= 0 && c <= 8) return base[c];
+    if (c >= 30 && c <= 37) return col[c - 30];
+    if (c >= 40 && c <= 47) { snprintf(buf, sizeof buf, "on_%s", col[c - 40]); return buf; }
+    if (c >= 90 && c <= 97) { snprintf(buf, sizeof buf, "bright_%s", col[c - 90]); return buf; }
+    if (c >= 100 && c <= 107) { snprintf(buf, sizeof buf, "on_bright_%s", col[c - 100]); return buf; }
+    return NULL;
+}
+PerlValue *perl_ansi_util(const char *name, PerlArray *args) {
+    long long n = args ? args->len : 0;
+    int wa = perl_current_wantarray_ctx();
+    if (!strcmp(name, "colorstrip")) {
+        PerlArray *out = perl_anon_array_new();
+        for (long long i = 0; i < n; i++) {
+            long long len = 0;
+            char *s = perl_to_string_dup_len(args->elems[i], &len);
+            char *w = s;
+            for (long long r = 0; r < len; ) {
+                if (s[r] == '\033' && r + 1 < len && s[r + 1] == '[') {
+                    long long k = r + 2;
+                    while (k < len && (isdigit((unsigned char)s[k]) || s[k] == ';')) k++;
+                    if (k < len && s[k] == 'm') { r = k + 1; continue; }
+                }
+                *w++ = s[r++];
+            }
+            PerlValue *v = perl_alloc_string_len(s, (long long)(w - s));
+            perl_array_push(out, v);
+            perl_free(v);
+            free(s);
+        }
+        if (wa) return perl_array_to_list_return(out);
+        PerlValue *sep = perl_alloc_string("");
+        PerlValue *r = perl_join(sep, out);
+        perl_free(sep);
+        return r;
+    }
+    if (!strcmp(name, "uncolor")) {
+        PerlArray *out = perl_anon_array_new();
+        for (long long i = 0; i < n; i++) {
+            char *s = perl_to_string_dup(args->elems[i]);
+            char *e = s;
+            if (e[0] == '\033' && e[1] == '[') e += 2;
+            size_t L = strlen(e);
+            if (L && e[L - 1] == 'm') e[--L] = 0;
+            for (size_t k = 0; k < L; k++)
+                if (!isdigit((unsigned char)e[k]) && e[k] != ';') {
+                    char msg[512]; snprintf(msg, sizeof msg, "%s", e); free(s);
+                    perl_die_croak("Bad escape sequence %s", msg);
+                }
+            for (char *p = e; *p; ) {
+                if (*p == ';') { p++; continue; }
+                long long code = strtoll(p, &p, 10);
+                const char *nm = ansi_name_for_code(code);
+                if (!nm) { free(s); perl_die_croak("No name for escape sequence %lld", code); }
+                PerlValue *v = perl_alloc_string(nm);
+                perl_array_push(out, v);
+                perl_free(v);
+            }
+            free(s);
+        }
+        if (wa) return perl_array_to_list_return(out);
+        return perl_alloc_int(out->len);
+    }
+    if (!strcmp(name, "colorvalid")) {
+        for (long long i = 0; i < n; i++) {
+            char *s = perl_to_string_dup(args->elems[i]);
+            char *save = NULL;
+            for (char *tok = strtok_r(s, " \t\n", &save); tok; tok = strtok_r(NULL, " \t\n", &save)) {
+                if (!ansi_code_for(tok)) {
+                    free(s);
+                    if (wa) return perl_array_to_list_return(perl_anon_array_new());
+                    return perl_alloc_undef();
+                }
+            }
+            free(s);
+        }
+        return perl_alloc_int(1);
+    }
+    perl_die_croak("Undefined subroutine &Term::ANSIColor::%s called", name);
+    return perl_alloc_undef();
+}
+
+/* D154: a :constants constant called with arguments, like the real
+   AUTOLOADed subs: CODE . join('', @_), plus "\e[0m" when
+   $Term::ANSIColor::AUTORESET is true; only the text when colors are
+   disabled. */
+PerlValue *perl_ansi_color_const_args(const char *name, PerlArray *args) {
+    if (!args || args->len == 0) return perl_ansi_color_const(name);
+    PerlValue *sep = perl_alloc_string("");
+    PerlValue *text = perl_join(sep, args);
+    perl_free(sep);
+    if (ansi_disabled()) return text;
+    PerlValue *code = ansi_seq_from_spec(name);
+    PerlValue *r = perl_concat(code, text);
+    perl_free(code); perl_free(text);
+    PerlValue *ar = perl_glob_get_scalar("Term::ANSIColor::AUTORESET");
+    if (ar && perl_is_true(ar)) {
+        PerlValue *reset = perl_alloc_string("\033[0m");
+        PerlValue *r2 = perl_concat(r, reset);
+        perl_free(r); perl_free(reset);
+        r = r2;
+    }
+    return r;
 }
 
 /* ── Encode ──────────────────────────────────────────────────────────────── */

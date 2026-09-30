@@ -137,6 +137,7 @@ Token Lexer::readNumber() {
 Token Lexer::readString(char delim, bool interpolates) {
     pos_++; /* skip opening delimiter */
     std::string raw;
+    bool wide = false;
     while (pos_ < src_.size()) {
         char c = src_[pos_];
         if (c == delim) { pos_++; break; }
@@ -154,54 +155,7 @@ Token Lexer::readString(char delim, bool interpolates) {
                 else { raw += '\\'; raw += esc; }
                 continue;
             }
-            switch (esc) {
-                case 'n':  raw += '\n'; break;
-                case 't':  raw += '\t'; break;
-                case 'r':  raw += '\r'; break;
-                case 'f':  raw += '\f'; break;
-                case 'b':  raw += '\b'; break;
-                case 'a':  raw += '\a'; break;
-                case 'e':  raw += '\x1b'; break;
-                case '0':  raw += '\0'; break;
-                case 'x': {
-                    auto hexv = [](char h) -> int {
-                        if (h >= '0' && h <= '9') return h - '0';
-                        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
-                        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
-                        return -1;
-                    };
-                    int h1 = hexv(peek()), h2 = hexv(peek(1));
-                    if (h1 >= 0 && h2 >= 0) {
-                        raw += (char)((h1 << 4) | h2);
-                        pos_ += 2;
-                    } else {
-                        raw += '\\'; raw += 'x';
-                    }
-                    break;
-                }
-                case '\\': raw += '\\'; break;
-                case '\'': raw += '\''; break;
-                case '"':  raw += '"';  break;
-                /* D51: \$ and \@ must NOT collapse to a bare $/@ here —
-                   the parser's interpolation scanner (parseStringInterp)
-                   re-scans this same raw text for a bare $/@ to trigger
-                   variable interpolation, and can't distinguish an
-                   escaped-literal $ from a real interpolation trigger
-                   once both look identical. A plain backslash isn't a
-                   safe marker either: "a\\$x" (an escaped backslash
-                   immediately followed by a genuine, unescaped $x)
-                   collapses \\ to one literal '\' one character earlier
-                   in this same switch, leaving that '\' directly
-                   adjacent to a real interpolation trigger — indistinguishable
-                   from an escaped \$ using a plain-backslash marker. Use
-                   \x02 (a control byte that can never otherwise appear
-                   in this raw buffer) instead, so parseStringInterp can
-                   recognize it unambiguously and treat the following
-                   character as literal. */
-                case '$':  raw += '\x02'; raw += '$'; break;
-                case '@':  raw += '\x02'; raw += '@'; break;
-                default:   raw += '\\'; raw += esc; break;
-            }
+            appendEscape(esc, raw, wide);
             continue;
         }
         if (c == '\n') line_++;
@@ -210,7 +164,89 @@ Token Lexer::readString(char delim, bool interpolates) {
     }
     /* For double-quoted strings, we store the raw content with $ intact —
        the parser handles interpolation by calling splitInterp() */
-    return {TK::STRING, raw, line_};
+    Token t{TK::STRING, raw, line_};
+    t.wide = wide;
+    return t;
+}
+
+/* Double-quoted escape sequences, shared by readString and the qq{...}
+   balanced-brace scanner (which previously had its own, smaller switch
+   with no \x at all). D154 adds \x{HEX}, one-digit \xH, bare \x (NUL)
+   and octal \NNN; a \x{...} above 0xFF is UTF-8 encoded and marks the
+   literal wide (a character string). */
+void Lexer::appendEscape(char esc, std::string &raw, bool &wide) {
+    auto hexv = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return -1;
+    };
+    auto putCode = [&](unsigned long cp) {
+        if (cp < 0x100) { raw += (char)cp; return; }
+        wide = true;
+        if (cp < 0x800) {
+            raw += (char)(0xC0 | (cp >> 6));
+            raw += (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            raw += (char)(0xE0 | (cp >> 12));
+            raw += (char)(0x80 | ((cp >> 6) & 0x3F));
+            raw += (char)(0x80 | (cp & 0x3F));
+        } else {
+            raw += (char)(0xF0 | (cp >> 18));
+            raw += (char)(0x80 | ((cp >> 12) & 0x3F));
+            raw += (char)(0x80 | ((cp >> 6) & 0x3F));
+            raw += (char)(0x80 | (cp & 0x3F));
+        }
+    };
+    switch (esc) {
+        case 'n':  raw += '\n'; break;
+        case 't':  raw += '\t'; break;
+        case 'r':  raw += '\r'; break;
+        case 'f':  raw += '\f'; break;
+        case 'b':  raw += '\b'; break;
+        case 'a':  raw += '\a'; break;
+        case 'e':  raw += '\x1b'; break;
+        case '0': case '1': case '2': case '3':
+        case '4': case '5': case '6': case '7': {
+            /* octal: up to 3 digits including this one */
+            unsigned long v = (unsigned long)(esc - '0');
+            for (int k = 0; k < 2 && peek() >= '0' && peek() <= '7'; k++) {
+                v = v * 8 + (unsigned long)(peek() - '0');
+                pos_++;
+            }
+            putCode(v);
+            break;
+        }
+        case 'x': {
+            if (peek() == '{') {
+                size_t close = src_.find('}', pos_);
+                if (close != std::string::npos) {
+                    unsigned long v = 0;
+                    for (size_t k = pos_ + 1; k < close; k++) {
+                        int d = hexv(src_[k]);
+                        if (d < 0) { if (src_[k] == '_' || src_[k] == ' ') continue; break; }
+                        v = v * 16 + (unsigned long)d;
+                    }
+                    pos_ = close + 1;
+                    putCode(v);
+                    break;
+                }
+            }
+            unsigned long v = 0;
+            int n = 0;
+            while (n < 2 && hexv(peek()) >= 0) { v = v * 16 + (unsigned long)hexv(peek()); pos_++; n++; }
+            putCode(v);   /* bare \x (no digits) is NUL, like perl */
+            break;
+        }
+        case '\\': raw += '\\'; break;
+        case '\'': raw += '\''; break;
+        case '"':  raw += '"';  break;
+        /* D51: \$ and \@ keep a \x02 marker so parseStringInterp can tell
+           an escaped literal from a real interpolation trigger. */
+        case '$':  raw += '\x02'; raw += '$'; break;
+        case '@':  raw += '\x02'; raw += '@'; break;
+        default:   raw += '\\'; raw += esc; break;
+    }
 }
 
 Token Lexer::readIdent() {
@@ -351,10 +387,34 @@ Token Lexer::readHeredoc() {
     pendingHeredocPos_   = p;
     pendingHeredocLines_ = extraLines;
 
-    if (interp)
-        return {TK::STRING, "\x01" + body, line_};
-    else
-        return {TK::STRING, body, line_};
+    if (interp) {
+        /* D154: <<"EOT" / <<EOT bodies are double-quoted strings — process
+           their escapes (\t, \n, \$, \x{..}, ...); they used to stay
+           literal (a\tb printed as a backslash-t). */
+        bool wide = false;
+        body = processEscapes(body, wide);
+        Token t{TK::STRING, "\x01" + body, line_};
+        t.wide = wide;
+        return t;
+    }
+    return {TK::STRING, body, line_};
+}
+
+std::string Lexer::processEscapes(const std::string &in, bool &wide) {
+    Lexer tmp(in);
+    std::string out;
+    while (tmp.pos_ < tmp.src_.size()) {
+        char c = tmp.src_[tmp.pos_];
+        if (c == '\\' && tmp.pos_ + 1 < tmp.src_.size()) {
+            tmp.pos_++;
+            char esc = tmp.src_[tmp.pos_++];
+            tmp.appendEscape(esc, out, wide);
+            continue;
+        }
+        out += c;
+        tmp.pos_++;
+    }
+    return out;
 }
 
 Token Lexer::readSubst() {
@@ -630,21 +690,21 @@ std::vector<Token> Lexer::tokenize() {
                 pos_++; /* skip '{' */
                 /* balanced brace scan */
                 std::string raw;
+                bool qqWide = false;
                 int depth = 1;
                 while (pos_ < src_.size() && depth > 0) {
                     char ch = src_[pos_];
                     if (ch == '\\' && pos_+1 < src_.size()) {
                         char esc = src_[pos_+1]; pos_ += 2;
-                        switch (esc) {
-                            case 'n': raw += '\n'; break; case 't': raw += '\t'; break;
-                            case 'r': raw += '\r'; break; case '\\': raw += '\\'; break;
-                            /* D108: same missing-escape bug as readString's
-                               switch, just in the qq{...} balanced-brace
-                               scan path. */
-                            case 'f': raw += '\f'; break; case 'b': raw += '\b'; break;
-                            case 'a': raw += '\a'; break; case 'e': raw += '\x1b'; break;
-                            default:  raw += '\\'; raw += esc; break;
+                        if (!dq) {
+                            /* q{...}: only \\ and escaped braces are special */
+                            if (esc == '\\' || esc == '{' || esc == '}') raw += esc;
+                            else { raw += '\\'; raw += esc; }
+                            continue;
                         }
+                        /* D154: qq{...} shares readString's escape set */
+                        if (esc == '{' || esc == '}') raw += esc;
+                        else appendEscape(esc, raw, qqWide);
                         continue;
                     }
                     if (ch == '{') depth++;
@@ -653,6 +713,7 @@ std::vector<Token> Lexer::tokenize() {
                     raw += ch; pos_++;
                 }
                 Token t{TK::STRING, dq ? "\x01" + raw : raw, line_};
+                t.wide = qqWide;
                 toks.push_back(t); continue;
             }
             /* q<delim>...<delim> / qq<delim>...<delim> with a non-'{'

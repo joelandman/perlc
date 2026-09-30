@@ -79,7 +79,7 @@ NodeList Parser::parseExprListFromTokens(std::vector<Token> tokens) {
 
 NodePtr Parser::litStr(std::string s, int line) {
     auto n = makeStr(std::move(s), line);
-    if (utf8Enabled_) n->ival = 1;
+    if (utf8Enabled_ || strWide_) n->ival = 1;
     return n;
 }
 
@@ -1603,6 +1603,35 @@ NodePtr Parser::parsePrint(bool isSay) {
          cur().text == "STDOUT" || cur().text == "STDERR")) {
         fhname = cur().text; advance();
     }
+    /* D155: `print WORD;` / `print WORD g()` — WORD is a filehandle unless
+       it names a sub (perl). Only codegen knows the callable set, so build a
+       bareword call and let the D153 probe (emitBareFhPrintProbe) decide.
+       Imports, constants and known handles are resolved here as before. */
+    if (!hasParen && fhname.empty() && check(TK::IDENT) &&
+        !importMap_.count(cur().text) && !constMap_.count(cur().text) &&
+        !knownBareFH_.count(cur().text) && !isCmpOpWord(cur().text) &&
+        cur().text.find("::") == std::string::npos) {
+        TK k1 = peek(1).kind;
+        bool endsStmt = (k1 == TK::SEMI || k1 == TK::EOF_TOK || k1 == TK::RBRACE ||
+                         k1 == TK::KW_IF || k1 == TK::KW_UNLESS || k1 == TK::KW_WHILE ||
+                         k1 == TK::KW_UNTIL || k1 == TK::KW_FOR || k1 == TK::KW_FOREACH ||
+                         k1 == TK::KW_OR || k1 == TK::KW_AND);
+        if (endsStmt) {
+            auto c = std::make_unique<Node>(); c->kind = NK::Call;
+            c->name = cur().text; c->line = line; c->ival = 1;
+            c->fval = 1.0;   /* D155: zero-arg print-filehandle candidate */
+            advance();
+            args.push_back(std::move(c));
+        } else if (k1 == TK::IDENT && !isCmpOpWord(peek(1).text) &&
+                   peek(2).kind != TK::FATARROW) {
+            std::string nm = cur().text; advance();
+            args.push_back(parseBareCall(nm, line));
+            while (match(TK::COMMA)) {
+                if (check(TK::SEMI) || check(TK::EOF_TOK) || isModifier()) break;
+                args.push_back(parseLowNot());
+            }
+        }
+    }
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
         args.push_back(parseLowNot());
@@ -1686,7 +1715,10 @@ NodePtr Parser::parseReturn() {
     int line = cur().line;
     consume(TK::KW_RETURN);
     NodePtr val;
-    if (!check(TK::SEMI) && !isModifier()) val = parseLowNot();
+    /* D155: bare `return` before `}` / `)` (`f() or return }`) */
+    if (!check(TK::SEMI) && !isModifier() && !check(TK::RBRACE) &&
+        !check(TK::RPAREN) && !check(TK::EOF_TOK) && !check(TK::COLON))
+        val = parseLowNot();
     auto n = std::make_unique<Node>(); n->kind = NK::Return; n->line = line;
     n->left = std::move(val);
     return n;
@@ -1907,6 +1939,27 @@ NodePtr Parser::parseExpr()    { return parseLowOr(); }
    low-precedence and/or/xor (`push @a, 1 or die` is `(push @a, 1) or die`);
    inside parentheses the full expression grammar applies. */
 NodePtr Parser::parseListOpArg(bool parens) { return parens ? parseExpr() : parseLowNot(); }
+
+/* D155: the operand of a named unary operator (length, lc/uc/lcfirst/
+   ucfirst, chr/ord/hex/oct, abs/int/sqrt). With no operand (`map { ord }`,
+   `length;`, `lc,`) it is $_. Without parens the operand binds tighter
+   than comparison and logical operators but looser than arithmetic/concat:
+   `length $x > 3` is length($x) > 3, `uc $a . $b` is uc($a . $b) — it was
+   parsed with the full expression grammar, so `length $x > 3` computed
+   length($x > 3). */
+NodePtr Parser::parseNamedUnaryArg(bool parens, int line) {
+    TK k = cur().kind;
+    bool none = (k == TK::RPAREN || k == TK::RBRACE || k == TK::RBRACKET ||
+                 k == TK::SEMI || k == TK::COMMA || k == TK::FATARROW ||
+                 k == TK::EOF_TOK || k == TK::QUESTION || k == TK::COLON ||
+                 k == TK::KW_OR || k == TK::KW_AND || k == TK::AND || k == TK::OR ||
+                 k == TK::DEFINED_OR || k == TK::EQ || k == TK::NE ||
+                 k == TK::LT || k == TK::GT || k == TK::LE || k == TK::GE ||
+                 k == TK::SPACESHIP || (k == TK::IDENT && isCmpOpWord(cur().text)) ||
+                 isModifier());
+    if (none) return makeScalar("_", line);
+    return parens ? parseExpr() : parseBinding();
+}
 
 /* D152: the filehandle argument of close/eof/tell/binmode/fileno. A bareword
    there is always a filehandle — even one never opened, or opened later in
@@ -2150,9 +2203,11 @@ NodePtr Parser::parseOr() {
            statement-body (no `;` consumed) and wrap in a Block exactly
            like parseOrRhs's low-precedence `or` handling, so the
            short-circuit codegen sees a value. */
-        if (check(TK::KW_NEXT) || check(TK::KW_LAST) || check(TK::KW_REDO)) {
+        if (check(TK::KW_NEXT) || check(TK::KW_LAST) || check(TK::KW_REDO) ||
+            check(TK::KW_RETURN)) {   /* D155: `$x || return` */
             NodePtr stmt;
-            if      (check(TK::KW_LAST)) { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
+            if      (check(TK::KW_RETURN)) { stmt = parseReturn(); }
+            else if (check(TK::KW_LAST)) { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
             else if (check(TK::KW_NEXT)) { advance(); stmt = parseLastNextRedoBody(NK::Next, line); }
             else                         { advance(); auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
             NodeList b; b.push_back(std::move(stmt));
@@ -2170,9 +2225,11 @@ NodePtr Parser::parseAnd() {
     auto lhs = parseBitOr();
     while (check(TK::AND2)) {
         int line = cur().line; advance();
-        if (check(TK::KW_NEXT) || check(TK::KW_LAST) || check(TK::KW_REDO)) {
+        if (check(TK::KW_NEXT) || check(TK::KW_LAST) || check(TK::KW_REDO) ||
+            check(TK::KW_RETURN)) {   /* D155: `$x || return` */
             NodePtr stmt;
-            if      (check(TK::KW_LAST)) { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
+            if      (check(TK::KW_RETURN)) { stmt = parseReturn(); }
+            else if (check(TK::KW_LAST)) { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
             else if (check(TK::KW_NEXT)) { advance(); stmt = parseLastNextRedoBody(NK::Next, line); }
             else                         { advance(); auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
             NodeList b; b.push_back(std::move(stmt));
@@ -2947,13 +3004,17 @@ NodePtr Parser::parsePrimary() {
     }
     /* string literal */
     if (check(TK::STRING)) {
-        std::string raw = cur().text; advance();
+        std::string raw = cur().text;
+        bool wide = cur().wide;   /* D154: "\x{263A}" — a character string */
+        advance();
         bool isDQ = !raw.empty() && raw[0] == '\x01';
-        if (isDQ) {
-            raw = raw.substr(1);
-            return parseStringInterp(raw, line);
-        }
-        return litStr(raw, line);
+        bool savedWide = strWide_;
+        strWide_ = wide;
+        NodePtr r;
+        if (isDQ) r = parseStringInterp(raw.substr(1), line);
+        else      r = litStr(raw, line);
+        strWide_ = savedWide;
+        return r;
     }
 
     /* qw(word list) — returns ArrayLit of string literals */
@@ -3958,14 +4019,7 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_LENGTH)) {
         advance();
         bool hasParen = match(TK::LPAREN);
-        TK lnx = cur().kind;
-        if (lnx == TK::RBRACE || lnx == TK::SEMI || lnx == TK::RPAREN ||
-            lnx == TK::COMMA || lnx == TK::EOF_TOK) {
-            auto n = std::make_unique<Node>(); n->kind = NK::LengthFunc;
-            n->left = makeScalar("_", line); n->line = line;
-            return n;
-        }
-        auto inner = parseExpr();
+        auto inner = parseNamedUnaryArg(hasParen, line);
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::LengthFunc;
         n->left = std::move(inner); n->line = line; return n;
@@ -4083,8 +4137,10 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_DIE)) {
         advance();
         NodePtr msg;
-        if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK) && !check(TK::RPAREN))
-            msg = parseExpr();
+        /* D155: bare `die` before `}` (`open(...) or die }`) */
+        if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK) && !check(TK::RPAREN) &&
+            !check(TK::RBRACE) && !check(TK::RBRACKET) && !check(TK::COLON))
+            msg = parseLowNot();
         auto n = std::make_unique<Node>(); n->kind = NK::DieStmt; n->line = line;
         n->left = std::move(msg);
         return n;
@@ -4241,7 +4297,7 @@ NodePtr Parser::parsePrimary() {
         if (kind != NK::IntLit) {
             advance();
             bool hp = match(TK::LPAREN);
-            auto inner = parseExpr();
+            auto inner = parseNamedUnaryArg(hp, line);
             if (hp) consume(TK::RPAREN, ")");
             auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
             n->left = std::move(inner); return n;
@@ -4258,7 +4314,7 @@ NodePtr Parser::parsePrimary() {
         if (kind != NK::IntLit) {
             advance();
             bool hp = match(TK::LPAREN);
-            auto inner = parseExpr();
+            auto inner = parseNamedUnaryArg(hp, line);
             if (hp) consume(TK::RPAREN, ")");
             auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
             n->left = std::move(inner); return n;
@@ -4275,7 +4331,7 @@ NodePtr Parser::parsePrimary() {
         if (kind != NK::IntLit) {
             advance();
             bool hp = match(TK::LPAREN);
-            auto inner = parseExpr();
+            auto inner = parseNamedUnaryArg(hp, line);
             if (hp) consume(TK::RPAREN, ")");
             auto n = std::make_unique<Node>(); n->kind = kind; n->line = line;
             n->left = std::move(inner); return n;
@@ -4933,6 +4989,20 @@ NodePtr Parser::parsePrimary() {
         /* In key context (hash subscript), barewords are strings */
         if (inKeyContext_) {
             return makeStr(nm, line);
+        }
+        /* D154: an imported function name is a call, never a bareword
+           string: `BOLD RED "x"` nests (BOLD(RED("x"))) and `BOLD . "x"` is
+           BOLD() . "x". `NAME => v` stays a string key. */
+        {
+            auto imp = importMap_.find(nm);
+            if (imp != importMap_.end() && !check(TK::FATARROW)) {
+                if (check(TK::IDENT) && !isCmpOpWord(cur().text) &&
+                    peek(1).kind != TK::FATARROW)
+                    return parseBareCall(nm, line);
+                auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                n->name = imp->second; n->line = line; n->ival = 0;
+                return n;
+            }
         }
         /* D36: bareword at end of expression — only treat as sub call if NOT
            followed by a binary operator (eq, cmp, ==, etc.) or SEMI/RBRACE.

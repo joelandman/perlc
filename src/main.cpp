@@ -898,6 +898,22 @@ static std::vector<Token> inlineModules(
                 names = {"decode","decode_utf8","encode","encode_utf8",
                          "str2bytes","bytes2str","encodings","find_encoding",
                          "find_mime_encoding","clone_encoding"};
+            if (modName == "Term::ANSIColor") {
+                /* D154: :constants / :pushpop — the 43 attribute/color
+                   constants (real %EXPORT_TAGS; :pushpop's PUSHCOLOR/
+                   POPCOLOR/LOCALCOLOR and :constants256 are not implemented). */
+                static const char *ansiTagConsts[] = { "CLEAR","RESET","BOLD","DARK","FAINT","ITALIC","UNDERLINE","UNDERSCORE","BLINK","REVERSE","CONCEALED","BLACK","RED","GREEN","YELLOW","BLUE","MAGENTA","CYAN","WHITE","ON_BLACK","ON_RED","ON_GREEN","ON_YELLOW","ON_BLUE","ON_MAGENTA","ON_CYAN","ON_WHITE","BRIGHT_BLACK","BRIGHT_RED","BRIGHT_GREEN","BRIGHT_YELLOW","BRIGHT_BLUE","BRIGHT_MAGENTA","BRIGHT_CYAN","BRIGHT_WHITE","ON_BRIGHT_BLACK","ON_BRIGHT_RED","ON_BRIGHT_GREEN","ON_BRIGHT_YELLOW","ON_BRIGHT_BLUE","ON_BRIGHT_MAGENTA","ON_BRIGHT_CYAN","ON_BRIGHT_WHITE", nullptr };
+                std::vector<std::string> expanded;
+                for (auto &nm : names) {
+                    std::string t = (!nm.empty() && nm[0] == '\x01') ? nm.substr(1) : nm;
+                    if (t == ":constants" || t == ":pushpop") {
+                        for (int i = 0; ansiTagConsts[i]; i++) expanded.push_back(ansiTagConsts[i]);
+                    } else {
+                        expanded.push_back(nm);
+                    }
+                }
+                names = expanded;
+            }
             if (names.size() == 1 && (names[0] == ":all" || names[0] == ":DEFAULT")) {
                 if (modName == "Encode")
                     names = {"decode","decode_utf8","encode","encode_utf8",
@@ -1482,13 +1498,9 @@ int main(int argc, char **argv) {
                 "ON_BLACK","ON_RED","ON_GREEN","ON_YELLOW","ON_BLUE","ON_MAGENTA",
                 "ON_CYAN","ON_WHITE", NULL
             };
-            for (int i = 0; ansiConsts[i]; i++) {
-                auto it = importMap.find(ansiConsts[i]);
-                if (it != importMap.end()) {
-                    protoMap[it->first] = "";
-                    protoMap[it->second] = "";
-                }
-            }
+            /* D154: no "" prototype — the real constants take a list
+               (`print BOLD "text"` is BOLD("text") → code . "text"). */
+            (void)ansiConsts;
             parser.setProtoMap(std::move(protoMap));
         }
         parser.setImportMap(std::move(importMap));

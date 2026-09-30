@@ -69,6 +69,18 @@ typedef struct PerlCplxRow {
 #define PV_FLAG_READONLY          (1u << 23)
 /* Immortal interned PVs (perl_alloc_bool's 1 / ""). Never pooled; writes croak. */
 #define PV_FLAG_IMMORTAL          (1u << 24)
+/* D154: a FLAT_ARRAY / FLOAT_PAIR built from integer expressions (`[1,2]`):
+   promotion to a real array boxes integral elements as IVs again, so the
+   compact double storage no longer turns them into NVs (Dumper quoted them). */
+#define PV_FLAG_INT_ELEMS         (1u << 27)   /* FLAT_ARRAY: all; FLOAT_PAIR: first */
+#define PV_FLAG_INT_ELEM2         (1u << 28)   /* FLOAT_PAIR: second element */
+#define PV_FLAG_INT_MASK          (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2)
+/* D154: set on a promoted element: still a PERL_FLOAT (the 2D compound-
+   assign fast paths rely on promoted rows holding NVs and update fval in
+   place), but it came from an integer literal — Data::Dumper prints it as
+   an IV. Any perl_assign to the slot clears it. (Bit 25 is native_stdlib's
+   PV_FLAG_AUTOFLUSH.) */
+#define PV_FLAG_IV_HINT           (1u << 29)
 
 typedef struct PerlValue {
     PerlTag      tag;
@@ -478,6 +490,8 @@ PerlValue *perl_try_tiny_tag(PerlValue *block, const char *cls, PerlArray *rest,
 PerlValue *perl_list_moreutils(const char *name, PerlArray *args);
 PerlValue *perl_ansi_color(PerlArray *args, int colored);
 PerlValue *perl_ansi_color_const(const char *name);
+PerlValue *perl_ansi_color_const_args(const char *name, PerlArray *args); /* D154 */
+PerlValue *perl_ansi_util(const char *name, PerlArray *args);  /* D154: uncolor/colorstrip/colorvalid */
 PerlValue *perl_encode_call(const char *name, PerlArray *args);
 PerlValue *perl_encode_method(PerlValue *obj, const char *m, PerlArray *args);
 
@@ -646,7 +660,8 @@ PerlValue *perl_ref_scalar(PerlValue *v);
 PerlValue *perl_ref_array(PerlArray *a);
 PerlValue *perl_ref_hash(PerlHash *h);
 PerlValue *perl_deref_scalar(PerlValue *ref);   /* returns (PerlValue*)ref->pval */
-PerlArray *perl_deref_array(PerlValue *ref);    /* returns (PerlArray*)ref->pval */
+PerlArray *perl_deref_array(PerlValue *ref);
+void       perl_mark_int_elems(PerlValue *v, long long bits);   /* D154: 1=first/all, 2=second */    /* returns (PerlArray*)ref->pval */
 PerlArray *perl_deref_array_ro(PerlValue *ref); /* fast read-only variant, assumes REF_ARRAY */
 PerlHash  *perl_deref_hash(PerlValue *ref);     /* returns (PerlHash*)ref->pval */
 /* D105: promote a FLAT_ARRAY/FLOAT_PAIR value to a real REF_ARRAY in place

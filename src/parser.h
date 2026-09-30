@@ -76,6 +76,7 @@ private:
     bool englishEnabled_      = false; /* use English — $PID, $OS_ERROR, … */
     bool autodieEnabled_      = false; /* use autodie — builtins croak on fail */
     bool openStdUtf8_         = false; /* use open qw(:std :utf8) */
+    bool                     strWide_ = false; /* D154: literal being built came from a wide "\x{...}" token */
     std::set<std::string>    knownBareFH_; /* open LOG, ... → print LOG */
     /* D128: registered Token::file tag of the main script (nullptr when
        unset — every non-null tag then reports as a foreign file). */
@@ -123,6 +124,7 @@ private:
 
     bool    isModifier() const;
     NodePtr parseModifier(NodePtr stmt, int line);
+    NodePtr parseNamedUnaryArg(bool parens, int line); /* D155: named-unary operand ($_ default, binds tighter than cmp) */
     NodePtr parseFhArg(bool parens);              /* D152: filehandle arg: bareword → Typeglob */
     NodePtr parseListOpArg(bool parens);          /* D150: list-op argument: parseExpr in parens, else stops at and/or/xor */
     NodePtr stmtValueExpr(Node &stmt, int line); /* D150: value of STMT as an or/and LHS; nullptr if STMT never completes */

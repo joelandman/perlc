@@ -495,7 +495,8 @@ void CodeGen::declareRuntime() {
     /* references */
     RT("perl_alloc_flat_array", pv, i64);  /* FLAT_ARRAY (Stage 22/23 path) */
     RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
-    RT("perl_alloc_float_array", pv, i64);  /* FLAT_ARRAY n-element (used by FLAT_ARRAY literal path) */
+    RT("perl_alloc_float_array", pv, i64);
+    RT("perl_mark_int_elems",    voidTy, pv, i64);  /* FLAT_ARRAY n-element (used by FLAT_ARRAY literal path) */
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
     RT("perl_ref_hash",     pv, av);  /* PerlHash* treated as opaque av */
@@ -824,6 +825,8 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_list_moreutils",    pv, strPtrTy, av);
     RT("perl_ansi_color",        pv, av, i32);
     RT("perl_ansi_color_const",  pv, strPtrTy);
+    RT("perl_ansi_color_const_args", pv, strPtrTy, av);
+    RT("perl_ansi_util",         pv, strPtrTy, av);
     RT("perl_encode_call",       pv, strPtrTy, av);
     RT("perl_findbin_init",     voidTy, i8p);
     RT("perl_findbin_get",      pv, i8p);
@@ -2341,8 +2344,10 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             "legal_ref_keys","hidden_ref_keys",
             "catch","finally",
         };
+        bool ansiList = n.name.rfind("Term::ANSIColor::", 0) == 0 &&
+                        (bare == "uncolor" || bare == "colorstrip" || bare == "colorvalid");
         if (listNative.count(bare) || n.name.rfind("List::MoreUtils::", 0) == 0 ||
-            n.name.rfind("Encode::", 0) == 0 || n.name == "csv") {
+            n.name.rfind("Encode::", 0) == 0 || n.name == "csv" || ansiList) {
             int saved = callCtx_;
             callCtx_ = 1;
             Value *pv = emitExpr(n);
@@ -10293,7 +10298,14 @@ Value *CodeGen::emitExpr(const Node &n) {
                 if (allF64) {
                     Value *re = emitExprF64(*n.args[0]);
                     Value *im = emitExprF64(*n.args[1]);
-                    return callRT("perl_alloc_float_pair", {re, im});
+                    Value *fp = callRT("perl_alloc_float_pair", {re, im});
+                    /* D154: `[1, 2]` keeps IV elements when promoted */
+                    long long bits = (canEmitI64(*n.args[0]) ? 1 : 0) |
+                                     (canEmitI64(*n.args[1]) ? 2 : 0);
+                    if (bits)
+                        callRT("perl_mark_int_elems",
+                               {fp, ConstantInt::get(Type::getInt64Ty(ctx_), bits)});
+                    return fp;
                 }
             }
             /* FLAT_ARRAY: all F64-capable children → flat double[] with zero-init */
@@ -10315,6 +10327,9 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *ep = builder_.CreateConstInBoundsGEP1_64(f64Ty, dblPtr, i, "flat.ep");
                     builder_.CreateStore(fv, ep);
                 }
+                bool allInt = true;
+                for (auto &e : n.args) if (!canEmitI64(*e)) { allInt = false; break; }
+                if (allInt) callRT("perl_mark_int_elems", {flatPV, ConstantInt::get(i64Ty, 1)});   /* D154 */
                 return flatPV;
             }
         }
@@ -12093,7 +12108,8 @@ const Node *CodeGen::bareFhPrintCandidate(const Node &n) {
         c = n.args[0].get();
     else if (n.kind == NK::PrintfStmt && n.name.empty() && n.left && n.args.empty())
         c = n.left.get();
-    if (c && c->kind == NK::Call && c->ival == 1 && !c->args.empty() &&
+    if (c && c->kind == NK::Call && c->ival == 1 &&
+        (!c->args.empty() || c->fval == 1.0) &&   /* D155: `print WORD;` */
         c->name.find("::") == std::string::npos)
         return c;
     return nullptr;
@@ -13277,21 +13293,48 @@ Value *CodeGen::emitCall(const Node &n) {
                 callRT("perl_array_free", {av});
                 return r;
             }
-            if (bare != "colorvalid" && bare != "uncolor" && bare != "color" && bare != "colored") {
-                return callRT("perl_ansi_color_const", {builder_.CreateGlobalStringPtr(bare)});
+            if (bare == "colorstrip" || bare == "uncolor" || bare == "colorvalid") {
+                /* D154: previously unimplemented ("Undefined subroutine") */
+                auto *i32Ty = Type::getInt32Ty(ctx_);
+                callRT("perl_push_wantarray", {ConstantInt::get(i32Ty, callCtx_ == 1 ? 1 : 0)});
+                callCtx_ = 0;
+                Value *av = callRT("perl_array_new", {});
+                fillCallArgs(av, n);
+                callRT("perl_push_call_frame",
+                    {builder_.CreateGlobalStringPtr(currentPackage_),
+                     builder_.CreateGlobalStringPtr(sourceFile_),
+                     ConstantInt::get(i32Ty, n.line)});
+                Value *r = callRT("perl_ansi_util", {builder_.CreateGlobalStringPtr(bare), av});
+                callRT("perl_pop_call_frame", {});
+                callRT("perl_pop_wantarray", {});
+                callRT("perl_array_free", {av});
+                return r;
+            }
+            if (bare != "colorvalid" && bare != "uncolor" && bare != "color" && bare != "colored" &&
+                bare != "colorstrip" && bare != "coloralias") {
+                if (n.args.empty())
+                    return callRT("perl_ansi_color_const", {builder_.CreateGlobalStringPtr(bare)});
+                /* D154: BOLD "text" / BOLD RED "text" — constant applied to a list */
+                Value *av = callRT("perl_array_new", {});
+                fillCallArgs(av, n);
+                Value *r = callRT("perl_ansi_color_const_args", {builder_.CreateGlobalStringPtr(bare), av});
+                callRT("perl_array_free", {av});
+                return r;
             }
         }
         static const std::unordered_set<std::string> ansiConsts = {
-            "CLEAR","RESET","BOLD","DARK","FAINT","ITALIC","UNDERLINE","UNDERSCORE",
-            "BLINK","REVERSE","CONCEALED",
-            "BLACK","RED","GREEN","YELLOW","BLUE","MAGENTA","CYAN","WHITE",
-            "BRIGHT_BLACK","BRIGHT_RED","BRIGHT_GREEN","BRIGHT_YELLOW",
-            "BRIGHT_BLUE","BRIGHT_MAGENTA","BRIGHT_CYAN","BRIGHT_WHITE",
-            "ON_BLACK","ON_RED","ON_GREEN","ON_YELLOW","ON_BLUE","ON_MAGENTA",
-            "ON_CYAN","ON_WHITE",
+            "CLEAR","RESET","BOLD","DARK","FAINT","ITALIC","UNDERLINE","UNDERSCORE","BLINK","REVERSE","CONCEALED","BLACK","RED","GREEN","YELLOW","BLUE","MAGENTA","CYAN","WHITE","ON_BLACK","ON_RED","ON_GREEN","ON_YELLOW","ON_BLUE","ON_MAGENTA","ON_CYAN","ON_WHITE","BRIGHT_BLACK","BRIGHT_RED","BRIGHT_GREEN","BRIGHT_YELLOW","BRIGHT_BLUE","BRIGHT_MAGENTA","BRIGHT_CYAN","BRIGHT_WHITE","ON_BRIGHT_BLACK","ON_BRIGHT_RED","ON_BRIGHT_GREEN","ON_BRIGHT_YELLOW","ON_BRIGHT_BLUE","ON_BRIGHT_MAGENTA","ON_BRIGHT_CYAN","ON_BRIGHT_WHITE",
         };
-        if (ansiConsts.count(bare) && n.name.rfind("Term::ANSIColor::", 0) == 0)
-            return callRT("perl_ansi_color_const", {builder_.CreateGlobalStringPtr(bare)});
+        if (ansiConsts.count(bare) && n.name.rfind("Term::ANSIColor::", 0) == 0) {
+            if (n.args.empty())
+                return callRT("perl_ansi_color_const", {builder_.CreateGlobalStringPtr(bare)});
+            /* D154: BOLD "text" / BOLD RED "text" — constant applied to a list */
+            Value *av = callRT("perl_array_new", {});
+            fillCallArgs(av, n);
+            Value *r = callRT("perl_ansi_color_const_args", {builder_.CreateGlobalStringPtr(bare), av});
+            callRT("perl_array_free", {av});
+            return r;
+        }
     }
     /* ── Encode ── */
     {
