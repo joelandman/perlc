@@ -757,13 +757,19 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_DO) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
         advance();
         auto blk = parseBlock();
-        /* do { } while/until (cond) — post-condition loop */
+        /* do { } while/until (cond) — post-condition loop. D166: the
+           condition doesn't need surrounding parens at all (it's the
+           same statement-modifier `while EXPR`/`until EXPR` form
+           parseModifier already handles unparenthesized above) — a
+           real `do {...} while !(COND);` (found in /usr/bin/perlbug,
+           `} while !((($alt) = grep(...)));`) died "expected ( but
+           got '!'" because this consumed a literal '(' unconditionally
+           instead of just parsing a general expression, which already
+           handles an optional leading '(' as ordinary grouping. */
         if (check(TK::KW_WHILE) || check(TK::KW_UNTIL)) {
             bool negate = check(TK::KW_UNTIL);
             advance();
-            consume(TK::LPAREN, "(");
             auto cond = parseExpr();
-            consume(TK::RPAREN, ")");
             match(TK::SEMI);
             if (negate) cond = makeUnary("!", std::move(cond), line);
             auto n = std::make_unique<Node>(); n->kind = NK::DoWhile; n->line = line;
@@ -3064,8 +3070,23 @@ NodePtr Parser::parsePrimary() {
            operator (-d && ... / -d || ... / -d or die) */
         if (!check(TK::SEMI) && !check(TK::EOF_TOK) && !check(TK::RPAREN) &&
             !check(TK::RBRACE) && !check(TK::COMMA) && !check(TK::AND2) &&
-            !check(TK::OR2) && !check(TK::KW_AND) && !check(TK::KW_OR))
-            path = hp ? parseExpr() : parsePostfix(); /* postfix-level: grabs $var, "str", $arr[i] */
+            !check(TK::OR2) && !check(TK::KW_AND) && !check(TK::KW_OR) &&
+            !check(TK::QUESTION)) {
+            /* D165: `-t STDERR` (a bareword filehandle operand, no
+               surrounding parens) — found via a real dpkg-preconfigure
+               script. A bare IDENT not followed by '(' or '->' here is
+               always a filehandle name (parsePostfix has no other use
+               for a standalone bareword), same disambiguation
+               parseFhArg already uses for close/eof's filehandle arg. */
+            if (!hp && check(TK::IDENT) && peek(1).kind != TK::LPAREN && peek(1).kind != TK::ARROW) {
+                auto t = std::make_unique<Node>(); t->kind = NK::Typeglob;
+                t->name = cur().text; t->line = cur().line;
+                advance();
+                path = std::move(t);
+            } else {
+                path = hp ? parseExpr() : parsePostfix(); /* postfix-level: grabs $var, "str", $arr[i] */
+            }
+        }
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::FileTestOp;
         n->sval = flag; n->left = std::move(path); n->line = line;

@@ -11844,6 +11844,23 @@ PerlValue *perl_filetest(int op, PerlValue *path_pv) {
         case 's': result = (stat(path, &st) == 0) ? perl_alloc_int(st.st_size) : perl_alloc_undef(); break;
         case 'l': result = perl_alloc_bool(lstat(path, &st) == 0 && S_ISLNK(st.st_mode)); break;
         case 'p': result = perl_alloc_bool(stat(path, &st) == 0 && S_ISFIFO(st.st_mode)); break;
+        /* D165: -t FILEHANDLE (isatty test) — found missing via a real
+           dpkg-preconfigure script (`-t STDERR` inside a larger boolean
+           expression). Real Perl's -t only makes sense on a filehandle
+           (not a path string); path_pv here is whatever expression was
+           given, which for -t is always a filehandle value (codegen's
+           bare-`-t` case passes STDIN specifically, not $_, matching
+           real Perl's own bare-`-t` default). A non-filehandle operand
+           (shouldn't occur in practice) is simply not a tty. */
+        case 't': {
+            if (path_pv && path_pv->tag == PERL_FILEHANDLE && path_pv->pval) {
+                int fd = fileno((FILE *)path_pv->pval);
+                result = perl_alloc_bool(fd >= 0 && isatty(fd));
+            } else {
+                result = perl_alloc_bool(0);
+            }
+            break;
+        }
         default:  result = perl_alloc_bool(0); break;
     }
     free(path);
@@ -12227,6 +12244,47 @@ PerlValue *perl_posix_wifstopped(PerlValue *status) {
 }
 PerlValue *perl_posix_wstopsig(PerlValue *status) {
     return perl_alloc_int(WSTOPSIG((int)perl_to_int(status)));
+}
+
+/* D165: POSIX's :fcntl_h mode-testing predicates — real functions,
+   not constants, despite similar S_IS*-vs-S_IxUSR naming (only
+   S_ISUID/S_ISGID are plain constants). Thin wrappers over the real
+   sys/stat.h macros. Found missing via a real dpkg-genbuildinfo
+   script (`use POSIX qw(:fcntl_h :locale_h strftime);`). */
+PerlValue *perl_posix_s_isreg(PerlValue *mode) {
+    return perl_alloc_bool(S_ISREG((mode_t)perl_to_int(mode)) ? 1 : 0);
+}
+PerlValue *perl_posix_s_isdir(PerlValue *mode) {
+    return perl_alloc_bool(S_ISDIR((mode_t)perl_to_int(mode)) ? 1 : 0);
+}
+PerlValue *perl_posix_s_ischr(PerlValue *mode) {
+    return perl_alloc_bool(S_ISCHR((mode_t)perl_to_int(mode)) ? 1 : 0);
+}
+PerlValue *perl_posix_s_isblk(PerlValue *mode) {
+    return perl_alloc_bool(S_ISBLK((mode_t)perl_to_int(mode)) ? 1 : 0);
+}
+PerlValue *perl_posix_s_isfifo(PerlValue *mode) {
+    return perl_alloc_bool(S_ISFIFO((mode_t)perl_to_int(mode)) ? 1 : 0);
+}
+PerlValue *perl_posix_s_islnk(PerlValue *mode) {
+#ifdef S_ISLNK
+    return perl_alloc_bool(S_ISLNK((mode_t)perl_to_int(mode)) ? 1 : 0);
+#else
+    return perl_alloc_bool(0);
+#endif
+}
+PerlValue *perl_posix_s_issock(PerlValue *mode) {
+#ifdef S_ISSOCK
+    return perl_alloc_bool(S_ISSOCK((mode_t)perl_to_int(mode)) ? 1 : 0);
+#else
+    return perl_alloc_bool(0);
+#endif
+}
+PerlValue *perl_posix_creat(PerlValue *path, PerlValue *mode) {
+    char *p = perl_to_string_dup(path);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, (mode_t)perl_to_int(mode));
+    free(p);
+    return perl_alloc_int(fd);
 }
 
 /* ── Scalar::Util ─────────────────────────────────────────────────────────── */

@@ -18,7 +18,39 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-30, D164 — 532/532 PASS, 0 FAIL):** Continuing the
+**Harness (2026-09-30, third real-script survey + D165/D166 —
+536/536 PASS, 0 FAIL):** A third randomized ~54-script compile survey
+found and fixed two batches. **D165**: `POSIX`'s `:fcntl_h` import tag
+wasn't recognized (found via a real `dpkg-genbuildinfo` script,
+`use POSIX qw(:fcntl_h :locale_h strftime);`) — added the tag plus
+its `S_IS*` mode-testing predicates (`S_ISREG`/`S_ISDIR`/etc. — real
+functions, not constants, despite similar `S_IS*`-vs-`S_IxUSR`
+naming) and `creat()` as thin C-library wrappers, plus the two
+missing constants (`O_ACCMODE`, `O_NOCTTY`) the tag needed. In the
+same pass, found and fixed a companion lexer gap: `<< "EOT"` /
+`<<~ "EOT"` (whitespace between `<<`/`<<~` and a QUOTED heredoc
+delimiter) was a hard parse error, even though real Perl allows it
+(it only forbids the *unquoted* bareword form with a space,
+`<< EOT`) — found via a real `/usr/bin/linux-version` script.
+**D166**: two separate parser/lexer gaps. (1) `-t FILEHANDLE` (isatty
+test) didn't work at all — lowercase `t` was simply missing from the
+lexer's filetest-operator character set entirely (only uppercase `T`,
+for `-T` text-file test, was present), and once that was added, a
+*bareword* filehandle operand (`-t STDERR`, no sigil) still wasn't
+parseable since the filetest operand parser only knew `$var`/`"str"`/
+`$arr[i]` shapes — found via a real `dpkg-preconfigure` script
+(`-t STDERR` inside a larger boolean expression). Also fixed: bare
+`-t` (no filehandle) must test STDIN specifically per real Perl, not
+`$_` like every other bare filetest, and a bare filetest immediately
+followed by `?` (ternary) must not try to consume the `?` as an
+operand. (2) `do { ... } while/until COND` required a literal `(`
+immediately after `while`/`until`, even though the condition is
+really just the same unparenthesized statement-modifier form used
+everywhere else — found via a real `/usr/bin/perlbug` script
+(`} while !((($alt) = grep(...)));`, which starts with `!`, not `(`).
+Tests: `tests/fcntl_h_{smoke,deep}.pl`,
+`tests/filetest_t_dowhile_{smoke,deep}.pl`.
+Previous session (2026-09-30, D164 — 532/532 PASS, 0 FAIL):** Continuing the
 second real-script survey, implemented core Perl's "diamond-glob"
 `<PATTERN>` syntax (`my @f = <*.md>;`, `(<callgrind.out*>)[0]`) —
 `<...>` was only ever recognized as filehandle readline (`<$fh>`,
@@ -572,7 +604,11 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D164 FIXED 2026-09-30**
+**Open generated-code defects:** none — **D166 FIXED 2026-09-30**
+(`-t FILEHANDLE` not implemented at all, plus `do{}while/until COND`
+requiring a literal `(` — see TESTS.md). **D165 FIXED 2026-09-30**
+(POSIX `:fcntl_h` tag not recognized, plus `<< "EOT"` heredoc
+whitespace — see TESTS.md). **D164 FIXED 2026-09-30**
 (diamond-glob `<PATTERN>` syntax not recognized, plus a pre-existing
 infinite-loop bug in scalar-context `glob()` — see TESTS.md). **D163
 FIXED 2026-09-30**

@@ -879,6 +879,27 @@ static std::vector<Token> inlineModules(
                     {"sys_wait_h", {"WEXITSTATUS","WIFEXITED","WIFSIGNALED",
                         "WIFSTOPPED","WNOHANG","WSTOPSIG","WTERMSIG",
                         "WUNTRACED"}},
+                    /* D165: :fcntl_h — found missing via a real
+                       dpkg-genbuildinfo script (`use POSIX qw(:fcntl_h
+                       :locale_h strftime);`). Probed from the real
+                       installed POSIX's own %EXPORT_TAGS. The S_IS*
+                       names here (S_ISREG etc.) are real FUNCTIONS
+                       (mode-testing predicates, e.g. S_ISDIR($mode)),
+                       not constants — despite similar S_IS*-vs-S_IxUSR
+                       naming, only S_ISUID/S_ISGID are plain constants;
+                       dispatched separately in codegen.cpp/runtime.c,
+                       not through perl_native_constant. `creat` is
+                       likewise a real function, not a constant. */
+                    {"fcntl_h", {"FD_CLOEXEC","F_DUPFD","F_GETFD","F_GETFL",
+                        "F_GETLK","F_RDLCK","F_SETFD","F_SETFL","F_SETLK",
+                        "F_SETLKW","F_UNLCK","F_WRLCK","O_ACCMODE",
+                        "O_APPEND","O_CREAT","O_EXCL","O_NOCTTY",
+                        "O_NONBLOCK","O_RDONLY","O_RDWR","O_TRUNC",
+                        "O_WRONLY","SEEK_CUR","SEEK_END","SEEK_SET",
+                        "S_IRGRP","S_IROTH","S_IRUSR","S_IRWXG","S_IRWXO",
+                        "S_IRWXU","S_ISBLK","S_ISCHR","S_ISDIR","S_ISFIFO",
+                        "S_ISGID","S_ISLNK","S_ISREG","S_ISSOCK","S_ISUID",
+                        "S_IWGRP","S_IWOTH","S_IWUSR","creat"}},
                 }},
                 {"File::Glob", {
                     /* real %File::Glob::EXPORT_TAGS: :bsd_glob and :glob

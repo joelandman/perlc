@@ -780,6 +780,14 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_posix_wtermsig",   pv, pv);
     RT("perl_posix_wifstopped", pv, pv);
     RT("perl_posix_wstopsig",   pv, pv);
+    RT("perl_posix_s_isreg",    pv, pv);
+    RT("perl_posix_s_isdir",    pv, pv);
+    RT("perl_posix_s_ischr",    pv, pv);
+    RT("perl_posix_s_isblk",    pv, pv);
+    RT("perl_posix_s_isfifo",   pv, pv);
+    RT("perl_posix_s_islnk",    pv, pv);
+    RT("perl_posix_s_issock",   pv, pv);
+    RT("perl_posix_creat",      pv, pv, pv);
     /* Scalar::Util */
     RT("perl_su_blessed",              pv, pv);
     RT("perl_su_reftype",              pv, pv);
@@ -11002,6 +11010,11 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *path;
         if (n.left) {
             path = emitExpr(*n.left);
+        } else if (op == 't') {
+            /* D165: bare `-t` (no filehandle given) tests STDIN
+               specifically in real Perl — NOT $_ like every other
+               bare filetest. */
+            path = callRT("perl_get_stdin", {});
         } else {
             /* bare `-d` etc. tests $_ (real Perl implicit-topic rule).
                Read the in-scope $_ slot if the sub has one (W29 shadow),
@@ -13063,6 +13076,42 @@ Value *CodeGen::emitCall(const Node &n) {
     if (n.name == "POSIX::WSTOPSIG" || n.name == "WSTOPSIG") {
         Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
         return callRT("perl_posix_wstopsig", {v});
+    }
+    /* D165: :fcntl_h mode-testing predicates + creat — found missing
+       via a real dpkg-genbuildinfo compile (`use POSIX qw(:fcntl_h
+       :locale_h strftime);`). */
+    if (n.name == "POSIX::S_ISREG" || n.name == "S_ISREG") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_s_isreg", {v});
+    }
+    if (n.name == "POSIX::S_ISDIR" || n.name == "S_ISDIR") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_s_isdir", {v});
+    }
+    if (n.name == "POSIX::S_ISCHR" || n.name == "S_ISCHR") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_s_ischr", {v});
+    }
+    if (n.name == "POSIX::S_ISBLK" || n.name == "S_ISBLK") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_s_isblk", {v});
+    }
+    if (n.name == "POSIX::S_ISFIFO" || n.name == "S_ISFIFO") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_s_isfifo", {v});
+    }
+    if (n.name == "POSIX::S_ISLNK" || n.name == "S_ISLNK") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_s_islnk", {v});
+    }
+    if (n.name == "POSIX::S_ISSOCK" || n.name == "S_ISSOCK") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_s_issock", {v});
+    }
+    if (n.name == "POSIX::creat" || n.name == "creat") {
+        Value *path = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *mode = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_posix_creat", {path, mode});
     }
     /* D69: List::Util::sum/min/max/uniq, scalar context. These only reach
        emitCall as a qualified NK::Call — the bare "sum"/"min"/"max"/"uniq"

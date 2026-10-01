@@ -782,6 +782,14 @@ PerlValue *perl_posix_wifsignaled(PerlValue *status);
 PerlValue *perl_posix_wtermsig(PerlValue *status);
 PerlValue *perl_posix_wifstopped(PerlValue *status);
 PerlValue *perl_posix_wstopsig(PerlValue *status);
+PerlValue *perl_posix_s_isreg(PerlValue *mode);  /* D165 */
+PerlValue *perl_posix_s_isdir(PerlValue *mode);
+PerlValue *perl_posix_s_ischr(PerlValue *mode);
+PerlValue *perl_posix_s_isblk(PerlValue *mode);
+PerlValue *perl_posix_s_isfifo(PerlValue *mode);
+PerlValue *perl_posix_s_islnk(PerlValue *mode);
+PerlValue *perl_posix_s_issock(PerlValue *mode);
+PerlValue *perl_posix_creat(PerlValue *path, PerlValue *mode);
 
 /* ── Scalar::Util functions ───────────────────────────────────────────────── */
 PerlValue *perl_su_blessed(PerlValue *v);

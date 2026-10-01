@@ -309,6 +309,20 @@ Token Lexer::readHeredoc() {
        scan below, since it appears immediately after the second '<'. */
     bool indented = false;
     if (pos_ < src_.size() && src_[pos_] == '~') { indented = true; pos_++; }
+    /* D165: `<< "EOT"` / `<<~ "EOT"` — real Perl allows (and tolerates
+       in practice) whitespace between `<<`/`<<~` and a QUOTED
+       delimiter (verified: `print <<   "QQ";` works). It does NOT
+       allow this for the bare-identifier form (`<< EOT` with a space
+       is a hard "Use of bare << to mean <<"" is forbidden" error in
+       real Perl) — so only skip the whitespace here when it's
+       followed by a quote char; otherwise leave it untouched so the
+       bareword-delimiter scan below behaves exactly as before. */
+    {
+        size_t wsSave = pos_;
+        while (pos_ < src_.size() && (src_[pos_] == ' ' || src_[pos_] == '\t')) pos_++;
+        if (!(pos_ < src_.size() && (src_[pos_] == '"' || src_[pos_] == '\'')))
+            pos_ = wsSave;
+    }
     bool interp = true;
     char quote  = 0;
     if (pos_ < src_.size() && (src_[pos_] == '"' || src_[pos_] == '\'')) {
@@ -1098,7 +1112,7 @@ std::vector<Token> Lexer::tokenize() {
                 else if (peek() == '>') { pos_++; toks.push_back({TK::ARROW, "->", line_}); }
                 else {
                     /* file test: -e/-f/-d/-r/-w/-x/-z/-s/-l/-p only at expression start */
-                    static const std::string ftOps = "efdrzswxolpSTMABC";
+                    static const std::string ftOps = "efdrzswxoltpSTMABC";
                     bool afterVal = !toks.empty() && [&]{
                         switch (toks.back().kind) {
                             case TK::INT: case TK::FLOAT: case TK::STRING:
