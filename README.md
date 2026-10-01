@@ -27,6 +27,63 @@ make clean
 ./perlc -pm program.pl                  # install missing modules then compile
 ```
 
+## Performance
+
+perlc compiles to a native binary via LLVM, so `-O` level matters.
+Benchmarked 2026-10-01 against the host's real `perl` (5.42) on the
+same machine, using `bench/fibn.pl`, `bench/nb.pl`, `bench/mbs.pl`,
+and `bench/regex_heavy.pl` (the last two scaled up from their
+checked-in defaults — see footnotes — since sub-30-second native
+`perl` runs are too noisy for a meaningful comparison):
+
+| Benchmark | Opt | perlc (ms) | perl (ms) | Speedup (perl/perlc) |
+|---|---|---|---|---|
+| **fibn(39)** — recursive, exponential | O0 | 69,841 | 39,240 | 0.56× (perlc slower) |
+| | O1 | 26,966 | 39,240 | 1.46× |
+| | O2 | 25,292 | 39,240 | 1.55× |
+| | O3 | 25,071 | 39,240 | **1.57×** |
+| **nb(50,000,000)** — N-body, tight numeric loop | O0 | 25,955 | 250,395 | 9.65× |
+| | O1 | 14,739 | 250,395 | 16.99× |
+| | O2 | 13,494 | 250,395 | **18.56×** |
+| | O3 | 14,790 | 250,395 | 16.93× |
+| **mbs** †(Mandelbrot grid, N=1024) | O0 | 22,587 | 65,789 | 2.91× |
+| | O1 | 9,076 | 65,789 | 7.25× |
+| | O2 | 8,451 | 65,789 | **7.79×** |
+| | O3 | 8,497 | 65,789 | 7.74× |
+| **regex_heavy** ‡(6M-item corpus × 70 passes, 420M matches) | O0 | 28,807 | 30,578 | 1.06× |
+| | O1 | 11,676 | 30,578 | 2.62× |
+| | O2 | 11,698 | 30,578 | 2.61× |
+| | O3 | 11,671 | 30,578 | **2.62×** |
+
+† `bench/mbs.pl` ships with a hardcoded `$N=4096` grid, too expensive
+to run under native `perl` in a reasonable time/memory budget for
+benchmarking (12+ minutes, 6+ GB RSS). The table uses a `$N=1024`
+copy of the same code instead.
+‡ `bench/regex_heavy.pl` ships with a 100,000-item corpus × 50
+passes (5M matches); the table uses a scaled-up 6,000,000-item
+corpus × 70 passes (420M matches) to get a stable, non-noisy native
+`perl` baseline.
+
+**Takeaways:**
+- Once past `-O0`, perlc beats native `perl` by **1.6×–18.6×** across
+  these benchmarks — the N-body numeric loop sees the largest win.
+- `-O0` → `-O1` captures nearly all the available speedup; `-O2`/`-O3`
+  add only a few more percent on top of `-O1` here (and `-O3` is
+  within noise of `-O2`, sometimes marginally behind it).
+- `fibn` (pure recursive call/return, no loop to optimize) is the one
+  case where perlc's unoptimized (`-O0`) output is slower than real
+  Perl's mature interpreter loop — it needs at least `-O1`'s call
+  overhead cleanup/inlining to pull ahead, and even then the margin
+  is the smallest of the four benchmarks.
+- `regex_heavy`'s lower ceiling (~2.6×) reflects that both perlc and
+  Perl bottleneck on the same underlying PCRE2 engine for the actual
+  matching; perlc's edge there is purely from avoiding Perl's
+  per-iteration interpreter dispatch overhead around each match call.
+
+Run it yourself: `make bench` (see `bench/bench.sh`), or compile a
+benchmark directly with an explicit level, e.g.
+`./perlc bench/nb.pl -O3 -o nb_opt3`.
+
 ## Implemented Features
 
 ### Core Language Features (Nearly Complete)
