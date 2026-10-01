@@ -18,7 +18,32 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-30, second real-script survey + D163 + URI::Escape —
+**Harness (2026-09-30, D164 — 532/532 PASS, 0 FAIL):** Continuing the
+second real-script survey, implemented core Perl's "diamond-glob"
+`<PATTERN>` syntax (`my @f = <*.md>;`, `(<callgrind.out*>)[0]`) —
+`<...>` was only ever recognized as filehandle readline (`<$fh>`,
+`<STDIN>`, bare `<FH>`); any non-identifier content (glob
+metacharacters, paths) fell through to a bare `<` token and a
+confusing downstream parse error. Found via a real
+`/usr/bin/callgrind_annotate` script. Fixed in the lexer only — a
+guarded second scan (only attempted where a *term* is expected, not
+right after a value, so `$a < $b > $c`-shaped comparisons are
+unaffected; further restricted to a safe filename/glob character
+allowlist so it can't swallow an unrelated later `>` on the same
+line) emits the same `TK::READLINE` token the identifier case uses;
+codegen already dispatches on whether that text is a pure identifier.
+Scoped out: the pattern text is a literal, not variable-interpolated
+(real Perl's `<$dir/*.txt>` substitutes `$dir`; perlc's `<...>` takes
+the text as-is) — document this if hit again. **Found while building
+this**: scalar-context `glob()` (`while (my $f = glob(...))`, and so
+also scalar-context `<PATTERN>`) was a pre-existing, serious,
+**outright infinite loop** whenever at least one file matched — it
+recomputed the full match list and returned element 0 on every call
+instead of advancing. Fixed with a per-callsite iterator-state global
+(mirroring `state $x`'s existing per-callsite-global mechanism) giving
+real readdir-style one-match-per-call-then-undef-then-restart
+semantics. Tests: `tests/diamond_glob_{smoke,deep}.pl`.
+Previous session (2026-09-30, second real-script survey + D163 + URI::Escape —
 530/530 PASS, 0 FAIL):** A second randomized ~50-script compile survey
 found and fixed **D163**: a bare `;` immediately after a block-ending
 statement (`if (...) { ... };`, `while (...) { ... };`, or just a
@@ -547,7 +572,10 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D163 FIXED 2026-09-30**
+**Open generated-code defects:** none — **D164 FIXED 2026-09-30**
+(diamond-glob `<PATTERN>` syntax not recognized, plus a pre-existing
+infinite-loop bug in scalar-context `glob()` — see TESTS.md). **D163
+FIXED 2026-09-30**
 (bare `;` after a block-ending statement was a hard parse error — see
 TESTS.md). **D161 FIXED 2026-09-30**
 (backtick `\$`/`\@` escaping, plus `qx(...)`/`qx{...}`/etc. not being

@@ -1172,6 +1172,59 @@ std::vector<Token> Lexer::tokenize() {
                     }
                     pos_ = save;
                 }
+                /* D164: diamond-glob <PATTERN> — real Perl treats <...>
+                   as glob(...) whenever its contents aren't a bare
+                   filehandle-shaped token (pure identifier, optionally
+                   `$`-prefixed) — e.g. <*.c>, <path/*.txt>, <~/.bashrc>.
+                   Single-line only (bail to plain '<' on newline/EOF),
+                   matching real Perl. Emits the same TK::READLINE token
+                   the identifier case uses; codegen's case NK::Readline
+                   distinguishes a glob pattern from a filehandle name by
+                   checking whether the text is a pure identifier. Note:
+                   the pattern text is NOT variable-interpolated (unlike
+                   real Perl's <$dir/*.txt> form) — scoped out; a literal
+                   pattern (the common real-world shape) works.
+
+                   Only attempted where a *term* is expected, not after a
+                   value — a genuine less-than ($a < $b, foo() < 5, ...)
+                   always has a value token immediately before '<', so
+                   this guard is both necessary and sufficient to avoid
+                   misparsing `$a < $b > $c`-shaped comparisons as a
+                   diamond-glob scan swallowing everything up to the
+                   first unrelated later '>' on the same line. */
+                bool ltAfterVal = !toks.empty() && [&]{
+                    switch (toks.back().kind) {
+                        case TK::INT: case TK::FLOAT: case TK::STRING:
+                        case TK::IDENT: case TK::RPAREN: case TK::RBRACKET:
+                        case TK::PLUS_PLUS: case TK::MINUS_MINUS:
+                            return true;
+                        default: return false;
+                    }
+                }();
+                if (!ltAfterVal) {
+                    /* Extra safety belt beyond ltAfterVal: only scan
+                       through characters that plausibly belong in a
+                       filename/glob pattern. Any other character (a
+                       space, &&, =, etc.) aborts the scan immediately
+                       rather than continuing to hunt for a '>' — this
+                       keeps something like `$h{k} < 5 && $x > 2`
+                       (where RBRACE isn't in the afterVal set above)
+                       from being swallowed as a bogus glob pattern. */
+                    size_t save = pos_;
+                    std::string rl;
+                    static const std::string globSafeChars =
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                        "0123456789_./\\-*?[]~@:+,$";
+                    while (pos_ < src_.size() && src_[pos_] != '>' &&
+                           globSafeChars.find(src_[pos_]) != std::string::npos)
+                        rl += src_[pos_++];
+                    if (!rl.empty() && pos_ < src_.size() && src_[pos_] == '>') {
+                        pos_++;  /* consume '>' */
+                        toks.push_back({TK::READLINE, rl, line_});
+                        break;
+                    }
+                    pos_ = save;
+                }
                 toks.push_back({TK::LT, "<", line_});
                 break;
             }

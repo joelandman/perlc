@@ -16573,6 +16573,58 @@ PerlArray *perl_bsd_glob_val(PerlValue *pattern, PerlValue *flagsArg) {
     return res;
 }
 
+/* D164: scalar-context glob() / diamond-glob `<PATTERN>` iterator.
+   Confirmed pre-existing bug: codegen's scalar-context `case
+   NK::GlobFunc` called perl_glob_val(pat) fresh on every call and
+   always returned element 0 — so `while (my $f = glob("*.txt"))`
+   never advanced and never terminated (an outright infinite loop
+   whenever at least one file matched), instead of real Perl's
+   readdir-style one-match-per-call-then-undef-then-restart behavior.
+   Each call site gets its own opaque iterator slot (the *slot
+   parameter is backed by a per-callsite LLVM global in codegen,
+   mirroring the existing `state $x` per-callsite-global mechanism —
+   see NK::StateDecl) so two independent glob() calls don't share
+   position. A new pattern string (or starting a fresh pass after
+   exhaustion) resets the match list; exhaustion frees the state and
+   returns undef, so the very next call with the same pattern starts
+   over — matching real Perl's own glob() restart-on-exhaustion
+   behavior. */
+typedef struct PerlGlobIterState {
+    PerlArray *matches;
+    long long  idx;
+    char      *pattern;
+} PerlGlobIterState;
+
+PerlValue *perl_glob_val_scalar(PerlValue *patternVal, PerlGlobIterState **slot) {
+    char *pat = perl_to_string_dup(patternVal);
+    PerlGlobIterState *st = *slot;
+    if (!st) {
+        st = (PerlGlobIterState *)calloc(1, sizeof(PerlGlobIterState));
+        *slot = st;
+    }
+    int needFresh = !st->matches || !st->pattern || strcmp(st->pattern, pat) != 0;
+    if (needFresh) {
+        if (st->matches) perl_array_free(st->matches);
+        free(st->pattern);
+        st->pattern = pat;
+        st->matches = perl_glob_val(patternVal);
+        st->idx = 0;
+    } else {
+        free(pat);
+    }
+    if (st->idx < st->matches->len) {
+        PerlValue *v = perl_clone(st->matches->elems[st->idx]);
+        st->idx++;
+        return v;
+    }
+    perl_array_free(st->matches);
+    st->matches = NULL;
+    free(st->pattern);
+    st->pattern = NULL;
+    st->idx = 0;
+    return perl_alloc_undef();
+}
+
 /* ── UNIVERSAL: isa / can ─────────────────────────────────────────────────── */
 
 /* D75: depth-first search matching perl_find_method_dfs's traversal —

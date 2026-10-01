@@ -862,6 +862,8 @@ PerlArray *perl_stat_path(PerlValue *v);
 PerlArray *perl_lstat_path(PerlValue *v);
 PerlArray *perl_glob_val(PerlValue *pattern);
 PerlArray *perl_bsd_glob_val(PerlValue *pattern, PerlValue *flagsArg); /* D157: File::Glob::bsd_glob */
+typedef struct PerlGlobIterState PerlGlobIterState;
+PerlValue *perl_glob_val_scalar(PerlValue *patternVal, PerlGlobIterState **slot); /* D164 */
 
 /* ── Tier 3 file / misc builtins ────────────────────────────────────────── */
 PerlValue *perl_read_fh(PerlValue *fh, PerlValue *buf_pv, PerlValue *nbytes, PerlValue *offset);

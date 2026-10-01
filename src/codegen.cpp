@@ -923,6 +923,7 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_lstat_path",       av, pv);
     RT("perl_glob_val",         av, pv);
     RT("perl_bsd_glob_val",     av, pv, pv);
+    RT("perl_glob_val_scalar",  pv, pv, pv); /* D164: 2nd arg is PerlGlobIterState** */
     /* UNIVERSAL */
     RT("perl_isa_check",        pv, pv, pv);
     RT("perl_can_check",        pv, pv, pv);
@@ -1738,6 +1739,20 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         if (n.sval == "DATA") {
             Value *fh = callRT("perl_get_data_fh", {});
             return callRT("perl_readline_all", {fh});
+        }
+        /* D164: diamond-glob <PATTERN> in list context — the lexer only
+           reaches here with non-identifier text (e.g. "*.md") when it's
+           NOT a filehandle-shaped token; a pure identifier/scalar-var
+           name is handled by the branches below exactly as before. */
+        bool isPureIdent = !n.sval.empty();
+        for (char c : n.sval)
+            if (!isalnum((unsigned char)c) && c != '_') { isPureIdent = false; break; }
+        if (!isPureIdent) {
+            Value *pat = builder_.CreateGlobalStringPtr(n.sval);
+            Value *patPv = callRT("perl_alloc_string", {pat});
+            Value *av = callRT("perl_glob_val", {patPv});
+            freeIfOwned(patPv);
+            return av;
         }
         if (auto *slot = lookupVar(n.sval)) {
             Value *fh = builder_.CreateLoad(perlPtrTy_, slot);
@@ -4850,6 +4865,7 @@ void CodeGen::compile(const Node &program, const std::string &modName,
     substEvalCounter_ = 0;
     stateSeq_ = 0;
     endSeq_ = 0;
+    globIterSeq_ = 0;
     lastSqrtInput_ = nullptr;
     floatSqrtOf_.clear();
 
@@ -7942,6 +7958,24 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *fh = callRT("perl_get_data_fh", {});
             return callRT("perl_readline", {fh});
         }
+        /* D164: diamond-glob <PATTERN> in scalar context — one match
+           per call via the same per-callsite iterator state GlobFunc
+           uses, then undef, then restart (see perl_glob_val_scalar).
+           Only reached for non-identifier text; see the identical
+           check in the list-context branch just above this function. */
+        bool isPureIdent = !n.sval.empty();
+        for (char c : n.sval)
+            if (!isalnum((unsigned char)c) && c != '_') { isPureIdent = false; break; }
+        if (!isPureIdent) {
+            Value *pat = builder_.CreateGlobalStringPtr(n.sval);
+            Value *patPv = callRT("perl_alloc_string", {pat});
+            std::string gname = "globiter.ptr." + std::to_string(globIterSeq_++);
+            auto *gptr = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage, ConstantPointerNull::get(perlPtrTy_), gname);
+            Value *res = callRT("perl_glob_val_scalar", {patPv, gptr});
+            freeIfOwned(patPv);
+            return res;
+        }
         if (auto *slot = lookupVar(n.sval)) {
             Value *fh = builder_.CreateLoad(perlPtrTy_, slot);
             return callRT("perl_readline", {fh});
@@ -8028,13 +8062,18 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::GlobFunc: {
-        /* scalar context: return first match */
+        /* D164: scalar context must iterate one match per call (like
+           readdir), then undef, then restart on the next call —
+           NOT return the same first match forever (the old
+           perl_glob_val+index-0 shape was an outright infinite-loop
+           bug for `while (my $f = glob(...))`). Each call site gets
+           its own opaque iterator-state global, mirroring
+           NK::StateDecl's per-callsite-global mechanism. */
         Value *pat = n.left ? emitExpr(*n.left) : perlUndef();
-        Value *av  = callRT("perl_glob_val", {pat});
-        Value *v   = callRT("perl_array_get_ref", {av, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
-        Value *res = callRT("perl_clone", {v});
-        callRT("perl_array_free", {av});
-        return res;
+        std::string gname = "globiter.ptr." + std::to_string(globIterSeq_++);
+        auto *gptr = new GlobalVariable(*mod_, perlPtrTy_, false,
+            GlobalValue::InternalLinkage, ConstantPointerNull::get(perlPtrTy_), gname);
+        return callRT("perl_glob_val_scalar", {pat, gptr});
     }
 
     case NK::ReadFunc: {

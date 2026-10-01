@@ -106,6 +106,7 @@ private:
     int substEvalCounter_ = 0; /* D38c: unique names for s///e eval fns */
     int stateSeq_ = 0;
     int endSeq_ = 0;
+    int globIterSeq_ = 0; /* D164: per-callsite scalar-context glob() iterator state */
     /* Stage 31: flat-double read cache: (outerNm\x01idxNm\x01elemIdx) → f64 Value*.
        Eliminates redundant loads like body[j][6] appearing 3× in the velocity-update
        block; invalidated only when the exact (outerNm, idxNm, elemIdx) is written. */
