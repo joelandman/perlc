@@ -802,6 +802,9 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_hostname",         pv);
     RT("perl_which",            pv, pv);
     RT("perl_where",            av, pv);
+    RT("perl_uri_escape",       pv, pv, pv);
+    RT("perl_uri_escape_utf8",  pv, pv, pv);
+    RT("perl_uri_unescape",     pv, pv);
     RT("perl_fpath_collect",    voidTy, av, pv);
     RT("perl_file_find",        pv, pv, av, i32);
     RT("perl_file_temp_template", pv, av, i32, i32);
@@ -13776,6 +13779,22 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *cnt = callRT("perl_array_len", {arr});
         callRT("perl_array_free", {arr});
         return cnt;
+    }
+    /* ── URI::Escape (native) ── no list-context difference; always
+       scalar-shaped (one string in, one string out). */
+    if (n.name == "uri_escape" || n.name == "URI::Escape::uri_escape") {
+        Value *txt  = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *patn = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_uri_escape", {txt, patn});
+    }
+    if (n.name == "uri_escape_utf8" || n.name == "URI::Escape::uri_escape_utf8") {
+        Value *txt  = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *patn = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_uri_escape_utf8", {txt, patn});
+    }
+    if (n.name == "uri_unescape" || n.name == "URI::Escape::uri_unescape") {
+        Value *txt = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_uri_unescape", {txt});
     }
     /* ── File::Spec / File::Spec::Functions / File::Spec::Unix ──
        Method calls (File::Spec->catfile) are intercepted in the MethodCall

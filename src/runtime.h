@@ -816,6 +816,9 @@ PerlValue *perl_realpath(PerlValue *pathPV);   /* Cwd::realpath (= abs_path)    
 PerlValue *perl_hostname(void);                /* Sys::Hostname::hostname       */
 PerlValue *perl_which(PerlValue *name);        /* File::Which::which  (scalar: first match/undef) */
 PerlArray *perl_where(PerlValue *name);        /* File::Which::where  (list: every match)         */
+PerlValue *perl_uri_escape(PerlValue *text, PerlValue *patn);      /* URI::Escape::uri_escape      */
+PerlValue *perl_uri_escape_utf8(PerlValue *text, PerlValue *patn); /* URI::Escape::uri_escape_utf8 */
+PerlValue *perl_uri_unescape(PerlValue *text);                    /* URI::Escape::uri_unescape    */
 
 /* File::Spec (Unix semantics, faithful to File::Spec::Unix 3.95's
    pure-text algorithms) */

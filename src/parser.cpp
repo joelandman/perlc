@@ -492,6 +492,21 @@ NodePtr Parser::parseBlock() {
 NodePtr Parser::parseStmt() {
     int line = cur().line;
 
+    /* A bare `;` is a legal null/empty statement in real Perl — most
+       commonly seen right after a block-ending statement
+       (`if (...) { ... };`, `while (...) { ... };`) where the `;` is
+       redundant but not an error, or just stray `;;;` runs. The
+       general expression-statement fallback below unconditionally
+       calls parseExpr(), which has no case for a leading `;` token and
+       fails with "unexpected token ';'". Swallow every run of bare
+       `;` here (an empty FlatBlock — no args — is already a no-op
+       elsewhere in this codegen) before any other dispatch runs. */
+    if (check(TK::SEMI)) {
+        while (check(TK::SEMI)) advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::FlatBlock; n->line = line;
+        return n;
+    }
+
     /* D125: `use MODULE` / `use PRAGMA` / `no PRAGMA` — previously only
        reachable from parseProgram()'s file-level statement loop, so a
        `use strict;` / `no warnings 'numeric';` inside any nested block or

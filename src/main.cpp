@@ -896,6 +896,15 @@ static std::vector<Token> inlineModules(
                         "GLOB_LIMIT","GLOB_MARK","GLOB_NOCASE","GLOB_NOCHECK",
                         "GLOB_NOMAGIC","GLOB_NOSORT","GLOB_NOSPACE",
                         "GLOB_QUOTE","GLOB_TILDE"}},
+                    /* real File::Glob's `:globally` isn't a normal
+                       %EXPORT_TAGS entry at all — it's a special pragma
+                       File::Glob's import() intercepts to make its
+                       bsd_glob override the CORE::glob() builtin
+                       process-wide. perlc's core glob() already matches
+                       bsd_glob's own corrected (D157) behavior, so this
+                       is a recognized no-op rather than a real export
+                       list. */
+                    {"globally", {}},
                 }},
             };
             std::vector<std::string> names = explicitImports;
@@ -1002,7 +1011,8 @@ static std::vector<Token> inlineModules(
             modName == "File::Find" || modName == "File::Temp" ||
             modName == "Text::Wrap" || modName == "Storable" ||
             modName == "JSON::PP" || modName == "JSON" ||
-            modName == "Cpanel::JSON::XS" || modName == "File::Which") {
+            modName == "Cpanel::JSON::XS" || modName == "File::Which" ||
+            modName == "URI::Escape") {
             /* File::Spec::Functions' real %EXPORT_TAGS defines
                ALL => [@EXPORT_OK, @EXPORT] — expand :ALL to that union.
                (Real File::Spec::Functions' %EXPORT_TAGS has only ALL.) */

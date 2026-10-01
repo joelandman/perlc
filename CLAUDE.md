@@ -18,8 +18,31 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-30, fresh real-script survey + D162 — 524/524 PASS,
-0 FAIL):** A randomized 100-script compile survey of real system Perl
+**Harness (2026-09-30, second real-script survey + D163 + URI::Escape —
+530/530 PASS, 0 FAIL):** A second randomized ~50-script compile survey
+found and fixed **D163**: a bare `;` immediately after a block-ending
+statement (`if (...) { ... };`, `while (...) { ... };`, or just a
+stray `;;;` run) was a hard parse error — `parseStmt()` had no
+dispatch case for a leading `;` token, so the expression-statement
+fallback choked on it. This is extremely common, idiomatic Perl (every
+`if (...) { return X };` is this shape) — found via a real
+`/usr/share/clang/scan-build-21/libexec/ccc-analyzer` compile. Fixed
+with a `parseStmt()` dispatch case that swallows a run of bare `;`
+tokens into a no-op `FlatBlock`, no AST growth. Also implemented
+`URI::Escape` as a native module (`uri_escape`/`uri_escape_utf8`/
+`uri_unescape`, default RFC3986 unreserved-set escaping, custom
+string character-class patterns, scoped out: `qr//`-object patterns,
+`uri_unescape`'s multi-arg list form, the `%escapes` hash export) —
+found via the same survey, verified against the real installed
+module. Also fixed a smaller gap found in the same pass: `File::Glob`
+didn't recognize the `:globally` import tag (a special pragma-style
+tag, not a real `%EXPORT_TAGS` entry in real Perl either — now a
+recognized no-op, since perlc's core `glob()` already matches
+`bsd_glob`'s corrected D157 behavior) — found via real `/usr/bin/
+helpztags`. Tests: `tests/empty_stmt_{smoke,deep}.pl`,
+`tests/uri_escape_{smoke,deep}.pl`.
+Previous session (2026-09-30, fresh real-script survey + D162 —
+524/524 PASS, 0 FAIL):** A randomized 100-script compile survey of real system Perl
 scripts found and fixed D162, a batch of defects: (1) a genuine
 **compiler bug** — `Text::ParseWords`'s scalar-context `shellwords`/
 `quotewords`/`parse_line` produced an invalid LLVM module (a boxed
@@ -524,7 +547,9 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D161 FIXED 2026-09-30**
+**Open generated-code defects:** none — **D163 FIXED 2026-09-30**
+(bare `;` after a block-ending statement was a hard parse error — see
+TESTS.md). **D161 FIXED 2026-09-30**
 (backtick `\$`/`\@` escaping, plus `qx(...)`/`qx{...}`/etc. not being
 implemented at all — see TESTS.md). D110/D120/D124 were fixed
 2026-09-13 (see TESTS.md). **D54** (tooling) **FIXED 2026-09-21**:
@@ -669,6 +694,7 @@ IO::Seekable/Pipe/Select/UNIX, SelectSaver, Fatal, open pragma (2026-09-23);
 File::Glob (`bsd_glob`, `GLOB_*` constants; 2026-09-30);
 File::Which (`which`/`where`; 2026-09-30);
 Cpanel::JSON::XS (aliases the native JSON::PP implementation — real Cpanel::JSON::XS isn't installed on this dev machine, so verified by cross-checking the identical script's output through the already-real-Perl-verified JSON::PP path instead; 2026-09-30);
+URI::Escape (`uri_escape`/`uri_escape_utf8`/`uri_unescape`; 2026-09-30);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`

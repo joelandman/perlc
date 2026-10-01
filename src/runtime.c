@@ -13192,6 +13192,149 @@ PerlArray *perl_where(PerlValue *namePV) {
     return arr;
 }
 
+/* ── URI::Escape ──
+ * uri_escape($text [, $patn]) / uri_escape_utf8($text [, $patn]) /
+ * uri_unescape($text). $patn, when given, is a plain string usable
+ * inside a `[...]` regex character class (e.g. "a-z", "^A-Za-z",
+ * "\x00-\x1f\x7f-\xff") — NOT a compiled Regexp object (the real
+ * module also accepts a qr// there; not supported here). Builds a
+ * 256-entry membership table from it. */
+static void uriClassReadEscaped(const char **pp, unsigned char *outc) {
+    const char *p = *pp;
+    if (*p == '\\' && p[1]) {
+        p++;
+        if (*p == 'x') {
+            p++;
+            char hex[3] = {0, 0, 0};
+            int hi = 0;
+            while (hi < 2 && isxdigit((unsigned char)*p)) hex[hi++] = *p++;
+            *outc = (unsigned char)strtol(hex, NULL, 16);
+        } else if (*p == 'n') { *outc = '\n'; p++; }
+        else if (*p == 't') { *outc = '\t'; p++; }
+        else if (*p == 'r') { *outc = '\r'; p++; }
+        else { *outc = (unsigned char)*p; p++; }
+    } else {
+        *outc = (unsigned char)*p;
+        p++;
+    }
+    *pp = p;
+}
+
+static void uriBuildClassTable(const char *patn, unsigned char table[256]) {
+    unsigned char members[256];
+    memset(members, 0, sizeof(members));
+    int negate = 0;
+    const char *p = patn;
+    if (*p == '^') { negate = 1; p++; }
+    while (*p) {
+        unsigned char c;
+        uriClassReadEscaped(&p, &c);
+        if (*p == '-' && p[1] != '\0') {
+            p++;
+            unsigned char c2;
+            uriClassReadEscaped(&p, &c2);
+            for (int x = c; x <= c2; x++) members[x] = 1;
+        } else {
+            members[c] = 1;
+        }
+    }
+    for (int i = 0; i < 256; i++)
+        table[i] = negate ? (unsigned char)!members[i] : members[i];
+}
+
+PerlValue *perl_uri_escape(PerlValue *textPV, PerlValue *patnPV) {
+    if (!textPV || textPV->tag == PERL_UNDEF) return perl_alloc_undef();
+    long long len;
+    char *text = perl_to_string_dup_len(textPV, &len);
+    unsigned char table[256];
+    int haveTable = 0;
+    if (patnPV && patnPV->tag != PERL_UNDEF) {
+        char *patn = perl_to_string_dup(patnPV);
+        uriBuildClassTable(patn, table);
+        free(patn);
+        haveTable = 1;
+    }
+    char *out = malloc((size_t)len * 3 + 1);
+    long long oi = 0;
+    static const char hexd[] = "0123456789ABCDEF";
+    for (long long i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)text[i];
+        int doEscape = haveTable ? table[c]
+                                  : !(isalnum(c) || c == '-' || c == '.' ||
+                                      c == '_' || c == '~');
+        if (doEscape) {
+            out[oi++] = '%';
+            out[oi++] = hexd[c >> 4];
+            out[oi++] = hexd[c & 0xF];
+        } else {
+            out[oi++] = (char)c;
+        }
+    }
+    out[oi] = '\0';
+    free(text);
+    PerlValue *r = perl_alloc_string_len(out, oi);
+    free(out);
+    return r;
+}
+
+PerlValue *perl_uri_escape_utf8(PerlValue *textPV, PerlValue *patnPV) {
+    if (!textPV || textPV->tag == PERL_UNDEF) return perl_alloc_undef();
+    long long len;
+    char *text = perl_to_string_dup_len(textPV, &len);
+    int alreadyUtf8 = (textPV->tag == PERL_STRING) &&
+                       (textPV->flags & PV_FLAG_UTF8);
+    char *encoded;
+    long long elen;
+    if (alreadyUtf8) {
+        encoded = text;
+        elen = len;
+    } else {
+        encoded = malloc((size_t)len * 2 + 1);
+        long long ei = 0;
+        for (long long i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)text[i];
+            if (c < 0x80) {
+                encoded[ei++] = (char)c;
+            } else {
+                encoded[ei++] = (char)(0xC0 | (c >> 6));
+                encoded[ei++] = (char)(0x80 | (c & 0x3F));
+            }
+        }
+        encoded[ei] = '\0';
+        elen = ei;
+    }
+    PerlValue *tmp = perl_alloc_string_len(encoded, elen);
+    if (encoded != text) free(encoded);
+    free(text);
+    PerlValue *r = perl_uri_escape(tmp, patnPV);
+    perl_free(tmp);
+    return r;
+}
+
+PerlValue *perl_uri_unescape(PerlValue *textPV) {
+    if (!textPV || textPV->tag == PERL_UNDEF) return perl_alloc_undef();
+    long long len;
+    char *text = perl_to_string_dup_len(textPV, &len);
+    char *out = malloc((size_t)len + 1);
+    long long oi = 0;
+    for (long long i = 0; i < len; i++) {
+        if (text[i] == '%' && i + 2 < len &&
+            isxdigit((unsigned char)text[i + 1]) &&
+            isxdigit((unsigned char)text[i + 2])) {
+            char hex[3] = {text[i + 1], text[i + 2], 0};
+            out[oi++] = (char)strtol(hex, NULL, 16);
+            i += 2;
+        } else {
+            out[oi++] = text[i];
+        }
+    }
+    out[oi] = '\0';
+    free(text);
+    PerlValue *r = perl_alloc_string_len(out, oi);
+    free(out);
+    return r;
+}
+
 /* ── Config (native module) ──
  * %Config / $Config::Config: special hash from the generated table in
  * src/config_data.h (tools/gen_config_data.pl, run once on the host perl;
