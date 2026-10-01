@@ -11,14 +11,48 @@ AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
                                       runtime.c
 ```
 
-## Current state (2026-09-30)
+## Current state (2026-10-01)
 
 Core language, OOP, regex (PCRE2 including `/x`), threads::shared, overload,
 Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-30, third real-script survey + D165/D166 —
+**Harness (2026-10-01, D167/D168 — 540/540 PASS, 0 FAIL):** A fourth
+real-script survey found and fixed two batches, both via a real
+`/usr/bin/json_pp` script. **D167**: a genuine **compiler crash** — a
+constant-string `eval "..."` whose inlined body hit a codegen-level
+compile-time error (here: a parenless bareword call to an unresolved
+name) threw a C++ exception while the eval's setjmp/longjmp LLVM basic
+blocks were mid-construction, escaping past the code that would
+normally terminate them — a hard "Basic Block ... does not have a
+terminator!" LLVM verify-error crash, not eval gracefully catching a
+compile error the way real Perl does. Fixed by catching the exception
+inside `case NK::EvalBlock` itself (where `resultAlloca`/`endBB` are
+in scope) and finishing the eval exactly like a caught runtime `die`
+would, with `$@` set to the error text. Found in the same investigation:
+perlc unconditionally treated ANY parenless bareword call to an
+unresolved name as a hard compile error, but real Perl only does that
+when the bareword has an argument (`foo "arg";`) — a bare,
+argument-less name (`foo;` alone) silently auto-quotes to a string
+instead when it never resolves to a sub; perlc doesn't track `use
+strict 'subs'` scoping anywhere, so it now always takes the
+more-permissive no-strict real-Perl behavior. **D168**: (1) a CODE
+reference was unconditionally FALSE in boolean context —
+`perl_is_true()`'s tag switch listed every other reference tag as
+always-true but omitted `PERL_CODE_REF` entirely; (2) a much more
+severe **use-after-free** found while verifying (1)'s fix let the
+script progress further — several native OO "chainable setter"
+methods (JSON::PP's `canonical`/`pretty`/etc., Math::BigInt's `bneg`)
+returned the literal `obj` pointer instead of a clone, so a
+void-context call (`$json->canonical;`, the common case for a
+chainable setter) had codegen free the exact PerlValue the caller's
+own live variable still pointed to — confirmed via `ref($json)`
+returning garbage memory immediately after. Fixed by returning
+`perl_clone(obj)` at all four such sites. Tests:
+`tests/eval_string_crash_{smoke,deep}.pl`,
+`tests/coderef_truthy_{smoke,deep}.pl`.
+Previous session (2026-09-30, third real-script survey + D165/D166 —
 536/536 PASS, 0 FAIL):** A third randomized ~54-script compile survey
 found and fixed two batches. **D165**: `POSIX`'s `:fcntl_h` import tag
 wasn't recognized (found via a real `dpkg-genbuildinfo` script,
@@ -604,7 +638,12 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D166 FIXED 2026-09-30**
+**Open generated-code defects:** none — **D168 FIXED 2026-10-01**
+(CODE-ref boolean-context truthiness, plus a use-after-free in
+several native OO chainable-setter methods — see TESTS.md). **D167
+FIXED 2026-10-01** (constant-string `eval` compile-error LLVM
+verify-crash, plus overly strict parenless-bareword handling — see
+TESTS.md). **D166 FIXED 2026-09-30**
 (`-t FILEHANDLE` not implemented at all, plus `do{}while/until COND`
 requiring a literal `(` — see TESTS.md). **D165 FIXED 2026-09-30**
 (POSIX `:fcntl_h` tag not recognized, plus `<< "EOT"` heredoc

@@ -2264,6 +2264,7 @@ int perl_is_true(const PerlValue *v) {
         case PERL_REF_SCALAR:
         case PERL_REF_ARRAY:
         case PERL_REF_HASH:
+        case PERL_CODE_REF:
         case PERL_FLAT_ARRAY:
         case PERL_FLOAT_PAIR:
         case PERL_CPLX_ROW:
@@ -6045,11 +6046,19 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
             return perl_bigint_ovl_str(obj);
         /* copy — return a clone */
         if (strcmp(method, "copy") == 0) return perl_clone(obj);
-        /* bneg — negate in place, return self */
+        /* bneg — negate in place, return self. D168: must be a CLONE,
+           not the literal `obj` pointer — a void-context statement
+           call (`$bigint->bneg;`, no assignment) has codegen free
+           whatever Value* this returns as an owned temporary; handing
+           back the exact same pointer the caller's own live `$bigint`
+           variable still holds made that free() a use-after-free on
+           the variable itself. perl_clone() hands back an
+           independently-freeable wrapper around the same underlying
+           mpz_t, exactly like the pre-existing `copy` method above. */
         if (strcmp(method, "bneg") == 0) {
             mpz_t *a = (mpz_t*)obj->pval;
             if (a) mpz_neg(*a, *a);
-            return obj;
+            return perl_clone(obj);
         }
     }
     if (obj && obj->tag == PERL_STRING && obj->sval && strcmp(obj->sval, "DBI") == 0) {
@@ -6186,6 +6195,20 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
             PerlValue *arg0 = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
             return perl_json_decode(arg0, obj);
         }
+        /* D168: every `return perl_clone(obj)` below (not `return obj`)
+           in this chainable-setter block is deliberate — found via a
+           real /usr/bin/json_pp script whose 'json' encoder sub calls
+           `$json->canonical if $json_opt{pretty};` as a bare,
+           void-context, result-discarded statement. Handing back the
+           literal `obj` pointer let codegen's generic "free an owned
+           temporary after a void-context call" logic free the very
+           PerlValue the caller's own live `$json` variable still
+           points to — an outright use-after-free (confirmed via
+           `ref($json)` returning garbage memory immediately after).
+           perl_clone() returns an independently-freeable wrapper
+           around the same underlying (refcounted) PerlHash, so the
+           chain keeps working (`$json->canonical->pretty->encode(...)`)
+           and a discarded, assigned, or chained call are all safe. */
         if (strcmp(method, "canonical") == 0 || strcmp(method, "pretty") == 0 ||
             strcmp(method, "indent") == 0 || strcmp(method, "utf8") == 0 ||
             strcmp(method, "ascii") == 0 || strcmp(method, "allow_nonref") == 0 ||
@@ -6199,7 +6222,7 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
                     perl_to_int(args->elems[0]) > 1) {
                     perl_hash_set_str(h, "indent", perl_alloc_int(perl_to_int(args->elems[0])));
                     perl_hash_set_str(h, "pretty", perl_alloc_int(1));
-                    return obj;
+                    return perl_clone(obj);
                 }
                 key = "pretty";
             }
@@ -6211,12 +6234,12 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
                     perl_hash_get_str_ref(h, "indent")->tag == PERL_UNDEF)
                     perl_hash_set_str(h, "indent", perl_alloc_int(3));
             }
-            return obj;
+            return perl_clone(obj);
         }
         if (strcmp(method, "filter_json_object") == 0) {
             PerlValue *cb = (args && args->len > 0) ? args->elems[0] : perl_alloc_undef();
             perl_hash_set_str(h, "filter_json_object", cb);
-            return obj;
+            return perl_clone(obj);
         }
     }
 

@@ -11229,14 +11229,46 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto savedIP = builder_.saveIP();
         evalReturnTargets_.push_back({resultAlloca, endBB});
         Value *bodyResult = perlUndef();
+        /* D167: some codegen paths (e.g. a parenless bareword call to an
+           unresolved name, matching real Perl's own compile-time "String
+           found where operator expected" error) throw a C++ exception to
+           signal a *compile-time-detected* error rather than returning a
+           Value* — this is how `eval "STRING"`'s own Lexer/Parser errors
+           are already caught just above this (the try/catch around
+           parseProgram()+emitExpr(ev) in the "eval" Call handler), but
+           that outer catch only expects the exception to fire *before*
+           any LLVM basic blocks here have been created/mutated. A
+           compile-time error detected *during* emitBlockLast (as in the
+           bareword-call case) instead escapes mid-construction — bodyBB
+           never gets its store+branch to endBB, leaving endBB without a
+           terminator (a hard LLVM verify-error crash, not a graceful
+           `eval` catching a compile error the way real Perl does). Catch
+           it HERE instead, where resultAlloca/endBB are in scope, and
+           finish this eval exactly like a caught runtime `die` would:
+           $@ gets the error text, the result is undef, and codegen
+           continues normally past this point. */
+        std::string evalCompileErrMsg;
+        bool hadCompileErr = false;
         if (n.body) {
-            bodyResult = emitBlockLast(*n.body);
+            try {
+                bodyResult = emitBlockLast(*n.body);
+            } catch (const std::exception &ex) {
+                hadCompileErr = true;
+                evalCompileErrMsg = ex.what();
+                bodyResult = perlUndef();
+            }
         }
         evalReturnTargets_.pop_back();
         /* save insert point after emitBlockLast (may be on nested eval's block) */
         auto *afterBodyBB = builder_.GetInsertBlock();
-        /* restore insert point — emitBlockLast may have moved it */
-        builder_.restoreIP(savedIP);
+        /* restore insert point — emitBlockLast may have moved it. D167:
+           NOT when a compile-time error was caught above — the current
+           block (wherever the throw left us, possibly after some earlier
+           statements in a multi-statement body already emitted fine) is
+           exactly the block that needs the error-path store+branch below;
+           resetting to the pre-body savedIP would discard/skip whatever
+           those earlier statements correctly emitted. */
+        if (!hadCompileErr) builder_.restoreIP(savedIP);
         /* store result so endBB can load it (survives longjmp via saved frame) */
         /* only emit if bodyBB doesn't already have a terminator (e.g., from die/return) */
         if (!builder_.GetInsertBlock()->getTerminator()) {
@@ -11248,8 +11280,12 @@ Value *CodeGen::emitExpr(const Node &n) {
                *before* the body executed, which (now that $@ is a real
                assignment target, see D52's other fix) let an in-block
                assignment wrongly "stick" instead of being clobbered by
-               eval's own success-clear, diverging from real Perl. */
-            callRT("perl_assign", {callRT("perl_get_dollar_at", {}), perlStr("")});
+               eval's own success-clear, diverging from real Perl.
+               D167: a caught compile-time error (see above) sets $@ to
+               the actual error message instead, matching real Perl's
+               `eval "syntax error"` behavior. */
+            callRT("perl_assign", {callRT("perl_get_dollar_at", {}),
+                                    hadCompileErr ? perlStr(evalCompileErrMsg) : perlStr("")});
             builder_.CreateStore(bodyResult, resultAlloca);
             builder_.CreateBr(endBB);
         }
@@ -14749,10 +14785,36 @@ Value *CodeGen::emitCall(const Node &n) {
         callRT("perl_array_free", {argsArr});
         return retVal;
     }
-    /* D36 residual: bareword call `foo "arg"` to an unknown name is a
-       compile error in real Perl ("String found where operator expected
-       / Do you need to predeclare"). Parenthesized `foo()` is deferred to
-       runtime, matching real Perl — see D113 below. */
+    /* D36 residual: bareword call `foo "arg"` (an unparenthesized name
+       WITH an argument) to an unknown name is a compile error in real
+       Perl ("String found where operator expected / Do you need to
+       predeclare") regardless of `use strict` — verified: real Perl
+       aborts compilation for this shape even with no `use strict` at
+       all. Parenthesized `foo()` is deferred to runtime, matching real
+       Perl — see D113 below.
+       D167: a BARE, ARGUMENT-LESS unparenthesized name (`foo;` alone,
+       not `foo "arg";`) is NOT a compile error in real Perl when it
+       never resolves to a sub — it silently auto-quotes to the string
+       "foo" instead (verified: `my $x = bar; print "$x\n";` with no
+       `use strict` prints "bar", no error, no warning). perlc doesn't
+       track `use strict 'subs'` scoping at all (nothing in this
+       codebase does), so this always takes the more-permissive,
+       no-strict real-Perl behavior — matching this codebase's existing
+       general non-enforcement of strict pragmas elsewhere. Found via a
+       real /usr/bin/json_pp script's `eval "...no strict;...$_"` whose
+       inlined body could contain a bare, non-strict, argument-less
+       bareword this way.
+       Guarded by `!inBareFhProbe_`: emitBareFhPrintProbe()
+       (D153/D155, just below in this file) deliberately relies on
+       THIS SAME throw as its signal that `print WORD;`'s WORD isn't a
+       real sub, to fall back to treating WORD as a bareword
+       filehandle — inside that probe, the pre-D167 throwing behavior
+       must stay exactly as it was, or `print NOPE;` starts printing
+       the literal string "NOPE" instead of probing it as a (silently
+       unopened) filehandle. */
+    if (n.ival == 1 && n.args.empty() && !inBareFhProbe_) {
+        return perlStr(n.name);
+    }
     if (n.ival == 1) {
         throw std::runtime_error(
             "String found where operator expected (Do you need to predeclare \"" +
