@@ -143,7 +143,7 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "HTTP::Tiny","version","autodie",
         "Term::ReadLine","CGI","MIME::QuotedPrint","Digest","Text::Tabs",
         "FileHandle","IO::Seekable","IO::Pipe","IO::Select","IO::Socket::UNIX",
-        "SelectSaver","Fatal","open",
+        "SelectSaver","Fatal","open","Test::More",
     };
 
     std::set<std::string> modulesToInstall;
@@ -413,7 +413,7 @@ static std::vector<Token> inlineModules(
         "HTTP::Tiny","version","autodie",
         "Term::ReadLine","CGI","MIME::QuotedPrint","Digest","Text::Tabs",
         "FileHandle","IO::Seekable","IO::Pipe","IO::Select","IO::Socket::UNIX",
-        "SelectSaver","Fatal","open",
+        "SelectSaver","Fatal","open","Test::More",
     };
 
     std::vector<Token> modTokens;   /* tokens from all inlined modules */
@@ -696,6 +696,45 @@ static std::vector<Token> inlineModules(
                 if (valIdx < defEnd) {
                     auto vtoks = extractValueTokens(valIdx, defEnd);
                     emitConstSub(cname, vtoks);
+                }
+            }
+            continue;
+        }
+
+        /* ── Test::More (native) ── every assertion/diag name below is
+           default-exported unconditionally (real Test::More ignores any
+           import list for these — confirmed against the real installed
+           module). `use Test::More tests => N;` additionally needs its
+           plan count at BEGIN time (real Perl prints "1..N" immediately,
+           before any other statement runs) — scan the raw tokens for a
+           `tests => VALUE` pair and inject a synthetic
+           `Test::More::__set_plan(VALUE);` call via constToks, which
+           gets spliced in ahead of the whole program, matching that
+           BEGIN-time ordering. */
+        if (modName == "Test::More") {
+            static const char *tmNames[] = {
+                "ok","is","isnt","like","unlike","cmp_ok","pass","fail",
+                "diag","note","done_testing","subtest", nullptr
+            };
+            for (int ti = 0; tmNames[ti]; ti++)
+                importMap[tmNames[ti]] = std::string("Test::More::") + tmNames[ti];
+
+            size_t mnIdx = useEnd;
+            while (mnIdx > 0 && tokens[mnIdx].text != modName) mnIdx--;
+            size_t afterMod = mnIdx + 1;
+            for (size_t p = afterMod; p < useEnd; p++) {
+                if (tokens[p].kind == TK::IDENT && tokens[p].text == "tests" &&
+                    p + 1 < useEnd &&
+                    (tokens[p+1].kind == TK::FATARROW || tokens[p+1].kind == TK::COMMA)) {
+                    size_t vStart = p + 2;
+                    if (vStart < useEnd) {
+                        constToks.push_back({TK::IDENT,  "Test::More::__set_plan", 0});
+                        constToks.push_back({TK::LPAREN, "(", 0});
+                        for (size_t q = vStart; q < useEnd; q++) constToks.push_back(tokens[q]);
+                        constToks.push_back({TK::RPAREN, ")", 0});
+                        constToks.push_back({TK::SEMI,   ";", 0});
+                    }
+                    break;
                 }
             }
             continue;

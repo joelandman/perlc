@@ -696,6 +696,30 @@ NodePtr Parser::parseStmt() {
             n->right = parseExpr();
             inKeyContext_ = false;
             consume(TK::RBRACE, "}");
+        } else if (check(TK::ARROW)) {
+            /* D169: `local $ref->{key} = val;` / `local $ref->[idx] = val;`
+               — found via a real perl_dbi_nulls_test.pl script's common
+               DBI idiom `local $dbh->{PrintError}=0;`. Single level only
+               (the base is the scalar variable just consumed, held in
+               n->cond as a ScalarVar expr) — matches the real-world shape;
+               a deeper chain (`local $self->{a}{b}`) is not handled. */
+            advance(); /* -> */
+            auto base = makeScalar(varName, line);
+            if (check(TK::LBRACKET)) {
+                advance();
+                n->sval = "array_elem_deref";
+                n->cond = std::move(base);
+                n->right = parseExpr();
+                consume(TK::RBRACKET, "]");
+            } else if (check(TK::LBRACE)) {
+                advance();
+                n->sval = "hash_elem_deref";
+                n->cond = std::move(base);
+                inKeyContext_ = true;
+                n->right = parseExpr();
+                inKeyContext_ = false;
+                consume(TK::RBRACE, "}");
+            }
         }
         if (match(TK::ASSIGN))
             n->left = parseLowNot();

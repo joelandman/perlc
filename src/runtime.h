@@ -828,6 +828,21 @@ PerlValue *perl_uri_escape(PerlValue *text, PerlValue *patn);      /* URI::Escap
 PerlValue *perl_uri_escape_utf8(PerlValue *text, PerlValue *patn); /* URI::Escape::uri_escape_utf8 */
 PerlValue *perl_uri_unescape(PerlValue *text);                    /* URI::Escape::uri_unescape    */
 
+/* ── Test::More (native) ───────────────────────────────────────────────── */
+void       perl_tm_set_plan(long long n, const char *file, int line);     /* `use Test::More tests => N;` */
+PerlValue *perl_tm_ok(PerlValue *cond, PerlValue *name, const char *file, int line);
+PerlValue *perl_tm_is(PerlValue *got, PerlValue *expected, PerlValue *name, const char *file, int line);
+PerlValue *perl_tm_isnt(PerlValue *got, PerlValue *expected, PerlValue *name, const char *file, int line);
+PerlValue *perl_tm_like(PerlValue *str, PerlValue *pat, PerlValue *name, const char *file, int line);
+PerlValue *perl_tm_unlike(PerlValue *str, PerlValue *pat, PerlValue *name, const char *file, int line);
+PerlValue *perl_tm_cmp_ok(PerlValue *got, PerlValue *op, PerlValue *expected, PerlValue *name, const char *file, int line);
+PerlValue *perl_tm_pass(PerlValue *name, const char *file, int line);
+PerlValue *perl_tm_fail(PerlValue *name, const char *file, int line);
+void       perl_tm_diag(PerlArray *args);
+void       perl_tm_note(PerlArray *args);
+void       perl_tm_done_testing(PerlValue *countArg, const char *file, int line);
+PerlValue *perl_tm_subtest(PerlValue *namePV, PerlValue *coderef, const char *file, int line);
+
 /* File::Spec (Unix semantics, faithful to File::Spec::Unix 3.95's
    pure-text algorithms) */
 PerlValue *perl_fspec_canonpath(PerlValue *pathPV);

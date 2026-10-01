@@ -18,7 +18,53 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-01, D167/D168 — 540/540 PASS, 0 FAIL):** A fourth
+**Harness (2026-10-01, D169 + native Test::More — 545/545 PASS,
+0 FAIL):** Same fifth real-script survey. Implemented `Test::More`
+as a native module — the single most commonly used Perl testing/TAP
+framework (found missing via
+`/usr/share/doc/libdbi-perl/examples/unicode_test.pl`'s `use
+Test::More;`). `ok`/`is`/`isnt`/`like`/`unlike`/`cmp_ok` (all 10
+required operators)/`pass`/`fail`/`diag`/`note`/`done_testing`/
+`subtest`, with real-Perl-exact TAP output (`ok N - name`/`not ok N -
+name`, the `is`/`cmp_ok` got/expected diagnostic formats, `diag` to
+stderr vs `note` to stdout with no-separator multi-arg joining and
+per-physical-line `# ` prefixing), both the upfront-plan (`use
+Test::More tests => N;`, injected as a synthetic BEGIN-time call so
+`1..N` prints immediately like real Perl) and deferred-plan
+(`done_testing()`) forms, the real exit-code formula
+(`min(failed,254)`, or 255 on a plan/actual-count mismatch), and
+`subtest`'s nested `# Subtest: NAME` header + 4-space-indented inner
+TAP + single outer `ok`/`not ok` line. Scoped out: `Test::More::UTF8`,
+`Test::Exception`, `BAIL_OUT`, `can_ok`/`isa_ok`/`new_ok`,
+`TODO`/`SKIP`/`$TODO`, `use_ok`/`require_ok`, `cmp_deeply`, and one
+narrow, verified divergence — a FAILING multi-line `subtest`'s outer
+diagnostic reports the call site's line, not (as real Perl does) the
+closure's last-executed line; doesn't affect pass/fail, TAP numbering,
+or indentation. Tests: `tests/test_more_{smoke,deep,plan}.pl` (these
+match the repo's `test_*.pl` `.gitignore` rule and need `git add -f`,
+same as the pre-existing `tests/test_do_filename.pl`/
+`tests/test_require_simple.pl`).
+Previous session (2026-10-01, D169 — 542/542 PASS, 0 FAIL):** A fifth
+real-script survey found and fixed `local $ref->{key} = val;` /
+`local $ref->[idx] = val;` (localizing a hash/array element reached
+through a scalar reference, single level only) being a hard
+"unexpected token '->'" parse error — the pre-existing `local
+$h{key}`/`local $arr[idx]` forms only ever handled a NAMED hash/array
+by that exact identifier, with no path for a `->` after the base
+scalar variable. Found via a real
+`/usr/share/doc/libdbi-perl/examples/perl_dbi_nulls_test.pl` script's
+common DBI idiom `local $dbh->{PrintError}=0;` (temporarily
+suppressing DBI error reporting for the duration of a block/sub).
+Fixed with a new parser branch (`src/parser.cpp`) producing two new
+`NK::LocalStmt` `sval` markers (`hash_elem_deref`/`array_elem_deref`,
+storing the base ref expression in the otherwise-unused `n.cond`
+field) and matching `src/codegen.cpp` branches that dereference it
+(`perl_deref_hash`/`perl_deref_array`) instead of looking up a named
+container — everything downstream (the actual
+save/restore/assign-on-scope-exit machinery) is unchanged and shared
+with the existing named-hash/array forms. Tests:
+`tests/local_ref_elem_{smoke,deep}.pl`.
+Previous session (2026-10-01, D167/D168 — 540/540 PASS, 0 FAIL):** A fourth
 real-script survey found and fixed two batches, both via a real
 `/usr/bin/json_pp` script. **D167**: a genuine **compiler crash** — a
 constant-string `eval "..."` whose inlined body hit a codegen-level
@@ -638,7 +684,9 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D168 FIXED 2026-10-01**
+**Open generated-code defects:** none — **D169 FIXED 2026-10-01**
+(`local $ref->{key}`/`local $ref->[idx]` was a hard parse error — see
+TESTS.md). **D168 FIXED 2026-10-01**
 (CODE-ref boolean-context truthiness, plus a use-after-free in
 several native OO chainable-setter methods — see TESTS.md). **D167
 FIXED 2026-10-01** (constant-string `eval` compile-error LLVM
@@ -798,6 +846,7 @@ File::Glob (`bsd_glob`, `GLOB_*` constants; 2026-09-30);
 File::Which (`which`/`where`; 2026-09-30);
 Cpanel::JSON::XS (aliases the native JSON::PP implementation — real Cpanel::JSON::XS isn't installed on this dev machine, so verified by cross-checking the identical script's output through the already-real-Perl-verified JSON::PP path instead; 2026-09-30);
 URI::Escape (`uri_escape`/`uri_escape_utf8`/`uri_unescape`; 2026-09-30);
+Test::More (`ok`/`is`/`isnt`/`like`/`unlike`/`cmp_ok`/`pass`/`fail`/`diag`/`note`/`done_testing`/`subtest`; 2026-10-01);
 `syscall`; **process/IPC:** `fork` `wait` `waitpid` `kill` `exec` `exit`
 `pipe` `getppid` `getpgrp` `setpgrp` `setsid` `umask` `getuid` `getgid`
 `geteuid` `getegid`; **sockets:** `socket` `bind` `listen` `accept` `connect`

@@ -18550,3 +18550,517 @@ PerlValue *perl_bigint_ovl_neg(PerlValue *self) {
     mpz_clear(r);
     return v;
 }
+
+/* ── Test::More (native) ──────────────────────────────────────────────────
+ * Real behavior verified against the installed Test::More/Test::Builder
+ * (/home/joe/local/lib/perl5/5.42.0/Test/Builder.pm), not guessed — exact
+ * diagnostic spacing/wording, stdout-vs-stderr split, plan handling, and
+ * the exit-code formula were all probed with real `perl` scripts. Scope:
+ * ok/is/isnt/like/unlike/cmp_ok/pass/fail/diag/note/done_testing/subtest.
+ * Deliberately out of scope (see CLAUDE.md task + TESTS.md write-up):
+ * Test::More::UTF8, Test::Exception, BAIL_OUT, can_ok/isa_ok/new_ok,
+ * TODO/SKIP blocks, $TODO, use_ok/require_ok, cmp_deeply, Dumper-style
+ * deep diff of complex structures, and `plan(tests => 0)`'s real
+ * compile-time die (treated as plain `plan(0)` here — a rare edge case).
+ *
+ * Process-lifetime TAP state, depth-aware so `subtest` can nest (its own
+ * frame is pushed/popped on a small stack; nothing here needs real
+ * threads, so no locking). The outermost scope's "ending" (deferred plan
+ * line / failure summary / process exit code) runs from a single atexit
+ * hook registered on first use; it calls _exit() (not exit()) to avoid
+ * re-entering atexit processing, after flushing stdout/stderr itself. */
+
+static int tm_registered     = 0;
+static int tm_count          = 0;   /* assertions run so far, current (sub)test scope */
+static int tm_failed         = 0;
+static long tm_plan          = -1;  /* -1 = no plan yet in this scope */
+static int tm_plan_printed   = 0;   /* "1..N" already written for this scope? */
+static int tm_done_testing_called = 0;
+static char *tm_done_testing_loc  = NULL; /* "FILE line N" of the first done_testing() call, for the double-call diag */
+static int tm_ended           = 0;  /* top-level ending already ran */
+static int tm_depth           = 0;  /* subtest nesting depth, for 4-space indent */
+
+typedef struct {
+    int count, failed;
+    long plan;
+    int plan_printed, done_testing_called;
+    char *done_testing_loc;
+} TMFrame;
+static TMFrame tm_stack[64];
+static int tm_stack_n = 0;
+
+static void tm_indent(FILE *f) {
+    for (int i = 0; i < tm_depth; i++) fputs("    ", f);
+}
+
+/* A plain TAP line (ok/not ok/1..N/# Subtest: NAME) — indented, no extra
+   "# " prefix beyond whatever literal text is passed in, flushed
+   immediately so stdout/stderr interleave in real call order even when
+   both are redirected to the same file (matching real Test::Builder,
+   which sets autoflush on both of its output filehandles). */
+static void tm_tap_line(FILE *f, const char *text) {
+    tm_indent(f);
+    fputs(text, f);
+    fputc('\n', f);
+    fflush(f);
+}
+
+/* diag()/note()-style output: prefixes every physical line of `text`
+ * with "# " (after this scope's indent), normalizing exactly one
+ * trailing newline away first — matches Test::Builder's `s/^/# /mg`
+ * applied to the whole composed message. */
+static void tm_diag_raw(FILE *f, const char *text) {
+    size_t len = strlen(text);
+    char *buf = (char *)malloc(len + 1);
+    memcpy(buf, text, len + 1);
+    if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = 0;
+    char *line = buf;
+    while (1) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        tm_indent(f);
+        fputs("# ", f);
+        fputs(line, f);
+        fputc('\n', f);
+        if (!nl) break;
+        line = nl + 1;
+    }
+    fflush(f);
+    free(buf);
+}
+
+/* "'text'" or "undef" — is()/isnt()/cmp_ok(eq|ne)'s always-quoted display. */
+static char *tm_disp_quoted(PerlValue *v) {
+    if (!perl_defined(v)) return strdup("undef");
+    char *s = perl_to_string_dup(v);
+    size_t n = strlen(s);
+    char *q = (char *)malloc(n + 3);
+    q[0] = '\'';
+    memcpy(q + 1, s, n);
+    q[n + 1] = '\'';
+    q[n + 2] = 0;
+    free(s);
+    return q;
+}
+
+/* raw stringified value or "undef" — cmp_ok(==|!=)'s unquoted display. */
+static char *tm_disp_plain(PerlValue *v) {
+    if (!perl_defined(v)) return strdup("undef");
+    return perl_to_string_dup(v);
+}
+
+/* NULL if undef (name omitted); otherwise a strdup'd stringified name. */
+static char *tm_name_str(PerlValue *name) {
+    if (!perl_defined(name)) return NULL;
+    return perl_to_string_dup(name);
+}
+
+static int tm_record(int passed) {
+    tm_count++;
+    if (!passed) tm_failed++;
+    return tm_count;
+}
+
+static void tm_emit_result(int passed, const char *name) {
+    char line[2048];
+    int num = tm_record(passed);
+    if (name && *name)
+        snprintf(line, sizeof line, "%s %d - %s", passed ? "ok" : "not ok", num, name);
+    else
+        snprintf(line, sizeof line, "%s %d", passed ? "ok" : "not ok", num);
+    tm_tap_line(stdout, line);
+}
+
+/* "  Failed test 'NAME'\n  at FILE line N."  /  "  Failed test at FILE line N."
+   (real Test::Builder's _ok_debug — the leading 2 raw spaces plus diag's
+   own "# " give the observed 3-space "#   Failed test ..." indent). */
+static void tm_failed_header(const char *name, const char *file, int line) {
+    char buf[2048];
+    if (name && *name)
+        snprintf(buf, sizeof buf, "  Failed test '%s'\n  at %s line %d.", name, file, line);
+    else
+        snprintf(buf, sizeof buf, "  Failed test at %s line %d.", file, line);
+    tm_diag_raw(stderr, buf);
+}
+
+/* The top-level (depth 0) ending: deferred plan line already printed by
+   done_testing() if it ran; this only prints the mismatch/failure summary
+   diagnostics and sets the final process exit code — formula verified
+   against real Test::Builder::_ending. */
+static void perl_tm_ending(void) {
+    if (tm_ended) return;
+    tm_ended = 1;
+    fflush(stdout);
+    fflush(stderr);
+
+    if (tm_plan < 0) {
+        if (tm_count == 0) return; /* nothing declared, nothing run: silent, exit 0 */
+        if (!tm_done_testing_called) {
+            tm_diag_raw(stderr, "Tests were run but no plan was declared and done_testing() was not seen.");
+            int code = tm_failed > 0 ? (tm_failed <= 254 ? tm_failed : 254) : 254;
+            _exit(code);
+        }
+        return; /* done_testing() with no upfront plan already finalized tm_plan */
+    }
+
+    if (tm_count == 0) {
+        /* real Test::Builder's _ending bails out before printing anything
+           when plan/count/failed are all "falsy" (plan == 0 included) —
+           verified: `done_testing(0)`/`tests => 0` with zero assertions
+           exits 255 silently, but a nonzero plan with zero assertions
+           prints "No tests run!" first. */
+        if (tm_plan != 0) tm_diag_raw(stderr, "No tests run!");
+        _exit(255);
+    }
+
+    long extra = tm_count - tm_plan;
+    if (extra != 0) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "Looks like you planned %ld test%s but ran %d.",
+                 tm_plan, tm_plan == 1 ? "" : "s", tm_count);
+        tm_diag_raw(stderr, buf);
+    }
+    if (tm_failed) {
+        char buf[256];
+        const char *qual = extra == 0 ? "" : " run";
+        snprintf(buf, sizeof buf, "Looks like you failed %d test%s of %d%s.",
+                 tm_failed, tm_failed == 1 ? "" : "s", tm_count, qual);
+        tm_diag_raw(stderr, buf);
+    }
+
+    int code = 0;
+    if (tm_failed) code = tm_failed <= 254 ? tm_failed : 254;
+    else if (extra != 0) code = 255;
+    if (code != 0) _exit(code);
+}
+
+static void tm_ensure_registered(void) {
+    if (!tm_registered) { tm_registered = 1; atexit(perl_tm_ending); }
+}
+
+/* `use Test::More tests => N;` — plan declared immediately (synthesized
+   call injected by main.cpp's inlineModules() right where the `use`
+   statement was, so it runs first thing, matching real Perl's BEGIN-time
+   plan()). */
+void perl_tm_set_plan(long long n, const char *file, int line) {
+    (void)file; (void)line;
+    tm_ensure_registered();
+    tm_plan = n;
+    char buf[64];
+    snprintf(buf, sizeof buf, "1..%lld", (long long)n);
+    tm_tap_line(stdout, buf);
+    tm_plan_printed = 1;
+}
+
+PerlValue *perl_tm_ok(PerlValue *cond, PerlValue *name, const char *file, int line) {
+    tm_ensure_registered();
+    int passed = perl_is_true(cond);
+    char *nm = tm_name_str(name);
+    tm_emit_result(passed, nm ? nm : "");
+    if (!passed) tm_failed_header(nm, file, line);
+    free(nm);
+    return perl_alloc_bool(passed);
+}
+
+PerlValue *perl_tm_is(PerlValue *got, PerlValue *expected, PerlValue *name, const char *file, int line) {
+    tm_ensure_registered();
+    int gotDef = perl_defined(got), expDef = perl_defined(expected);
+    int passed;
+    if (!gotDef || !expDef) {
+        passed = !gotDef && !expDef;
+    } else {
+        char *g = perl_to_string_dup(got), *e = perl_to_string_dup(expected);
+        passed = strcmp(g, e) == 0;
+        free(g); free(e);
+    }
+    char *nm = tm_name_str(name);
+    tm_emit_result(passed, nm ? nm : "");
+    if (!passed) {
+        tm_failed_header(nm, file, line);
+        char *g = tm_disp_quoted(got), *e = tm_disp_quoted(expected);
+        char buf[4096];
+        snprintf(buf, sizeof buf, "%9sgot: %s\n%4sexpected: %s", "", g, "", e);
+        tm_diag_raw(stderr, buf);
+        free(g); free(e);
+    }
+    free(nm);
+    return perl_alloc_bool(passed);
+}
+
+PerlValue *perl_tm_isnt(PerlValue *got, PerlValue *expected, PerlValue *name, const char *file, int line) {
+    tm_ensure_registered();
+    int gotDef = perl_defined(got), expDef = perl_defined(expected);
+    int passed;
+    if (!gotDef || !expDef) {
+        passed = !(!gotDef && !expDef); /* undef only "matches" undef; isnt wants NOT that */
+    } else {
+        char *g = perl_to_string_dup(got), *e = perl_to_string_dup(expected);
+        passed = strcmp(g, e) != 0;
+        free(g); free(e);
+    }
+    char *nm = tm_name_str(name);
+    tm_emit_result(passed, nm ? nm : "");
+    if (!passed) {
+        tm_failed_header(nm, file, line);
+        char *g = tm_disp_quoted(got);
+        char buf[4096];
+        snprintf(buf, sizeof buf, "%9sgot: %s\n%4sexpected: anything else", "", g, "");
+        tm_diag_raw(stderr, buf);
+        free(g);
+    }
+    free(nm);
+    return perl_alloc_bool(passed);
+}
+
+PerlValue *perl_tm_like(PerlValue *str, PerlValue *pat, PerlValue *name, const char *file, int line) {
+    tm_ensure_registered();
+    int matched = perl_regex_match_sv_bool(str, pat, 0);
+    char *nm = tm_name_str(name);
+    tm_emit_result(matched, nm ? nm : "");
+    if (!matched) {
+        tm_failed_header(nm, file, line);
+        char *thing = tm_disp_quoted(str);
+        char *patstr = perl_to_string_dup(pat);
+        char buf[4096];
+        snprintf(buf, sizeof buf, "%18s%s\n    %13s '%s'", "", thing, "doesn't match", patstr);
+        tm_diag_raw(stderr, buf);
+        free(thing); free(patstr);
+    }
+    free(nm);
+    return perl_alloc_bool(matched);
+}
+
+PerlValue *perl_tm_unlike(PerlValue *str, PerlValue *pat, PerlValue *name, const char *file, int line) {
+    tm_ensure_registered();
+    int matched = perl_regex_match_sv_bool(str, pat, 0);
+    int passed = !matched;
+    char *nm = tm_name_str(name);
+    tm_emit_result(passed, nm ? nm : "");
+    if (!passed) {
+        tm_failed_header(nm, file, line);
+        char *thing = tm_disp_quoted(str);
+        char *patstr = perl_to_string_dup(pat);
+        char buf[4096];
+        snprintf(buf, sizeof buf, "%18s%s\n    %13s '%s'", "", thing, "matches", patstr);
+        tm_diag_raw(stderr, buf);
+        free(thing); free(patstr);
+    }
+    free(nm);
+    return perl_alloc_bool(passed);
+}
+
+PerlValue *perl_tm_cmp_ok(PerlValue *got, PerlValue *opv, PerlValue *expected, PerlValue *name, const char *file, int line) {
+    tm_ensure_registered();
+    char *op = perl_to_string_dup(opv);
+    int isEq = !strcmp(op, "==") || !strcmp(op, "eq");
+    int isNe = !strcmp(op, "!=") || !strcmp(op, "ne");
+    int isNum = !strcmp(op, "==") || !strcmp(op, "!=") || !strcmp(op, "<") ||
+                !strcmp(op, ">") || !strcmp(op, "<=") || !strcmp(op, ">=");
+    int passed = 0;
+    if (isNum) {
+        double a = perl_to_float(got), b = perl_to_float(expected);
+        if (!strcmp(op, "==")) passed = a == b;
+        else if (!strcmp(op, "!=")) passed = a != b;
+        else if (!strcmp(op, "<")) passed = a < b;
+        else if (!strcmp(op, ">")) passed = a > b;
+        else if (!strcmp(op, "<=")) passed = a <= b;
+        else if (!strcmp(op, ">=")) passed = a >= b;
+    } else {
+        char *a = perl_to_string_dup(got), *b = perl_to_string_dup(expected);
+        int c = strcmp(a, b);
+        if (!strcmp(op, "eq")) passed = c == 0;
+        else if (!strcmp(op, "ne")) passed = c != 0;
+        else if (!strcmp(op, "lt")) passed = c < 0;
+        else if (!strcmp(op, "gt")) passed = c > 0;
+        free(a); free(b);
+    }
+    char *nm = tm_name_str(name);
+    tm_emit_result(passed, nm ? nm : "");
+    if (!passed) {
+        tm_failed_header(nm, file, line);
+        char buf[4096];
+        if (isEq) {
+            char *g = !strcmp(op, "eq") ? tm_disp_quoted(got) : tm_disp_plain(got);
+            char *e = !strcmp(op, "eq") ? tm_disp_quoted(expected) : tm_disp_plain(expected);
+            snprintf(buf, sizeof buf, "%9sgot: %s\n%4sexpected: %s", "", g, "", e);
+            tm_diag_raw(stderr, buf);
+            free(g); free(e);
+        } else if (isNe) {
+            char *g = !strcmp(op, "ne") ? tm_disp_quoted(got) : tm_disp_plain(got);
+            snprintf(buf, sizeof buf, "%9sgot: %s\n%4sexpected: anything else", "", g, "");
+            tm_diag_raw(stderr, buf);
+            free(g);
+        } else {
+            char *g = tm_disp_quoted(got), *e = tm_disp_quoted(expected);
+            snprintf(buf, sizeof buf, "%4s%s\n%8s%s\n%4s%s", "", g, "", op, "", e);
+            tm_diag_raw(stderr, buf);
+            free(g); free(e);
+        }
+    }
+    free(op);
+    free(nm);
+    return perl_alloc_bool(passed);
+}
+
+PerlValue *perl_tm_pass(PerlValue *name, const char *file, int line) {
+    (void)file; (void)line;
+    tm_ensure_registered();
+    char *nm = tm_name_str(name);
+    tm_emit_result(1, nm ? nm : "");
+    free(nm);
+    return perl_alloc_bool(1);
+}
+
+PerlValue *perl_tm_fail(PerlValue *name, const char *file, int line) {
+    tm_ensure_registered();
+    char *nm = tm_name_str(name);
+    tm_emit_result(0, nm ? nm : "");
+    tm_failed_header(nm, file, line);
+    free(nm);
+    return perl_alloc_bool(0);
+}
+
+/* join('', @msgs) — real Test::Builder::diag/note join with no separator,
+   not space, confirmed against real Perl. */
+static char *tm_join_args(PerlArray *args) {
+    long long n = perl_array_len_i64(args);
+    size_t cap = 64, len = 0;
+    char *buf = (char *)malloc(cap);
+    buf[0] = 0;
+    for (long long i = 0; i < n; i++) {
+        PerlValue *el = perl_array_get(args, i);
+        char *s = perl_defined(el) ? perl_to_string_dup(el) : strdup("undef");
+        size_t sl = strlen(s);
+        if (len + sl + 1 > cap) {
+            while (len + sl + 1 > cap) cap *= 2;
+            buf = (char *)realloc(buf, cap);
+        }
+        memcpy(buf + len, s, sl + 1);
+        len += sl;
+        free(s);
+    }
+    return buf;
+}
+
+void perl_tm_diag(PerlArray *args) {
+    tm_ensure_registered();
+    if (perl_array_len_i64(args) == 0) return;
+    char *buf = tm_join_args(args);
+    tm_diag_raw(stderr, buf);
+    free(buf);
+}
+
+void perl_tm_note(PerlArray *args) {
+    tm_ensure_registered();
+    if (perl_array_len_i64(args) == 0) return;
+    char *buf = tm_join_args(args);
+    tm_diag_raw(stdout, buf);
+    free(buf);
+}
+
+/* done_testing() / done_testing($n) — deferred plan (prints "1..N"
+   immediately if no upfront plan existed yet) or validates an existing
+   upfront plan's count; see the real Test::Builder::done_testing source
+   (`/home/joe/local/lib/perl5/5.42.0/Test/Builder.pm`) and this task's
+   write-up for the exact cases this reproduces. */
+void perl_tm_done_testing(PerlValue *countArg, const char *file, int line) {
+    tm_ensure_registered();
+    if (tm_done_testing_called) {
+        /* real perl: ok(0, "done_testing() was already called at FILE line N")
+           reusing the FIRST call's location. */
+        tm_emit_result(0, tm_done_testing_loc ? tm_done_testing_loc : "done_testing() was already called");
+        return;
+    }
+    {
+        char locbuf[512];
+        snprintf(locbuf, sizeof locbuf, "done_testing() was already called at %s line %d", file, line);
+        tm_done_testing_loc = strdup(locbuf);
+    }
+    tm_done_testing_called = 1;
+
+    int haveCount = perl_defined(countArg);
+    long n = haveCount ? (long)(perl_to_float(countArg) + 0.5) : -1;
+
+    if (tm_plan >= 0) {
+        /* upfront plan already declared (and its "1..N" already printed). */
+        if (haveCount && n != tm_plan) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "planned to run %ld but done_testing() expects %ld", tm_plan, n);
+            tm_emit_result(0, msg);
+            tm_failed_header(msg, file, line);
+        }
+        return;
+    }
+
+    long finalN = haveCount ? n : tm_count;
+    tm_plan = finalN;
+    char buf[64];
+    snprintf(buf, sizeof buf, "1..%ld", finalN);
+    tm_tap_line(stdout, buf);
+    tm_plan_printed = 1;
+}
+
+/* subtest NAME => sub { ... } — nested test group. Real Test::More prints
+   "# Subtest: NAME" (at the OUTER indent) before entering, then every
+   inner TAP line indented 4 spaces (its own "1..N" plan included), then a
+   single ok/not ok line for the whole group back in the outer sequence.
+   Verified against real Perl (see this task's write-up) for: the header
+   format, the indent width, that a missing done_testing() inside auto-
+   plans silently (no "no plan was declared" diag — that's a top-level-
+   only diagnostic), and that the inner summary diag still prints even
+   when done_testing() WAS called. */
+PerlValue *perl_tm_subtest(PerlValue *namePV, PerlValue *coderef, const char *file, int line) {
+    tm_ensure_registered();
+    char *name = perl_defined(namePV) ? perl_to_string_dup(namePV) : strdup("");
+
+    char hdr[1024];
+    snprintf(hdr, sizeof hdr, "# Subtest: %s", name);
+    tm_tap_line(stdout, hdr);
+
+    TMFrame *fr = &tm_stack[tm_stack_n++];
+    fr->count = tm_count; fr->failed = tm_failed; fr->plan = tm_plan;
+    fr->plan_printed = tm_plan_printed; fr->done_testing_called = tm_done_testing_called;
+    fr->done_testing_loc = tm_done_testing_loc;
+    tm_count = 0; tm_failed = 0; tm_plan = -1; tm_plan_printed = 0;
+    tm_done_testing_called = 0; tm_done_testing_loc = NULL;
+    tm_depth++;
+
+    PerlArray *noargs = perl_array_new();
+    PerlValue *bodyResult = perl_call_code_ref(coderef, noargs);
+    if (bodyResult) perl_free(bodyResult);
+    perl_array_free(noargs);
+
+    if (!tm_plan_printed) {
+        if (tm_plan < 0) tm_plan = tm_count;
+        char buf[64];
+        snprintf(buf, sizeof buf, "1..%ld", tm_plan);
+        tm_tap_line(stdout, buf);
+    }
+    long extra = tm_count - tm_plan;
+    if (extra != 0) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "Looks like you planned %ld test%s but ran %d.",
+                 tm_plan, tm_plan == 1 ? "" : "s", tm_count);
+        tm_diag_raw(stderr, buf);
+    }
+    if (tm_failed) {
+        char buf[256];
+        const char *qual = extra == 0 ? "" : " run";
+        snprintf(buf, sizeof buf, "Looks like you failed %d test%s of %d%s.",
+                 tm_failed, tm_failed == 1 ? "" : "s", tm_count, qual);
+        tm_diag_raw(stderr, buf);
+    }
+    int subPassed = (tm_failed == 0 && extra == 0);
+
+    tm_depth--;
+    tm_stack_n--;
+    tm_count = fr->count; tm_failed = fr->failed; tm_plan = fr->plan;
+    tm_plan_printed = fr->plan_printed; tm_done_testing_called = fr->done_testing_called;
+    if (tm_done_testing_loc) free(tm_done_testing_loc);
+    tm_done_testing_loc = fr->done_testing_loc;
+
+    tm_emit_result(subPassed, name);
+    if (!subPassed) tm_failed_header(name, file, line);
+    free(name);
+    return perl_alloc_bool(subPassed);
+}

@@ -813,6 +813,20 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_uri_escape",       pv, pv, pv);
     RT("perl_uri_escape_utf8",  pv, pv, pv);
     RT("perl_uri_unescape",     pv, pv);
+    /* Test::More (native) */
+    RT("perl_tm_set_plan",      voidTy, i64, i8p, i32);
+    RT("perl_tm_ok",            pv, pv, pv, i8p, i32);
+    RT("perl_tm_is",            pv, pv, pv, pv, i8p, i32);
+    RT("perl_tm_isnt",          pv, pv, pv, pv, i8p, i32);
+    RT("perl_tm_like",          pv, pv, pv, pv, i8p, i32);
+    RT("perl_tm_unlike",        pv, pv, pv, pv, i8p, i32);
+    RT("perl_tm_cmp_ok",        pv, pv, pv, pv, pv, i8p, i32);
+    RT("perl_tm_pass",          pv, pv, i8p, i32);
+    RT("perl_tm_fail",          pv, pv, i8p, i32);
+    RT("perl_tm_diag",          voidTy, av);
+    RT("perl_tm_note",          voidTy, av);
+    RT("perl_tm_done_testing",  voidTy, pv, i8p, i32);
+    RT("perl_tm_subtest",       pv, pv, pv, i8p, i32);
     RT("perl_fpath_collect",    voidTy, av, pv);
     RT("perl_file_find",        pv, pv, av, i32);
     RT("perl_file_temp_template", pv, av, i32, i32);
@@ -7537,6 +7551,27 @@ void CodeGen::emitStmt(const Node &n) {
             if (!av) break;
             Value *idx = emitIdx(*n.right);
             pv = callRT("perl_array_lvalue", {av, idx});
+        } else if (n.sval == "hash_elem_deref" && n.right && n.cond) {
+            /* D169: local $ref->{key} = val; — single-level deref form,
+               same lvalue shape as the named-hash "hash_elem" case just
+               above but deriving the PerlHash* from dereferencing n.cond
+               instead of looking up a named hash. */
+            Value *refVal = emitExpr(*n.cond);
+            Value *hv = callRT("perl_deref_hash", {refVal});
+            freeIfOwned(refVal);
+            if (Value *kp = constKeyPtr(*n.right, builder_))
+                pv = callRT("perl_hash_lvalue_str", {hv, kp});
+            else {
+                Value *key = emitExpr(*n.right);
+                pv = callRT("perl_hash_lvalue_sv", {hv, key});
+                freeIfOwned(key);
+            }
+        } else if (n.sval == "array_elem_deref" && n.right && n.cond) {
+            Value *refVal = emitExpr(*n.cond);
+            Value *av = callRT("perl_deref_array", {refVal});
+            freeIfOwned(refVal);
+            Value *idx = emitIdx(*n.right);
+            pv = callRT("perl_array_lvalue", {av, idx});
         } else if (n.name == "/")   pv = callRT("perl_get_input_sep",    {});
         else if (n.name == "!") pv = callRT("perl_get_dollar_bang",{});
         else if (n.name == ".") pv = callRT("perl_get_dollar_dot",  {});
@@ -13059,6 +13094,94 @@ Value *CodeGen::emitCall(const Node &n) {
         for (auto &arg : n.args) callRT("perl_array_push", {av, emitExpr(*arg)});
         return av;
     };
+    /* ── Test::More (native) — bare and Test::More::-qualified forms both
+       dispatch here (importMap maps the default-exported bare names when
+       `use Test::More;` is seen; see main.cpp's inlineModules()). Every
+       assertion takes the compile-time call-site file/line, matching
+       real Test::Builder's "at FILE line N." diagnostics (verified
+       against the real installed Test::More — see TESTS.md). */
+    {
+        auto tmFile = [&]() { return builder_.CreateGlobalStringPtr(sourceFile_, "tm.file"); };
+        auto tmLine = [&]() { return ConstantInt::get(Type::getInt32Ty(ctx_), n.line); };
+        if (n.name == "ok" || n.name == "Test::More::ok") {
+            Value *cond = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+            Value *name = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+            return callRT("perl_tm_ok", {cond, name, tmFile(), tmLine()});
+        }
+        if (n.name == "is" || n.name == "Test::More::is") {
+            Value *got  = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+            Value *exp  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+            Value *name = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+            return callRT("perl_tm_is", {got, exp, name, tmFile(), tmLine()});
+        }
+        if (n.name == "isnt" || n.name == "Test::More::isnt") {
+            Value *got  = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+            Value *exp  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+            Value *name = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+            return callRT("perl_tm_isnt", {got, exp, name, tmFile(), tmLine()});
+        }
+        if (n.name == "like" || n.name == "Test::More::like") {
+            Value *str  = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+            Value *pat  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+            Value *name = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+            return callRT("perl_tm_like", {str, pat, name, tmFile(), tmLine()});
+        }
+        if (n.name == "unlike" || n.name == "Test::More::unlike") {
+            Value *str  = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+            Value *pat  = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+            Value *name = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+            return callRT("perl_tm_unlike", {str, pat, name, tmFile(), tmLine()});
+        }
+        if (n.name == "cmp_ok" || n.name == "Test::More::cmp_ok") {
+            Value *got  = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+            Value *op   = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+            Value *exp  = n.args.size() > 2 ? emitExpr(*n.args[2]) : perlUndef();
+            Value *name = n.args.size() > 3 ? emitExpr(*n.args[3]) : perlUndef();
+            return callRT("perl_tm_cmp_ok", {got, op, exp, name, tmFile(), tmLine()});
+        }
+        if (n.name == "pass" || n.name == "Test::More::pass") {
+            Value *name = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            return callRT("perl_tm_pass", {name, tmFile(), tmLine()});
+        }
+        if (n.name == "fail" || n.name == "Test::More::fail") {
+            Value *name = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            return callRT("perl_tm_fail", {name, tmFile(), tmLine()});
+        }
+        if (n.name == "diag" || n.name == "Test::More::diag" ||
+            n.name == "note" || n.name == "Test::More::note") {
+            Value *av = callRT("perl_array_new", {});
+            for (auto &a : n.args) {
+                Value *sub = emitArrayPtr(*a);
+                if (sub) callRT("perl_array_extend", {av, sub});
+                else     callRT("perl_array_push",   {av, emitExpr(*a)});
+            }
+            callRT((n.name.find("note") != std::string::npos) ? "perl_tm_note" : "perl_tm_diag", {av});
+            return perlInt(1);
+        }
+        if (n.name == "done_testing" || n.name == "Test::More::done_testing") {
+            Value *cnt = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+            callRT("perl_tm_done_testing", {cnt, tmFile(), tmLine()});
+            return perlInt(1);
+        }
+        if (n.name == "subtest" || n.name == "Test::More::subtest") {
+            Value *name = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+            Value *code = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+            return callRT("perl_tm_subtest", {name, code, tmFile(), tmLine()});
+        }
+        /* internal only: synthesized by main.cpp's inlineModules() for
+           `use Test::More tests => N;` — never user-reachable as a name. */
+        if (n.name == "Test::More::__set_plan") {
+            Value *cnt;
+            if (!n.args.empty()) {
+                Value *v = emitExpr(*n.args[0]);
+                cnt = callRT("perl_to_int", {v});
+            } else {
+                cnt = ConstantInt::get(Type::getInt64Ty(ctx_), 0);
+            }
+            callRT("perl_tm_set_plan", {cnt, tmFile(), tmLine()});
+            return perlInt(1);
+        }
+    }
     if (n.name == "POSIX::floor" || n.name == "floor") {
         Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
         return callRT("perl_posix_floor", {v});
