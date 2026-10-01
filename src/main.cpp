@@ -832,6 +832,53 @@ static std::vector<Token> inlineModules(
                 {"POSIX", {
                     {"all", {"LC_ALL","LC_COLLATE","LC_CTYPE","LC_NUMERIC",
                              "LC_MONETARY","LC_MESSAGES"}},
+                    /* D162: :errno_h/:locale_h/:sys_wait_h — probed from
+                       the real installed POSIX's own %EXPORT_TAGS; found
+                       missing via two real scripts (dpkg-genchanges:
+                       `use POSIX qw(:errno_h :locale_h);`, dpkg-
+                       buildpackage: `use POSIX qw(:sys_wait_h);`), which
+                       died "is not defined in %EXPORT_TAGS of the POSIX
+                       module" before this. LC_SYNTAX/LC_TOD (real
+                       locale_h) and EOTHER/EPROCLIM (real errno_h) are
+                       deliberately omitted — they aren't defined on this
+                       platform in real Perl either (verified: `POSIX->
+                       LC_SYNTAX()` dies "not a valid POSIX macro" on the
+                       real, installed module too), so the existing
+                       unknown-macro die in perl_native_constant already
+                       matches real behavior for them without needing an
+                       entry here. `errno_h`'s "errno" and `locale_h`'s
+                       "setlocale"/"localeconv" are real functions, not
+                       constants — dispatched separately in codegen.cpp/
+                       runtime.c, not through perl_native_constant. */
+                    {"errno_h", {"E2BIG","EACCES","EADDRINUSE",
+                        "EADDRNOTAVAIL","EAFNOSUPPORT","EAGAIN","EALREADY",
+                        "EBADF","EBADMSG","EBUSY","ECANCELED","ECHILD",
+                        "ECONNABORTED","ECONNREFUSED","ECONNRESET",
+                        "EDEADLK","EDESTADDRREQ","EDOM","EDQUOT","EEXIST",
+                        "EFAULT","EFBIG","EHOSTDOWN","EHOSTUNREACH","EIDRM",
+                        "EILSEQ","EINPROGRESS","EINTR","EINVAL","EIO",
+                        "EISCONN","EISDIR","ELOOP","EMFILE","EMLINK",
+                        "EMSGSIZE","ENAMETOOLONG","ENETDOWN","ENETRESET",
+                        "ENETUNREACH","ENFILE","ENOBUFS","ENODATA","ENODEV",
+                        "ENOENT","ENOEXEC","ENOLCK","ENOLINK","ENOMEM",
+                        "ENOMSG","ENOPROTOOPT","ENOSPC","ENOSR","ENOSTR",
+                        "ENOSYS","ENOTBLK","ENOTCONN","ENOTDIR","ENOTEMPTY",
+                        "ENOTRECOVERABLE","ENOTSOCK","ENOTSUP","ENOTTY",
+                        "ENXIO","EOPNOTSUPP","EOVERFLOW","EOWNERDEAD",
+                        "EPERM","EPFNOSUPPORT","EPIPE","EPROTO",
+                        "EPROTONOSUPPORT","EPROTOTYPE","ERANGE","EREMOTE",
+                        "ERESTART","EROFS","ESHUTDOWN","ESOCKTNOSUPPORT",
+                        "ESPIPE","ESRCH","ESTALE","ETIME","ETIMEDOUT",
+                        "ETOOMANYREFS","ETXTBSY","EUSERS","EWOULDBLOCK",
+                        "EXDEV","errno"}},
+                    {"locale_h", {"LC_ALL","LC_COLLATE","LC_CTYPE",
+                        "LC_MESSAGES","LC_MONETARY","LC_NUMERIC","LC_TIME",
+                        "LC_IDENTIFICATION","LC_MEASUREMENT","LC_PAPER",
+                        "LC_TELEPHONE","LC_ADDRESS","LC_NAME","LC_SYNTAX",
+                        "LC_TOD","NULL","localeconv","setlocale"}},
+                    {"sys_wait_h", {"WEXITSTATUS","WIFEXITED","WIFSIGNALED",
+                        "WIFSTOPPED","WNOHANG","WSTOPSIG","WTERMSIG",
+                        "WUNTRACED"}},
                 }},
                 {"File::Glob", {
                     /* real %File::Glob::EXPORT_TAGS: :bsd_glob and :glob

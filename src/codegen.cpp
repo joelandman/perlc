@@ -704,6 +704,7 @@ void CodeGen::declareRuntime() {
     /* special globals */
     RT("perl_get_input_sep",    pv);
     RT("perl_get_dollar_bang",  pv);
+    RT("perl_set_dollar_bang",  voidTy, pv);
     RT("perl_push_wantarray", i32, i32);
 RT("perl_pop_wantarray",  i32);
 RT("perl_wantarray",             pv);
@@ -770,6 +771,15 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_posix_ceil",       pv, pv);
     RT("perl_posix_fmod",       pv, pv, pv);
     RT("perl_posix_strftime",   pv, av);
+    RT("perl_posix_errno",      pv);
+    RT("perl_posix_setlocale",  pv, pv, pv);
+    RT("perl_posix_localeconv", pv);
+    RT("perl_posix_wifexited",  pv, pv);
+    RT("perl_posix_wexitstatus", pv, pv);
+    RT("perl_posix_wifsignaled", pv, pv);
+    RT("perl_posix_wtermsig",   pv, pv);
+    RT("perl_posix_wifstopped", pv, pv);
+    RT("perl_posix_wstopsig",   pv, pv);
     /* Scalar::Util */
     RT("perl_su_blessed",              pv, pv);
     RT("perl_su_reftype",              pv, pv);
@@ -8915,8 +8925,17 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.left->kind == NK::ScalarVar &&
             (n.left->name == "/" || n.left->name == "!")) {
             Value *rhs = emitExpr(*n.right);
-            Value *pv  = (n.left->name == "/") ? callRT("perl_get_input_sep",  {})
-                                                : callRT("perl_get_dollar_bang", {});
+            if (n.left->name == "!") {
+                /* D162: $! = N must set the real OS errno (see
+                   perl_set_dollar_bang's comment) — perl_get_dollar_bang's
+                   own cell unconditionally recomputes from errno on
+                   every read, so assigning into that cell via
+                   perl_assign (the old behavior) never actually
+                   persisted past the very next read. */
+                callRT("perl_set_dollar_bang", {rhs});
+                return rhs;
+            }
+            Value *pv = callRT("perl_get_input_sep", {});
             callRT("perl_assign", {pv, rhs});
             return rhs;
         }
@@ -12965,6 +12984,44 @@ Value *CodeGen::emitCall(const Node &n) {
     if (n.name == "POSIX::strftime" || n.name == "strftime") {
         return callRT("perl_posix_strftime", {buildArgArray()});
     }
+    /* D162: POSIX::errno/setlocale/localeconv and the sys_wait_h status
+       macros — found missing via real dpkg-genchanges/dpkg-buildpackage
+       compiles (`:errno_h`/`:locale_h`/`:sys_wait_h` import tags). */
+    if (n.name == "POSIX::errno" || n.name == "errno") {
+        return callRT("perl_posix_errno", {});
+    }
+    if (n.name == "POSIX::setlocale" || n.name == "setlocale") {
+        Value *cat = n.args.size() > 0 ? emitExpr(*n.args[0]) : perlUndef();
+        Value *loc = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
+        return callRT("perl_posix_setlocale", {cat, loc});
+    }
+    if (n.name == "POSIX::localeconv" || n.name == "localeconv") {
+        return callRT("perl_posix_localeconv", {});
+    }
+    if (n.name == "POSIX::WIFEXITED" || n.name == "WIFEXITED") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_wifexited", {v});
+    }
+    if (n.name == "POSIX::WEXITSTATUS" || n.name == "WEXITSTATUS") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_wexitstatus", {v});
+    }
+    if (n.name == "POSIX::WIFSIGNALED" || n.name == "WIFSIGNALED") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_wifsignaled", {v});
+    }
+    if (n.name == "POSIX::WTERMSIG" || n.name == "WTERMSIG") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_wtermsig", {v});
+    }
+    if (n.name == "POSIX::WIFSTOPPED" || n.name == "WIFSTOPPED") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_wifstopped", {v});
+    }
+    if (n.name == "POSIX::WSTOPSIG" || n.name == "WSTOPSIG") {
+        Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        return callRT("perl_posix_wstopsig", {v});
+    }
     /* D69: List::Util::sum/min/max/uniq, scalar context. These only reach
        emitCall as a qualified NK::Call — the bare "sum"/"min"/"max"/"uniq"
        keyword forms are their own dedicated node kinds (NK::SumFunc etc.,
@@ -14168,8 +14225,18 @@ Value *CodeGen::emitCall(const Node &n) {
         for (auto &a : n.args) callRT("perl_array_push", {texts, emitExpr(*a)});
         Value *arr = callRT("perl_parsewords",
             {perlStr(" "), perlInt(0), texts});
+        /* D162: perl_array_len already returns a boxed PerlValue* (its
+           signature is PerlValue *perl_array_len(PerlArray *a)) — the
+           old code then passed that PerlValue* straight into
+           perl_alloc_int (which expects a raw i64), a pointer-as-
+           integer type confusion that produced invalid LLVM IR
+           ("Call parameter type does not match function signature!",
+           found via a real /usr/sbin/pam_getenv compile). Return the
+           count directly, same scalar-context convention keys/values/
+           split already use (perl_array_len + perl_array_free). */
         Value *len = callRT("perl_array_len", {arr});
-        return callRT("perl_alloc_int", {len}); /* scalar: count */
+        callRT("perl_array_free", {arr});
+        return len;
     }
     if (n.name == "quotewords" || n.name == "Text::ParseWords::quotewords" ||
         n.name == "parse_line" || n.name == "Text::ParseWords::parse_line") {
@@ -14179,8 +14246,10 @@ Value *CodeGen::emitCall(const Node &n) {
         for (size_t i = 2; i < n.args.size(); i++)
             callRT("perl_array_push", {texts, emitExpr(*n.args[i])});
         Value *arr = callRT("perl_parsewords", {d, k, texts});
+        /* D162: see the identical fix/comment on shellwords above. */
         Value *len = callRT("perl_array_len", {arr});
-        return callRT("perl_alloc_int", {len});
+        callRT("perl_array_free", {arr});
+        return len;
     }
     if (n.name == "compare" || n.name == "File::Compare::compare" ||
         n.name == "File::Compare::cmp") {

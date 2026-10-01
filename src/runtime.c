@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#include <locale.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -523,6 +524,23 @@ PerlValue *perl_get_dollar_bang(void) {
         s_dollar_bang.slen = 0;
     }
     return &s_dollar_bang;
+}
+
+/* D162: `$! = N` must set the real OS errno (real Perl's $! is a true
+   dualvar backed by errno — `$! = 2; print $!;` prints "No such file
+   or directory") so a later plain read of $! (or POSIX::errno(), which
+   reads the same C global) sees it. The assignment codegen previously
+   just wrote into the s_dollar_bang cell above via perl_assign, which
+   perl_get_dollar_bang's own next call unconditionally overwrites from
+   the live errno anyway — so the assignment never actually persisted
+   past the very next read, and never touched errno()'s view either.
+   A non-numeric RHS (`$! = "custom"`) is accepted as a no-op on the
+   OS errno, matching real Perl's own int(string) coercion (anything
+   that doesn't look like a number numifies to 0, which would clear
+   errno — but scripts essentially never assign a literal string to
+   $! in practice, so this narrow corner isn't chased further). */
+void perl_set_dollar_bang(PerlValue *v) {
+    errno = (int)perl_to_int(v);
 }
 
 /* wantarray context stack: 0=scalar, 1=list, 2=void (D87).
@@ -12151,6 +12169,64 @@ PerlValue *perl_posix_strftime(PerlArray *args) {
     strftime(buf, sizeof(buf), fmt, &tm);
     free(fmt);
     return perl_alloc_string(buf);
+}
+
+/* D162: POSIX::errno/setlocale/localeconv and the sys_wait_h status
+   macros (WIFEXITED/WEXITSTATUS/WIFSIGNALED/WTERMSIG/WIFSTOPPED/
+   WSTOPSIG) — found missing via real /usr/bin/dpkg-genchanges
+   (`setlocale(LC_TIME, 'C')`) and /usr/bin/dpkg-buildpackage
+   (`WIFEXITED($status)`/`WEXITSTATUS($status)`). WNOHANG/WUNTRACED
+   are plain constants, already covered by native_constants.h. */
+PerlValue *perl_posix_errno(void) {
+    return perl_alloc_int(errno);
+}
+PerlValue *perl_posix_setlocale(PerlValue *category, PerlValue *locale) {
+    int cat = (int)perl_to_int(category);
+    char *loc = (locale && locale->tag != PERL_UNDEF) ? perl_to_string_dup(locale) : NULL;
+    char *r = setlocale(cat, loc);
+    if (loc) free(loc);
+    return r ? perl_alloc_string(r) : perl_alloc_undef();
+}
+PerlValue *perl_posix_localeconv(void) {
+    struct lconv *lc = localeconv();
+    PerlHash *h = perl_anon_hash_new();
+    if (lc) {
+        perl_hash_set_str(h, "decimal_point", perl_alloc_string(lc->decimal_point ? lc->decimal_point : ""));
+        perl_hash_set_str(h, "thousands_sep", perl_alloc_string(lc->thousands_sep ? lc->thousands_sep : ""));
+        perl_hash_set_str(h, "int_curr_symbol", perl_alloc_string(lc->int_curr_symbol ? lc->int_curr_symbol : ""));
+        perl_hash_set_str(h, "currency_symbol", perl_alloc_string(lc->currency_symbol ? lc->currency_symbol : ""));
+        perl_hash_set_str(h, "mon_decimal_point", perl_alloc_string(lc->mon_decimal_point ? lc->mon_decimal_point : ""));
+        perl_hash_set_str(h, "mon_thousands_sep", perl_alloc_string(lc->mon_thousands_sep ? lc->mon_thousands_sep : ""));
+        perl_hash_set_str(h, "positive_sign", perl_alloc_string(lc->positive_sign ? lc->positive_sign : ""));
+        perl_hash_set_str(h, "negative_sign", perl_alloc_string(lc->negative_sign ? lc->negative_sign : ""));
+        perl_hash_set_str(h, "int_frac_digits", perl_alloc_int(lc->int_frac_digits));
+        perl_hash_set_str(h, "frac_digits", perl_alloc_int(lc->frac_digits));
+        perl_hash_set_str(h, "p_cs_precedes", perl_alloc_int(lc->p_cs_precedes));
+        perl_hash_set_str(h, "p_sep_by_space", perl_alloc_int(lc->p_sep_by_space));
+        perl_hash_set_str(h, "n_cs_precedes", perl_alloc_int(lc->n_cs_precedes));
+        perl_hash_set_str(h, "n_sep_by_space", perl_alloc_int(lc->n_sep_by_space));
+        perl_hash_set_str(h, "p_sign_posn", perl_alloc_int(lc->p_sign_posn));
+        perl_hash_set_str(h, "n_sign_posn", perl_alloc_int(lc->n_sign_posn));
+    }
+    return perl_ref_hash(h);
+}
+PerlValue *perl_posix_wifexited(PerlValue *status) {
+    return perl_alloc_bool(WIFEXITED((int)perl_to_int(status)) ? 1 : 0);
+}
+PerlValue *perl_posix_wexitstatus(PerlValue *status) {
+    return perl_alloc_int(WEXITSTATUS((int)perl_to_int(status)));
+}
+PerlValue *perl_posix_wifsignaled(PerlValue *status) {
+    return perl_alloc_bool(WIFSIGNALED((int)perl_to_int(status)) ? 1 : 0);
+}
+PerlValue *perl_posix_wtermsig(PerlValue *status) {
+    return perl_alloc_int(WTERMSIG((int)perl_to_int(status)));
+}
+PerlValue *perl_posix_wifstopped(PerlValue *status) {
+    return perl_alloc_bool(WIFSTOPPED((int)perl_to_int(status)) ? 1 : 0);
+}
+PerlValue *perl_posix_wstopsig(PerlValue *status) {
+    return perl_alloc_int(WSTOPSIG((int)perl_to_int(status)));
 }
 
 /* ── Scalar::Util ─────────────────────────────────────────────────────────── */

@@ -18,8 +18,28 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-09-30, File::Glob/File::Which/Cpanel::JSON::XS + D156-D161
-— 522/522 PASS, 0 FAIL, 2 more skipped-by-default):** Native `File::Glob`
+**Harness (2026-09-30, fresh real-script survey + D162 — 524/524 PASS,
+0 FAIL):** A randomized 100-script compile survey of real system Perl
+scripts found and fixed D162, a batch of defects: (1) a genuine
+**compiler bug** — `Text::ParseWords`'s scalar-context `shellwords`/
+`quotewords`/`parse_line` produced an invalid LLVM module (a boxed
+`PerlValue*` from `perl_array_len` passed straight into `perl_alloc_int`,
+which expects a raw `i64`) — a hard compile-time "Call parameter type
+does not match function signature!" error, found via a real
+`/usr/sbin/pam_getenv` compile. (2) `POSIX`'s native constant-export
+mechanism only recognized a handful of hand-picked tags — `:errno_h`,
+`:locale_h`, `:sys_wait_h` weren't recognized at all (found via real
+`dpkg-genchanges`/`dpkg-buildpackage`); added the full real-Perl tag
+lists (175 constants total now) plus the real `errno()`/`setlocale()`/
+`localeconv()`/`WIFEXITED`/`WEXITSTATUS`/etc. functions as C-library
+wrappers. (3) Found while verifying `errno()`: `$! = N` assignment was a
+separate, deeper, pre-existing bug — it never actually persisted past
+the next read of `$!`, and never touched the real OS `errno` either;
+fixed with a dedicated `perl_set_dollar_bang()`. Tests:
+`tests/parsewords_scalar_{smoke,deep}.pl`,
+`tests/posix_errno_locale_{smoke,deep}.pl`.
+Previous session (2026-09-30, File::Glob/File::Which/Cpanel::JSON::XS +
+D156-D161 — 522/522 PASS, 0 FAIL, 2 more skipped-by-default):** Native `File::Glob`
 (`bsd_glob`, `:glob`/`:bsd_glob` tags, `GLOB_*` constants) and `File::Which`
 (`which`/`where`, with real Perl's non-obvious context-sensitivity: `which`
 itself returns every match in list context, not just the first; `where` in

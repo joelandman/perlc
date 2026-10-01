@@ -773,6 +773,15 @@ PerlValue *perl_posix_floor(PerlValue *v);
 PerlValue *perl_posix_ceil(PerlValue *v);
 PerlValue *perl_posix_fmod(PerlValue *a, PerlValue *b);
 PerlValue *perl_posix_strftime(PerlArray *args); /* (fmt, sec,min,hour,mday,mon,year,...) */
+PerlValue *perl_posix_errno(void);
+PerlValue *perl_posix_setlocale(PerlValue *category, PerlValue *locale);
+PerlValue *perl_posix_localeconv(void);
+PerlValue *perl_posix_wifexited(PerlValue *status);
+PerlValue *perl_posix_wexitstatus(PerlValue *status);
+PerlValue *perl_posix_wifsignaled(PerlValue *status);
+PerlValue *perl_posix_wtermsig(PerlValue *status);
+PerlValue *perl_posix_wifstopped(PerlValue *status);
+PerlValue *perl_posix_wstopsig(PerlValue *status);
 
 /* ── Scalar::Util functions ───────────────────────────────────────────────── */
 PerlValue *perl_su_blessed(PerlValue *v);
@@ -914,6 +923,7 @@ PerlValue *perl_chmod_op(PerlValue *mode, PerlArray *files);
 /* ── special global variables ────────────────────────────────────────────── */
 PerlValue *perl_get_input_sep(void);           /* $/ — input record separator (stable ptr) */
 PerlValue *perl_get_dollar_bang(void);         /* $! — errno string */
+void       perl_set_dollar_bang(PerlValue *v); /* $! = N — sets real OS errno */
 typedef PerlValue *(*PerlSubFnCtx)(PerlArray *, int); /* fn(args, ctx) */
 
 int perl_push_wantarray(int ctx);
