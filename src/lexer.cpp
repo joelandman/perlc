@@ -576,15 +576,23 @@ std::vector<Token> Lexer::tokenize() {
 
         /* backtick command `cmd` */
         if (c == '`') {
-            advance();
-            std::string cmd;
-            while (pos_ < src_.size() && src_[pos_] != '`') {
-                if (src_[pos_] == '\n') line_++;
-                cmd += src_[pos_++];
-            }
-            if (pos_ < src_.size()) pos_++; /* consume closing backtick */
+            /* D161: this used to be a separate raw character-copy loop
+               with ZERO escape processing — \$/\@ (meant to protect a
+               literal $/@ from Perl's own interpolation before the
+               text reaches the shell) passed through completely
+               unhandled, so `` `echo "\$x hello"` `` both interpolated
+               $x to its value AND left a stray literal backslash in
+               front of it, instead of real Perl's `\$x` → literal
+               `$x` for the shell to see. Now reuses readString's
+               shared escape/appendEscape handling — the exact same
+               path "..." literals already use, including \$/\@'s
+               \x02 marker that parseStringInterp recognizes. */
+            Token t = readString('`', /*interpolates=*/true);
+            t.kind = TK::BACKTICK;
             /* prefix \x01 so parser treats content like a dq string (interpolation) */
-            toks.push_back({TK::BACKTICK, "\x01" + cmd, line_}); continue;
+            t.text = "\x01" + t.text;
+            toks.push_back(t);
+            continue;
         }
 
         /* D65: a bare `$`/`@`/`%` sigil is tokenized as its own, separate
@@ -730,6 +738,64 @@ std::vector<Token> Lexer::tokenize() {
             Token t = readString(qclose, /*interpolates=*/dq);
             if (dq) t.text = "\x01" + t.text;
             toks.push_back(t); continue;
+        }
+
+        /* qx(CMD) / qx{CMD} / qx/CMD/ — command execution, the exact
+           same semantics as backticks `` `CMD` `` (real Perl treats
+           them as two spellings of one operator). D161: previously
+           not recognized AT ALL (a hard parse error, "String found
+           where operator expected") — qx(...) just fell through to
+           being read as a bareword `qx` call followed by a parenthesized
+           expression. Mirrors qq's own delimiter handling one level up
+           (including the `{...}` nested-brace-depth scan) since qx is
+           semantically "qq-style interpolating text whose result
+           executes as a shell command", not a separate feature —
+           producing a TK::BACKTICK token so it reuses every bit of the
+           backtick codegen/interpolation path unchanged (including the
+           \$/\@ escape fix just above). `qx` itself is never a valid
+           bareword sigil/arrow target, so no afterSigil/afterArrow
+           guard is needed the way q/qq/qr/m/s/tr all carry one for
+           their single-letter names ($q, ->q, etc.) — "qx" as an
+           identifier prefix is already a vanishingly rare, and this
+           still only fires when a genuine delimiter character follows. */
+        if (c == 'q' && peek(1) == 'x') {
+            size_t lookQx = 2;
+            while (peek(lookQx) == ' ' || peek(lookQx) == '\t') lookQx++;
+            char dQx = peek(lookQx);
+            bool closerDelimQx = (dQx == '}' || dQx == ']' || dQx == ')' || dQx == '>');
+            bool fatCommaQx = (dQx == '=' && peek(lookQx + 1) == '>');
+            if (!closerDelimQx && !fatCommaQx &&
+                dQx != '\0' && !isalnum((unsigned char)dQx) && dQx != '_' &&
+                dQx != ' ' && dQx != '\t' && dQx != '\n' && dQx != '\r') {
+                pos_ += lookQx; /* skip 'qx' and optional whitespace */
+                if (peek() == '{') {
+                    pos_++; /* skip '{' */
+                    std::string raw;
+                    bool qxWide = false;
+                    int depth = 1;
+                    while (pos_ < src_.size() && depth > 0) {
+                        char ch = src_[pos_];
+                        if (ch == '\\' && pos_ + 1 < src_.size()) {
+                            char esc = src_[pos_ + 1]; pos_ += 2;
+                            if (esc == '{' || esc == '}') raw += esc;
+                            else appendEscape(esc, raw, qxWide);
+                            continue;
+                        }
+                        if (ch == '{') depth++;
+                        else if (ch == '}') { if (--depth == 0) { pos_++; break; } }
+                        if (ch == '\n') line_++;
+                        raw += ch; pos_++;
+                    }
+                    toks.push_back({TK::BACKTICK, "\x01" + raw, line_});
+                    continue;
+                }
+                char qxOpen  = peek();
+                char qxClose = (qxOpen == '(') ? ')' : (qxOpen == '[') ? ']' :
+                               (qxOpen == '<') ? '>' : qxOpen;
+                Token t = readString(qxClose, /*interpolates=*/true);
+                toks.push_back({TK::BACKTICK, "\x01" + t.text, line_});
+                continue;
+            }
         }
 
         /* m/pattern/flags or m{pat}x — any non-word delimiter.
