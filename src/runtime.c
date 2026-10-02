@@ -16892,7 +16892,20 @@ PerlValue *perl_get_os_name(void) {
 
 PerlValue *perl_get_perl_version(void) {
     /* $^V as a dotted version string. sprintf("%vd", $^V) uses this. */
-    return perl_alloc_string("5.42.0");
+    return perl_alloc_string("v5.44.0");
+}
+
+/* D175: $] — the "oldstyle" decimal Perl version number (distinct
+   from $^V's "v5.44.0" dotted-string form). Found completely missing
+   (not implemented at all, not even outside string interpolation) via
+   a real /usr/bin/gprofng-display-html script's
+   `version->parse("$]")->normal`. A plain string constant, matching
+   this codebase's existing $^V convention — perlc's generic string-
+   to-number coercion already handles `$] + 1` correctly from this
+   (strtod-based, confirmed: "5.044000" + 1 == 6.044, matching real
+   Perl exactly), so no separate numeric/dualvar storage is needed. */
+PerlValue *perl_get_dollar_rbracket(void) {
+    return perl_alloc_string("5.044000");
 }
 
 /* ── XS / FFI support ───────────────────────────────────────────────────── */

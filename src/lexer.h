@@ -148,7 +148,7 @@ private:
     void skipLineComment();
     void skipBlockComment();
     Token readNumber();
-    Token readString(char delim, bool interpolates);
+    Token readString(char delim, bool interpolates, char openDelim = 0);
     void appendEscape(char esc, std::string &raw, bool &wide); /* D154: shared "..." / qq{} escape handling */
     static std::string processEscapes(const std::string &in, bool &wide); /* D154: heredoc bodies */
     Token readHeredoc();

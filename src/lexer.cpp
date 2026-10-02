@@ -134,13 +134,32 @@ Token Lexer::readNumber() {
     return {isFloat ? TK::FLOAT : TK::INT, clean, line_};
 }
 
-Token Lexer::readString(char delim, bool interpolates) {
+Token Lexer::readString(char delim, bool interpolates, char openDelim) {
     pos_++; /* skip opening delimiter */
     std::string raw;
     bool wide = false;
+    /* D174: for a true BRACKETING delimiter pair (open != close, e.g.
+       q(...), qq[...], qx<...>) real Perl balances nested occurrences
+       of the SAME pair — qq(hello (world) foo) must stop at the
+       outer ')', not the first one — exactly like the existing
+       qq{...} scanner (a separate, hand-rolled loop) already does for
+       braces specifically. This generic readString() had no such
+       tracking at all for the non-brace bracketing delimiters, since
+       it only ever received the single close character and treated
+       the first occurrence of it as the end — confirmed broken for
+       (), [], and <> via q(hello (world) foo) (real Perl: "hello
+       (world) foo"; perlc: hard parse error, ran off past the
+       intended end into the surrounding code). A non-zero
+       `openDelim` different from `delim` enables depth tracking. */
+    int depth = 1;
+    bool tracking = openDelim != 0 && openDelim != delim;
     while (pos_ < src_.size()) {
         char c = src_[pos_];
-        if (c == delim) { pos_++; break; }
+        if (tracking && c == openDelim) depth++;
+        if (c == delim) {
+            if (tracking && --depth > 0) { raw += c; pos_++; continue; }
+            pos_++; break;
+        }
         if (c == '\\' && pos_ + 1 < src_.size()) {
             pos_++;
             char esc = src_[pos_++];
@@ -749,7 +768,7 @@ std::vector<Token> Lexer::tokenize() {
             char qopen  = peek();
             char qclose = (qopen == '(') ? ')' : (qopen == '[') ? ']' :
                           (qopen == '{') ? '}' : (qopen == '<') ? '>' : qopen;
-            Token t = readString(qclose, /*interpolates=*/dq);
+            Token t = readString(qclose, /*interpolates=*/dq, /*openDelim=*/qopen);
             if (dq) t.text = "\x01" + t.text;
             toks.push_back(t); continue;
         }
@@ -806,7 +825,7 @@ std::vector<Token> Lexer::tokenize() {
                 char qxOpen  = peek();
                 char qxClose = (qxOpen == '(') ? ')' : (qxOpen == '[') ? ']' :
                                (qxOpen == '<') ? '>' : qxOpen;
-                Token t = readString(qxClose, /*interpolates=*/true);
+                Token t = readString(qxClose, /*interpolates=*/true, /*openDelim=*/qxOpen);
                 toks.push_back({TK::BACKTICK, "\x01" + t.text, line_});
                 continue;
             }
@@ -1019,6 +1038,16 @@ std::vector<Token> Lexer::tokenize() {
     if (c == '$' && pos_ < src_.size() && src_[pos_] == '+') {
       pos_++;
       toks.back().text = "+";
+      continue;
+    }
+    /* D175: $] — the oldstyle decimal Perl version number. Without
+       this, '$' and ']' lexed as two separate tokens (SCALAR then a
+       bare RBRACKET), which only "worked" by accident wherever a
+       stray RBRACKET happened to be silently tolerated — in practice
+       it just silently evaluated to undef/empty everywhere. */
+    if (c == '$' && pos_ < src_.size() && src_[pos_] == ']') {
+      pos_++;
+      toks.back().text = "]";
       continue;
     }
             /* $^X control variables: encode as "^X" in the SCALAR token text */

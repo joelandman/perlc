@@ -3358,6 +3358,15 @@ NodePtr Parser::parsePrimary() {
             }
             return makeScalar("+", line);
         }
+        /* D175: $] — oldstyle decimal Perl version (single-token:
+           SCALAR text="]", mirroring $+'s identical convention —
+           must be checked here, BEFORE the generic `advance(); skip
+           $` below, since there is no separate following token to
+           read a name from for this single-token form). */
+        if (cur().text == "]") {
+            advance();
+            return makeScalar("]", line);
+        }
         advance(); /* skip $ */
         /* $@ — eval error variable */
         if (check(TK::ARRAY) && cur().text == "@") {
@@ -5539,10 +5548,13 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
             parts.push_back(std::move(n));
             i += 2; continue;
         }
-        /* $. $, $\ $& $! $/ — special single-char vars */
+        /* $. $, $\ $& $! $/ $] — special single-char vars. D175: $]
+           (oldstyle decimal Perl version) was missing from this list
+           entirely — found via a real /usr/bin/gprofng-display-html
+           script's `version->parse("$]")->normal`. */
         if (raw[i] == '$' && i + 1 < raw.size()) {
             char nc = raw[i+1];
-            if (nc == '.' || nc == ',' || nc == '!' || nc == '/') {
+            if (nc == '.' || nc == ',' || nc == '!' || nc == '/' || nc == ']') {
                 flush();
                 std::string vn(1, nc);
                 parts.push_back(makeScalar(vn, line));

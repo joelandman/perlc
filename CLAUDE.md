@@ -11,14 +11,45 @@ AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
                                       runtime.c
 ```
 
-## Current state (2026-10-01)
+## Current state (2026-10-02)
 
 Core language, OOP, regex (PCRE2 including `/x`), threads::shared, overload,
 Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-01, D173 — 551/551 PASS, 0 FAIL):** A seventh
+**Harness (2026-10-02, D174/D175 — 555/555 PASS, 0 FAIL):** An eighth
+real-script survey found two more parse/lexer gaps. **D174**:
+`q(...)`/`qq(...)`/`qx(...)` with a true bracketing delimiter pair
+(`()`, `[]`, `<>` — where open and close differ, as opposed to a
+symmetric delimiter like `/`) didn't track nested depth at all —
+`qq(hello (world) foo)` stopped at the FIRST `)`, not the matching
+outer one. The pre-existing `qq{...}` brace scanner already did this
+correctly (a separate, hand-rolled loop with its own depth counter),
+but the shared `src/lexer.cpp` `readString()` helper used for every
+other delimiter only ever received the single close character, with
+no concept of the opening one to count against. Found via a real
+`/usr/bin/ucfq` script's `qq($main::MYNAME $main::VERSION\n\t
+Copyright (C) 2002-2024 )` (an unescaped nested `(C)`). Fixed by
+giving `readString()` an optional `openDelim` parameter that enables
+the same depth-tracking logic the brace scanner already used, passed
+at the two non-brace call sites (`q`/`qq` and `qx`). **D175**: `$]`
+(the "oldstyle" decimal Perl version number, distinct from `$^V`'s
+dotted-string form) was not implemented AT ALL — not just missing
+from string interpolation, but completely broken even as a bare
+expression. Found via a real `/usr/bin/gprofng-display-html` script's
+`version->parse("$]")->normal`. Needed two independent fixes: (1) the
+main lexer/parser — `$]` lexes as a single mutated `SCALAR` token
+(mirroring the pre-existing `$+` convention) and needed an explicit
+`parsePrimary()` check for that text *before* the generic "advance
+past `$`, read the next token as the name" path, which has no second
+token to read for this single-token form; (2) the STRING
+INTERPOLATION scanner (`parseStringInterp`), a wholly separate
+raw-text-based system, needed `]` added to its own
+`$.`/`$,`/`$\`/`$&`/`$!`/`$/` special-single-char-variable list.
+Tests: `tests/qq_nested_delim_{smoke,deep}.pl`,
+`tests/dollar_rbracket_{smoke,deep}.pl`.
+Previous session (2026-10-01, D173 — 551/551 PASS, 0 FAIL):** A seventh
 real-script survey found that diamond-glob `<PATTERN>`'s pattern text
 was NOT variable-interpolated at all — D164's own write-up had
 claimed this matched real Perl ("the pattern text is a literal, not
@@ -765,7 +796,10 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D173 FIXED 2026-10-01**
+**Open generated-code defects:** none — **D175 FIXED 2026-10-02**
+(`$]` not implemented at all — see TESTS.md). **D174 FIXED
+2026-10-02** (`q()`/`qq()`/`qx()` nested-bracket-delimiter depth
+tracking — see TESTS.md). **D173 FIXED 2026-10-01**
 (diamond-glob `<PATTERN>` wasn't variable-interpolated — see
 TESTS.md). **D172 FIXED 2026-10-01**
 (`last`/`next`/`redo` as a comma-expression operand was a parse

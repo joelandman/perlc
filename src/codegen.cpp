@@ -577,6 +577,7 @@ void CodeGen::declareRuntime() {
     RT("perl_system_list", pv, av);
     RT("perl_quotemeta_str", pv, pv);
     RT("perl_get_perl_version", pv);
+    RT("perl_get_dollar_rbracket", pv);
     RT("perl_pod2usage", pv, av);
     RT("perl_syscall",    pv, pv);
     RT("perl_fork",              pv);
@@ -7854,6 +7855,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.name == "\\") return callRT("perl_get_dollar_bsl",   {});
         if (n.name == "&")  return callRT("perl_get_dollar_amp",   {});
         if (n.name == "?")  return callRT("perl_get_dollar_question", {});
+        if (n.name == "]")  return callRT("perl_get_dollar_rbracket", {});
         /* $AUTOLOAD — set by dispatch when AUTOLOAD is called */
         if (n.name == "AUTOLOAD") return callRT("perl_get_autoload_name", {});
         if (n.name == "ARGV") return callRT("perl_get_dollar_argv", {});
