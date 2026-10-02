@@ -18,7 +18,34 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D184-D187 — 577/577 PASS, 0 FAIL):** **D187**:
+**Harness (2026-10-02, D186 — 579/579 PASS, 0 FAIL):** Root-caused and
+fixed the scope-tracking bug logged (not fixed) under D186 while
+building D184. Root cause: `tryEmitI1Cond()`'s `tryFileGlobalI64`
+fast path (Stage 26a, lets a `my VAR CMP literal` loop condition skip
+full `PerlValue` boxing when `VAR` is a file-scope global) indexed
+`fileScalarGlobals_` directly by bare variable name — bypassing the
+lexical-shadowing check the general `lookupVar()`/`lookupIntVar()`/
+`lookupFloatVar()` resolution paths already correctly do everywhere
+else. So a C-style `for (my $i = 0; $i < N; $i++)` loop whose own
+`$i` happened to share a bare name with an EARLIER, unrelated
+file-scope `my $i` got its condition evaluated against the STALE
+outer value instead of its own freshly-initialized one — a genuinely
+silent wrong-condition bug, no crash: the loop would silently run
+zero iterations (or the wrong count) whenever the stale outer value
+happened to already fail the condition. Fixed by having
+`tryFileGlobalI64` check `scopes_`/`intScopes_`/`floatScopes_` for a
+nearer declaration of the same bare name first, bailing out of the
+fast path (falling through to the always-correct general `emitExpr`/
+`lookupVar` resolution) whenever one is found. Verified against real
+Perl for: the original D184-era repro, the simplest two-declaration
+shadowing shape, a shadowing case specifically chosen so the stale
+outer value would make the condition immediately false (the exact
+failure signature), shadowing inside a sub (a free-variable read of
+an outer file-scope global is a different, legitimate case that must
+keep working), and a regression check that the ordinary non-shadowed
+fast path is unaffected. Tests:
+`tests/loop_var_shadow_{smoke,deep}.pl`.
+Previous session (2026-10-02, D184-D187 — 577/577 PASS, 0 FAIL):** **D187**:
 found while cleaning up this very test suite — `unlink @names;` /
 `unlink LIST` silently deleted NOTHING when the argument was a
 list-producing expression (an array variable, not a bare scalar
@@ -1009,14 +1036,13 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** **D186** (narrow, pre-existing
-scope-tracking bug: reusing the same loop-variable name across three
-sibling top-level `my` declarations in a specific sequence silently
-drops the last loop's output — found while testing D184, reproduces
-with plain `for` too, nothing to do with D184's fix itself; see
-TESTS.md for the minimal repro) — not yet fixed. **D187 FIXED
-2026-10-02** (`unlink @names;`/`unlink LIST` silently deleted nothing
-for a list-producing argument — see TESTS.md). **D184+D185 FIXED
+**Open generated-code defects:** none — **D186 FIXED 2026-10-02**
+(`tryEmitI1Cond`'s file-scope-global comparison fast path didn't
+respect lexical shadowing, silently evaluating a loop condition
+against a stale same-named outer variable — see TESTS.md). **D187
+FIXED 2026-10-02** (`unlink @names;`/`unlink LIST` silently deleted
+nothing for a list-producing argument — see TESTS.md). **D184+D185
+FIXED
 2026-10-02** (C-style `foreach (init; cond; step)` was a parse error,
 and `<PATTERN>`/`glob()` didn't brace-expand `{a,b,c}` — see
 TESTS.md). **D182+D183 FIXED 2026-10-02**

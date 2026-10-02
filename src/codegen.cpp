@@ -3638,6 +3638,25 @@ Value *CodeGen::tryEmitI1Cond(const Node &n) {
         if (nd.kind != NK::ScalarVar) return nullptr;
         std::string nm = nd.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        /* D186: this fast path indexed fileScalarGlobals_ directly by bare
+           name, bypassing the lexical-shadowing check lookupVar() (and
+           lookupIntVar/lookupFloatVar) already do — so a nearer `my $i`
+           declared in an inner scope with the same bare name as an
+           earlier file-scope `my $i` was silently ignored here, and this
+           fast path grabbed the STALE outer global instead. Reproduces
+           as a genuinely silent wrong-condition bug (no crash): a
+           `for (my $i = 0; $i < N; $i++)` loop whose own freshly-
+           initialized `$i` is shadowed this way checks the OLD `$i`'s
+           leftover value instead, so the loop can appear to never run
+           at all. Bail out of the fast path (forcing the normal,
+           scope-correct emitExpr/lookupVar resolution below) whenever
+           ANY nearer scope already declares this bare name. */
+        for (auto &scope : scopes_)
+            if (scope.count(nm)) return nullptr;
+        for (auto &scope : intScopes_)
+            if (scope.count(nm)) return nullptr;
+        for (auto &scope : floatScopes_)
+            if (scope.count(nm)) return nullptr;
         auto git = fileScalarGlobals_.find(nm);
         if (git == fileScalarGlobals_.end()) return nullptr;
         Value *pv = builder_.CreateLoad(perlPtrTy_, git->second, nm);
