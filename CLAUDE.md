@@ -18,7 +18,47 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-01, D169 + native Test::More — 545/545 PASS,
+**Harness (2026-10-01, D170/D171 — 547/547 PASS, 0 FAIL):** A sixth
+real-script survey found and fixed two genuine **compiler crashes**
+plus a related interpolation bug. **D170**: a `use MODULE ...`
+statement with no terminating semicolon before end-of-input made
+`main.cpp`'s semicolon-scanning loop in `inlineModules()` walk one
+index past the lexer's trailing `EOF_TOK` sentinel (it only ever
+checked "not SEMI", never "not EOF_TOK"), so `useEnd` ended up ==
+`tokens.size()` — one past the last valid index — and every
+downstream `tokens[useEnd]`-based access indexed out of bounds: an
+assertion-failure crash in a debug `libstdc++`, undefined behavior
+otherwise. Found via a non-Perl `/usr/bin/perldoc` (a plain
+shell-script placeholder on this system, not actually Perl) fed to
+perlc by mistake — but the bounds bug is real and applies to any
+genuinely malformed/truncated `.pl` input, which perlc must reject
+gracefully, never crash on. Fixed by also stopping the scan at
+`EOF_TOK`. Self-verifying test (not part of the byte-for-byte harness
+corpus, following the D128 precedent):
+`tests/d170_malformed_use_crash.sh`. **D171**: two defects found via
+a real `/usr/bin/deb-systemd-helper` script's
+`$opts{'create_links'} //= 1;`. (1) Another genuine **compiler
+crash** — `||=`/`&&=`/`//=` on a hash element, array element,
+deref'd hash/array element (`$ref->{k}`/`$ref->[i]`), or plain scalar
+deref (`$$ref`) as the LHS: `emitLValue()` had no case at all for any
+of these (only `DollarAt`/`ScalarVar`/`SymbolicDeref` were handled),
+so its `default: return nullptr;` fired — and `NK::CompoundAssign`'s
+short-circuit branch created its two LLVM basic blocks *before*
+checking whether `emitLValue` succeeded, so the null-return early-exit
+left both permanently registered with no instructions and no
+terminator, an immediate LLVM verify-error crash on any of these
+extremely common LHS shapes. Fixed by adding the four missing
+`emitLValue` cases (reusing the same `perl_hash_lvalue_str/sv`/
+`perl_array_lvalue`/`perl_deref_scalar` runtime calls the non-compound
+assignment path already uses) and reordering so lvalue resolution
+happens before block creation — a general, defensive fix for any
+future unsupported lvalue kind too, not just these four. (2) Found
+while verifying (1): a quoted hash key inside string interpolation
+(`"$h{'key'}"`, `"$h{\"key\"}"`) was used as the literal,
+quote-included text instead of the quoted string's value, at all four
+duplicate interpolation-scanner sites that build a bareword-string key
+node. Tests: `tests/compound_assign_lvalue_{smoke,deep}.pl`.
+Previous session (2026-10-01, D169 + native Test::More — 545/545 PASS,
 0 FAIL):** Same fifth real-script survey. Implemented `Test::More`
 as a native module — the single most commonly used Perl testing/TAP
 framework (found missing via
@@ -684,7 +724,11 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D169 FIXED 2026-10-01**
+**Open generated-code defects:** none — **D171 FIXED 2026-10-01**
+(short-circuit compound-assign LLVM verify-crash on hash/array
+elements, plus a quoted-interpolation-key bug — see TESTS.md). **D170
+FIXED 2026-10-01** (out-of-bounds crash on a malformed/unterminated
+`use` statement — see TESTS.md). **D169 FIXED 2026-10-01**
 (`local $ref->{key}`/`local $ref->[idx]` was a hard parse error — see
 TESTS.md). **D168 FIXED 2026-10-01**
 (CODE-ref boolean-context truthiness, plus a use-after-free in

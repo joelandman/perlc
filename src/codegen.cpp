@@ -9218,11 +9218,20 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::CompoundAssign: {
         /* short-circuit compound assignments: ||= &&= //= */
         if (n.sval == "||" || n.sval == "&&" || n.sval == "//") {
+            /* D171: resolve the lvalue BEFORE creating any basic blocks —
+               emitLValue returns nullptr for any unsupported LHS kind,
+               and the two blocks below were previously created first,
+               so that early-return left them permanently registered on
+               the function with no instructions and no terminator: a
+               guaranteed LLVM verify-error crash on ANY unsupported
+               lvalue (not just the specific kinds now implemented in
+               emitLValue — this reordering is the general, defensive
+               half of the fix, independent of which kinds it supports). */
+            Value *lhsPtr = emitLValue(*n.left);
+            if (!lhsPtr) return perlUndef();
             auto *fn    = builder_.GetInsertBlock()->getParent();
             auto *rhsBB = BasicBlock::Create(ctx_, "sca.rhs", fn);
             auto *endBB = BasicBlock::Create(ctx_, "sca.end", fn);
-            Value *lhsPtr = emitLValue(*n.left);
-            if (!lhsPtr) return perlUndef();
             Value *lhsVal = builder_.CreateLoad(perlPtrTy_, lhsPtr);
             Value *test;
             if (n.sval == "//")
@@ -12300,6 +12309,83 @@ Value *CodeGen::emitLValue(const Node &n) {
         phi->addIncoming(holdRef, refBBp);
         phi->addIncoming(holdSym, symBBp);
         return phi;
+    }
+    /* D171: $h{key} / $arr[idx] / $ref->{key} / $ref->[idx] / $$ref as
+       the LHS of a short-circuit compound assignment (||= &&= //=) —
+       found via a real /usr/bin/deb-systemd-helper script's
+       `$opts{'create_links'} //= 1;`. None of these lvalue shapes had
+       a case here at all, so emitLValue's `default: return nullptr;`
+       fired — and NK::CompoundAssign's short-circuit branch created
+       its two LLVM basic blocks (sca.rhs/sca.end) *before* checking
+       whether emitLValue succeeded, so the null-return early-exit left
+       both blocks permanently registered on the function with zero
+       instructions and no terminator: a guaranteed "Basic Block ...
+       does not have a terminator!" LLVM verify-error crash on ANY
+       unsupported lvalue kind reaching this path, not just these four
+       — see the reordering in NK::CompoundAssign below for the general
+       defensive fix. These four cases are the actual feature fix:
+       each resolves to the same already-autovivified element cell
+       PerlValue* the non-compound assignment path already uses
+       (`perl_hash_lvalue_str/sv`, `perl_array_lvalue`,
+       `perl_deref_scalar`), wrapped in a fresh alloca so the generic
+       load/perl_assign machinery above (DollarAt/ScalarVar) can use it
+       uniformly. */
+    case NK::HashElem: {
+        if (n.name == "ENV" || n.name == "Config" || n.name == "Config::Config")
+            return nullptr; /* no lvalue cell for these synthetic hashes */
+        Value *hv = lookupHash(n.name);
+        if (!hv) return nullptr;
+        Value *pv;
+        if (Value *kp = constKeyPtr(*n.left, builder_))
+            pv = callRT("perl_hash_lvalue_str", {hv, kp});
+        else {
+            Value *key = emitExpr(*n.left);
+            pv = callRT("perl_hash_lvalue_sv", {hv, key});
+            freeIfOwned(key);
+        }
+        auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "he.lv");
+        builder_.CreateStore(pv, slot);
+        return slot;
+    }
+    case NK::ArrayElem: {
+        Value *av = lookupArray(n.name);
+        if (!av) return nullptr;
+        Value *idx = emitIdx(*n.left);
+        Value *pv = callRT("perl_array_lvalue", {av, idx});
+        auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "ae.lv");
+        builder_.CreateStore(pv, slot);
+        return slot;
+    }
+    case NK::ArrowDeref: {
+        Value *refVal = emitExpr(*n.left);
+        Value *pv;
+        if (n.sval == "array") {
+            Value *av = callRT("perl_deref_array", {refVal});
+            freeIfOwned(refVal);
+            Value *idx = emitIdx(*n.right);
+            pv = callRT("perl_array_lvalue", {av, idx});
+        } else {
+            Value *hv = callRT("perl_deref_hash", {refVal});
+            freeIfOwned(refVal);
+            if (Value *kp = constKeyPtr(*n.right, builder_))
+                pv = callRT("perl_hash_lvalue_str", {hv, kp});
+            else {
+                Value *key = emitExpr(*n.right);
+                pv = callRT("perl_hash_lvalue_sv", {hv, key});
+                freeIfOwned(key);
+            }
+        }
+        auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "ad.lv");
+        builder_.CreateStore(pv, slot);
+        return slot;
+    }
+    case NK::DerefScalar: {
+        Value *ref = emitExpr(*n.left);
+        Value *pv = callRT("perl_deref_scalar", {ref});
+        freeIfOwned(ref);
+        auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "ds.lv");
+        builder_.CreateStore(pv, slot);
+        return slot;
     }
     default: return nullptr;
     }

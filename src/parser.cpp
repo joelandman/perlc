@@ -10,6 +10,25 @@
    sequence in print/say/printf's filehandle-detection heuristic, indicate
    the IDENT is actually an operator (e.g. `print $x eq $y`) rather than a
    filehandle name (e.g. `print $fh @args`). */
+/* D171 (found while verifying the compound-assign lvalue crash fix):
+   a quoted hash key inside string interpolation ("$h{'key'}",
+   "$h{\"key\"}") was being used as the literal, quote-included text
+   (`'key'`, 3 extra chars) instead of the quoted string's VALUE —
+   `"$opts{'x'}"` silently printed nothing because the lookup key was
+   the 3-character string "'x'", not "x". Real Perl's interpolation
+   scanner strips exactly one matching layer of '...'/"..." around an
+   interpolated subscript's key text before using it as a bareword
+   string. Minimal: does not interpret backslash escapes inside a
+   double-quoted key — a key containing e.g. \" would need a nested
+   string lexer this intentionally avoids. */
+static std::string stripInterpKeyQuotes(const std::string &s) {
+    if (s.size() >= 2 &&
+        ((s.front() == '\'' && s.back() == '\'') ||
+         (s.front() == '"'  && s.back() == '"')))
+        return s.substr(1, s.size() - 2);
+    return s;
+}
+
 static bool isCmpOpWord(const std::string &w) {
     static const std::string cmpOps[] = {"eq","ne","lt","gt","le","ge","cmp","x","xor","and","or","not",""};
     for (int i = 0; !cmpOps[i].empty(); i++)
@@ -5418,7 +5437,7 @@ NodePtr Parser::parseSubscriptGroup(const std::string &raw, size_t &i, int line,
                 } else if (part.empty()) {
                     group.push_back(makeStr("", line));
                 } else {
-                    group.push_back(makeStr(part, line));
+                    group.push_back(makeStr(stripInterpKeyQuotes(part), line));
                 }
                 if (e >= inner.size()) break;
                 b = e + 1;
@@ -5745,7 +5764,7 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                              Lexer kl(key_s); auto ktoks = kl.tokenize();
                              keyExpr = Parser::parseExprFromTokens(std::move(ktoks));
                          } else {
-                             keyExpr = makeStr(key_s, line);
+                             keyExpr = makeStr(stripInterpKeyQuotes(key_s), line);
                          }
                          if (!arrowSeenQ && !haveSubscriptQ) {
                              auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
@@ -5845,7 +5864,7 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                             Lexer kl(key_s); auto ktoks = kl.tokenize();
                             keyExpr = Parser::parseExprFromTokens(std::move(ktoks));
                         } else {
-                            keyExpr = makeStr(key_s, line);
+                            keyExpr = makeStr(stripInterpKeyQuotes(key_s), line);
                         }
                         if (!arrowSeenQ && !haveSubscriptQ) {
                             auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
@@ -5919,7 +5938,7 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                         Lexer kl(key_s); auto ktoks = kl.tokenize();
                         keyExpr = Parser::parseExprFromTokens(std::move(ktoks));
                     } else {
-                        keyExpr = makeStr(key_s, line);
+                        keyExpr = makeStr(stripInterpKeyQuotes(key_s), line);
                     }
                     if (!arrowSeen && !haveSubscript) {
                         /* first subscript, no "->": plain $hash{key} */

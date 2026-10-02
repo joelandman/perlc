@@ -524,11 +524,27 @@ static std::vector<Token> inlineModules(
 
         std::string modName = tokens[i+1].text;
 
-        /* find semicolon end of this use statement */
+        /* find semicolon end of this use statement. D170: also stop at
+           EOF_TOK — the lexer always appends one trailing EOF_TOK
+           sentinel (the last element of `tokens`), but this loop only
+           ever checked "not SEMI", so a malformed/truncated `use`
+           statement with no semicolon before end-of-input ran straight
+           past that sentinel to `j == tokens.size()` — one past the
+           last valid index. `useEnd` (and the many `tokens[useEnd]`/
+           `tokens[useEnd-1]`/backward-scan-from-useEnd accesses all
+           through this function) then indexed out of bounds, an
+           assertion-failure crash in debug libstdc++, undefined
+           behavior otherwise. Found via a non-Perl `/usr/bin/perldoc`
+           (a plain shell-script placeholder on this system, not
+           actually Perl) being fed to perlc by mistake during a
+           real-script survey — but the underlying bounds bug is real
+           and applies to any genuinely malformed/truncated .pl input,
+           which perlc should reject gracefully, never crash on. */
         size_t j = i + 2;
-        while (j < tokens.size() && tokens[j].kind != TK::SEMI) j++;
-        size_t useEnd = j;  /* index of SEMI */
-        i = j < tokens.size() ? j + 1 : j;  /* advance past semicolon */
+        while (j < tokens.size() && tokens[j].kind != TK::SEMI &&
+               tokens[j].kind != TK::EOF_TOK) j++;
+        size_t useEnd = j;  /* index of SEMI (or EOF_TOK if unterminated) */
+        i = (j < tokens.size() && tokens[j].kind == TK::SEMI) ? j + 1 : j;
 
         /* use if COND, MODULE, ARGS — compile-time conditional use */
         if (modName == "if") {
