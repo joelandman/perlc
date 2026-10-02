@@ -18,7 +18,25 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-01, D172 — 549/549 PASS, 0 FAIL):** Continuing the
+**Harness (2026-10-01, D173 — 551/551 PASS, 0 FAIL):** A seventh
+real-script survey found that diamond-glob `<PATTERN>`'s pattern text
+was NOT variable-interpolated at all — D164's own write-up had
+claimed this matched real Perl ("the pattern text is a literal, not
+variable-interpolated"), but that claim was wrong/under-verified:
+real Perl always interpolates it, confirmed directly (`<$dir/*.txt>`
+with `$dir="/tmp"` must glob `/tmp/*.txt`, not the literal string
+`"$dir/*.txt"`). Found via a real `/usr/sbin/update-rc.d` script
+using the quoted form, `<"$dpkg_root/etc/rc[S12345].d/S[0-9][0-9]
+$scriptname">`, which also needed the lexer's glob-pattern safe-char
+allowlist widened (it previously aborted its scan on the opening
+`"`, falling back to a bare `<` token and a parse error). Fixed by
+routing the (optionally quote-stripped — real Perl strips a single
+surrounding `"..."`/`'...'` as pure delimiter syntax, confirmed even
+the single-quoted form still interpolates) pattern text through
+`Parser::parseInterpString()`, the same scanner ordinary `"..."`
+literals use, in both the list- and scalar-context codegen sites.
+Tests: `tests/diamond_glob_interp_{smoke,deep}.pl`.
+Previous session (2026-10-01, D172 — 549/549 PASS, 0 FAIL):** Continuing the
 sixth real-script survey. `last`/`next`/`redo` used as an EXPRESSION —
 most commonly the trailing operand of a comma expression immediately
 followed by an `if`/`unless` modifier (`$x = EXPR, last if COND;`) —
@@ -747,7 +765,9 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D172 FIXED 2026-10-01**
+**Open generated-code defects:** none — **D173 FIXED 2026-10-01**
+(diamond-glob `<PATTERN>` wasn't variable-interpolated — see
+TESTS.md). **D172 FIXED 2026-10-01**
 (`last`/`next`/`redo` as a comma-expression operand was a parse
 error, and `last`/`next` silently didn't actually jump once
 parseable — see TESTS.md). **D171 FIXED 2026-10-01**

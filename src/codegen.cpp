@@ -1765,13 +1765,36 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         /* D164: diamond-glob <PATTERN> in list context — the lexer only
            reaches here with non-identifier text (e.g. "*.md") when it's
            NOT a filehandle-shaped token; a pure identifier/scalar-var
-           name is handled by the branches below exactly as before. */
+           name is handled by the branches below exactly as before.
+           D173: real Perl always variable-interpolates this text —
+           confirmed directly against the real installed perl, which
+           contradicted D164's own "pattern is a literal, not
+           interpolated" scoping note (that note was wrong/under-
+           verified). Found via a real /usr/sbin/update-rc.d script:
+           `<"$dpkg_root/etc/rc[S12345].d/S[0-9][0-9]$scriptname">` —
+           the quoted form, which also needed the lexer's glob-pattern
+           safe-char set widened to allow `"`/`'` through at all (it
+           previously aborted the scan on the opening quote, falling
+           back to a bare '<' token and a confusing parse error). A
+           single matching layer of surrounding '"..."'/"'...'" is
+           stripped first (real Perl strips it as pure <...> delimiter
+           syntax, not pattern content — confirmed: a *single-quoted*
+           <'...'> interpolates its contents too, despite single quotes
+           normally meaning no interpolation; this diamond-glob form
+           just doesn't carry that distinction), then the remainder is
+           always run through the same interpolation scanner ordinary
+           "..." literals use. */
         bool isPureIdent = !n.sval.empty();
         for (char c : n.sval)
             if (!isalnum((unsigned char)c) && c != '_') { isPureIdent = false; break; }
         if (!isPureIdent) {
-            Value *pat = builder_.CreateGlobalStringPtr(n.sval);
-            Value *patPv = callRT("perl_alloc_string", {pat});
+            std::string patText = n.sval;
+            if (patText.size() >= 2 &&
+                ((patText.front() == '"' && patText.back() == '"') ||
+                 (patText.front() == '\'' && patText.back() == '\'')))
+                patText = patText.substr(1, patText.size() - 2);
+            NodePtr interpExpr = Parser::parseInterpString(patText, n.line, currentPackage_);
+            Value *patPv = emitExpr(*interpExpr);
             Value *av = callRT("perl_glob_val", {patPv});
             freeIfOwned(patPv);
             return av;
@@ -8005,13 +8028,26 @@ Value *CodeGen::emitExpr(const Node &n) {
            per call via the same per-callsite iterator state GlobFunc
            uses, then undef, then restart (see perl_glob_val_scalar).
            Only reached for non-identifier text; see the identical
-           check in the list-context branch just above this function. */
+           check in the list-context branch just above this function.
+           D173: interpolated like the list-context branch — see that
+           comment for the full rationale (real Perl always
+           interpolates this text; re-interpolating fresh on every
+           call here is correct and required, since
+           perl_glob_val_scalar's own "did the pattern change since
+           last call" check needs the actual current value each time,
+           e.g. inside `while (my $f = <$dir/*>)` where $dir could in
+           principle change between iterations). */
         bool isPureIdent = !n.sval.empty();
         for (char c : n.sval)
             if (!isalnum((unsigned char)c) && c != '_') { isPureIdent = false; break; }
         if (!isPureIdent) {
-            Value *pat = builder_.CreateGlobalStringPtr(n.sval);
-            Value *patPv = callRT("perl_alloc_string", {pat});
+            std::string patText = n.sval;
+            if (patText.size() >= 2 &&
+                ((patText.front() == '"' && patText.back() == '"') ||
+                 (patText.front() == '\'' && patText.back() == '\'')))
+                patText = patText.substr(1, patText.size() - 2);
+            NodePtr interpExpr = Parser::parseInterpString(patText, n.line, currentPackage_);
+            Value *patPv = emitExpr(*interpExpr);
             std::string gname = "globiter.ptr." + std::to_string(globIterSeq_++);
             auto *gptr = new GlobalVariable(*mod_, perlPtrTy_, false,
                 GlobalValue::InternalLinkage, ConstantPointerNull::get(perlPtrTy_), gname);

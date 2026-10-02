@@ -1228,7 +1228,7 @@ std::vector<Token> Lexer::tokenize() {
                     std::string rl;
                     static const std::string globSafeChars =
                         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-                        "0123456789_./\\-*?[]~@:+,$";
+                        "0123456789_./\\-*?[]~@:+,$\"'";
                     while (pos_ < src_.size() && src_[pos_] != '>' &&
                            globSafeChars.find(src_[pos_]) != std::string::npos)
                         rl += src_[pos_++];
