@@ -4225,6 +4225,23 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
+    /* D172: last/next/redo [LABEL] — also usable in expression
+       context, most commonly as the trailing operand of a comma
+       expression immediately followed by an `if`/`unless` modifier:
+       `$x = $_, last if COND;` (found verbatim in real
+       /usr/bin/perlbug and /usr/bin/perlthanks:
+       `$sendmail = $_, last if -e $_;`). Previously these three were
+       only ever recognized at full-statement dispatch (parseStmt),
+       so a bare `last`/`next`/`redo` appearing as a comma-expression
+       operand — a position parsePrimary must also handle — was an
+       "unexpected token" parse error. Reuses the same
+       parseLastNextRedoBody() the statement-level dispatch already
+       calls (optional LABEL, no leading keyword/trailing `;` of its
+       own) — the AST node it returns is identical either way. */
+    if (check(TK::KW_LAST))  { advance(); return parseLastNextRedoBody(NK::Last, line); }
+    if (check(TK::KW_NEXT))  { advance(); return parseLastNextRedoBody(NK::Next, line); }
+    if (check(TK::KW_REDO))  { advance(); return parseLastNextRedoBody(NK::Redo, line); }
+
     /* 'my $var [= expr]' in expression context (e.g. while (my $line = <$fh>)) */
     if (check(TK::KW_MY) && peek(1).kind == TK::SCALAR) {
         advance();  /* my */

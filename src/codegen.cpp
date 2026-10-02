@@ -8231,6 +8231,37 @@ Value *CodeGen::emitExpr(const Node &n) {
         return ConstantPointerNull::get(perlPtrTy_);
     }
 
+    /* D172: last/next as an EXPRESSION — e.g. the trailing operand of
+       a comma expression (`$x = EXPR, last if COND;`, found verbatim
+       in real /usr/bin/perlbug and /usr/bin/perlthanks), which reaches
+       emitExpr via NK::ArrayLit's per-element emitExpr loop, not
+       emitStmt. case NK::Last/NK::Next existed only in emitStmt, so
+       emitExpr's `default: return perlUndef();` silently swallowed
+       the control-flow jump entirely — the loop never actually broke/
+       continued, just evaluated to undef and fell through to whatever
+       code followed. Mirrors emitStmt's identical label-lookup logic
+       exactly (see the case NK::Last/NK::Next pair just above the
+       emitStmt/emitExpr split in this file), returning a null constant
+       like NK::Redo just above once the block is terminated by the
+       branch — never calling perl_alloc_undef() after a terminator. */
+    case NK::Last:
+        if (!n.sval.empty()) {
+            for (auto it = loopLabels_.rbegin(); it != loopLabels_.rend(); ++it)
+                if (it->name == n.sval) { builder_.CreateBr(it->exit); break; }
+        } else if (!loopExits_.empty()) {
+            builder_.CreateBr(loopExits_.back());
+        }
+        return ConstantPointerNull::get(perlPtrTy_);
+
+    case NK::Next:
+        if (!n.sval.empty()) {
+            for (auto it = loopLabels_.rbegin(); it != loopLabels_.rend(); ++it)
+                if (it->name == n.sval) { builder_.CreateBr(it->cont); break; }
+        } else if (!loopContinues_.empty()) {
+            builder_.CreateBr(loopContinues_.back());
+        }
+        return ConstantPointerNull::get(perlPtrTy_);
+
     case NK::LockStmt: {
         if (n.sval == "array") {
             Value *av = lookupArray(n.name);

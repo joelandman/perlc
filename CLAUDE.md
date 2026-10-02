@@ -18,7 +18,30 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-01, D170/D171 — 547/547 PASS, 0 FAIL):** A sixth
+**Harness (2026-10-01, D172 — 549/549 PASS, 0 FAIL):** Continuing the
+sixth real-script survey. `last`/`next`/`redo` used as an EXPRESSION —
+most commonly the trailing operand of a comma expression immediately
+followed by an `if`/`unless` modifier (`$x = EXPR, last if COND;`) —
+was a hard "unexpected token 'last'/'next'/'redo'" parse error; found
+verbatim (the identical source line) in two real scripts,
+`/usr/bin/perlbug` and `/usr/bin/perlthanks`:
+`$sendmail = $_, last if -e $_;`. Fixed the parse error by adding
+`last`/`next`/`redo` to `parsePrimary()` (they were previously only
+reachable via full-statement dispatch), reusing the existing
+`parseLastNextRedoBody()` helper. **Found while verifying this fix**:
+once parseable, `last`/`next` (unlike `redo`, which already had a
+case) silently did NOT actually break/continue the loop at all when
+reached this way — `case NK::Last`/`NK::Next` existed only in
+`emitStmt`, so `emitExpr`'s `default: return perlUndef();` fired when
+the comma-expression's `NK::ArrayLit` evaluator called `emitExpr` on
+them (not `emitStmt`), silently swallowing the control-flow jump
+entirely and falling through to whatever code followed — a real,
+silent-wrong-behavior bug, not just a parse error. Fixed by adding
+matching `emitExpr` cases mirroring `emitStmt`'s identical label-
+lookup logic exactly, following the same already-correct pattern
+`NK::Redo`'s own `emitExpr` case used. Tests:
+`tests/last_next_redo_expr_{smoke,deep}.pl`.
+Previous session (2026-10-01, D170/D171 — 547/547 PASS, 0 FAIL):** A sixth
 real-script survey found and fixed two genuine **compiler crashes**
 plus a related interpolation bug. **D170**: a `use MODULE ...`
 statement with no terminating semicolon before end-of-input made
@@ -724,7 +747,10 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D171 FIXED 2026-10-01**
+**Open generated-code defects:** none — **D172 FIXED 2026-10-01**
+(`last`/`next`/`redo` as a comma-expression operand was a parse
+error, and `last`/`next` silently didn't actually jump once
+parseable — see TESTS.md). **D171 FIXED 2026-10-01**
 (short-circuit compound-assign LLVM verify-crash on hash/array
 elements, plus a quoted-interpolation-key bug — see TESTS.md). **D170
 FIXED 2026-10-01** (out-of-bounds crash on a malformed/unterminated
