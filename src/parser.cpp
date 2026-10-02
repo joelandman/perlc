@@ -1796,8 +1796,26 @@ NodePtr Parser::parseReturn() {
    that arises from invoking the full `parseStmt` recursively. */
 NodePtr Parser::parseDieWarnBody(bool isDie, int line) {
     NodePtr msg;
-    if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK) && !check(TK::RBRACE))
+    if (!check(TK::SEMI) && !isModifier() && !check(TK::EOF_TOK) && !check(TK::RBRACE)) {
         msg = parseLowNot();
+        /* D178: die/warn LIST — a comma-separated multi-argument form
+           with no parens (`warn "a\n", "b\n", "c\n";`) — found via a
+           real /usr/bin/geteltorito script. Real Perl joins every
+           list element with NO separator (exactly like a multi-arg
+           print), not just the last one. Rather than wrapping the
+           extra args in an NK::ArrayLit (whose scalar-context
+           emitExpr already means "evaluate each, keep only the
+           last" — wrong semantics here), build a left-associative
+           string-concatenation chain (`.`) directly: the existing
+           `.` operator's codegen already stringifies and joins
+           operands correctly, with zero other changes needed. */
+        while (check(TK::COMMA)) {
+            advance();
+            if (check(TK::SEMI) || isModifier() || check(TK::EOF_TOK) || check(TK::RBRACE))
+                break;
+            msg = makeBin(".", std::move(msg), parseLowNot(), line);
+        }
+    }
     auto n = std::make_unique<Node>();
     n->kind = isDie ? NK::DieStmt : NK::WarnStmt; n->line = line;
     n->left = std::move(msg);

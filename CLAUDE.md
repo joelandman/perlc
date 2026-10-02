@@ -18,7 +18,25 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D177 — 559/559 PASS, 0 FAIL):** A tenth
+**Harness (2026-10-02, D178 — 561/561 PASS, 0 FAIL):** An eleventh
+real-script survey found `die`/`warn LIST` — a comma-separated
+multi-argument form with no parens (`warn "a\n", "b\n", "c\n";`) —
+was a hard "unexpected token ','" parse error. `parseDieWarnBody()`
+only ever parsed a single expression, with no comma-continuation at
+all, unlike `print`/`push` and similar LIST-taking builtins. Found
+via a real `/usr/bin/geteltorito` script's multi-line `warn` call.
+Fixed by having the parser build a left-associative string-
+concatenation chain (`.`) directly out of the comma-separated
+arguments, instead of wrapping them in an `NK::ArrayLit` (whose
+scalar-context `emitExpr` means "evaluate each, keep only the last"
+— wrong semantics for `die`/`warn`'s actual no-separator-join
+behavior, identical to a multi-arg `print`) — the existing `.`
+operator's codegen already stringifies and joins correctly, so no
+codegen changes were needed. Verified this doesn't regress D102's
+single-argument `die REF` reference-identity preservation (only
+engages when there's an actual trailing comma). Tests:
+`tests/die_warn_list_{smoke,deep}.pl`.
+Previous session (2026-10-02, D177 — 559/559 PASS, 0 FAIL):** A tenth
 real-script survey found `*NAME{IO}` (the IO slot of a typeglob —
 CLAUDE.md's own "Known remaining gaps" table had long listed this as
 a documented, not-yet-implemented limitation) was a hard "expected )
@@ -828,7 +846,9 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D177 FIXED 2026-10-02**
+**Open generated-code defects:** none — **D178 FIXED 2026-10-02**
+(`die`/`warn LIST`, comma-separated multi-arg form, was a parse
+error — see TESTS.md). **D177 FIXED 2026-10-02**
 (`*NAME{IO}` typeglob slot — see TESTS.md). **D176 FIXED 2026-10-02**
 (quoted heredoc delimiter with punctuation characters — see
 TESTS.md). **D175 FIXED 2026-10-02**
