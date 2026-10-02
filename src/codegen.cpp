@@ -8347,8 +8347,22 @@ Value *CodeGen::emitExpr(const Node &n) {
      }
 
     case NK::UnlinkFunc: {
+        /* `unlink @names;` / `unlink LIST` silently deleted nothing for
+           any list-producing argument (an array variable, a function
+           call returning a list, etc.) — each arg was always pushed
+           via plain emitExpr, which on an ArrayVar-shaped node doesn't
+           yield the flattened list of filenames perl_unlink_files()
+           needs, just some other (wrong) scalar value. Found via a
+           repo-root file cleanup bug in this project's own test suite:
+           `unlink @names;` at the end of a test script that itself
+           creates @names-listed files left them all behind. Mirrors
+           the emitArrayPtr-then-fallback-to-scalar pattern already
+           used by sort/die/warn's own LIST-argument handling. */
         Value *av = callRT("perl_array_new", {});
-        for (auto &a : n.args) callRT("perl_array_push", {av, emitExpr(*a)});
+        for (auto &a : n.args) {
+            if (Value *sub = emitArrayPtr(*a)) callRT("perl_array_extend", {av, sub});
+            else callRT("perl_array_push", {av, emitExpr(*a)});
+        }
         return callRT("perl_unlink_files", {av});
     }
 

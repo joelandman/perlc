@@ -114,6 +114,7 @@ private:
     NodePtr parseWhile();
     NodePtr parseFor();
     NodePtr parseForeach();
+    NodePtr parseForOrForeachCommon(int line);
     NodePtr parseForeachBody(int line);
     NodePtr parseSub();
     NodePtr parseMy();

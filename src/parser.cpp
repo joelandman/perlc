@@ -1060,7 +1060,20 @@ NodePtr Parser::parseWhile() {
 NodePtr Parser::parseFor() {
     int line = cur().line;
     consume(TK::KW_FOR);
+    return parseForOrForeachCommon(line);
+}
 
+/* Real Perl's `for` and `foreach` are full synonyms, including the
+   C-style three-clause form (`foreach ($i=0; $i<10; $i++) { }`) —
+   found via two separate real scripts in the same survey,
+   /usr/share/doc/ppp/examples/scripts/lcp_rtt_dump and
+   /usr/lib/llvm-22/libexec/ccc-analyzer, both spelling the C-style loop
+   with `foreach` instead of `for`. Previously only `KW_FOR` ran this
+   lookahead-for-a-top-level-`;`-inside-the-parens check; `KW_FOREACH`
+   went straight to the list/foreach-variable parse, so a `;` inside
+   its parens surfaced as a confusing "expected ) but got ';'". Shared
+   here so both keywords get identical treatment. */
+NodePtr Parser::parseForOrForeachCommon(int line) {
     /* peek: if next is '(' and body has ';', it's C-style */
     /* otherwise treat as foreach */
     if (check(TK::LPAREN)) {
@@ -1135,7 +1148,7 @@ NodePtr Parser::parseFor() {
 NodePtr Parser::parseForeach() {
     int line = cur().line;
     consume(TK::KW_FOREACH);
-    return parseForeachBody(line);
+    return parseForOrForeachCommon(line);
 }
 
 NodePtr Parser::parseForeachBody(int line) {

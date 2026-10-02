@@ -16602,11 +16602,17 @@ PerlArray *perl_glob_val(PerlValue *pattern) {
     /* D157: was GLOB_TILDE | GLOB_NOCHECK — GLOB_NOCHECK makes glob(3)
        return the literal pattern string when nothing matches, but real
        Perl's glob() returns an empty list on no match (verified against
-       real perl: `glob("*.nomatch")` gives `()`, not `("*.nomatch")`). */
+       real perl: `glob("*.nomatch")` gives `()`, not `("*.nomatch")`).
+       GLOB_BRACE added (D184 batch): real Perl's builtin glob()/
+       diamond-glob `<PATTERN>` brace-expands by default (`<*.{gz,txt}>`
+       — confirmed against real Perl), found via a real /usr/bin/
+       helpztags script; this codebase's lexer already allowed `{`/`}`
+       in a diamond-glob pattern's character set once added for this
+       fix, but glob(3) itself was never told to honor them. */
     char *pat = perl_to_string_dup(pattern);
     PerlArray *res = perl_array_new();
     glob_t g;
-    if (glob(pat, GLOB_TILDE, NULL, &g) == 0) {
+    if (glob(pat, GLOB_TILDE | GLOB_BRACE, NULL, &g) == 0) {
         for (size_t i = 0; i < g.gl_pathc; i++)
             perl_array_push(res, perl_alloc_string(g.gl_pathv[i]));
         globfree(&g);

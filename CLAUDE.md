@@ -18,7 +18,80 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D182+D183 — 571/571 PASS, 0 FAIL):** Two small,
+**Harness (2026-10-02, D184-D187 — 577/577 PASS, 0 FAIL):** **D187**:
+found while cleaning up this very test suite — `unlink @names;` /
+`unlink LIST` silently deleted NOTHING when the argument was a
+list-producing expression (an array variable, not a bare scalar
+filename). `case NK::UnlinkFunc`'s codegen pushed every argument via
+plain `emitExpr()`, which on an array-variable-shaped node doesn't
+yield the flattened filename list `perl_unlink_files()` needs — so
+the underlying `unlink(2)` calls never happened, with no error at
+all. Caught because D185's own `glob_brace_deep.pl` test (which
+creates temp files, then calls `unlink @names;` to clean them up at
+the end) left four 0-byte files behind in the repo root after a full
+`make test-all` run. Fixed by using the same `emitArrayPtr()`-then-
+scalar-fallback pattern already used elsewhere (sort/die/warn's own
+LIST-argument handling) instead of unconditional `emitExpr()`.
+Verified against real Perl for: the `@names`-array form (the exact
+shape that caused the leftover files), a multi-argument scalar-list
+form (`unlink 'a', 'b';`), and the single-bare-scalar form, confirming
+all three actually remove their files. Tests:
+`tests/unlink_list_{smoke,deep}.pl`.
+Previous session (2026-10-02, twelfth real-script survey + D184/D185 —
+573/573 PASS, 0 FAIL):** A ~31-script survey (small sample this round;
+~27 of 31 failures were missing-module `Can't locate` errors, not
+compiler defects — mostly Debian packaging tooling's internal
+`Debian::Debhelper::Dh_Lib`/`Dpkg::*` modules, not realistic
+general-CPAN candidates). **D184**: real Perl's `for` and `foreach`
+keywords are full synonyms, including the C-style three-clause form
+(`foreach (init; cond; step) { }`) — only `for` ran the lookahead that
+detects a top-level `;` inside the parens to pick the C-style parse;
+`foreach` went straight to the list/foreach-variable parse, so a `;`
+inside its parens was a hard "expected ) but got ';'" parse error.
+Found verbatim, the identical shape, in **two separate real scripts**
+in this one survey: `/usr/share/doc/ppp/examples/scripts/
+lcp_rtt_dump` and `/usr/lib/llvm-22/libexec/ccc-analyzer`. Fixed by
+extracting the shared C-style-vs-list lookahead/dispatch logic
+(previously only reachable from `parseFor()`) into a new
+`parseForOrForeachCommon()`, called from both `parseFor()` and
+`parseForeach()`. **D185**: the diamond-glob `<PATTERN>` syntax and
+the plain `glob()` builtin didn't brace-expand `{a,b,c}` alternation
+at all (`<*.{gz,txt}>` only ever matched the literal, never-found
+filename `"*.{gz,txt}"`, silently empty) — real Perl's default
+glob brace-expands. Found via a real `/usr/bin/helpztags` script:
+`foreach my $file (<*.{gz,txt,??x}>)`. Needed two fixes: the lexer's
+diamond-glob safe-character allowlist didn't include `{`/`}` at all
+(a hard parse error before even reaching the glob call), and
+`perl_glob_val` (the runtime behind both `glob()` and `<PATTERN>`)
+never passed `GLOB_BRACE` to the underlying `glob(3)` call. Verified
+the `{`/`}` allowlist addition doesn't regress ordinary hash-element
+comparisons (`$h{k} < 5 && ...`) — already guarded by the existing
+`ltAfterVal` check, confirmed with a dedicated regression test.
+Tests: `tests/foreach_cstyle_{smoke,deep}.pl`,
+`tests/glob_brace_{smoke,deep}.pl`. **Found, not fixed, while writing
+D184's deep test**: a narrow, pre-existing (reproduces identically
+with plain `for`, nothing to do with the `foreach` fix itself)
+scope-tracking bug — reusing the exact same loop-variable name (e.g.
+`$i`) across three sibling top-level `my` declarations in a specific
+sequence (a multi-var `my ($i,$j) = (...)` inside one C-style loop's
+init, then a plain `my $i = ...;`, then another C-style loop's own
+`my $i = ...` init) causes the LAST loop's body to silently never run
+— no crash, just missing output. Narrow enough (three same-named
+redeclarations in a row) that it's unlikely to bite real code, but
+logged here rather than silently worked around; minimal repro kept
+nearby for whoever picks it up next. **Also noted, not attempted**:
+`*$var = sub { ... }` (assigning to a *dynamically-named* typeglob —
+the "computed typeglob" pattern core `Config.pm` itself uses, and the
+exact shape hit by a real `/usr/bin/ucfq` script in this survey) is a
+much larger lift than a D-number-sized fix — this codebase's typeglob
+model resolves every `*NAME = ...` target at COMPILE time via a
+whole-program `collectGlobNames()` pre-pass, which fundamentally
+cannot know a dynamic name ahead of time; a real fix needs a runtime
+symbol-table for dynamically-named subs. This is the same item
+long-flagged as W16 from the 2026-09-15 survey ("Config.pm's computed
+typeglob is the top one") — still open, now re-confirmed hitting real
+scripts beyond Config.pm itself.
+Previous session (2026-10-02, D182+D183 — 571/571 PASS, 0 FAIL):** Two small,
 previously-logged-but-unfixed gaps, picked up directly rather than via
 a fresh survey. **D182**: bare `$+` (the "last bracket match of the
 last successful search pattern" special variable — distinct from
@@ -936,7 +1009,17 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D182+D183 FIXED 2026-10-02**
+**Open generated-code defects:** **D186** (narrow, pre-existing
+scope-tracking bug: reusing the same loop-variable name across three
+sibling top-level `my` declarations in a specific sequence silently
+drops the last loop's output — found while testing D184, reproduces
+with plain `for` too, nothing to do with D184's fix itself; see
+TESTS.md for the minimal repro) — not yet fixed. **D187 FIXED
+2026-10-02** (`unlink @names;`/`unlink LIST` silently deleted nothing
+for a list-producing argument — see TESTS.md). **D184+D185 FIXED
+2026-10-02** (C-style `foreach (init; cond; step)` was a parse error,
+and `<PATTERN>`/`glob()` didn't brace-expand `{a,b,c}` — see
+TESTS.md). **D182+D183 FIXED 2026-10-02**
 (bare `$+` not implemented at all, and `*{EXPR}{IO}` deref-glob form
 was a parse error — see TESTS.md). **D180+D181 FIXED 2026-10-02**
 (`sort({ BLOCK } LIST)` parenthesized-call form plus a single-bare-
