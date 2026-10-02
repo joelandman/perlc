@@ -3141,6 +3141,29 @@ NodePtr Parser::parsePrimary() {
         advance();
         auto n = std::make_unique<Node>(); n->kind = NK::Typeglob;
         n->name = cur().text; n->line = line; advance();
+        /* D177: *NAME{IO} — the IO slot of a typeglob, most commonly
+           used to pass a bareword filehandle like STDERR/STDOUT to a
+           sub expecting a real filehandle value (`usage(*STDERR{IO});`
+           — found verbatim, the identical idiom, in three separate
+           real scripts across two surveys: /usr/bin/linux-version,
+           /usr/lib/emacsen-common/emacs-package-remove,
+           /usr/bin/linux-run-hooks). perlc's typeglob model already
+           resolves a bare `*NAME` for a known glob/FH name directly to
+           the underlying filehandle value (see emitExpr's
+           `case NK::Typeglob`) — `{IO}` on a bareword filehandle name
+           doesn't need to select anything different, so this is a
+           pure parser-level no-op: consume and discard the `{IO}`
+           subscript, keeping the exact same Typeglob node. Other
+           typeglob slots (`{FORMAT}`, `{SCALAR}`, etc.) and `{IO}` on
+           something that ISN'T already a recognized filehandle name
+           remain out of scope — this codebase's typeglob model has no
+           general "multiple named slots on one object" representation
+           to select from. */
+        if (check(TK::LBRACE) && pos_ + 2 < toks_.size() &&
+            toks_[pos_+1].kind == TK::IDENT && toks_[pos_+1].text == "IO" &&
+            toks_[pos_+2].kind == TK::RBRACE) {
+            advance(); advance(); advance(); /* { IO } */
+        }
         return n;
     }
 

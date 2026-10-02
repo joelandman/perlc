@@ -18,7 +18,25 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D176 — 557/557 PASS, 0 FAIL):** A ninth
+**Harness (2026-10-02, D177 — 559/559 PASS, 0 FAIL):** A tenth
+real-script survey found `*NAME{IO}` (the IO slot of a typeglob —
+CLAUDE.md's own "Known remaining gaps" table had long listed this as
+a documented, not-yet-implemented limitation) was a hard "expected )
+but got '{'" parse error. Most commonly seen passing a bareword
+filehandle like STDERR/STDOUT to a sub expecting a real filehandle
+value: `usage(*STDERR{IO});`. Found verbatim — the identical idiom —
+in **three separate real scripts** across two surveys:
+`/usr/bin/linux-version`, `/usr/lib/emacsen-common/
+emacs-package-remove`, `/usr/bin/linux-run-hooks`. Fixed as a pure
+parser-level no-op: perlc's typeglob model already resolves a bare
+`*NAME` for a known glob/FH name directly to the underlying
+filehandle value, so `{IO}` right after a bareword `*NAME` just gets
+consumed and discarded, keeping the exact same `NK::Typeglob` node.
+Scoped out (not found in any real script, a separate and more
+advanced feature): `*{EXPR}{IO}` — the symbolic/deref-glob form on a
+non-bareword expression like a lexical filehandle variable. Tests:
+`tests/typeglob_io_slot_{smoke,deep}.pl`.
+Previous session (2026-10-02, D176 — 557/557 PASS, 0 FAIL):** A ninth
 real-script survey found that a QUOTED heredoc delimiter containing
 non-alnum/underscore characters (`<<'!END!'`, `<<"TAG WITH SPACES"`)
 was a hard "unexpected token '<<'" parse error — the delimiter scan
@@ -810,7 +828,8 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D176 FIXED 2026-10-02**
+**Open generated-code defects:** none — **D177 FIXED 2026-10-02**
+(`*NAME{IO}` typeglob slot — see TESTS.md). **D176 FIXED 2026-10-02**
 (quoted heredoc delimiter with punctuation characters — see
 TESTS.md). **D175 FIXED 2026-10-02**
 (`$]` not implemented at all — see TESTS.md). **D174 FIXED
@@ -914,7 +933,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 
 | Gap | Notes |
 |-----|-------|
-| Typeglob `{IO}`/`{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, and bare `open LOG` / `print LOG` work. `*FH{IO}` / FORMAT slots are not implemented. |
+| Typeglob `{IO}`/`{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, bare `open LOG` / `print LOG`, and `*BAREWORD{IO}` (D177, 2026-10-02 — e.g. `*STDERR{IO}`) work. `*{EXPR}{IO}` (deref form on a non-bareword expression) and `{FORMAT}` slots are not implemented. |
 | Full XS | DynaLoader-compatible FFI: `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load` (perlc `.so`/`.pl` modules + raw C via `XS::call` sig dispatch). Real perlguts XSUBs (SV* ABI) not implemented |
 | `pidigits.pl` vs perl | PASS — was `undef $s` not clearing the accumulator, not mini-gmp. |
 | Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |
