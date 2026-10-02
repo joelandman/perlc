@@ -578,6 +578,8 @@ void CodeGen::declareRuntime() {
     RT("perl_quotemeta_str", pv, pv);
     RT("perl_get_perl_version", pv);
     RT("perl_get_dollar_rbracket", pv);
+    RT("perl_get_dollar_plus", pv);
+    RT("perl_resolve_glob_io", pv, pv);
     RT("perl_pod2usage", pv, av);
     RT("perl_syscall",    pv, pv);
     RT("perl_fork",              pv);
@@ -1479,6 +1481,15 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         /* collect input array */
         Value *av = nullptr;
         if (n.left) av = emitArrayPtr(*n.left);
+        if (n.left && !av) {
+            /* n.left is a single scalar-shaped expression (e.g. a bare
+               literal: `sort { ... } 9`) rather than a list-producing
+               node emitArrayPtr knows how to expand — treat it as a
+               one-element list instead of silently sorting an empty
+               array. */
+            av = callRT("perl_array_new", {});
+            callRT("perl_array_push", {av, emitExpr(*n.left)});
+        }
         if (!av && !n.args.empty()) {
             if (n.args.size() == 1) {
                 av = emitArrayPtr(*n.args[0]);
@@ -4825,6 +4836,8 @@ static void scanMatchGlobalUse(const Node &n, bool &amp, bool &caps, bool &dynEv
         amp = true;
     if (n.kind == NK::CaptureVar)
         caps = true;
+    if (n.kind == NK::ScalarVar && n.name == "+")
+        caps = true;
     if ((n.kind == NK::HashElem || n.kind == NK::HashVar || n.kind == NK::HashSlice)
         && n.name == "+")
         caps = true;
@@ -7856,6 +7869,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.name == "&")  return callRT("perl_get_dollar_amp",   {});
         if (n.name == "?")  return callRT("perl_get_dollar_question", {});
         if (n.name == "]")  return callRT("perl_get_dollar_rbracket", {});
+        if (n.name == "+")  return callRT("perl_get_dollar_plus", {});
         /* $AUTOLOAD — set by dispatch when AUTOLOAD is called */
         if (n.name == "AUTOLOAD") return callRT("perl_get_autoload_name", {});
         if (n.name == "ARGV") return callRT("perl_get_dollar_argv", {});
@@ -9715,6 +9729,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::Call: return emitCall(n);
 
     case NK::Typeglob: {
+        /* *{EXPR}{IO} — the deref-glob form. n.left holds EXPR (a
+           glob-ref like `\*STDOUT`, or a lexical filehandle variable);
+           resolve it to a usable filehandle value at runtime rather
+           than this node's usual bareword-name resolution below. */
+        if (n.left) {
+            Value *inner = emitExpr(*n.left);
+            return callRT("perl_resolve_glob_io", {inner});
+        }
         /* If this name is a glob/FH, return the scalar/IO cell so
            print {LOG} / close LOG work. Otherwise stringify *pkg::name. */
         if (isGlobName(n.name) || n.name == "STDOUT" || n.name == "STDERR" ||

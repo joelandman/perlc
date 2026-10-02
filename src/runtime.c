@@ -16908,6 +16908,36 @@ PerlValue *perl_get_dollar_rbracket(void) {
     return perl_alloc_string("5.044000");
 }
 
+/* Bare $+ — "the last bracket match of the last successful search
+   pattern": the text captured by the highest-numbered group that
+   actually PARTICIPATED in the match (not just the highest-numbered
+   group in the pattern — a later, non-participating group, e.g. `(a)
+   (b)?` matching "a", must be skipped). install_match_captures()
+   already leaves a non-participating perl_captures_[i] as NULL, so
+   scanning from the top down for the first non-NULL entry gives
+   exactly this. Found broken (bare, non-subscripted form; distinct
+   from the already-working %+ named-capture hash, `$+{name}`) as a
+   side effect of D175's $] investigation — not fixed there since it
+   wasn't what that script needed. */
+PerlValue *perl_get_dollar_plus(void) {
+    for (int i = PERL_MAX_CAPTURES; i >= 1; i--) {
+        if (perl_captures_[i]) return perl_clone(perl_captures_[i]);
+    }
+    return perl_alloc_undef();
+}
+
+/* *{EXPR}{IO} — resolve EXPR (typically a glob-ref like `\*STDOUT`, or
+   a lexical filehandle variable already holding a usable filehandle
+   value directly) to the actual filehandle value. Mirrors D177's
+   bareword *NAME{IO} (a no-op passthrough for a known glob/FH name)
+   for the general expression form: a scalar-ref is unwrapped to its
+   target; anything else (already a bare filehandle value) passes
+   through unchanged. */
+PerlValue *perl_resolve_glob_io(PerlValue *v) {
+    if (v && v->tag == PERL_REF_SCALAR) return perl_deref_scalar(v);
+    return v;
+}
+
 /* ── XS / FFI support ───────────────────────────────────────────────────── */
 
 typedef struct PerlXSModuleInfo {

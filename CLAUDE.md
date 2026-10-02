@@ -18,7 +18,79 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D179 — 563/563 PASS, 0 FAIL):** Continuing
+**Harness (2026-10-02, D182+D183 — 571/571 PASS, 0 FAIL):** Two small,
+previously-logged-but-unfixed gaps, picked up directly rather than via
+a fresh survey. **D182**: bare `$+` (the "last bracket match of the
+last successful search pattern" special variable — distinct from
+`%+`'s already-working named-capture hash, `$+{name}`) was not
+implemented at all, in either a bare expression or string
+interpolation — found as a side effect of D175's `$]` investigation,
+logged but not fixed there since it wasn't what that script needed.
+Needed the same two-system fix D175 did: (1) the main parser already
+tokenized `$+` correctly (reusing its existing single-token
+`cur().text == "+"` branch) but built a plain, never-populated scalar
+variable instead of reading the actual last-paren-match value; (2)
+the separate string-interpolation scanner had a case for `$+{...}`
+but none for bare `$+`. Both now call a new `perl_get_dollar_plus()`,
+which scans the existing `perl_captures_[]` array (already populated
+by every successful match, just never read this way before) from the
+highest index down for the first non-NULL entry — giving exactly "the
+highest-numbered group that actually participated," correctly
+skipping a later, non-participating optional group (`(a)(b)?`
+matching `"a"` must yield group 1, not undef from group 2). Also
+needed `scanMatchGlobalUse()` (the whole-program pre-pass that decides
+whether match captures are worth populating at all) extended to treat
+bare `$+` as a capture-user, the same way it already does for `%+`.
+**D183**: `*{EXPR}{IO}` — the deref-glob form of D177's bareword
+`*NAME{IO}` (e.g. `*STDERR{IO}`), on an arbitrary expression (a
+glob-ref like `\*STDOUT`, or a lexical filehandle variable) instead of
+a literal bareword name — was a hard "unexpected token '\*'" parse
+error. Explicitly scoped out of D177 at the time (no real script
+needed it yet, and this codebase's typeglob model has no general
+multi-slot glob representation). Fixed the same way as D177, just one
+level more general: the parser now recognizes `*{EXPR}{IO}` (consuming
+the whole `{IO}` subscript as before, still the only slot supported),
+building the existing `NK::Typeglob` node but with the EXPR stored in
+its (otherwise bareword-only) node's `left` field; a new runtime
+helper `perl_resolve_glob_io()` resolves whatever EXPR evaluates to at
+runtime — unwrapping a scalar-ref (`\*STDOUT`'s shape) to its target,
+or passing an already-bare filehandle value (an `open`ed lexical `$fh`)
+straight through unchanged — covering both representations without
+needing to know which one a given EXPR will produce at compile time.
+Tests: `tests/dollar_plus_{smoke,deep}.pl`,
+`tests/typeglob_deref_io_{smoke,deep}.pl`.
+Previous session (2026-10-02, D180+D181 — 567/567 PASS, 0 FAIL):** Two parse
+errors found while triaging leftover candidates from the eleventh
+real-script survey. **D180**: `sort({ BLOCK } LIST)` — the whole call,
+comparator block included, wrapped in one set of parens (real Perl
+allows this; the parenthesized-call-with-block form, e.g.
+`sort({ version_cmp($a->[0], $b->[0]) * $sign } @versions)`) — was a
+hard "expected ) but got '@'" parse error, since `sort`'s existing
+`{ ... }` comparator-block detection ran only on the token
+immediately after the `sort` keyword, never looking past a leading
+`(`. Fixed by peeking past a leading `LPAREN` for an immediately-
+following `LBRACE`, and closing the matching `RPAREN` at every return
+point of the `sort` parse via a small `finishSort()` helper. Found,
+and fixed in the same pass since it was directly on the codegen path
+just touched, a second, narrower, pre-existing bug: `sort { ... } 9`
+(sorting a *single bare scalar literal*, no array variable, with or
+without the new paren-wrap) silently sorted an empty list — `n.left`
+being a plain non-list-producing expression made `emitArrayPtr` return
+null with no fallback, unlike the sibling `n.args` multi-element path
+which already had one. **D181**: `require v5.8.1;` (a `v`-prefixed
+dotted-decimal VERSION, lexing as `IDENT "v5" DOT INT "8" DOT INT
+"1"`) was a hard "unexpected token '.'" parse error — `require`'s
+VERSION handling only recognized a plain `FLOAT`/`INT` form (`require
+5.008;`). Fixed by recognizing a leading `v`+digit identifier (mirroring
+the existing `use v5.36` detection) and consuming any trailing
+`.NUMBER` components as a no-op, matching the existing numeric-VERSION
+no-op behavior — like the pre-existing numeric form, this is a parse-
+time no-op with no runtime version check at all (an already-documented
+scope limit, not new to this fix): real Perl dies at runtime for an
+unsatisfiable VERSION (`require v10;` on a v5.44 host), while perlc
+always accepts it. Tests: `tests/sort_wrapped_paren_{smoke,deep}.pl`,
+`tests/require_vversion_{smoke,deep}.pl`.
+Previous session (2026-10-02, D179 — 563/563 PASS, 0 FAIL):** Continuing
 the eleventh real-script survey. `not` nested inside a
 tighter-binding expression (e.g. `$a && not $b`) was a hard
 "unexpected token 'not'" parse error — `not` was only ever reachable
@@ -864,7 +936,12 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D179 FIXED 2026-10-02**
+**Open generated-code defects:** none — **D182+D183 FIXED 2026-10-02**
+(bare `$+` not implemented at all, and `*{EXPR}{IO}` deref-glob form
+was a parse error — see TESTS.md). **D180+D181 FIXED 2026-10-02**
+(`sort({ BLOCK } LIST)` parenthesized-call form plus a single-bare-
+scalar `sort` argument silently sorting empty, and `require v5.8.1;`
+dotted-v VERSION form — see TESTS.md). **D179 FIXED 2026-10-02**
 (`not` nested inside a tighter-binding expression like `$a && not $b`
 — see TESTS.md). **D178 FIXED 2026-10-02**
 (`die`/`warn LIST`, comma-separated multi-arg form, was a parse
@@ -973,7 +1050,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 
 | Gap | Notes |
 |-----|-------|
-| Typeglob `{IO}`/`{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, bare `open LOG` / `print LOG`, and `*BAREWORD{IO}` (D177, 2026-10-02 — e.g. `*STDERR{IO}`) work. `*{EXPR}{IO}` (deref form on a non-bareword expression) and `{FORMAT}` slots are not implemented. |
+| Typeglob `{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, bare `open LOG` / `print LOG`, `*BAREWORD{IO}` (D177), and `*{EXPR}{IO}` (D183, 2026-10-02 — deref form on an arbitrary expression, e.g. `*{\*STDOUT}{IO}`/`*{$fh}{IO}`) all work. Only the `{IO}` slot is modeled; `{FORMAT}` and other typeglob slots are not implemented. |
 | Full XS | DynaLoader-compatible FFI: `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load` (perlc `.so`/`.pl` modules + raw C via `XS::call` sig dispatch). Real perlguts XSUBs (SV* ABI) not implemented |
 | `pidigits.pl` vs perl | PASS — was `undef $s` not clearing the accumulator, not mini-gmp. |
 | Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |

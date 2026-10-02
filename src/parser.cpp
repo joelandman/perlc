@@ -929,7 +929,19 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_REQUIRE)) {
         advance();
         std::string modname;
-        /* require Module::Name  or  require "file.pm"  or  require VERSION */
+        /* require Module::Name  or  require "file.pm"  or  require VERSION
+           (require 5.008;)  or  require vVERSION (require v5.8.1;) — the
+           latter lexes as IDENT "v5" DOT INT "8" DOT INT "1". No-op like
+           the numeric VERSION form (host is new enough); consume any
+           trailing .NUMBER components. */
+        if (check(TK::IDENT) && cur().text.size() >= 2 &&
+            cur().text[0] == 'v' && isdigit((unsigned char)cur().text[1])) {
+            advance(); /* vN */
+            while (match(TK::DOT) && (check(TK::INT) || check(TK::FLOAT))) advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
+            n->sval = ""; n->line = line;
+            return parseModifier(std::move(n), line);
+        }
         if (check(TK::IDENT)) { modname = cur().text; advance(); }
         else if (check(TK::STRING)) { modname = cur().text; advance(); }
         else if (check(TK::FLOAT) || check(TK::INT)) {
@@ -3177,6 +3189,30 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
+    /* *{EXPR}{IO} — the deref-glob form of D177's *BAREWORD{IO}, on an
+       arbitrary expression (typically a glob-ref like `\*STDOUT` or a
+       lexical filehandle variable) rather than a literal bareword name.
+       Scoped out at D177 time (no real script needed it); this codebase's
+       typeglob model still has no general multi-slot glob representation,
+       so (like D177) only the `{IO}` slot is recognized — the inner EXPR
+       is kept as-is and resolved to a usable filehandle value at runtime
+       (perl_resolve_glob_io: unwraps a scalar-ref to its target, passes
+       an already-bare filehandle value through unchanged). */
+    if (check(TK::STAR) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
+        advance(); advance(); /* * { */
+        auto inner = parseExpr();
+        consume(TK::RBRACE, "}");
+        if (check(TK::LBRACE) && pos_ + 2 < toks_.size() &&
+            toks_[pos_+1].kind == TK::IDENT && toks_[pos_+1].text == "IO" &&
+            toks_[pos_+2].kind == TK::RBRACE) {
+            advance(); advance(); advance(); /* { IO } */
+            auto n = std::make_unique<Node>(); n->kind = NK::Typeglob;
+            n->left = std::move(inner); n->line = line;
+            return n;
+        }
+        throw std::runtime_error(parseErrPrefix(line) + "expected {IO} after *{EXPR}");
+    }
+
     /* typeglob: *NAME at expression start */
     if (check(TK::STAR) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::IDENT) {
         advance();
@@ -4008,6 +4044,27 @@ NodePtr Parser::parsePrimary() {
     /* sort LIST  or  sort { CMP } LIST  or  sort keys %h  or  sort @arr */
     if (check(TK::KW_SORT)) {
         advance();
+        /* sort({ BLOCK } LIST) — the whole call, block included, wrapped in
+           one set of parens (real Perl allows this; found via a real
+           /usr/bin/podebconf-report-po-like script using
+           `sort({ $a->[0] <=> $b->[0] } @list)`). Detected by peeking past
+           a leading LPAREN for an immediately-following LBRACE; otherwise
+           the LPAREN is left alone for the ordinary `sort(LIST)` path
+           below. */
+        bool sortWrapParen = false;
+        if (check(TK::LPAREN)) {
+            size_t save = pos_;
+            advance();
+            if (check(TK::LBRACE)) {
+                sortWrapParen = true;
+            } else {
+                pos_ = save;
+            }
+        }
+        auto finishSort = [&](NodePtr n) -> NodePtr {
+            if (sortWrapParen) consume(TK::RPAREN, ")");
+            return n;
+        };
         /* detect sort { $a <=> $b } or { $b <=> $a } or sort { BLOCK } */
         std::string sortMode;
         NodePtr sortBlock;
@@ -4061,14 +4118,14 @@ NodePtr Parser::parsePrimary() {
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
             n->left = std::move(inner); n->sval = sortMode; n->line = line;
             n->body = std::move(sortBlock); n->name = sortSubName;
-            return n;
+            return finishSort(std::move(n));
         }
         if (check(TK::ARRAY)) {
             auto inner = parsePrimary();
             auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
             n->left = std::move(inner); n->sval = sortMode; n->line = line;
             n->body = std::move(sortBlock); n->name = sortSubName;
-            return n;
+            return finishSort(std::move(n));
         }
         if (check(TK::LPAREN) || check(TK::QWORDS)) {
             if (check(TK::QWORDS)) {
@@ -4110,13 +4167,13 @@ NodePtr Parser::parsePrimary() {
                 auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
                 n->left = std::move(inner); n->sval = sortMode; n->line = line;
                 n->body = std::move(sortBlock); n->name = sortSubName;
-                return n;
+                return finishSort(std::move(n));
             }
         }
         auto n = std::make_unique<Node>(); n->kind = NK::SortFunc;
         n->args = std::move(elems); n->sval = sortMode; n->line = line;
         n->body = std::move(sortBlock); n->name = sortSubName;
-        return n;
+        return finishSort(std::move(n));
     }
 
     /* pop / shift */
@@ -5644,6 +5701,15 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 n->left = makeStr(key, line); n->line = line;
                 parts.push_back(std::move(n));
                 continue;
+            }
+            /* bare $+ — the last-paren-match special variable (distinct
+               from %+'s named-capture hash just above). Found
+               independently broken — even outside %+'s subscripted
+               form — as a side effect of D175's $] investigation. */
+            if (nc == '+') {
+                flush();
+                parts.push_back(makeScalar("+", line));
+                i += 2; continue;
             }
         }
         /* $0 — program name */

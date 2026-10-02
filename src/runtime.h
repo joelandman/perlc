@@ -898,6 +898,8 @@ PerlValue *perl_getpid(void);                  /* getpid() */
 PerlValue *perl_get_os_name(void);             /* $^O — "linux" */
 PerlValue *perl_get_perl_version(void);        /* $^V stringified as 5.x.y */
 PerlValue *perl_get_dollar_rbracket(void);     /* D175: $] — oldstyle decimal version */
+PerlValue *perl_get_dollar_plus(void);         /* bare $+ — last paren match */
+PerlValue *perl_resolve_glob_io(PerlValue *v); /* *{EXPR}{IO} — deref-glob form */
 
 /* ── UNIVERSAL isa / can ──────────────────────────────────────────────────── */
 PerlValue *perl_isa_check(PerlValue *obj, PerlValue *class_pv);
