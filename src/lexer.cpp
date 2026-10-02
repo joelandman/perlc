@@ -348,10 +348,24 @@ Token Lexer::readHeredoc() {
         quote  = src_[pos_++];
         interp = (quote == '"');
     }
-    /* read delimiter name */
+    /* read delimiter name. D176: a QUOTED heredoc delimiter
+       (<<'!END!', <<"TAG WITH SPACES") allows ANY character up to the
+       closing quote in real Perl — not just alnum/underscore, which
+       this scan previously enforced even for the quoted form. Found
+       recurring across two separate real-script surveys: a real
+       /usr/lib/.../Config_heavy.pl (Perl's own generated Config.pm
+       support file!) uses `our $summary = <<'!END!';`. The bareword
+       (unquoted) form keeps the stricter alnum/underscore-only scan —
+       real Perl's own bareword-identifier rule for that form is
+       unchanged. */
     std::string delim;
-    while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
-        delim += src_[pos_++];
+    if (quote) {
+        while (pos_ < src_.size() && src_[pos_] != quote && src_[pos_] != '\n')
+            delim += src_[pos_++];
+    } else {
+        while (pos_ < src_.size() && (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+            delim += src_[pos_++];
+    }
     if (delim.empty())
         return {TK::EOF_TOK, "", line_}; /* not a heredoc — caller handles */
     /* A digit-leading unquoted delimiter (`1<<5`) is the left-shift

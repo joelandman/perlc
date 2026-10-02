@@ -18,7 +18,21 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D174/D175 — 555/555 PASS, 0 FAIL):** An eighth
+**Harness (2026-10-02, D176 — 557/557 PASS, 0 FAIL):** A ninth
+real-script survey found that a QUOTED heredoc delimiter containing
+non-alnum/underscore characters (`<<'!END!'`, `<<"TAG WITH SPACES"`)
+was a hard "unexpected token '<<'" parse error — the delimiter scan
+enforced the stricter bareword-identifier rule even for the quoted
+form, when real Perl allows any character up to the closing quote
+there. Found recurring across two separate surveys, in a real
+`/usr/lib/.../Config_heavy.pl` — part of Perl's own generated
+`Config.pm` support files, not an obscure third-party script:
+`our $summary = <<'!END!';`. Fixed in `src/lexer.cpp`'s
+`readHeredoc()` by giving the quoted and unquoted delimiter forms
+separate scan rules (quoted: any char up to the matching quote;
+unquoted: unchanged, alnum/underscore only). Tests:
+`tests/heredoc_punct_delim_{smoke,deep}.pl`.
+Previous session (2026-10-02, D174/D175 — 555/555 PASS, 0 FAIL):** An eighth
 real-script survey found two more parse/lexer gaps. **D174**:
 `q(...)`/`qq(...)`/`qx(...)` with a true bracketing delimiter pair
 (`()`, `[]`, `<>` — where open and close differ, as opposed to a
@@ -796,7 +810,9 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D175 FIXED 2026-10-02**
+**Open generated-code defects:** none — **D176 FIXED 2026-10-02**
+(quoted heredoc delimiter with punctuation characters — see
+TESTS.md). **D175 FIXED 2026-10-02**
 (`$]` not implemented at all — see TESTS.md). **D174 FIXED
 2026-10-02** (`q()`/`qq()`/`qx()` nested-bracket-delimiter depth
 tracking — see TESTS.md). **D173 FIXED 2026-10-01**
