@@ -2874,6 +2874,29 @@ NodePtr Parser::interpRegexPattern(const std::string &pattern, int line) {
 NodePtr Parser::parsePrimary() {
     int line = cur().line;
 
+    /* D179: `not` nested inside a tighter-binding expression, e.g.
+       `$a && not $b` (found via a real /usr/bin/podebconf-report-po
+       script: `if ($LANGUAGETEAM_ARG && defined $CALL && not
+       $CALL_WITH_TRANSLATORS)`). `not` is normally only reachable at
+       the very bottom of the precedence chain (parseLowNot(), below
+       even assignment) — real Perl's `not` genuinely DOES have lower
+       precedence than `&&`, but it's also a prefix operator that can
+       appear wherever a term/operand is expected; when nothing follows
+       its own operand for it to (loosely) absorb, `not $b` simply
+       becomes the complete, self-contained operand `&&` needed,
+       exactly as if it had been written `$a && (not $b)`. Without this
+       check, `&&`'s right-operand parsing calls down through the
+       chain to here and finds no case for a bare `not`, failing with
+       "unexpected token 'not'". Skipped in hash-key context
+       ($h{not} is the literal string key "not", matching every other
+       keyword's existing behavior there) by simply not short-
+       circuiting ahead of that check below. */
+    if (!inKeyContext_ && check(TK::KW_NOT) &&
+        !(pos_ + 1 < toks_.size() && toks_[pos_ + 1].kind == TK::FATARROW)) {
+        advance();
+        return makeUnary("!", parseLowNot(), line);
+    }
+
     /* D136 (part 2): inside a hash subscript key context ($h{all}),
        ANY bareword-ish token — keyword or identifier — is the string
        key, whatever follows (`my @a = @{ $r->{all} };` previously died

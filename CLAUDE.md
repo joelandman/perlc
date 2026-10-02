@@ -18,7 +18,25 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D178 — 561/561 PASS, 0 FAIL):** An eleventh
+**Harness (2026-10-02, D179 — 563/563 PASS, 0 FAIL):** Continuing
+the eleventh real-script survey. `not` nested inside a
+tighter-binding expression (e.g. `$a && not $b`) was a hard
+"unexpected token 'not'" parse error — `not` was only ever reachable
+at the very bottom of the precedence chain (`parseLowNot()`, below
+even assignment), but real Perl's `not`, despite genuinely having
+lower precedence than `&&`, is also a prefix operator usable
+wherever a term is expected; with nothing following for it to
+(loosely) absorb, `not $b` becomes a complete, self-contained
+operand, exactly as if written `$a && (not $b)`. Found via a real
+`/usr/bin/podebconf-report-po` script:
+`if ($LANGUAGETEAM_ARG && defined $CALL && not $CALL_WITH_TRANSLATORS)`.
+Fixed by adding a `KW_NOT` check to `parsePrimary()` itself (guarded
+against breaking the existing `not => 1` bareword-before-`=>`
+auto-quote special case, and against hash-key context where `not` is
+a literal string key) that delegates to the same `parseLowNot()`
+logic the statement-level case already uses. Tests:
+`tests/not_nested_expr_{smoke,deep}.pl`.
+Previous session (2026-10-02, D178 — 561/561 PASS, 0 FAIL):** An eleventh
 real-script survey found `die`/`warn LIST` — a comma-separated
 multi-argument form with no parens (`warn "a\n", "b\n", "c\n";`) —
 was a hard "unexpected token ','" parse error. `parseDieWarnBody()`
@@ -846,7 +864,9 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D178 FIXED 2026-10-02**
+**Open generated-code defects:** none — **D179 FIXED 2026-10-02**
+(`not` nested inside a tighter-binding expression like `$a && not $b`
+— see TESTS.md). **D178 FIXED 2026-10-02**
 (`die`/`warn LIST`, comma-separated multi-arg form, was a parse
 error — see TESTS.md). **D177 FIXED 2026-10-02**
 (`*NAME{IO}` typeglob slot — see TESTS.md). **D176 FIXED 2026-10-02**
