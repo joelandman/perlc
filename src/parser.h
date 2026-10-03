@@ -176,6 +176,7 @@ private:
                                  NodePtr sigPrefix = nullptr);
     NodePtr parseStringInterp(const std::string &raw, int line);
     NodePtr parseSubscript(NodePtr base, int line); /* chains ->[]/->{}  */
+    NodePtr parseHashKeySingle(); /* $h{"a","b"} multi-dim-emulation key */
     /* D120: subscript group(s) inside interpolated strings — see
        parseStringInterp for the node shapes. */
     NodePtr interpRegexPattern(const std::string &pattern, int line);

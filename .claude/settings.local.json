@@ -352,7 +352,29 @@
       "Bash(/home/joe/.claude/jobs/13b065b1/tmp/do_filename_bin)",
       "Bash(/home/joe/.claude/jobs/*)",
       "Bash(make *)",
-      "Bash(awk '/^NodePtr Parser::parseStringInterp/,/^}/' src/parser.cpp)"
+      "Bash(awk '/^NodePtr Parser::parseStringInterp/,/^}/' src/parser.cpp)",
+      "Bash(make test-all *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(jobs)",
+      "Bash(/tmp/probe/each2)",
+      "Bash(/tmp/probe/die1)",
+      "Bash(/tmp/probe/copy1)",
+      "Bash(/tmp/probe/copy3)",
+      "Bash(awk '/Value \\\\*CodeGen::emitArrayPtr/,0' src/codegen.cpp)",
+      "Bash(/tmp/probe/p8)",
+      "Bash(awk '/^Value \\\\*CodeGen::emitArrayPtr/,/^Value \\\\*CodeGen::[A-Za-z]/' src/codegen.cpp)",
+      "Bash(awk -F: '$1>960 {print; c++} c>=2{exit}')",
+      "Bash(/tmp/d99/edge2)",
+      "Bash(/tmp/d99/edge3)",
+      "Bash(/tmp/d99/edge4)",
+      "Bash(./tests/harness.sh tests/d99_array_copy_smoke.pl tests/d99_array_copy_deep.pl)",
+      "Bash(/tmp/d105/min3)",
+      "Bash(/tmp/d105/d96)",
+      "Bash(ulimit -c unlimited)",
+      "Bash(./d96)",
+      "Bash(gdb -q -batch -ex run -ex bt ./d96)",
+      "Bash(/home/joe/work/pc/perlc/perlc /home/joe/work/pc/perlc/tests/d96_flat_row_op_assign_smoke.pl -g -o d96g)",
+      "Bash(gdb -q -batch -ex run -ex bt ./d96g)"
     ]
   }
 }

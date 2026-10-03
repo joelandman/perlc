@@ -711,9 +711,7 @@ NodePtr Parser::parseStmt() {
         } else if (check(TK::LBRACE)) {
             advance();
             n->sval = "hash_elem";
-            inKeyContext_ = true;
-            n->right = parseExpr();
-            inKeyContext_ = false;
+            n->right = parseHashKeySingle();
             consume(TK::RBRACE, "}");
         } else if (check(TK::ARROW)) {
             /* D169: `local $ref->{key} = val;` / `local $ref->[idx] = val;`
@@ -734,9 +732,7 @@ NodePtr Parser::parseStmt() {
                 advance();
                 n->sval = "hash_elem_deref";
                 n->cond = std::move(base);
-                inKeyContext_ = true;
-                n->right = parseExpr();
-                inKeyContext_ = false;
+                n->right = parseHashKeySingle();
                 consume(TK::RBRACE, "}");
             }
         }
@@ -2576,6 +2572,43 @@ NodePtr Parser::parsePow() {
     return makeBin("**", std::move(lhs), std::move(rhs), line);
 }
 
+/* $h{"a","b"} — real Perl's multi-dimensional-emulation hash key: a
+   comma-separated list inside a single (non-slice) hash subscript is
+   joined into one composite key with the $; separator (default
+   "\x1c", SUBSEP) — `$h{"a","b"}` is `$h{"a" . $; . "b"}`, NOT a
+   two-element slice (that needs `@h{...}`, a different sigil/node
+   entirely — HashSlice already handles its own comma-list correctly
+   and must not be touched). Every single-key subscript site
+   previously called `parseExpr()` directly, which doesn't consume a
+   following comma at all, so `$h{"a","b"}` was a hard "expected } but
+   got ','" parse error. Found via a real
+   /usr/bin/callgrind_annotate script: `$compressed{$context,$index}`.
+   `$;`'s *value* itself is not independently settable in this
+   codebase (real Perl allows `local $; = ...`, vanishingly rare in
+   practice) — the default SUBSEP is hardcoded, matching real Perl's
+   own default and every realistic use of this idiom. */
+NodePtr Parser::parseHashKeySingle() {
+    int line = cur().line;
+    inKeyContext_ = true;
+    auto key = parseExpr();
+    if (check(TK::COMMA)) {
+        NodeList parts;
+        parts.push_back(std::move(key));
+        while (match(TK::COMMA)) {
+            if (check(TK::RBRACE)) break; /* tolerate a trailing comma */
+            parts.push_back(parseExpr());
+        }
+        NodePtr composite = std::move(parts[0]);
+        for (size_t i = 1; i < parts.size(); i++) {
+            composite = makeBin(".", std::move(composite), makeStr("\x1c", line), line);
+            composite = makeBin(".", std::move(composite), std::move(parts[i]), line);
+        }
+        key = std::move(composite);
+    }
+    inKeyContext_ = false;
+    return key;
+}
+
 NodePtr Parser::parseSubscript(NodePtr base, int line) {
     /* consume -> then [ or { */
     /* also handles adjacent [] {} (no -> needed after first subscript) */
@@ -2594,9 +2627,7 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
             }
             if (check(TK::LBRACE)) {
                 advance();
-                inKeyContext_ = true;
-                auto key = parseExpr();
-                inKeyContext_ = false;
+                auto key = parseHashKeySingle();
                 consume(TK::RBRACE, "}");
                 auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
                 n->sval = "hash"; n->left = std::move(base);
@@ -2792,9 +2823,7 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         }
         if (base->kind == NK::DerefScalar && check(TK::LBRACE)) {
             advance();
-            inKeyContext_ = true;
-            auto key = parseExpr();
-            inKeyContext_ = false;
+            auto key = parseHashKeySingle();
             consume(TK::RBRACE, "}");
             auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
             n->sval = "hash"; n->left = std::move(base->left);
@@ -2832,9 +2861,7 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         }
         if (base->kind == NK::SymbolicDeref && check(TK::LBRACE)) {
             advance();
-            inKeyContext_ = true;
-            auto key = parseExpr();
-            inKeyContext_ = false;
+            auto key = parseHashKeySingle();
             consume(TK::RBRACE, "}");
             auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
             n->sval = "hash"; n->left = std::move(base->left);
@@ -2854,9 +2881,7 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         }
         if (isSubscriptableK(base->kind) && check(TK::LBRACE)) {
             advance();
-            inKeyContext_ = true;
-            auto key = parseExpr();
-            inKeyContext_ = false;
+            auto key = parseHashKeySingle();
             consume(TK::RBRACE, "}");
             auto n = std::make_unique<Node>();
             /* $scalar{key} → HashElem; $ref->{key} → ArrowDeref */
@@ -3367,9 +3392,7 @@ NodePtr Parser::parsePrimary() {
             }
             if (check(TK::LBRACE)) {
                 advance();
-                inKeyContext_ = true;
-                auto key = parseExpr();
-                inKeyContext_ = false;
+                auto key = parseHashKeySingle();
                 consume(TK::RBRACE, "}");
                 /* $h{key} element read — NK::HashElem (name=h) */
                 auto he = std::make_unique<Node>();
@@ -3501,9 +3524,7 @@ NodePtr Parser::parsePrimary() {
             advance();
             if (check(TK::LBRACE)) {
                 advance();
-                inKeyContext_ = true;
-                auto key = parseExpr();
-                inKeyContext_ = false;
+                auto key = parseHashKeySingle();
                 consume(TK::RBRACE, "}");
                 auto n = std::make_unique<Node>();
                 n->kind = NK::HashElem; n->name = "+";
@@ -3613,9 +3634,7 @@ NodePtr Parser::parsePrimary() {
         auto sv = makeScalar(nm, line);
         if (nm == "+" && check(TK::LBRACE)) {
           advance();
-          inKeyContext_ = true;
-          auto key = parseExpr();
-          inKeyContext_ = false;
+          auto key = parseHashKeySingle();
           consume(TK::RBRACE, "}");
           auto n = std::make_unique<Node>();
           n->kind = NK::HashElem;
@@ -3636,9 +3655,7 @@ NodePtr Parser::parsePrimary() {
         /* $hash{key} */
         if (check(TK::LBRACE)) {
             advance();
-            inKeyContext_ = true;
-            auto key = parseExpr();
-            inKeyContext_ = false;
+            auto key = parseHashKeySingle();
             consume(TK::RBRACE, "}");
             auto n = std::make_unique<Node>(); n->kind = NK::HashElem;
             n->name = nm; n->left = std::move(key); n->line = line;
@@ -3964,9 +3981,7 @@ NodePtr Parser::parsePrimary() {
             n->sval = "array";
         } else {
             consume(TK::LBRACE, "{");
-            inKeyContext_ = true;
-            n->left = parseExpr();
-            inKeyContext_ = false;
+            n->left = parseHashKeySingle();
             consume(TK::RBRACE, "}");
         }
         /* exists $h{a}{b} / $h{a}[0] — extra subscripts in args */
@@ -3980,9 +3995,7 @@ NodePtr Parser::parsePrimary() {
             } else {
                 advance(); /* { */
                 sub->sval = "hash";
-                inKeyContext_ = true;
-                sub->left = parseExpr();
-                inKeyContext_ = false;
+                sub->left = parseHashKeySingle();
                 consume(TK::RBRACE, "}");
             }
             n->args.push_back(std::move(sub));
@@ -4063,9 +4076,7 @@ NodePtr Parser::parsePrimary() {
             n->sval = "array";
         } else {
             consume(TK::LBRACE, "{");
-            inKeyContext_ = true;
-            n->left = parseExpr();
-            inKeyContext_ = false;
+            n->left = parseHashKeySingle();
             consume(TK::RBRACE, "}");
         }
         if (hasParen) consume(TK::RPAREN, ")");

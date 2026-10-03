@@ -5218,14 +5218,18 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         allNamesCaptured_ = hasEvalCall(program);
 
         emitBlock(program);
-        popScope();
 
         callRT("perl_pop_wantarray", {});
-        /* restore any local()s before returning */
+        /* D189: restore any local()s BEFORE popping the outer file-scope
+           — same ordering bug as emitBlock/emitBlockLast (see D189's
+           write-up there): a `local $fileScopeHashVar->{key} = ...;`
+           directly at file scope must be restored while that file-
+           scope `my` hash is still alive. */
         {
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
             callRT("perl_local_restore_to", {depth});
         }
+        popScope();
 
         /* Register perl_cleanup via atexit so valgrind reports zero leaks. */
         {
@@ -5793,9 +5797,15 @@ Value *CodeGen::emitBlock(const Node &n) {
         /* Don't stop on a terminator: goto leaves a dead BB, but a later
            LabelStmt still needs to be emitted into its own block. */
     }
-    popScope();
+    /* D189: restore before popping scope — see the identical fix (and
+       full explanation) in emitBlockLast() just below. This is the
+       plain-statement-context twin of that same bug: a bare `{ ... }`
+       block (not in expression/last-value position) has its own
+       separate copy of the same local-save/restore-vs-popScope
+       ordering, previously backwards here too. */
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
+    popScope();
     return nullptr;
 }
 
@@ -5914,9 +5924,25 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         result = callRT("perl_clone", {result});
         freeIfOwned(orig);
     }
-    popScope();
+    /* D189: perl_local_restore_to() MUST run BEFORE popScope() — a
+       `local $ref->{key} = val;` target is a raw PerlValue* pointing
+       INTO a container (e.g. a hash cell), not an independently-owned
+       value; if `$ref` itself is a `my` variable in THIS block, the
+       old (wrong) order freed that container's cells in popScope()
+       first, then wrote the saved-old-value through what was now a
+       dangling pointer into freed memory — silently corrupting the
+       allocator's freelist (no crash here; it surfaces as a SEGFAULT
+       on some LATER, unrelated allocation, in pv_alloc()'s freelist
+       walk). Every other local-restore call site (sub exit, the
+       top-level program body, loop bodies) already does restore
+       before scope-popping; this one, specific to a bare block's own
+       internal local-save/restore pair, had it backwards. Found via
+       a real-world-shaped regression check while verifying an
+       unrelated fix: `sub f { my $r = {z=>1}; local $r->{z} = 5; ...
+       } f(); <anything allocating more PerlValues afterward>`. */
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
+    popScope();
     if (!result || llvm::isa<llvm::ConstantPointerNull>(result))
         result = llvm::ConstantPointerNull::get(perlPtrTy_);
     return result;
