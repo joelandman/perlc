@@ -18,7 +18,51 @@ Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
 `syscall()`, and Unix process/IPC/sockets are implemented. Correctness is
 gated by `make test-all` (byte-for-byte vs real `perl`).
 
-**Harness (2026-10-02, D186 — 579/579 PASS, 0 FAIL):** Root-caused and
+**Harness (2026-10-02, thirteenth real-script survey + D188 —
+581/581 PASS, 0 FAIL):** A ~56-script survey (40 of 56 failures were
+missing-module `Can't locate` errors, mostly Debian packaging
+tooling's internal modules and unpackaged CPAN examples — not
+realistic general-CPAN candidates). **D188**: `${EXPR}{key}` /
+`${EXPR}[idx]` — the explicit-brace spelling of D63's sigil-chain
+`$$name{key}`/`$$name[idx]` — silently produced WRONG data, not even
+a parse error. `NK::SymbolicDeref` (built for the `${ EXPR }` form)
+had no case anywhere in the subscript-chain parser (`Parser::
+parseSubscript`, nor the `isSubscriptable` gate in `parsePostfix`
+that decides whether to call it at all) for a following `{key}`/
+`[idx]` — so the subscript was silently left completely unconsumed,
+and (worse than a parse error) got silently re-parsed as an unrelated
+bare-block STATEMENT immediately following the real one (its value
+discarded), while `${EXPR}` alone evaluated via `perl_deref_scalar`
+(which only unwraps a SCALAR ref) on what's actually a hash/array
+ref, silently giving undef. Found via a real
+`/usr/bin/podebconf-report-po` script using Mail::Message:
+`Mail::Message->build( From => ${$mail}{'From'}, ... )`. Fixed by
+adding `NK::SymbolicDeref` to `isSubscriptable`'s gate, plus two new
+branches in `parseSubscript` mirroring the existing `DerefScalar`
+ones exactly: a subscript immediately after `${ EXPR }` means `EXPR`
+itself is the ref to index (one level of deref total, matching
+`EXPR->{key}`/`EXPR->[idx]`), not "scalar-deref `EXPR`, then subscript
+that." The rarer symbolic-reference-by-string form
+(`${"name"}{key}` meaning `%name`'s element) isn't specially handled
+by this fix — falls through to whatever `perl_deref_hash`/
+`perl_deref_array` already do with a non-ref argument (an existing,
+narrower, pre-existing limitation, not a new regression). Verified
+against real Perl for: the exact real-world repro (both as a plain
+assignment and directly as a function-call argument), the array-ref
+form, a chained double-subscript, an LVALUE write through
+`${EXPR}{key}`, and regression checks that plain `${EXPR}` (both the
+true-ref and symbolic-by-string cases, no subscript at all) and the
+sigil-chain `$$name{key}`/`$$name[idx]` form are both unaffected.
+Also found, not fixed, three more parse errors in the same survey —
+logged as candidates for the next pass: a multi-key hash subscript
+(`$h{"a","b"}`, the `$;`-joined composite-key idiom); a trailing
+comma with no semicolon as the LAST statement in a block (`push
+@x, sprintf "...", $a, $b,\n}` — legal Perl, since the last statement
+in a block never needs a trailing `;`); and `our $a = our $b = ...`
+(chained `our` used as a chainable assignment EXPRESSION, not just a
+standalone declaration statement). Tests:
+`tests/symbolic_deref_subscript_{smoke,deep}.pl`.
+Previous session (2026-10-02, D186 — 579/579 PASS, 0 FAIL):** Root-caused and
 fixed the scope-tracking bug logged (not fixed) under D186 while
 building D184. Root cause: `tryEmitI1Cond()`'s `tryFileGlobalI64`
 fast path (Stage 26a, lets a `my VAR CMP literal` loop condition skip
@@ -1036,7 +1080,13 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** none — **D186 FIXED 2026-10-02**
+**Open generated-code defects:** three parse errors found during the
+thirteenth survey, not yet fixed — a multi-key hash subscript
+(`$h{"a","b"}`), a trailing comma with no semicolon as a block's last
+statement, and chained `our $a = our $b = ...` as an expression; see
+TESTS.md's D188 write-up for detail and minimal repros. **D188 FIXED
+2026-10-02** (`${EXPR}{key}`/`${EXPR}[idx]` silently produced wrong
+data — see TESTS.md). **D186 FIXED 2026-10-02**
 (`tryEmitI1Cond`'s file-scope-global comparison fast path didn't
 respect lexical shadowing, silently evaluating a loop condition
 against a stale same-named outer variable — see TESTS.md). **D187

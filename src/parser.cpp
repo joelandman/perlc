@@ -2802,6 +2802,46 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
             base = std::move(n);
             continue;
         }
+        /* ${EXPR}{key} / ${EXPR}[idx] — the explicit-brace spelling of
+           D63's $$name{key}/$$name[idx]: a subscript immediately after
+           `${ EXPR }` means EXPR itself is the array/hash ref to index
+           (one level of deref total), exactly like `EXPR->{key}` —
+           NOT "scalar-deref EXPR, then subscript that". Before this
+           fix, NK::SymbolicDeref (built for the `${ EXPR }` form) had
+           no case here at all, so the subscript was silently left
+           unconsumed — not a parse error, since it then got re-parsed
+           as an unrelated bare-block STATEMENT (`{key}` as its own
+           `{ EXPR }` block, its value discarded) immediately following
+           the real statement, silently losing the subscript entirely.
+           Found via a real Mail::Message-using script's
+           `${$mail}{'From'}`. The rarer symbolic-reference-by-string
+           form (`${"name"}{key}` meaning %name's element) is not
+           specially handled here — it falls through to whatever
+           `perl_deref_hash`/`perl_deref_array` do with a non-ref
+           argument (currently an empty container), an existing,
+           narrower, pre-existing limitation, not a new regression. */
+        if (base->kind == NK::SymbolicDeref && check(TK::LBRACKET)) {
+            advance();
+            auto idx = parseExpr();
+            consume(TK::RBRACKET, "]");
+            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+            n->sval = "array"; n->left = std::move(base->left);
+            n->right = std::move(idx); n->line = line;
+            base = std::move(n);
+            continue;
+        }
+        if (base->kind == NK::SymbolicDeref && check(TK::LBRACE)) {
+            advance();
+            inKeyContext_ = true;
+            auto key = parseExpr();
+            inKeyContext_ = false;
+            consume(TK::RBRACE, "}");
+            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+            n->sval = "hash"; n->left = std::move(base->left);
+            n->right = std::move(key); n->line = line;
+            base = std::move(n);
+            continue;
+        }
         if (isSubscriptableK(base->kind) && check(TK::LBRACKET)) {
             advance();
             auto idx = parseExpr();
@@ -2846,6 +2886,7 @@ NodePtr Parser::parsePostfix() {
     auto isSubscriptable = [](NK k) {
         return k == NK::ArrowDeref || k == NK::ArrayElem || k == NK::HashElem ||
                k == NK::MethodCall || k == NK::CallCodeRef || k == NK::DerefScalar ||
+               k == NK::SymbolicDeref ||
                /* list-producing expressions: (sort)[0], (map)[0], etc. */
                k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
                k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::Call ||
