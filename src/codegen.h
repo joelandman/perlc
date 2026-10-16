@@ -259,6 +259,14 @@ private:
     /* names that appear as *NAME = ... in this compilation — package
        $NAME/@NAME/%NAME (when not a lexical) route through the glob table */
     std::unordered_set<std::string> globNames_;
+    /* D192: the program assigns to a computed typeglob (*$name / *{EXPR}).
+       Call sites then skip AST inlining and consult the dynamic sub table
+       before the direct LLVM call. Programs without that assignment keep
+       today's direct calls. */
+    bool dynamicGlobAssign_ = false;
+    /* D192: \&{EXPR} appears, so compile-time subs must be findable by
+       bare name in the method table (normally only :: names are registered). */
+    bool dynamicCodeRef_ = false;
 
     /* AST-level inline subs: subs with (my (@params)=@_; return expr) body.
        At call sites these are expanded directly, bypassing @_ construction. */

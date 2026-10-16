@@ -1603,6 +1603,37 @@ NodePtr Parser::parseMy() {
     return n;
 }
 
+/* D191: expression-context `my`/`our $x` / `@a` / `%h` [= INIT].
+   Name is stored with its sigil, matching the existing expression-`my`
+   nodes (emitStmt strips it). Initializer is parseAssign() so
+   `our $b = our $c = 7` chains and `or` stays outside the declaration.
+   Does not consume `;`. List form `my ($a,$b)` is left to the later
+   LPAREN handler — this returns nullptr for that shape. */
+NodePtr Parser::parseDeclExpr() {
+    if (inKeyContext_) return nullptr;
+    if (!check(TK::KW_MY) && !check(TK::KW_OUR)) return nullptr;
+    TK sig = peek(1).kind;
+    if (sig != TK::SCALAR && sig != TK::ARRAY && sig != TK::HASH) return nullptr;
+    int line = cur().line;
+    bool isOur = check(TK::KW_OUR);
+    advance(); /* my / our */
+    char sigil = (sig == TK::SCALAR) ? '$' : (sig == TK::ARRAY) ? '@' : '%';
+    advance(); /* sigil */
+    std::string vname = advance().text;
+    auto n = std::make_unique<Node>();
+    n->kind = NK::My;
+    n->line = line;
+    n->name = std::string(1, sigil) + vname;
+    if (isOur) n->ival |= 2;
+    if (check(TK::COLON) && pos_ + 1 < (int)toks_.size() &&
+        toks_[pos_ + 1].text == "shared") {
+        advance(); advance();
+        n->ival |= 1;
+    }
+    if (match(TK::ASSIGN)) n->right = parseAssign();
+    return n;
+}
+
 NodePtr Parser::parsePrint(bool isSay) {
      int line = cur().line;
      advance(); /* consume print/say */
@@ -1633,6 +1664,9 @@ NodePtr Parser::parsePrint(bool isSay) {
          NodeList args;
          while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
              if (check(TK::RPAREN)) break; /* for parenthesized form */
+             /* D190: a block's last statement needs no `;`, and a trailing
+                comma before `}` is legal (`print {FH} "a", }`). */
+             if (check(TK::RBRACE)) break;
              args.push_back(parseLowNot());
              if (!match(TK::COMMA)) break;
          }
@@ -1713,12 +1747,14 @@ NodePtr Parser::parsePrint(bool isSay) {
             args.push_back(parseBareCall(nm, line));
             while (match(TK::COMMA)) {
                 if (check(TK::SEMI) || check(TK::EOF_TOK) || isModifier()) break;
+                if (check(TK::RBRACE)) break; /* D190 */
                 args.push_back(parseLowNot());
             }
         }
     }
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
+        if (!hasParen && check(TK::RBRACE)) break; /* D190 */
         args.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
     }
@@ -1752,8 +1788,14 @@ NodePtr Parser::parsePush() {
         arrName = cur().text; advance();
     }
     match(TK::COMMA);
+    /* D190: `push @x, sprintf(...), }` — the comma is consumed, then `}`
+       ends the block. Real Perl accepts a trailing comma as the last
+       statement of a block (no semicolon required). Do not treat `}` as
+       the end when the call itself is parenthesized (`push(@a, {k=>1})`
+       — that `}` belongs to the hash, and is consumed inside parseLowNot). */
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
+        if (!hasParen && check(TK::RBRACE)) break;
         vals.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
     }
@@ -1786,6 +1828,7 @@ NodePtr Parser::parseUnshift() {
     NodeList vals;
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
         if (hasParen && check(TK::RPAREN)) break;
+        if (!hasParen && check(TK::RBRACE)) break; /* D190 */
         vals.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
     }
@@ -1992,6 +2035,7 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
         NodeList elems;
         while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
             if (hasParen && check(TK::RPAREN)) break;
+            if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             elems.push_back(parseExpr());
             if (!match(TK::COMMA)) break;
         }
@@ -3095,6 +3139,12 @@ NodePtr Parser::parsePrimary() {
         return makeStr(key, line);
     }
 
+    /* D191: our/my as an assignment term (`our $a = our $b = 7`).
+       After the fat-arrow autoquote above, so `our => 1` stays a string
+       key. Hash-key context already returned at the top of parsePrimary,
+       so `$h{our}` is unaffected. */
+    if (NodePtr decl = parseDeclExpr()) return decl;
+
     /* do { BLOCK } — block in expression context, returns last value */
     if (check(TK::KW_DO) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::LBRACE) {
         advance(); /* consume 'do' */
@@ -3289,7 +3339,24 @@ NodePtr Parser::parsePrimary() {
             n->left = std::move(inner); n->line = line;
             return n;
         }
-        throw std::runtime_error(parseErrPrefix(line) + "expected {IO} after *{EXPR}");
+        /* D192: *{EXPR} without {IO} is a computed typeglob
+           (`*{$n} = sub { ... }`, `*{$pkg.'::'.$f} = \&{$f}`). sval
+           "dyn" distinguishes it from the {IO} form above, which also
+           stores EXPR in left but leaves sval empty. */
+        auto n = std::make_unique<Node>(); n->kind = NK::Typeglob;
+        n->sval = "dyn"; n->left = std::move(inner); n->line = line;
+        return n;
+    }
+
+    /* D192: *$name — computed typeglob on a scalar variable. */
+    if (check(TK::STAR) && pos_ + 2 < toks_.size() &&
+        toks_[pos_ + 1].kind == TK::SCALAR && toks_[pos_ + 2].kind == TK::IDENT) {
+        advance(); /* * */
+        advance(); /* $ */
+        std::string nm = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::Typeglob;
+        n->sval = "dyn"; n->left = makeScalar(nm, line); n->line = line;
+        return n;
     }
 
     /* typeglob: *NAME at expression start */
@@ -3419,6 +3486,17 @@ NodePtr Parser::parsePrimary() {
         }
         if (check(TK::AND)) {
             advance();
+            /* D192: \&{EXPR} — code ref looked up by a runtime name
+               (`*{$n} = \&{$f}`). Must be checked before reading an
+               IDENT, or `{` would be consumed as the sub's name. */
+            if (check(TK::LBRACE)) {
+                advance();
+                auto inner = parseExpr();
+                consume(TK::RBRACE, "}");
+                auto n = std::make_unique<Node>(); n->kind = NK::RefSub;
+                n->left = std::move(inner); n->line = line;
+                return n;
+            }
             std::string nm = cur().text; advance();
             auto n = std::make_unique<Node>(); n->kind = NK::RefSub;
             n->name = nm; n->line = line;
@@ -4305,6 +4383,7 @@ NodePtr Parser::parsePrimary() {
         bool hasParen = match(TK::LPAREN);
         NodeList args;
         while (args.size() < 4 && !check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+            if (!hasParen && (check(TK::RBRACE) || check(TK::SEMI))) break; /* D190 */
             args.push_back(parseExpr());
             if (!match(TK::COMMA)) break;
         }
@@ -4321,6 +4400,7 @@ NodePtr Parser::parsePrimary() {
         match(TK::COMMA);
         NodeList rest;
         while (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
+            if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             rest.push_back(parseListOpArg(hasParen));
             if (!match(TK::COMMA)) break;
         }
@@ -4360,6 +4440,7 @@ NodePtr Parser::parsePrimary() {
         while (true) {
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             args.push_back(parseListOpArg(hasParen));
             if (!match(TK::COMMA)) break;
         }
@@ -4400,6 +4481,7 @@ NodePtr Parser::parsePrimary() {
         auto n = std::make_unique<Node>(); n->kind = NK::UnlinkFunc; n->line = line;
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) &&
                !(hasParen && check(TK::RPAREN))) {
+            if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hasParen));
             if (!match(TK::COMMA)) break;
         }
@@ -4499,6 +4581,7 @@ NodePtr Parser::parsePrimary() {
             if (!hasParen && isModifier()) break;
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             args.push_back(parseListOpArg(hasParen));
         }
         if (hasParen) consume(TK::RPAREN, ")");
@@ -4517,6 +4600,7 @@ NodePtr Parser::parsePrimary() {
             if (!hasParen && isModifier()) break;
             if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             args.push_back(parseListOpArg(hasParen));
         }
         if (hasParen) consume(TK::RPAREN, ")");
@@ -4725,6 +4809,7 @@ NodePtr Parser::parsePrimary() {
         bool hp = match(TK::LPAREN);
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
+            if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
@@ -4744,6 +4829,7 @@ NodePtr Parser::parsePrimary() {
         match(TK::COMMA);
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
+            if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
@@ -4760,6 +4846,7 @@ NodePtr Parser::parsePrimary() {
         match(TK::COMMA);
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
+            if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
@@ -4790,6 +4877,7 @@ NodePtr Parser::parsePrimary() {
         /* collect all args (array var, list, or scalar) */
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
+            if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
@@ -4818,6 +4906,7 @@ NodePtr Parser::parsePrimary() {
         /* parse the input list (array, range, or explicit list) */
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (hp && check(TK::RPAREN)) break;
+            if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
             if (!match(TK::COMMA)) break;
         }
@@ -4899,6 +4988,7 @@ NodePtr Parser::parsePrimary() {
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
             if (!match(TK::COMMA)) break;
             if ((hp && check(TK::RPAREN)) || check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
         }
         if (hp) consume(TK::RPAREN, ")");
@@ -4917,6 +5007,7 @@ NodePtr Parser::parsePrimary() {
             while (match(TK::COMMA)) {
                 if (hp && check(TK::RPAREN)) break;
                 if (check(TK::SEMI) || check(TK::EOF_TOK) || isModifier()) break;
+                if (!hp && check(TK::RBRACE)) break; /* D190 */
                 n->args.push_back(parseListOpArg(hp));
             }
         }
@@ -4975,6 +5066,7 @@ NodePtr Parser::parsePrimary() {
         while (match(TK::COMMA)) {
             if (hp && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
         }
         if (hp) consume(TK::RPAREN, ")");

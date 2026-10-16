@@ -668,6 +668,10 @@ void CodeGen::declareRuntime() {
     RT("perl_register_method",         voidTy, i8p, i8p);
     RT("perl_get_or_create_global_scalar", pv, i8p);
     RT("perl_glob_assign",     voidTy, i8p, pv);
+    RT("perl_glob_assign_sv",  voidTy, pv, pv, i8p);          /* D192 */
+    RT("perl_call_sub_maybe_dynamic", pv, i8p, i8p, av, i32); /* D192 */
+    RT("perl_code_ref_by_name", pv, pv);                     /* D192 */
+    RT("perl_dyn_glob_name",   pv, pv, i8p);                 /* D192 */
     RT("perl_glob_set_scalar", voidTy, i8p, pv);
     RT("perl_glob_set_array",  voidTy, i8p, av);
     RT("perl_glob_set_hash",   voidTy, i8p, av); /* PerlHash* is also a ptr */
@@ -4810,6 +4814,26 @@ Value *CodeGen::emitExprF64(const Node &n) {
    into NK::AnonSub bodies (a named sub could be declared inside a
    closure) — both fall out naturally from the generic walk with no
    special-casing needed. */
+/* D192: computed typeglob assignment and \&{EXPR}. */
+static void scanDynamicGlobs(const Node &n, bool &dynAssign, bool &dynCodeRef) {
+    if (n.kind == NK::Assign && n.left && n.left->kind == NK::Typeglob &&
+        n.left->sval == "dyn")
+        dynAssign = true;
+    if (n.kind == NK::RefSub && n.left)
+        dynCodeRef = true;
+    if (n.left)  scanDynamicGlobs(*n.left,  dynAssign, dynCodeRef);
+    if (n.right) scanDynamicGlobs(*n.right, dynAssign, dynCodeRef);
+    if (n.cond)  scanDynamicGlobs(*n.cond,  dynAssign, dynCodeRef);
+    if (n.body)  scanDynamicGlobs(*n.body,  dynAssign, dynCodeRef);
+    if (n.init)  scanDynamicGlobs(*n.init,  dynAssign, dynCodeRef);
+    if (n.step)  scanDynamicGlobs(*n.step,  dynAssign, dynCodeRef);
+    for (auto &a : n.args) scanDynamicGlobs(*a, dynAssign, dynCodeRef);
+    for (auto &b : n.branches) {
+        if (b.cond) scanDynamicGlobs(*b.cond, dynAssign, dynCodeRef);
+        if (b.body) scanDynamicGlobs(*b.body, dynAssign, dynCodeRef);
+    }
+}
+
 static void collectGlobNames(const Node &n, std::unordered_set<std::string> &out) {
     if (n.kind == NK::Assign && n.left && n.left->kind == NK::Typeglob &&
         !n.left->name.empty())
@@ -4953,8 +4977,11 @@ void CodeGen::compile(const Node &program, const std::string &modName,
     subs_.clear();
     subCaptures_.clear();
     globNames_.clear();
+    dynamicGlobAssign_ = false;
+    dynamicCodeRef_ = false;
     collectSubDefs(program, subs_);
     collectGlobNames(program, globNames_);
+    scanDynamicGlobs(program, dynamicGlobAssign_, dynamicCodeRef_);
 
     evalPadScalars_.clear();
     evalPadArrays_.clear();
@@ -5096,12 +5123,22 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             }
         }
 
-        /* register all subs in the method dispatch table (before user code runs) */
+        /* register all subs in the method dispatch table (before user code runs).
+           D192: \&{EXPR} looks a compile-time sub up by the runtime string,
+           which for `sub hello` is the bare name "hello" (and "main::hello").
+           Only programs that actually use \&{EXPR} or a computed typeglob
+           get the extra bare-name entries — other programs stay first-match
+           identical to before. */
         for (auto *s : subs_) {
-            if (s->name.find("::") != std::string::npos) {
-                Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
-                auto *fn = mod_->getFunction(subLLVMName(s->name));
-                callRT("perl_register_method", {keyStr, fn});
+            bool qual = s->name.find("::") != std::string::npos;
+            if (!qual && !dynamicGlobAssign_ && !dynamicCodeRef_) continue;
+            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+            auto *fn = mod_->getFunction(subLLVMName(s->name));
+            if (!fn) continue;
+            callRT("perl_register_method", {keyStr, fn});
+            if (!qual) {
+                Value *mainKey = builder_.CreateGlobalStringPtr("main::" + s->name);
+                callRT("perl_register_method", {mainKey, fn});
             }
         }
 
@@ -8575,6 +8612,17 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Assign: {
+        /* D192: *$name = ... / *{EXPR} = ... — name is computed. */
+        if (n.left && n.left->kind == NK::Typeglob && n.left->sval == "dyn") {
+            Value *nm = n.left->left ? emitExpr(*n.left->left) : perlUndef();
+            Value *rhs = n.right ? emitExpr(*n.right) : perlUndef();
+            Value *pkg = builder_.CreateGlobalStringPtr(currentPackage_);
+            callRT("perl_glob_assign_sv", {nm, rhs, pkg});
+            Value *shown = callRT("perl_dyn_glob_name", {nm, pkg});
+            freeIfOwned(nm);
+            freeIfOwned(rhs);
+            return shown;
+        }
         /* *NAME = ... — glob slot assignment */
         if (n.left && n.left->kind == NK::Typeglob) {
             Value *key = builder_.CreateGlobalStringPtr(n.left->name);
@@ -9788,6 +9836,15 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::Call: return emitCall(n);
 
     case NK::Typeglob: {
+        /* D192: *$name / *{EXPR} read — stringify *pkg::name. The {IO}
+           form also stores EXPR in left, but leaves sval empty. */
+        if (n.left && n.sval == "dyn") {
+            Value *nm = emitExpr(*n.left);
+            Value *pkg = builder_.CreateGlobalStringPtr(currentPackage_);
+            Value *shown = callRT("perl_dyn_glob_name", {nm, pkg});
+            freeIfOwned(nm);
+            return shown;
+        }
         /* *{EXPR}{IO} — the deref-glob form. n.left holds EXPR (a
            glob-ref like `\*STDOUT`, or a lexical filehandle variable);
            resolve it to a usable filehandle value at runtime rather
@@ -11777,6 +11834,13 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RefSub: {
+        /* D192: \&{EXPR} — resolve the name at runtime. */
+        if (n.left) {
+            Value *nm = emitExpr(*n.left);
+            Value *ref = callRT("perl_code_ref_by_name", {nm});
+            freeIfOwned(nm);
+            return ref;
+        }
         auto *subFn = mod_->getFunction(subLLVMName(n.name));
         if (!subFn) return perlUndef();
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
@@ -13251,8 +13315,12 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_bigint_from_decstr_unblessed",
                        {builder_.CreateGlobalStringPtr(n.sval)});
 
-    /* Try AST-level inline first: eliminates @_ construction for simple subs. */
-    if (Value *v = tryEmitInline(n)) return v;
+    /* Try AST-level inline first: eliminates @_ construction for simple subs.
+       D192: a computed typeglob can replace that sub at runtime, so the
+       inlined body would ignore the override. */
+    if (!dynamicGlobAssign_) {
+        if (Value *v = tryEmitInline(n)) return v;
+    }
 
     /* eval EXPR — constant strings without new subs compile as EvalBlock
        (outer lexicals visible). Dynamic strings and strings that define
@@ -15114,7 +15182,18 @@ Value *CodeGen::emitCall(const Node &n) {
         else
             ctxVal = ConstantInt::get(i32Ty, 0);
         callCtx_ = 0;
-        Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
+        Value *retVal;
+        if (dynamicGlobAssign_) {
+            /* Prefer a runtime-installed sub (latest wins, captures kept).
+               Otherwise call the compile-time function with ctx as its
+               argument — do not push wantarray on that path. */
+            Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
+            Value *fnPtr = ConstantExpr::getPointerCast(fn, PointerType::getUnqual(ctx_));
+            retVal = callRT("perl_call_sub_maybe_dynamic",
+                            {nameStr, fnPtr, argsArr, ctxVal});
+        } else {
+            retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
+        }
         callRT("perl_pop_call_frame", {});
         callRT("perl_array_free", {argsArr});
         return retVal;

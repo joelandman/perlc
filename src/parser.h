@@ -118,6 +118,11 @@ private:
     NodePtr parseForeachBody(int line);
     NodePtr parseSub();
     NodePtr parseMy();
+    /* D191: `our $a = our $b = EXPR` / `my $a = my $b = EXPR` — a
+       declaration used as an assignment term. Statement-level parseMy
+       stays the entry for a leading my/our (it consumes `;` and low-prec
+       `or`). Returns nullptr when the next tokens are not my/our + sigil. */
+    NodePtr parseDeclExpr();
     NodePtr parsePrint(bool isSay);
     NodePtr parsePush();
     NodePtr parseUnshift();

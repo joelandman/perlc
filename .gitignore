@@ -1,5 +1,6 @@
 perlc
 perlc_tsan
+tests/realworld/last-report.txt
 a.out
 src/*.o
 src/*.a

@@ -11,7 +11,33 @@ AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
                                       runtime.c
 ```
 
-## Current state (2026-10-02)
+## Current state (2026-10-15)
+
+**D190, D191, D192 (2026-10-15).** Three items that stopped real scripts.
+**D190**: a trailing comma as the last statement of a block
+(`push @x, sprintf(...), }`) is legal Perl and now parses — the list-op
+argument loops stop on `}` when the call is not parenthesized.
+**D191**: chained `our` / `my` used as an expression
+(`our $a = our $b = our $c = 7`, and the same shape with `my`).
+**D192**: computed typeglob assignment `*$name = sub { ... }` and
+`*{$expr} = \&{expr}`. An existing sub is replaced, a name that did not
+exist at compile time becomes callable, and a closure keeps its captures.
+A program with no computed glob assign still emits a direct LLVM call and
+still inlines. Static `*NAME = \&sub` does not override that direct call
+unless the program also contains a computed glob assign. `*$x{IO}` is not
+parsed. A standing compile-only corpus is `tests/realworld/`
+(`make test-realworld`). It classifies each system script as ok,
+missing-file, missing-module, parse-error, or other-compile-error, never
+executes the binary, and is not part of `make test-all`. The 2026-10-15 host baseline (`tests/realworld/baseline.txt`) is
+30 scripts: 15 ok, 10 missing-module, 5 parse-error, 0 other.
+`crontab2english.pl`, `callgrind_annotate`, and `json_pp` compile.
+`make test-all` is **593/593 PASS, 0 FAIL** (2026-10-15), including the
+six D190–D192 tests. While gating, `tests/term_readline_deep.pl` failed
+under `TERM=dumb`: the native Stub always wrote the xterm ornament
+sequence around the prompt, and real perl writes the bare prompt when
+Term::Cap has no capabilities. Ornaments are now emitted only when
+`TERM` is set and is not `dumb`. `TERM=xterm` still matches the
+previous sequence.
 
 Core language, OOP, regex (PCRE2 including `/x`), threads::shared, overload,
 Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
@@ -53,14 +79,15 @@ form, a chained double-subscript, an LVALUE write through
 `${EXPR}{key}`, and regression checks that plain `${EXPR}` (both the
 true-ref and symbolic-by-string cases, no subscript at all) and the
 sigil-chain `$$name{key}`/`$$name[idx]` form are both unaffected.
-Also found, not fixed, three more parse errors in the same survey —
-logged as candidates for the next pass: a multi-key hash subscript
-(`$h{"a","b"}`, the `$;`-joined composite-key idiom); a trailing
-comma with no semicolon as the LAST statement in a block (`push
-@x, sprintf "...", $a, $b,\n}` — legal Perl, since the last statement
-in a block never needs a trailing `;`); and `our $a = our $b = ...`
+Also found, not fixed in that session, three more parse errors —
+later fixed elsewhere: a multi-key hash subscript (`$h{"a","b"}`, the
+`$;`-joined composite-key idiom) in commit `dae3c35`
+(`parseHashKeySingle`, SUBSEP `\x1c`); a trailing comma with no
+semicolon as the LAST statement in a block (`push @x, sprintf "...",
+$a, $b,\n}` — legal Perl, since the last statement in a block never
+needs a trailing `;`) as **D190**; and `our $a = our $b = ...`
 (chained `our` used as a chainable assignment EXPRESSION, not just a
-standalone declaration statement). Tests:
+standalone declaration statement) as **D191**. Tests:
 `tests/symbolic_deref_subscript_{smoke,deep}.pl`.
 Previous session (2026-10-02, D186 — 579/579 PASS, 0 FAIL):** Root-caused and
 fixed the scope-tracking bug logged (not fixed) under D186 while
@@ -150,18 +177,22 @@ init, then a plain `my $i = ...;`, then another C-style loop's own
 — no crash, just missing output. Narrow enough (three same-named
 redeclarations in a row) that it's unlikely to bite real code, but
 logged here rather than silently worked around; minimal repro kept
-nearby for whoever picks it up next. **Also noted, not attempted**:
-`*$var = sub { ... }` (assigning to a *dynamically-named* typeglob —
-the "computed typeglob" pattern core `Config.pm` itself uses, and the
-exact shape hit by a real `/usr/bin/ucfq` script in this survey) is a
-much larger lift than a D-number-sized fix — this codebase's typeglob
-model resolves every `*NAME = ...` target at COMPILE time via a
-whole-program `collectGlobNames()` pre-pass, which fundamentally
-cannot know a dynamic name ahead of time; a real fix needs a runtime
-symbol-table for dynamically-named subs. This is the same item
-long-flagged as W16 from the 2026-09-15 survey ("Config.pm's computed
-typeglob is the top one") — still open, now re-confirmed hitting real
-scripts beyond Config.pm itself.
+nearby for whoever picks it up next. **Also noted, not attempted in that session** (fixed later as
+**D192**, 2026-10-15): `*$var = sub { ... }` (assigning to a
+*dynamically-named* typeglob — the "computed typeglob" pattern core
+`Config.pm` itself uses, and the exact shape hit by a real
+`/usr/bin/ucfq` script in this survey). The compile-time
+`collectGlobNames()` pre-pass cannot know a dynamic name; D192 adds a
+runtime latest-wins table (`s_dyn_subs`) consulted before a direct
+LLVM call, and only in programs that contain a computed glob assign.
+Closure captures are kept by storing a cloned `PerlClosure`, not a
+bare function pointer. `\&{EXPR}` is the matching code-ref form.
+Config.pm itself stays a native module, so its own
+`*{$pkg.'::'.$f}=\&{$f}` line still does not execute. `/usr/bin/ucfq`
+still fails to compile later, on `format`/`write` picture lines
+(`@<<<<<<`), which is an explicit non-goal. The historical note
+called this W16; the survey-3 id for the computed typeglob is W27
+(W16 is Exporter tag validation, fixed 2026-09-16).
 Previous session (2026-10-02, D182+D183 — 571/571 PASS, 0 FAIL):** Two small,
 previously-logged-but-unfixed gaps, picked up directly rather than via
 a fresh survey. **D182**: bare `$+` (the "last bracket match of the
@@ -848,7 +879,8 @@ are in TESTS.md):**
   `q!`/`qq!`/`tr|/|_`; `qw (` spacing; `print($fh "str")` fh-in-parens;
   `&delete()` keyword-named sub calls; Getopt::Long::Configure no-op)
   and logged 10 open items (W16/W19/W22/W23/W27–W31 — Config.pm's
-  computed typeglob is the top one). Agent B implemented Cwd,
+  computed typeglob, W27, was the top one; the language feature is
+  D192, 2026-10-15, and Config itself stays native). Agent B implemented Cwd,
   Sys::Hostname, File::Spec(+::Functions, native, all three invocation
   styles, real quirks matched), Time::Local (all 8 exports, real DST
   semantics), and fixed scalar-context `gmtime(EXPR)`/`localtime(EXPR)`
@@ -1080,11 +1112,23 @@ are in TESTS.md):**
   instead of becoming the actual escape character. Found via the real
   `/usr/bin/debconf-escape` script.
 
-**Open generated-code defects:** three parse errors found during the
-thirteenth survey, not yet fixed — a multi-key hash subscript
-(`$h{"a","b"}`), a trailing comma with no semicolon as a block's last
-statement, and chained `our $a = our $b = ...` as an expression; see
-TESTS.md's D188 write-up for detail and minimal repros. **D188 FIXED
+**Open generated-code defects:** the three parse errors logged under
+D188 are fixed. Multi-key `$h{"a","b"}` landed in `dae3c35`
+(`parseHashKeySingle`). Trailing comma before `}` is **D190**.
+Chained `our`/`my` is **D191**. Computed typeglob `*$name = sub {}` /
+`*{$expr} = \&{expr}` is **D192** (W27). The compile-only corpus
+(`make test-realworld`, `tests/realworld/baseline.txt`) is the
+standing list of what real scripts still do. The 2026-10-15 host run
+is 30 scripts, 15 ok, 10 missing-module, 5 parse-error, 0 other.
+`/usr/bin/splain` gets past the chained `our` and stops at
+`while (defined (my $error = <>))` (`unexpected token 'print'`).
+`/usr/bin/ucfq` gets past the computed glob and stops on `format`
+picture lines (`@<<<<<<`); `format`/`write` is an explicit non-goal.
+`/usr/bin/perlbug` and `/usr/bin/perlthanks` stop at line 1168
+(`unexpected token '.'`). `/usr/bin/zipdetails` stops at line 171
+(`unexpected token ':'`). Those five are recorded, not fixed here.
+Missing-module `Can't locate` results are not compiler defects and
+are not harness failures. **D188 FIXED
 2026-10-02** (`${EXPR}{key}`/`${EXPR}[idx]` silently produced wrong
 data — see TESTS.md). **D186 FIXED 2026-10-02**
 (`tryEmitI1Cond`'s file-scope-global comparison fast path didn't
@@ -1209,7 +1253,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 
 | Gap | Notes |
 |-----|-------|
-| Typeglob `{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, bare `open LOG` / `print LOG`, `*BAREWORD{IO}` (D177), and `*{EXPR}{IO}` (D183, 2026-10-02 — deref form on an arbitrary expression, e.g. `*{\*STDOUT}{IO}`/`*{$fh}{IO}`) all work. Only the `{IO}` slot is modeled; `{FORMAT}` and other typeglob slots are not implemented. |
+| Typeglob `{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, bare `open LOG` / `print LOG`, `*BAREWORD{IO}` (D177), and `*{EXPR}{IO}` (D183) all work. Computed `*$name = sub {}` / `*{$expr} = \&{expr}` (D192, 2026-10-15) installs or replaces a sub at runtime, including closures. Only the `{IO}` slot is modeled. `{FORMAT}`, `format`/`write`, and `*$x{IO}` are not implemented. A static `*NAME = \&sub` does not override a direct LLVM call unless the program also has a computed glob assign. |
 | Full XS | DynaLoader-compatible FFI: `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load` (perlc `.so`/`.pl` modules + raw C via `XS::call` sig dispatch). Real perlguts XSUBs (SV* ABI) not implemented |
 | `pidigits.pl` vs perl | PASS — was `undef $s` not clearing the accumulator, not mini-gmp. |
 | Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |
@@ -1222,6 +1266,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 make                 # ./perlc  (g++ 15 + LLVM 18.1)
 make test            # 4 assertion files (do/require/DBI/XS)
 make test-all        # harness vs real perl — mandatory pre-commit gate
+make test-realworld  # compile-only system-script corpus; not a gate
 make test-tsan       # threads + destroy under TSan
 make test-valgrind   # memcheck (skips DBI/XS)
 make clean
@@ -1257,8 +1302,9 @@ including `and`/`or`/`xor`, bitwise, compounds; subs, closures, `wantarray`;
 regex `i/g/s/m/e/x`, `s///`, `tr///`, named captures; `eval { BLOCK }` and
 string `eval EXPR` (outer `my` via eval pad); `use v5.xx` / `use feature
 'signatures'`; sub signatures (`sub f($x, $y=0, @rest)`); prototypes
-(`$ @ % & _ ; ()`), `goto LABEL` / `goto &NAME`; typeglob `*name` stringify
-and `*alias = \&sub`; bare filehandles (`open LOG`, `print LOG`, `<IN>`);
+(`$ @ % & _ ; ()`), `goto LABEL` / `goto &NAME`; typeglob `*name` stringify,
+`*alias = \&sub`, and computed `*$name = sub {}` / `*{$expr} = \&{expr}`
+(D192); bare filehandles (`open LOG`, `print LOG`, `<IN>`);
 UTF-8 `:utf8`/`:encoding(UTF-8)` open/binmode layers and `use utf8` source
 encoding; diamond `<>` / `<ARGV>` / `$ARGV`; `__DATA__`/`__END__` + `<DATA>`;
 `unshift @{EXPR}`; `exists $h{a}{b}`; POD skip; OOP (`bless`, `SUPER::`,

@@ -1066,6 +1066,21 @@ PerlHash  *perl_eval_pad_get_hash_or_new(const char *name);
 
 /* typeglob slots — *foo = \$x / \@a / \%h share the pointed-to cell */
 void       perl_glob_assign(const char *name, PerlValue *rhs);
+/* D192: computed typeglob. namepv is stringified (a leading '*' is
+   skipped). A CODE ref is installed latest-wins, keeping the closure
+   (captures included). Other ref tags use perl_glob_assign. pkg is the
+   compile-time package used when the name has no '::'. */
+void       perl_glob_assign_sv(PerlValue *namepv, PerlValue *rhs, const char *pkg);
+/* Call the dynamic sub registered under name, else direct(args, ctx).
+   direct is the compile-time PerlSubFnCtx (may be NULL). */
+PerlValue *perl_call_sub_maybe_dynamic(const char *name, PerlSubFnCtx direct,
+                                        PerlArray *args, int ctx);
+/* \&{EXPR}: dynamic table first (cloned, caller owns it), else the
+   latest method-table entry wrapped as a code ref, else undef. */
+PerlValue *perl_code_ref_by_name(PerlValue *namepv);
+/* Stringify a computed typeglob: *pkg::name, or *qual::name when the
+   runtime string already contains '::'. */
+PerlValue *perl_dyn_glob_name(PerlValue *namepv, const char *pkg);
 void       perl_glob_set_scalar(const char *name, PerlValue *cell);
 void       perl_glob_set_array(const char *name, PerlArray *av);
 void       perl_glob_set_hash(const char *name, PerlHash *hv);

@@ -28,7 +28,7 @@ TARGET   := perlc
 ASSERT_TESTS := tests/test_do_filename.pl tests/test_require_simple.pl tests/dbi_sqlite.pl tests/xs_ffi.pl
 TSAN_TESTS := tests/threads.pl tests/threads_atomic.pl tests/destroy.pl
 
-.PHONY: all clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt% test-opt-matrix test-valgrind test-tsan-full
+.PHONY: all clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt% test-opt-matrix test-valgrind test-tsan-full test-realworld
 
 all: $(TARGET)
 
@@ -83,6 +83,12 @@ test: $(TARGET)
 
 test-all: $(TARGET)
 	@./tests/harness.sh
+
+# Compile-only survey of real system scripts. Not part of test-all:
+# missing Debian modules and known non-goals (format/write) are reports,
+# not harness failures. The runner never executes the compiled binaries.
+test-realworld: $(TARGET)
+	@./tests/realworld/run.sh
 
 test-smoke: $(TARGET)
 	@./tests/harness.sh --smoke-only
