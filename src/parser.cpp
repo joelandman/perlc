@@ -3590,10 +3590,36 @@ NodePtr Parser::parsePrimary() {
 
     /* scalar variable: $name  or  $$ref (scalar deref) */
     if (check(TK::SCALAR)) {
-        /* $#arr — last index (scalar(@arr) - 1) */
+        /* $#arr — last index (scalar(@arr) - 1). A bare '#' marker (no
+           name) is the indirect form #$ref / $#{$ref}: "last index of an
+           array reference". The lexer emits a bare '#' token for those
+           (a '#' after '$' is otherwise a comment), so it must not be
+           swallowed here. Same ScalarFunc shape as scalar(@$ref) minus 1. */
         if (!cur().text.empty() && cur().text[0] == '#') {
             std::string arrname = cur().text.substr(1);
             advance();
+            if (arrname.empty()) {
+                NodePtr deref = nullptr;
+                if (check(TK::LBRACE)) {            /* $#{$ref} */
+                    advance();
+                    auto inner = parseExpr();
+                    consume(TK::RBRACE, "}");
+                    deref = std::make_unique<Node>(); deref->kind = NK::DerefArray;
+                    deref->left = std::move(inner); deref->line = line;
+                } else if (check(TK::SCALAR)) {     /* #$ref */
+                    advance();
+                    std::string nm = cur().text; advance();
+                    deref = std::make_unique<Node>(); deref->kind = NK::DerefArray;
+                    deref->left = makeScalar(nm, line); deref->line = line;
+                } else {
+                    throw std::runtime_error(std::string(parseErrPrefix(line))
+                        + "expected an array reference after '#'");
+                }
+                auto scNode = std::make_unique<Node>();
+                scNode->kind = NK::ScalarFunc; scNode->line = line;
+                scNode->left = std::move(deref);
+                return makeBin("-", std::move(scNode), makeInt(1, line), line);
+            }
             auto scNode = std::make_unique<Node>();
             scNode->kind = NK::ScalarFunc; scNode->name = arrname; scNode->line = line;
             return makeBin("-", std::move(scNode), makeInt(1, line), line);
@@ -5969,11 +5995,48 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 vname += raw[i++]; vname += raw[i++];
                 while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_')) vname += raw[i++];
             }
-            auto scNode = std::make_unique<Node>();
-            scNode->kind = NK::ScalarFunc; scNode->name = vname; scNode->line = line;
-            parts.push_back(makeBin("-", std::move(scNode), makeInt(1, line), line));
-            continue;
-        }
+             auto scNode = std::make_unique<Node>();
+             scNode->kind = NK::ScalarFunc; scNode->name = vname; scNode->line = line;
+             parts.push_back(makeBin("-", std::move(scNode), makeInt(1, line), line));
+             continue;
+         }
+         /* D2xx: #$ref / $#{$ref} — "last index of an array reference" in
+            interpolation. scalar(@$ref) - 1, the same ScalarFunc shape the
+            token-level parser emits for the same construct. Previously the
+            '#'}'/'$' stayed literal text and the following ref interpolated. */
+         if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '#' &&
+             i + 2 < raw.size() && (raw[i+2] == '$' || raw[i+2] == '{')) {
+             flush();
+             NodePtr deref;
+             if (raw[i+2] == '{') {                    /* $#{$ref} */
+                 int depth = 0; size_t j = i + 2;
+                 for (; j < raw.size(); j++) {
+                     if (raw[j] == '{') depth++;
+                     else if (raw[j] == '}') { if (--depth == 0) { j++; break; } }
+                 }
+                 std::string inner = raw.substr(i + 3, j - (i + 3));
+                 i = j;
+                 Lexer innerLex(inner);
+                 auto innerToks = innerLex.tokenize();
+                 auto innerNode = Parser::parseExprFromTokens(std::move(innerToks));
+                 deref = std::make_unique<Node>(); deref->kind = NK::DerefArray;
+                 deref->left = std::move(innerNode); deref->line = line;
+             } else {                                  /* #$ref */
+                 size_t j = i + 2;
+                 if (j < raw.size() && raw[j] == '$') j++;
+                 std::string nm;
+                 while (j < raw.size() && (isalnum((unsigned char)raw[j]) || raw[j] == '_'))
+                     nm += raw[j++];
+                 i = j;
+                 deref = std::make_unique<Node>(); deref->kind = NK::DerefArray;
+                 deref->left = makeScalar(nm, line); deref->line = line;
+             }
+             auto scNode = std::make_unique<Node>();
+             scNode->kind = NK::ScalarFunc; scNode->line = line;
+             scNode->left = std::move(deref);
+             parts.push_back(makeBin("-", std::move(scNode), makeInt(1, line), line));
+             continue;
+         }
         /* $1-$9 — capture vars */
         if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] >= '1' && raw[i+1] <= '9') {
             flush();

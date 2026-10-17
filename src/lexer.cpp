@@ -1061,6 +1061,19 @@ std::vector<Token> Lexer::tokenize() {
                     }
                     toks.back().text = "#" + arrname;
                     continue;
+                } else if (nxt == '$' || nxt == '{') {
+                    /* D2xx: indirect array last-index — #$ref or $#{$ref}
+                       ("last index of an array reference"). The char after
+                       '#' is not an identifier, so the fast-path above does
+                       not consume the '#'; without this the '#' falls through
+                       to the comment scanner and eats the rest of the line,
+                       leaving a bare '$' that runs off the token stream. Emit
+                       a bare '#' marker token so the token-level parser's
+                       indirect branch (parser.cpp) reads the arrayref that
+                       follows. */
+                    pos_++; /* skip '#' */
+                    toks.back().text = "#";
+                    continue;
                 }
             }
     if (c == '$' && pos_ < src_.size() && src_[pos_] == '+') {
