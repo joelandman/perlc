@@ -2,13 +2,24 @@
 # tests/harness.sh — Correctness harness: compare perlc output vs real perl
 #
 # Usage:
-#   ./tests/harness.sh                  # run all runnable tests, compare vs perl
-#   ./tests/harness.sh tests/nb.pl      # specific test(s)
-#   PERLC=../perlc ./tests/harness.sh   # use existing binary
-#   TOLERANCE=1e-9 ./tests/harness.sh   # FP tolerance for numeric tests
+#   ./tests/harness.sh                       # every tests/*.pl, compare vs perl
+#   ./tests/harness.sh tests/nb.pl           # one or more named tests
+#   ./tests/harness.sh --smoke-only          # only *_smoke.pl
+#   ./tests/harness.sh --assertion-only      # the four contract programs
+#   ./tests/harness.sh --help
+#   PERLC=../perlc ./tests/harness.sh        # use an existing binary
+#   OPT_LEVEL=2 ./tests/harness.sh           # pass -O2 to perlc
+#   PERLC_FLAGS='-O0 -g' ./tests/harness.sh  # raw extra perlc arguments
+#   TOLERANCE=1e-9 ./tests/harness.sh        # FP tolerance for numeric tests
+#   TIMEOUT_SEC=60 ./tests/harness.sh        # per-test perl and binary timeout
+#   RUN_IN_PARALLEL=0 ./tests/harness.sh     # one test at a time
+#   CORE_DIVISOR=2 ./tests/harness.sh        # worker count is nproc/CORE_DIVISOR
 #
-# Exit status: 0 if all compared tests match, nonzero otherwise.
-# Prints PASS/FAIL for each, and a final summary.
+# Exit status: 0 if every compared test matches, nonzero otherwise.
+# Prints PASS/FAIL for each, then a summary.
+#
+# Files named in SKIP_BY_DEFAULT run only when you pass that path yourself
+# (or via --assertion-only, which names the DBI and XS programs).
 
 set -u
 set -o pipefail
@@ -211,11 +222,12 @@ CORE_DIVISOR="${CORE_DIVISOR:-2}"   # tests run 1-per-2-cores by default
 RUN_IN_PARALLEL="${RUN_IN_PARALLEL:-1}"   # set to 0 to force serial execution
 
 main() {
+    # $1 is 1 when the user named files (or --assertion-only did).
+    # A default or --smoke-only discovery run passes 0, and then
+    # SKIP_BY_DEFAULT entries are reported and not compared.
+    local user_explicit="$1"
+    shift
     local tests=("$@")
-    if [[ ${#tests[@]} -eq 0 ]]; then
-        # Default: all .pl under tests/, sorted
-        mapfile -t tests < <(find "$SCRIPT_DIR" -maxdepth 1 -name '*.pl' | sort)
-    fi
 
     local total=0 pass=0 fail=0
 
@@ -238,13 +250,13 @@ main() {
     # 1) Print skip notices up-front (original serial ordering).
     for t in "${tests[@]}"; do
         base=$(basename "$t")
-        for s in "${SKIP_BY_DEFAULT[@]}"; do
-            if [[ "$base" == "$s" ]]; then
-                if [[ ${#tests[@]} -eq 0 || "$*" != *"$base"* ]]; then
+        if [[ "$user_explicit" -eq 0 ]]; then
+            for s in "${SKIP_BY_DEFAULT[@]}"; do
+                if [[ "$base" == "$s" ]]; then
                     printf 'SKIP %s (skipped by default — run explicitly if desired)\n' "$base"
                 fi
-            fi
-        done
+            done
+        fi
     done
 
     # 2) Execute (parallel pool of nworkers, or serial when disabled),
@@ -255,11 +267,11 @@ main() {
 
         # Skip heavy/external by default unless explicitly listed
         skip=0
-        for s in "${SKIP_BY_DEFAULT[@]}"; do
-            if [[ "$base" == "$s" ]]; then
-                if [[ ${#tests[@]} -eq 0 || "$*" != *"$base"* ]]; then skip=1; fi
-            fi
-        done
+        if [[ "$user_explicit" -eq 0 ]]; then
+            for s in "${SKIP_BY_DEFAULT[@]}"; do
+                if [[ "$base" == "$s" ]]; then skip=1; fi
+            done
+        fi
         [[ $skip -eq 1 ]] && continue
 
         if [[ $RUN_IN_PARALLEL -eq 1 && $nworkers -ge 1 ]]; then
@@ -278,11 +290,11 @@ main() {
         base=$(basename "$t")
 
         skip=0
-        for s in "${SKIP_BY_DEFAULT[@]}"; do
-            if [[ "$base" == "$s" ]]; then
-                if [[ ${#tests[@]} -eq 0 || "$*" != *"$base"* ]]; then skip=1; fi
-            fi
-        done
+        if [[ "$user_explicit" -eq 0 ]]; then
+            for s in "${SKIP_BY_DEFAULT[@]}"; do
+                if [[ "$base" == "$s" ]]; then skip=1; fi
+            done
+        fi
         [[ $skip -eq 1 ]] && continue
 
         rfile="$res_dir/$base"
@@ -314,4 +326,96 @@ main() {
     return 0
 }
 
-main "$@"
+usage() {
+    cat <<'EOF'
+Usage: tests/harness.sh [--smoke-only | --assertion-only] [test.pl ...]
+
+  (no arguments)     Compare every tests/*.pl with real perl.
+                     Skips dbi_sqlite.pl, xs_ffi.pl, and
+                     cpanel_json_xs_{smoke,deep}.pl unless you name them.
+  test.pl ...        Compare only those files. A skipped-by-default
+                     file runs when you name it.
+  --smoke-only       Keep only *_smoke.pl from the selection.
+  --assertion-only   Compare these four contract programs:
+                       tests/test_do_filename.pl
+                       tests/test_require_simple.pl
+                       tests/dbi_sqlite.pl
+                       tests/xs_ffi.pl
+                     dbi_sqlite.pl needs SQLite. xs_ffi.pl needs the
+                     fixture under tests/lib/auto/.
+  --help             Show this text.
+
+Environment:
+  PERLC            Compiler binary (default: ./perlc next to tests/)
+  PERL             Reference interpreter (default: perl)
+  OPT_LEVEL        Digit 0-5. Adds -ON unless PERLC_FLAGS already has -O.
+  PERLC_FLAGS      Extra arguments passed to perlc before the script.
+  TIMEOUT_SEC      Seconds for one perl run and one compiled binary (default 60).
+                   mbs.pl uses 300.
+  TOLERANCE        Relative float tolerance for nb, nbody, mbs, fibn, arith
+                   (default 1e-9).
+  RUN_IN_PARALLEL  1 (default) runs a pool; 0 runs one test at a time.
+  CORE_DIVISOR     Pool size is nproc divided by this (default 2).
+
+Exit 0 when every compared test matches. A missing selection exits 1.
+EOF
+}
+
+user_explicit=0
+smoke_only=0
+assertion_only=0
+user_tests=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --smoke-only) smoke_only=1; shift ;;
+        --assertion-only) assertion_only=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; user_tests+=("$@"); break ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *) user_tests+=("$1"); shift ;;
+    esac
+done
+
+if [[ "$assertion_only" -eq 1 && "$smoke_only" -eq 1 ]]; then
+    echo "--smoke-only and --assertion-only select different sets." >&2
+    exit 2
+fi
+
+if [[ ${#user_tests[@]} -gt 0 ]]; then
+    user_explicit=1
+    selected=("${user_tests[@]}")
+elif [[ "$assertion_only" -eq 1 ]]; then
+    # Naming these files is what lets the default-skip list run them.
+    user_explicit=1
+    selected=(
+        "$SCRIPT_DIR/test_do_filename.pl"
+        "$SCRIPT_DIR/test_require_simple.pl"
+        "$SCRIPT_DIR/dbi_sqlite.pl"
+        "$SCRIPT_DIR/xs_ffi.pl"
+    )
+else
+    user_explicit=0
+    mapfile -t selected < <(find "$SCRIPT_DIR" -maxdepth 1 -name '*.pl' | sort)
+fi
+
+if [[ "$smoke_only" -eq 1 ]]; then
+    filtered=()
+    for t in "${selected[@]}"; do
+        base=$(basename "$t")
+        if [[ "$base" == *_smoke.pl ]]; then
+            filtered+=("$t")
+        fi
+    done
+    selected=("${filtered[@]}")
+fi
+
+if [[ ${#selected[@]} -eq 0 ]]; then
+    echo "No tests selected." >&2
+    exit 1
+fi
+
+main "$user_explicit" "${selected[@]}"

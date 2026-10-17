@@ -2,23 +2,115 @@
 
 ## Gate
 
+`make` with no goal builds `./perlc` only. It does not run tests.
+`make help` lists every target. The workflows below are the same ones
+in README.md → "Build and test", kept here so a test change can be
+checked without leaving this file.
+
+**Policy:** every compiler fix ships a smoke test (`*_smoke.pl`) and a
+deep test, verified byte-for-byte against real Perl.
+
+### What each target runs
+
+| Command | Builds | Runs | Compares with `perl`? | Pass looks like |
+|---|---|---|---|---|
+| `make` / `make all` | `./perlc` | nothing | no | `./perlc` exists. Current tree prints `Nothing to be done for 'all'.` |
+| `make clean` | nothing (deletes `./perlc`, `./perlc_tsan`, `src/*.o`) | nothing | no | those files are gone |
+| `make test` | `./perlc` | `test_do_filename.pl`, `test_require_simple.pl`, `dbi_sqlite.pl`, `xs_ffi.pl` | no, exit code only | each process exits 0 and prints `name=ok` |
+| `make test-all` | `./perlc` | every `tests/*.pl` except the skip list | yes | `FAIL: 0` and exit 0. 2026-10-16 was `PASS: 599` |
+| `make test-full` | same as `make test-all` | same | yes | same |
+| `make test-smoke` | `./perlc` | only `tests/*_smoke.pl`, still honoring the skip list | yes | `FAIL: 0` |
+| `make test-assertion` | `./perlc` | the same four files as `make test` | yes | `Total compared: 4`, `PASS: 4` |
+| `make test-realworld` | `./perlc` | compile each path in `tests/realworld/manifest.txt` | no, and the binaries are not executed | always exit 0. Summary line `total=… ok=…`. Report: `tests/realworld/last-report.txt` |
+| `make test-tsan` | `./perlc_tsan` (does not replace `./perlc`) | `threads.pl`, `threads_atomic.pl`, `destroy.pl` under TSan | no | three `=== TSan: ===` sections, exit 0, no sanitizer report |
+| `make test-tsan-full` | `./perlc_tsan` | every `tests/*.pl` except `dbi_sqlite.pl`, `xs_dbi_test.pl`, `xs_ffi.pl` | no | exit 0, no sanitizer report |
+| `make test-valgrind` | `./perlc` | every `tests/*.pl` except those same three names, under memcheck | no | exit 0. On this host valgrind has died with SIGILL on perlc binaries (D151); a SIGILL fail is that environment, not a new leak result |
+| `make test-optN` | `./perlc` | the `make test-all` set, compiled with `-ON` | yes | `FAIL: 0`. N is 0–5. `make test-opt` with no digit exits 2 |
+| `make test-opt-matrix` | `./perlc` | the full diff three times, at `-O0`, `-O2`, `-O3` | yes | three `FAIL: 0` summaries |
+| `make bench` | `./perlc` | `bench/bench.sh` on `bench/*.pl` | times only, writes `bench/results.csv` | CSV rows `name,perlc_ms,perl_ms,ratio` |
+
+`tests/harness.sh` is the diff runner behind `test-all`, `test-smoke`,
+`test-assertion`, `test-full`, `test-optN`, and `test-opt-matrix`.
+Numeric tests (`nb.pl`, `nbody.pl`, `mbs.pl`, `fibn.pl`, `arith.pl`)
+allow relative tolerance `TOLERANCE` (default `1e-9`). `mbs.pl` gets
+300 seconds; other tests get `TIMEOUT_SEC` (default 60).
+
+**Skipped by the diff gate unless the path is on the command line:**
+`dbi_sqlite.pl`, `xs_ffi.pl`, `cpanel_json_xs_smoke.pl`,
+`cpanel_json_xs_deep.pl`. `make test-assertion` names the first two,
+so they run there. `xs_dbi_test.pl` is not in the harness skip list
+(the file is not in this tree). `make test-tsan-full` and
+`make test-valgrind` skip `dbi_sqlite.pl`, `xs_dbi_test.pl`, and
+`xs_ffi.pl` by name.
+
+### Concrete commands
+
+One or two scripts, after `make`:
+
 ```bash
-make              # build ./perlc
-make test-all     # tests/harness.sh — compare every tests/*.pl vs real perl
-make test-realworld  # tests/realworld/run.sh — compile-only, not a gate
-make test         # 4 assertion files only (do / require / DBI / XS)
-make test-tsan    # threads.pl threads_atomic.pl destroy.pl
+./tests/harness.sh tests/double_heredoc_smoke.pl tests/double_heredoc_deep.pl
 ```
 
-`tests/harness.sh` compiles each `tests/*.pl` with `./perlc`, runs it and
-`perl`, and diffs stdout. Numeric tests (`nb.pl`, `nbody.pl`, `mbs.pl`,
-`fibn.pl`, `arith.pl`) allow FP tolerance. `mbs.pl` gets a 300s timeout.
+Smoke set only, or the four assertion programs diffed against perl:
 
-**Skipped by default** (run explicitly if you have the deps):
-`dbi_sqlite.pl`, `xs_dbi_test.pl`, `xs_ffi.pl`.
+```bash
+make test-smoke
+make test-assertion
+./tests/harness.sh --smoke-only tests/or_print_smoke.pl
+```
 
-**Policy:** every compiler fix ships a smoke test (`*_smoke.pl`) and a deep
-test, verified byte-for-byte against real Perl.
+A file the gate skips, run on purpose:
+
+```bash
+./tests/harness.sh tests/dbi_sqlite.pl
+./tests/harness.sh tests/xs_ffi.pl
+./tests/harness.sh tests/cpanel_json_xs_smoke.pl
+```
+
+Optimization gate for the change you are about to commit, then the
+full matrix when the numbers matter:
+
+```bash
+make test-all
+make test-opt0
+make test-opt-matrix
+```
+
+Thread and leak checks. TSan compiles with
+`TSAN_OPTIONS=die_after_fork=0` and runs the program with
+`TSAN_OPTIONS=halt_on_error=1`:
+
+```bash
+make test-tsan
+make test-tsan-full
+make test-valgrind
+```
+
+System scripts, compile only. Do not run the binaries. Replace the
+checked-in host snapshot only when you mean to:
+
+```bash
+make test-realworld
+REALWORLD_UPDATE_BASELINE=1 make test-realworld
+```
+
+`REALWORLD_TIMEOUT` (default 60) is the per-script compile budget.
+`PERLC=/path/to/perlc` selects the binary for the harness and for
+`make test-realworld`.
+
+Timing:
+
+```bash
+make bench
+make bench BENCH_ARGS='-n 3 bench/nb.pl'
+make bench BENCH_ARGS='--baseline'
+make bench BENCH_ARGS='--compare'
+```
+
+Harness knobs: `OPT_LEVEL` (adds `-ON` unless `PERLC_FLAGS` already
+contains `-O`), `PERLC_FLAGS` (raw extra perlc arguments),
+`RUN_IN_PARALLEL=0` (serial), `CORE_DIVISOR` (pool size is
+`nproc/CORE_DIVISOR`, default 2), `PERL` (reference interpreter).
 
 **Real-script corpus** (`tests/realworld/`, 2026-10-15): `make test-realworld`
 compiles the paths in `manifest.txt` and classifies each as ok,

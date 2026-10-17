@@ -1290,17 +1290,29 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 
 ## Build & test
 
+`make` and `make all` build `./perlc` and do not run tests
+(`.DEFAULT_GOAL` is `all`). `make help` lists every target. Full
+workflows, success lines, skips, and `./perlc` flags are in README.md
+→ "Build and test" and TESTS.md → "Gate".
+
 ```bash
-make                 # ./perlc  (g++ 15 + LLVM 18.1)
-make test            # 4 assertion files (do/require/DBI/XS)
+make                 # ./perlc only (g++ 15 + LLVM 18.1). Default goal.
+make test            # 4 assertion programs, exit code only (do/require/DBI/XS)
 make test-all        # harness vs real perl — mandatory pre-commit gate
-make test-realworld  # compile-only system-script corpus; not a gate
-make test-tsan       # threads + destroy under TSan
-make test-valgrind   # memcheck (skips DBI/XS)
+make test-smoke      # harness, *_smoke.pl only
+make test-assertion  # the 4 assertion programs, diffed vs perl
+make test-realworld  # compile-only system-script corpus; always exit 0; not a gate
+make test-tsan       # ./perlc_tsan on threads.pl threads_atomic.pl destroy.pl
+make test-tsan-full  # ./perlc_tsan on tests/*.pl except DBI/XS
+make test-valgrind   # memcheck; skips DBI/XS; SIGILL on this host is environmental
+make test-opt2       # full diff gate at perlc -O2 (digit 0-5)
+make test-opt-matrix # full diff gate at -O0, -O2, -O3
+make bench           # bench/bench.sh; BENCH_ARGS='-n 3 bench/nb.pl'
 make clean
 ```
 
-`./perlc foo.pl -o out` · `--emit-ir` · `-g` · `-pm` (cpanm local-lib)
+`./perlc foo.pl -o out` · no `-O` means level 2, bare `-O` means 1 ·
+`--emit-ir` · `--emit-bc` · `-g` · `-pm` · `-I` · `-v`
 
 Every fix ships a **smoke + deep** test compared against real Perl.
 

@@ -9,23 +9,314 @@ A Perl compiler that translates Perl source to LLVM IR and links a C runtime to 
 - `libpcre2-8` (`apt install libpcre2-dev`)
 - `libsqlite3-dev` (for DBI/SQLite integration, `apt install libsqlite3-dev`)
 
-## Build
+## Build and test
+
+`make` with no goal builds the compiler. It is the same as `make all`:
+it links `./perlc` from the C++ sources and `src/runtime.c`, and it does
+not run any tests. `make help` prints the target list. The recipes below
+rebuild `./perlc` first when sources are newer than the binary, except
+`make clean` and `make help`.
+
+### Build the compiler
 
 ```bash
-make           # produces ./perlc
-make test      # 4 assertion-based contract tests
-make test-all  # full suite vs real perl (the correctness gate)
-make clean
+make
 ```
+
+Success is a `./perlc` you can run. If the binary is already current,
+make prints `Nothing to be done for 'all'.` A one-file check:
+
+```bash
+./perlc -e 2>/dev/null || true
+printf '%s\n' 'print "hi\n";' > /tmp/perlc-hello.pl
+./perlc /tmp/perlc-hello.pl -o /tmp/perlc-hello
+/tmp/perlc-hello
+```
+
+The last command prints `hi`. `./perlc` with no script prints the usage
+text to stderr and exits 1. That is the driver, not the `make` default.
+
+`make clean` deletes `./perlc`, `./perlc_tsan`, and every `src/*.o`.
+The next `make` is a full rebuild.
+
+### `make test` — four assertion programs
+
+Runs these programs and requires each process to exit 0. It does not
+diff them against `perl`.
+
+- `tests/test_do_filename.pl` — `do FILE` return value, missing file, parse error, runtime `die`
+- `tests/test_require_simple.pl` — `require` of a small module
+- `tests/dbi_sqlite.pl` — DBI talking to SQLite (`libsqlite3`)
+- `tests/xs_ffi.pl` — the DynaLoader-style FFI fixture under `tests/lib/auto/`
+
+```bash
+make test
+```
+
+Each program prints `name=ok` lines and a `*_done` line. The recipe
+stops at the first program that exits non-zero. Compiled binaries go
+to `/tmp/perlc_<name>`. The `do` test creates and then deletes
+`test_do_*.pl` in the current directory.
+
+Use this when you touched `do`, `require`, DBI, or the FFI loader and
+want a short contract check. The full gate below skips the DBI, XS,
+and Cpanel::JSON::XS files unless you name them.
+
+### `make test-all` — correctness gate
+
+Compiles every `tests/*.pl` with `./perlc`, runs that binary and `perl`
+on the same script, and diffs the output. This is the gate to run
+before a commit that changes the compiler. It takes several minutes.
+
+```bash
+make test-all
+```
+
+A passing run ends with:
+
+```text
+=== Summary ===
+Total compared: 599
+PASS: 599
+FAIL: 0
+All compared tests match perl output (within tolerance where applicable).
+```
+
+The compared count grows as new tests are added. Exit status is 0 only
+when `FAIL` is 0. These files are listed and not compared, because the
+host `perl` cannot load the module either (`Cpanel::JSON::XS`) or the
+test needs a local database or a built fixture:
+
+- `tests/dbi_sqlite.pl`
+- `tests/xs_ffi.pl`
+- `tests/cpanel_json_xs_smoke.pl`
+- `tests/cpanel_json_xs_deep.pl`
+
+Run one of those on purpose:
+
+```bash
+./tests/harness.sh tests/dbi_sqlite.pl
+./tests/harness.sh tests/cpanel_json_xs_smoke.pl
+```
+
+One script, or a few, without the rest of the suite:
+
+```bash
+./tests/harness.sh tests/double_heredoc_smoke.pl tests/or_print_deep.pl
+```
+
+`nb.pl`, `nbody.pl`, `mbs.pl`, `fibn.pl`, and `arith.pl` allow a
+relative float tolerance of `1e-9` (override with `TOLERANCE=`).
+`mbs.pl` gets 300 seconds; every other test gets 60
+(`TIMEOUT_SEC=`). Tests run in a pool of `nproc/2` (`CORE_DIVISOR=`,
+or `RUN_IN_PARALLEL=0` for one at a time). `make test-full` is the
+same recipe as `make test-all`.
+
+### `make test-smoke` — smoke tests only
+
+Same diff as `make test-all`, but only files named `*_smoke.pl`.
+Use this after a parser or lexer change when you want the short
+repro for each fix before paying for the deep tests.
+
+```bash
+make test-smoke
+```
+
+Success is the same `FAIL: 0` summary, with a smaller `Total compared`.
+`cpanel_json_xs_smoke.pl` is still skipped unless you name it.
+A single smoke file:
+
+```bash
+./tests/harness.sh --smoke-only tests/double_heredoc_smoke.pl
+```
+
+`--smoke-only` together with a path that is not a smoke test selects
+nothing and exits 1 (`No tests selected.`).
+
+### `make test-assertion` — the four programs, diffed
+
+Same four programs as `make test`, compared byte-for-byte with `perl`
+instead of only checking the exit code. DBI and the XS fixture are
+included on purpose.
+
+```bash
+make test-assertion
+```
+
+Success is `Total compared: 4`, `PASS: 4`, `FAIL: 0`. If SQLite or
+the FFI fixture is missing, this target fails; `make test-all` does
+not, because it skips those two files.
+
+### `make test-realworld` — compile system scripts, do not run them
+
+Compiles each absolute path in `tests/realworld/manifest.txt`. It
+never executes the binary. Several of those scripts are system tools.
+The recipe always exits 0. A missing module (`Can't locate`) is a
+report, not a compiler failure. This target is not part of
+`make test-all`.
+
+```bash
+make test-realworld
+```
+
+Each path prints one class: `ok`, `missing-file`, `missing-module`,
+`parse-error`, or `other-compile-error`. The summary line looks like:
+
+```text
+Summary  total=30  ok=15  missing-file=0  missing-module=10  parse-error=5  other=0
+Report   tests/realworld/last-report.txt
+This corpus is not a gate. Exit 0.
+```
+
+The counts are host-specific. `last-report.txt` is rewritten every
+run. `tests/realworld/baseline.txt` is replaced only when it is
+missing, or when you ask:
+
+```bash
+REALWORLD_UPDATE_BASELINE=1 make test-realworld
+```
+
+`REALWORLD_TIMEOUT` is seconds per compile (default 60). A timeout is
+`other-compile-error`. `PERLC=/path/to/perlc` selects another binary.
+
+### `make test-tsan` — threads under ThreadSanitizer
+
+Builds a separate binary, `./perlc_tsan`, with `-fsanitize=thread`.
+It does not replace `./perlc`. It then compiles and runs only:
+
+- `tests/threads.pl`
+- `tests/threads_atomic.pl`
+- `tests/destroy.pl`
+
+The compile step sets `TSAN_OPTIONS=die_after_fork=0` (the compiler
+itself forks `clang-18`). The run step sets
+`TSAN_OPTIONS=halt_on_error=1`. Output is the program's own prints.
+There is no diff against `perl`.
+
+```bash
+make test-tsan
+```
+
+Success is three sections (`=== TSan: tests/threads.pl ===` and the
+two siblings) and exit 0. Any ThreadSanitizer error fails the recipe.
+The first compile of `perlc_tsan` is a full second build.
+
+### `make test-tsan-full` — ThreadSanitizer on the suite
+
+Same `./perlc_tsan` binary and the same `TSAN_OPTIONS`, over every
+`tests/*.pl` except `dbi_sqlite.pl`, `xs_dbi_test.pl`, and `xs_ffi.pl`
+(`xs_dbi_test.pl` is not in this tree; the name is still skipped if
+it appears). This is a long run. It checks that the compiled programs
+stay quiet under TSan. It does not diff against `perl`.
+
+```bash
+make test-tsan-full
+```
+
+Success is exit 0 and a `=== TSan: ... ===` header per file. A
+sanitizer report aborts that program and fails the recipe.
+
+### `make test-valgrind` — leak check
+
+Uses the ordinary `./perlc`, then runs each compiled program under:
+
+```bash
+valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all --error-exitcode=1
+```
+
+Program stdout is discarded. DBI and XS tests are skipped, same names
+as `make test-tsan-full`. There is no diff against `perl`.
+
+```bash
+make test-valgrind
+```
+
+Success is exit 0 and a `=== Valgrind: ... ===` header per file. On
+this host, valgrind has died with SIGILL on every perlc binary
+(noted with the D151 file-op work). If that still happens, the recipe
+fails immediately and this target is not evidence about leaks.
+
+### `make test-optN` and `make test-opt-matrix` — optimization levels
+
+`make test-opt2` is the full `make test-all` diff, with `./perlc -O2`
+for every script. The digit is required and must be 0, 1, 2, 3, 4,
+or 5. `make test-opt` alone is an error.
+
+```bash
+make test-opt0
+make test-opt2
+```
+
+`make test-opt-matrix` runs that gate three times, at `-O0`, then
+`-O2`, then `-O3`, and stops at the first level that fails. Budget
+about three times a `make test-all` run.
+
+```bash
+make test-opt-matrix
+```
+
+What the digit means is in the Usage section below. The compiler
+binary itself is still the normal `./perlc`; only the programs it
+emits are optimized at that level.
+
+### `make bench` — timing
+
+Builds `./perlc` if needed, then runs `bench/bench.sh`. With no
+arguments that script times every `bench/*.pl` (or `tests/*.pl` if
+`bench/` has none) once, against `perl`, and writes `bench/results.csv`.
+
+```bash
+make bench
+make bench BENCH_ARGS='-n 3 bench/nb.pl bench/fibn.pl'
+make bench BENCH_ARGS='--baseline'
+make bench BENCH_ARGS='--compare'
+```
+
+`-n 3` is three runs, average reported. `--baseline` records perlc
+times only. `--compare` diffs the current run against the last
+baseline. Each run's wall clock is capped at 120 seconds.
 
 ## Usage
 
 ```bash
-./perlc program.pl -o output            # compile and link
-./perlc program.pl -o out.ll --emit-ir  # dump LLVM IR instead of linking
-./perlc program.pl -g -o output         # compile with debugging symbols (Perl source lines in gdb)
-./perlc -pm program.pl                  # install missing modules then compile
+./perlc program.pl -o output            # compile and link (default opt level 2)
+./perlc program.pl -o out.ll --emit-ir  # write LLVM IR and stop
+./perlc program.pl -o out.bc --emit-bc  # write LLVM bitcode and stop
+./perlc program.pl -g -o output         # Perl source lines in the binary for gdb
+./perlc -pm program.pl                  # cpanm-install missing modules, then compile
+./perlc -I/opt/lib program.pl -o output # extra module search directory
+./perlc program.pl -O0 -o output        # no IR optimization
+./perlc program.pl -v -o output         # print the clang link line
 ```
+
+With no script, `./perlc` prints this option list and exits 1.
+
+| Option | What it does |
+|---|---|
+| `-o <file>` | Output path. Default is `a.out` in the current directory. With `--emit-ir` and no `-o`, the path is the script name with `.ll`. `--emit-bc` uses `.bc` the same way. |
+| `--emit-ir` | Write LLVM IR and do not link. |
+| `--emit-bc` | Write LLVM bitcode and do not link. |
+| `--do-lib` | Write a shared library for runtime `do FILE`. The runtime invokes this itself. The library is not linked with `runtime.c`; it uses the caller's runtime when loaded. |
+| `--eval-lib` | Same as `--do-lib`, and bind outer `my` cells from the eval pad. The runtime invokes this for string `eval`. |
+| `-O` / `-O0` … `-O5` | Optimization. No flag means level **2**. A bare `-O` means level **1**. `-O0` skips the LLVM IR passes. `-O1` uses the LLVM O1 pipeline. `-O2` uses O2. `-O3`, `-O4`, and `-O5` use the LLVM O3 pipeline. The same digit is passed to `clang-18 -O<digit> -march=native` when linking. `clang-18` warns that `-O4` is deprecated, and it rejects `-O5`. |
+| `-g` | Debugging symbols, so a debugger can show Perl source lines. |
+| `-v` | Print the `clang-18` link command. |
+| `-pm` | Run `cpanm` for modules the script `use`s and that are not found, then compile. |
+| `-I<dir>` | Add `<dir>` to the module search path. `-I <dir>` is the same. `PERL5LIB` (colon-separated) is prepended as well, and `use lib` inside the script is honored. |
+| `--mini-gmp` | Accepted and ignored as a switch. Math::BigInt always uses the bundled mini-gmp. System GMP is not linked. It also turns on `-v`. |
+
+Workflow: see the IR for one function, then link a binary at `-O0` when
+you are chasing a miscompile.
+
+```bash
+./perlc tests/double_heredoc_smoke.pl --emit-ir -o /tmp/heredoc.ll
+./perlc tests/double_heredoc_smoke.pl -O0 -g -o /tmp/heredoc
+/tmp/heredoc
+```
+
+`perlc` looks for `src/runtime.c` next to the compiler binary, then in
+the current directory. Run it from a checkout, or keep the `src/`
+directory beside the binary you copied.
 
 ## Performance
 
