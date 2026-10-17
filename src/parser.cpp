@@ -2170,8 +2170,8 @@ NodePtr Parser::parseOrRhs() {
     int line = cur().line;
     NodePtr stmt;
     if      (k == TK::KW_RETURN) { stmt = parseReturn(); }
-    else if (k == TK::KW_DIE)    { stmt = parseDieWarnBody(true,  line); }
-    else if (k == TK::KW_WARN)   { stmt = parseDieWarnBody(false, line); }
+    else if (k == TK::KW_DIE)    { advance(); stmt = parseDieWarnBody(true,  line); }
+    else if (k == TK::KW_WARN)   { advance(); stmt = parseDieWarnBody(false, line); }
     else if (k == TK::KW_LAST)   { advance(); stmt = parseLastNextRedoBody(NK::Last, line); }
     else if (k == TK::KW_NEXT)   { advance(); stmt = parseLastNextRedoBody(NK::Next, line); }
     else if (k == TK::KW_REDO)   { advance(); auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
