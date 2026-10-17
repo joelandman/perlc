@@ -243,6 +243,20 @@ static std::string subLLVMName(const std::string &name) {
     return "perlsub_" + result;
 }
 
+/* D195: `::NAME` is main::NAME. A sub declared `sub NAME` in package main
+   is emitted under the bare name. Prefer an exact match, then that bare
+   sub. A real `sub main::Other::NAME` is left qualified. */
+static std::string definedSubName(llvm::Module &mod, const std::string &name) {
+    if (mod.getFunction(subLLVMName(name))) return name;
+    if (name.rfind("main::", 0) == 0) {
+        std::string bare = name.substr(6);
+        if (bare.find("::") == std::string::npos &&
+            mod.getFunction(subLLVMName(bare)))
+            return bare;
+    }
+    return name;
+}
+
 /* ── construction ────────────────────────────────────────────────────────── */
 
 CodeGen::CodeGen(bool debug, int optLevel)
@@ -2486,7 +2500,8 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     }
     /* user-defined sub call in list context: call with ctx=1, unwrap result */
     if (n.kind == NK::Call) {
-        if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+        std::string resolvedSub = definedSubName(*mod_, n.name);
+        if (auto *fn = mod_->getFunction(subLLVMName(resolvedSub))) {
             Value *argsArr = callRT("perl_array_new", {});
             fillCallArgs(argsArr, n);
             auto *i32Ty = Type::getInt32Ty(ctx_);
@@ -11841,7 +11856,8 @@ Value *CodeGen::emitExpr(const Node &n) {
             freeIfOwned(nm);
             return ref;
         }
-        auto *subFn = mod_->getFunction(subLLVMName(n.name));
+        std::string subName = definedSubName(*mod_, n.name);
+        auto *subFn = mod_->getFunction(subLLVMName(subName));
         if (!subFn) return perlUndef();
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
 
@@ -11862,7 +11878,7 @@ Value *CodeGen::emitExpr(const Node &n) {
            seen), fall back to a plain code ref. */
         const Node *subAst = nullptr;
         for (auto *s : subs_) {
-            if (s->name == n.name) { subAst = s; break; }
+            if (s->name == subName || s->name == n.name) { subAst = s; break; }
         }
         if (subAst && subAst->body) {
             std::set<std::string> usedNames;
@@ -12739,6 +12755,13 @@ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
        shared logic, which many other callers (sub bodies, do-file bodies,
        ternary/if branches) correctly rely on behaving the way it already
        does. */
+    /* D194: `f() || print FH $x` / `f() or print "x"`. print/say/printf
+       are statements. Run them here; a successful print is true (1). */
+    if (rhsNode.kind == NK::PrintStmt || rhsNode.kind == NK::SayStmt ||
+        rhsNode.kind == NK::PrintfStmt) {
+        emitStmt(rhsNode);
+        return perlInt(1);
+    }
     if (rhsNode.kind == NK::Block && rhsNode.args.size() == 1 &&
         rhsNode.args[0]->kind == NK::Return) {
         emitStmt(*rhsNode.args[0]);
@@ -15159,7 +15182,8 @@ Value *CodeGen::emitCall(const Node &n) {
         freeIfOwned(sig);
         return ret;
     }
-    if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+    std::string resolvedSub = definedSubName(*mod_, n.name);
+    if (auto *fn = mod_->getFunction(subLLVMName(resolvedSub))) {
         /* Use push_nc (no-clone) for scalar args so we skip 63M clone/free per
            mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
            after the call; non-owned (ScalarVar, borrow) need no action. */

@@ -5914,6 +5914,17 @@ void perl_glob_copy(const char *dst, const char *src) {
     d->hash = s->hash;
     d->io = s->io;
     d->format = s->format;
+    /* STDOUT/STDERR/STDIN are not stored in the glob table; print to
+       those names calls perl_get_std*. `*ALIAS = *STDOUT` must see the
+       same handle. A scalar already holding a filehandle wins. */
+    if (!d->scalar || d->scalar->tag != PERL_FILEHANDLE) {
+        const char *b = src ? src : "";
+        const char *col = strstr(b, "::");
+        if (col) b = col + 2;
+        if (strcmp(b, "STDOUT") == 0) d->scalar = perl_get_stdout();
+        else if (strcmp(b, "STDERR") == 0) d->scalar = perl_get_stderr();
+        else if (strcmp(b, "STDIN") == 0) d->scalar = perl_get_stdin();
+    }
     if (d->array && d->array->refcount > 0) d->array->refcount++;
     if (d->hash && d->hash->refcount > 0) d->hash->refcount++;
 }
@@ -5994,6 +6005,11 @@ void perl_glob_assign(const char *name, PerlValue *rhs) {
         perl_glob_set_array(name, (PerlArray *)rhs->pval);
     else if (rhs->tag == PERL_REF_HASH)
         perl_glob_set_hash(name, (PerlHash *)rhs->pval);
+    else if (rhs->tag == PERL_FILEHANDLE) {
+        /* `*TH = $flag ? *STDOUT : *STDERR` evaluates to the standard
+           handle value (not a Typeglob node, so not perl_glob_copy). */
+        glob_get_or_create(name)->scalar = rhs;
+    }
     else if (rhs->tag == PERL_CODE_REF && rhs->pval) {
         PerlClosure *cl = (PerlClosure *)rhs->pval;
         if (cl->fn) {

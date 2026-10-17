@@ -2362,6 +2362,15 @@ NodePtr Parser::parseOr() {
             lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
             continue;
         }
+        /* D194: `call() || print FH $x` (splain). `print`/`say`/`printf`
+           are statement keywords, so parseAnd() never sees them. Same
+           body parsers as low-precedence `or` (parseOrRhs); codegen's
+           short-circuit RHS runs the statement. */
+        if (check(TK::KW_PRINT) || check(TK::KW_SAY) || check(TK::KW_PRINTF)) {
+            NodePtr rhs = parseOrRhs();
+            lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
+            continue;
+        }
         auto rhs = parseAnd();
         lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
     }
@@ -2381,6 +2390,12 @@ NodePtr Parser::parseAnd() {
             else                         { advance(); auto n = std::make_unique<Node>(); n->kind = NK::Redo; n->line = line; stmt = std::move(n); }
             NodeList b; b.push_back(std::move(stmt));
             auto rhs = makeBlock(std::move(b), line);
+            lhs = makeBin("&&", std::move(lhs), std::move(rhs), line);
+            continue;
+        }
+        /* D194: `call() && print ...`, same as the `||` case above. */
+        if (check(TK::KW_PRINT) || check(TK::KW_SAY) || check(TK::KW_PRINTF)) {
+            NodePtr rhs = parseOrRhs();
             lhs = makeBin("&&", std::move(lhs), std::move(rhs), line);
             continue;
         }
@@ -5348,9 +5363,17 @@ NodePtr Parser::parsePrimary() {
                 return parseAmpBlockCall(nm, *pr, line);
         }
         if (check(TK::LPAREN)) return parseCall(nm, line);
-        /* check constant map so bare NAME resolves without parens */
+        /* check constant map so bare NAME resolves without parens.
+           D195: `::NAME` lexes as main::NAME. A main-script `use constant`
+           is stored under the bare name. */
         {
-            auto cit = constMap_.find(nm);
+            std::string ck = nm;
+            if (!constMap_.count(ck) && ck.rfind("main::", 0) == 0) {
+                std::string bare = ck.substr(6);
+                if (bare.find("::") == std::string::npos && constMap_.count(bare))
+                    ck = bare;
+            }
+            auto cit = constMap_.find(ck);
             if (cit != constMap_.end()) {
                 return cit->second->clone();  /* pre-parsed AST node (cloned for reuse) */
             }
@@ -5460,6 +5483,16 @@ NodePtr Parser::parsePrimary() {
                     return n;
                 }
                 if (cur().kind == TK::COMMA) {
+                    /* D195: a qualified name is a sub call, not a bareword
+                       string. `::ZIP_SIG,` is main::ZIP_SIG (a constant or
+                       sub). Unqualified `print S_IRUSR, ","` stays a string
+                       below. */
+                    if (nm.find("::") != std::string::npos) {
+                        auto n = std::make_unique<Node>(); n->kind = NK::Call;
+                        n->name = nm; n->args = NodeList{}; n->line = line;
+                        n->ival = 1;
+                        return n;
+                    }
                     /* Qualified all-caps names in the constant modules
                        (Fcntl::F_GETFD) are ALWAYS the constant call — no
                        import needed (real Perl's qualified constant form

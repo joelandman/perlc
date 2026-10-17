@@ -11,33 +11,49 @@ AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
                                       runtime.c
 ```
 
-## Current state (2026-10-15)
+## Current state (2026-10-16)
 
-**D190, D191, D192 (2026-10-15).** Three items that stopped real scripts.
-**D190**: a trailing comma as the last statement of a block
-(`push @x, sprintf(...), }`) is legal Perl and now parses — the list-op
-argument loops stop on `}` when the call is not parenthesized.
-**D191**: chained `our` / `my` used as an expression
-(`our $a = our $b = our $c = 7`, and the same shape with `my`).
-**D192**: computed typeglob assignment `*$name = sub { ... }` and
-`*{$expr} = \&{expr}`. An existing sub is replaced, a name that did not
-exist at compile time becomes callable, and a closure keeps its captures.
-A program with no computed glob assign still emits a direct LLVM call and
-still inlines. Static `*NAME = \&sub` does not override that direct call
-unless the program also contains a computed glob assign. `*$x{IO}` is not
-parsed. A standing compile-only corpus is `tests/realworld/`
+**D193, D194, D195 (2026-10-16).** Three parser/lexer items from the
+compile-only corpus, after D190–D192.
+**D193**: two heredocs in one expression
+(`cond ? <<'EOT' : <<'EOT'`, `<<'A' . <<'B'`, `print <<E1, <<E2`).
+A second `<<` on the same statement starts where the previous pending
+body ended. `1 << 5` is still a shift.
+**D194**: high-precedence `||` / `&&` / `//` with `print` / `say` /
+`printf` on the right (`f() || print FH $msg`). The print runs only
+when the short-circuit says so, and its value is 1. The same value
+applies to the older `or print` form. `*ALIAS = *STDOUT` and
+`*ALIAS = $flag ? *STDOUT : *STDERR` alias the standard handle, so
+`print ALIAS` writes there.
+**D195**: a leading `::NAME` means `main::NAME`, including inside
+another package. `::CONST` finds a `use constant` declared in main,
+and `\&::Sub` / `::Sub()` find a sub declared in main. It does not
+mean the current package.
+
+D190–D192 (2026-10-15) remain: trailing comma before `}` on an
+unparenthesized list-op, expression `our`/`my`, and computed typeglob
+`*$name = sub { ... }` / `*{$expr} = \&{expr}`. A program with no
+computed glob assign still emits a direct LLVM call and still inlines.
+`*$x{IO}` is not parsed. `make test-all` on that commit was
+**593/593 PASS, 0 FAIL**. While gating it, `tests/term_readline_deep.pl`
+failed under `TERM=dumb`; ornaments are emitted only when `TERM` is
+set and is not `dumb`.
+
+`make test-all` is **599/599 PASS, 0 FAIL** (2026-10-16), including
+the six D193–D195 tests.
+
+A standing compile-only corpus is `tests/realworld/`
 (`make test-realworld`). It classifies each system script as ok,
-missing-file, missing-module, parse-error, or other-compile-error, never
-executes the binary, and is not part of `make test-all`. The 2026-10-15 host baseline (`tests/realworld/baseline.txt`) is
-30 scripts: 15 ok, 10 missing-module, 5 parse-error, 0 other.
+missing-file, missing-module, parse-error, or other-compile-error,
+never executes the binary, and is not part of `make test-all`.
+`tests/realworld/baseline.txt` is still the 2026-10-15 snapshot
+(30 scripts: 15 ok, 10 missing-module, 5 parse-error, 0 other) and
+still quotes the pre-D193 error lines. After D193–D195 those five
+still fail later: `perlbug` and `perlthanks` at line 1217
+(`unexpected token '^'`, a `format` picture; `format`/`write` is a
+non-goal), `splain` at line 589 (`&$olddie`), `zipdetails` at line
+2576 (`return '', '', 0`), and `ucfq` on `format` (`@<<<<<<`).
 `crontab2english.pl`, `callgrind_annotate`, and `json_pp` compile.
-`make test-all` is **593/593 PASS, 0 FAIL** (2026-10-15), including the
-six D190–D192 tests. While gating, `tests/term_readline_deep.pl` failed
-under `TERM=dumb`: the native Stub always wrote the xterm ornament
-sequence around the prompt, and real perl writes the bare prompt when
-Term::Cap has no capabilities. Ornaments are now emitted only when
-`TERM` is set and is not `dumb`. `TERM=xterm` still matches the
-previous sequence.
 
 Core language, OOP, regex (PCRE2 including `/x`), threads::shared, overload,
 Math::BigInt (mini-gmp), pack/unpack, `do FILE`, string `eval EXPR`,
@@ -1116,19 +1132,31 @@ are in TESTS.md):**
 D188 are fixed. Multi-key `$h{"a","b"}` landed in `dae3c35`
 (`parseHashKeySingle`). Trailing comma before `}` is **D190**.
 Chained `our`/`my` is **D191**. Computed typeglob `*$name = sub {}` /
-`*{$expr} = \&{expr}` is **D192** (W27). The compile-only corpus
-(`make test-realworld`, `tests/realworld/baseline.txt`) is the
-standing list of what real scripts still do. The 2026-10-15 host run
-is 30 scripts, 15 ok, 10 missing-module, 5 parse-error, 0 other.
-`/usr/bin/splain` gets past the chained `our` and stops at
-`while (defined (my $error = <>))` (`unexpected token 'print'`).
-`/usr/bin/ucfq` gets past the computed glob and stops on `format`
-picture lines (`@<<<<<<`); `format`/`write` is an explicit non-goal.
-`/usr/bin/perlbug` and `/usr/bin/perlthanks` stop at line 1168
-(`unexpected token '.'`). `/usr/bin/zipdetails` stops at line 171
-(`unexpected token ':'`). Those five are recorded, not fixed here.
-Missing-module `Can't locate` results are not compiler defects and
-are not harness failures. **D188 FIXED
+`*{$expr} = \&{expr}` is **D192** (W27). Double heredoc is **D193**.
+High-precedence `|| print` is **D194**. Leading `::NAME` is **D195**.
+The compile-only corpus (`make test-realworld`,
+`tests/realworld/baseline.txt`) is the standing list of what real
+scripts still do. The checked-in baseline is still the 2026-10-15
+host run (30 scripts, 15 ok, 10 missing-module, 5 parse-error,
+0 other) and still quotes the old error lines. After D193–D195:
+`/usr/bin/perlbug` and `/usr/bin/perlthanks` get past the double
+heredoc and stop at line 1217 (`unexpected token '^'`, `format`
+picture `^<<<<`); `format`/`write` is an explicit non-goal, same
+class as `/usr/bin/ucfq`'s `@<<<<<<`. `/usr/bin/splain` gets past
+`|| print THITHER` and stops at line 589 (`unexpected token '&'`,
+`&$olddie` — a call through a scalar code reference).
+`/usr/bin/zipdetails` gets past `::CONST` / `\&::Sub` and stops at
+line 2576 (`unexpected token ','`, unparenthesized
+`return '', '', 0`). Those later errors are recorded, not fixed
+here. Missing-module `Can't locate` results are not compiler defects
+and are not harness failures. **D195 FIXED 2026-10-16** (leading
+`::NAME` is `main::NAME` — see TESTS.md). **D194 FIXED 2026-10-16**
+(`||`/`&&`/`// print` and standard-handle glob alias — see TESTS.md).
+**D193 FIXED 2026-10-16** (two heredocs in one expression — see
+TESTS.md). **D192 FIXED 2026-10-15** (computed typeglob — see
+TESTS.md). **D191 FIXED 2026-10-15** (expression `our`/`my` — see
+TESTS.md). **D190 FIXED 2026-10-15** (trailing comma before `}` —
+see TESTS.md). **D188 FIXED
 2026-10-02** (`${EXPR}{key}`/`${EXPR}[idx]` silently produced wrong
 data — see TESTS.md). **D186 FIXED 2026-10-02**
 (`tryEmitI1Cond`'s file-scope-global comparison fast path didn't

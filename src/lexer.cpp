@@ -384,13 +384,25 @@ Token Lexer::readHeredoc() {
     size_t lineEnd = pos_;
     while (lineEnd < src_.size() && src_[lineEnd] != '\n') lineEnd++;
 
+    /* D193: several heredocs in one statement (`cond ? <<'EOT' : <<'EOT'`,
+       the shape in /usr/bin/perlbug) stack their bodies in source order
+       after that line. A later marker on this same line must start where
+       the previous body ended, not at the first line after the statement
+       again — otherwise the second body is left in the token stream and
+       parsed as code (`unexpected token '.'`). */
+    size_t bodyStart;
+    if (pendingHeredocPos_)
+        bodyStart = pendingHeredocPos_;
+    else
+        bodyStart = (lineEnd < src_.size()) ? lineEnd + 1 : lineEnd;
+
     /* collect heredoc body from subsequent lines. For the indented form,
        the terminator line may itself be preceded by whitespace — match it
        with that leading whitespace stripped, and remember the stripped
        prefix so it can be removed from every body line below (real Perl's
        `<<~IDENT` strips the terminator line's own indentation from the
        whole body). */
-    size_t p = (lineEnd < src_.size()) ? lineEnd + 1 : lineEnd;
+    size_t p = bodyStart;
     std::string body;
     std::string indentPrefix;
     int extraLines = 0;
@@ -430,9 +442,11 @@ Token Lexer::readHeredoc() {
         body = stripped;
     }
 
-    /* after the current line's \n is consumed, jump past the heredoc body */
-    pendingHeredocPos_   = p;
-    pendingHeredocLines_ = extraLines;
+    /* after the current line's \n is consumed, jump past every heredoc
+       body queued on this line. Line count accumulates; the jump adds it
+       once. */
+    pendingHeredocPos_    = p;
+    pendingHeredocLines_ += extraLines;
 
     if (interp) {
         /* D154: <<"EOT" / <<EOT bodies are double-quoted strings — process
@@ -1143,7 +1157,29 @@ std::vector<Token> Lexer::tokenize() {
             case ',':  toks.push_back({TK::COMMA,    ",", line_}); break;
             case '\\': toks.push_back({TK::BACKSLASH,"\\",line_}); break;
             case '?':  toks.push_back({TK::QUESTION, "?", line_}); break;
-            case ':':  toks.push_back({TK::COLON,    ":", line_}); break;
+            case ':':
+                /* D195: `::NAME` is main::NAME (zipdetails' `::ZIP_LOCAL_HDR_SIG`
+                   and `\&::LocalHeader`). A single `:` stays the ternary/label
+                   colon. pos_ is already past the first colon. */
+                if (peek() == ':' && pos_ + 1 < src_.size() &&
+                    (isalpha((unsigned char)src_[pos_ + 1]) || src_[pos_ + 1] == '_')) {
+                    pos_++; /* second colon */
+                    std::string name = "main::";
+                    while (pos_ < src_.size() &&
+                           (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+                        name += src_[pos_++];
+                    while (pos_ + 1 < src_.size() && src_[pos_] == ':' && src_[pos_ + 1] == ':') {
+                        pos_ += 2;
+                        name += "::";
+                        while (pos_ < src_.size() &&
+                               (isalnum((unsigned char)src_[pos_]) || src_[pos_] == '_'))
+                            name += src_[pos_++];
+                    }
+                    toks.push_back({TK::IDENT, name, line_});
+                    break;
+                }
+                toks.push_back({TK::COLON, ":", line_});
+                break;
             case '+':
                 if (peek() == '+') { pos_++; toks.push_back({TK::PLUS_PLUS, "++", line_}); }
                 else if (peek() == '=') { pos_++; toks.push_back({TK::PLUS_ASSIGN, "+=", line_}); }
