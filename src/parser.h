@@ -130,6 +130,8 @@ private:
     NodePtr parseListOpArg(bool parens);          /* D150: list-op argument: parseExpr in parens, else stops at and/or/xor */
     NodePtr stmtValueExpr(Node &stmt, int line); /* D150: value of STMT as an or/and LHS; nullptr if STMT never completes */
     bool atLowOrOp();                              /* next token is low-precedence or/and/xor */
+    bool atTrailingDelim();                        /* D191: cur() is }/)/] — cannot start a list element (a preceding comma was trailing) */
+    bool consumeTrailingComma();                   /* D191: if cur() is a comma whose next token terminates the scope/statement, consume it */
     NodePtr finishDeclLowOr(NodePtr decl, NodePtr var, int line); /* D150: (my $x = INIT) or RHS */
     NodePtr consumeLowOrChain(NodePtr init);  /* consume or/and/xor statement separators, folding onto init; returns the chain (or init) */
 

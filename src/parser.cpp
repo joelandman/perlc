@@ -1596,9 +1596,12 @@ NodePtr Parser::parseMy() {
         return finishDeclLowOr(std::move(decl), [&]{ auto v = std::make_unique<Node>(); v->kind = NK::HashVar; v->name = nm; v->line = line; return v; }(), line);
     }
 
-    /* fallback: expression statement */
-    auto expr = parseExpr();
-    match(TK::SEMI);
+     /* fallback: expression statement */
+     auto expr = parseExpr();
+     /* D191: tolerate a trailing comma after the expression (`$x = f(),`
+        before `;`/`}`). */
+     consumeTrailingComma();
+     match(TK::SEMI);
     auto n = std::make_unique<Node>(); n->kind = NK::ExprStmt; n->left = std::move(expr); n->line = line;
     return n;
 }
@@ -1630,12 +1633,14 @@ NodePtr Parser::parsePrint(bool isSay) {
           n->name = "";
           n->left = std::move(fhExpr);
          /* Now parse the rest as arguments */
-         NodeList args;
-         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
-             if (check(TK::RPAREN)) break; /* for parenthesized form */
-             args.push_back(parseLowNot());
-             if (!match(TK::COMMA)) break;
-         }
+          NodeList args;
+          while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
+              if (check(TK::RPAREN)) break; /* for parenthesized form */
+              args.push_back(parseLowNot());
+              if (!match(TK::COMMA)) break;
+              /* D191: a trailing comma before `}`/`)` here is legal Perl. */
+              if (atTrailingDelim()) break;
+          }
          n->args = std::move(args);
          n->line = line;
          return n;
@@ -1721,6 +1726,11 @@ NodePtr Parser::parsePrint(bool isSay) {
         if (hasParen && check(TK::RPAREN)) break;
         args.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
+        /* D191: a trailing comma before `}`/`)` (the last argument of a
+           print/say with no following element) is legal Perl — stop here
+           rather than trying to parse the delimiter as another argument,
+           the same guard `parsePush`/`parseUnshift` apply. */
+        if (atTrailingDelim()) break;
     }
     if (hasParen) match(TK::RPAREN);
 
@@ -1756,6 +1766,10 @@ NodePtr Parser::parsePush() {
         if (hasParen && check(TK::RPAREN)) break;
         vals.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
+        /* D191: a trailing comma before `}`/`)`/`]` (the last argument of a
+           list with no following element) is legal Perl — stop here rather
+           than trying to parse the delimiter as another element. */
+        if (atTrailingDelim()) break;
     }
     if (hasParen) match(TK::RPAREN);
     auto n = std::make_unique<Node>(); n->kind = NK::PushStmt;
@@ -1788,6 +1802,8 @@ NodePtr Parser::parseUnshift() {
         if (hasParen && check(TK::RPAREN)) break;
         vals.push_back(parseLowNot());
         if (!match(TK::COMMA)) break;
+        /* D191: trailing comma before `}`/`)`/`]` (see parsePush). */
+        if (atTrailingDelim()) break;
     }
     if (hasParen) match(TK::RPAREN);
     auto n = std::make_unique<Node>(); n->kind = NK::UnshiftStmt2;
@@ -1869,10 +1885,39 @@ bool Parser::isModifier() const {
    (`my $n = EXPR || next;` — pl2pm), discarding it changes program
    behavior, so the chain is now returned as a real BinOp node (nullptr
    when there was nothing). Callers fold it onto the declared RHS. */
-bool Parser::atLowOrOp() {
-    return check(TK::KW_OR) || check(TK::KW_AND) ||
-           (cur().kind == TK::IDENT && cur().text == "xor");
-}
+ bool Parser::atLowOrOp() {
+     return check(TK::KW_OR) || check(TK::KW_AND) ||
+            (cur().kind == TK::IDENT && cur().text == "xor");
+ }
+
+ /* D191: true when cur() is a closing delimiter (`}`, `)` or `]`) that can
+    never begin a new list element — so a comma just before it is a trailing
+    comma (real Perl: the final comma of a list is optional and may be left
+    off with the element). Used both to stop an arg-list loop from trying to
+    parse the delimiter as another element and to recognize a statement's
+    trailing comma in the block loop. */
+ bool Parser::atTrailingDelim() {
+     TK k = cur().kind;
+     return k == TK::RBRACE || k == TK::RPAREN || k == TK::RBRACKET;
+ }
+
+ /* D191: consume a trailing comma if cur() is a COMMA and the token that
+    follows terminates the enclosing scope/statement (`;`/`}`/`)`/`]`/a
+    statement modifier, or EOF). Real Perl lets the final comma of a
+    list/statement stand with no following element; without this the comma
+    is left dangling and the next parseStmt chokes on it. Returns true if a
+    comma was consumed. */
+  bool Parser::consumeTrailingComma() {
+      if (!check(TK::COMMA)) return false;
+      if (pos_ + 1 >= toks_.size()) { advance(); return true; }  /* comma before EOF */
+      TK nk = toks_[pos_ + 1].kind;
+      if (nk == TK::SEMI || nk == TK::RBRACE || nk == TK::RPAREN ||
+             nk == TK::RBRACKET || nk == TK::EOF_TOK || isModifier()) {
+          advance(); /* consume the trailing comma */
+          return true;
+      }
+      return false;
+  }
 
 /* D150: `my $x = INIT or RHS` is `(my $x = INIT) or RHS` — the declaration's
    assignment, not INIT alone, is the LHS (folding RHS into INIT put a list
@@ -1881,6 +1926,9 @@ bool Parser::atLowOrOp() {
 NodePtr Parser::finishDeclLowOr(NodePtr decl, NodePtr var, int line) {
     if (!decl->right || !atLowOrOp()) {
         decl->right = consumeLowOrChain(std::move(decl->right));
+        /* D191: tolerate a trailing comma after the RHS (e.g. `my $x = 5,`
+           or `my $v = pop @a,` before `;`/`}`). */
+        consumeTrailingComma();
         match(TK::SEMI);
         return decl;
     }
@@ -1888,6 +1936,8 @@ NodePtr Parser::finishDeclLowOr(NodePtr decl, NodePtr var, int line) {
     asgn->left = std::move(var); asgn->right = std::move(decl->right);
     auto es = std::make_unique<Node>(); es->kind = NK::ExprStmt; es->line = line;
     es->left = consumeLowOrChain(std::move(asgn));
+    /* D191: tolerate a trailing comma after the RHS. */
+    consumeTrailingComma();
     match(TK::SEMI);
     auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock; fb->line = line;
     fb->args.push_back(std::move(decl));
@@ -2029,6 +2079,9 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
         }
         return parseModifier(std::move(stmt), line);  /* `next or X if C` */
     }
+    /* D191: tolerate a trailing comma after the statement (`push @a,` or
+       `my $x = 5,` before `;`/`}`). */
+    consumeTrailingComma();
     match(TK::SEMI);
     return stmt;
 }
@@ -4437,13 +4490,18 @@ NodePtr Parser::parsePrimary() {
     if (check(TK::KW_NEXT))  { advance(); return parseLastNextRedoBody(NK::Next, line); }
     if (check(TK::KW_REDO))  { advance(); return parseLastNextRedoBody(NK::Redo, line); }
 
-    /* 'my $var [= expr]' in expression context (e.g. while (my $line = <$fh>)) */
-    if (check(TK::KW_MY) && peek(1).kind == TK::SCALAR) {
-        advance();  /* my */
+    /* 'my $var [= expr]' / 'our $var [= expr]' in expression context (e.g.
+       while (my $line = <$fh>). The `our` form was a hard parse error
+       ("unexpected token 'our'") before — real Perl treats both as chainable
+       assignment expressions, so `our $a = our $b = 5;` must parse. */
+    if ((check(TK::KW_MY) || check(TK::KW_OUR)) && peek(1).kind == TK::SCALAR) {
+        bool isOur = check(TK::KW_OUR);
+        advance();  /* my/our */
         pos_++;     /* $ */
         std::string vname = advance().text;
         auto n = std::make_unique<Node>(); n->kind = NK::My; n->line = line;
         n->name = "$" + vname;
+        if (isOur) n->ival |= 2; /* package global even in expression context */
         if (check(TK::ASSIGN)) { advance(); n->right = parseAssign(); }
         return n;
     }
