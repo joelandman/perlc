@@ -5400,10 +5400,18 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         dib_->finalize();
     }
 
-    std::string err;
-    raw_string_ostream es(err);
-    if (verifyModule(*mod_, &es))
-        throw std::runtime_error("LLVM verify error: " + err);
+     std::string err;
+     raw_string_ostream es(err);
+     if (verifyModule(*mod_, &es)) {
+         for (llvm::Function &f : mod_->getFunctionList()) {
+             std::string ferr; llvm::raw_string_ostream fes(ferr);
+             if (verifyFunction(f, &fes)) {
+                 f.print(llvm::errs(), nullptr);
+                 break;
+             }
+         }
+         throw std::runtime_error("LLVM verify error: " + err);
+     }
 }
 
 /* forward declarations — defined in "statement emission" section */
@@ -6594,17 +6602,28 @@ void CodeGen::emitStmt(const Node &n) {
                         break; /* done — no PV alloca, no trackPv */
                     }
                 }
-                auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
-                /* allocate a stable PerlValue* that lives for this variable's lifetime */
-                Value *pv = perlUndef();
-                builder_.CreateStore(pv, alloca);
-                trackPv(pv);
+                /* D196: if a short-circuit preheader hoisted this decl's
+                   placeholder, reuse it (it already lives for the variable's
+                   lifetime and is tracked for freeing) instead of minting a
+                   branch-local one that the scope-cleanup free would then
+                   fail to dominate. */
+                Value *pv;
+                if (myHoisitNames_.count(nm)) {
+                    Value *slot = lookupVar(nm);
+                    pv = builder_.CreateLoad(perlPtrTy_, slot, nm);
+                } else {
+                    auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
+                    /* allocate a stable PerlValue* that lives for this variable's lifetime */
+                    pv = perlUndef();
+                    builder_.CreateStore(pv, alloca);
+                    trackPv(pv);
+                    declareVar(nm, alloca);
+                }
                 if (n.right) {
                     Value *init = emitExpr(*n.right);
                     callRT("perl_assign", {pv, init});
                     freeIfOwned(init);
                 }
-                declareVar(nm, alloca);
                 if (n.right) tryBindCplxPair(nm, *n.right);
             }
         }
@@ -8433,8 +8452,8 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::CondSignal:    { callRT("perl_cond_signal",    {emitExpr(*n.left)}); return perlUndef(); }
     case NK::CondBcast:     { callRT("perl_cond_broadcast", {emitExpr(*n.left)}); return perlUndef(); }
 
-    case NK::DieStmt: {
-         auto *i32Ty = Type::getInt32Ty(ctx_);
+      case NK::DieStmt: {
+           auto *i32Ty = Type::getInt32Ty(ctx_);
          Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
          Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "die.file");
          Value *lineVal = ConstantInt::get(i32Ty, n.line);
@@ -12735,8 +12754,8 @@ bool CodeGen::isExplicitListKind(const Node &n) {
            (k == NK::ReverseFunc   && n.sval != "scalar_ctx");
 }
 
-Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
-    /* D8a: `EXPR or return VALUE` / `EXPR and return VALUE` parse into a
+ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
+     /* D8a: `EXPR or return VALUE` / `EXPR and return VALUE` parse into a
        BinOp("||"/"&&") whose RHS is a Block wrapping a single Return
        statement (Parser::parseOrRhs). Routing that through the ordinary
        emitExpr()->emitBlockLast() path is wrong here: emitBlockLast treats
@@ -12773,9 +12792,80 @@ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
            runtime, but the caller's PHI node still needs a well-typed
            value here to keep the IR valid. */
         return perlUndef();
-    }
-    return emitExpr(rhsNode);
-}
+     }
+      return emitExpr(rhsNode);
+  }
+
+  /* Collect the NK::My declaration nodes that a short-circuit RHS
+     (operand of && / || / //) will evaluate in this one evaluation. Their
+     backing PerlValue* placeholders are allocated lazily *inside* the RHS
+     basic block, but are tracked for freeing by the enclosing scope's
+     cleanup — which runs at the enclosing block's merge. That merge is
+     reached by paths that never fell through the RHS branch, so the
+     placeholder isn't defined there: an "instruction does not dominate
+     all uses!" verify crash (e.g. ckbcomp's `$code >= 64 && $code <= 127
+     && defined(my $special = ...)`). Hoist each collected placeholder to
+     the short-circuit's preheader (see hoistMyDeclForRhs below) so it is
+     defined on every path, matching the way the While case already hoists
+     `while (my $x = ...)` into the loop preheader. Only direct decls (and
+     those nested through more short-circuit operands or call args) are
+     hoisted — a my inside a nested Block/Sub body keeps its own scope. */
+  static void collectMyDeclsInRhs(const Node &n,
+                                 std::vector<const Node *> &out) {
+     if (n.kind == NK::My) { out.push_back(&n); return; }
+     if (n.kind == NK::Assign) {   /* (my $x = EXPR) / my $x=, ...= */
+         if (n.left) collectMyDeclsInRhs(*n.left, out);
+         if (n.right) collectMyDeclsInRhs(*n.right, out);
+         return;
+     }
+     /* Named-unary builtins hold their single operand in `left`; a `my` decl
+        there (e.g. `defined(my $x = ...)`) is evaluated as part of the RHS. */
+     if (n.kind == NK::DefinedFunc || n.kind == NK::ExistsFunc ||
+         n.kind == NK::UndefFunc || n.kind == NK::ScalarFunc ||
+         n.kind == NK::SortFunc) {
+         if (n.left) collectMyDeclsInRhs(*n.left, out);
+         return;
+     }
+     /* Nested short-circuit operands are all in the same evaluation. */
+     if (n.kind == NK::BinOp &&
+         (n.sval == "&&" || n.sval == "||" || n.sval == "//")) {
+         if (n.left) collectMyDeclsInRhs(*n.left, out);
+         if (n.right) collectMyDeclsInRhs(*n.right, out);
+     }
+     for (const auto &a : n.args) collectMyDeclsInRhs(*a, out);
+ }
+
+ /* D196: allocate the backing PerlValue* placeholders for the fresh `my`
+    decls in a short-circuit RHS *here* (the preheader) instead of letting
+    each one allocate inside the branch block it evaluates in. The first
+    placeholder is returned; the RHS's own my-decl codegen reuses it (see
+    case NK::My) rather than minting a fresh, branch-local one that its
+    scope-cleanup free would then fail to dominate. Declns already declared
+    in the current scope are left alone. */
+  llvm::Value *CodeGen::hoistMyDeclsInRhs(const Node &rhsNode) {
+      /* D196: per-short-circuit — clear any names hoisted by a *previous*
+         short-circuit so a later, independently-scoped `my` (same name, no
+         hoist) doesn't wrongly reuse a placeholder that doesn't exist in its
+         own scope. */
+      myHoisitNames_.clear();
+      std::vector<const Node *> decls;
+      collectMyDeclsInRhs(rhsNode, decls);
+      llvm::Value *first = nullptr;
+     for (const Node *mn : decls) {
+         std::string nm = mn->name;
+         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+         if (nm.empty()) continue;
+         if (scopes_.back().count(nm)) continue;  /* already hoisted/declared */
+         auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, mn->name);
+         Value *pv = perlUndef();
+         builder_.CreateStore(pv, alloca);
+         trackPv(pv);
+         declareVar(nm, alloca);
+         myHoisitNames_.insert(nm);          /* D196: RHS my-decl reuses this */
+         if (!first) first = pv;
+     }
+     return first;
+ }
 
 /* D103: the raw i64 fast path below (emitExprI64) does native wrapping
    arithmetic with no overflow check at all — `my $big = 9223372036854775807;
@@ -13018,6 +13108,9 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *endBB  = BasicBlock::Create(ctx_, "and.end",  fn);
         int savedCallCtx = callCtx_;
         callCtx_ = 0;   /* left always scalar */
+        /* D196: hoist any `my` decl in the RHS so its placeholder is allocated
+           in this preheader (dominating the merge) instead of inside rhsBB. */
+        hoistMyDeclsInRhs(*n.right);
         Value *lv  = emitExpr(*n.left);
         callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
@@ -13045,6 +13138,8 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *endBB  = BasicBlock::Create(ctx_, "or.end", fn);
         int savedCallCtx = callCtx_;
         callCtx_ = 0;   /* left always scalar */
+        /* D196: hoist any `my` decl in the RHS (see the && branch). */
+        hoistMyDeclsInRhs(*n.right);
         Value *lv  = emitExpr(*n.left);
         callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
@@ -13073,6 +13168,8 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *endBB = BasicBlock::Create(ctx_, "defor.end", fn);
         int savedCallCtx = callCtx_;
         callCtx_ = 0;   /* left always scalar (defined-test) */
+        /* D196: hoist any `my` decl in the RHS (see the && branch). */
+        hoistMyDeclsInRhs(*n.right);
         Value *lv   = emitExpr(*n.left);
         callCtx_ = savedCallCtx;
         Value *lb   = callRT("perl_defined", {lv});
