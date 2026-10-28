@@ -102,11 +102,11 @@ NodePtr Parser::litStr(std::string s, int line) {
     return n;
 }
 
-Token &Parser::cur()                { return toks_[pos_]; }
+Token &Parser::cur()                { return pos_ < toks_.size() ? toks_[pos_] : toks_.back(); }
 Token &Parser::peek(int off)        { size_t p = pos_ + off; return p < toks_.size() ? toks_[p] : toks_.back(); }
-bool   Parser::check(TK k)  const  { return toks_[pos_].kind == k; }
+bool   Parser::check(TK k)  const  { return pos_ < toks_.size() && toks_[pos_].kind == k; }
 bool   Parser::checkIdent(const std::string &s) const {
-    return toks_[pos_].kind == TK::IDENT && toks_[pos_].text == s;
+    return pos_ < toks_.size() && toks_[pos_].kind == TK::IDENT && toks_[pos_].text == s;
 }
 Token Parser::advance()             { return toks_[pos_++]; }
 bool  Parser::match(TK k)          { if (check(k)) { pos_++; return true; } return false; }
@@ -779,6 +779,20 @@ NodePtr Parser::parseStmt() {
             n->sval = "expr";
             n->left = parseExpr();
         }
+        return parseModifier(std::move(n), line);
+    }
+    /* `s{pat}{repl}flags` / `s|pat|repl|flags` — substitution on `$_`.
+       The lexer produces a TK::SUBST token for this (including optional
+       whitespace between `s` and the delimiter, D200). */
+    if (check(TK::SUBST)) {
+        std::string txt = cur().text; advance();
+        size_t s1 = txt.find('\x01'), s2 = txt.find('\x01', s1 + 1);
+        auto n = std::make_unique<Node>(); n->kind = NK::RegexSubst; n->line = line;
+        n->sval  = txt.substr(0, s1);                       /* pattern */
+        n->name  = txt.substr(s1 + 1, s2 - s1 - 1)         /* replacement */
+                 + "\x01" + txt.substr(s2 + 1);             /* flags */
+        if (NodePtr interp = interpRegexPattern(n->sval, line))
+            n->right = std::move(interp);
         return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_UNTIL)) {
@@ -5352,14 +5366,27 @@ NodePtr Parser::parsePrimary() {
         n->left = std::move(fh); n->right = std::move(len); return n;
     }
 
-    /* each %hash */
+    /* each %hash / each %$ref — hash iteration over named hash or hash ref */
     if (check(TK::KW_EACH)) {
         advance(); bool hp = match(TK::LPAREN);
-        match(TK::HASH);
-        std::string nm = cur().text; advance();
+        if (!check(TK::HASH)) throw std::runtime_error(parseErrPrefix(line) + "each: expected %hash or %$ref");
+        advance(); /* % */
+        /* `each %$ref` — hash deref: `$ref` is a scalar holding a hash ref.
+           `each %hash` — named hash. */
+        std::string nm;
+        bool isDeref = false;
+        if (check(TK::SCALAR)) {
+            advance(); /* $ */
+            nm = cur().text; advance();
+            isDeref = true;
+        } else {
+            nm = cur().text; advance();
+        }
         if (hp) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::EachFunc; n->line = line;
-        n->name = nm; return n;
+        n->name = nm;
+        if (isDeref) n->sval = "deref";
+        return n;
     }
 
     /* pos($str) or pos */

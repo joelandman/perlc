@@ -696,11 +696,22 @@ std::vector<Token> Lexer::tokenize() {
                          (open == '{') ? '}' : (open == '<') ? '>' : open;
             pos_++; /* skip opening delimiter */
             std::string words;
-            while (pos_ < src_.size() && src_[pos_] != close) {
-                if (src_[pos_] == '\n') line_++;
-                words += src_[pos_++];
+            /* D199: balanced-brace/bracket/paren tracking for qw delimiters
+               that support nesting (the same pairs q/qq use). Without this,
+               `qw[a[b]c]` stops at the first `]` and swallows `c]`. */
+            int depth = 1;
+            while (pos_ < src_.size() && depth > 0) {
+                char ch = src_[pos_];
+                if (ch == '\\' && pos_+1 < src_.size()) {
+                    words += ch; words += src_[pos_+1]; pos_ += 2; continue;
+                }
+                if (ch == open) depth++;
+                else if (ch == close) {
+                    if (--depth == 0) { pos_++; break; }
+                }
+                if (ch == '\n') line_++;
+                words += ch; pos_++;
             }
-            if (pos_ < src_.size()) pos_++; /* skip closing delimiter */
             toks.push_back({TK::QWORDS, words, line_}); continue;
         }
 
@@ -920,20 +931,29 @@ std::vector<Token> Lexer::tokenize() {
         /* s/pattern/replacement/flags — any non-word delimiter.
            Not after a bare sigil ($s / @s / %s are variable names).
            Closers `}` `]` `)` are legal-but-vanishingly-rare s/// openers
-           and collide with the common hash-key form `$h{s}` (D66 remainder). */
+           and collide with the common hash-key form `$h{s}` (D66 remainder).
+           D200: optional whitespace between `s` and the delimiter, like
+           `s {pat} {repl}g` (found verbatim in /usr/bin/splain). */
         if (c == 's' && pos_ + 1 < src_.size()) {
-            char d = peek(1);
-            bool afterBareSigil = !toks.empty() &&
-                (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
-                 toks.back().kind == TK::HASH) &&
-                toks.back().text.size() <= 1;
-            bool closerDelim = (d == '}' || d == ']' || d == ')');
-            if (!afterBareSigil && !closerDelim &&
-                !isalnum((unsigned char)d) && d != '_' && d != '\0' &&
-                d != ' ' && d != '\t' && d != '\n' && d != '\r') {
-                pos_ += 2; /* skip 's' and opening delim */
-                toks.push_back(readSubst());
-                continue;
+            size_t look = 1;
+            while (look < src_.size() - pos_ &&
+                   (src_[pos_ + look] == ' ' || src_[pos_ + look] == '\t'))
+                look++;
+            if (look < src_.size() - pos_) {
+                char d = src_[pos_ + look];
+                bool afterBareSigil = !toks.empty() &&
+                    (toks.back().kind == TK::SCALAR || toks.back().kind == TK::ARRAY ||
+                     toks.back().kind == TK::HASH) &&
+                    toks.back().text.size() <= 1;
+                bool closerDelim = (d == '}' || d == ']' || d == ')');
+                if (!afterBareSigil && !closerDelim &&
+                    !isalnum((unsigned char)d) && d != '_' && d != '\0' &&
+                    d != ' ' && d != '\t' && d != '\n' && d != '\r' &&
+                    d != '=' && d != '>') {
+                    pos_ += look + 1; /* skip 's', whitespace, and opening delim */
+                    toks.push_back(readSubst());
+                    continue;
+                }
             }
         }
 

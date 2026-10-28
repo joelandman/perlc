@@ -1456,9 +1456,17 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *pat = n.left ? emitExpr(*n.left) : perlUndef();
         return callRT("perl_glob_val", {pat});
     }
-    /* each %hash in list context → (key, val) pair */
+    /* each %hash / each %$ref in list context → (key, val) pair */
     if (n.kind == NK::EachFunc) {
-        Value *hv = lookupHash(n.name);
+        Value *hv;
+        if (n.sval == "deref") {
+            Value *sv = lookupVar(n.name);
+            if (!sv) return callRT("perl_array_new", {});
+            Value *refVal = builder_.CreateLoad(perlPtrTy_, sv, "each_ref");
+            hv = callRT("perl_deref_hash", {refVal});
+        } else {
+            hv = lookupHash(n.name);
+        }
         if (!hv) return callRT("perl_array_new", {});
         return callRT("perl_each_hash", {hv});
     }
@@ -8316,8 +8324,17 @@ Value *CodeGen::emitExpr(const Node &n) {
            wrong. perl_array_get already returns undef for an
            out-of-range index, matching the post-exhaustion case (an
            empty pair array). */
-        Value *hv = lookupHash(n.name);
-        if (!hv) return perlUndef();
+        /* D198: `each %$ref` — hash deref form. */
+        Value *hv;
+        if (n.sval == "deref") {
+            Value *sv = lookupVar(n.name);
+            if (!sv) return perlUndef();
+            Value *refVal = builder_.CreateLoad(perlPtrTy_, sv, "each_ref");
+            hv = callRT("perl_deref_hash", {refVal});
+        } else {
+            hv = lookupHash(n.name);
+            if (!hv) return perlUndef();
+        }
         Value *av = callRT("perl_each_hash", {hv});
         Value *idx0 = ConstantInt::get(Type::getInt64Ty(ctx_), 0);
         Value *key = callRT("perl_array_get", {av, idx0});
@@ -11053,7 +11070,17 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RegexSubst: {
-        Value *str = emitExpr(*n.left);
+        /* Statement-level `s///` on `$_` has n.left == nullptr. */
+        Value *str;
+        if (n.left) {
+            str = emitExpr(*n.left);
+        } else {
+            /* Default to $_ */
+            if (auto *slot = lookupVar("_"))
+                str = builder_.CreateLoad(perlPtrTy_, slot, "subst_default");
+            else
+                str = perlUndef();
+        }
         size_t sep = n.name.find('\x01');
         std::string repl  = n.name.substr(0, sep);
         std::string flags = n.name.substr(sep + 1);
