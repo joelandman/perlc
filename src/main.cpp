@@ -288,7 +288,6 @@ scanExports(const std::vector<Token> &toks)
                        and resolving a bare EXPORT_OK/EXPORT array ref to
                        the already-scanned array's contents */
                     std::vector<std::string> collected;
-                    std::string refArr;
                     from++;
                     int depth = 1;
                     while (from < end && depth > 0) {
@@ -302,9 +301,15 @@ scanExports(const std::vector<Token> &toks)
                         if (depth == 1) {
                             if (toks[from].kind == TK::ARRAY &&
                                 from + 1 < end && toks[from + 1].kind == TK::IDENT) {
-                                /* @EXPORT_OK lexes as ARRAY("@") + IDENT */
-                                refArr = toks[from + 1].text;
+                                /* @EXPORT/@EXPORT_OK lexes as ARRAY("@") + IDENT
+                                   — resolve EACH reference immediately (not just
+                                   the last one), so [@EXPORT, @EXPORT_OK] pulls
+                                   in both arrays' contents. */
+                                std::string curRef = toks[from + 1].text;
                                 from++;
+                                auto it = result.find(curRef);
+                                if (it != result.end())
+                                    out.insert(out.end(), it->second.begin(), it->second.end());
                             } else if (toks[from].kind == TK::IDENT ||
                                        toks[from].kind == TK::STRING ||
                                        toks[from].kind == TK::QWORDS) {
@@ -319,11 +324,7 @@ scanExports(const std::vector<Token> &toks)
                         }
                         from++;
                     }
-                    if (!refArr.empty()) {
-                        auto it = result.find(refArr);
-                        if (it != result.end())
-                            out.insert(out.end(), it->second.begin(), it->second.end());
-                    } else {
+                    if (!collected.empty()) {
                         out.insert(out.end(), collected.begin(), collected.end());
                     }
                     return; /* one list value per tag */
