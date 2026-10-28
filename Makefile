@@ -28,9 +28,39 @@ TARGET   := perlc
 ASSERT_TESTS := tests/test_do_filename.pl tests/test_require_simple.pl tests/dbi_sqlite.pl tests/xs_ffi.pl
 TSAN_TESTS := tests/threads.pl tests/threads_atomic.pl tests/destroy.pl
 
-.PHONY: all clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt% test-opt-matrix test-valgrind test-tsan-full
+# Default goal. `make` and `make all` build ./perlc and nothing else.
+# Keep this explicit so a new target added above `all` cannot become
+# the default. Test workflows are in README.md (Build and test).
+.DEFAULT_GOAL := all
+
+OPT_TARGETS := test-opt0 test-opt1 test-opt2 test-opt3 test-opt4 test-opt5
+
+.PHONY: all help clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt $(OPT_TARGETS) test-opt-matrix test-valgrind test-tsan-full test-realworld
 
 all: $(TARGET)
+
+help:
+	@echo "make            Build ./perlc (the default; same as make all)"
+	@echo "make all        Build ./perlc"
+	@echo "make clean      Remove ./perlc, ./perlc_tsan, and src/*.o"
+	@echo "make test       Run the 4 assertion programs (do, require, DBI, XS)"
+	@echo "make test-all   Diff every tests/*.pl against real perl (the gate)"
+	@echo "make test-smoke Diff only tests/*_smoke.pl against real perl"
+	@echo "make test-assertion"
+	@echo "                Diff the 4 assertion programs against real perl"
+	@echo "make test-full  Same as make test-all"
+	@echo "make test-realworld"
+	@echo "                Compile the system-script corpus; do not run the binaries"
+	@echo "make test-tsan  ThreadSanitizer on threads.pl, threads_atomic.pl, destroy.pl"
+	@echo "make test-tsan-full"
+	@echo "                ThreadSanitizer on every tests/*.pl except DBI/XS"
+	@echo "make test-valgrind"
+	@echo "                memcheck on every tests/*.pl except DBI/XS"
+	@echo "make test-optN  Full diff gate with perlc -ON (N is 0 through 5)"
+	@echo "make test-opt-matrix"
+	@echo "                Full diff gate at -O0, -O2, and -O3"
+	@echo "make bench      Time bench/*.pl against real perl (see BENCH_ARGS)"
+	@echo "Workflows, success lines, and skips: README.md, section Build and test."
 
 $(TARGET): $(OBJS) $(RT_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
@@ -84,6 +114,12 @@ test: $(TARGET)
 test-all: $(TARGET)
 	@./tests/harness.sh
 
+# Compile-only survey of real system scripts. Not part of test-all:
+# missing Debian modules and known non-goals (format/write) are reports,
+# not harness failures. The runner never executes the compiled binaries.
+test-realworld: $(TARGET)
+	@./tests/realworld/run.sh
+
 test-smoke: $(TARGET)
 	@./tests/harness.sh --smoke-only
 
@@ -126,8 +162,16 @@ test-valgrind: $(TARGET)
 test-full: $(TARGET)
 	@./tests/harness.sh
 
-test-opt%:
-	@OPT_LEVEL=$* ./tests/harness.sh
+# Static pattern, not a match-anything `test-opt%` rule. A bare pattern
+# also matched `test-opt.o`, and `make test-opt` then followed make's
+# built-in `%: %.o` link rule. `make test-opt2` runs the full diff gate
+# with `./perlc -O2`.
+test-opt:
+	@echo "usage: make test-optN   (N is 0, 1, 2, 3, 4, or 5)"
+	@exit 2
+
+$(OPT_TARGETS): test-opt%: $(TARGET)
+	@OPT_LEVEL="$*" ./tests/harness.sh
 
 test-opt-matrix: $(TARGET)
 	@set -e; \

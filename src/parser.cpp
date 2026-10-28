@@ -1818,8 +1818,25 @@ NodePtr Parser::parseReturn() {
     NodePtr val;
     /* D155: bare `return` before `}` / `)` (`f() or return }`) */
     if (!check(TK::SEMI) && !isModifier() && !check(TK::RBRACE) &&
-        !check(TK::RPAREN) && !check(TK::EOF_TOK) && !check(TK::COLON))
+        !check(TK::RPAREN) && !check(TK::EOF_TOK) && !check(TK::COLON)) {
         val = parseLowNot();
+        /* Unparenthesized multi-value return (`return '', '', 0`):
+           collect all comma-separated values into an ArrayLit so the
+           return produces a list, not just the first element. */
+        if (check(TK::COMMA)) {
+            NodeList elems;
+            elems.push_back(std::move(val));
+            while (match(TK::COMMA)) {
+                if (check(TK::SEMI) || isModifier() || check(TK::RBRACE) ||
+                    check(TK::RPAREN) || check(TK::EOF_TOK) || check(TK::COLON))
+                    break;
+                elems.push_back(parseLowNot());
+            }
+            auto arr = std::make_unique<Node>(); arr->kind = NK::ArrayLit;
+            arr->args = std::move(elems); arr->line = line;
+            val = std::move(arr);
+        }
+    }
     auto n = std::make_unique<Node>(); n->kind = NK::Return; n->line = line;
     n->left = std::move(val);
     return n;
@@ -2607,6 +2624,28 @@ NodePtr Parser::parseUnary() {
        A(+1)); parsePrimary had no case for it and threw "unexpected
        token '+'". Return the operand unchanged. */
     if (check(TK::PLUS)) { advance(); return parsePow(); }
+    /* `&$scalar` / `&$scalar(args)` — call a code reference stored in a
+       scalar variable. Found verbatim in /usr/bin/splain: `&$olddie if
+       defined $olddie` and in /usr/bin/zipdetails: `&$olddie("...")`.
+       Desugars to `$scalar->(...)` (CallCodeRef with optional args). */
+    if (check(TK::AND) && peek(1).kind == TK::SCALAR) {
+        advance(); /* & */
+        advance(); /* $ */
+        std::string varName = cur().text; advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::CallCodeRef;
+        n->left = makeScalar(varName, line);
+        n->line = line;
+        /* Optional parenthesized args: `&$scalar(args)` */
+        if (check(TK::LPAREN)) {
+            advance();
+            while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                n->args.push_back(parseExpr());
+                if (!match(TK::COMMA)) break;
+            }
+            consume(TK::RPAREN, ")");
+        }
+        return n;
+    }
     if (check(TK::PLUS_PLUS)) {
         advance(); return makeUnary("pre++", parsePostfix(), line);
     }
