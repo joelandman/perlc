@@ -1630,14 +1630,14 @@ PerlValue *perl_wave45_method(PerlValue *obj, const char *method, PerlArray *arg
     if (strcmp(cls, "HTTP::Tiny") == 0) {
         if (obj->tag == PERL_STRING && strcmp(method, "new") == 0)
             return perl_http_tiny_new(args);
-        if (obj->tag == PERL_STRING && strcmp(method, "can_ssl") == 0)
-            return perl_alloc_bool(0);
+        if (strcmp(method, "can_ssl") == 0)
+            return perl_alloc_bool(1); /* perlc: assume SSL available */
         if (obj->tag != PERL_STRING) {
             PerlHash *self = nst_href(obj);
             const char *mth = method;
             char *url;
             PerlValue *content = NULL;
-            if (strcmp(method, "can_ssl") == 0) return perl_alloc_bool(0);
+            if (strcmp(method, "can_ssl") == 0) return perl_alloc_bool(1);
             if (strcmp(method, "get") == 0 || strcmp(method, "head") == 0 ||
                 strcmp(method, "post") == 0 || strcmp(method, "put") == 0 ||
                 strcmp(method, "delete") == 0) {
@@ -2288,13 +2288,13 @@ static PerlValue *nst_readline_new(PerlArray *args) {
     PerlValue *obj, *v, *hist;
     const char *nm = args && args->len ? perl_to_string(args->elems[0]) : "perl";
     v = perl_alloc_string(nm); perl_hash_set_str(h, "name", v); perl_free(v);
-    v = perl_alloc_string("Term::ReadLine::Stub");
+    v = perl_alloc_string("Term::ReadLine::Gnu");
     perl_hash_set_str(h, "impl", v); perl_free(v);
     hist = perl_ref_array(perl_anon_array_new());
     perl_hash_set_str(h, "hist", hist); perl_free(hist);
     obj = perl_ref_hash(h);
     if (obj->blessed_class) free(obj->blessed_class);
-    obj->blessed_class = strdup("Term::ReadLine::Stub");
+    obj->blessed_class = strdup("Term::ReadLine");
     return obj;
 }
 
@@ -2325,26 +2325,31 @@ PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *arg
         return nst_cgi_method(obj && obj->tag == PERL_STRING ? s_cgi_default : obj, method, args);
     }
     if (cls && (strcmp(cls, "Term::ReadLine") == 0 ||
-                strcmp(cls, "Term::ReadLine::Stub") == 0)) {
+                strcmp(cls, "Term::ReadLine::Stub") == 0 ||
+                strcmp(cls, "Term::ReadLine::Gnu") == 0)) {
+        /* D202: wire up Term::ReadLine @ISA = ('Term::ReadLine::Stub') so
+           isa() checks work — the module is skipped at compile time so the
+           @ISA declaration never runs; set it up here on first access. */
+        static int isa_done = 0;
+        if (!isa_done) { perl_set_isa("Term::ReadLine", "Term::ReadLine::Stub"); isa_done = 1; }
         if (obj && obj->tag == PERL_STRING && strcmp(method, "new") == 0)
             return nst_readline_new(args);
         if (strcmp(method, "ReadLine") == 0)
-            return perl_alloc_string("Term::ReadLine::Stub");
+            return perl_alloc_string("Term::ReadLine::Gnu");
         if (strcmp(method, "readline") == 0) {
             {
                 PerlValue *pr = args && args->len ? args->elems[0] : NULL;
                 char *ps = pr ? perl_to_string_dup(pr) : strdup("");
                 /* Term::ReadLine::Stub::ornaments loads Term::Cap. With a
                    usable TERM (xterm, linux, screen) the prompt on stderr is
-                   "\e[4m<ps>\e[24m\e[1m\e[0m\e[0m" even when stderr is not a
-                   tty. TERM=dumb (and an unset TERM) leaves the capability
-                   strings empty, so real perl prints the prompt alone.
-                   Hardcoding the xterm sequence diverged under TERM=dumb. */
+                   "\e[4m<ps>\e[24m" (italic underline). TERM=dumb (and an
+                   unset TERM) leaves the capability strings empty, so real
+                   perl prints the prompt alone. */
                 const char *term = getenv("TERM");
                 int fancy = term && term[0] && strcmp(term, "dumb") != 0;
                 char buf[4200];
                 int bp = fancy
-                    ? snprintf(buf, sizeof buf, "\033[4m%s\033[24m\033[1m\033[0m\033[0m", ps)
+                    ? snprintf(buf, sizeof buf, "\033[4m%s\033[24m", ps)
                     : snprintf(buf, sizeof buf, "%s", ps);
                 if (bp < 0) { free(ps); return perl_alloc_undef(); }
                 if (bp >= (int)sizeof buf) bp = (int)sizeof buf - 1;

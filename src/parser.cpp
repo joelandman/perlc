@@ -1396,10 +1396,28 @@ NodePtr Parser::parseAmpBlockCall(std::string name, const std::string &proto, in
     NodeList args;
     args.push_back(parseAnonSubBody(line, ""));
     match(TK::COMMA);
+    /* D201: Perl's ternary `?:` has higher precedence than list operators,
+       so `any { ... } LIST ? 1 : 0` parses as `any { ... } LIST_WITH_TERNARY,
+       (LAST_ARG ? 1 : 0)`. We detect a trailing `?` after argument parsing
+       and fold it into the last argument to match real Perl precedence. */
     while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier() &&
            !check(TK::RPAREN) && !check(TK::RBRACE) && !check(TK::RBRACKET)) {
+        size_t argStart = pos_;
         args.push_back(parseExpr());
         if (!match(TK::COMMA) && !match(TK::FATARROW)) break;
+    }
+    /* If a `?` follows, fold the ternary into the last argument */
+    if (check(TK::QUESTION) && args.size() > 1) {
+        /* Parse `? COND : THEN` and append to last arg */
+        advance(); /* skip ? */
+        NodePtr cond = parseExpr();
+        consume(TK::COLON, ":");
+        NodePtr thenVal = parseExpr();
+        auto tern = std::make_unique<Node>(); tern->kind = NK::BinOp; tern->sval = "?:";
+        tern->cond = std::move(cond); tern->left = std::move(thenVal);
+        tern->right = nullptr; tern->line = line;
+        /* Replace last arg with the ternary */
+        args[args.size() - 1] = std::move(tern);
     }
     checkProtoArity(name, proto, (int)args.size(), line);
     auto n = std::make_unique<Node>(); n->kind = NK::Call;
