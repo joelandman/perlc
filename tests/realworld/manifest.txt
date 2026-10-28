@@ -1,0 +1,39 @@
+# Compile-only corpus of real system Perl scripts.
+# One absolute path per line. Blank lines and # comments are ignored.
+# Host-specific: a missing path is classified missing-file, not a failure.
+# Do not execute these scripts. make test-realworld only compiles them.
+#
+# These are the scripts the 2026-09/10 surveys actually hit. The runner
+# separates Can't locate (missing module) from Parse error (compiler gap)
+# from a clean compile. It is not part of make test-all.
+
+/usr/bin/splain
+/usr/share/doc/cron/examples/crontab2english.pl
+/usr/bin/callgrind_annotate
+/usr/bin/ucfq
+/usr/bin/perlbug
+/usr/bin/perlthanks
+/usr/bin/json_pp
+/usr/bin/piconv
+/usr/bin/pod2text
+/usr/bin/pod2man
+/usr/bin/pod2html
+/usr/bin/instmodsh
+/usr/bin/pl2pm
+/usr/bin/cpan
+/usr/bin/prove
+/usr/bin/ptar
+/usr/bin/ptardiff
+/usr/bin/shasum
+/usr/bin/streamzip
+/usr/bin/zipdetails
+/usr/bin/helpztags
+/usr/bin/linux-version
+/usr/bin/linux-run-hooks
+/usr/bin/geteltorito
+/usr/bin/podebconf-report-po
+/usr/sbin/update-rc.d
+/usr/bin/deb-systemd-helper
+/usr/share/clang/scan-build-21/libexec/ccc-analyzer
+/usr/lib/llvm-22/libexec/ccc-analyzer
+/usr/share/doc/ppp/examples/scripts/lcp_rtt_dump

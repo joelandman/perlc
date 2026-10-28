@@ -2,22 +2,132 @@
 
 ## Gate
 
+`make` with no goal builds `./perlc` only. It does not run tests.
+`make help` lists every target. The workflows below are the same ones
+in README.md → "Build and test", kept here so a test change can be
+checked without leaving this file.
+
+**Policy:** every compiler fix ships a smoke test (`*_smoke.pl`) and a
+deep test, verified byte-for-byte against real Perl.
+
+### What each target runs
+
+| Command | Builds | Runs | Compares with `perl`? | Pass looks like |
+|---|---|---|---|---|
+| `make` / `make all` | `./perlc` | nothing | no | `./perlc` exists. Current tree prints `Nothing to be done for 'all'.` |
+| `make clean` | nothing (deletes `./perlc`, `./perlc_tsan`, `src/*.o`) | nothing | no | those files are gone |
+| `make test` | `./perlc` | `test_do_filename.pl`, `test_require_simple.pl`, `dbi_sqlite.pl`, `xs_ffi.pl` | no, exit code only | each process exits 0 and prints `name=ok` |
+| `make test-all` | `./perlc` | every `tests/*.pl` except the skip list | yes | `FAIL: 0` and exit 0. 2026-10-16 was `PASS: 599` |
+| `make test-full` | same as `make test-all` | same | yes | same |
+| `make test-smoke` | `./perlc` | only `tests/*_smoke.pl`, still honoring the skip list | yes | `FAIL: 0` |
+| `make test-assertion` | `./perlc` | the same four files as `make test` | yes | `Total compared: 4`, `PASS: 4` |
+| `make test-realworld` | `./perlc` | compile each path in `tests/realworld/manifest.txt` | no, and the binaries are not executed | always exit 0. Summary line `total=… ok=…`. Report: `tests/realworld/last-report.txt` |
+| `make test-tsan` | `./perlc_tsan` (does not replace `./perlc`) | `threads.pl`, `threads_atomic.pl`, `destroy.pl` under TSan | no | three `=== TSan: ===` sections, exit 0, no sanitizer report |
+| `make test-tsan-full` | `./perlc_tsan` | every `tests/*.pl` except `dbi_sqlite.pl`, `xs_dbi_test.pl`, `xs_ffi.pl` | no | exit 0, no sanitizer report |
+| `make test-valgrind` | `./perlc` | every `tests/*.pl` except those same three names, under memcheck | no | exit 0. On this host valgrind has died with SIGILL on perlc binaries (D151); a SIGILL fail is that environment, not a new leak result |
+| `make test-optN` | `./perlc` | the `make test-all` set, compiled with `-ON` | yes | `FAIL: 0`. N is 0–5. `make test-opt` with no digit exits 2 |
+| `make test-opt-matrix` | `./perlc` | the full diff three times, at `-O0`, `-O2`, `-O3` | yes | three `FAIL: 0` summaries |
+| `make bench` | `./perlc` | `bench/bench.sh` on `bench/*.pl` | times only, writes `bench/results.csv` | CSV rows `name,perlc_ms,perl_ms,ratio` |
+
+`tests/harness.sh` is the diff runner behind `test-all`, `test-smoke`,
+`test-assertion`, `test-full`, `test-optN`, and `test-opt-matrix`.
+Numeric tests (`nb.pl`, `nbody.pl`, `mbs.pl`, `fibn.pl`, `arith.pl`)
+allow relative tolerance `TOLERANCE` (default `1e-9`). `mbs.pl` gets
+300 seconds; other tests get `TIMEOUT_SEC` (default 60).
+
+**Skipped by the diff gate unless the path is on the command line:**
+`dbi_sqlite.pl`, `xs_ffi.pl`, `cpanel_json_xs_smoke.pl`,
+`cpanel_json_xs_deep.pl`. `make test-assertion` names the first two,
+so they run there. `xs_dbi_test.pl` is not in the harness skip list
+(the file is not in this tree). `make test-tsan-full` and
+`make test-valgrind` skip `dbi_sqlite.pl`, `xs_dbi_test.pl`, and
+`xs_ffi.pl` by name.
+
+### Concrete commands
+
+One or two scripts, after `make`:
+
 ```bash
-make              # build ./perlc
-make test-all     # tests/harness.sh — compare every tests/*.pl vs real perl
-make test         # 4 assertion files only (do / require / DBI / XS)
-make test-tsan    # threads.pl threads_atomic.pl destroy.pl
+./tests/harness.sh tests/double_heredoc_smoke.pl tests/double_heredoc_deep.pl
 ```
 
-`tests/harness.sh` compiles each `tests/*.pl` with `./perlc`, runs it and
-`perl`, and diffs stdout. Numeric tests (`nb.pl`, `nbody.pl`, `mbs.pl`,
-`fibn.pl`, `arith.pl`) allow FP tolerance. `mbs.pl` gets a 300s timeout.
+Smoke set only, or the four assertion programs diffed against perl:
 
-**Skipped by default** (run explicitly if you have the deps):
-`dbi_sqlite.pl`, `xs_dbi_test.pl`, `xs_ffi.pl`.
+```bash
+make test-smoke
+make test-assertion
+./tests/harness.sh --smoke-only tests/or_print_smoke.pl
+```
 
-**Policy:** every compiler fix ships a smoke test (`*_smoke.pl`) and a deep
-test, verified byte-for-byte against real Perl.
+A file the gate skips, run on purpose:
+
+```bash
+./tests/harness.sh tests/dbi_sqlite.pl
+./tests/harness.sh tests/xs_ffi.pl
+./tests/harness.sh tests/cpanel_json_xs_smoke.pl
+```
+
+Optimization gate for the change you are about to commit, then the
+full matrix when the numbers matter:
+
+```bash
+make test-all
+make test-opt0
+make test-opt-matrix
+```
+
+Thread and leak checks. TSan compiles with
+`TSAN_OPTIONS=die_after_fork=0` and runs the program with
+`TSAN_OPTIONS=halt_on_error=1`:
+
+```bash
+make test-tsan
+make test-tsan-full
+make test-valgrind
+```
+
+System scripts, compile only. Do not run the binaries. Replace the
+checked-in host snapshot only when you mean to:
+
+```bash
+make test-realworld
+REALWORLD_UPDATE_BASELINE=1 make test-realworld
+```
+
+`REALWORLD_TIMEOUT` (default 60) is the per-script compile budget.
+`PERLC=/path/to/perlc` selects the binary for the harness and for
+`make test-realworld`.
+
+Timing:
+
+```bash
+make bench
+make bench BENCH_ARGS='-n 3 bench/nb.pl'
+make bench BENCH_ARGS='--baseline'
+make bench BENCH_ARGS='--compare'
+```
+
+Harness knobs: `OPT_LEVEL` (adds `-ON` unless `PERLC_FLAGS` already
+contains `-O`), `PERLC_FLAGS` (raw extra perlc arguments),
+`RUN_IN_PARALLEL=0` (serial), `CORE_DIVISOR` (pool size is
+`nproc/CORE_DIVISOR`, default 2), `PERL` (reference interpreter).
+
+**Real-script corpus** (`tests/realworld/`, 2026-10-15): `make test-realworld`
+compiles the paths in `manifest.txt` and classifies each as ok,
+missing-file, missing-module (`Can't locate`), parse-error, or
+other-compile-error. It does not run the binaries and it always exits 0.
+`tests/harness.sh` does not recurse, so these files stay out of
+`make test-all`. The host snapshot is `baseline.txt` (rewritten only when
+missing, or with `REALWORLD_UPDATE_BASELINE=1`). The 2026-10-15 baseline file still records the pre-D193 lines
+(30 scripts, 15 ok, 10 missing-module, 5 parse-error, 0 other). After
+D193–D195 those five still fail to compile, at later lines:
+`splain` (`&$olddie` at line 589), `ucfq` (`<<` from a `format`
+picture; `format`/`write` is a non-goal), `perlbug` and `perlthanks`
+(`^` at line 1217, a `format` picture), and `zipdetails`
+(`return '', '', 0` at line 2576). Missing Debian modules are not
+harness failures. Refresh the file with
+`REALWORLD_UPDATE_BASELINE=1 make test-realworld` when the error
+lines should be the new snapshot.
 
 ## Scoreboard
 
@@ -96,8 +206,14 @@ eval STRING and eval-defined subs see outer `my`).
 | D161 | **FIXED 2026-09-30** | Backtick (`` `CMD` ``) string lexing mishandled `\$`/`\@` escaping, **and** `qx(...)`/`qx{...}`/etc. (real Perl's alternate backtick spelling, flexible delimiters — not a separate feature) wasn't recognized at all. (1) Backtick lexing was a bare raw character-copy loop with zero escape processing of any kind: `` `echo "\$x hello"` `` both interpolated `$x` to its value AND left a stray literal backslash in front of it, instead of real Perl's `\$x` → literal `"$x"` text for the shell to see — fixed by routing backtick lexing through the same `readString()`/`appendEscape()` path `"..."` literals already use (`src/lexer.cpp`), including the `\x02` `\$`/`\@`-protection marker. (2) Investigating this found `qx(...)` wasn't implemented at all — a hard parse error ("String found where operator expected") — a bigger, separate gap than the original D161 write-up assumed (it only *guessed* `qx()` shared the escaping bug without verifying, since the module wasn't installed at the time). Added full `qx` support mirroring `qq`'s own delimiter handling (including the `{...}` nested-brace-depth scan) across every real-Perl delimiter form (`qx(...)`, `qx{...}`, `qx/.../`, `qx[...]`, `qx<...>`), producing the same `TK::BACKTICK` token so it reuses the entire backtick codegen/interpolation path unchanged — including fix (1). Verified against real Perl for: genuine interpolation still working, `\$`/`\@` escaping, mixed escaped+real interpolation in one string, plain escapes (tab) unaffected, every `qx` delimiter form, a nested brace inside `qx{...}`, and a regression check that `qx` as a bareword hash key is unaffected. Tests: `tests/backtick_qx_escapes_{smoke,deep}.pl`. |
 | D162 | **FIXED 2026-09-30** | A batch of pre-existing gaps found via two real scripts (`/usr/bin/dpkg-genchanges`: `use POSIX qw(:errno_h :locale_h);` then `setlocale(LC_TIME, 'C')`; `/usr/bin/dpkg-buildpackage`: `use POSIX qw(:sys_wait_h);` then `WIFEXITED($status)`/`WEXITSTATUS($status)`). (1) **A genuine, separate compiler bug** found while testing `shellwords`/`quotewords`/`parse_line` (`Text::ParseWords`) in scalar context: codegen called `perl_array_len` (which already returns a boxed `PerlValue*`) and then passed that `PerlValue*` straight into `perl_alloc_int` (which expects a raw `i64`) — a pointer-as-integer type confusion that produced an invalid LLVM module, a hard compile-time "Call parameter type does not match function signature!" error, found via a real `/usr/sbin/pam_getenv` compile. Fixed by returning `perl_array_len`'s result directly (plus `perl_array_free`), the same scalar-context convention `keys`/`values`/`split` already use. (2) **`POSIX`'s native constant-export mechanism** (`src/main.cpp`) only recognized a handful of hand-picked tags/names — `:errno_h`, `:locale_h`, and `:sys_wait_h` weren't recognized at all, dying `"is not defined in %EXPORT_TAGS of the POSIX module"` on the `use` line itself. Added the full real-Perl tag lists (probed from the host perl via `tools/gen_native_constants.pl`, extended to 175 constants), deliberately omitting the handful of names (`LC_SYNTAX`/`LC_TOD`, `EOTHER`/`EPROCLIM`) that aren't defined on this platform in real Perl either — verified real Perl itself dies the identical way for those. (3) `errno()`/`setlocale()`/`localeconv()` (real functions, not constants) and the `sys_wait_h` status macros (`WIFEXITED`/`WEXITSTATUS`/`WIFSIGNALED`/`WTERMSIG`/`WIFSTOPPED`/`WSTOPSIG`) weren't implemented at all — added as thin wrappers over the real C library (`errno`, `setlocale(3)`, `localeconv(3)`, and the real `WIFEXITED`/`WEXITSTATUS`/etc. macros from `sys/wait.h`). (4) **Found while verifying `errno()`**: `$! = N` assignment was a completely separate, deeper, pre-existing bug — it wrote into `perl_get_dollar_bang`'s internal cell via plain `perl_assign`, but that cell is unconditionally *recomputed from the live OS `errno`* on every subsequent read, so the assignment never actually persisted past the very next read of `$!`, and never touched the real OS `errno` at all (so the new `errno()` never saw it either). Fixed with a dedicated `perl_set_dollar_bang()` that sets the real `errno` global, matching real Perl's `$!` dualvar semantics (`$! = 2; print $!;` → `"No such file or directory"`). Verified against real Perl for: all three new tags importing and resolving correctly, `setlocale`/`localeconv`, `$! = N` then reading `$!` and `errno()` both seeing the change (including resetting to 0), and `WIFEXITED`/`WEXITSTATUS` on both a successful and a failing real child-process exit status. Tests: `tests/parsewords_scalar_{smoke,deep}.pl`, `tests/posix_errno_locale_{smoke,deep}.pl`. |
 | D187 | **FIXED 2026-10-02** | `unlink @names;` / `unlink LIST` silently deleted NOTHING when the argument was a list-producing expression (an array variable, a function call returning a list, etc.) rather than a bare scalar filename or a literal comma-separated list of scalars — no error, no warning, the files simply stayed on disk. Root cause: `case NK::UnlinkFunc` (`src/codegen.cpp`) pushed every argument into the filename array via plain `emitExpr()` unconditionally; on an array-variable-shaped node (`@names`), `emitExpr()` doesn't yield the flattened list of filenames `perl_unlink_files()` needs, just some other (wrong, and in this case apparently harmless-looking) value — so the real filenames never reached the underlying `unlink(2)` calls at all. Caught via this project's OWN test suite: D185's `glob_brace_deep.pl` test creates several temp files and ends with `unlink @names;` to clean them up — after a full `make test-all` run, four 0-byte files were found left behind in the repo root (`glob_brace_deep_a.gz` etc.), traced directly to this bug rather than any issue with the glob-brace fix itself. Fixed by using the same `emitArrayPtr()`-then-scalar-fallback pattern several other LIST-taking builtins already use (sort's `n.args`, die/warn's comma-continuation) instead of unconditional `emitExpr()` — a list-producing argument now extends the filename array via `perl_array_extend`, a non-list-producing one falls back to a single `perl_array_push` exactly as before. Verified against real Perl for: the `@names`-array form (the exact shape that caused the leftover files), a multi-argument literal scalar-list form (`unlink 'a', 'b';`), and the pre-existing single-bare-scalar form, confirming all three actually remove their target files (checked via `-e` before and after, not just absence of a crash). Tests: `tests/unlink_list_{smoke,deep}.pl`. |
-| D188 | **FIXED 2026-10-02** | `${EXPR}{key}` / `${EXPR}[idx]` — the explicit-brace spelling of D63's sigil-chain `$$name{key}`/`$$name[idx]` — silently produced WRONG data instead of erroring. `NK::SymbolicDeref` (the node `Parser::parsePrimary()` builds for the `${ EXPR }` form) had no case anywhere in the subscript-chaining logic: not in `Parser::parseSubscript()`'s own branches (which already had dedicated `DerefScalar`+`[`/`{` cases for the sigil-chain form), and not even in `parsePostfix()`'s `isSubscriptable` gate that decides whether to call `parseSubscript` at all — so a `{key}`/`[idx]` immediately following `${ EXPR }` was never recognized as a subscript of it. Worse than an ordinary parse error: the un-consumed `{key}`/`[idx]` tokens were silently re-parsed as an unrelated bare-block STATEMENT immediately after the real one (a bare `{ EXPR }` block is itself legal Perl syntax — a scope with one expression-statement, its value simply discarded) — so there was no parse error, no crash, just silently wrong output, with `${EXPR}` alone evaluating via the existing `perl_deref_scalar` runtime call (which only unwraps a genuine SCALAR ref) against what's actually a hash/array ref, silently giving undef. Found via a real `/usr/bin/podebconf-report-po` script's Mail::Message usage: `Mail::Message->build( From => ${$mail}{'From'}, ... )`. Fixed by adding `NK::SymbolicDeref` to `isSubscriptable`'s kind list, plus two new branches in `parseSubscript()` exactly mirroring the existing `DerefScalar` ones: `${ EXPR }{key}` / `${ EXPR }[idx]` build an `ArrowDeref` node with `EXPR` itself (unwrapped from the `SymbolicDeref`'s `left` field) as the ref to index — one level of deref total, exactly `EXPR->{key}`/`EXPR->[idx]`, NOT "scalar-deref EXPR, then subscript that." The rarer symbolic-reference-BY-STRING form (`${"name"}{key}`, meaning `%name`'s element when `EXPR` is a plain string rather than a real ref) isn't specially handled by this fix — it falls through to whatever `perl_deref_hash`/`perl_deref_array` already do when handed a non-ref argument (an existing, narrower, pre-existing limitation that this fix doesn't make any worse). Verified against real Perl for: the exact real-world repro (as a plain assignment AND directly as a function-call argument — the shape that originally surfaced as the hard parse error that found this), the array-ref form, a chained double-subscript (`${$nested}{'list'}[0]`), an LVALUE write through `${EXPR}{key} = ...`, and regression checks that plain `${EXPR}` with no subscript (both the true-ref and symbolic-by-string sub-cases) and the sigil-chain `$$name{key}`/`$$name[idx]` form (D63) are both completely unaffected. **Found, not fixed, in the same survey** (three more real scripts, logged as candidates for the next pass — see CLAUDE.md): a multi-key hash subscript (`$h{"a","b"}`, the `$;`-joined composite-key idiom, from `/usr/bin/callgrind_annotate`); a trailing comma with no following semicolon as the LAST statement in a block (`push @x, sprintf "...", $a, $b,` immediately followed by the block's closing `}` — legal Perl, since a block's final statement never needs a trailing `;`, from `/usr/share/doc/cron/examples/crontab2english.pl`); and `our $a = our $b = our $c = EXPR;` (chained `our` used as a chainable assignment EXPRESSION rather than only a standalone declaration statement, from `/usr/bin/splain`). Tests: `tests/symbolic_deref_subscript_{smoke,deep}.pl`. |
+| D188 | **FIXED 2026-10-02** | `${EXPR}{key}` / `${EXPR}[idx]` — the explicit-brace spelling of D63's sigil-chain `$$name{key}`/`$$name[idx]` — silently produced WRONG data instead of erroring. `NK::SymbolicDeref` (the node `Parser::parsePrimary()` builds for the `${ EXPR }` form) had no case anywhere in the subscript-chaining logic: not in `Parser::parseSubscript()`'s own branches (which already had dedicated `DerefScalar`+`[`/`{` cases for the sigil-chain form), and not even in `parsePostfix()`'s `isSubscriptable` gate that decides whether to call `parseSubscript` at all — so a `{key}`/`[idx]` immediately following `${ EXPR }` was never recognized as a subscript of it. Worse than an ordinary parse error: the un-consumed `{key}`/`[idx]` tokens were silently re-parsed as an unrelated bare-block STATEMENT immediately after the real one (a bare `{ EXPR }` block is itself legal Perl syntax — a scope with one expression-statement, its value simply discarded) — so there was no parse error, no crash, just silently wrong output, with `${EXPR}` alone evaluating via the existing `perl_deref_scalar` runtime call (which only unwraps a genuine SCALAR ref) against what's actually a hash/array ref, silently giving undef. Found via a real `/usr/bin/podebconf-report-po` script's Mail::Message usage: `Mail::Message->build( From => ${$mail}{'From'}, ... )`. Fixed by adding `NK::SymbolicDeref` to `isSubscriptable`'s kind list, plus two new branches in `parseSubscript()` exactly mirroring the existing `DerefScalar` ones: `${ EXPR }{key}` / `${ EXPR }[idx]` build an `ArrowDeref` node with `EXPR` itself (unwrapped from the `SymbolicDeref`'s `left` field) as the ref to index — one level of deref total, exactly `EXPR->{key}`/`EXPR->[idx]`, NOT "scalar-deref EXPR, then subscript that." The rarer symbolic-reference-BY-STRING form (`${"name"}{key}`, meaning `%name`'s element when `EXPR` is a plain string rather than a real ref) isn't specially handled by this fix — it falls through to whatever `perl_deref_hash`/`perl_deref_array` already do when handed a non-ref argument (an existing, narrower, pre-existing limitation that this fix doesn't make any worse). Verified against real Perl for: the exact real-world repro (as a plain assignment AND directly as a function-call argument — the shape that originally surfaced as the hard parse error that found this), the array-ref form, a chained double-subscript (`${$nested}{'list'}[0]`), an LVALUE write through `${EXPR}{key} = ...`, and regression checks that plain `${EXPR}` with no subscript (both the true-ref and symbolic-by-string sub-cases) and the sigil-chain `$$name{key}`/`$$name[idx]` form (D63) are both completely unaffected. **Later fixed, not in this row:** the multi-key hash subscript (`$h{"a","b"}`, the `$;`-joined composite-key idiom, from `/usr/bin/callgrind_annotate`) in commit `dae3c35` (`Parser::parseHashKeySingle`, SUBSEP `\x1c`); the trailing comma before `}` as **D190** (`/usr/share/doc/cron/examples/crontab2english.pl`); chained `our` as **D191** (`/usr/bin/splain`). Tests: `tests/symbolic_deref_subscript_{smoke,deep}.pl`. |
 | D189 | **regression guard (test-only)** | A byte-for-byte test pair for the `undef EXPR` **lvalue-clearing** behavior, kept as stable coverage after the D138 number was taken by an unrelated defect (`\&name == \&name` CODE-ref identity). Real Perl treats `undef $s` as a named-unary that undefines its target in place — NOT the same as `$s = undef` for arrays/hashes (which are a 1-element list), and a genuine scalar undefine — so `pidigits.pl`'s `undef $s` works, and `Text::ParseWords::parse_line`'s `undef $word` between fields must actually reset the accumulator (leaving it a no-op duplicates every field). perlc implements this via `NK::UndefFunc` in `Parser::parsePrimary()` (`src/parser.cpp`): `undef` followed by an lvalue starter (`$/@/%`) is parsed as `undef EXPR`, and codegen (`src/codegen.cpp`) desugars scalar `undef $s` through `Assign($s, undef)` → `perl_assign` (frees the old payload, sets the tag PERL_UNDEF), `undef @a` → `perl_array_clear`, `undef %h` → `perl_hash_clear`; a bare `undef` (no lvalue follow) stays the undefined value. `tests/d189_undef_smoke.pl` covers the four base shapes (scalar undefine, array emptied, hash emptied, undef-then-reassign); `tests/d189_undef_deep.pl` exercises the canonical Text::ParseWords accumulator-reset repro (`accumulate(5)` returns `"x"`, not `"xxxxx"`), undef-then-`.=`, undef-empties-array/hash, `undef` inside a bare block, string-payload reset, and a 300-iteration allocator-stress repeat. All output must match real perl byte-for-byte. |
+| D190 | **FIXED 2026-10-15** | A trailing comma as the last statement of a block (`push @x, sprintf("%s", $a, $b,), }` with the comma immediately before `}`) was `unexpected token '}'`. Real Perl accepts it: a block's final statement needs no `;`, and a trailing comma is legal there. The unparenthesized list-argument loops (`print`, `push`, `unshift`, `sprintf`, `join`, `reverse`, `map`/`grep`, `system`, `chmod`, `open`, `unlink`, `pack`, `substr`, `splice`, List::Util `sum`/`min`/`max`/`uniq`/`first`/`any`/`all`/`none`/`reduce`, and the foreach-modifier list) now break on `}` *before* parsing the next argument, and only when the call is not parenthesized — so `push(@a, {k=>1})` still parses the hash. A trailing comma followed by another statement is still another argument (`push @x, "a", print "b"`), matching Perl. `push`/`unshift` as a sub's return value was already empty in perlc (real Perl returns the new length); the tests store into an `our` array inside the block and print the elements after the sub returns. `/usr/share/doc/cron/examples/crontab2english.pl` compiles. Tests: `tests/trailing_comma_block_{smoke,deep}.pl`. |
+| D191 | **FIXED 2026-10-15** | `our $a = our $b = our $c = 7` (and `my $a = my $b = 4`) was `unexpected token 'our'`/`'my'`. `our`/`my` were only statements. `Parser::parseDeclExpr()` accepts `my`/`our` plus a scalar, array, or hash (not a parenthesized list) in expression position, stores the sigil-prefixed name the existing `emitExpr` `NK::My` case already expects, and parses the initializer with `parseAssign()` so the chain is right-associative and `or` stays outside (`our $z = 1 or die` does not die). `our => 1` and `$h{our}` stay string keys. List-form `my ($a, $b)` and `open my $fh` are unchanged. Found in `/usr/bin/splain`. The `print THITHER` line that script hit next is **D194**. Tests: `tests/our_chain_{smoke,deep}.pl`. |
+| D192 | **FIXED 2026-10-15** | Computed typeglob assignment (survey-3 W27; older notes sometimes called it W16). `*$name = sub { ... }` and `*{$expr} = \&{expr}` were parse errors. Real Perl installs or replaces the sub under the runtime name, including a name that did not exist at compile time, and a closure keeps its captures. Parser: `*{EXPR}` without `{IO}` is `NK::Typeglob` with `sval="dyn"` (empty `sval` remains the D183 `{IO}` form); `*$scalar` is the same node; `\&{EXPR}` is `NK::RefSub` with `left` set. Runtime: a latest-wins table `s_dyn_subs` stores a cloned CODE value. `perl_call_sub_maybe_dynamic` is used instead of a direct LLVM call only when the program contains a computed glob assign (`dynamicGlobAssign_`); the same flag skips `tryEmitInline`, which would otherwise ignore the override. `perl_call_named_sub` / `_checked` consult the table first, so a brand-new name works. `perl_glob_assign_sv` installs a CODE ref under the exact name and, when the name has no `::`, also `pkg::name`. Other ref tags (`\$x`) still go through `perl_glob_assign`. `perl_code_ref_by_name` clones a dyn entry or wraps a compile-time sub. `print *$n` stringifies as `*main::hello` via `perl_dyn_glob_name`. Programs with neither a computed glob assign nor `\&{EXPR}` keep the old `::`-only method-table registration. Scope limits: a static `*NAME = \&sub` does not override a direct LLVM call unless the program also has a computed glob assign; `*$x{IO}` is not parsed; `\&{EXPR}` of a compile-time sub has no closure captures; a qualified name is not also installed under its bare trailing component. Config.pm stays native, so its own computed-glob import still does not run. `/usr/bin/ucfq` still fails later on `format` picture lines (`@<<<<<<`), an explicit non-goal. Tests: `tests/dyn_typeglob_{smoke,deep}.pl`. |
+| D193 | **FIXED 2026-10-16** | Two heredocs in one expression (`cond ? <<'EOT' : <<'EOT'`, `<<'A' . <<'B'`, `print <<E1, <<E2`) were `unexpected token '.'`. `Lexer::readHeredoc` kept a single pending body and always started the next body on the line after the `<<` line, so a second `<<` on the same statement re-read the first body and left the pending position at the end of that first body. A second `<<` now starts where the previous pending body ended, and `pendingHeredocLines_` accumulates. The jump after the statement newline still skips every stacked body in one step. An empty delimiter and a digit-leading unquoted `1<<5` still return without touching the pending state, so the caller emits `LSHIFT`. Quoted vs unquoted delimiters (D176), `<< "EOT"` whitespace (D165), `<<~` indent (D104), and interpolation are unchanged. `__LINE__` on the statement stays the statement line. Found in `/usr/bin/perlbug` and `/usr/bin/perlthanks` line 1168. Both still fail later, at line 1217 (`unexpected token '^'`), on a `format STDOUT` picture (`^<<<<`). `format`/`write` is an explicit non-goal. Tests: `tests/double_heredoc_{smoke,deep}.pl`. |
+| D194 | **FIXED 2026-10-16** | High-precedence `||` / `&&` / `//` with `print`, `say`, or `printf` on the right (`splainthis($error) || print THITHER $error`) was `unexpected token 'print'`. `parseLowOr` already accepted those keywords for low-precedence `or`/`and`; `parseOr` and `parseAnd` did not. Both loops now call `parseOrRhs()` and use that node as the RHS. The print is not wrapped in a block, so it does not push a scope. `CodeGen::emitShortCircuitRhs` runs a `PrintStmt`/`SayStmt`/`PrintfStmt` with `emitStmt` and returns `perlInt(1)`, which is what a successful print yields. The existing short-circuit IR still skips the RHS when the LHS decides the result, so `keep() || print` does not print and `drop() && print` does not print. The same return-1 path also covers the older `or print` form. `*THITHER = $flag ? *STDOUT : *STDERR` is not a `Typeglob` RHS, so it went through `perl_glob_assign`; a `PERL_FILEHANDLE` now aliases the destination glob's scalar slot to that stable handle (`perl_get_stdout` / `stderr` / `stdin`). `*OUT = *STDOUT` goes through `perl_glob_copy`, which does the same alias when the dest scalar is not already a filehandle. `print THITHER` then loads `perl_glob_get_scalar`. The static stdout cell is not freed. Found in `/usr/bin/splain` line 500, after `*THITHER = $standalone ? *STDOUT : *STDERR`. That script still fails later, at line 589 (`unexpected token '&'`), on `&$olddie if defined $olddie and ...`. Calling a code reference through `&$scalar` is a separate parse gap. Tests: `tests/or_print_{smoke,deep}.pl`. |
+| D195 | **FIXED 2026-10-16** | A leading `::NAME` with no sigil (`::ZIP_LOCAL_HDR_SIG`, `\&::LocalHeader`, `::hello()`) was `unexpected token ':'`. It means `main::NAME`, including inside another package. It does not mean the current package. The lexer, once it has consumed the first `:`, emits one `IDENT` `"main::" + name` when the next character is `:` and the one after that starts an identifier. Further `::` segments are included (`::Foo::Bar`). A single `:` (ternary, label) stays `COLON`. `$::name` / `@::arr` / `%::hash` stay on the existing sigil path (D121). `::::foo` is unchanged. `use constant NAME` stores the bare name, so a `main::NAME` constant lookup with no further `::` falls back to that bare entry. A qualified name before a comma is a call (`ival = 1`), not an auto-quoted string. `\&::LocalHeader` is `NK::RefSub` named `main::LocalHeader`. `definedSubName` resolves that to the bare `LocalHeader` LLVM function when the qualified function does not exist and the rest of the name has no `::`. That resolution is used for `\&name`, list-context calls, and `emitCall`. An exact qualified function wins when both exist. `perl_call_sub_maybe_dynamic` still receives the original name. Found in `/usr/bin/zipdetails` line 171, inside `{ package Signatures; ... ::ZIP_LOCAL_HDR_SIG, [ \&::LocalHeader, ... ] }`. The constants and `sub LocalHeader` are in `main`. That script still fails later, at line 2576 (`unexpected token ','`), on unparenthesized `return '', '', 0`. Tests: `tests/colon_colon_name_{smoke,deep}.pl`. |
 | D186 | **FIXED 2026-10-02** | A narrow, pre-existing scope-tracking bug originally found (but not root-caused) while writing D184's deep test, reproducing identically with the plain `for` keyword (nothing to do with D184's `foreach` fix itself): reusing the exact same loop-variable name across three sibling top-level `my` declarations in a specific sequence caused the LAST loop's body to silently never execute — no crash, no error, just missing output. Minimal repro: `for (my ($i, $j) = (0, 10); $i < 3; $i++, $j--) { print "multi=$i,$j\n"; } my $i = 0; foreach (; $i < 2; $i++) { print "noinit=$i\n"; } for (my $i = 0; $i < 2; $i++) { print "for_cstyle=$i\n"; }`. Root-caused by emitting `--emit-ir` for the repro and inspecting the generated LLVM: the THIRD loop's own `my $i = 0` correctly created a fresh, scope-local `PerlValue*` (used correctly by the loop BODY for printing/incrementing) — but the loop's CONDITION check (`$i < 2`, both at loop entry and at the end of every iteration) loaded from `@g.i`, the OLD global created by the second block's unrelated top-level `my $i = 0;`, not the new local at all. Traced to `tryEmitI1Cond()`'s `tryFileGlobalI64` fast path (`src/codegen.cpp`, Stage 26a — lets a `VAR < literal`-shaped condition skip full `PerlValue` boxing when `VAR` is a file-scope global) indexing `fileScalarGlobals_` directly by bare name, with no check at all for whether a NEARER lexical scope (the loop's own fresh `my $i`) shadows that name — unlike the general `lookupVar()`/`lookupIntVar()`/`lookupFloatVar()` resolution paths used everywhere else, which already correctly walk `scopes_`/`intScopes_`/`floatScopes_` innermost-first before ever falling back to the file-global map. Fixed by having `tryFileGlobalI64` check all three scope-stack maps for an existing entry under the same bare name first, bailing out of the fast path (falling through to the always-correct general `emitExpr` path) whenever one is found. Verified against real Perl for: the original three-declaration repro, the simplest possible two-declaration shadowing shape, a shadowing case deliberately chosen so the stale outer value would make the condition immediately false (reproducing the exact silent-zero-iterations failure signature), shadowing inside a `sub` (confirmed a legitimate, different case — a sub's free-variable read of an outer file-scope global with NO local `my` of its own — still correctly resolves to the outer global, only an actual same-named local `my` triggers the bail-out), and a regression check that the ordinary non-shadowed fast path (the common case this optimization exists for) is completely unaffected. Tests: `tests/loop_var_shadow_{smoke,deep}.pl`. |
 | D185 | **FIXED 2026-10-02** | The diamond-glob `<PATTERN>` syntax and the plain `glob()` builtin didn't brace-expand `{a,b,c}` alternation at all — `<*.{gz,txt}>` only ever matched the literal, never-found filename `"*.{gz,txt}"` (silently empty), instead of real Perl's default brace-expansion behavior (`glob()`/`<PATTERN>` brace-expand without needing any extra flag or `File::Glob` import — confirmed directly against real Perl). Found via a real `/usr/bin/helpztags` script: `foreach my $file (<*.{gz,txt,??x}>) { ... }`. Needed two independent fixes: (1) the lexer's diamond-glob safe-character allowlist (`src/lexer.cpp`, the same `globSafeChars` string D173 widened for quote characters) didn't include `{`/`}` at all, so a pattern containing them aborted the guarded second-scan early and fell back to a bare `TK::LT` token — a confusing parse error well before the glob call was ever reached; (2) `perl_glob_val()` (`src/runtime.c`, the runtime behind both the plain `glob()` builtin and `<PATTERN>`) only ever passed `GLOB_TILDE` to the underlying `glob(3)` call, never `GLOB_BRACE` — `File::Glob::bsd_glob`'s own flag-translation layer (D157) already knew how to honor `GLOB_BRACE` when explicitly requested via its FLAGS argument, but the plain unflagged builtin had no way to turn it on at all. Fixed by adding `{`/`}` to the lexer's allowlist and unconditionally OR-ing `GLOB_BRACE` into `perl_glob_val`'s `glob(3)` flags (matching real Perl's always-on default, not an opt-in). Verified the `{`/`}` lexer addition doesn't regress ordinary hash-element comparisons immediately after a `<` (`$h{k} < 5 && $x > 2`-shaped code, already guarded by the pre-existing `ltAfterVal` check) with a dedicated regression case. Verified against real Perl for: two-way and three-way brace alternation via both `<PATTERN>` and `glob()`, a brace pattern with no matches (empty list, not a glob(3) error), and regression checks for a non-brace pattern and the hash-comparison case. Tests: `tests/glob_brace_{smoke,deep}.pl`. |
 | D184 | **FIXED 2026-10-02** | Real Perl's `for` and `foreach` keywords are full synonyms, including the C-style three-clause form (`foreach (init; cond; step) { }`, not just the more common `foreach VAR (LIST)` form) — only `for` ran the lookahead that scans ahead for a top-level `;` inside the parens to distinguish the C-style parse from the list/foreach-variable parse; `KW_FOREACH` went straight to the list-form parse unconditionally, so a `;` inside its parens surfaced as a confusing "expected ) but got ';'". Found verbatim, the identical C-style-via-`foreach` shape, in **two separate real scripts in the same survey**: `/usr/share/doc/ppp/examples/scripts/lcp_rtt_dump` (`foreach (my $i= 0; $i < @{ $s->{data} }; $i++) { ... }`) and `/usr/lib/llvm-22/libexec/ccc-analyzer` (`foreach (my $i = 0; $i < scalar(@ARGV); ++$i) { ... }`) — strong evidence this is a real, if uncommon, stylistic choice rather than a one-off. Fixed by extracting `parseFor()`'s entire post-keyword body (the C-style lookahead/parse plus the list-form fallback) into a new shared `Parser::parseForOrForeachCommon(int line)`, called identically from both `parseFor()` (after consuming `KW_FOR`) and `parseForeach()` (after consuming `KW_FOREACH`) — zero duplicated logic, and the existing C-style codegen path (`NK::For`) is completely unchanged since both keywords now produce the identical node. Verified against real Perl for: the basic C-style form spelled with `foreach`, a multi-clause comma-separated init/step (`foreach (my ($i,$j) = (0,10); $i<3; $i++,$j--)`), `next`/`last` inside it, an omitted init clause, and regression checks that plain `for(;;)`, `foreach VAR (LIST)`, bare `foreach (LIST)` (implicit `$_`), and `foreach VAR (LIST) { } continue { }` are all unaffected. **Found, not fixed, while writing this test**: **D186** (a narrow, unrelated scope-tracking bug triggered by reusing the same loop-variable name across three sibling `my` declarations — reproduces with plain `for` too). Tests: `tests/foreach_cstyle_{smoke,deep}.pl`. |
@@ -2515,7 +2631,7 @@ perl's core dirs):
 | update-xmlcatalog | File::Spec, Getopt::Long | no | File::Spec → now implemented; byte-identical no-args |
 | geteltorito | Getopt::Std | no | `${"opt_$x"}` symbolic deref (W22, open) |
 | instmodsh | ExtUtils::Installed, IO::File | no | Fcntl SEEK_SET tag export+value (W16, open) |
-| pod2usage | Config | no | Config.pm:52 `*{$pkg.'::'.$f}=\&{$f}` (W27, open) |
+| pod2usage | Config | no | Config.pm:52 computed typeglob (W27). Language feature fixed as D192 (2026-10-15); Config stays native, so that line still does not run. |
 | validlocale | POSIX qw(LC_ALL) | no | LC_ALL bareword-constant value (W16, open) |
 | pl2pm | core only | no | `s/\|foo\|bar/next`-style `next` after `||` (W2-class, open) |
 | update-language | Text::ParseWords | yes | W29 `local *_` fixed 2026-09-16 |
@@ -2551,8 +2667,12 @@ perl's core dirs):
 **Logged, not fixed** (repros in git history of the survey agent's
 report; the highest-leverage next items):
 1. **W27 — Config.pm's `*{$pkg.'::'.$f}=\&{$f}`** (computed typeglob
-   assignment) — Config.pm is the highest-leverage single target (it
-   gates pod2usage, instmodsh, perlthanks, h2ph, splain...).
+   assignment). **Fixed as D192 (2026-10-15)** for `*$name = sub {}`,
+   `*{$expr} = \&{expr}`, closure captures, and a name that did not
+   exist at compile time. Config.pm itself stays the native module, so
+   its source still does not run. A static `*NAME = \&sub` does not
+   override a direct LLVM call unless the program also contains a
+   computed glob assign. `*$x{IO}` is not parsed.
 2. **W16 — Exporter tag validation + XS-constant values**: requesting a
    name that's only in a `%EXPORT_TAGS` value (e.g. Fcntl's SEEK_SET in
    `:standard`) is falsely rejected, and there's no value path for
@@ -2590,8 +2710,8 @@ once, output committed), and the 4 real functions
 byte-identical output to real Config on this host (myconfig/config_sh
 are baked strings from the host `perl -V`). Because the module is native
 its file is never inlined, so Config.pm's computed-typeglob import
-(W27) never executes — that item stops mattering for Config users
-(pod2usage, instmodsh, perlthanks, h2ph, splain). `exists $Config{...}`
+(W27) never executes. The language feature itself is **D192**
+(2026-10-15), for scripts that assign a glob at runtime. `exists $Config{...}`
 and `exists $ENV{...}` now work (the ExistsFunc single-key path had no
 special-hash handling; real message parity maintained). Keys iteration
 (`keys %Config`, both contexts) works. Behavioral note: perlc resolves

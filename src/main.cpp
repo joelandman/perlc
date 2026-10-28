@@ -1505,7 +1505,7 @@ static void usage(const char *prog) {
               << "              runtime to implement `do FILE`, D24)\n"
               << "  --eval-lib  Like --do-lib, plus bind outer `my` cells from the eval pad\n"
               << "              (internal use — invoked by perl_eval_string())\n"
-              << "  -O[level]   Optimization level 0-5 (default: 1)\n"
+              << "  -O[level]   Optimization level 0-5 (default: 2; bare -O means 1)\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
               << "  -I<dir>     Add <dir> to the module search path (also: PERL5LIB, use lib)\n"

@@ -201,7 +201,12 @@ private:
        use the unboxed int/float fast path (intScopes_/floatScopes_,
        which has no real PerlValue* for a closure to later share) even
        though the fast path would otherwise apply — see D64 in TESTS.md. */
-    std::unordered_set<std::string> capturedNamesInCurrentFn_;
+     std::unordered_set<std::string> capturedNamesInCurrentFn_;
+     /* D196: names of `my` decls whose backing placeholder was hoisted into a
+        short-circuit preheader (see hoistMyDeclsInRhs); the RHS's own my-decl
+        emission reuses those placeholders instead of minting a branch-local
+        one its scope-cleanup free would then fail to dominate. */
+     std::unordered_set<std::string> myHoisitNames_;
      /* D56: warnings pragma state (set from parser at compile() entry) */
      bool warningsEnabled_     = false;
      bool warningsUninitialized_ = false;
@@ -259,6 +264,14 @@ private:
     /* names that appear as *NAME = ... in this compilation — package
        $NAME/@NAME/%NAME (when not a lexical) route through the glob table */
     std::unordered_set<std::string> globNames_;
+    /* D192: the program assigns to a computed typeglob (*$name / *{EXPR}).
+       Call sites then skip AST inlining and consult the dynamic sub table
+       before the direct LLVM call. Programs without that assignment keep
+       today's direct calls. */
+    bool dynamicGlobAssign_ = false;
+    /* D192: \&{EXPR} appears, so compile-time subs must be findable by
+       bare name in the method table (normally only :: names are registered). */
+    bool dynamicCodeRef_ = false;
 
     /* AST-level inline subs: subs with (my (@params)=@_; return expr) body.
        At call sites these are expanded directly, bypassing @_ construction. */
@@ -285,8 +298,15 @@ private:
     void declareArray(const std::string &name, llvm::Value *ptr);
     llvm::Value *lookupHash(const std::string &name);
     void declareHash(const std::string &name, llvm::Value *ptr);
-    void trackPv(llvm::Value *pv);
-    void emitScopeCleanup();  /* free all tracked pvs in all active scopes */
+     void trackPv(llvm::Value *pv);
+     void emitScopeCleanup();  /* free all tracked pvs in all active scopes */
+     /* D196: allocate the backing PerlValue* for every fresh `my` decl found
+        in a short-circuit RHS (&& / || / //) in the current (preheader)
+        block, so its scope-cleanup free isn't left dangling in a block the
+        placeholder isn't dominated from. Returns the placeholder for the
+        first hoisted decl (or nullptr if none), which the RHS's own my-decl
+        emission then reuses instead of minting a fresh, branch-local one. */
+     llvm::Value *hoistMyDeclsInRhs(const Node &rhsNode);
     void emitEvalPadFill();   /* dump in-scope my cells into the eval pad */
     void emitEvalPadBind();   /* --eval-lib: load pad cells into file-scope GVs */
     /* returns a PerlArray* Value for things that produce arrays */

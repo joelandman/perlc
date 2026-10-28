@@ -2334,12 +2334,18 @@ PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *arg
             {
                 PerlValue *pr = args && args->len ? args->elems[0] : NULL;
                 char *ps = pr ? perl_to_string_dup(pr) : strdup("");
-                /* Term::ReadLine writes cursor-positioning codes around the
-                   prompt even when it returns immediately in non-tty mode:
-                   "\e[4m<ps>\e[24m\e[1m\e[0m\e[0m". Match that so the prompt
-                   bytes (on stderr) match real perl. */
+                /* Term::ReadLine::Stub::ornaments loads Term::Cap. With a
+                   usable TERM (xterm, linux, screen) the prompt on stderr is
+                   "\e[4m<ps>\e[24m\e[1m\e[0m\e[0m" even when stderr is not a
+                   tty. TERM=dumb (and an unset TERM) leaves the capability
+                   strings empty, so real perl prints the prompt alone.
+                   Hardcoding the xterm sequence diverged under TERM=dumb. */
+                const char *term = getenv("TERM");
+                int fancy = term && term[0] && strcmp(term, "dumb") != 0;
                 char buf[4200];
-                int bp = snprintf(buf, sizeof buf, "\033[4m%s\033[24m\033[1m\033[0m\033[0m", ps);
+                int bp = fancy
+                    ? snprintf(buf, sizeof buf, "\033[4m%s\033[24m\033[1m\033[0m\033[0m", ps)
+                    : snprintf(buf, sizeof buf, "%s", ps);
                 if (bp < 0) { free(ps); return perl_alloc_undef(); }
                 if (bp >= (int)sizeof buf) bp = (int)sizeof buf - 1;
                 buf[bp] = '\0';

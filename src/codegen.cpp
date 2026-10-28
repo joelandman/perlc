@@ -243,6 +243,20 @@ static std::string subLLVMName(const std::string &name) {
     return "perlsub_" + result;
 }
 
+/* D195: `::NAME` is main::NAME. A sub declared `sub NAME` in package main
+   is emitted under the bare name. Prefer an exact match, then that bare
+   sub. A real `sub main::Other::NAME` is left qualified. */
+static std::string definedSubName(llvm::Module &mod, const std::string &name) {
+    if (mod.getFunction(subLLVMName(name))) return name;
+    if (name.rfind("main::", 0) == 0) {
+        std::string bare = name.substr(6);
+        if (bare.find("::") == std::string::npos &&
+            mod.getFunction(subLLVMName(bare)))
+            return bare;
+    }
+    return name;
+}
+
 /* ── construction ────────────────────────────────────────────────────────── */
 
 CodeGen::CodeGen(bool debug, int optLevel)
@@ -668,6 +682,10 @@ void CodeGen::declareRuntime() {
     RT("perl_register_method",         voidTy, i8p, i8p);
     RT("perl_get_or_create_global_scalar", pv, i8p);
     RT("perl_glob_assign",     voidTy, i8p, pv);
+    RT("perl_glob_assign_sv",  voidTy, pv, pv, i8p);          /* D192 */
+    RT("perl_call_sub_maybe_dynamic", pv, i8p, i8p, av, i32); /* D192 */
+    RT("perl_code_ref_by_name", pv, pv);                     /* D192 */
+    RT("perl_dyn_glob_name",   pv, pv, i8p);                 /* D192 */
     RT("perl_glob_set_scalar", voidTy, i8p, pv);
     RT("perl_glob_set_array",  voidTy, i8p, av);
     RT("perl_glob_set_hash",   voidTy, i8p, av); /* PerlHash* is also a ptr */
@@ -2482,7 +2500,8 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     }
     /* user-defined sub call in list context: call with ctx=1, unwrap result */
     if (n.kind == NK::Call) {
-        if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+        std::string resolvedSub = definedSubName(*mod_, n.name);
+        if (auto *fn = mod_->getFunction(subLLVMName(resolvedSub))) {
             Value *argsArr = callRT("perl_array_new", {});
             fillCallArgs(argsArr, n);
             auto *i32Ty = Type::getInt32Ty(ctx_);
@@ -4810,6 +4829,26 @@ Value *CodeGen::emitExprF64(const Node &n) {
    into NK::AnonSub bodies (a named sub could be declared inside a
    closure) — both fall out naturally from the generic walk with no
    special-casing needed. */
+/* D192: computed typeglob assignment and \&{EXPR}. */
+static void scanDynamicGlobs(const Node &n, bool &dynAssign, bool &dynCodeRef) {
+    if (n.kind == NK::Assign && n.left && n.left->kind == NK::Typeglob &&
+        n.left->sval == "dyn")
+        dynAssign = true;
+    if (n.kind == NK::RefSub && n.left)
+        dynCodeRef = true;
+    if (n.left)  scanDynamicGlobs(*n.left,  dynAssign, dynCodeRef);
+    if (n.right) scanDynamicGlobs(*n.right, dynAssign, dynCodeRef);
+    if (n.cond)  scanDynamicGlobs(*n.cond,  dynAssign, dynCodeRef);
+    if (n.body)  scanDynamicGlobs(*n.body,  dynAssign, dynCodeRef);
+    if (n.init)  scanDynamicGlobs(*n.init,  dynAssign, dynCodeRef);
+    if (n.step)  scanDynamicGlobs(*n.step,  dynAssign, dynCodeRef);
+    for (auto &a : n.args) scanDynamicGlobs(*a, dynAssign, dynCodeRef);
+    for (auto &b : n.branches) {
+        if (b.cond) scanDynamicGlobs(*b.cond, dynAssign, dynCodeRef);
+        if (b.body) scanDynamicGlobs(*b.body, dynAssign, dynCodeRef);
+    }
+}
+
 static void collectGlobNames(const Node &n, std::unordered_set<std::string> &out) {
     if (n.kind == NK::Assign && n.left && n.left->kind == NK::Typeglob &&
         !n.left->name.empty())
@@ -4953,8 +4992,11 @@ void CodeGen::compile(const Node &program, const std::string &modName,
     subs_.clear();
     subCaptures_.clear();
     globNames_.clear();
+    dynamicGlobAssign_ = false;
+    dynamicCodeRef_ = false;
     collectSubDefs(program, subs_);
     collectGlobNames(program, globNames_);
+    scanDynamicGlobs(program, dynamicGlobAssign_, dynamicCodeRef_);
 
     evalPadScalars_.clear();
     evalPadArrays_.clear();
@@ -5096,12 +5138,22 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             }
         }
 
-        /* register all subs in the method dispatch table (before user code runs) */
+        /* register all subs in the method dispatch table (before user code runs).
+           D192: \&{EXPR} looks a compile-time sub up by the runtime string,
+           which for `sub hello` is the bare name "hello" (and "main::hello").
+           Only programs that actually use \&{EXPR} or a computed typeglob
+           get the extra bare-name entries — other programs stay first-match
+           identical to before. */
         for (auto *s : subs_) {
-            if (s->name.find("::") != std::string::npos) {
-                Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
-                auto *fn = mod_->getFunction(subLLVMName(s->name));
-                callRT("perl_register_method", {keyStr, fn});
+            bool qual = s->name.find("::") != std::string::npos;
+            if (!qual && !dynamicGlobAssign_ && !dynamicCodeRef_) continue;
+            Value *keyStr = builder_.CreateGlobalStringPtr(s->name);
+            auto *fn = mod_->getFunction(subLLVMName(s->name));
+            if (!fn) continue;
+            callRT("perl_register_method", {keyStr, fn});
+            if (!qual) {
+                Value *mainKey = builder_.CreateGlobalStringPtr("main::" + s->name);
+                callRT("perl_register_method", {mainKey, fn});
             }
         }
 
@@ -5348,10 +5400,18 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         dib_->finalize();
     }
 
-    std::string err;
-    raw_string_ostream es(err);
-    if (verifyModule(*mod_, &es))
-        throw std::runtime_error("LLVM verify error: " + err);
+     std::string err;
+     raw_string_ostream es(err);
+     if (verifyModule(*mod_, &es)) {
+         for (llvm::Function &f : mod_->getFunctionList()) {
+             std::string ferr; llvm::raw_string_ostream fes(ferr);
+             if (verifyFunction(f, &fes)) {
+                 f.print(llvm::errs(), nullptr);
+                 break;
+             }
+         }
+         throw std::runtime_error("LLVM verify error: " + err);
+     }
 }
 
 /* forward declarations — defined in "statement emission" section */
@@ -6542,17 +6602,28 @@ void CodeGen::emitStmt(const Node &n) {
                         break; /* done — no PV alloca, no trackPv */
                     }
                 }
-                auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
-                /* allocate a stable PerlValue* that lives for this variable's lifetime */
-                Value *pv = perlUndef();
-                builder_.CreateStore(pv, alloca);
-                trackPv(pv);
+                /* D196: if a short-circuit preheader hoisted this decl's
+                   placeholder, reuse it (it already lives for the variable's
+                   lifetime and is tracked for freeing) instead of minting a
+                   branch-local one that the scope-cleanup free would then
+                   fail to dominate. */
+                Value *pv;
+                if (myHoisitNames_.count(nm)) {
+                    Value *slot = lookupVar(nm);
+                    pv = builder_.CreateLoad(perlPtrTy_, slot, nm);
+                } else {
+                    auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
+                    /* allocate a stable PerlValue* that lives for this variable's lifetime */
+                    pv = perlUndef();
+                    builder_.CreateStore(pv, alloca);
+                    trackPv(pv);
+                    declareVar(nm, alloca);
+                }
                 if (n.right) {
                     Value *init = emitExpr(*n.right);
                     callRT("perl_assign", {pv, init});
                     freeIfOwned(init);
                 }
-                declareVar(nm, alloca);
                 if (n.right) tryBindCplxPair(nm, *n.right);
             }
         }
@@ -8381,8 +8452,8 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::CondSignal:    { callRT("perl_cond_signal",    {emitExpr(*n.left)}); return perlUndef(); }
     case NK::CondBcast:     { callRT("perl_cond_broadcast", {emitExpr(*n.left)}); return perlUndef(); }
 
-    case NK::DieStmt: {
-         auto *i32Ty = Type::getInt32Ty(ctx_);
+      case NK::DieStmt: {
+           auto *i32Ty = Type::getInt32Ty(ctx_);
          Value *msg = n.left ? emitExpr(*n.left) : perlStr("Died");
          Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "die.file");
          Value *lineVal = ConstantInt::get(i32Ty, n.line);
@@ -8575,6 +8646,17 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::Assign: {
+        /* D192: *$name = ... / *{EXPR} = ... — name is computed. */
+        if (n.left && n.left->kind == NK::Typeglob && n.left->sval == "dyn") {
+            Value *nm = n.left->left ? emitExpr(*n.left->left) : perlUndef();
+            Value *rhs = n.right ? emitExpr(*n.right) : perlUndef();
+            Value *pkg = builder_.CreateGlobalStringPtr(currentPackage_);
+            callRT("perl_glob_assign_sv", {nm, rhs, pkg});
+            Value *shown = callRT("perl_dyn_glob_name", {nm, pkg});
+            freeIfOwned(nm);
+            freeIfOwned(rhs);
+            return shown;
+        }
         /* *NAME = ... — glob slot assignment */
         if (n.left && n.left->kind == NK::Typeglob) {
             Value *key = builder_.CreateGlobalStringPtr(n.left->name);
@@ -9788,6 +9870,15 @@ Value *CodeGen::emitExpr(const Node &n) {
     case NK::Call: return emitCall(n);
 
     case NK::Typeglob: {
+        /* D192: *$name / *{EXPR} read — stringify *pkg::name. The {IO}
+           form also stores EXPR in left, but leaves sval empty. */
+        if (n.left && n.sval == "dyn") {
+            Value *nm = emitExpr(*n.left);
+            Value *pkg = builder_.CreateGlobalStringPtr(currentPackage_);
+            Value *shown = callRT("perl_dyn_glob_name", {nm, pkg});
+            freeIfOwned(nm);
+            return shown;
+        }
         /* *{EXPR}{IO} — the deref-glob form. n.left holds EXPR (a
            glob-ref like `\*STDOUT`, or a lexical filehandle variable);
            resolve it to a usable filehandle value at runtime rather
@@ -11777,7 +11868,15 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RefSub: {
-        auto *subFn = mod_->getFunction(subLLVMName(n.name));
+        /* D192: \&{EXPR} — resolve the name at runtime. */
+        if (n.left) {
+            Value *nm = emitExpr(*n.left);
+            Value *ref = callRT("perl_code_ref_by_name", {nm});
+            freeIfOwned(nm);
+            return ref;
+        }
+        std::string subName = definedSubName(*mod_, n.name);
+        auto *subFn = mod_->getFunction(subLLVMName(subName));
         if (!subFn) return perlUndef();
         Value *fnPtr = ConstantExpr::getPointerCast(subFn, PointerType::getUnqual(ctx_));
 
@@ -11798,7 +11897,7 @@ Value *CodeGen::emitExpr(const Node &n) {
            seen), fall back to a plain code ref. */
         const Node *subAst = nullptr;
         for (auto *s : subs_) {
-            if (s->name == n.name) { subAst = s; break; }
+            if (s->name == subName || s->name == n.name) { subAst = s; break; }
         }
         if (subAst && subAst->body) {
             std::set<std::string> usedNames;
@@ -12655,8 +12754,8 @@ bool CodeGen::isExplicitListKind(const Node &n) {
            (k == NK::ReverseFunc   && n.sval != "scalar_ctx");
 }
 
-Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
-    /* D8a: `EXPR or return VALUE` / `EXPR and return VALUE` parse into a
+ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
+     /* D8a: `EXPR or return VALUE` / `EXPR and return VALUE` parse into a
        BinOp("||"/"&&") whose RHS is a Block wrapping a single Return
        statement (Parser::parseOrRhs). Routing that through the ordinary
        emitExpr()->emitBlockLast() path is wrong here: emitBlockLast treats
@@ -12675,6 +12774,13 @@ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
        shared logic, which many other callers (sub bodies, do-file bodies,
        ternary/if branches) correctly rely on behaving the way it already
        does. */
+    /* D194: `f() || print FH $x` / `f() or print "x"`. print/say/printf
+       are statements. Run them here; a successful print is true (1). */
+    if (rhsNode.kind == NK::PrintStmt || rhsNode.kind == NK::SayStmt ||
+        rhsNode.kind == NK::PrintfStmt) {
+        emitStmt(rhsNode);
+        return perlInt(1);
+    }
     if (rhsNode.kind == NK::Block && rhsNode.args.size() == 1 &&
         rhsNode.args[0]->kind == NK::Return) {
         emitStmt(*rhsNode.args[0]);
@@ -12686,9 +12792,80 @@ Value *CodeGen::emitShortCircuitRhs(const Node &rhsNode) {
            runtime, but the caller's PHI node still needs a well-typed
            value here to keep the IR valid. */
         return perlUndef();
-    }
-    return emitExpr(rhsNode);
-}
+     }
+      return emitExpr(rhsNode);
+  }
+
+  /* Collect the NK::My declaration nodes that a short-circuit RHS
+     (operand of && / || / //) will evaluate in this one evaluation. Their
+     backing PerlValue* placeholders are allocated lazily *inside* the RHS
+     basic block, but are tracked for freeing by the enclosing scope's
+     cleanup — which runs at the enclosing block's merge. That merge is
+     reached by paths that never fell through the RHS branch, so the
+     placeholder isn't defined there: an "instruction does not dominate
+     all uses!" verify crash (e.g. ckbcomp's `$code >= 64 && $code <= 127
+     && defined(my $special = ...)`). Hoist each collected placeholder to
+     the short-circuit's preheader (see hoistMyDeclForRhs below) so it is
+     defined on every path, matching the way the While case already hoists
+     `while (my $x = ...)` into the loop preheader. Only direct decls (and
+     those nested through more short-circuit operands or call args) are
+     hoisted — a my inside a nested Block/Sub body keeps its own scope. */
+  static void collectMyDeclsInRhs(const Node &n,
+                                 std::vector<const Node *> &out) {
+     if (n.kind == NK::My) { out.push_back(&n); return; }
+     if (n.kind == NK::Assign) {   /* (my $x = EXPR) / my $x=, ...= */
+         if (n.left) collectMyDeclsInRhs(*n.left, out);
+         if (n.right) collectMyDeclsInRhs(*n.right, out);
+         return;
+     }
+     /* Named-unary builtins hold their single operand in `left`; a `my` decl
+        there (e.g. `defined(my $x = ...)`) is evaluated as part of the RHS. */
+     if (n.kind == NK::DefinedFunc || n.kind == NK::ExistsFunc ||
+         n.kind == NK::UndefFunc || n.kind == NK::ScalarFunc ||
+         n.kind == NK::SortFunc) {
+         if (n.left) collectMyDeclsInRhs(*n.left, out);
+         return;
+     }
+     /* Nested short-circuit operands are all in the same evaluation. */
+     if (n.kind == NK::BinOp &&
+         (n.sval == "&&" || n.sval == "||" || n.sval == "//")) {
+         if (n.left) collectMyDeclsInRhs(*n.left, out);
+         if (n.right) collectMyDeclsInRhs(*n.right, out);
+     }
+     for (const auto &a : n.args) collectMyDeclsInRhs(*a, out);
+ }
+
+ /* D196: allocate the backing PerlValue* placeholders for the fresh `my`
+    decls in a short-circuit RHS *here* (the preheader) instead of letting
+    each one allocate inside the branch block it evaluates in. The first
+    placeholder is returned; the RHS's own my-decl codegen reuses it (see
+    case NK::My) rather than minting a fresh, branch-local one that its
+    scope-cleanup free would then fail to dominate. Declns already declared
+    in the current scope are left alone. */
+  llvm::Value *CodeGen::hoistMyDeclsInRhs(const Node &rhsNode) {
+      /* D196: per-short-circuit — clear any names hoisted by a *previous*
+         short-circuit so a later, independently-scoped `my` (same name, no
+         hoist) doesn't wrongly reuse a placeholder that doesn't exist in its
+         own scope. */
+      myHoisitNames_.clear();
+      std::vector<const Node *> decls;
+      collectMyDeclsInRhs(rhsNode, decls);
+      llvm::Value *first = nullptr;
+     for (const Node *mn : decls) {
+         std::string nm = mn->name;
+         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+         if (nm.empty()) continue;
+         if (scopes_.back().count(nm)) continue;  /* already hoisted/declared */
+         auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, mn->name);
+         Value *pv = perlUndef();
+         builder_.CreateStore(pv, alloca);
+         trackPv(pv);
+         declareVar(nm, alloca);
+         myHoisitNames_.insert(nm);          /* D196: RHS my-decl reuses this */
+         if (!first) first = pv;
+     }
+     return first;
+ }
 
 /* D103: the raw i64 fast path below (emitExprI64) does native wrapping
    arithmetic with no overflow check at all — `my $big = 9223372036854775807;
@@ -12931,6 +13108,9 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *endBB  = BasicBlock::Create(ctx_, "and.end",  fn);
         int savedCallCtx = callCtx_;
         callCtx_ = 0;   /* left always scalar */
+        /* D196: hoist any `my` decl in the RHS so its placeholder is allocated
+           in this preheader (dominating the merge) instead of inside rhsBB. */
+        hoistMyDeclsInRhs(*n.right);
         Value *lv  = emitExpr(*n.left);
         callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
@@ -12958,6 +13138,8 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *endBB  = BasicBlock::Create(ctx_, "or.end", fn);
         int savedCallCtx = callCtx_;
         callCtx_ = 0;   /* left always scalar */
+        /* D196: hoist any `my` decl in the RHS (see the && branch). */
+        hoistMyDeclsInRhs(*n.right);
         Value *lv  = emitExpr(*n.left);
         callCtx_ = savedCallCtx;
         Value *lb  = callRT("perl_is_true", {lv});
@@ -12986,6 +13168,8 @@ Value *CodeGen::emitBinOp(const Node &n) {
         auto *endBB = BasicBlock::Create(ctx_, "defor.end", fn);
         int savedCallCtx = callCtx_;
         callCtx_ = 0;   /* left always scalar (defined-test) */
+        /* D196: hoist any `my` decl in the RHS (see the && branch). */
+        hoistMyDeclsInRhs(*n.right);
         Value *lv   = emitExpr(*n.left);
         callCtx_ = savedCallCtx;
         Value *lb   = callRT("perl_defined", {lv});
@@ -13251,8 +13435,12 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_bigint_from_decstr_unblessed",
                        {builder_.CreateGlobalStringPtr(n.sval)});
 
-    /* Try AST-level inline first: eliminates @_ construction for simple subs. */
-    if (Value *v = tryEmitInline(n)) return v;
+    /* Try AST-level inline first: eliminates @_ construction for simple subs.
+       D192: a computed typeglob can replace that sub at runtime, so the
+       inlined body would ignore the override. */
+    if (!dynamicGlobAssign_) {
+        if (Value *v = tryEmitInline(n)) return v;
+    }
 
     /* eval EXPR — constant strings without new subs compile as EvalBlock
        (outer lexicals visible). Dynamic strings and strings that define
@@ -15091,7 +15279,8 @@ Value *CodeGen::emitCall(const Node &n) {
         freeIfOwned(sig);
         return ret;
     }
-    if (auto *fn = mod_->getFunction(subLLVMName(n.name))) {
+    std::string resolvedSub = definedSubName(*mod_, n.name);
+    if (auto *fn = mod_->getFunction(subLLVMName(resolvedSub))) {
         /* Use push_nc (no-clone) for scalar args so we skip 63M clone/free per
            mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
            after the call; non-owned (ScalarVar, borrow) need no action. */
@@ -15114,7 +15303,18 @@ Value *CodeGen::emitCall(const Node &n) {
         else
             ctxVal = ConstantInt::get(i32Ty, 0);
         callCtx_ = 0;
-        Value *retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
+        Value *retVal;
+        if (dynamicGlobAssign_) {
+            /* Prefer a runtime-installed sub (latest wins, captures kept).
+               Otherwise call the compile-time function with ctx as its
+               argument — do not push wantarray on that path. */
+            Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
+            Value *fnPtr = ConstantExpr::getPointerCast(fn, PointerType::getUnqual(ctx_));
+            retVal = callRT("perl_call_sub_maybe_dynamic",
+                            {nameStr, fnPtr, argsArr, ctxVal});
+        } else {
+            retVal = builder_.CreateCall(fn, {argsArr, ctxVal});
+        }
         callRT("perl_pop_call_frame", {});
         callRT("perl_array_free", {argsArr});
         return retVal;

@@ -5673,7 +5673,64 @@ void perl_register_method(const char *key, PerlSubFnCtx fn) {
     }
 }
 
+/* D192: latest-wins table for subs installed by *$name = sub {...}.
+   The method table appends and lookups return the FIRST match, so a
+   later perl_register_method cannot replace a compile-time sub. This
+   table stores the CODE PerlValue itself (cloned) so a closure's
+   captures stay alive after the assignment temporary is freed. */
+#define DYN_SUB_MAX 256
+static struct { char *key; PerlValue *code; } s_dyn_subs[DYN_SUB_MAX];
+static int s_dyn_sub_count = 0;
+
+static PerlValue *dyn_sub_lookup(const char *name) {
+    if (!name) return NULL;
+    for (int i = s_dyn_sub_count - 1; i >= 0; i--) {
+        if (s_dyn_subs[i].key && strcmp(s_dyn_subs[i].key, name) == 0)
+            return s_dyn_subs[i].code;
+    }
+    return NULL;
+}
+
+static void dyn_sub_install_one(const char *key, PerlValue *code) {
+    if (!key || !code || code->tag != PERL_CODE_REF) return;
+    for (int i = 0; i < s_dyn_sub_count; i++) {
+        if (s_dyn_subs[i].key && strcmp(s_dyn_subs[i].key, key) == 0) {
+            perl_free(s_dyn_subs[i].code);
+            s_dyn_subs[i].code = perl_clone(code);
+            return;
+        }
+    }
+    if (s_dyn_sub_count >= DYN_SUB_MAX) return;
+    s_dyn_subs[s_dyn_sub_count].key = strdup(key);
+    s_dyn_subs[s_dyn_sub_count].code = perl_clone(code);
+    s_dyn_sub_count++;
+}
+
+/* 1 and *out set when a dynamic sub is installed under name (or, when
+   name has no '::', under main::name). An undef return is still a hit —
+   it must not fall through to the compile-time sub. Pushes wantarray
+   because perl_call_code_ref reads the current context stack. */
+static int dyn_call_if(const char *name, PerlArray *args, int ctx, PerlValue **out) {
+    PerlValue *code = NULL;
+    char buf[512];
+    if (!name) return 0;
+    code = dyn_sub_lookup(name);
+    if (!code && !strstr(name, "::")) {
+        snprintf(buf, sizeof buf, "main::%s", name);
+        code = dyn_sub_lookup(buf);
+    }
+    if (!code && strncmp(name, "main::", 6) == 0)
+        code = dyn_sub_lookup(name + 6);
+    if (!code) return 0;
+    (void)perl_push_wantarray(ctx);
+    *out = perl_call_code_ref(code, args);
+    perl_pop_wantarray();
+    return 1;
+}
+
 PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx) {
+    PerlValue *dyn = NULL;
+    if (dyn_call_if(name, args, ctx, &dyn)) return dyn;
     if (!name) return perl_alloc_undef();
     for (int i = 0; i < s_method_count; i++) {
         if (strcmp(s_method_table[i].key, name) == 0) {
@@ -5698,6 +5755,13 @@ PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx) {
 PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ctx,
                                          const char *qualname, const char *file, int line) {
     if (name) {
+        PerlValue *dyn = NULL;
+        perl_push_call_frame(file, file, line);
+        if (dyn_call_if(name, args, ctx, &dyn)) {
+            perl_pop_call_frame();
+            return dyn;
+        }
+        perl_pop_call_frame();
         for (int i = 0; i < s_method_count; i++) {
             if (strcmp(s_method_table[i].key, name) == 0) {
                 PerlSubFnCtx fn = s_method_table[i].fn;
@@ -5850,6 +5914,17 @@ void perl_glob_copy(const char *dst, const char *src) {
     d->hash = s->hash;
     d->io = s->io;
     d->format = s->format;
+    /* STDOUT/STDERR/STDIN are not stored in the glob table; print to
+       those names calls perl_get_std*. `*ALIAS = *STDOUT` must see the
+       same handle. A scalar already holding a filehandle wins. */
+    if (!d->scalar || d->scalar->tag != PERL_FILEHANDLE) {
+        const char *b = src ? src : "";
+        const char *col = strstr(b, "::");
+        if (col) b = col + 2;
+        if (strcmp(b, "STDOUT") == 0) d->scalar = perl_get_stdout();
+        else if (strcmp(b, "STDERR") == 0) d->scalar = perl_get_stderr();
+        else if (strcmp(b, "STDIN") == 0) d->scalar = perl_get_stdin();
+    }
     if (d->array && d->array->refcount > 0) d->array->refcount++;
     if (d->hash && d->hash->refcount > 0) d->hash->refcount++;
 }
@@ -5930,6 +6005,11 @@ void perl_glob_assign(const char *name, PerlValue *rhs) {
         perl_glob_set_array(name, (PerlArray *)rhs->pval);
     else if (rhs->tag == PERL_REF_HASH)
         perl_glob_set_hash(name, (PerlHash *)rhs->pval);
+    else if (rhs->tag == PERL_FILEHANDLE) {
+        /* `*TH = $flag ? *STDOUT : *STDERR` evaluates to the standard
+           handle value (not a Typeglob node, so not perl_glob_copy). */
+        glob_get_or_create(name)->scalar = rhs;
+    }
     else if (rhs->tag == PERL_CODE_REF && rhs->pval) {
         PerlClosure *cl = (PerlClosure *)rhs->pval;
         if (cl->fn) {
@@ -5939,6 +6019,100 @@ void perl_glob_assign(const char *name, PerlValue *rhs) {
             perl_register_method(buf, cl->fn);
         }
     }
+}
+
+/* D192 helpers. Declared here, after perl_glob_assign, so the CODE
+   path can share dyn_sub_install_one defined above. */
+static void dyn_sub_install(const char *nm, PerlValue *rhs, const char *pkg) {
+    if (!nm || !rhs) return;
+    dyn_sub_install_one(nm, rhs);
+    if (!strstr(nm, "::")) {
+        char buf[512];
+        snprintf(buf, sizeof buf, "%s::%s", (pkg && pkg[0]) ? pkg : "main", nm);
+        dyn_sub_install_one(buf, rhs);
+    }
+}
+
+void perl_glob_assign_sv(PerlValue *namepv, PerlValue *rhs, const char *pkg) {
+    char *raw;
+    const char *nm;
+    if (!namepv || !rhs) return;
+    raw = perl_to_string_dup(namepv);
+    if (!raw) return;
+    nm = raw;
+    if (nm[0] == '*') nm++;
+    if (rhs->tag == PERL_CODE_REF)
+        dyn_sub_install(nm, rhs, pkg);
+    else
+        perl_glob_assign(nm, rhs);
+    free(raw);
+}
+
+PerlValue *perl_call_sub_maybe_dynamic(const char *name, PerlSubFnCtx direct,
+                                        PerlArray *args, int ctx) {
+    PerlValue *dyn = NULL;
+    if (dyn_call_if(name, args, ctx, &dyn)) return dyn;
+    if (!direct) return perl_alloc_undef();
+    return direct(args, ctx);
+}
+
+PerlValue *perl_code_ref_by_name(PerlValue *namepv) {
+    char *raw;
+    const char *nm;
+    PerlValue *code;
+    char buf[512];
+    int i;
+    if (!namepv) return perl_alloc_undef();
+    raw = perl_to_string_dup(namepv);
+    if (!raw) return perl_alloc_undef();
+    nm = raw[0] == '*' ? raw + 1 : raw;
+    code = dyn_sub_lookup(nm);
+    if (!code && !strstr(nm, "::")) {
+        snprintf(buf, sizeof buf, "main::%s", nm);
+        code = dyn_sub_lookup(buf);
+    }
+    if (!code && strncmp(nm, "main::", 6) == 0)
+        code = dyn_sub_lookup(nm + 6);
+    if (code) {
+        PerlValue *owned = perl_clone(code);
+        free(raw);
+        return owned;
+    }
+    /* Latest method-table entry (scan from the end). Named subs have
+       no closure captures in this model, so the fn pointer is enough. */
+    for (i = s_method_count - 1; i >= 0; i--) {
+        int hit = s_method_table[i].key &&
+                  (strcmp(s_method_table[i].key, nm) == 0);
+        if (!hit && !strstr(nm, "::")) {
+            snprintf(buf, sizeof buf, "main::%s", nm);
+            hit = s_method_table[i].key &&
+                  strcmp(s_method_table[i].key, buf) == 0;
+        }
+        if (hit && s_method_table[i].fn) {
+            PerlValue *ref = perl_make_code_ref(s_method_table[i].fn);
+            free(raw);
+            return ref;
+        }
+    }
+    free(raw);
+    return perl_alloc_undef();
+}
+
+PerlValue *perl_dyn_glob_name(PerlValue *namepv, const char *pkg) {
+    char *raw;
+    char buf[512];
+    const char *nm;
+    if (!namepv) return perl_alloc_string("*main::");
+    raw = perl_to_string_dup(namepv);
+    nm = raw ? raw : "";
+    if (nm[0] == '*') nm++;
+    if (strstr(nm, "::"))
+        snprintf(buf, sizeof buf, "*%s", nm);
+    else
+        snprintf(buf, sizeof buf, "*%s::%s",
+                 (pkg && pkg[0]) ? pkg : "main", nm);
+    free(raw);
+    return perl_alloc_string(buf);
 }
 
 PerlValue *perl_get_or_create_global_scalar(const char *key) {
