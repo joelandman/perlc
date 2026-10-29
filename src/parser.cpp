@@ -880,6 +880,8 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_PUSH))   { return parseModifier(parsePush(),        line); }
     if (check(TK::KW_UNSHIFT)){ return parseModifier(parseUnshift(),     line); }
     if (check(TK::KW_RETURN)) { return parseModifier(parseReturn(),      line); }
+    if (check(TK::KW_FORMAT)) { return parseModifier(parseFormat(),      line); }
+    if (check(TK::KW_WRITE))  { return parseModifier(parseWrite(),       line); }
     if (check(TK::KW_LAST)) {
         advance();
         return parseModifier(parseLastNextRedoBody(NK::Last, line), line);
@@ -6743,4 +6745,128 @@ NodeList Parser::parseArgList() {
     }
     consume(TK::RPAREN, ")");
     return args;
+}
+
+/* ── format / write ─────────────────────────────────────────────────────── */
+
+/* Parse a picture line from the token stream.  Returns a node where:
+ *   sval = picture line text (reconstructed from tokens)
+ *   ival = number of format fields found
+ *   args = empty (field info stored in sval)
+ *
+ * Reads tokens until the line number changes or we hit a terminator. */
+NodePtr Parser::parsePictureLine() {
+    if (check(TK::EOF_TOK) || check(TK::DOT)) return nullptr;
+    int startLine = cur().line;
+    std::string picText;
+    bool first = true;
+    while (!check(TK::EOF_TOK) && !check(TK::DOT) && cur().line == startLine) {
+        if (!first) picText += " ";
+        picText += cur().text;
+        advance();
+        first = false;
+    }
+    if (picText.empty()) return nullptr;
+    auto n = std::make_unique<Node>();
+    n->kind = NK::FlatBlock;   /* used as a container */
+    n->sval = std::move(picText);
+    n->line = startLine;
+    return n;
+}
+
+/* Parse a variable line: comma-separated Perl expressions on one line. */
+NodeList Parser::parseVariableLine() {
+    if (check(TK::EOF_TOK) || check(TK::DOT)) return {};
+    NodeList vars;
+    int startLine = cur().line;
+    while (!check(TK::EOF_TOK) && !check(TK::DOT) && cur().line == startLine) {
+        /* skip leading commas */
+        if (check(TK::COMMA)) { advance(); continue; }
+        if (!vars.empty() && !match(TK::COMMA)) break;
+        /* Parse a simple scalar variable: $name */
+        if (check(TK::SCALAR)) {
+            advance(); /* skip $ */
+            if (check(TK::IDENT)) {
+                std::string nm = cur().text; advance();
+                auto n = std::make_unique<Node>(); n->kind = NK::ScalarVar;
+                n->name = "$" + nm; n->line = startLine;
+                vars.push_back(std::move(n));
+            } else {
+                /* bare $ — treat as undef */
+                vars.push_back(makeStr("", startLine));
+            }
+        } else {
+            /* For more complex expressions, try parseLowNot but stop at line boundary */
+            size_t savedPos = pos_;
+            try {
+                auto expr = parseLowNot();
+                /* Check if we stayed on the same line */
+                if (cur().line == startLine) {
+                    vars.push_back(std::move(expr));
+                } else {
+                    /* Backtrack — we went past the line */
+                    pos_ = savedPos;
+                    break;
+                }
+            } catch (...) {
+                /* Backtrack on error */
+                pos_ = savedPos;
+                break;
+            }
+        }
+    }
+    return vars;
+}
+
+NodePtr Parser::parseFormat() {
+    int line = cur().line;
+    consume(TK::KW_FORMAT);
+    std::string name = cur().text; advance();
+    consume(TK::ASSIGN);
+
+    auto n = std::make_unique<Node>();
+    n->kind = NK::FormatDecl;
+    n->name = std::move(name);
+    n->line = line;
+
+    /* Read alternating picture-line / variable-line pairs until '.' */
+    while (!check(TK::DOT) && !check(TK::EOF_TOK)) {
+        auto picLine = parsePictureLine();
+        if (!picLine || picLine->sval.empty()) break;
+
+        auto vars = parseVariableLine();
+
+        /* Store each field as a child: sval=picture text, args=variable exprs */
+        auto field = std::make_unique<Node>();
+        field->kind = NK::FlatBlock;
+        field->sval = std::move(picLine->sval);
+        field->args = std::move(vars);
+        field->line = picLine->line;
+        n->args.push_back(std::move(field));
+    }
+    consume(TK::DOT);
+    return n;
+}
+
+NodePtr Parser::parseWrite() {
+    int line = cur().line;
+    consume(TK::KW_WRITE);
+
+    auto n = std::make_unique<Node>();
+    n->kind = NK::WriteStmt;
+    n->line = line;
+
+    /* write NAME;  – optional target format name (bareword) or filehandle */
+    if (check(TK::IDENT)) {
+        std::string ident = cur().text;
+        /* For write, a bareword is the FORMAT NAME (not a filehandle).
+           Real Perl: `write FOO` uses format FOO. `write STDOUT` uses
+           format STDOUT (which also happens to be a filehandle name). */
+        n->name = ident; advance();
+    } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
+        /* write $fh — scalar variable as format name */
+        n->left = parseLowNot();
+    }
+    match(TK::SEMI);
+    return n;
 }

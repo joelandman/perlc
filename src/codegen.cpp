@@ -257,6 +257,133 @@ static std::string definedSubName(llvm::Module &mod, const std::string &name) {
     return name;
 }
 
+/* ── format / write helpers ─────────────────────────────────────────────── */
+
+/* Extract a variable name from an expression node.  Handles:
+ *   ScalarVar  → name without leading '$'
+ *   BinOp "."  → left side of a concat (recurse)
+ *   Returns "" if no variable name can be extracted. */
+static std::string extractVarName(const Node &n) {
+    if (n.kind == NK::ScalarVar) {
+        std::string nm = n.name;
+        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        return nm;
+    }
+    if (n.kind == NK::BinOp && n.sval == ".") {
+        /* concat: try left side first */
+        std::string nm = extractVarName(*n.left);
+        if (!nm.empty()) return nm;
+        return extractVarName(*n.right);
+    }
+    if (n.kind == NK::DerefScalar) {
+        return extractVarName(*n.left);
+    }
+    if (n.kind == NK::Call) {
+        /* function call — try to find a variable in the args */
+        for (auto &a : n.args) {
+            std::string nm = extractVarName(*a);
+            if (!nm.empty()) return nm;
+        }
+    }
+    if (n.kind == NK::InterpolatedStr) {
+        /* interpolated string — find first variable */
+        for (auto &a : n.args) {
+            std::string nm = extractVarName(*a);
+            if (!nm.empty()) return nm;
+        }
+    }
+    return "";
+}
+
+/* Parse a picture line text and produce:
+ *   pair<format_string, vector<expression_nodes>>
+ *
+ * Recognized specifiers (in token-reconstructed text):
+ *   @ <<...  → %-Ns (left-aligned, N = count of '<' chars)
+ *   @ | |... → %s     (centered — simplified to left-align for MVP)
+ *   ^ <<...  → %s     (multi-line — simplified for MVP)
+ *   ~ ~      → %s     (scalar expression — argument follows)
+ *
+ * The `varExprs` list provides the Perl expressions that supply values
+ * for each field, in order.  Nodes are cloned (not moved) so the
+ * original list stays intact for later reuse. */
+static std::pair<std::string, std::vector<NodePtr>>
+parsePictureLine(const std::string &picText, const NodeList &varExprs, int line) {
+    (void)line; /* unused */
+    std::string fmtStr;
+    std::vector<NodePtr> argExprs;
+
+    /* Count fields by looking for @ and ^ markers */
+    int fieldIdx = 0;
+    size_t i = 0;
+    while (i < picText.size()) {
+        /* Skip whitespace */
+        if (isspace((unsigned char)picText[i])) { i++; continue; }
+
+        char c = picText[i];
+
+        if (c == '@' || c == '^') {
+            char type = c;
+            i++; /* skip @ or ^ */
+
+            /* Count width characters (< or |) */
+            int width = 0;
+            bool hasLt = false, hasPipe = false;
+            while (i < picText.size() &&
+                   (picText[i] == '<' || picText[i] == '|' ||
+                    picText[i] == ' ' || picText[i] == '\t')) {
+                if (picText[i] == '<') { width++; hasLt = true; }
+                else if (picText[i] == '|') { width++; hasPipe = true; }
+                i++;
+            }
+
+            if (hasLt) {
+                /* LEFT_ALIGN or MULTI_LINE */
+                if (type == '^') {
+                    /* Multi-line: for MVP, just print the string */
+                    fmtStr += "%s";
+                } else {
+                    /* Left-aligned string field */
+                    fmtStr += "%-";
+                    fmtStr += std::to_string(width);
+                    fmtStr += "s";
+                }
+            } else if (hasPipe) {
+                /* Centered — simplified to left-align for MVP */
+                fmtStr += "%s";
+            } else {
+                fmtStr += "%s";
+            }
+
+            fmtStr += " ";  /* separator between fields */
+
+            if (fieldIdx < (int)varExprs.size()) {
+                argExprs.push_back(varExprs[fieldIdx]->clone());
+            }
+            fieldIdx++;
+        } else if (c == '~') {
+            /* SCALAR_EXPR: ~ ~ */
+            i++; /* skip first ~ */
+            if (i < picText.size() && picText[i] == '~') i++; /* skip second ~ */
+
+            fmtStr += "%s";
+            fmtStr += " ";
+
+            if (fieldIdx < (int)varExprs.size()) {
+                argExprs.push_back(varExprs[fieldIdx]->clone());
+            }
+            fieldIdx++;
+        } else {
+            i++; /* skip other characters */
+        }
+    }
+
+    /* Add newline at end */
+    fmtStr += "\n";
+
+    return {std::move(fmtStr), std::move(argExprs)};
+}
+
 /* ── construction ────────────────────────────────────────────────────────── */
 
 CodeGen::CodeGen(bool debug, int optLevel)
@@ -1074,6 +1201,11 @@ void CodeGen::popScope() {
 }
 
 Value *CodeGen::lookupVar(const std::string &nm) {
+    /* Try both with and without sigil prefix ($/@/%). Variables are stored
+       without sigil (see declareVar), but callers sometimes pass with sigil. */
+    std::string bare = nm;
+    if (!bare.empty() && (bare[0] == '$' || bare[0] == '@' || bare[0] == '%'))
+        bare = bare.substr(1);
     for (int i = (int)scopes_.size() - 1; i >= 0; i--) {
         auto it = scopes_[i].find(nm);
         if (it != scopes_[i].end()) return it->second;
@@ -1092,6 +1224,11 @@ Value *CodeGen::lookupVar(const std::string &nm) {
     }
     auto git = fileScalarGlobals_.find(nm);
     if (git != fileScalarGlobals_.end()) return git->second;
+    /* Try bare name too (sigil-stripped) */
+    if (bare != nm) {
+        auto git2 = fileScalarGlobals_.find(bare);
+        if (git2 != fileScalarGlobals_.end()) return git2->second;
+    }
     return nullptr;
 }
 
@@ -6806,6 +6943,65 @@ void CodeGen::emitStmt(const Node &n) {
             callRT("perl_printf_fh", {fh, fmt, av});
         } else {
             callRT("perl_printf", {fmt, av});
+        }
+        break;
+    }
+
+    case NK::FormatDecl: {
+        /* Register format for write calls to look up.
+         * Do NOT emit inline code here — the body is emitted by WriteStmt. */
+        for (auto &field : n.args) {
+            FormatField rf;
+            rf.pictureText = field->sval;
+            for (auto &ve : field->args)
+                rf.varExprs.push_back(ve->clone());
+            formatRegistry_[n.name].push_back(std::move(rf));
+        }
+        break;
+    }
+
+    case NK::WriteStmt: {
+        /* Source-to-source: emit format body inline.
+         * n.name = optional target format name (for known FHs like STDOUT)
+         * n.left = format name expression (for write EXPR where EXPR is a bareword)
+         * Look up format in registry to get variable expressions. */
+        std::string fmtName;
+        if (!n.name.empty()) {
+            fmtName = n.name;
+        } else if (n.left) {
+            /* Extract format name from the left expression.
+             * For bareword format names (write F), extract the identifier. */
+            if (n.left->kind == NK::ScalarVar) {
+                fmtName = n.left->name;
+                if (!fmtName.empty() && fmtName[0] == '$') fmtName = fmtName.substr(1);
+            } else if (n.left->kind == NK::StringLit) {
+                fmtName = n.left->sval;
+            }
+            /* For other expression types (e.g. $fh), we'd need runtime lookup
+             * which is beyond MVP — fall back to STDOUT. */
+            if (fmtName.empty()) fmtName = "STDOUT";
+        } else {
+            fmtName = "STDOUT";
+        }
+        auto it = formatRegistry_.find(fmtName);
+        if (it == formatRegistry_.end()) break;
+
+        for (auto &ff : it->second) {
+            std::string picText = ff.pictureText;
+            auto [fmtStr, argExprs] = parsePictureLine(picText, ff.varExprs, 0);
+
+            if (!fmtStr.empty()) {
+                Value *fmtVal = builder_.CreateGlobalStringPtr(fmtStr);
+                Value *av = callRT("perl_array_new", {});
+                for (auto &ae : argExprs) {
+                    Value *v = emitExpr(*ae);
+                    callRT("perl_array_push_list_or_scalar", {av, v});
+                }
+                Value *sprintfResult = callRT("perl_sprintf", {fmtVal, av});
+                callRT("perl_print", {sprintfResult});
+                callRT("perl_print_ors", {});
+                callRT("perl_array_free", {av});
+            }
         }
         break;
     }

@@ -105,6 +105,9 @@ static inline PerlValue *pv_alloc(void) {
     if (__builtin_expect(pv_freelist_ != NULL, 1)) {
         PerlValue *v  = pv_freelist_;
         pv_freelist_  = (PerlValue *)v->pval;
+        /* Zero out the reused slot to prevent stale data (e.g. freed
+           blessed_class pointers) from leaking into the new allocation. */
+        memset(v, 0, sizeof(*v));
         return v;
     }
     /* Cold miss: allocate a contiguous slab, return first entry, link rest. */
@@ -1401,6 +1404,9 @@ PerlValue *perl_alloc_string(const char *s) {
 
 PerlValue *perl_clone(const PerlValue *src) {
     if (!src) return perl_alloc_undef();
+    /* Sanity: if tag is bogus, fall back to undef instead of corrupting memory */
+    if ((int)src->tag < PERL_UNDEF || (int)src->tag > PERL_XS_PTR)
+        return perl_alloc_undef();
     if (src->tag == PERL_STRING) {
         PerlValue *v = perl_alloc_string_len(src->sval, src->slen);
         v->flags |= (src->flags & PV_FLAG_UTF8); /* D90 */
@@ -2049,40 +2055,45 @@ char *perl_to_string_dup(const PerlValue *v) {
     /* D97: check for "" (stringification) overload on blessed objects.
        This is NOT in perl_to_string (which is __attribute__((pure)) and
        can't call methods); it's handled here where we can safely dispatch. */
-    if (v && v->blessed_class) {
-        const char *method = perl_find_overload(v, "\"\"");
-        if (method) {
-            /* D97: built-in C function overload (Math::BigInt) */
-            if (strcmp(method, "perl_bigint_ovl_str") == 0) {
-                PerlValue *r = perl_bigint_ovl_str((PerlValue*)v);
-                char *s = perl_to_string_dup(r);
-                perl_free(r);
-                return s;
-            }
-            if (strcmp(method, "perl_tp_ovl_str") == 0) {
-                PerlValue *r = perl_tp_ovl_str((PerlValue*)v);
-                char *s = perl_to_string_dup(r);
-                perl_free(r);
-                return s;
-            }
-            if (strcmp(method, "perl_ver_ovl_str") == 0) {
-                PerlValue *r = perl_ver_ovl_str((PerlValue*)v);
-                char *s = perl_to_string_dup(r);
-                perl_free(r);
-                return s;
-            }
-            PerlArray *args = perl_array_new();
-            PerlValue *clone = perl_clone((PerlValue*)v);
-            perl_array_push(args, clone);
-            int saved = perl_push_wantarray(0);
-            PerlValue *result = perl_call_named_sub(method, args, 0);
-            perl_pop_wantarray();
-            perl_free(clone);
-            perl_array_free(args);
-            if (result) {
-                char *s = perl_to_string_dup(result);
-                perl_free(result);
-                return s;
+    if (v && v->blessed_class && v->tag != PERL_STRING && v->tag != PERL_UNDEF) {
+        /* Also skip if tag is bogus — a corrupted PV would have a garbage tag
+           that passes the above check but isn't a real blessed object. */
+        int t = (int)v->tag;
+        if (t >= 0 && t <= 19) {
+            const char *method = perl_find_overload(v, "\"\"");
+            if (method) {
+                /* D97: built-in C function overload (Math::BigInt) */
+                if (strcmp(method, "perl_bigint_ovl_str") == 0) {
+                    PerlValue *r = perl_bigint_ovl_str((PerlValue*)v);
+                    char *s = perl_to_string_dup(r);
+                    perl_free(r);
+                    return s;
+                }
+                if (strcmp(method, "perl_tp_ovl_str") == 0) {
+                    PerlValue *r = perl_tp_ovl_str((PerlValue*)v);
+                    char *s = perl_to_string_dup(r);
+                    perl_free(r);
+                    return s;
+                }
+                if (strcmp(method, "perl_ver_ovl_str") == 0) {
+                    PerlValue *r = perl_ver_ovl_str((PerlValue*)v);
+                    char *s = perl_to_string_dup(r);
+                    perl_free(r);
+                    return s;
+                }
+                PerlArray *args = perl_array_new();
+                PerlValue *clone = perl_clone((PerlValue*)v);
+                perl_array_push(args, clone);
+                int saved = perl_push_wantarray(0);
+                PerlValue *result = perl_call_named_sub(method, args, 0);
+                perl_pop_wantarray();
+                perl_free(clone);
+                perl_array_free(args);
+                if (result) {
+                    char *s = perl_to_string_dup(result);
+                    perl_free(result);
+                    return s;
+                }
             }
         }
     }
@@ -5590,7 +5601,10 @@ static const char *perl_find_overload(const PerlValue *obj, const char *op) {
     const char *cls = obj->blessed_class;
     for (int depth = 0; depth < 32; depth++) {
         for (int i = 0; i < s_overload_count; i++) {
-            if (strcmp(s_overload_table[i].class_name, cls) == 0 &&
+            const char *tbl_cls = s_overload_table[i].class_name;
+            /* Safety: skip if tbl_cls or cls is NULL or looks corrupted */
+            if (!tbl_cls || !cls || tbl_cls[0] == '\0' || cls[0] == '\0') continue;
+            if (strcmp(tbl_cls, cls) == 0 &&
                 strcmp(s_overload_table[i].op, op) == 0)
                 return s_overload_table[i].method;
         }

@@ -282,6 +282,16 @@ private:
     std::unordered_map<std::string, InlineSub> inlineSubs_;
     llvm::Value *tryEmitInline(const Node &callNode);  /* returns nullptr if not inlineable */
 
+    /* Format/write support: registry of format declarations keyed by name.
+       Each entry maps format_name → list of field nodes (each: sval=picture,
+       args=variable exprs). Populated during FormatDecl emission, consumed
+       by WriteStmt to look up variable expressions. */
+    struct FormatField {
+        std::string pictureText;
+        NodeList varExprs;
+    };
+    std::unordered_map<std::string, std::vector<FormatField>> formatRegistry_;
+
     /* runtime function declarations */
     std::unordered_map<std::string, llvm::Function *> rtFuncs_;
 

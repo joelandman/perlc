@@ -127,6 +127,10 @@ private:
     NodePtr parsePush();
     NodePtr parseUnshift();
     NodePtr parseReturn();
+    NodePtr parseFormat();
+    NodePtr parseWrite();
+    NodePtr parsePictureLine();
+    NodeList parseVariableLine();
 
     bool    isModifier() const;
     NodePtr parseModifier(NodePtr stmt, int line);

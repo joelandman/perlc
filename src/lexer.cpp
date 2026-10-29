@@ -71,6 +71,7 @@ static const std::unordered_map<std::string, TK> KEYWORDS = {
     {"none",     TK::KW_NONE},      {"uniq",   TK::KW_UNIQ},   {"reduce", TK::KW_REDUCE},
     {"tie",    TK::KW_TIE},     {"untie",    TK::KW_UNTIE},
     {"pack",   TK::KW_PACK},    {"unpack",   TK::KW_UNPACK},
+    {"format", TK::KW_FORMAT},  {"write",    TK::KW_WRITE},
 };
 
 /* D128: process-wide registry of source-file names. Token::file points at

@@ -53,6 +53,8 @@ enum class TK {
     KW_SUM, KW_MIN, KW_MAX, KW_FIRST, KW_ANY, KW_ALL, KW_NONE, KW_UNIQ, KW_REDUCE,
     /* pack/unpack */
     KW_PACK, KW_UNPACK,
+    /* format / write */
+    KW_FORMAT, KW_WRITE,
     SPACESHIP,    /* <=> */
     FILETEST,  /* -e/-f/-d/-r/-w/-x/-z/-s/-l/-p – text = flag char */
     QWORDS,    /* qw(...) – text = space-separated words */

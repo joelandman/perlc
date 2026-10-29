@@ -169,6 +169,13 @@ enum class NK {
     /* D97: use overload — args = flat list of (op_str, method_name) pairs;
        name = current package (where the overload is being declared) */
     OverloadStmt,
+    /* format / write */
+    FormatDecl,   /* format NAME = … .          – name=format_name,
+                                  args=[FieldNode, …] each:
+                                    sval=picture_line_text
+                                    args=[var_expr, …]           */
+    WriteStmt,    /* write; / write NAME;       – name=optional target FH
+                                  args=[var_expr, …] (from format's var line) */
     /* typeglob */
     Typeglob,     /* *name            – name=glob name                          */
 };
