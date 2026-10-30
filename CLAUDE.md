@@ -1288,7 +1288,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
  | Exporter tag validation + XS constants (W16) | **FIXED** — Fcntl/POSIX constants and tag validation work. | Verified: `use Fcntl qw(:seek); print SEEK_SET` works. |
  | `sub f { return (32); }` returns empty (W31) | **FIXED** — smoke tests pass, output matches real Perl. | `return (32)` now correctly yields 32. Verified: scalar, list, and element access all produce correct results. |
  | `use constant B => A + 1` (W19) | **FIXED** — constant expression RHS now correctly resolves bareword constants. | Verified: `use constant A => 1; use constant B => A + 1;` produces `A=1 B=2`. |
- | `${"opt_$x"}` symbolic deref (W22) | **OPEN** — symbolic scalar dereference by computed name not implemented. | `$name = "x"; print ${$name}` prints `${x}` instead of the value. |
+ | `${"opt_$x"}` symbolic deref (W22) | **FIXED** — symbolic scalar dereference by computed name works. | Verified: `${$name}` where `$name = "x"` correctly prints the value of `$x`. `${"opt_$first"}` pattern (Getopt::Std) works. |
  | `in-key auto-quote` swallows keywords (W23) | **FIXED** — hash key expressions with builtin keywords work. | Verified: `$h{lc $k}` correctly evaluates the expression as a key. |
  | `local *_ = \join(...)` (W29) | **FIXED** — local typeglob assignment works. | Verified: `local *$_ = \join(...)` correctly localizes and restores `$_`. |
  | `eval "sub $name() { ... }"` (W30) | **FIXED** — runtime sub-defining string eval works. | Verified: `eval "sub MyConst() { 42 }"; MyConst()` returns 42. |
