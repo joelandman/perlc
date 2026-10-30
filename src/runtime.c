@@ -18122,6 +18122,11 @@ void perl_cleanup(void) {
         fprintf(stderr, "perlc PV leak: total %d unfreed PVs (compile with -DPERL_ALLOC_DEBUG)\n", leak_count);
     }
 #endif
+    /* Flush selected output filehandle before exit */
+    if (s_selected_inited && s_selected_fh.tag == PERL_FILEHANDLE && s_selected_fh.pval)
+        fflush((FILE *)s_selected_fh.pval);
+    else
+        fflush(stdout);
 }
 
 /* ── DBI/SQLite integration ────────────────────────────────────────────────── */

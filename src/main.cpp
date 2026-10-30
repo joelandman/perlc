@@ -1525,7 +1525,7 @@ int main(int argc, char **argv) {
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
     bool doLib = false, evalLib = false;
-    int optLevel = 2;
+    int optLevel = 0;  /* O1+ hangs clang-18 on our IR; disabled PM in codegen too */
 
     /* D113: PERL5LIB (colon-separated) is honored the same way real perl
        honors it — prepended to the module search path. */

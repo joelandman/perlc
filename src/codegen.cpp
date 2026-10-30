@@ -1210,6 +1210,13 @@ Value *CodeGen::lookupVar(const std::string &nm) {
         auto it = scopes_[i].find(nm);
         if (it != scopes_[i].end()) return it->second;
     }
+    /* Also try bare name in scopes (declareVar stores without sigil) */
+    if (bare != nm) {
+        for (int i = (int)scopes_.size() - 1; i >= 0; i--) {
+            auto it = scopes_[i].find(bare);
+            if (it != scopes_[i].end()) return it->second;
+        }
+    }
     /* D112: a free variable reference inside a sub (no local `my` of its
        own) first tries ITS OWN package's qualified global before the bare
        name. Two different packages' same-named file-scope `my` (or `our`)
@@ -6991,13 +6998,15 @@ void CodeGen::emitStmt(const Node &n) {
             auto [fmtStr, argExprs] = parsePictureLine(picText, ff.varExprs, 0);
 
             if (!fmtStr.empty()) {
-                Value *fmtVal = builder_.CreateGlobalStringPtr(fmtStr);
+                Value *fmtPV = callRT("perl_alloc_string_len",
+                    {builder_.CreateGlobalStringPtr(fmtStr),
+                     ConstantInt::get(Type::getInt64Ty(ctx_), fmtStr.size())});
                 Value *av = callRT("perl_array_new", {});
                 for (auto &ae : argExprs) {
                     Value *v = emitExpr(*ae);
                     callRT("perl_array_push_list_or_scalar", {av, v});
                 }
-                Value *sprintfResult = callRT("perl_sprintf", {fmtVal, av});
+                Value *sprintfResult = callRT("perl_sprintf", {fmtPV, av});
                 callRT("perl_print", {sprintfResult});
                 callRT("perl_print_ors", {});
                 callRT("perl_array_free", {av});
@@ -15644,31 +15653,14 @@ Value *CodeGen::emitCall(const Node &n) {
 /* ── optimization ────────────────────────────────────────────────────────── */
 
 void CodeGen::runOptimization() {
+    // Temporarily disabled: new PM hangs on complex IR (LLVM 18)
+    // TODO: investigate and fix the new PM hang
     if (optLevel_ <= 0) return;
-
     if (verifyModule(*mod_, &errs())) {
         errs() << "IR verification failed before optimization\n";
         return;
     }
-
-    PassBuilder PB;
-    LoopAnalysisManager LAM;
-    FunctionAnalysisManager FAM;
-    CGSCCAnalysisManager CGAM;
-    ModuleAnalysisManager MAM;
-
-    PB.registerModuleAnalyses(MAM);
-    PB.registerCGSCCAnalyses(CGAM);
-    PB.registerFunctionAnalyses(FAM);
-    PB.registerLoopAnalyses(LAM);
-    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
-    OptimizationLevel level = OptimizationLevel::O1;
-    if (optLevel_ >= 2) level = OptimizationLevel::O2;
-    if (optLevel_ >= 3) level = OptimizationLevel::O3;
-
-    ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(level);
-    MPM.run(*mod_, MAM);
+    // Skip optimization - new PM hangs, legacy PM headers not available in LLVM 18
 }
 
 /* ── output ──────────────────────────────────────────────────────────────── */
