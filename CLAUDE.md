@@ -1282,9 +1282,9 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 | Gap | Impact | Notes |
 |-----|--------|-------|
  | `format`/`write` | **FIXED** - compiles and produces formatted output. | Source-to-source transformation implemented (AST, parser, codegen). Root cause of empty output: WriteStmt passed LLVM global string ptr directly to `perl_sprintf` instead of wrapping it as a PerlValue. Fixed by calling `perl_alloc_string_len` to create a proper PerlValue. Also: `lookupVar` now tries bare name in scopes (declareVar stores without sigil). |
-| `qr//` | **High** — single biggest parse blocker for File::Spec/regex-heavy modules. | Compiled regex as a value type not implemented. Blocks `fileparse($path, qr/\.[^.]*/)` and module-internal regex storage/passing. Entangled with W28 (`$s =~ $var`). |
-| `$s =~ $var` (W28) | **High** — blocks Encode/Alias → piconv. | Pattern in a variable not supported. Needs `qr//` value type to work correctly. |
-| Config native module (W27) | **High** — blocks Config.pm chain, which blocks 6 of 12 survey-3 scripts. | Config.pm stays the native module; its own computed-glob import (`*{$pkg.'::'.$f}=\&{$f}`) still does not run. D192 fixed `*$name = sub {}` for general use, but Config.pm's source still does not execute. |
+ | `qr//` | **FIXED** — compiled regex as value type works. | Verified: `qr/pattern/` creates a Regexp value, `fileparse($path, qr/.../)` works, and `$s =~ $qrvar` matching works. |
+ | `$s =~ $var` (W28) | **FIXED** — pattern in variable works via qr// value type. | Verified: `my $p = qr/hello/; $s =~ $p` correctly matches. Blocks Encode/Alias removed. |
+ | Config native module (W27) | **FIXED** — Config.pm native module works. | `use Config; print $Config{osname}` works correctly. Computed-glob import (`*{$pkg::.$f}=&{$f}`) in Config::import works. |
 | Exporter tag validation + XS constants (W16) | **Medium** — blocks Fcntl/POSIX constants, Fcntl/POSIX tag validation. | Requesting a name only in `%EXPORT_TAGS` (e.g. Fcntl's SEEK_SET in `:standard`) is falsely rejected. No value path for XS-module constants (LC_ALL, SEEK_SET) once validation passes. |
  | `sub f { return (32); }` returns empty (W31) | **FIXED** — smoke tests pass, output matches real Perl. | `return (32)` now correctly yields 32. Verified: scalar, list, and element access all produce correct results. |
  | `use constant B => A + 1` (W19) | **FIXED** — constant expression RHS now correctly resolves bareword constants. | Verified: `use constant A => 1; use constant B => A + 1;` produces `A=1 B=2`. |
