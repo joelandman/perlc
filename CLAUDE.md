@@ -1279,14 +1279,25 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 
 **Known remaining gaps (not defects in implemented code):**
 
-| Gap | Notes |
-|-----|-------|
-| Typeglob `{FORMAT}` | `*alias = \&sub`, stringify, `*a = \$x`/`\@a`/`\%h`, bare `open LOG` / `print LOG`, `*BAREWORD{IO}` (D177), and `*{EXPR}{IO}` (D183) all work. Computed `*$name = sub {}` / `*{$expr} = \&{expr}` (D192, 2026-10-15) installs or replaces a sub at runtime, including closures. Only the `{IO}` slot is modeled. `{FORMAT}`, `format`/`write`, and `*$x{IO}` are not implemented. A static `*NAME = \&sub` does not override a direct LLVM call unless the program also has a computed glob assign. |
-| Full XS | DynaLoader-compatible FFI: `dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load` (perlc `.so`/`.pl` modules + raw C via `XS::call` sig dispatch). Real perlguts XSUBs (SV* ABI) not implemented |
-| `pidigits.pl` vs perl | PASS — was `undef $s` not clearing the accumulator, not mini-gmp. |
-| Complex CPAN | Parser may fail on advanced `our`/OO. POD (`=pod`…`=cut`) is skipped. |
-| eval/`do` at runtime | Needs `perlc` + `clang-18` on the target (`--eval-lib` / `--do-lib`). |
-| Auto-parallel `map`/`foreach` | Deferred 2026-09-22. Pthreads + known `map` length exist; no dependence analyzer. Gated pure-`$_` map is the only safe slice. See TESTS.md → "Future: auto-parallel `map` / counted loops". |
+| Gap | Impact | Notes |
+|-----|--------|-------|
+| `format`/`write` | **Medium** — ucfq compiles but produces no output; `perlbug`/`perlthanks` blocked. | Source-to-source transformation implemented (AST, parser, codegen). Picture-line parsing works. Format registers in `formatRegistry_`, WriteStmt emits inline `sprintf`+`print`. **Remaining:** format output is empty — `perl_print` receives valid pointer but produces no output. Root cause: likely `perl_promote_ref_array` or value corruption in the format code path. Fix needed in codegen emit or runtime `perl_print`/`perl_sprintf` interaction. |
+| `qr//` | **High** — single biggest parse blocker for File::Spec/regex-heavy modules. | Compiled regex as a value type not implemented. Blocks `fileparse($path, qr/\.[^.]*/)` and module-internal regex storage/passing. Entangled with W28 (`$s =~ $var`). |
+| `$s =~ $var` (W28) | **High** — blocks Encode/Alias → piconv. | Pattern in a variable not supported. Needs `qr//` value type to work correctly. |
+| Config native module (W27) | **High** — blocks Config.pm chain, which blocks 6 of 12 survey-3 scripts. | Config.pm stays the native module; its own computed-glob import (`*{$pkg.'::'.$f}=\&{$f}`) still does not run. D192 fixed `*$name = sub {}` for general use, but Config.pm's source still does not execute. |
+| Exporter tag validation + XS constants (W16) | **Medium** — blocks Fcntl/POSIX constants, Fcntl/POSIX tag validation. | Requesting a name only in `%EXPORT_TAGS` (e.g. Fcntl's SEEK_SET in `:standard`) is falsely rejected. No value path for XS-module constants (LC_ALL, SEEK_SET) once validation passes. |
+| `sub f { return (32); }` returns empty (W31) | **Medium** — breaks `use constant D => (32)`, affects any sub returning a parenthesized list. | `return (32)` yields empty string instead of 32. Impacts `use constant` definitions and any code relying on parenthesized return values. |
+| `use constant B => A + 1` (W19) | **Medium** — fresh-Parser constant injection lacks constMap. | A bareword prior constant misparses when used in a constant expression RHS. |
+| `${"opt_$x"}` symbolic deref (W22) | **Medium** — blocks Getopt/Std.pm → geteltorito. | Symbolic scalar dereference by computed name not implemented. |
+| `in-key auto-quote` swallows keywords (W23) | **Medium** — blocks Debconf::ConfModule, Encode::MIME::Name. | `$h{lc $k}`-style expressions in hash keys get over-generalized by D136; builtin keywords swallowed as bareword strings. |
+| `local *_ = \join(...)` (W29) | **Medium** — blocks Text::ParseWords → update-language. | Local assignment to typeglob not implemented. |
+| `eval "sub $name() { ... }"` (W30) | **Medium** — blocks Errno.pm, File::Path. | Runtime sub-defining string eval not implemented. |
+| `*$x{IO}` not parsed | **Low** — symbolic/deref-glob IO slot. | `*{EXPR}{IO}` form (lexical filehandle variable) not parsed. Only bareword `*NAME{IO}` (D177) works. |
+| Full XS (perlguts XSUBs) | **Low** — DynaLoader FFI works; only real perlguts XSUBs blocked. | DynaLoader-compatible FFI (`dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load`) implemented. Loading genuine perlguts XSUB modules compiled against real perl headers requires SV-ABI emulation layer. |
+| Complex CPAN OO / advanced `our` | **Low** — parser fails on some advanced module patterns. | Blocks `-pm`-installed dependencies with nontrivial internals (e.g. `Debian::Debhelper::Dh_Lib.pm`). |
+| `eval`/`do` at runtime | **Low** — needs `perlc` + `clang-18` on target. | Dynamic `eval EXPR` and `do FILE` require re-invoking `perlc` + `clang-18` on the target machine (`--eval-lib` / `--do-lib`). |
+| Auto-parallel `map`/`foreach` | **Deferred** — no dependence analyzer. | Pthreads + known `map` length exist; gated pure-`$_` map is the only safe slice. |
+| `pidigits.pl` vs perl | **PASS** — was `undef $s` not clearing accumulator, not mini-gmp. | No remaining gap. |
 
 ## Build & test
 
