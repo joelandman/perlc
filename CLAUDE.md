@@ -1281,7 +1281,7 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
 
 | Gap | Impact | Notes |
 |-----|--------|-------|
-| `format`/`write` | **Medium** — ucfq compiles but produces no output; `perlbug`/`perlthanks` blocked. | Source-to-source transformation implemented (AST, parser, codegen). Picture-line parsing works. Format registers in `formatRegistry_`, WriteStmt emits inline `sprintf`+`print`. **Remaining:** format output is empty — `perl_print` receives valid pointer but produces no output. Root cause: likely `perl_promote_ref_array` or value corruption in the format code path. Fix needed in codegen emit or runtime `perl_print`/`perl_sprintf` interaction. |
+ | `format`/`write` | **FIXED** - compiles and produces formatted output. | Source-to-source transformation implemented (AST, parser, codegen). Root cause of empty output: WriteStmt passed LLVM global string ptr directly to `perl_sprintf` instead of wrapping it as a PerlValue. Fixed by calling `perl_alloc_string_len` to create a proper PerlValue. Also: `lookupVar` now tries bare name in scopes (declareVar stores without sigil). |
 | `qr//` | **High** — single biggest parse blocker for File::Spec/regex-heavy modules. | Compiled regex as a value type not implemented. Blocks `fileparse($path, qr/\.[^.]*/)` and module-internal regex storage/passing. Entangled with W28 (`$s =~ $var`). |
 | `$s =~ $var` (W28) | **High** — blocks Encode/Alias → piconv. | Pattern in a variable not supported. Needs `qr//` value type to work correctly. |
 | Config native module (W27) | **High** — blocks Config.pm chain, which blocks 6 of 12 survey-3 scripts. | Config.pm stays the native module; its own computed-glob import (`*{$pkg.'::'.$f}=\&{$f}`) still does not run. D192 fixed `*$name = sub {}` for general use, but Config.pm's source still does not execute. |
@@ -1322,7 +1322,7 @@ make bench           # bench/bench.sh; BENCH_ARGS='-n 3 bench/nb.pl'
 make clean
 ```
 
-`./perlc foo.pl -o out` · no `-O` means level 2, bare `-O` means 1 ·
+`./*perlc* foo.pl -o out` - no `-O` means level 0, bare `-O` means 1 -
 `--emit-ir` · `--emit-bc` · `-g` · `-pm` · `-I` · `-v`
 
 Every fix ships a **smoke + deep** test compared against real Perl.
