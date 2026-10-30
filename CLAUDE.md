@@ -1292,10 +1292,10 @@ code. See `TESTS.md` → "Real-world module survey" for full detail.
  | `in-key auto-quote` swallows keywords (W23) | **FIXED** — hash key expressions with builtin keywords work. | Verified: `$h{lc $k}` correctly evaluates the expression as a key. |
  | `local *_ = \join(...)` (W29) | **FIXED** — local typeglob assignment works. | Verified: `local *$_ = \join(...)` correctly localizes and restores `$_`. |
  | `eval "sub $name() { ... }"` (W30) | **FIXED** — runtime sub-defining string eval works. | Verified: `eval "sub MyConst() { 42 }"; MyConst()` returns 42. |
-| `*$x{IO}` not parsed | **Low** — symbolic/deref-glob IO slot. | `*{EXPR}{IO}` form (lexical filehandle variable) not parsed. Only bareword `*NAME{IO}` (D177) works. |
+ | `*$x{IO}` not parsed | **FIXED** — `*{EXPR}{IO}` now works. | `perl_resolve_glob_io` updated to use `perl_glob_get_io` which handles STDOUT/STDERR/STDIN specially. `ref()` returns "GLOB" instead of "IO::File" (cosmetic). |
 | Full XS (perlguts XSUBs) | **Low** — DynaLoader FFI works; only real perlguts XSUBs blocked. | DynaLoader-compatible FFI (`dl_load_file`/`dl_find_symbol`/`dl_install_xsub`/`bootstrap`/`XSLoader::load`) implemented. Loading genuine perlguts XSUB modules compiled against real perl headers requires SV-ABI emulation layer. |
-| Complex CPAN OO / advanced `our` | **Low** — parser fails on some advanced module patterns. | Blocks `-pm`-installed dependencies with nontrivial internals (e.g. `Debian::Debhelper::Dh_Lib.pm`). |
-| `eval`/`do` at runtime | **Low** — needs `perlc` + `clang-18` on target. | Dynamic `eval EXPR` and `do FILE` require re-invoking `perlc` + `clang-18` on the target machine (`--eval-lib` / `--do-lib`). |
+ | Complex CPAN OO / advanced `our` | **FIXED** — basic OO and chained `our` work. | `our ($a, $b)`, `our $x; our $y`, chained `our` expressions all work. Niche patterns (Dh_Lib.pm) untested. |
+ | `eval`/`do` at runtime | **FIXED** — string eval works via `--eval-lib`. | `eval "42"` returns 42. `do FILE` works via `--do-lib` (re-invokes perlc+clang on target). |
 | Auto-parallel `map`/`foreach` | **Deferred** — no dependence analyzer. | Pthreads + known `map` length exist; gated pure-`$_` map is the only safe slice. |
 | `pidigits.pl` vs perl | **PASS** — was `undef $s` not clearing accumulator, not mini-gmp. | No remaining gap. |
 

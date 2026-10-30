@@ -17128,7 +17128,14 @@ PerlValue *perl_get_dollar_plus(void) {
    target; anything else (already a bare filehandle value) passes
    through unchanged. */
 PerlValue *perl_resolve_glob_io(PerlValue *v) {
+    /* *{EXPR}{IO}: if EXPR is a string, look up the glob by name and return
+       its IO slot. Otherwise, if it's a scalar ref, deref it. Otherwise
+       return as-is (already a filehandle value). */
     if (v && v->tag == PERL_REF_SCALAR) return perl_deref_scalar(v);
+    if (v && v->tag == PERL_STRING && v->sval && v->slen > 0) {
+        /* Use perl_glob_get_io which handles STDOUT/STDERR/STDIN specially */
+        return perl_glob_get_io(v->sval);
+    }
     return v;
 }
 
