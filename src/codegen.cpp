@@ -637,6 +637,7 @@ void CodeGen::declareRuntime() {
     RT("perl_alloc_flat_array", pv, i64);  /* FLAT_ARRAY (Stage 22/23 path) */
     RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
     RT("perl_alloc_float_array", pv, i64);
+    RT("perl_repeat_flat_array", pv, Type::getDoubleTy(ctx_), i64);  /* D95: [val] x N → FLAT_ARRAY */
     RT("perl_mark_int_elems",    voidTy, pv, i64);  /* FLAT_ARRAY n-element (used by FLAT_ARRAY literal path) */
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
@@ -2902,7 +2903,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_alloc_bool",
         "perl_open_fh", "perl_open2_fh", "perl_closedir_fh",  /* 1 / undef */
         /* single-arg math/string builtins */
-        "perl_alloc_flat_array", "perl_alloc_float_pair",
+        "perl_alloc_flat_array", "perl_alloc_float_pair", "perl_repeat_flat_array",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
         "perl_uc_str", "perl_lc_str", "perl_ucfirst_str", "perl_lcfirst_str",
         "perl_quotemeta_str", "perl_system_list", "perl_get_perl_version",

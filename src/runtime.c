@@ -69,7 +69,7 @@ static __thread PerlValue *pv_freelist_ = NULL;
 /* Slab tracking: keeps a list of all allocated slabs for cleanup at exit.
  * This is always enabled (not just for PERL_ALLOC_DEBUG) so valgrind
  * can report zero leaks. */
-#define PV_SLAB_CAP 256
+#define PV_SLAB_CAP 16384
 static PerlValue *pv_slabs_[PV_SLAB_CAP];
 static int pv_slab_count_ = 0;
 
@@ -99,7 +99,7 @@ static inline void pv_free_track(PerlValue *v)  {}
 /* Slab size: allocate this many PVs at once on a cold miss.
  * Contiguous allocation keeps pool entries cache-hot, dramatically reducing
  * the cache-miss penalty that dominates perl_clone time in tight loops. */
-#define PV_SLAB 128
+#define PV_SLAB 512
 
 static inline PerlValue *pv_alloc(void) {
     if (__builtin_expect(pv_freelist_ != NULL, 1)) {
@@ -1350,6 +1350,25 @@ PerlValue *perl_alloc_float_array(long long n) {
     v->tag = PERL_FLAT_ARRAY;
     if (n > 0) {
         v->pval = calloc((size_t)n, sizeof(double));  /* zero-initialized */
+    }
+    v->matchpos = n;
+    v->blessed_class = NULL;
+    return v;
+}
+
+/* D95: [value] x N → FLAT_ARRAY with N repetitions of a single double.
+   Used by `[re, im] x M` in mbs/nb benchmarks to avoid creating M
+   separate PerlValue objects. */
+PerlValue *perl_repeat_flat_array(double value, long long n) {
+    PerlValue *v = pv_alloc();
+    v->tag = PERL_FLAT_ARRAY;
+    if (n > 0) {
+        double *arr = (double *)malloc(sizeof(double) * (size_t)n);
+        for (long long i = 0; i < n; i++)
+            arr[(size_t)i] = value;
+        v->pval = arr;
+    } else {
+        v->pval = NULL;
     }
     v->matchpos = n;
     v->blessed_class = NULL;

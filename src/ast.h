@@ -67,6 +67,7 @@ enum class NK {
     RefArray,     /* \@arr      – name = array name         */
     RefHash,      /* \%h        – name = hash name          */
     AnonArray,    /* [list]     – args = elements           */
+    RepeatArray,  /* [expr] x N – args=[elem], ival=N (FLAT_ARRAY) */
     AnonHash,     /* {k=>v,...} – args = flat k,v list      */
     DerefScalar,  /* $$ref      – left = ref expr           */
     DerefArray,   /* @$ref      – left = ref expr           */
