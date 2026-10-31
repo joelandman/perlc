@@ -162,6 +162,8 @@ enum class NK {
     AllFunc,      /* all   { BLOCK } LIST – body=block, args=list; uses $_            */
     NoneFunc,     /* none  { BLOCK } LIST – body=block, args=list; uses $_            */
     ReduceFunc,   /* reduce { BLOCK } LIST – body=block, args=list; uses $a/$b        */
+    /* D95: FLAT_ARRAY row construction */
+    FlatFillPair, /* flat_fill_pair(re,im,re_stride,im_stride,count) → FLAT_ARRAY     */
     /* pack/unpack */
     PackFunc,     /* pack FORMAT, args...   – sval=format, args=data               */
     UnpackFunc,   /* unpack FORMAT, string  – sval=format, left=string expr         */

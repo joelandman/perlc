@@ -638,6 +638,8 @@ void CodeGen::declareRuntime() {
     RT("perl_alloc_float_pair", pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_));
     RT("perl_alloc_float_array", pv, i64);
     RT("perl_repeat_flat_array", pv, Type::getDoubleTy(ctx_), i64);  /* D95: [val] x N → FLAT_ARRAY */
+    RT("perl_flat_fill_pair",    pv, Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_),
+       Type::getDoubleTy(ctx_), Type::getDoubleTy(ctx_), i64);  /* D95: [re,im] with strides → FLAT_ARRAY */
     RT("perl_mark_int_elems",    voidTy, pv, i64);  /* FLAT_ARRAY n-element (used by FLAT_ARRAY literal path) */
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
@@ -2903,7 +2905,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_alloc_bool",
         "perl_open_fh", "perl_open2_fh", "perl_closedir_fh",  /* 1 / undef */
         /* single-arg math/string builtins */
-        "perl_alloc_flat_array", "perl_alloc_float_pair", "perl_repeat_flat_array",
+        "perl_alloc_flat_array", "perl_alloc_float_pair", "perl_repeat_flat_array", "perl_flat_fill_pair",
         "perl_abs_val", "perl_int_trunc", "perl_sqrt_val",
         "perl_uc_str", "perl_lc_str", "perl_ucfirst_str", "perl_lcfirst_str",
         "perl_quotemeta_str", "perl_system_list", "perl_get_perl_version",
@@ -13840,6 +13842,16 @@ Value *CodeGen::emitCall(const Node &n) {
             callRT("perl_tm_set_plan", {cnt, tmFile(), tmLine()});
             return perlInt(1);
         }
+    }
+    /* D95: flat_fill_pair(re, im, re_stride, im_stride, count) → FLAT_ARRAY
+       row with N FLOAT_PAIRs interleaved: re0, im0, re1, im1, ... */
+    if (n.name == "flat_fill_pair") {
+        Value *re     = n.args.size() > 0 ? callRT("perl_to_float", {emitExpr(*n.args[0])}) : perlFloat(0.0);
+        Value *im     = n.args.size() > 1 ? callRT("perl_to_float", {emitExpr(*n.args[1])}) : perlFloat(0.0);
+        Value *reStr  = n.args.size() > 2 ? callRT("perl_to_float", {emitExpr(*n.args[2])}) : perlFloat(0.0);
+        Value *imStr  = n.args.size() > 3 ? callRT("perl_to_float", {emitExpr(*n.args[3])}) : perlFloat(0.0);
+        Value *count  = n.args.size() > 4 ? callRT("perl_to_int", {emitExpr(*n.args[4])}) : perlInt(0);
+        return callRT("perl_flat_fill_pair", {re, im, reStr, imStr, count});
     }
     if (n.name == "POSIX::floor" || n.name == "floor") {
         Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);

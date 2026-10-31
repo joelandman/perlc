@@ -53,50 +53,59 @@ sub cabs {
 sub fill_z {
     my ( $z, $N, $xmin, $dx, $ymin, $dy ) = @_;
     for ( my $j = 0 ; $j < $N ; $j++ ) {
-        $z->[$j] = [];
-        for ( my $i = 0 ; $i < $N ; $i++ ) {
-            $z->[$j][$i] = cplx( $xmin + $i * $dx, $ymin + $j * $dy );
-        }
+        $z->[$j] = flat_fill_pair( $xmin, $ymin + $j * $dy, $dx, 0, $N );
     }
     return;
 }
 
 # mbi! performs Mandelbrot iterations in place on zzz using ccc as constant
+# Works with FLAT_ARRAY rows: re[i] at 2*i, im[i] at 2*i+1
 sub mbi {
     my ( $zzz, $ccc, $Niter, $N ) = @_;
 
-    # preallocate temp (equivalent to zeros inside)
+    # preallocate temp (FLAT_ARRAY rows initialized to 0+0i)
     my @zzzp;
     for ( my $j = 0 ; $j < $N ; $j++ ) {
-        $zzzp[$j] = [];
+        $zzzp[$j] = flat_fill_pair( 0, 0, 0, 0, $N );
     }
 
     for ( my $iter = 0 ; $iter < $Niter ; $iter++ ) {
 
         # zzzp .= zzz .* zzz .+ ccc
-        # pragma omp for
+        # For FLAT_ARRAY: z_re[i] at 2*i, z_im[i] at 2*i+1
+        # cmul(z,z): new_re = z_re^2 - z_im^2, new_im = 2*z_re*z_im
+        # cadd(result, cc): new_re += cc_re, new_im += cc_im
         for ( my $j = 0 ; $j < $N ; $j++ ) {
             my $zj  = $zzz->[$j];
             my $ccj = $ccc->[$j];
             my $zpj = $zzzp[$j];
             for ( my $i = 0 ; $i < $N ; $i++ ) {
-                my $z = $zj->[$i];
-                $zpj->[$i] = cadd( cmul( $z, $z ), $ccj->[$i] );
+                my $z_re  = $zj->[ $i * 2 ];
+                my $z_im  = $zj->[ $i * 2 + 1 ];
+                my $cc_re = $ccj->[ $i * 2 ];
+                my $cc_im = $ccj->[ $i * 2 + 1 ];
+                # cmul(z,z) + cc
+                my $new_re = $z_re * $z_re - $z_im * $z_im + $cc_re;
+                my $new_im = 2 * $z_re * $z_im + $cc_im;
+                $zpj->[ $i * 2 ]     = $new_re;
+                $zpj->[ $i * 2 + 1 ] = $new_im;
             }
         }
 
         # zzz .= zzzp .* (abs2(zzzp) < 4) .+ (2+0i) * (abs(zzzp) >= 4)
-        # pragma omp for
         for ( my $j = 0 ; $j < $N ; $j++ ) {
             my $zpj = $zzzp[$j];
             my $zj  = $zzz->[$j];
             for ( my $i = 0 ; $i < $N ; $i++ ) {
-                my $zp = $zpj->[$i];
-                if ( cabs2($zp) < 4.0 ) {
-                    $zj->[$i] = $zp;
-                }
-                else {
-                    $zj->[$i] = cplx( 2.0, 0.0 );
+                my $zp_re = $zpj->[ $i * 2 ];
+                my $zp_im = $zpj->[ $i * 2 + 1 ];
+                my $abs2  = $zp_re * $zp_re + $zp_im * $zp_im;
+                if ( $abs2 < 4.0 ) {
+                    $zj->[ $i * 2 ]     = $zp_re;
+                    $zj->[ $i * 2 + 1 ] = $zp_im;
+                } else {
+                    $zj->[ $i * 2 ]     = 2.0;
+                    $zj->[ $i * 2 + 1 ] = 0.0;
                 }
             }
         }
@@ -133,12 +142,14 @@ my $t_iter = time() - $t0;
 $t0 = time();
 my @field;
 for ( my $j = 0 ; $j < $N ; $j++ ) {
-    $field[$j] = [];
+    $field[$j] = flat_fill_pair( 0, 0, 0, 0, $N );
     for ( my $i = 0 ; $i < $N ; $i++ ) {
-        $field[$j][$i] = cabs( $z[$j][$i] );
+        my $z_re = $z[$j]->[ $i * 2 ];
+        my $z_im = $z[$j]->[ $i * 2 + 1 ];
+        $field[$j]->[ $i * 2 ] = sqrt( $z_re * $z_re + $z_im * $z_im );
     }
 }
-my $sample_abs = $field[0][0];
+my $sample_abs = $field[0]->[0];
 my $t_mag      = time() - $t0;
 
 # PyPlot code commented out (cannot convert):

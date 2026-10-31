@@ -1375,6 +1375,30 @@ PerlValue *perl_repeat_flat_array(double value, long long n) {
     return v;
 }
 
+/* D95: [re, im] x N with strides → FLAT_ARRAY with N FLOAT_PAIRs interleaved.
+   Layout: re0, im0, re1, im1, ..., reN-1, imN-1 (2*N doubles total).
+   re[i] = re_base + i * re_stride, im[i] = im_base + i * im_stride.
+   Used by mbs fill_z: re=$xmin+$i*$dx, im=$ymin+$j*$dy. */
+PerlValue *perl_flat_fill_pair(double re_base, double im_base,
+                                double re_stride, double im_stride,
+                                long long n) {
+    PerlValue *v = pv_alloc();
+    v->tag = PERL_FLAT_ARRAY;
+    if (n > 0) {
+        double *arr = (double *)malloc(sizeof(double) * (size_t)(n * 2));
+        for (long long i = 0; i < n; i++) {
+            arr[(size_t)(i * 2)]     = re_base + (double)i * re_stride;
+            arr[(size_t)(i * 2 + 1)] = im_base + (double)i * im_stride;
+        }
+        v->pval = arr;
+    } else {
+        v->pval = NULL;
+    }
+    v->matchpos = n * 2;  /* element count for FLAT_ARRAY */
+    v->blessed_class = NULL;
+    return v;
+}
+
 PerlValue *perl_alloc_xs_ptr(void *p) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_XS_PTR;
