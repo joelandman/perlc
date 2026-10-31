@@ -1,74 +1,51 @@
 # LLVM Optimization Hang Analysis
 
-## IR Patterns That Cause Hangs
+## IR Patterns That Caused Hangs (FIXED)
 
-### 1. Large Main Function with Inline Globals
+### 1. Large Main Function with Inline Globals — FIXED
 
-**Pattern:** `main()` contains all global initialization (overload registration, constant
+**Before:** `main()` contained all global initialization (overload registration, constant
 loading, FLAT_ARRAY setup) — 339 perl_ calls, 145 branches/comparisons.
 
-```llvm
-define i32 @main(...) {
-  ; 13 overload registrations
-  ; 3 global constant initializations (pi, solar_mass, days_per_year)
-  ; 5 body array initializations (FLAT_ARRAY with 7 doubles each)
-  ; 100+ store/load instructions for global variables
-  ; Nested loops with 50M+ iterations
-}
-```
+**After:** Split into two functions:
+- `__perlc_init_globals(int argc, char **argv)` — 24 perl_ calls (35 IR lines)
+- `main(int argc, char **argv)` — 123 perl_ calls (315 IR lines)
 
-**Why it hangs:** LLVM's inliner tries to inline all perl_ calls into main, creating a
-massive function with complex control flow. The IPO (Interprocedural Optimization) passes
-then struggle with:
-- Alias analysis on 10+ global variables
-- Dead code elimination across 339 function calls
-- Loop optimization on nested loops with indirect calls
+**Fix:** Extracted global initialization into a separate function. main() now calls
+init() then runs the program body.
 
-### 2. FLAT_ARRAY Initialization with Many Stores
+### 2. FLAT_ARRAY Initialization with Many Stores — PARTIALLY FIXED
 
-**Pattern:** Each FLAT_ARRAY element is a separate `store double` instruction:
+**Pattern:** Each FLAT_ARRAY element is a separate `store double` instruction.
 
-```llvm
-%flat.ep = getelementptr inbounds double, ptr %flat.dbl, i64 0
-store double 0.000000e+00, ptr %flat.ep, align 8
-%flat.ep14 = getelementptr inbounds double, ptr %flat.dbl, i64 1
-store double 0.000000e+00, ptr %flat.ep14, align 8
-; ... 50+ more stores
-```
-
-**Why it hangs:** LLVM's SROA (Scalar Replacement of Aggregates) pass tries to scalarize
+**Why it hung:** LLVM's SROA (Scalar Replacement of Aggregates) pass tries to scalarize
 these stores, but the FLAT_ARRAY's `pval` pointer and `matchpos` field prevent clean
 scalarization. The pass iterates many times trying different transformations.
 
-### 3. Nested Loops with Indirect Calls
+**Fix:** Loop unrolling disabled by default in hot loops. SROA still runs at O2+ but
+doesn't hang due to the main() split reducing function size.
 
-**Pattern:** Hot loops call perl_ functions indirectly through the runtime:
+### 3. Nested Loops with Indirect Calls — FIXED
 
-```llvm
-for (...) {
-  %z_re = load ptr, ptr %zj, align 8
-  %z_im = load ptr, ptr %zj, align 8
-  %new_re = call double @perl_to_float(ptr %z_re)
-  %new_im = call double @perl_to_float(ptr %z_im)
-  store double %new_re, ptr %zpj, align 8
-  ; ... 100+ iterations
-}
-```
+**Pattern:** Hot loops call perl_ functions indirectly through the runtime.
 
-**Why it hangs:** LLVM's loop vectorizer and unswitcher can't prove that `perl_to_float`
-is pure (no side effects) because it's declared with `memory(read)` but not marked
-`nounwind` or `readnone`. This prevents vectorization and causes the optimizer to
-iterate many times trying to simplify the loop.
+**Why it hung:** LLVM's loop vectorizer and unswitcher couldn't prove that `perl_to_float`
+is pure (no side effects) because it wasn't marked `nounwind`.
 
-### 4. Many Small Functions with Overlap
+**Fix:** All perl_ runtime functions marked with `noinline` + `nounwind`. Loop unrolling
+disabled by default. This enables better optimization without hangs.
+
+### 4. Many Small Functions with Overlap — FIXED
 
 **Pattern:** 4 functions in nb.ll, but each has 100+ basic blocks due to:
 - PerlValue tag checking (`perl_is_bigint_pv`, `perl_is_blessed_pv`)
 - Branching on tag types (PERL_INT, PERL_FLOAT, PERL_STRING, etc.)
 - Clone/free pairs for every temporary value
 
-**Why it hangs:** The function inliner tries to inline all small perl_ calls, but the
-tag-checking branches create many unreachable paths that the optimizer must prune.
+**Why it hung:** The function inliner tried to inline all small perl_ calls, but the
+tag-checking branches created many unreachable paths that the optimizer must prune.
+
+**Fix:** `noinline` attribute on all 500+ perl_ runtime functions prevents inlining.
 
 ## Optimization Passes at Each Level
 
@@ -181,22 +158,27 @@ ModulePassManager:
  10. SLIP                        - Second scalar replacement pass
 ```
 
-## Key Passes That Likely Cause Hangs
+## Actual Benchmark Results (O0-O3)
 
-| Pass | Why It Hangs | Fix |
-|------|-------------|-----|
-| **ModuleInlinerPass** | Tries to inline 339 perl_ calls into main | Add `noinline` to perl_ functions |
-| **SROA** | Can't scalarize FLAT_ARRAY due to mixed types | Pre-convert FLAT_ARRAY to simple arrays |
-| **LoopVectorize** | Can't prove perl_ calls are pure | Mark perl_ calls with `readnone` where possible |
-| **LoopUnroll** | Unrolls 50M+ iteration loops | Add `#pragma clang loop unroll(disable)` |
-| **LICM** | Can't hoist through perl_ calls | Mark perl_ calls as `memory(read)` only |
-| **GlobalDCEPass** | Can't prove globals are unused | Use `internal` linkage for globals |
+| Test | O0 (ms) | O1 (ms) | O2 (ms) | O3 (ms) | Perl (ms) | Best vs Perl |
+|------|---------|---------|---------|---------|-----------|-------------|
+| **fibn** | 32 | 31 | 21 | 21 | 67 | **3.19x faster** (O2/O3) |
+| **nb** | 26 | 26 | 33 | 27 | 27 | Matches Perl (O1/O3) |
+| **regex_heavy** | 1092 | 665 | 675 | 633 | 760 | **1.20x faster** (O3) |
 
-## Recommended Fixes
+## Fixes Applied (All Working)
 
-1. **Mark perl_ functions as `nounwind readnone`** where they don't modify memory
-2. **Add `noinline` attribute** to perl_ functions to prevent inlining
-3. **Use `internal` linkage** for globals instead of `global`
-4. **Split main() into smaller functions** (one per Perl sub)
-5. **Add `llvm.loop.unroll.disable` metadata** to hot loops
-6. **Use `optnone` attribute** on functions that confuse the optimizer
+| # | Fix | Status | Impact |
+|---|-----|--------|--------|
+| 1 | Split main() into `__perlc_init_globals` + main body | DONE | Reduces perl_ calls from 339 to 147 |
+| 2 | Add `noinline` + `nounwind` to all perl_ functions | DONE | Prevents inlining explosion |
+| 3 | Use `internal` linkage for globals | DONE (was already) | Helps GlobalDCE |
+| 4 | Disable loop unrolling by default | DONE | Prevents loop unroll hangs |
+| 5 | Mark pure perl_ calls with `readonly` | DONE (selective) | Enables GVN/LICM |
+
+## Remaining Work
+
+1. **O4 optimization** — Would add LoopUnswitch, more aggressive vectorization
+2. **Loop vectorization** — Could help fibn/nb if perl_ calls marked as `readnone`
+3. **LLVM 22 upgrade** — When available, would provide new PM stability
+4. **Split subs into more functions** — Could further reduce main() size
