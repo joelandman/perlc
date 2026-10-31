@@ -5478,7 +5478,8 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         inMainBody_         = savedInMainBody;
         asDoLib_            = savedAsDoLib;
         asEvalPad_          = savedAsEvalPad;
-        fileArrayGlobals_   = savedFileArrayGlobals;
+        /* D95: do NOT restore fileArrayGlobals_ — init() legitimately adds
+           entries like ARGV that main() needs to see via lookupArray(). */
 
         builder_.CreateRetVoid();
 
