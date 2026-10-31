@@ -5266,28 +5266,50 @@ void CodeGen::compile(const Node &program, const std::string &modName,
 
     auto *i32Ty = Type::getInt32Ty(ctx_);
     if (!asDoLib) {
-        /* emit main(int argc, char **argv) */
-        auto *i8p  = PointerType::getUnqual(ctx_);
-        auto *mainFT = FunctionType::get(i32Ty, {i32Ty, i8p}, false);
-        auto *mainFn = Function::Create(mainFT, Function::ExternalLinkage,
-                                        "main", mod_.get());
-        mainFn->getArg(0)->setName("argc");
-        mainFn->getArg(1)->setName("argv");
-        auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
-        builder_.SetInsertPoint(entry);
+        auto *i8p = PointerType::getUnqual(ctx_);
+
+        /* -- __perlc_init_globals(int argc, char **argv) -- */
+        auto *initFT = FunctionType::get(Type::getVoidTy(ctx_), {i32Ty, i8p}, false);
+        auto *initFn = Function::Create(initFT, Function::ExternalLinkage,
+                                         "__perlc_init_globals", mod_.get());
+        initFn->getArg(0)->setName("argc");
+        initFn->getArg(1)->setName("argv");
+        auto *initEntry = BasicBlock::Create(ctx_, "entry", initFn);
+        builder_.SetInsertPoint(initEntry);
 
         if (debug_) {
-            mainFn->setSubprogram(currentSP_);
+            initFn->setSubprogram(currentSP_);
             builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
         }
 
-        currentFn_ = mainFn;
-        stmtLabels_.clear();
-        collectGotoLabels(program);
-        pushScope();
-        /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
-        fileScopeDepth_ = (int)scopes_.size() + 1;
+        /* Save CodeGen state -- init function uses its own scope stack and
+           modifies several fields; restore them on exit so main() starts
+           clean. */
+        auto savedScopes          = scopes_;
+        auto savedArrayScopes     = arrayScopes_;
+        auto savedHashScopes      = hashScopes_;
+        auto savedPvScopes        = pvScopes_;
+        auto savedFloatScopes     = floatScopes_;
+        auto savedIntScopes       = intScopes_;
+        auto savedDerefAVScopes   = derefAVScopes_;
+        auto savedRowAVScopes     = rowAVScopes_;
+        auto savedFlatRowScopes   = flatRowScopes_;
+        auto savedPairScopes      = pairScopes_;
+        auto savedLocalDepthAlloca = localDepthAlloca_;
+        auto savedStmtLabels      = stmtLabels_;
+        auto savedCurrentPackage  = currentPackage_;
+        auto savedCurrentSubName  = currentSubName_;
+        auto savedInAnonSubEmit   = inAnonSubEmit_;
+        auto savedCapturedNames   = capturedNamesInCurrentFn_;
+        auto savedAllNamesCaptured = allNamesCaptured_;
+        auto savedInMainBody      = inMainBody_;
+        auto savedAsDoLib         = asDoLib_;
+        auto savedAsEvalPad       = asEvalPad_;
+        auto savedFileArrayGlobals = fileArrayGlobals_;
+
         inMainBody_ = true;
+        stmtLabels_.clear();
+        pushScope();
 
         {
             bool amp = false, caps = false, dynEval = false;
@@ -5378,8 +5400,8 @@ void CodeGen::compile(const Node &program, const std::string &modName,
 
         /* set up @ARGV and $0 from command-line arguments */
         {
-            Value *argc_v = mainFn->getArg(0);
-            Value *argv_v = mainFn->getArg(1);
+            Value *argc_v = initFn->getArg(0);
+            Value *argv_v = initFn->getArg(1);
             Value *argvArr = callRT("perl_init_argv", {argc_v, argv_v});
             {
                 auto *gvArgv = new GlobalVariable(*mod_, perlPtrTy_, false,
@@ -5433,11 +5455,72 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
         allNamesCaptured_ = hasEvalCall(program);
 
+        popScope();
+
+        /* Restore CodeGen state so main() starts clean */
+        scopes_             = savedScopes;
+        arrayScopes_        = savedArrayScopes;
+        hashScopes_         = savedHashScopes;
+        pvScopes_           = savedPvScopes;
+        floatScopes_        = savedFloatScopes;
+        intScopes_          = savedIntScopes;
+        derefAVScopes_      = savedDerefAVScopes;
+        rowAVScopes_        = savedRowAVScopes;
+        flatRowScopes_      = savedFlatRowScopes;
+        pairScopes_         = savedPairScopes;
+        localDepthAlloca_   = savedLocalDepthAlloca;
+        stmtLabels_         = savedStmtLabels;
+        currentPackage_     = savedCurrentPackage;
+        currentSubName_     = savedCurrentSubName;
+        inAnonSubEmit_      = savedInAnonSubEmit;
+        capturedNamesInCurrentFn_ = savedCapturedNames;
+        allNamesCaptured_   = savedAllNamesCaptured;
+        inMainBody_         = savedInMainBody;
+        asDoLib_            = savedAsDoLib;
+        asEvalPad_          = savedAsEvalPad;
+        fileArrayGlobals_   = savedFileArrayGlobals;
+
+        builder_.CreateRetVoid();
+
+        /* -- emit main(int argc, char **argv) -- */
+        auto *mainFT = FunctionType::get(i32Ty, {i32Ty, i8p}, false);
+        auto *mainFn = Function::Create(mainFT, Function::ExternalLinkage,
+                                         "main", mod_.get());
+        mainFn->getArg(0)->setName("argc");
+        mainFn->getArg(1)->setName("argv");
+        auto *entry = BasicBlock::Create(ctx_, "entry", mainFn);
+        builder_.SetInsertPoint(entry);
+
+        if (debug_) {
+            mainFn->setSubprogram(currentSP_);
+            builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
+        }
+
+        currentFn_ = mainFn;
+        stmtLabels_.clear();
+        collectGotoLabels(program);
+        pushScope();
+        /* emitBlock(program) will push one more scope; file-scope my vars live at that depth */
+        fileScopeDepth_ = (int)scopes_.size() + 1;
+        inMainBody_ = true;
+
+        /* Call init function -- all global setup (overloads, @ARGV, $0, $_,
+           FindBin, autodie, local-depth, closure pre-scan) runs first. */
+        builder_.CreateCall(initFn, {mainFn->getArg(0), mainFn->getArg(1)});
+
+        /* capture local() save depth at function entry */
+        localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
+        builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+
+        /* D64: same pre-scan as emitSub/AnonSub, for the top-level program body */
+        collectClosureCapturedNames(program, capturedNamesInCurrentFn_);
+        allNamesCaptured_ = hasEvalCall(program);
+
         emitBlock(program);
 
         callRT("perl_pop_wantarray", {});
         /* D189: restore any local()s BEFORE popping the outer file-scope
-           — same ordering bug as emitBlock/emitBlockLast (see D189's
+           -- same ordering bug as emitBlock/emitBlockLast (see D189's
            write-up there): a `local $fileScopeHashVar->{key} = ...;`
            directly at file scope must be restored while that file-
            scope `my` hash is still alive. */
