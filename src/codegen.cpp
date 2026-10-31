@@ -8,6 +8,10 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <stdexcept>
@@ -15666,14 +15670,34 @@ Value *CodeGen::emitCall(const Node &n) {
 /* ── optimization ────────────────────────────────────────────────────────── */
 
 void CodeGen::runOptimization() {
-    // Temporarily disabled: new PM hangs on complex IR (LLVM 18)
-    // TODO: investigate and fix the new PM hang
     if (optLevel_ <= 0) return;
+
     if (verifyModule(*mod_, &errs())) {
         errs() << "IR verification failed before optimization\n";
         return;
     }
-    // Skip optimization - new PM hangs, legacy PM headers not available in LLVM 18
+
+    // LLVM legacy PM optimization pipeline
+    // Avoid aggressive inlining/loop passes that hang on complex IR
+
+    // Function-level passes (simplification only, no inlining)
+    {
+        legacy::FunctionPassManager fpm(mod_.get());
+        fpm.add(createInstructionCombiningPass());
+        fpm.add(createDeadCodeEliminationPass());
+        fpm.add(createInstructionCombiningPass());
+        fpm.add(createDeadCodeEliminationPass());
+        fpm.doInitialization();
+        for (Function &F : *mod_) {
+            if (F.isDeclaration()) continue;
+            fpm.run(F);
+        }
+        fpm.doFinalization();
+    }
+
+    if (verifyModule(*mod_, &errs())) {
+        errs() << "IR verification failed after optimization\n";
+    }
 }
 
 /* ── output ──────────────────────────────────────────────────────────────── */
