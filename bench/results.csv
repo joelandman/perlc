@@ -1,1 +1,10 @@
-name,perlc_ms,perl_ms,ratio
+name,opt,perlc_ms,perl_ms,ratio
+fibn,O0,28,65,2.32
+fibn,O1,22,65,2.95
+nb,O0,31,25,0.81
+nb,O1,26,25,0.96
+regex_heavy,O0,1135,731,0.64
+regex_heavy,O1,678,731,1.08
+mbs256,O0,28000,200,0.01
+mbs256,O1,15000,200,0.01
+mbs1024,O1,240000,200,0.00
