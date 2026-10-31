@@ -476,10 +476,15 @@ void CodeGen::declareRuntime() {
     auto  pv     = perlPtrTy_;   /* PerlValue* */
     auto  av     = arrayPtrTy_;  /* PerlArray* */
 
+    /* D95: Add noinline/nounwind to runtime functions to prevent LLVM IPO
+       hangs. noinline prevents inliner from creating massive main().
+       nounwind enables better optimization (no unwind table generation). */
 #define RT(nm, ret, ...) \
     rtFuncs_[nm] = Function::Create( \
         makeRT(ctx_, ret, {__VA_ARGS__}), \
-        Function::ExternalLinkage, nm, mod_.get())
+        Function::ExternalLinkage, nm, mod_.get()); \
+    rtFuncs_[nm]->addFnAttr(Attribute::NoInline); \
+    rtFuncs_[nm]->addFnAttr(Attribute::NoUnwind)
 
     RT("perl_alloc_undef",   pv);
     RT("perl_alloc_int",     pv,  i64);
@@ -7343,9 +7348,10 @@ void CodeGen::emitStmt(const Node &n) {
             auto *backBr = builder_.CreateBr(condBB);
             /* Stage 34: vectorize only counted unboxed i64/f64 bodies (mbs's
                boxed FLOAT_PAIR inner for stays scalar). Inner unroll only
-               when that body is also numeric — unrolling mbs would bloat IR. */
+               when that body is also numeric — unrolling mbs would bloat IR.
+               D95: Disable unrolling by default to prevent LLVM IPO hangs. */
             bool vec = cforIsCountedNumeric(n);
-            attachCountedLoopMD(backBr, isInnerLoop && vec, vec);
+            attachCountedLoopMD(backBr, false, vec);
         }
 
         loopExits_.pop_back();
@@ -7586,8 +7592,9 @@ void CodeGen::emitStmt(const Node &n) {
                 auto *backBr = builder_.CreateBr(condBB2);
                 /* Stage 28: unroll+interleave on every inner integer-range
                    foreach (n-body sqrtpd). Stage 34: also vectorize when the
-                   body is unboxed i64/f64 (no perl_* calls). */
-                attachCountedLoopMD(backBr, isInnerLoop, vec);
+                   body is unboxed i64/f64 (no perl_* calls).
+                   D95: Disable unrolling by default to prevent LLVM IPO hangs. */
+                attachCountedLoopMD(backBr, false, vec);
             }
 
             loopExits_.pop_back();
