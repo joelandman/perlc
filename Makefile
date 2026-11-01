@@ -1,5 +1,5 @@
 CXX      := g++
-LLVM_CFG := llvm-config-18
+LLVM_CFG := llvm-config-22
 LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 
 # Force complete libstdc++ containers before any LLVM header in every TU.
@@ -7,7 +7,7 @@ LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 # problem with LLVM 18 + clang-18 + gcc-16 libstdc++ on this host.
 FORCE_STD := -include src/force_complete_std.h
 
-CXXFLAGS := -std=c++17 -g -Wall -Wno-unused-function -Wno-atomic-alignment -fexceptions -mcx16 -I/usr/lib/llvm-18/include -include src/force_complete_std.h
+CXXFLAGS := -std=c++17 -g -Wall -Wno-unused-function -Wno-atomic-alignment -fexceptions -mcx16 -I/usr/lib/llvm-22/include -include src/force_complete_std.h
 
 TSAN_CXXFLAGS := $(CXXFLAGS) -fsanitize=thread -fno-omit-frame-pointer
 TSAN_CFLAGS := $(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer

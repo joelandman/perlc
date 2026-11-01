@@ -21,6 +21,16 @@
 
 using namespace llvm;
 
+/* LLVM 22 renamed IntrinsicGetDeclaration → getOrInsertDeclaration.
+   Provide a compatibility alias so the same code works with both. */
+#if LLVM_VERSION_MAJOR >= 22
+#define IntrinsicGetDeclaration(M, ID, ST) \
+    Intrinsic::getOrInsertDeclaration(M, ID, ST)
+#else
+#define IntrinsicGetDeclaration(M, ID, ST) \
+    Intrinsic::getDeclaration(M, ID, ST)
+#endif
+
 /* collect all ScalarVar names referenced in a node (skip nested SubDef —
    named subs are compiled as standalone top-level functions, unrelated to
    the enclosing lexical scope).  AnonSub IS recursed into: a nested closure
@@ -476,15 +486,20 @@ void CodeGen::declareRuntime() {
     auto  pv     = perlPtrTy_;   /* PerlValue* */
     auto  av     = arrayPtrTy_;  /* PerlArray* */
 
-    /* D95: Add noinline/nounwind to runtime functions to prevent LLVM IPO
-       hangs. noinline prevents inliner from creating massive main().
-       nounwind enables better optimization (no unwind table generation). */
+/* D95: Add noinline to runtime functions to prevent LLVM IPO hangs.
+        nounwind removed for LLVM 22: it triggers nocallback/nocreateundeforpoison
+        attrs that break the legacy IR writer. */
 #define RT(nm, ret, ...) \
     rtFuncs_[nm] = Function::Create( \
         makeRT(ctx_, ret, {__VA_ARGS__}), \
         Function::ExternalLinkage, nm, mod_.get()); \
     rtFuncs_[nm]->addFnAttr(Attribute::NoInline); \
-    rtFuncs_[nm]->addFnAttr(Attribute::NoUnwind)
+    RT_NOUNIND
+#if LLVM_VERSION_MAJOR < 22
+#define RT_NOUNIND rtFuncs_[nm]->addFnAttr(Attribute::NoUnwind)
+#else
+#define RT_NOUNIND /**/
+#endif
 
     RT("perl_alloc_undef",   pv);
     RT("perl_alloc_int",     pv,  i64);
@@ -1156,7 +1171,9 @@ RT("perl_clear_named_captures", voidTy);
                             "perl_is_bigint_pv"}) {
         auto *F = getRTFunc(nm);
         F->setMemoryEffects(MemoryEffects::readOnly());
+#if LLVM_VERSION_MAJOR < 22
         F->addFnAttr(Attribute::NoUnwind);
+#endif
         F->addFnAttr(Attribute::WillReturn);
     }
 }
@@ -2060,7 +2077,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         builder_.CreateStore(udPv, udAlloca);
 
         auto *iAlloca = createEntryAlloca(i64, nullptr, "mg.i");
-        builder_.CreateStore(ConstantInt::get(i64, 0), iAlloca);
+        builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(ctx_), 0), iAlloca);
 
         auto *condBB = BasicBlock::Create(ctx_, isMap ? "map.cond" : "grep.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, isMap ? "map.body" : "grep.body", fn);
@@ -2141,7 +2158,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             builder_.SetInsertPoint(nextBB);
         }
 
-        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(Type::getInt64Ty(ctx_), 1));
         builder_.CreateStore(i2, iAlloca);
         builder_.CreateBr(condBB);
 
@@ -3140,7 +3157,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
     auto *i64 = Type::getInt64Ty(ctx_);
     switch (n.kind) {
     case NK::IntLit:
-        return ConstantInt::get(i64, n.ival);
+        return ConstantInt::get(Type::getInt64Ty(ctx_), n.ival);
     case NK::ScalarVar: {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
@@ -3159,7 +3176,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
             unsigned long long r = (n.sval == "&") ? (lb & rb)
                                 : (n.sval == "|") ? (lb | rb) : (lb ^ rb);
             if (r >> 63) return nullptr; /* UV result */
-            return ConstantInt::get(i64, (long long)r);
+            return ConstantInt::get(Type::getInt64Ty(ctx_), (long long)r);
         }
         /* W1: `>>` with constant count [1,63] — logical shift of the bit
            pattern; bit 63 is cleared, result always matches Perl's UV form. */
@@ -3169,7 +3186,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
             canEmitI64(*n.left)) {
             Value *lv = emitExprI64(*n.left);
             if (!lv) return nullptr;
-            return builder_.CreateLShr(lv, ConstantInt::get(i64, n.right->ival), "bshr");
+            return builder_.CreateLShr(lv, ConstantInt::get(Type::getInt64Ty(ctx_), n.right->ival), "bshr");
         }
         /* W1: `<<` / `**` constant folding with real Perl's exact semantics:
            << : count clamped to [0,63] (else 0); result with bit 63 set is a
@@ -3182,24 +3199,24 @@ Value *CodeGen::emitExprI64(const Node &n) {
             n.right && n.right->kind == NK::IntLit) {
             long long b = n.left->ival, e = n.right->ival;
             if (n.sval == "<<") {
-                if (e < 0 || e > 63) return ConstantInt::get(i64, 0);
+                if (e < 0 || e > 63) return ConstantInt::get(Type::getInt64Ty(ctx_), 0);
                 __uint128_t r = (__uint128_t)(unsigned long long)b << e;
                 if (r >= ((__uint128_t)1) << 63) return nullptr; /* UV result */
-                return ConstantInt::get(i64, (long long)r);
+                return ConstantInt::get(Type::getInt64Ty(ctx_), (long long)r);
             }
             if (e < 0) return nullptr; /* NV: 1/b^e */
             unsigned long long ab = b < 0 ? (unsigned long long)(-b)
                                           : (unsigned long long)b;
-            if (ab == 0) return ConstantInt::get(i64, e == 0 ? 1 : 0);
+            if (ab == 0) return ConstantInt::get(Type::getInt64Ty(ctx_), e == 0 ? 1 : 0);
             int m = 0; { unsigned long long t = ab; while (t >>= 1) m++; }
             if (ab == 1)
-                return ConstantInt::get(i64, (b < 0 && (e & 1)) ? -1 : 1);
+                return ConstantInt::get(Type::getInt64Ty(ctx_), (b < 0 && (e & 1)) ? -1 : 1);
             if ((ab & (ab - 1)) == 0) {
                 /* power-of-2 base: Perl stores NV; integer print only while
                    2^(m*e) < 1e15, i.e. m*e <= 49. */
                 if ((long long)m * e > 49) return nullptr;
                 unsigned long long r = 1ULL << (m * e);
-                return ConstantInt::get(i64,
+                return ConstantInt::get(Type::getInt64Ty(ctx_),
                     (b < 0 && (e & 1)) ? -(long long)r : (long long)r);
             }
             /* non-pow-of-2: Perl keeps IV/UV only while e*bitlen(|b|) <= 64
@@ -3212,7 +3229,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
             }
             if (res >= ((unsigned __int128)1) << 63) return nullptr; /* UV */
             unsigned long long rv = (unsigned long long)res;
-            return ConstantInt::get(i64,
+            return ConstantInt::get(Type::getInt64Ty(ctx_),
                 (b < 0 && (e & 1)) ? -(long long)rv : (long long)rv);
         }
         static const char *intOps[] = {"+", "-", "*", "%", nullptr};
@@ -3236,7 +3253,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
         if (n.sval == "~" && n.left && n.left->kind == NK::IntLit) {
             long long r = ~(long long)n.left->ival;
             if (r < 0) return nullptr; /* UV result */
-            return ConstantInt::get(i64, r);
+            return ConstantInt::get(Type::getInt64Ty(ctx_), r);
         }
         return nullptr;
     case NK::AbsFunc: {
@@ -3244,7 +3261,7 @@ Value *CodeGen::emitExprI64(const Node &n) {
         if (!n.left || n.left->kind != NK::IntLit) return nullptr;
         long long v = n.left->ival;
         if (v == INT64_MIN) return nullptr;
-        return ConstantInt::get(i64, v < 0 ? -v : v);
+        return ConstantInt::get(Type::getInt64Ty(ctx_), v < 0 ? -v : v);
     }
     case NK::IntFunc: {
         /* W1: int() on an integer is the identity. */
@@ -3375,23 +3392,23 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     builder_.CreateCondBr(isCplx, cBB, pBB);
 
     builder_.SetInsertPoint(cBB);
-    Value *hdrPtr = builder_.CreateConstInBoundsGEP1_64(i8, rowPv, 8, "cplx.hp");
+    Value *hdrPtr = builder_.CreateGEP(i8, rowPv, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.hp");
     Value *hdr = builder_.CreateLoad(perlPtrTy_, hdrPtr, "cplx.hdr");
     Value *dataPtr = builder_.CreateLoad(perlPtrTy_, hdr, "cplx.data");
-    Value *nPtr = builder_.CreateConstInBoundsGEP1_64(i8, hdr, 8, "cplx.np");
+    Value *nPtr = builder_.CreateGEP(i8, hdr, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.np");
     Value *n = builder_.CreateLoad(i64, nPtr, "cplx.n");
     Value *inRange = builder_.CreateAnd(
-        builder_.CreateICmpSGE(idx, ConstantInt::get(i64, 0)),
+        builder_.CreateICmpSGE(idx, ConstantInt::get(Type::getInt64Ty(ctx_), 0)),
         builder_.CreateICmpSLT(idx, n), "cplx.ir");
     auto *okBB = BasicBlock::Create(ctx_, "cplx.ok", curFn);
     builder_.CreateCondBr(inRange, okBB, fBB);
     builder_.SetInsertPoint(okBB);
-    Value *two = ConstantInt::get(i64, 2);
+    Value *two = ConstantInt::get(Type::getInt64Ty(ctx_), 2);
     Value *base = builder_.CreateMul(idx, two, "cplx.b");
     Value *dataF = builder_.CreateBitCast(dataPtr, f64->getPointerTo());
     Value *reP = builder_.CreateGEP(f64, dataF, base, "cplx.rep");
     Value *imP = builder_.CreateGEP(f64, dataF,
-        builder_.CreateAdd(base, ConstantInt::get(i64, 1)), "cplx.imp");
+        builder_.CreateAdd(base, ConstantInt::get(Type::getInt64Ty(ctx_), 1)), "cplx.imp");
     Value *reC = builder_.CreateLoad(f64, reP, "cplx.re");
     Value *imC = builder_.CreateLoad(f64, imP, "cplx.im");
     setTBAA(reC, tbaaFlatDoubleTag_);
@@ -3411,8 +3428,8 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     builder_.SetInsertPoint(fBB);
     Value *elem = callRT("perl_cplx_elem", {rowPv, idx});
     Value *reF2 = builder_.CreateLoad(f64,
-        builder_.CreateConstInBoundsGEP1_64(i8, elem, 8, "cplx.repv"), "cplx.ref");
-    Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(i8, elem, 16, "cplx.mp");
+        builder_.CreateGEP(i8, elem, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.repv"), "cplx.ref");
+    Value *mpPtr = builder_.CreateGEP(i8, elem, ConstantInt::get(Type::getInt64Ty(ctx_), 16), "cplx.mp");
     Value *mpBits = builder_.CreateLoad(i64, mpPtr, "cplx.imb");
     Value *imF = builder_.CreateBitCast(mpBits, f64, "cplx.imf");
     freeIfOwned(elem);
@@ -3470,22 +3487,22 @@ bool CodeGen::tryStoreCplxPair(Value *rowPv, Value *idx, Value *re, Value *im) {
     auto *chkBB = BasicBlock::Create(ctx_, "cplx.st.chk", curFn);
     builder_.CreateCondBr(isCplx, chkBB, fbBB);
     builder_.SetInsertPoint(chkBB);
-    Value *hdrPtr = builder_.CreateConstInBoundsGEP1_64(i8, rowPv, 8, "cplx.st.hp");
+    Value *hdrPtr = builder_.CreateGEP(i8, rowPv, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.st.hp");
     Value *hdr = builder_.CreateLoad(perlPtrTy_, hdrPtr, "cplx.st.hdr");
     Value *dataPtr = builder_.CreateLoad(perlPtrTy_, hdr, "cplx.st.data");
-    Value *nPtr = builder_.CreateConstInBoundsGEP1_64(i8, hdr, 8, "cplx.st.np");
+    Value *nPtr = builder_.CreateGEP(i8, hdr, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.st.np");
     Value *n = builder_.CreateLoad(i64, nPtr, "cplx.st.n");
     Value *inRange = builder_.CreateAnd(
-        builder_.CreateICmpSGE(idx, ConstantInt::get(i64, 0)),
+        builder_.CreateICmpSGE(idx, ConstantInt::get(Type::getInt64Ty(ctx_), 0)),
         builder_.CreateICmpSLT(idx, n), "cplx.st.ir");
     builder_.CreateCondBr(inRange, okBB, fbBB);
     builder_.SetInsertPoint(okBB);
-    Value *two = ConstantInt::get(i64, 2);
+    Value *two = ConstantInt::get(Type::getInt64Ty(ctx_), 2);
     Value *base = builder_.CreateMul(idx, two, "cplx.st.b");
     Value *dataF = builder_.CreateBitCast(dataPtr, f64->getPointerTo());
     Value *reP = builder_.CreateGEP(f64, dataF, base, "cplx.st.rep");
     Value *imP = builder_.CreateGEP(f64, dataF,
-        builder_.CreateAdd(base, ConstantInt::get(i64, 1)), "cplx.st.imp");
+        builder_.CreateAdd(base, ConstantInt::get(Type::getInt64Ty(ctx_), 1)), "cplx.st.imp");
     auto *s1 = builder_.CreateStore(re, reP);
     auto *s2 = builder_.CreateStore(im, imP);
     if (tbaaFlatDoubleTag_) {
@@ -3739,7 +3756,7 @@ bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
         if (Value *ia = lookupIntVar(nm)) {
             auto *i64 = Type::getInt64Ty(ctx_);
             Value *cur = builder_.CreateLoad(i64, ia);
-            Value *next = builder_.CreateAdd(cur, ConstantInt::get(i64, isInc ? 1LL : -1LL));
+            Value *next = builder_.CreateAdd(cur, ConstantInt::get(Type::getInt64Ty(ctx_), isInc ? 1LL : -1LL));
             builder_.CreateStore(next, ia);
             return true;
         }
@@ -3869,7 +3886,7 @@ Value *CodeGen::tryEmitI1Cond(const Node &n) {
 Value *CodeGen::emitIdx(const Node &n) {
     auto *i64 = Type::getInt64Ty(ctx_);
     if (n.kind == NK::IntLit)
-        return ConstantInt::get(i64, n.ival);
+        return ConstantInt::get(Type::getInt64Ty(ctx_), n.ival);
     if (n.kind == NK::ScalarVar) {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
@@ -4608,16 +4625,24 @@ Value *CodeGen::emitExprF64(const Node &n) {
         Value *v = emitExprF64(*n.left);
         if (!v) return nullptr;
         lastSqrtInput_ = v;  /* Stage 30: remember input so cube opts can use x*sqrt(x) */
-        auto *sqrtFn = llvm::Intrinsic::getDeclaration(mod_.get(),
+        auto *sqrtFn = IntrinsicGetDeclaration(mod_.get(),
             llvm::Intrinsic::sqrt, {f64});
+#if LLVM_VERSION_MAJOR >= 22
+        /* LLVM 22: intrinsics get auto-attrs (nocallback etc.) from readonly+willreturn.
+           Clear all attrs to prevent the IR printer from adding unserializable attrs. */
+        sqrtFn->setAttributes(AttributeList());
+#endif
         return builder_.CreateCall(sqrtFn, {v}, "sqrt");
     }
     case NK::AbsFunc: {
         if (!canEmitF64(*n.left)) return nullptr;
         Value *v = emitExprF64(*n.left);
         if (!v) return nullptr;
-        auto *absFn = llvm::Intrinsic::getDeclaration(mod_.get(),
+        auto *absFn = IntrinsicGetDeclaration(mod_.get(),
             llvm::Intrinsic::fabs, {f64});
+#if LLVM_VERSION_MAJOR >= 22
+        absFn->setAttributes(AttributeList());
+#endif
         return builder_.CreateCall(absFn, {v}, "fabs");
     }
     case NK::IntFunc: {
@@ -4630,12 +4655,14 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!v) return nullptr;
         /* Truncation toward zero: if v >= 0, floor(v); else ceil(v) */
         auto *i64 = Type::getInt64Ty(ctx_);
-        Value *floored = builder_.CreateCall(
-            llvm::Intrinsic::getDeclaration(mod_.get(), llvm::Intrinsic::floor, {f64}),
-            {v}, "floor");
-        Value *ceiled = builder_.CreateCall(
-            llvm::Intrinsic::getDeclaration(mod_.get(), llvm::Intrinsic::ceil, {f64}),
-            {v}, "ceil");
+        auto *floorFn = IntrinsicGetDeclaration(mod_.get(), llvm::Intrinsic::floor, {f64});
+        auto *ceilFn  = IntrinsicGetDeclaration(mod_.get(), llvm::Intrinsic::ceil, {f64});
+#if LLVM_VERSION_MAJOR >= 22
+        floorFn->setAttributes(AttributeList());
+        ceilFn->setAttributes(AttributeList());
+#endif
+        Value *floored = builder_.CreateCall(floorFn, {v}, "floor");
+        Value *ceiled = builder_.CreateCall(ceilFn, {v}, "ceil");
         Value *isNeg = builder_.CreateFCmpOLT(v, ConstantFP::get(f64, 0.0), "iscmp");
         Value *truncated = builder_.CreateSelect(isNeg, ceiled, floored, "trunc");
         /* Convert i64 back to double */
@@ -4741,7 +4768,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
                             Value *pp17   = builder_.CreateGEP(perlPtrTy_, el17, idx17, "pp");
                             Value *pv17   = builder_.CreateLoad(perlPtrTy_, pp17, "pv");
                             setTBAA(pv17, tbaaAvElemTag_);
-                            Value *fp17   = builder_.CreateConstInBoundsGEP1_64(i8Ty17n, pv17, 8, "fp");
+                            Value *fp17   = builder_.CreateGEP(i8Ty17n, pv17, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fp");
                             fvn17         = builder_.CreateLoad(f64Ty17, fp17, "nfv");
                             setTBAA(fvn17, tbaaPvFvalTag_);
                         }
@@ -4788,7 +4815,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     builder_.CreateCondBr(isFlatU, fBBU, nBBU);
                     /* flat: load double directly from pval[] */
                     builder_.SetInsertPoint(fBBU);
-                    Value *pvalOffU = builder_.CreateConstInBoundsGEP1_64(i8Tu, innerRef, 8, "pvaloffu");
+                    Value *pvalOffU = builder_.CreateGEP(i8Tu, innerRef, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "pvaloffu");
                     Value *dblPtrU  = builder_.CreateLoad(perlPtrTy_, pvalOffU, "dblpu");
                     Value *epU      = builder_.CreateGEP(f64Tu, dblPtrU, idx17u, "epu");
                     Value *fvFlatU  = builder_.CreateLoad(f64Tu, epU, "fvflatu");
@@ -4803,7 +4830,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
                     Value *pvPtrU    = builder_.CreateGEP(perlPtrTy_, elemsU, idx17u, "ppu");
                     Value *pvU       = builder_.CreateLoad(perlPtrTy_, pvPtrU, "pvu");
                     setTBAA(pvU, tbaaAvElemTag_);
-                    Value *fvPtrU    = builder_.CreateConstInBoundsGEP1_64(i8Tu, pvU, 8, "fpu");
+                    Value *fvPtrU    = builder_.CreateGEP(i8Tu, pvU, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fpu");
                     Value *fvNormU   = builder_.CreateLoad(f64Tu, fvPtrU, "fvnu");
                     setTBAA(fvNormU, tbaaPvFvalTag_);
                     builder_.CreateBr(mBBU);
@@ -4823,7 +4850,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
                 Value *pvPtr17 = builder_.CreateGEP(perlPtrTy_, elems17, idx17, "pv.ptr");
                 Value *pv17    = builder_.CreateLoad(perlPtrTy_, pvPtr17, "pv");
                 setTBAA(pv17, tbaaAvElemTag_);
-                Value *fvPtr17 = builder_.CreateConstInBoundsGEP1_64(i8Ty17, pv17, 8, "fv.ptr");
+                Value *fvPtr17 = builder_.CreateGEP(i8Ty17, pv17, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fv.ptr");
                 Value *fv17    = builder_.CreateLoad(f64Ty17, fvPtr17, "fv");
                 setTBAA(fv17, tbaaPvFvalTag_);
                 return fv17;
@@ -4868,12 +4895,12 @@ Value *CodeGen::emitExprF64(const Node &n) {
                           if (n.right->kind == NK::IntLit &&
                               (n.right->ival == 0 || n.right->ival == 1)) {
                               if (n.right->ival == 0) {
-                                  Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
-                                      i8Ty, pv, 8, "fp.re.ptr");
+                                  Value *fvPtr = builder_.CreateGEP(
+                                      i8Ty, pv, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fp.re.ptr");
                                   pairFv = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
                               } else {
-                                  Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
-                                      i8Ty, pv, 16, "fp.im.ptr");
+                                  Value *mpPtr = builder_.CreateGEP(
+                                      i8Ty, pv, ConstantInt::get(Type::getInt64Ty(ctx_), 16), "fp.im.ptr");
                                   Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
                                   pairFv = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
                               }
@@ -4888,13 +4915,13 @@ Value *CodeGen::emitExprF64(const Node &n) {
                               auto *idxM = BasicBlock::Create(ctx_, "fp.idm", curFn);
                               builder_.CreateCondBr(idx0, reBB, imBB);
                               builder_.SetInsertPoint(reBB);
-                              Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(
-                                  i8Ty, pv, 8, "fp.re.ptr");
+                              Value *fvPtr = builder_.CreateGEP(
+                                  i8Ty, pv, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fp.re.ptr");
                               Value *reV = builder_.CreateLoad(f64Ty, fvPtr, "fp.re");
                               builder_.CreateBr(idxM);
                               builder_.SetInsertPoint(imBB);
-                              Value *mpPtr = builder_.CreateConstInBoundsGEP1_64(
-                                  i8Ty, pv, 16, "fp.im.ptr");
+                              Value *mpPtr = builder_.CreateGEP(
+                                  i8Ty, pv, ConstantInt::get(Type::getInt64Ty(ctx_), 16), "fp.im.ptr");
                               Value *mpBits = builder_.CreateLoad(i64Ty, mpPtr, "fp.im.bits");
                               Value *imV = builder_.CreateBitCast(mpBits, f64Ty, "fp.im");
                               builder_.CreateBr(idxM);
@@ -4912,7 +4939,7 @@ Value *CodeGen::emitExprF64(const Node &n) {
                           /* FLAT_ARRAY fast path: load double* from pval (offset 8),
                                GEP by index, load double directly */
                           builder_.SetInsertPoint(flatBB);
-                          Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fa.dp");
+                          Value *pvalPtr = builder_.CreateGEP(i8Ty, pv, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fa.dp");
                           Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "fa.dpp");
                           dblPtr = builder_.CreateBitCast(dblPtr, f64Ty->getPointerTo());
                           Value *idx = emitIdx(*n.right);
@@ -7591,7 +7618,7 @@ void CodeGen::emitStmt(const Node &n) {
                         Value *rowRefPP   = builder_.CreateGEP(perlPtrTy_, outerElems, idx, outerNm + "." + idxNm + ".rpp");
                         Value *rowRef     = builder_.CreateLoad(perlPtrTy_, rowRefPP, outerNm + "." + idxNm + ".rref");
                         setTBAA(rowRef, tbaaAvElemTag_);
-                        Value *pvalPtr    = builder_.CreateConstInBoundsGEP1_64(i8TyRD, rowRef, 8, outerNm + "." + idxNm + ".pp");
+                        Value *pvalPtr    = builder_.CreateGEP(i8TyRD, rowRef, ConstantInt::get(Type::getInt64Ty(ctx_), 8), outerNm + "." + idxNm + ".pp");
                         auto *fra = createEntryAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".fra");
                         auto *ra  = createEntryAlloca(perlPtrTy_, nullptr, outerNm + "." + idxNm + ".ra");
                         builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), fra);
@@ -7670,7 +7697,7 @@ void CodeGen::emitStmt(const Node &n) {
 
             builder_.SetInsertPoint(stepBB);
             Value *cur2 = builder_.CreateLoad(i64, counterAlloca);
-            builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1)),
+            builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(Type::getInt64Ty(ctx_), 1)),
                                  counterAlloca);
             {
                 auto *backBr = builder_.CreateBr(condBB2);
@@ -7714,7 +7741,7 @@ void CodeGen::emitStmt(const Node &n) {
 
         /* index counter */
         auto *idxAlloca = createEntryAlloca(i64, nullptr, "foreach.idx");
-        builder_.CreateStore(ConstantInt::get(i64, 0), idxAlloca);
+        builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(ctx_), 0), idxAlloca);
 
         auto *condBB = BasicBlock::Create(ctx_, "foreach.cond", fn);
 
@@ -7761,7 +7788,7 @@ void CodeGen::emitStmt(const Node &n) {
         builder_.SetInsertPoint(stepBB);
         Value *idx2 = builder_.CreateLoad(i64, idxAlloca);
         builder_.CreateStore(
-            builder_.CreateAdd(idx2, ConstantInt::get(i64, 1)), idxAlloca);
+            builder_.CreateAdd(idx2, ConstantInt::get(Type::getInt64Ty(ctx_), 1)), idxAlloca);
         builder_.CreateBr(condBB);
         loopExits_.pop_back();
         loopContinues_.pop_back();
@@ -8210,18 +8237,18 @@ void CodeGen::emitStmt(const Node &n) {
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *i64   = Type::getInt64Ty(ctx_);
         auto *iA    = createEntryAlloca(i64, nullptr, "us.i");
-        builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(i64, 1)), iA);
+        builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(Type::getInt64Ty(ctx_), 1)), iA);
         auto *condBB = BasicBlock::Create(ctx_, "us.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "us.body", fn);
         auto *exitBB = BasicBlock::Create(ctx_, "us.exit", fn);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
         Value *i = builder_.CreateLoad(i64, iA);
-        builder_.CreateCondBr(builder_.CreateICmpSGE(i, ConstantInt::get(i64, 0)), bodyBB, exitBB);
+        builder_.CreateCondBr(builder_.CreateICmpSGE(i, ConstantInt::get(Type::getInt64Ty(ctx_), 0)), bodyBB, exitBB);
         builder_.SetInsertPoint(bodyBB);
         Value *elem = callRT("perl_array_get_ref", {tmp, i});
         callRT("perl_array_unshift", {av, elem});
-        builder_.CreateStore(builder_.CreateSub(i, ConstantInt::get(i64, 1)), iA);
+        builder_.CreateStore(builder_.CreateSub(i, ConstantInt::get(Type::getInt64Ty(ctx_), 1)), iA);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(exitBB);
         break;
@@ -8864,7 +8891,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     auto *i64 = Type::getInt64Ty(ctx_);
                     Value *cur = builder_.CreateLoad(i64, ia);
                     bool isInc = (n.sval == "pre++" || n.sval == "post++");
-                    Value *delta = ConstantInt::get(i64, isInc ? 1 : -1);
+                    Value *delta = ConstantInt::get(Type::getInt64Ty(ctx_), isInc ? 1 : -1);
                     Value *next = builder_.CreateAdd(cur, delta, isInc ? "preinc" : "predec");
                     builder_.CreateStore(next, ia);
                     bool isPre = (n.sval == "pre++" || n.sval == "pre--");
@@ -9414,8 +9441,8 @@ Value *CodeGen::emitExpr(const Node &n) {
                 /* flat: extract double from rhs, store directly into double[] */
                 builder_.SetInsertPoint(fBB32);
                 Value *rhsF32    = callRT("perl_to_float", {rhs});
-                Value *pvalOff32 = builder_.CreateConstInBoundsGEP1_64(
-                                       i8T32, base, 8, "pvaloff32");
+                Value *pvalOff32 = builder_.CreateGEP(
+                                       i8T32, base, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "pvaloff32");
                 Value *dblPtr32  = builder_.CreateLoad(perlPtrTy_, pvalOff32, "dblp32");
                 Value *ep32      = builder_.CreateGEP(f64T32, dblPtr32, idx, "ep32");
                 auto *fst32 = builder_.CreateStore(rhsF32, ep32);
@@ -9707,7 +9734,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     builder_.SetInsertPoint(chkBB);
                     builder_.CreateCondBr(isFlat, fBB, nBB);
                     builder_.SetInsertPoint(fBB);
-                    Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(i8T, base, 8, "lva.pv");
+                    Value *pvalPtr = builder_.CreateGEP(i8T, base, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "lva.pv");
                     Value *dblPtr = builder_.CreateLoad(perlPtrTy_, pvalPtr, "lva.dp");
                     builder_.CreateBr(mBB);
                     auto *fBBp = builder_.GetInsertBlock();
@@ -9988,7 +10015,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                                         Value *pvPtr18 = builder_.CreateGEP(perlPtrTy_, elems18, idx18, "pp");
                                         Value *pv18    = builder_.CreateLoad(perlPtrTy_, pvPtr18, "pv");
                                         setTBAA(pv18, tbaaAvElemTag_);
-                                        Value *fvPtr18 = builder_.CreateConstInBoundsGEP1_64(i8Ty18, pv18, 8, "fp");
+                                        Value *fvPtr18 = builder_.CreateGEP(i8Ty18, pv18, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fp");
                                         Value *lhsN    = builder_.CreateLoad(f64Ty18, fvPtr18, "lhsn");
                                         setTBAA(lhsN, tbaaPvFvalTag_);
                                         Value *newN    = applyF64(lhsN, rhsF);  /* reuse rhsF */
@@ -10094,7 +10121,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *pvPtr = builder_.CreateGEP(perlPtrTy_, elems, idx, "pv.ptr");
                     Value *pv    = builder_.CreateLoad(perlPtrTy_, pvPtr, "pv");
                     setTBAA(pv, tbaaAvElemTag_);
-                    Value *fvPtr = builder_.CreateConstInBoundsGEP1_64(i8Ty, pv, 8, "fv.ptr");
+                    Value *fvPtr = builder_.CreateGEP(i8Ty, pv, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fv.ptr");
                     Value *lhsF  = builder_.CreateLoad(f64Ty, fvPtr, "lhsf");
                     setTBAA(lhsF, tbaaPvFvalTag_);
                     Value *rhsF  = emitExprF64(*n.right);
@@ -10315,18 +10342,18 @@ Value *CodeGen::emitExpr(const Node &n) {
         auto *fn    = builder_.GetInsertBlock()->getParent();
         auto *i64   = Type::getInt64Ty(ctx_);
         auto *iA    = createEntryAlloca(i64, nullptr, "us2.i");
-        builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(i64, 1)), iA);
+        builder_.CreateStore(builder_.CreateSub(tmpLen, ConstantInt::get(Type::getInt64Ty(ctx_), 1)), iA);
         auto *condBB = BasicBlock::Create(ctx_, "us2.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "us2.body", fn);
         auto *exitBB = BasicBlock::Create(ctx_, "us2.exit", fn);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
         Value *i = builder_.CreateLoad(i64, iA);
-        builder_.CreateCondBr(builder_.CreateICmpSGE(i, ConstantInt::get(i64, 0)), bodyBB, exitBB);
+        builder_.CreateCondBr(builder_.CreateICmpSGE(i, ConstantInt::get(Type::getInt64Ty(ctx_), 0)), bodyBB, exitBB);
         builder_.SetInsertPoint(bodyBB);
         Value *elem = callRT("perl_array_get_ref", {tmp, i});
         callRT("perl_array_unshift", {av, elem});
-        builder_.CreateStore(builder_.CreateSub(i, ConstantInt::get(i64, 1)), iA);
+        builder_.CreateStore(builder_.CreateSub(i, ConstantInt::get(Type::getInt64Ty(ctx_), 1)), iA);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(exitBB);
         return callRT("perl_array_len", {av});
@@ -10874,7 +10901,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *udPv    = perlUndef();
         builder_.CreateStore(udPv, udAlloca);
         auto *iAlloca = createEntryAlloca(i64, nullptr, "fan.i");
-        builder_.CreateStore(ConstantInt::get(i64, 0), iAlloca);
+        builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(ctx_), 0), iAlloca);
 
         auto *condBB = BasicBlock::Create(ctx_, "fan.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "fan.body", fn);
@@ -10925,7 +10952,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
 
         builder_.SetInsertPoint(nextBB);
-        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(Type::getInt64Ty(ctx_), 1));
         builder_.CreateStore(i2, iAlloca);
         builder_.CreateBr(condBB);
 
@@ -10963,13 +10990,13 @@ Value *CodeGen::emitExpr(const Node &n) {
 
         /* accumulator starts as first element */
         auto *accAlloca = createEntryAlloca(perlPtrTy_, nullptr, "red.acc");
-        Value *first    = callRT("perl_array_get_ref", {inputArr, ConstantInt::get(i64, 0)});
+        Value *first    = callRT("perl_array_get_ref", {inputArr, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
         Value *accCell  = callRT("perl_alloc_undef", {});
         callRT("perl_assign", {accCell, first});
         builder_.CreateStore(accCell, accAlloca);
 
         auto *iAlloca = createEntryAlloca(i64, nullptr, "red.i");
-        builder_.CreateStore(ConstantInt::get(i64, 1), iAlloca); /* start from index 1 */
+        builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(ctx_), 1), iAlloca); /* start from index 1 */
 
         auto *condBB = BasicBlock::Create(ctx_, "red.cond", fn);
         auto *bodyBB = BasicBlock::Create(ctx_, "red.body", fn);
@@ -11005,7 +11032,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* update accumulator */
         callRT("perl_assign", {builder_.CreateLoad(perlPtrTy_, accAlloca), blockResult});
 
-        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(i64, 1));
+        Value *i2 = builder_.CreateAdd(i, ConstantInt::get(Type::getInt64Ty(ctx_), 1));
         builder_.CreateStore(i2, iAlloca);
         builder_.CreateBr(condBB);
 
@@ -11079,8 +11106,8 @@ Value *CodeGen::emitExpr(const Node &n) {
                 auto *f64Ty = Type::getDoubleTy(ctx_);
                 Value *nElems  = ConstantInt::get(i64Ty, (long long)n.args.size(), true);
                 Value *flatPV  = callRT("perl_alloc_float_array", {nElems});
-                Value *pvalPtr = builder_.CreateConstInBoundsGEP1_64(
-                    i8Ty, flatPV, 8, "flat.pval.ptr");
+                Value *pvalPtr = builder_.CreateGEP(
+                    i8Ty, flatPV, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "flat.pval.ptr");
                 Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "flat.dbl");
                 for (int i = 0; i < (int)n.args.size(); i++) {
                     Value *fv = emitExprF64(*n.args[i]);
@@ -13225,7 +13252,7 @@ Value *CodeGen::emitI64OverflowCheckedBinOp(const Node &n) {
                       : n.sval == "-" ? Intrinsic::ssub_with_overflow
                                       : Intrinsic::smul_with_overflow;
     auto *i64 = Type::getInt64Ty(ctx_);
-    Function *intr = Intrinsic::getDeclaration(mod_.get(), id, {i64});
+    Function *intr = IntrinsicGetDeclaration(mod_.get(), id, {i64});
     Value *pair = builder_.CreateCall(intr, {lv, rv});
     Value *rawResult = builder_.CreateExtractValue(pair, 0);
     Value *overflowed = builder_.CreateExtractValue(pair, 1);
@@ -13390,9 +13417,9 @@ Value *CodeGen::emitBinOp(const Node &n) {
                     Value *lt = builder_.CreateICmpSLT(lv, rv, "ss.lt");
                     Value *gt = builder_.CreateICmpSGT(lv, rv, "ss.gt");
                     Value *r = builder_.CreateSelect(
-                        lt, ConstantInt::get(i64, -1),
-                        builder_.CreateSelect(gt, ConstantInt::get(i64, 1),
-                                               ConstantInt::get(i64, 0), "ss.mid"),
+                        lt, ConstantInt::get(Type::getInt64Ty(ctx_), -1),
+                        builder_.CreateSelect(gt, ConstantInt::get(Type::getInt64Ty(ctx_), 1),
+                                               ConstantInt::get(Type::getInt64Ty(ctx_), 0), "ss.mid"),
                         "spaceship");
                     return boxI64(r);
                 }
@@ -15762,6 +15789,13 @@ Value *CodeGen::emitCall(const Node &n) {
 
 void CodeGen::runOptimization() {
     if (optLevel_ <= 0) return;
+
+#if LLVM_VERSION_MAJOR >= 22
+    /* LLVM 22: legacy PM creates attributes (nocallback, nocreateundeforpoison)
+       and GEPs (inbounds nuw i8) that the legacy IR writer can't serialize.
+       Skip optimization entirely — the backend does its own combining. */
+    return;
+#endif
 
     if (verifyModule(*mod_, &errs())) {
         errs() << "IR verification failed before optimization\n";
