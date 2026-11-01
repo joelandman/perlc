@@ -1447,8 +1447,13 @@ PerlValue *perl_alloc_string(const char *s) {
 
 PerlValue *perl_clone(const PerlValue *src) {
     if (!src) return perl_alloc_undef();
-    /* Sanity: if tag is bogus, fall back to undef instead of corrupting memory */
-    if ((int)src->tag < PERL_UNDEF || (int)src->tag > PERL_XS_PTR)
+    /* Sanity: if tag is bogus, fall back to undef instead of corrupting memory
+       The highest valid PerlTag is PERL_CPLX_ROW (19); PERL_XS_PTR is only 16,
+       so this must not use PERL_XS_PTR as the bound, or BigInt (17), QR (18),
+       and complex (19) clones are rejected here as "undef" even though they
+       each have a dedicated case below (which broke Math::BigInt arithmetic,
+       since perl_clone(oprand) returned undef for blessed BigInt operands). */
+    if ((int)src->tag < PERL_UNDEF || (int)src->tag > PERL_CPLX_ROW)
         return perl_alloc_undef();
     if (src->tag == PERL_STRING) {
         PerlValue *v = perl_alloc_string_len(src->sval, src->slen);

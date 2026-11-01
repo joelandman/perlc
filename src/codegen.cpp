@@ -1596,7 +1596,14 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *str;
         if (n.right) str = emitExpr(*n.right);
         else if (auto *slot = lookupVar("_")) str = builder_.CreateLoad(perlPtrTy_, slot);
-        else str = perlUndef();
+        /* $_ is the GLOBAL $_ cell unless a lexical shadows it (a map /
+            foreach loop variable, or a sub that uses $_) - in which case the
+            lookupVar("_") branch above handles it. At file scope `local $_
+            = ...` mutates the global cell directly (no lexical slot), so
+            lookupVar("_") is NULL and perlUndef() would split nothing; fetch
+            the current global cell instead, matching `local $_` and the
+            runtime no-arg string ops (perl_get_dollar_under). */
+        else str = callRT("perl_get_dollar_under", {});
         /* D118: optional 3rd LIMIT argument, stored in n.args[0] if given. */
         Value *limit = n.args.empty()
             ? ConstantInt::get(Type::getInt64Ty(ctx_), 0, true)
@@ -10492,7 +10499,14 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *str;
         if (n.right) str = emitExpr(*n.right);
         else if (auto *slot = lookupVar("_")) str = builder_.CreateLoad(perlPtrTy_, slot);
-        else str = perlUndef();
+        /* $_ is the GLOBAL $_ cell unless a lexical shadows it (a map /
+            foreach loop variable, or a sub that uses $_) - in which case the
+            lookupVar("_") branch above handles it. At file scope `local $_
+            = ...` mutates the global cell directly (no lexical slot), so
+            lookupVar("_") is NULL and perlUndef() would split nothing; fetch
+            the current global cell instead, matching `local $_` and the
+            runtime no-arg string ops (perl_get_dollar_under). */
+        else str = callRT("perl_get_dollar_under", {});
         /* D118: optional 3rd LIMIT argument, stored in n.args[0] if given. */
         Value *limit = n.args.empty()
             ? ConstantInt::get(Type::getInt64Ty(ctx_), 0, true)

@@ -167,11 +167,14 @@ run_one() {
     c_out=$(mktemp)
     c_bin=$(mktemp)
 
-    # Run under perl
-    if ! timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1; then
-        # Some tests are expected to die (eval tests etc.). Capture anyway.
-        :
-    fi
+    # Run under perl. Capture exit status: most tests exit 0, but some are
+    # designed to die (caught by eval, they print their verdict and exit 0);
+    # a few exit non-zero. We only act on non-zero when perl could not START
+    # the program at all — see the perl-start-skip check below. Capture the
+    # status directly (capturing it inside an `if ! cmd; then` block would
+    # read the negated status and always see 0).
+    perl_rc=0
+    timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1 || perl_rc=$?
 
     # Compile with perlc (if binary exists)
     if [[ ! -x "$PERLC_BIN" ]]; then
@@ -198,6 +201,19 @@ run_one() {
         log "FAIL $base (perlc did not produce executable)"
         rm -f "$p_out" "$c_out" "$c_bin" "$compile_log"
         return 1
+    fi
+
+    # If perl itself could not START the program (a missing module, a parse
+    # error, or any other fatal compile-time failure) then there is no
+    # reference behavior to compare against — the compiled binary is
+    # uncomparable. That is an environment limitation, not a perlc
+    # correctness bug, so report SKIP rather than FAIL. perlc's own compile
+    # failure is still caught by the check above (it returns before here).
+    if [[ $perl_rc -ne 0 ]] \
+        && grep -qE 'Can.t locate .* in @INC|BEGIN failed--compilation aborted|Unrecognized character|[Ss]yntax error|String where operator expected|Unterminated' "$p_out"; then
+        printf 'SKIP %s (perl could not start the program — environment: install the missing module or make the test source portable)\n' "$base"
+        rm -f "$p_out" "$c_out" "$c_bin" "$compile_log"
+        return 0
     fi
 
     if ! timeout "$test_timeout" "$c_bin" $args >"$c_out" 2>&1; then
