@@ -1750,7 +1750,7 @@ int main(int argc, char **argv) {
                state (method dispatch table, $@, PV allocator, etc.) as
                the program that do'd it, instead of getting an isolated
                second copy of every runtime global. */
-            std::string cmd = "clang-18 -O" + std::to_string(optLevel) +
+            std::string cmd = "clang-22 -O" + std::to_string(optLevel) +
                                " -march=native -Wno-atomic-alignment -shared -fPIC";
             if (debugSymbols) cmd += " -g";
             cmd += " " + tmpIR;
@@ -1764,7 +1764,7 @@ int main(int argc, char **argv) {
         }
 
         /* String-eval (JIT) removed; eval EXPR sets $@ and returns undef. */
-        std::string cmd = "clang-18 -O" + std::to_string(optLevel) + " -march=native"
+        std::string cmd = "clang-22 -O" + std::to_string(optLevel) + " -march=native"
                             " -Wno-atomic-alignment -rdynamic"
                             " -DPERLC_SELF_PATH=\"\\\"" + selfPath + "\\\"\"";
          if (debugSymbols) cmd += " -g";
