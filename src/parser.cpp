@@ -500,11 +500,18 @@ bool Parser::scanBraceHashLike() {
 
 NodePtr Parser::parseBlock() {
     int line = cur().line;
+    /* block-scoped package: a `package` declared inside the block reverts to
+       the enclosing package on exit. Without this, `package Signatures;` inside
+       a bare `{ ... }` block leaks — every sub declared after the block (even
+       at file scope) is qualified with the wrong package, so a normal call
+       becomes an unknown-bareword "predeclare" error (see zipdetails). */
+    std::string savedPackage = currentPackage_;
     consume(TK::LBRACE, "{");
     NodeList stmts;
     while (!check(TK::RBRACE) && !check(TK::EOF_TOK))
         stmts.push_back(parseStmt());
     consume(TK::RBRACE, "}");
+    currentPackage_ = savedPackage;
     return makeBlock(std::move(stmts), line);
 }
 

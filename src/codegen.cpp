@@ -6134,10 +6134,29 @@ Value *CodeGen::emitBlock(const Node &n) {
         builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     }
     pushScope();
-    for (auto &stmt : n.args) {
-        emitStmt(*stmt);
-        /* Don't stop on a terminator: goto leaves a dead BB, but a later
-           LabelStmt still needs to be emitted into its own block. */
+    /* Package changes inside a block are block-scoped in real Perl
+       (`{ package Foo; ... }` reverts to the enclosing package on exit).
+       Without this restore, a `package` inside a bare block at file scope
+       (e.g. zipdetails' `{ package Signatures; ... }`) leaks: every sub
+       defined afterward resolves against the wrong package, so a normal
+       `sub f` call becomes an unknown-call "predeclare" error. */
+    std::string savedPackage = currentPackage_;
+    for (size_t i = 0; i < n.args.size(); ++i) {
+        emitStmt(*n.args[i]);
+        /* An unconditional terminator (`return;`, `die`, or an eval-block
+           early return) makes every following statement unreachable. Stop
+           emitting them: emitting instructions after a terminator in the same
+           basic block is an LLVM "terminator in the middle of a block" verify
+           error, and they'd never run at runtime (matching real Perl, which
+           treats post-return code as dead). Trailing LABELs are the one
+           exception — a `goto LABEL` can still reach a label that follows an
+           early return, and LabelStmt starts its own block (coping with a
+           pending terminator), so keep emitting those. */
+        if (builder_.GetInsertBlock()->getTerminator()) {
+            bool trailingLabel = i + 1 < n.args.size() &&
+                                 n.args[i + 1]->kind == NK::LabelStmt;
+            if (!trailingLabel) break;
+        }
     }
     /* D189: restore before popping scope — see the identical fix (and
        full explanation) in emitBlockLast() just below. This is the
@@ -6147,6 +6166,7 @@ Value *CodeGen::emitBlock(const Node &n) {
        ordering, previously backwards here too. */
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
+    currentPackage_ = savedPackage;
     popScope();
     return nullptr;
 }
@@ -6161,6 +6181,10 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     }
     pushScope();
+    /* Package changes inside a block are block-scoped in real Perl; restore
+       the enclosing package on exit so a `package` inside a bare block can't
+       leak and misattribute subs defined afterward (see emitBlock). */
+    std::string savedPackage = currentPackage_;
     /* Stage 27b: start with null; allocate only if no expr provides a value.
        Avoids a dead alloc_undef when the block's return value is unused (e.g.
        advance() implicit-return undef — caller always frees it, but we delay
@@ -6257,6 +6281,16 @@ Value *CodeGen::emitBlockLast(const Node &n) {
             }
         } else {
             emitStmt(*work);
+            /* An unconditional terminator (a `return;` / `die` mid-body) makes
+               following statements unreachable. Stop emitting them: post-
+               terminator code in the same block is an LLVM verify error and
+               never runs at runtime. Trailing LABELs are the one exception
+               (a `goto LABEL` can still reach such a label). */
+            if (builder_.GetInsertBlock()->getTerminator()) {
+                bool trailingLabel = i + 1 < n.args.size() &&
+                                     n.args[i + 1]->kind == NK::LabelStmt;
+                if (!trailingLabel) break;
+            }
         }
     }
     /* Clone result before popScope() frees variables it may reference.
@@ -6284,6 +6318,7 @@ Value *CodeGen::emitBlockLast(const Node &n) {
        } f(); <anything allocating more PerlValues afterward>`. */
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
+    currentPackage_ = savedPackage;
     popScope();
     if (!result || llvm::isa<llvm::ConstantPointerNull>(result))
         result = llvm::ConstantPointerNull::get(perlPtrTy_);
@@ -7149,6 +7184,35 @@ void CodeGen::emitStmt(const Node &n) {
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *merge = BasicBlock::Create(ctx_, "if.end", fn);
 
+        /* D-dominator: hoist `my $var` declared in an IF/ELSEIF condition into
+           the pre-header (the block we're currently inserting into, before any
+           condbr) so its PerlValue* (undef placeholder) allocation dominates
+           the merge block. The branch loop below emits each elsif branch's
+           cond *inside the previous branch's else block* (emitExpr at
+           NK::If), and that block does not dominate the merge; popScope() /
+           emitScopeCleanup() then frees the placeholder at function exit,
+           landing in the merge where it is not dominated -- LLVM's
+           "Instruction does not dominate all uses" verifier error.
+           Allocating once up front fixes it. Each branch still assigns its
+           initializer in its own entry block below, so the my's value is only
+           set when that branch is actually taken. */
+        std::vector<Value *>          hoistedCondPv;
+        std::vector<const Node *>     hoistedCondNodes;
+        std::vector<const Node *>     hoistedCondRhs; /* nullptr == no init */
+        for (auto &br : n.branches) {
+            if (!br.cond || br.cond->kind != NK::My) continue;
+            if (br.cond->name.empty() || br.cond->name[0] != '$') continue;
+            std::string nm = br.cond->name.substr(1);
+            auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, br.cond->name);
+            Value *pv = perlUndef();
+            builder_.CreateStore(pv, alloca);
+            trackPv(pv);
+            declareVar(nm, alloca);
+            hoistedCondPv.push_back(pv);
+            hoistedCondNodes.push_back(br.cond.get());
+            hoistedCondRhs.push_back(br.cond->right.get());
+        }
+
         for (size_t i = 0; i < n.branches.size(); i++) {
             auto &br = n.branches[i];
             if (!br.cond) {
@@ -7158,13 +7222,35 @@ void CodeGen::emitStmt(const Node &n) {
                     builder_.CreateBr(merge);
                 break;
             }
-            Value *bv = tryEmitI1Cond(*br.cond);
-            if (!bv) {
-                Value *cond = emitExpr(*br.cond);
-                Value *b    = callRT("perl_is_true", {cond});
-                freeIfOwned(cond);
+            bool hoistedMy = br.cond->kind == NK::My && !br.cond->name.empty()
+                             && br.cond->name[0] == '$';
+            Value *bv;
+            if (hoistedMy) {
+                /* Locate this branch's hoisted placeholder + initializer. */
+                Value *pvH = nullptr; const Node *rhs = nullptr;
+                for (size_t k = 0; k < hoistedCondNodes.size(); k++)
+                    if (hoistedCondNodes[k] == br.cond.get()) {
+                        pvH = hoistedCondPv[k];
+                        rhs = hoistedCondRhs[k];
+                        break;
+                    }
+                if (rhs) {
+                    Value *init = emitExpr(*rhs);
+                    callRT("perl_assign", {pvH, init});
+                    freeIfOwned(init);
+                }
+                Value *b = callRT("perl_is_true", {pvH});
                 bv = builder_.CreateICmpNE(b,
                             ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+            } else {
+                bv = tryEmitI1Cond(*br.cond);
+                if (!bv) {
+                    Value *cond = emitExpr(*br.cond);
+                    Value *b    = callRT("perl_is_true", {cond});
+                    freeIfOwned(cond);
+                    bv = builder_.CreateICmpNE(b,
+                                ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+                }
             }
             auto *thenBB = BasicBlock::Create(ctx_, "if.then", fn);
             auto *elseBB = BasicBlock::Create(ctx_, "if.else", fn);
@@ -15663,6 +15749,20 @@ Value *CodeGen::emitCall(const Node &n) {
         return ret;
     }
     std::string resolvedSub = definedSubName(*mod_, n.name);
+    /* Intra-package bareword call: an unqualified sub call `cleanEval`
+       inside `package TextEncoding` means TextEncoding::cleanEval.
+       definedSubName() only handles the main:: prefix, so qualify the name
+       against the current package when the bareword call is unqualified and
+       that package-qualified sub actually exists in the module. Only then, so
+       a genuinely undefined sub still falls through to the predeclare/
+       runtime-error paths (real Perl also fails on those). */
+    if (n.name.find("::") == std::string::npos &&
+        resolvedSub.find("::") == std::string::npos &&
+        !currentPackage_.empty() && currentPackage_ != "main") {
+        std::string qual = currentPackage_ + "::" + n.name;
+        if (mod_->getFunction(subLLVMName(qual)))
+            resolvedSub = qual;
+    }
     if (auto *fn = mod_->getFunction(subLLVMName(resolvedSub))) {
         /* Use push_nc (no-clone) for scalar args so we skip 63M clone/free per
            mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
