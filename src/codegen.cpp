@@ -1229,6 +1229,8 @@ void CodeGen::popScope() {
     pairScopes_.pop_back();
 }
 
+ScopeGuard::~ScopeGuard() { cg_.popScope(); }
+
 Value *CodeGen::lookupVar(const std::string &nm) {
     /* Try both with and without sigil prefix ($/@/%). Variables are stored
        without sigil (see declareVar), but callers sometimes pass with sigil. */
@@ -6134,6 +6136,7 @@ Value *CodeGen::emitBlock(const Node &n) {
         builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     }
     pushScope();
+    ScopeGuard guard{*this};
     /* Package changes inside a block are block-scoped in real Perl
        (`{ package Foo; ... }` reverts to the enclosing package on exit).
        Without this restore, a `package` inside a bare block at file scope
@@ -6167,7 +6170,6 @@ Value *CodeGen::emitBlock(const Node &n) {
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     currentPackage_ = savedPackage;
-    popScope();
     return nullptr;
 }
 
@@ -6181,6 +6183,7 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         builder_.CreateStore(callRT("perl_local_save_depth", {}), bdAlloca);
     }
     pushScope();
+    ScopeGuard guard{*this};
     /* Package changes inside a block are block-scoped in real Perl; restore
        the enclosing package on exit so a `package` inside a bare block can't
        leak and misattribute subs defined afterward (see emitBlock). */
@@ -6319,7 +6322,6 @@ Value *CodeGen::emitBlockLast(const Node &n) {
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     currentPackage_ = savedPackage;
-    popScope();
     if (!result || llvm::isa<llvm::ConstantPointerNull>(result))
         result = llvm::ConstantPointerNull::get(perlPtrTy_);
     return result;

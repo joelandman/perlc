@@ -15,6 +15,29 @@
 /* A scope frame maps variable names → alloca (PerlValue*) */
 using Scope = std::unordered_map<std::string, llvm::Value *>;
 
+/* Forward declaration — ScopeGuard (below) references the full CodeGen type. */
+class CodeGen;
+
+/* RAII guard that pops the current Perl scope when the enclosing function
+   exits — normally OR via exception unwinding. Without this, a C++ exception
+   thrown mid-codegen (e.g. a parse/emit error inside a nested block) would
+   unwind past the matching popScope(), leaking one scope frame. The *next*
+   enclosing emitBlock/emitBlockLast would then popScope() the wrong (outer)
+   frame, leaving the innermost frame dangling: its scope size never returned
+   to the file-scope depth, so file-scope `my` scalars were misclassified and
+   emitted to a local alloca instead of a package global (making them
+   invisible to subs). Register enter() right after pushScope(); the destructor
+   always pops exactly once. */
+class ScopeGuard {
+public:
+    explicit ScopeGuard(CodeGen &cg) : cg_(cg) {}
+    ~ScopeGuard();
+    ScopeGuard(const ScopeGuard &) = delete;
+    ScopeGuard &operator=(const ScopeGuard &) = delete;
+private:
+    CodeGen &cg_;
+};
+
 class CodeGen {
 public:
     CodeGen(bool debug = false, int optLevel = 0);
@@ -301,6 +324,9 @@ private:
 
     void pushScope();
     void popScope();
+    /* ScopeGuard (a scoped RAII helper) needs to call popScope() on unwind;
+       grant it access here. */
+    friend class ScopeGuard;
     llvm::Value *lookupVar(const std::string &name);
     bool isGlobName(const std::string &name) const;
     void declareVar(const std::string &name, llvm::Value *alloca);
