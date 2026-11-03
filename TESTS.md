@@ -28,6 +28,7 @@ deep test, verified byte-for-byte against real Perl.
 | `make test-optN` | `./perlc` | the `make test-all` set, compiled with `-ON` | yes | `FAIL: 0`. N is 0–5. `make test-opt` with no digit exits 2 |
 | `make test-opt-matrix` | `./perlc` | the full diff three times, at `-O0`, `-O2`, `-O3` | yes | three `FAIL: 0` summaries |
 | `make bench` | `./perlc` | `bench/bench.sh` on `bench/*.pl` | times only, writes `bench/results.csv` | CSV rows `name,perlc_ms,perl_ms,ratio` |
+| `make bench-regress` | `./perlc` | `bench/regress.sh` on `fibn`/`nb`/`regex_heavy` | perlc run-time vs committed `bench/baseline.csv` (not vs perl) | exit 0 + `RESULT: PASS`; exit 1 if any benchmark regresses past `BENCH_TOLERANCE` (default 10%). Record a new baseline with `./bench/regress.sh --fix`. |
 
 `tests/harness.sh` is the diff runner behind `test-all`, `test-smoke`,
 `test-assertion`, `test-full`, `test-optN`, and `test-opt-matrix`.

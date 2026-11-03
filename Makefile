@@ -54,7 +54,7 @@ TSAN_TESTS := tests/threads.pl tests/threads_atomic.pl tests/destroy.pl
 
 OPT_TARGETS := test-opt0 test-opt1 test-opt2 test-opt3 test-opt4 test-opt5
 
-.PHONY: all help clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt $(OPT_TARGETS) test-opt-matrix test-valgrind test-tsan-full test-realworld gap
+.PHONY: all help clean test test-all test-smoke test-assertion test-tsan test-full bench bench-regress test-opt $(OPT_TARGETS) test-opt-matrix test-valgrind test-tsan-full test-realworld gap bench-regress
 
 all: $(TARGET)
 
@@ -84,6 +84,8 @@ help:
 	@echo "make test-opt-matrix"
 	@echo "                Full diff gate at -O0, -O2, and -O3"
 	@echo "make bench      Time bench/*.pl against real perl (see BENCH_ARGS)"
+	@echo "make bench-regress"
+	@echo "                Gate: perlc runtime vs bench/baseline.csv (fails on regression)"
 	@echo "Workflows, success lines, and skips: README.md, section Build and test."
 
 $(TARGET): $(OBJS) $(RT_OBJ)
@@ -219,3 +221,10 @@ test-opt-matrix: $(TARGET)
 
 bench: $(TARGET)
 	@./bench/bench.sh $(BENCH_ARGS)
+
+# Performance guard: fails (exit != 0) if perlc has regressed vs the committed
+# baseline/baseline.csv beyond BENCH_TOLERANCE (default 10%). Fast iterations:
+# BENCH_RUNS=1 make bench-regress. Record a new known-good baseline with:
+#   ./bench/regress.sh --fix
+bench-regress: $(TARGET)
+	@./bench/regress.sh $(BENCH_ARGS)
