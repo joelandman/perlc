@@ -1582,6 +1582,20 @@ HOTX void perl_free(PerlValue *v) {
         v->flags |= PV_FLAG_CAPTURE_RELEASED;
         return;
     }
+    /* Fast path: a no-payload leaf (UNDEF/INT/FLOAT) has no heap string,
+       no array/bigint/closure payload, no DESTROY hook, and can never be
+       blessed, so the only thing a free actually does is return the struct
+       to the pool. Skip the full ~12-tag teardown ladder and the
+       free(v->blessed_class=NULL) call. In hot numeric paths — fib
+       recursion, tight numeric loops (nb.pl) — virtually every freed value
+       is exactly this, so this turns a branch chain + an extra free()
+       into two checks and a pool push. Behaviour-identical: for these
+       tags the slow path frees nothing and also sets flags=0 before pooling. */
+    if (v->tag < PERL_REF_SCALAR) {
+        v->flags = 0;
+        pv_pool_push(v);
+        return;
+    }
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
     if (v->tag == PERL_CPLX_ROW && v->pval) {
