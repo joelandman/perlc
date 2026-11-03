@@ -1768,6 +1768,14 @@ int main(int argc, char **argv) {
                             " -Wno-atomic-alignment -rdynamic"
                             " -DPERLC_SELF_PATH=\"\\\"" + selfPath + "\\\"\"";
          if (debugSymbols) cmd += " -g";
+#if defined(PERLC_GAP_TRACE)
+         /* Phase-0: propagate the gap-detector instrumentation into the
+             compiled binary.  Only emitted when perlc itself was built with
+             -DPERLC_GAP_TRACE; even then PERLC_GAPS must be set at run time
+             (see runtime.c), so a perlc built without the define produces a
+             user binary with zero instrumentation cost. */
+         cmd += " -DPERLC_GAP_TRACE";
+#endif
          cmd += " " + tmpIR + " " + rtSrc + " " + mgmpSrc + " " + nstSrc;
          cmd += " -o " + outputFile + " -lm -lpcre2-8 -lsqlite3 -latomic -ldl -lcrypto 2>&1";
         if (verbose) std::cerr << "[link] " << cmd << "\n";

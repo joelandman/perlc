@@ -7,7 +7,26 @@ LLVM_CXXFLAGS := $(shell $(LLVM_CFG) --cxxflags)
 # problem with LLVM 18 + clang-18 + gcc-16 libstdc++ on this host.
 FORCE_STD := -include src/force_complete_std.h
 
-CXXFLAGS := -std=c++17 -g -Wall -Wno-unused-function -Wno-atomic-alignment -fexceptions -mcx16 -I/usr/lib/llvm-22/include -include src/force_complete_std.h
+# Phase-0 runtime gap detector (see tools/gap_report.py). The default build
+# is ZERO-COST: the detector is not compiled in at all.  `make TRACE=1`
+# rebuilds ./perlc with -DPERLC_GAP_TRACE; the instrumentation then runs only
+# when the compiled binary is launched with PERLC_GAPS set (see runtime.c).
+TRACE_DEFINE :=
+ifeq ($(TRACE),1)
+TRACE_DEFINE := -DPERLC_GAP_TRACE
+endif
+
+# Stamp recording the requested TRACE state. Toggling TRACE rewrites the
+# stamp (fresh mtime), which forces a rebuild of the two TUs that carry the
+# -DPERLC_GAP_TRACE define — make keys off file mtimes, not flags, so absent
+# this a stale trace build would otherwise linger after `make TRACE=1`
+# followed by `make`.
+TRACE_FLAG := .perlc_trace_flag
+FORCE:
+$(TRACE_FLAG): FORCE
+	@if [ ! -f $@ ] || [ "$$(cat $@ 2>/dev/null)" != "$(TRACE)" ]; then printf '%s' "$(TRACE)" > $@; fi
+
+CXXFLAGS := -std=c++17 -g -Wall -Wno-unused-function -Wno-atomic-alignment -fexceptions -mcx16 -I/usr/lib/llvm-22/include -include src/force_complete_std.h $(TRACE_DEFINE)
 
 TSAN_CXXFLAGS := $(CXXFLAGS) -fsanitize=thread -fno-omit-frame-pointer
 TSAN_CFLAGS := $(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer
@@ -15,7 +34,7 @@ TSAN_CFLAGS := $(CFLAGS) -fsanitize=thread -fno-omit-frame-pointer
 LDFLAGS  := $(shell $(LLVM_CFG) --ldflags) $(shell $(LLVM_CFG) --libs core native) -lpthread -ldl -lpcre2-8 -lsqlite3 -latomic -lcrypto
 
 CC       := clang-18
-CFLAGS   := -g -O2 -mcx16 -Wno-atomic-alignment
+CFLAGS   := -g -O2 -mcx16 -Wno-atomic-alignment $(TRACE_DEFINE)
 
 SRCDIR   := src
 OBJS     := $(SRCDIR)/main.o $(SRCDIR)/lexer.o $(SRCDIR)/parser.o $(SRCDIR)/codegen.o $(SRCDIR)/ast.o $(SRCDIR)/llvm_early_init.o
@@ -35,7 +54,7 @@ TSAN_TESTS := tests/threads.pl tests/threads_atomic.pl tests/destroy.pl
 
 OPT_TARGETS := test-opt0 test-opt1 test-opt2 test-opt3 test-opt4 test-opt5
 
-.PHONY: all help clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt $(OPT_TARGETS) test-opt-matrix test-valgrind test-tsan-full test-realworld
+.PHONY: all help clean test test-all test-smoke test-assertion test-tsan test-full bench test-opt $(OPT_TARGETS) test-opt-matrix test-valgrind test-tsan-full test-realworld gap
 
 all: $(TARGET)
 
@@ -51,6 +70,11 @@ help:
 	@echo "make test-full  Same as make test-all"
 	@echo "make test-realworld"
 	@echo "                Compile the system-script corpus; do not run the binaries"
+	@echo "make gap"
+	@echo "                Phase-0 runtime gap inventory: build a trace-enabled perlc,"
+	@echo "                run each successfully-compiled real-world script with"
+	@echo "                PERLC_GAPS to record unresolved runtime substitutions, and"
+	@echo "                print a per-target checklist + corpus triage queue."
 	@echo "make test-tsan  ThreadSanitizer on threads.pl, threads_atomic.pl, destroy.pl"
 	@echo "make test-tsan-full"
 	@echo "                ThreadSanitizer on every tests/*.pl except DBI/XS"
@@ -68,7 +92,7 @@ $(TARGET): $(OBJS) $(RT_OBJ)
 $(TSAN_TARGET): $(TSAN_OBJS) $(TSAN_RT_OBJ)
 	$(CXX) $(TSAN_CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h
+$(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h $(TRACE_FLAG)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(SRCDIR)/runtime_tsan.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h
@@ -92,7 +116,7 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 $(SRCDIR)/%_tsan.o: $(SRCDIR)/%.cpp
 	$(CXX) $(TSAN_CXXFLAGS) -c -o $@ $<
 
-$(SRCDIR)/main.o: $(SRCDIR)/main.cpp $(SRCDIR)/lexer.h $(SRCDIR)/ast.h $(SRCDIR)/parser.h $(SRCDIR)/codegen.h $(SRCDIR)/llvm_early_init.h src/force_complete_std.h
+$(SRCDIR)/main.o: $(SRCDIR)/main.cpp $(SRCDIR)/lexer.h $(SRCDIR)/ast.h $(SRCDIR)/parser.h $(SRCDIR)/codegen.h $(SRCDIR)/llvm_early_init.h src/force_complete_std.h $(TRACE_FLAG)
 $(SRCDIR)/lexer.o: $(SRCDIR)/lexer.cpp $(SRCDIR)/lexer.h
 $(SRCDIR)/parser.o: $(SRCDIR)/parser.cpp $(SRCDIR)/parser.h $(SRCDIR)/ast.h $(SRCDIR)/lexer.h
 $(SRCDIR)/codegen.o: $(SRCDIR)/codegen.cpp $(SRCDIR)/codegen.h $(SRCDIR)/ast.h $(SRCDIR)/runtime.h
@@ -100,7 +124,7 @@ $(SRCDIR)/ast.o: $(SRCDIR)/ast.cpp $(SRCDIR)/ast.h
 $(SRCDIR)/llvm_early_init.o: $(SRCDIR)/llvm_early_init.cpp $(SRCDIR)/llvm_early_init.h
 
 clean:
-	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.a $(TARGET) $(TSAN_TARGET)
+	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.a $(TARGET) $(TSAN_TARGET) $(TRACE_FLAG)
 
 test: $(TARGET)
 	@set -e; \
@@ -119,6 +143,19 @@ test-all: $(TARGET)
 # not harness failures. The runner never executes the compiled binaries.
 test-realworld: $(TARGET)
 	@./tests/realworld/run.sh
+
+# Phase-0 runtime gap inventory: builds a trace-enabled perlc, runs every
+# successfully-compiled real-world script with PERLC_GAPS set to capture its
+# runtime gaps, prints a per-target checklist + corpus-wide triage queue
+# (tools/gap_report.py), then rebuilds the standard zero-cost perlc.
+gap:
+	@set -e; \
+	echo "=== building trace-enabled perlc (-DPERLC_GAP_TRACE) ==="; \
+	make TRACE=1 >/dev/null; \
+	echo "=== running runtime-gap inventory against tests/realworld ==="; \
+	./tests/realworld/run_gaps.sh; \
+	echo "=== rebuilding standard perlc ==="; \
+	make >/dev/null
 
 test-smoke: $(TARGET)
 	@./tests/harness.sh --smoke-only

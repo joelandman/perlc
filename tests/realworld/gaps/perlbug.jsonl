@@ -1,0 +1,3 @@
+{"target":"/usr/bin/perlbug","sub":"Config::local_patches","qual":"Config::local_patches","cat":"CORE_MOD_SUB","call_site":"/usr/bin/perlbug:8","hits":1}
+{"target":"/usr/bin/perlbug","sub":"Mail::Util::maildomain","qual":"Mail::Util::maildomain","cat":"CORE_MOD_SUB","call_site":"/usr/bin/perlbug:275","hits":1}
+{"target":"/usr/bin/perlbug","sub":"getpwuid","qual":"main::getpwuid","cat":"CORE_SUB","call_site":"/usr/bin/perlbug:289","hits":1}

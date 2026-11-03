@@ -934,6 +934,21 @@ static PerlValue *nst_io_open(PerlArray *args, const char *cls) {
     if (args && args->len >= 1) path = perl_to_string_dup(args->elems[0]);
     if (args && args->len >= 2) mode = perl_to_string_dup(args->elems[1]);
     if (!path) { free(mode); return perl_alloc_undef(); }
+    /* Single-arg IO::File->new("<$file"): a leading magic mode prefix
+       ("<", ">", ">>", "+", "+<", "+>") is folded into the path.  Perl only
+       recognises those as mode indicators (a leading letter such as "a" or
+       "w" stays part of the filename), so peel just '<','>','+'.  mode is a
+       read-only literal consumed immediately by fopen via nst_fopen_mode. */
+    if (!mode && path[0] == '<') {
+        mode = strdup("<");
+        memmove(path, path + 1, strlen(path + 1) + 1);
+    } else if (!mode && path[0] == '>') {
+        mode = strdup(">");
+        memmove(path, path + 1, strlen(path + 1) + 1);
+    } else if (!mode && path[0] == '+' && (path[1] == '<' || path[1] == '>')) {
+        mode = strdup(path[1] == '<' ? "+<" : "+>");
+        memmove(path, path + 2, strlen(path + 2) + 1);
+    }
     fp = fopen(path, nst_fopen_mode(mode));
     free(path); free(mode);
     if (!fp) return perl_alloc_undef();
@@ -2313,6 +2328,97 @@ static PerlValue *nst_select_new(PerlArray *args) {
     return obj;
 }
 
+/* Case-insensitive helpers for emulating the encoding::euc* heuristics. */
+static int nst_ci_equals(const char *a, const char *b) {
+    return (a && b) ? (strcasecmp(a, b) == 0) : 0;
+}
+static int nst_ci_start_with(const char *s, const char *p) {
+    return (s && p) && strncasecmp(s, p, strlen(p)) == 0;
+}
+static int nst_ci_end_with(const char *s, const char *p) {
+    if (!s || !p) return 0;
+    size_t sl = strlen(s), pl = strlen(p);
+    return pl <= sl && strncasecmp(s + sl - pl, p, pl) == 0;
+}
+
+/* encoding::_get_locale_encoding — emulate the POSIX::setlocale() fallback
+   path of Perl's encoding.pm.  The MSWin32 path and the I18N::Langinfo path
+   are intentionally skipped here (Langinfo "isn't available everywhere");
+   that matches real Perl, which falls through to the POSIX::setlocale()
+   block.  Real Perl (encoding.pm):
+       my $locale = POSIX::setlocale(POSIX::LC_CTYPE());   // LC_CTYPE() == 0
+       if ($locale =~ /^([^\.]+)\.([^\.@]+)(?:@.*)?$/) {
+           my ($country_language, $locale_encoding) = ($1, $2);
+           if (lc($locale_encoding) eq 'euc') {
+               ja_JP -> euc-jp, ko_KR -> euc-kr, zh_CN -> euc-cn,
+               zh_TW -> euc-tw ; else Carp::croak(...)
+           }
+       }
+       return $locale_encoding;   // undef for "C"/"POSIX" and other non-matches
+   We replicate the regex as a simple byte scan (first '.', then the run of
+   bytes that are neither '.' nor '@') and return the same encoding name
+   string, or undef.  The ambiguous-EUC carp is swallowed by the caller's
+   eval in practice, so we simply return undef there. */
+static PerlValue *nst_encoding_get_locale_encoding(PerlArray *args) {
+    PerlValue *ret = perl_alloc_undef();
+    const char *loc = NULL;
+
+    PerlValue *cat_pv = perl_alloc_int(0);           /* POSIX::LC_CTYPE() == 0 */
+    PerlValue *loc_pv = perl_posix_setlocale(cat_pv, NULL);
+    perl_free(cat_pv);
+    if (loc_pv && loc_pv->tag == PERL_UNDEF) { perl_free(loc_pv); return ret; }
+    if (loc_pv) { loc = perl_to_string_dup(loc_pv); perl_free(loc_pv); }
+    if (!loc) return ret;
+
+    /* regex: /^([^.]+)\.([^.@]+)(?:@.*)?$/  — a '.' starts the locale, the
+       encoding field is the run of bytes after it that are neither '.' nor
+       '@'; the optional @suffix then requires end-of-string or an '@'.  A
+       trailing '.' after the field means no match. */
+    const char *dot = strchr(loc, '.');
+    if (!dot) return ret;
+    const char *enc_start = dot + 1;
+    const char *p = enc_start;
+    while (*p && *p != '.' && *p != '@') p++;
+    if (*p == '.' || (*p != '\0' && *p != '@')) return ret;   /* no match */
+    {
+        size_t country_len = (size_t)(dot - loc);
+        size_t enc_len = (size_t)(p - enc_start);
+        /* country = loc[0, country_len); encoding = enc_start[0, enc_len) */
+        char *cl = (char *)malloc(country_len + 1);
+        char *le = (char *)malloc(enc_len + 1);
+        if (cl && le) {
+            memcpy(cl, loc, country_len);        cl[country_len] = '\0';
+            memcpy(le, enc_start, enc_len);      le[enc_len] = '\0';
+            if (strcasecmp(le, "euc") == 0) {
+                if (nst_ci_start_with(cl, "ja_JP") || nst_ci_end_with(cl, "japan") ||
+                    nst_ci_end_with(cl, "japanese")) {
+                    ret = perl_alloc_string("euc-jp");
+                } else if (nst_ci_start_with(cl, "ko_KR") ||
+                             nst_ci_equals(cl, "korea") ||
+                             nst_ci_equals(cl, "korean")) {
+                    ret = perl_alloc_string("euc-kr");
+                } else if (nst_ci_start_with(cl, "zh_CN") ||
+                             nst_ci_end_with(cl, "chin") ||
+                             nst_ci_equals(cl, "china") ||
+                             nst_ci_equals(cl, "chinese")) {
+                    ret = perl_alloc_string("euc-cn");
+                } else if (nst_ci_start_with(cl, "zh_TW") ||
+                             nst_ci_equals(cl, "taiwan") ||
+                             nst_ci_equals(cl, "taiwanese")) {
+                    ret = perl_alloc_string("euc-tw");
+                }
+                /* else: ambiguous EUC -> real Perl carp's (caught by
+                   caller's eval); return undef. */
+            } else {
+                ret = perl_alloc_string(le);      /* verbatim encoding name */
+            }
+        }
+        free(cl); free(le);
+    }
+    free((void *)loc);
+    return ret;
+}
+
 PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *args) {
     const char *cls = NULL;
     if (!method) return NULL;
@@ -2462,6 +2568,12 @@ PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *arg
         if (strcmp(method, "reader") == 0) return nst_hget(obj, "r");
         if (strcmp(method, "writer") == 0) return nst_hget(obj, "w");
         return NULL;
+    }
+    /* encoding::_get_locale_encoding(): emulate Perl's encoding.pm POSIX::
+       setlocale() fallback (see nst_encoding_get_locale_encoding). */
+    if (cls && strcmp(cls, "encoding") == 0 &&
+        strcmp(method, "_get_locale_encoding") == 0) {
+        return nst_encoding_get_locale_encoding(args);
     }
     /* MIME::QuotedPrint functional form (encode_qp/decode_qp are @EXPORT). */
     if (cls && strcmp(cls, "MIME::QuotedPrint") == 0) {

@@ -1,6 +1,8 @@
 perlc
 perlc_tsan
 tests/realworld/last-report.txt
+# Phase-0 gap detector: build stamp recording the TRACE flag (see Makefile)
+.perlc_trace_flag
 a.out
 src/*.o
 src/*.a

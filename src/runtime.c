@@ -5807,6 +5807,181 @@ PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx) {
     return perl_alloc_undef();
 }
 
+#if defined(PERLC_GAP_TRACE)
+/* ── runtime gap detector (Phase 0) ──────────────────────────────────────
+   perlc compiles a Perl program into a standalone binary, but some runtime
+   substitutions it cannot resolve (missing core-module subs, unemulated
+   constructs) only surface when the binary RUNS.  This block records those
+   "gaps": every time the checked-dispatch path below hits a sub it cannot
+   find, it logs one JSONL event and, when PERLC_GAPS collection is active,
+   returns undef instead of dying so the program walks further and surfaces
+   subsequent gaps.  A companion tool (tools/gap_report.py) aggregates the
+   sidecar into a per-target checklist and a corpus-wide triage queue.
+
+   ZERO COST when PERLC_GAP_TRACE is not defined: the table and all of this
+   code vanish, and the hot path is exactly what it was (plain fprintf +
+   exit(255)).  When defined, still fully gated by the PERLC_GAPS runtime
+   env var — an unconfigured build behaves byte-for-byte as before. */
+
+typedef enum {
+    GAP_CORE_SUB = 0,          /* core builtin, no module wrapper (utf8::encode) */
+    GAP_CORE_MOD_SUB,          /* core-module sub, not yet emulated (_get_locale_encoding) */
+    GAP_MOD_CONSTRUCT,         /* a .pm construct perlc cannot execute */
+    GAP_MISSING_RUNTIME_C,     /* needs a C-level table/mechanism (iconv DB, syscall) */
+    GAP_FEATURE,               /* a language feature not supported (format/write, threads) */
+    GAP_CROSS_MODULE,          /* a drag-in dependency subtree (encoding -> Config, I18N::Langinfo) */
+    GAP_XS_BINARY              /* a prebuilt extension, not portable */
+} gap_cat_t;
+
+typedef struct {
+    char      *sub;       /* looked-up name, e.g. "encoding::_get_locale_encoding" */
+    char      *qual;      /* qualname for the error display */
+    char      *site;      /* call-site file (sourceFile_); also the report target key */
+    int        site_line; /* line of the failing call in the source script */
+    gap_cat_t  cat;
+    unsigned long hits;   /* call count: first occurrence emits, later ones bump this */
+} gap_rec_t;
+
+#define GAP_TABLE_MAX 8192
+static gap_rec_t s_gap_table[GAP_TABLE_MAX];
+static int        s_gap_count = 0;
+static FILE      *s_gap_fp = NULL;    /* sidecar stream (file mode); NULL in json mode */
+static int        s_gap_json = 0;     /* 1 = collect in memory, emit a JSON blob at exit */
+static int        s_gap_stdio = 0;    /* 1 = echo each line to stderr as it happens */
+static int        s_gap_init = 0;     /* has PERLC_GAPS been read yet? */
+
+static const char *gap_cat_str(gap_cat_t c) {
+    switch (c) {
+        case GAP_CORE_SUB:         return "CORE_SUB";
+        case GAP_CORE_MOD_SUB:     return "CORE_MOD_SUB";
+        case GAP_MOD_CONSTRUCT:    return "MOD_CONSTRUCT";
+        case GAP_MISSING_RUNTIME_C:return "MISSING_RUNTIME_C";
+        case GAP_FEATURE:          return "FEATURE";
+        case GAP_CROSS_MODULE:     return "CROSS_MODULE";
+        case GAP_XS_BINARY:        return "XS_BINARY";
+    }
+    return "CORE_MOD_SUB";
+}
+
+/* best-effort classification: a genuinely-undefined call reached here is,
+   from perlc's point of view, a core builtin (bare name) or a module sub
+   (qualified Pkg::name).  gap_report.py reclassifies authoritatively. */
+static gap_cat_t gap_default_cat(const char *name) {
+    if (name && strstr(name, "::") && strncmp(name, "main::", 6) != 0)
+        return GAP_CORE_MOD_SUB;
+    return GAP_CORE_SUB;
+}
+
+static void gap_json_str(FILE *fp, const char *s) {
+    fputc('"', fp);
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+            case '"':  fputs("\\\"", fp); break;
+            case '\\': fputs("\\\\", fp); break;
+            case '\n': fputs("\\n", fp);  break;
+            case '\r': fputs("\\r", fp);  break;
+            case '\t': fputs("\\t", fp);  break;
+            default:
+                if (c < 0x20) fprintf(fp, "\\u%04x", c);
+                else fputc(c, fp);
+        }
+    }
+    fputc('"', fp);
+}
+
+/* Write the JSONL line for a (deduped, first-occurrence) gap.  Emits to the
+   sidecar when one is open (file mode); in json-blob mode s_gap_fp is NULL
+   and the record is simply buffered in s_gap_table for the exit-time blob. */
+static void gap_emit_line(gap_rec_t *r) {
+    if (s_gap_fp) {
+        FILE *out = s_gap_fp;
+        fprintf(out, "{\"target\":"); gap_json_str(out, r->site);
+        fprintf(out, ",\"sub\":");    gap_json_str(out, r->sub);
+        fprintf(out, ",\"qual\":");   gap_json_str(out, r->qual);
+        fprintf(out, ",\"cat\":\"%s\"", gap_cat_str(r->cat));
+        fprintf(out, ",\"call_site\":\"%s:%d\"", r->site, r->site_line);
+        fprintf(out, ",\"hits\":%lu}\n", r->hits);
+        fflush(out);
+    }
+    if (s_gap_stdio) {           /* live log to stderr alongside the sidecar */
+        FILE *e = stderr;
+        fprintf(e, "{\"target\":"); gap_json_str(e, r->site);
+        fprintf(e, ",\"sub\":");    gap_json_str(e, r->sub);
+        fprintf(e, ",\"qual\":");   gap_json_str(e, r->qual);
+        fprintf(e, ",\"cat\":\"%s\"", gap_cat_str(r->cat));
+        fprintf(e, ",\"call_site\":\"%s:%d\"", r->site, r->site_line);
+        fprintf(e, ",\"hits\":%lu}\n", r->hits);
+    }
+}
+
+/* json-blob mode: dump the whole collected set as one JSON object at exit. */
+static void gap_emit_json_blob(void) {
+    FILE *out = s_gap_fp ? s_gap_fp : stderr;
+    fprintf(out, "{\"gaps\":[\n");
+    for (int i = 0; i < s_gap_count; i++) {
+        gap_rec_t *r = &s_gap_table[i];
+        fprintf(out, "  {\"target\":"); gap_json_str(out, r->site);
+        fprintf(out, ",\"sub\":");       gap_json_str(out, r->sub);
+        fprintf(out, ",\"qual\":");      gap_json_str(out, r->qual);
+        fprintf(out, ",\"cat\":\"%s\"", gap_cat_str(r->cat));
+        fprintf(out, ",\"call_site\":\"%s:%d\"", r->site, r->site_line);
+        fprintf(out, ",\"hits\":%lu}", r->hits);
+        fputc(i + 1 < s_gap_count ? ',' : '\n', out);
+    }
+    fprintf(out, "]}\n");
+    if (s_gap_fp) fflush(s_gap_fp);
+}
+
+/* Called once, on the first undefined-sub call: read PERLC_GAPS and set up
+   the sidecar/json blob.  Returns 1 if collection is active (the die site
+   should then record + continue), 0 if the env var is unset/unparseable
+   (the default exit(255) path runs). */
+static int gap_trace_active(void) {
+    if (s_gap_init) return 1;
+    s_gap_init = 1;
+    const char *env = getenv("PERLC_GAPS");
+    if (!env || !*env) return 0;
+
+    if (!strcmp(env, "1") || !strcmp(env, "true") ||
+        !strcmp(env, "yes") || !strcmp(env, "collect") || !strcmp(env, "stderr")) {
+        s_gap_stdio = 1; s_gap_fp = stderr; return 1;
+    }
+    if (!strcmp(env, "json")) { s_gap_json = 1; atexit(gap_emit_json_blob); return 1; }
+    if (!strncmp(env, "json:", 5)) {
+        FILE *f = fopen(env + 5, "w");
+        if (f) { s_gap_fp = f; s_gap_json = 1; atexit(gap_emit_json_blob); return 1; }
+        return 0;
+    }
+    /* otherwise: a file path — append a JSONL sidecar as gaps happen. */
+    FILE *f = fopen(env, "a");
+    if (f) { s_gap_fp = f; return 1; }
+    return 0;
+}
+
+/* Record one unresolved call.  Dedup by (sub, cat): the first occurrence is
+   emitted/buffered and subsequent identical calls only bump `hits`. */
+static void gap_record(const char *sub, const char *qual,
+                       const char *site, int site_line, gap_cat_t cat) {
+    if (!s_gap_fp && !s_gap_json) return;
+    for (int i = 0; i < s_gap_count; i++) {
+        if (s_gap_table[i].cat == cat && !strcmp(s_gap_table[i].sub, sub)) {
+            s_gap_table[i].hits++;
+            return;
+        }
+    }
+    if (s_gap_count >= GAP_TABLE_MAX) { s_gap_table[GAP_TABLE_MAX - 1].hits++; return; }
+    gap_rec_t *r = &s_gap_table[s_gap_count++];
+    r->sub = strdup(sub);
+    r->qual = strdup(qual ? qual : sub);
+    r->site = strdup(site ? site : "-");
+    r->site_line = site_line;
+    r->cat = cat;
+    r->hits = 1;
+    gap_emit_line(r);
+}
+#endif  /* PERLC_GAP_TRACE */
+
 /* D113: real Perl dies with "Undefined subroutine &Pkg::name called at
    FILE line N." (exit 255) rather than silently returning undef. Used
    at codegen call sites that dispatch a genuine sub call (bareword /
@@ -5864,6 +6039,17 @@ PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ct
             }
         }
     }
+    /* Phase-0 gap detector: when PERLC_GAPS collection is active, record the
+       unresolved call and return undef so execution can continue and surface
+       further gaps instead of dying at the first.  With collection inactive
+       (the default, or a build without PERLC_GAP_TRACE) this is absent and
+       the exit(255) below is unchanged. */
+#if defined(PERLC_GAP_TRACE)
+    if (gap_trace_active()) {
+        gap_record(name, qualname, file, line, gap_default_cat(name));
+        return perl_alloc_undef();
+    }
+#endif
     fprintf(stderr, "Undefined subroutine &%s called at %s line %d.\n",
             qualname ? qualname : (name ? name : "(unknown)"),
             file ? file : "-", line);

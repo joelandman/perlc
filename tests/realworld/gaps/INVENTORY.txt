@@ -1,0 +1,36 @@
+# perlc runtime-gap inventory (Phase 0)
+# host: Linux 7.0.0-38-generic x86_64  date: 2026-11-02T18:10:34Z
+# perlc: /home/joe/work/pc/perlc/perlc  (trace build)
+# each captured script was run with PERLC_GAPS=<sidecar> for 20s
+# total=30 compiled=3 nogap/other=27
+
+nogap	/usr/bin/splain	(no runtime gaps on a bare run)
+nogap	/usr/share/doc/cron/examples/crontab2english.pl	(no runtime gaps on a bare run)
+missing-file	/usr/bin/callgrind_annotate	(missing on host)
+nogap	/usr/bin/ucfq	(no runtime gaps on a bare run)
+gapped	/usr/bin/perlbug	3 gaps -> /home/joe/work/pc/perlc/tests/realworld/gaps/perlbug.jsonl
+gapped	/usr/bin/perlthanks	3 gaps -> /home/joe/work/pc/perlc/tests/realworld/gaps/perlthanks.jsonl
+nogap	/usr/bin/json_pp	(no runtime gaps on a bare run)
+compile-fail	/usr/bin/piconv
+compile-fail	/usr/bin/pod2text
+compile-fail	/usr/bin/pod2man
+compile-fail	/usr/bin/pod2html
+compile-fail	/usr/bin/instmodsh
+nogap	/usr/bin/pl2pm	(no runtime gaps on a bare run)
+compile-fail	/usr/bin/cpan
+compile-fail	/usr/bin/prove
+compile-fail	/usr/bin/ptar
+compile-fail	/usr/bin/ptardiff
+nogap	/usr/bin/shasum	(no runtime gaps on a bare run)
+compile-fail	/usr/bin/streamzip
+gapped	/usr/bin/zipdetails	1 gaps -> /home/joe/work/pc/perlc/tests/realworld/gaps/zipdetails.jsonl
+nogap	/usr/bin/helpztags	(no runtime gaps on a bare run)
+nogap	/usr/bin/linux-version	(no runtime gaps on a bare run)
+nogap	/usr/bin/linux-run-hooks	(no runtime gaps on a bare run)
+missing-file	/usr/bin/geteltorito	(missing on host)
+nogap	/usr/bin/podebconf-report-po	(no runtime gaps on a bare run)
+nogap	/usr/sbin/update-rc.d	(no runtime gaps on a bare run)
+nogap	/usr/bin/deb-systemd-helper	(no runtime gaps on a bare run)
+nogap	/usr/share/clang/scan-build-21/libexec/ccc-analyzer	(no runtime gaps on a bare run)
+nogap	/usr/lib/llvm-22/libexec/ccc-analyzer	(no runtime gaps on a bare run)
+nogap	/usr/share/doc/ppp/examples/scripts/lcp_rtt_dump	(no runtime gaps on a bare run)
