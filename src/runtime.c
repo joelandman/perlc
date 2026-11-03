@@ -6995,6 +6995,38 @@ PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filena
     /* In-memory filehandle: the filename argument is a scalar REFERENCE
        (open($fh, '<', \$str) — real Perl treats it as an in-memory file). */
     if (filename_pv && filename_pv->tag == PERL_REF_SCALAR) {
+        PerlValue *referent = (PerlValue *)filename_pv->pval;
+        if (referent && referent->tag == PERL_FILEHANDLE && referent->pval) {
+            /* filehandle dup (real perl's `open $fh, ">&", \*FH`): $fh writes
+               to the same destination as the referent. Clone the underlying
+               stream so the new handle is independent — closing it must not
+               close the referent — by wrapping a dup'd fd in its own FILE*.
+               This fixes a heap-corruption crash: previously the dup fell
+               through to perl_open_in_memory, which bound a pmf cookie to
+               the filehandle's scalar; on the next write that cookie called
+               free() on sval, which for a PERL_FILEHANDLE is not a heap
+               string, corrupting the heap. */
+            if (target->tag == PERL_FILEHANDLE && target->pval)
+                fclose((FILE*)target->pval);
+            target->tag = PERL_FILEHANDLE;
+            target->matchpos = 0;
+            target->flags &= ~PV_FLAG_UTF8;
+            FILE *orig = (FILE*)referent->pval;
+            int fd = fileno(orig);
+            if (fd >= 0) {
+                int df = dup(fd);
+                if (df >= 0) {
+                    FILE *nfp = fdopen(df, "w");
+                    if (nfp) { target->pval = nfp; return perl_alloc_bool(1); }
+                    close(df);
+                }
+            }
+            /* fdopen failed — fall back to sharing the FILE* (acceptable for
+               the common fd-based stream when neither handle is closed
+               mid-stream, e.g. zipdetails' select()-based switch). */
+            target->pval = orig;
+            return perl_alloc_bool(1);
+        }
         char *mms = perl_to_string_dup(mode_pv);
         FILE *mfp = perl_open_in_memory(target, mms, filename_pv);
         free(mms);
