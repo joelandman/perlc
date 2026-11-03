@@ -1,10 +1,47 @@
 # Design Document: Perl `format` and `write` Support for perlc
 
 **Date:** 2026-10-29
-**Status:** Draft
+**Status:** Out of scope — see Scope Decision below. Static (compile-time)
+`format`/`write` support exists in codegen; dynamic formats declared in
+runtime `eval` strings are intentionally not supported.
 **Target:** perlc (Perl→LLVM AOT compiler, C++17 + LLVM 18)
 
 ---
+
+## Scope Decision: dynamic (eval'd) formats are out of scope
+
+perlc supports **only static, compile-time** `format`/`write` — the
+`format NAME = … .` declaration appears verbatim in the source perlc parses.
+It does **not** support **dynamic formats**, i.e. formats written as a string
+passed to `eval` at runtime:
+
+```perl
+eval "format $FMT =
+@<<<<<<<<
+$data
+.
+";
+write $FMT;
+```
+
+The format name and picture lines are not present in the AST perlc compiles,
+so the format is invisible to the compiler and its output cannot be
+reproduced.
+
+**Impact (documented runtime gap).** The bundled utility `/usr/bin/zipdetails`
+emits its hex-dump report through exactly this pattern (`eval "format $FMT1 = …"`
+in `setupOutput`, evaluated per file in `displayFileInfo`). perlc runs
+`zipdetails` without crashing, but does not reproduce the formatted output —
+only the `print`/`say`-driven lines outside the eval'd formats appear. Other
+bundled utilities that rely on eval'd formats show the same behavior.
+
+**Why this is intentionally out of scope.** `format`/`write` is a deprecated
+Perl feature with little modern usage. The crash that prevented perlc from
+even *loading* such programs (the `perl_open_fh` filehandle-dup heap
+corruption, fixed in `src/runtime.c`) is fixed; producing the formatted dump
+would require runtime evaluation of format picture lines — a substantial,
+deprecated-feature effort for negligible payoff. Future scripts are not
+expected to depend on it.
 
 ## 1. Summary of Perl `format`/`write` Syntax and Semantics
 
