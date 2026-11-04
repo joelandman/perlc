@@ -18784,6 +18784,22 @@ PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
    non-flat rows fall back to the normal converting path.  Mirrors
    perl_array_set's ownership convention (clones v; caller retains v). */
 PerlValue *perl_array_set_row(PerlValue *row_pv, long long idx, PerlValue *v) {
+    /* REF_* bases alias caller storage and must be dereferenced to the
+     * OUTER container before any element store: `my ($z) = @_; $z->[0] =
+     * [1,2]` (fill_z in bench/mbs.pl) or `my $ref = \@a; $ref->[0] = [1,2]`.
+     * Without this, the Stage-35 pack-convert branch below rewrote the ref
+     * PV in place (REF_* -> CPLX_ROW), silently dropping the store into the
+     * real container (found 2026-11-04: @z stayed empty and mbs iterated on
+     * undef/0 rows). Row-shaped PVs (UNDEF/FLAT/FLOAT_PAIR/CPLX, and
+     * PerlArray-backed rows borrowed via perl_array_get_ref) keep the
+     * packed in-place paths below unchanged. */
+    if (row_pv && (row_pv->tag == PERL_REF_SCALAR ||
+                   row_pv->tag == PERL_REF_ARRAY ||
+                   row_pv->tag == PERL_REF_HASH)) {
+        PerlArray *av = perl_deref_array(row_pv);
+        if (av) perl_array_set(av, idx, v);
+        return v;
+    }
     if (row_pv && row_pv->tag == PERL_FLAT_ARRAY &&
         idx >= 0 && idx < row_pv->matchpos) {
         double *flat = (double *)row_pv->pval;

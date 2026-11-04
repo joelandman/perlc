@@ -3545,14 +3545,15 @@ bool CodeGen::emitPackedPairComponents(const Node &n, Value *&re, Value *&im) {
         }
         return false;
     }
-    if (n.kind == NK::ArrowDeref && n.sval == "array" && n.left && n.right &&
-        n.left->kind != NK::ArrowDeref) {
-        Value *base = emitExpr(*n.left);
-        Value *idx = emitIdx(*n.right);
-        bool ok = tryLoadCplxPairF64(base, idx, re, im);
-        freeIfOwned(base);
-        return ok;
-    }
+    /* ArrowDeref RHS was treated here as a pair read ($row->[$k] =
+       $other->[$i]) via tryLoadCplxPairF64 — but an ArrowDeref RHS is also
+       the SCALAR PROJECTION shape ($pair->[0] on a FLOAT_PAIR base), which
+       this cannot distinguish at compile time. Feeding a scalar projection
+       through the pair-store path stored a bogus pair instead of the
+       projected scalar (found 2026-11-04: $wi->[0] = cadd(...)->[0] stored
+       (2,0) where perl stores 2). The general store path below handles
+       both shapes correctly, so the fast path only accepts RHS kinds whose
+       pair-ness is decided by the AST itself. */
     if (n.kind == NK::Call) {
         auto it = inlineSubs_.find(n.name);
         if (it == inlineSubs_.end() || !it->second.bodyExpr) return false;
