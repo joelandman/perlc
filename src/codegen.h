@@ -61,6 +61,12 @@ public:
     void initializeDebugInfo(const std::string &sourceFile);
     llvm::DILocation *getDebugLoc(int line, llvm::DIScope *scope = nullptr);
 
+    /* const accessor for the file's static D135 walkers (they take a
+       const CodeGen&, which cannot touch private members directly).
+       Reports whether Stage 37's whole-program call-site analysis proved
+       'nm' to be an exact-i64 @_-parameter for the scan-root 'body'. */
+    bool atArgIntProvableByBody(const Node *body, const std::string &nm) const;
+
 private:
     /* ctx_ is heap-allocated so it can be released to ThreadSafeModule
        while all ctx_ references in this class remain valid. */
@@ -246,6 +252,28 @@ private:
     /* Stage 25: promotion kind for @_ args identified before sub body emission */
     enum class PPKind { Int, Float, DerefAV };
     std::unordered_map<std::string, PPKind> prePromotedArgs_;
+
+    /* Stage 37: for each SubDef node, the @_-unpacked scalar param names
+       whose runtime value EVERY whole-program direct call site provably
+       passes as an exact i64 (all sites positionally supply the argument and
+       its expression is int-shaped under the callee's own assumed-int params
+       plus the enclosing body's D135 int set — self-recursion resolves
+       against the callee's own assumed params). The unpack then takes the
+       unboxed-i64 fast path: `perl_to_int` on an INT PV is the identity, so
+       any subsequent use — including string contexts and returns (boxing on
+       demand reproduces the identical INT PV) — is observably exact.
+       Poisoned to empty whenever dynamic dispatch shapes exist (string eval,
+       do FILE, runtime require, dynamic typeglob assignment). Params that
+       are reference-taken, symbolically deref'd, local()'d targets, state()
+       targets, or closure-captured are excluded individually. */
+    std::unordered_map<const Node *, std::unordered_set<std::string>>
+        atArgIntProvable_;
+    /* The same proven params, keyed by the ROOT SCAN BODY — d135's write-
+       walk consults this (a body's own unpack writes keep their int shape
+       exactly for proven members; unknown-origin unpacks refuse it). */
+    std::unordered_map<const Node *, std::unordered_set<std::string>>
+        atArgIntProvableByBody_;
+    void analyzeAtArgIntUnboxing(const Node &program);
     /* loop control blocks */
     struct LoopLabel { std::string name; llvm::BasicBlock *exit; llvm::BasicBlock *cont; llvm::BasicBlock *redo; };
     std::vector<llvm::BasicBlock *> loopExits_;
@@ -399,6 +427,12 @@ private:
     llvm::Value *perlStr(const std::string &s);
 
     bool isOwnedTemp(llvm::Value *v);
+    /* 2026-11-04: a Value* returned by emitExpr that is one of the my-var
+       PVs tracked for freeing in an active scope (pvScopes_). Such values
+       must NOT be treated as transferable owned temps — the scope exit
+       (popScope/emitScopeCleanup) will free the cell, so a return/assign in
+       call-result position still needs its defensive clone. */
+    bool isTrackedPv(llvm::Value *v);
     void freeIfOwned(llvm::Value *v);
 
     llvm::Value *lookupFloatVar(const std::string &name);

@@ -177,6 +177,8 @@ eval STRING and eval-defined subs see outer `my`).
 
 | ID | Status | Notes |
 |----|--------|-------|
+| D197 | **OPEN (2026-11-04)** | `defined($param)` lies for missing `@_` args when the param gets INT-promoted by Stage 25's ladder: `sub m2 { my ($y) = @_; return defined($y) ? "D" : "U"; }  print m2();` — perl: `U`, perlc: `D`; `m2(1)` correctly `D`. Confirmed identical on the pre-D197 binary, so pre-existing, untouched by Stages 36/37: `floatSafe` (the ladder's only body-use gate) doesn't know about `defined()`, an int-promoted alloca can't represent undef, and the unbox emits `perl_to_int(get_ref(args,0))` — the undef sentinel numerifies to 0 and boxes an INT, which is always defined. Same root class would misreport `defined` after an otherwise-int-only write sequence. Correct fix shape: refuse int promotion when the body can observe definedness (`defined($nm)` / list-assignment defaults / splice/each interactions), or keep an undef-capable side slot. Found by `tests/atarg_int_unbox_*` while landing the perf items; those tests scope it out and this row tracks it. |
+| D198 | **OPEN (2026-11-04)** | `wantarray()` inside a de-boxed prologue reads a stale/genuine-LIST context: `sub cq { my ($x) = @_; my @r = $x ? (1,2) : (3); return wantarray ? "want-list" : join("/", @r); }  print cq(1);` — perl: `1/2` (scalar ctx: wantarray false), perlc (pre-Session build, byte-identical): the call site pushes ctx=1 for some argument-collection shapes (print/list-assign arg collection), so the prologue-peeled wantarray reads LIST even though the statement context is scalar/void. Standalone `print cq(1);` compiles correctly (`r1[1/2]` in the isolated probe) — the fork needs the surrounding multi-sub context (fill_z/magnitude-style subs defined earlier), which suggests wantarray-stack depth accounting (Stage 24a's hasWantarrayOrUserCall gate vs call-site pushes) goes unbalanced for some multi-sub programs. Fix shape: audit Stage 24a's push/pop pairing across all argument-collection call sites (print/list-assign/map-grep args) or make wantarray() read the frame's ctx param rather than the shared stack top. Found while writing `tests/atarg_int_unbox_deep.pl`; that test scopes it out and this row tracks it. Same root would mis-dispatch `wantarray`-dependent subs in real scripts. |
 | D190 | **regression guard (test-only)** | A byte-for-byte regression guard for the `$;`-joined composite-key hash subscript (`$h{"a","b"}` / `$h{"a","b","c"}`) — the multi-key-subscript idiom where a subscript like `"a","b"` indexes the same entry real Perl does (the keys joined by `$SUBSEP`/`;`). The `$;`-joining is handled upstream (`perl_hash_get`/`perl_hash_set` build an `\x1c`-joined composite key for a comma-separated subscript), so this test locks in that behavior rather than fixing a defect: a write through a composite key is read back correctly, a fresh composite key is undef, two distinct composite keys don't collide (`$h{"ab",1}` vs `$h{"a","b1"}`), and an overwrite through the same key returns the new value. All composite-key lookups/round-trips pass in perlc; the one unrelated gap is that `ord($;)` (the `$;` scalar's VALUE) reports `0` in perlc rather than real Perl's `28` (`$SUBSEP` is used internally by the subscript join, but the `$;` special variable itself isn't readable) — a separate, pre-existing gap, not part of this guard. Tests: `tests/d190_composite_key_{smoke,deep}.pl`. |
 | D191 | **FIXED 2026-10-06** | A trailing comma with no following semicolon as the LAST statement of a block (`push @x, "a", "b",\n}`) was a hard parse error in several list-op/assignment forms. Root cause: `Parser::consumeTrailingComma()` (`src/parser.cpp`) returned a bool but never actually advanced past the comma, leaving it dangling so the next `parseStmt` choked on it — the shared fix was making `consumeTrailingComma()` advance. The list-operator arg loops each need their own trailing-comma guard, `atTrailingDelim()` (stop parsing args when the token after a consumed comma is `}`/`)`/`]`): `parsePush`/`parseUnshift` already had it, but `parsePrint`/`parseSay` were missing it (so `print "x",` still failed) — added there. **Covered shapes, byte-for-byte:** a trailing comma after a list operator that is the last statement of a sub, after a list operator in a nested bare block, after element assignments, and after a bareword `print`; **out of scope** (separate pre-existing gaps): a trailing comma after a statement modifier (`$x = 1 if C,`) is still a parse error (that's a modifier's trailing comma, not a list-op one — the modifier's own trailing comma isn't consumed), a void-context `my $x = 5,` as the last statement of a sub returns undef in perlc but the assigned value in real Perl (a separate `my`-decl-in-void-context limitation), and a trailing comma followed by another statement is a list-continuation (perl's normal list grammar), not a trailing comma. Tests: `tests/d191_trailing_comma_{smoke,deep}.pl`. |
 | D192 | **FIXED 2026-10-06** | Chained `our` used as a chainable assignment EXPRESSION — `our $a = our $b = ...;` (real Perl makes `our` return the assigned value, so the chain binds left-to-right). Was a hard parse error: `Parser::parsePrimary()` had a case for a plain `my` in expression context but none for `our`, so a leading `our` before a `my`-shaped decl was a parse error. Fixed by treating `our` like `my` in `parsePrimary()`'s expression-context handler (same `ival |= 2` "force package global" codegen path), so `our $a = our $b = N;` parses and evaluates correctly. **Covered, byte-for-byte:** a two-way scalar chain (`our $a = our $b = 5;`), a three-way chain, a chain with an expression RHS (`our $x = our $y = (2 + 3);`), and the exact `/usr/bin/splain` file-scope four-way chain (`our $opt_p = our $opt_d = our $opt_v = our $opt_f = '';`). **Out of scope** (separate pre-existing limitation): `our (@a, $b)`/`our (%h)` chained forms aren't handled — perlc's `our` model resolves a dynamic target only at compile time, so a chained array/hash `our` can't bind the intermediate target the way scalar chains do; scalar chains (the real-script shape, e.g. splain) are covered. Tests: `tests/d192_chained_our_{smoke,deep}.pl`. |
@@ -3469,6 +3471,50 @@ A failing `try` with no `catch` returns undef without rethrowing
 - **Interned bool PVs**: `perl_alloc_bool` returns process-lifetime 1 / `""` cells (`PV_FLAG_IMMORTAL`), never pooled. `perl_free` is a no-op; writes croak like perl's `PL_sv_yes`/`PL_sv_no`. JSON::PP::Boolean clones first. Tests: `tests/intern_bool_{smoke,deep}.pl`.
 - **Stage 34 loop vectorize**: counted C-style `for` and integer-range `foreach` whose body is unboxed i64/f64 get a `llvm.loop.vectorize.width=4` hint. Statement-context `+=`/`++`/assign on int/float allocas store only (no `perl_alloc_int` box, which blocked LV). Mixed `$i * 1.0` SIToFPs the int; `$i + 1` stays i64 (D78). Inner foreach still gets Stage 28 unroll. Disable with `PERLC_OPT_DISABLE=loopvec`. Tests: `tests/loop_vec_{smoke,deep}.pl`.
 - **Stage 35 packed complex rows**: `$row->[$i] = [re,im]` (or `cplx`/`cadd`/`cmul` results) packs the row as `PERL_CPLX_ROW` — a refcounted interleaved `double[2N]` still observed as an ARRAY of 2-element arrayrefs. Codegen loads `$z->[0]`/`$z->[1]` and `$row->[$i][0|1]` from that buffer and stores pairs without `perl_alloc_float_pair` when the index is in bounds. A non-pair store, `@$row`, or `perl_promote_ref_array` unpacks to a real `REF_ARRAY` of `FLOAT_PAIR`s (D105). Disable IR fast paths with `PERLC_OPT_DISABLE=cplxrow` (runtime packing still happens). Tests: `tests/cplx_row_{smoke,deep}.pl`.
+- **Stage 36 flat-row scalar-half binding** (2026-11-04, perf item 3):
+  `my $v = $row->[expr]` where the enclosing body never observes `$v` as a
+  PV (floatVarUseSafe, no deref-chain base per isRowishUse, not
+  closure-captured) binds the scalar-half value directly with NO PV cell:
+  FLAT(10) rows load (row[idx], row[idx+1]) as (re,im) with two GEP+loads
+  behind a bounds check (zero runtime calls; out-of-range/negative shapes
+  fall back to the boxed perl_cplx_elem read), CPLX_ROW(19) loads its pair
+  directly. The `.re` slot is registered as the scalar (declareFloatVar), so
+  arithmetic on the variable lowers to plain f64 ops; the assign-time
+  tryBindCplxPair keeps slots synced on reassignment. `tryBindCplxPair`
+  additionally refuses to bind deref-chain-base variables (their slots
+  would never be read; the mbs row bindings were paying a full cplx
+  dispatch per binding for nothing). Statement/compound element stores
+  (`$row->[k] = f64v`, `$row->[k] += f`) now count as numeric-domain
+  statements for Stage 34's vectorize hint, and the My-decl-with-pure-f64
+  expr case joins too. mbs's inner k-loop IR dropped from ~418 perl_ calls
+  to 91; combined with emitIdx's raw-i64 indexes and Stage 37 the mbs640
+  kernel went 67.3s → 12.8s (O3+flto). Tests:
+  `tests/atarg_int_unbox_{smoke,deep}.pl`.
+- **Stage 37 whole-program @_ INT unboxing** (2026-11-04, perf item 4):
+  a whole-program pre-pass proves an @_-unpacked scalar param is always an
+  exact i64 when EVERY direct call site positionally supplies an int-shaped
+  argument (rhsIsIntShapedCtx resolved in the CALLER's context: enclosing
+  sub locals ∪ file-scope int vars ∪ the enclosing sub's own lattice —
+  never the callee's), the sub is not \&-referenced/method-dispatched/
+  barename-ambiguous, its non-unpack writes stay int-shaped, and the value
+  is never reference-taken/symbolically-dereffed/local()'d/state()'d/
+  closure-captured. The unpack then promotes unboxed (perl_to_int on an
+  INT PV = identity exact). This pins `sub fib { my ($n) = @_; ... }`-class
+  recursion to i64: fib's per-call runtime calls dropped 45 → ~12, and
+  fibn(37) went 24.6s → 10.5s at plain -O2 (→7.6s with -flto), ~6.5×
+  faster than perl. Poisoned by string eval / do FILE / runtime require /
+  dynamic typeglobs. Disable with `PERLC_OPT_DISABLE=st37`. Tests:
+  `tests/atarg_int_unbox_{smoke,deep}.pl`.
+- **emitIdx raw-i64 indexes** (2026-11-04): index expressions emitted as
+  plain i64 math when exact — no alloc_int/overflow-branch/perl_free
+  pipeline per element access (an i64-wrapped index is an OOB element,
+  same result as Perl's BigInt index). Also skip unconditional clones of
+  owned temps for sub returns / block-last values (`return $x` cell reads
+  still clone; `perl_free` ownership transfers once).
+- **Stage 24b widened**: subs with an explicit `return` no longer pay
+  `perl_local_save_depth`/`perl_local_restore_to` when the body contains
+  no `local()` (die-unwind depth is restored globally by perl_die from the
+  capturing eval frame before longjmp).
 
 ### Future: auto-parallel `map` / counted loops (2026-09-22, deferred)
 

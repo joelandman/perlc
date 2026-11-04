@@ -208,7 +208,8 @@ Strategic:
 
 ## 6. Profiling summary (O2 binaries, `perf record -F 2200 -g`)
 
-fibn (49.4 s perl / 24.5 s perlc — 2.0×):
+fibn (49.4 s perl / 24.5 s perlc — 2.0×): [pre-Session snapshot; see §8 for
+post-delivery]
 ```
 16.3% perlsub_fib        (the actual recursion)
 12.2% perl_free          (PV pool churn)
@@ -292,7 +293,55 @@ overhead that a pattern-pointer cache + hoisted deref would remove.
    post-D196 binaries (they measured an all-zero grid); refresh with
    a `bench.sh` run after next perf changes.
 
-## 9. Reproduction commands
+## 8. Delivery status — items 1, 3, 4 (2026-11-04, later the same day)
+
+All three landed same-day; correctness `make test-all` **609/609 PASS**
+(607 prior + 2 new contract tests), `make bench-regress` PASS (fibn
+**55% faster** than its own prior baseline at the gate's small N).
+
+Workloads (perl baseline / plain -O2 default build / -O3 `-flto` build;
+all best-of-3, sequential, idle machine):
+
+| Workload | perl | perlc O2 | perlc O3+flto | perlc/perl |
+|---|---|---|---|---|
+| fibn 37 (recursion) | 49.4 | **10.53** (was 24.6) | **7.63** | **4.7× / 6.5×** |
+| nb 4M (numeric loop) | 64.4 | **17.59** (was 18.2) | **16.26** | 3.7× / 4.0× |
+| regex3m (PCRE2-bound) | 50.8 | 25.43 (was 23.2) | 21.29 | 2.0× / 2.4× |
+| mbs N=640 (kernels) | 57.3 | **15.55** (was 67.5) | **12.79** | **3.7× / 4.5×** |
+
+All four benchmarks' outputs verified byte-equal to perl at each level.
+IR census after delivery: fib per-call perl_ calls 45 → ~12; mbi total
+perl_ calls 418 → 91; mbs's inner loop is now pure f64 + direct GEPs
+behind a well-predicted bounds branch (261 packed-vector instructions
+in the O3+flto binary — the first real auto-vectorization to fire in
+this suite).
+
+What landed, mapped to items:
+- **Item 1**: `-flto` cached full-LTO link (`main.cpp` + the leaf
+  attribute diet in `declareRuntime()`), incl. the soundness repair of
+  two `memory(read)` claims that were allocating/mutating under the hood
+  (`perl_array_len`, `perl_deref_array_ro`) before LTO could
+  amplify them.
+- **Item 4**: Stage 37's whole-program `@_` INT-unbox pre-pass (caller's-
+  context int-shape resolution, poison on dynamic dispatch, per-param
+  exotic-use exclusions); Stage 24b's no-local save-skip; dead
+  clone/free round-trips removed for owned-temp returns.
+- **Item 3**: Stage 36 flat-row scalar-half binding (no PV cell, direct
+  GEP+loads for FLAT/CPLX rows); emitIdx's raw-i64 index math (drops the
+  per-access boxed overflow pipeline); the vec-hint predicate widened
+  for element stores/decls; `tryBindCplxPair` no longer binds
+  deref-chain-base variables (pure per-iteration waste). Remaining vec
+  work is LLVM-level now (dependence/noalias evidence for LV's runtime
+  checks) rather than AST-level.
+- **Side finds** (logged OPEN, all confirmed pre-existing on the
+  pre-session binary, out of today's scope): **D197** `defined($param)`
+  lies for missing @_-args when Stage 25's ladder INT-promotes the param;
+  **D198** `wantarray()` can read a stale LIST ctx in some multi-sub
+  argument-collection shapes (Stage 24a stack accounting), and the
+  known keyword-shadowing class (`first`/`cp`/... user-subs vs List::Util
+  and File::Copy name-probe mapping) bit the probes repeatedly.
+
+## 10. Reproduction commands
 
 ```bash
 # benchmark set (all in /tmp/opencode/perf/cal — see session notes)

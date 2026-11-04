@@ -2954,14 +2954,19 @@ Value *CodeGen::emitHashDelete(Value *hv, const Node &keyNode) {
     return r;
 }
 
+bool CodeGen::isTrackedPv(Value *v) {
+    for (auto &s : pvScopes_)
+        for (Value *x : s)
+            if (x == v) return true;
+    return false;
+}
+
+bool CodeGen::atArgIntProvableByBody(const Node *body, const std::string &nm) const {
+    auto it = atArgIntProvableByBody_.find(body);
+    return it != atArgIntProvableByBody_.end() && it->second.count(nm) != 0;
+}
+
 bool CodeGen::isOwnedTemp(llvm::Value *v) {
-    auto *ci = llvm::dyn_cast<llvm::CallInst>(v);
-    if (!ci) return false;
-    auto *fn = ci->getCalledFunction();
-    if (!fn) return false;
-    llvm::StringRef nm = fn->getName();
-    /* user-defined subs always return a freshly cloned PerlValue* */
-    if (nm.starts_with("perlsub_")) return true;
     static const std::unordered_set<std::string> owned = {
         "perl_alloc_int", "perl_alloc_float", "perl_alloc_string", "perl_alloc_undef",
         "perl_alloc_bool",
@@ -3005,6 +3010,37 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_ref_hash", "perl_ref_array", "perl_ref_scalar",
         "perl_cplx_elem", "perl_alloc_cplx_row", "perl_alloc_float_pair",
     };
+    /* Overflow-checked arithmetic funnels through a phi over the fast
+       (boxI64) and slow (perl_add/...) arms — both arms are owned temps, so
+       the phi is one too. One level only (no visited-set): phi-to-phi
+       structures are treated as not-owned (conservative). */
+    if (auto *pn = llvm::dyn_cast<llvm::PHINode>(v)) {
+        if (pn->getNumIncomingValues() == 0 || pn->getNumIncomingValues() > 4)
+            return false;
+        for (unsigned i = 0; i < pn->getNumIncomingValues(); i++) {
+            llvm::Value *in = pn->getIncomingValue(i);
+            if (llvm::dyn_cast<llvm::PHINode>(in)) return false;
+            if (auto *ci = llvm::dyn_cast<llvm::CallInst>(in)) {
+                auto *fn = ci->getCalledFunction();
+                if (!fn) return false;
+                llvm::StringRef nm = fn->getName();
+                if (!nm.starts_with("perlsub_") && !owned.count(nm.str()))
+                    return false;
+            } else if (llvm::dyn_cast<llvm::ConstantPointerNull>(in)) {
+                /* fine: null results are the safe "no value" marker */
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+    auto *ci = llvm::dyn_cast<llvm::CallInst>(v);
+    if (!ci) return false;
+    auto *fn = ci->getCalledFunction();
+    if (!fn) return false;
+    llvm::StringRef nm = fn->getName();
+    /* user-defined subs always return a freshly cloned PerlValue* */
+    if (nm.starts_with("perlsub_")) return true;
     if (owned.count(nm.str()) > 0) return true;
     /* perl_bless returns its first argument unchanged.  It is owned (and therefore
        safe to free after cloning for return) ONLY when the argument is itself an
@@ -3183,6 +3219,14 @@ bool CodeGen::canEmitI64(const Node &n) {
             if ((long long)bv * (long long)(m + 1) > 64) return false; /* NV pow */
             return true; /* emit checks result < 2^63 */
         }
+        /* Perf item 3 (2026-11-04): attempt 1 — REVERTED. Plain arithmetic
+           in canEmitI64 was unsound: an arithmetic expression's overflow
+           leaves the integer domain in real Perl (auto-BigInt/NV, D103)
+           while raw i64 evaluation would wrap, and canEmitI64 gates
+           COMPARISON shapes where that exactness is observable. Element
+           INDEX positions instead use emitIdx()'s own raw-i64 attempt,
+           which is OOB-safe for wrapped results and is the sanctioned
+           route. */
         return false;
     }
     case NK::UnaryOp:
@@ -3465,13 +3509,46 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     auto *okBBp = builder_.GetInsertBlock();
 
     builder_.SetInsertPoint(pBB);
-    Value *isPair = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 13), "ispairr");
+    Value *isFlat10 = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 10), "isflatr");
+    auto *flBB = BasicBlock::Create(ctx_, "cplx.flat", curFn);
     auto *prBB = BasicBlock::Create(ctx_, "cplx.pr", curFn);
-    builder_.CreateCondBr(isPair, prBB, fBB);
+    builder_.CreateCondBr(isFlat10, flBB, prBB);
+
+    /* Perf item 3 (2026-11-04): FLAT_ARRAY rows (flat_fill_pair-style
+       interleaved re,im double[2N]) — "pair at idx" is (row[idx],
+       row[idx+1]); the re half is exactly the scalar double the boxed
+       general read (perl_cplx_elem→alloc_float) would return, so binding
+       this way is observably identical while emitting ZERO runtime calls:
+       two GEP+loads behind a bounds check. Out-of-flat-range shapes fall
+       through to the boxed path unchanged. */
+    builder_.SetInsertPoint(flBB);
+    Value *flatHpF = builder_.CreateGEP(i8, rowPv,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.fhp");
+    Value *flatDataF = builder_.CreateLoad(perlPtrTy_, flatHpF, "cplx.fdata");
+    Value *flatNpF = builder_.CreateGEP(i8, rowPv,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 16), "cplx.fnp");
+    Value *flatN = builder_.CreateLoad(i64, flatNpF, "cplx.flen");
+    Value *flatNext = builder_.CreateAdd(idx,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 1), "cplx.fn1");
+    Value *flatInRange = builder_.CreateAnd(
+        builder_.CreateICmpSGE(idx, ConstantInt::get(Type::getInt64Ty(ctx_), 0)),
+        builder_.CreateICmpSLT(flatNext, flatN), "cplx.fir");
+    auto *fokBB = BasicBlock::Create(ctx_, "cplx.fok", curFn);
+    builder_.CreateCondBr(flatInRange, fokBB, fBB);
+    builder_.SetInsertPoint(fokBB);
+    Value *flatF64 = builder_.CreateBitCast(flatDataF, f64->getPointerTo());
+    Value *reFlat = builder_.CreateLoad(f64, builder_.CreateGEP(f64, flatF64, idx), "cplx.fre");
+    Value *imFlat = builder_.CreateLoad(f64, builder_.CreateGEP(f64, flatF64, flatNext), "cplx.fim");
+    setTBAA(reFlat, tbaaFlatDoubleTag_);
+    setTBAA(imFlat, tbaaFlatDoubleTag_);
+    builder_.CreateBr(mBB);
+    auto *fokBBp = builder_.GetInsertBlock();
+
     builder_.SetInsertPoint(prBB);
     /* Indexing a FLOAT_PAIR as a 1-element "row" is not a pair-of-pairs.
        Fall through to boxed elem. */
-    builder_.CreateBr(fBB);
+    Value *isPair = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 13), "ispairr");
+    builder_.CreateCondBr(isPair, fBB, fBB);
 
     builder_.SetInsertPoint(fBB);
     Value *elem = callRT("perl_cplx_elem", {rowPv, idx});
@@ -3485,10 +3562,12 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     auto *fBBp = builder_.GetInsertBlock();
 
     builder_.SetInsertPoint(mBB);
-    auto *rePhi = builder_.CreatePHI(f64, 2, "cplx.re.phi");
-    auto *imPhi = builder_.CreatePHI(f64, 2,  "cplx.im.phi");
+    auto *rePhi = builder_.CreatePHI(f64, 3, "cplx.re.phi");
+    auto *imPhi = builder_.CreatePHI(f64, 3,  "cplx.im.phi");
     rePhi->addIncoming(reC, okBBp);
     imPhi->addIncoming(imC, okBBp);
+    rePhi->addIncoming(reFlat, fokBBp);
+    imPhi->addIncoming(imFlat, fokBBp);
     rePhi->addIncoming(reF2, fBBp);
     imPhi->addIncoming(imF, fBBp);
     re = rePhi;
@@ -3496,11 +3575,23 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     return true;
 }
 
+/* forward: defined after tryLoadCplxPairF64 (see Stage 37 section) */
+static bool isRowishUse(const Node &n, const std::string &nm);
+
 bool CodeGen::tryBindCplxPair(const std::string &nm, const Node &rhs) {
     if (!isOptStageEnabled("cplxrow")) return false;
     if (rhs.kind != NK::ArrowDeref || rhs.sval != "array" || !rhs.left || !rhs.right)
         return false;
     if (rhs.left->kind == NK::ArrowDeref) return false;
+    /* Perf item 3 (2026-11-04): if the variable is used as a deref-chain BASE
+       anywhere in the enclosing body ($zj->[$i], @$zj, $zj->method, ...), it
+       holds a row/reference PV and its pair slots would never be read — the
+       binding (a full cplx tag-dispatch chain at every binding site) is then
+       pure per-iteration overhead. Bind only when the slots can actually be
+       read as a pair (the mbs-shaped `my $re = $row->[2i]` scalar-half
+       bindings, which register the .re slot as the scalar). */
+    if (currentSubBody_ && isRowishUse(*currentSubBody_, nm)) return false;
+    if (!currentSubBody_ && mainBody_ && isRowishUse(*mainBody_, nm)) return false;
     Value *base = emitExpr(*rhs.left);
     Value *idx = emitIdx(*rhs.right);
     Value *re = nullptr, *im = nullptr;
@@ -3705,12 +3796,34 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
         if (n.right->kind == NK::ArrowDeref && n.right->sval == "array" &&
             n.right->left && n.right->left->kind != NK::ArrowDeref)
             return true;
+        /* Perf item 3 (2026-11-04): `my $new_re = <pure f64/i64 expr>` (the
+           mbs inner-loop kernel's own temporaries) also stays numeric —
+           the decl lowers to a float/int alloca store when both scans
+           pass, so the loop qualifies for the vectorize hint. */
+        if (n.right->kind != NK::Call && n.right->kind != NK::MethodCall && n.right->kind != NK::CallCodeRef &&
+            (canEmitF64(*n.right) || canEmitI64(*n.right)))
+            return true;
         return false;
     }
     if (n.kind == NK::Assign) {
         if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
             n.right && isPackedPairRhs(*n.right))
             return true;
+        /* Perf item 3 (2026-11-04): a statement-context element store
+           (`$row->[2i] = $new_re`, the mbs inner-loop shape) keeps the
+           numeric domain when the row is a flat double[] (checked at
+           runtime, not in this predicate) and the value is unboxed i64/f64 —
+           the emit lowers to a GEP+store on the row's double buffer. Accept
+           it so counted loops over flat rows get the Stage-34 vectorize
+           hint; LLVM's own dependence legality still gates the actual
+           vectorization, so a false positive here costs nothing. */
+        if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
+            n.left->left && n.left->left->kind != NK::ArrowDeref && n.right &&
+            (canEmitF64(*n.right) || canEmitI64(*n.right)))
+            return true;
+        if (getenv("PERLC_DEBUG_ST37") && n.left && n.left->kind == NK::ArrowDeref && n.right)
+            fprintf(stderr, "ST34 elassign RHS kind=%d f64=%d i64=%d\n",
+                    (int)n.right->kind, (int)canEmitF64(*n.right), (int)canEmitI64(*n.right));
         if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
         std::string nm = loopScalarNm(*n.left);
         if (n.right->kind == NK::ArrowDeref && n.right->sval == "array")
@@ -3721,6 +3834,15 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
         return false;
     }
     if (n.kind == NK::CompoundAssign) {
+        /* Perf item 3 (2026-11-04): `$row->[k] += floatch` on a flat row
+           lowers to an inline fadd+GEP store (the w22 flat path), i.e. it
+           stays in the numeric domain — same rationale as the Assign
+           element-store case above. */
+        if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
+            n.left->left && n.left->left->kind != NK::ArrowDeref && n.right &&
+            (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") &&
+            (canEmitF64(*n.right) || canEmitI64(*n.right)))
+            return true;
         if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
         std::string nm = loopScalarNm(*n.left);
         bool rhsOk = canEmitF64(*n.right) || canEmitI64(*n.right);
@@ -3946,6 +4068,16 @@ Value *CodeGen::emitIdx(const Node &n) {
             return builder_.CreateFPToSI(d, i64, nm + ".i");
         }
     }
+    /* Perf (2026-11-04) / Stage 37: pure-i64 arithmetic index (e.g. `$i * 2`)
+       emits plain i64 math with NO overflow-carry machinery and NO boxing.
+       Element accessors take i64 indexes anyway, so the old path — emitExpr
+       (which boxes every intermediate sub-expression through the overflow→
+       BigInt pipeline, several alloc_int/perl_free round trips per access)
+       followed by perl_to_int — was pure waste: an i64-wrapped index is
+       simply an out-of-bounds element (undef), which for an index position
+       is unobservable vs Perl's own OOB element semantics. emitExprI64's own
+       operand checks still return nullptr for anything not exact-i64. */
+    if (Value *iv = emitExprI64(n)) return iv;
     Value *pv = emitExpr(n);
     Value *i  = callRT("perl_to_int", {pv});
     freeIfOwned(pv);
@@ -4301,13 +4433,36 @@ static bool d135WriteKeepsInt(const Node &rhs, const D135IntSet &cur,
 }
 
 /* walks the root finding every direct write to 'nm'; returns false the
-   moment any write's RHS would leave the integer domain under 'cur' */
-static bool d135CheckVarWrites(const Node &n, const std::string &nm,
-                               const D135IntSet &cur) {
+   moment any write's RHS would leave the integer domain under 'cur'.
+   'unpackOkByBody' (Stage 37's per-body proven @_-params) marks the ONE
+   exception: a list-assign unpack element whose call-site proof fixed its
+   runtime value to an exact i64. */
+static bool d135CheckVarWrites(const CodeGen &cg, const Node &root, const Node &n,
+                               const std::string &nm, const D135IntSet &cur,
+                               const std::unordered_set<std::string> *unpackOk = nullptr) {
     switch (n.kind) {
     case NK::Assign: {
         if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
             return n.right && rhsIsIntShapedCtx(*n.right, cur, {nm});
+        /* @_-unpack list-assign (`my ($a, $b) = @_;`) — each matching element
+           is a write whose runtime origin is the CALLER's argument value,
+           statically unknown. 2026-11-04 (Stage 37 fallout): these used to
+           be invisible, so an unpacked param was admitted VACUOUSLY (no
+           visible writes = "int-shaped") and then advertised as int to every
+           consumer of the set — e.g. `flat_fill_pair($xmin, ...)` treated
+           the float $xmin as an i64 and truncated the whole mbs grid.
+           Unpacked params are refused here unless Stage 37's whole-program
+           call-site analysis (the root body's proven-param set) pinned them
+           to exact-i64 values; it promotes them directly (PPKind::Int) and
+           its members are admitted as seeds in d135ComputeIntSet.
+           The Stage-37 pass itself checks a candidate's OTHER writes first,
+           passing its own trusted-unpack set ({nm}) through 'unpackOk'. */
+        if (n.left && n.left->kind == NK::ArrayLit) {
+            for (auto &e : n.left->args)
+                if (e && e->kind == NK::ScalarVar && e->name == nm)
+                    return unpackOk ? unpackOk->count(nm) != 0
+                                    : cg.atArgIntProvableByBody(&root, nm);
+        }
         break;
     }
     case NK::CompoundAssign: {
@@ -4325,31 +4480,65 @@ static bool d135CheckVarWrites(const Node &n, const std::string &nm,
         break;
     }
     bool ok = true;
-    if (n.left)  ok = ok && d135CheckVarWrites(*n.left,  nm, cur);
-    if (n.right) ok = ok && d135CheckVarWrites(*n.right, nm, cur);
-    for (auto &a : n.args) ok = ok && d135CheckVarWrites(*a, nm, cur);
-    if (n.body)  ok = ok && d135CheckVarWrites(*n.body,  nm, cur);
-    if (n.init)  ok = ok && d135CheckVarWrites(*n.init,  nm, cur);
-    if (n.cond)  ok = ok && d135CheckVarWrites(*n.cond,  nm, cur);
-    if (n.step)  ok = ok && d135CheckVarWrites(*n.step,  nm, cur);
+    if (n.left)  ok = ok && d135CheckVarWrites(cg, root, *n.left,  nm, cur, unpackOk);
+    if (n.right) ok = ok && d135CheckVarWrites(cg, root, *n.right, nm, cur, unpackOk);
+    for (auto &a : n.args) ok = ok && d135CheckVarWrites(cg, root, *a, nm, cur, unpackOk);
+    if (n.body)  ok = ok && d135CheckVarWrites(cg, root, *n.body,  nm, cur, unpackOk);
+    if (n.init)  ok = ok && d135CheckVarWrites(cg, root, *n.init,  nm, cur, unpackOk);
+    if (n.cond)  ok = ok && d135CheckVarWrites(cg, root, *n.cond,  nm, cur, unpackOk);
+    if (n.step)  ok = ok && d135CheckVarWrites(cg, root, *n.step,  nm, cur, unpackOk);
     for (auto &b : n.branches) {
-        if (b.cond) ok = ok && d135CheckVarWrites(*b.cond, nm, cur);
-        if (b.body) ok = ok && d135CheckVarWrites(*b.body, nm, cur);
+        if (b.cond) ok = ok && d135CheckVarWrites(cg, root, *b.cond, nm, cur, unpackOk);
+        if (b.body) ok = ok && d135CheckVarWrites(cg, root, *b.body, nm, cur, unpackOk);
     }
     return ok;
 }
 
+/* Stage 37/D135+ (2026-11-04): a variable declared with a float-shaped
+   initializer can never be exact-i64 no matter what later writes do. Vacuous
+   admission (no writes visible) used to promote @_-params AND unknown-origin
+   vars into the int set; this origin gate closes that. Bare-my and @_-unpack
+   origins fall through to later-writes reasoning (or Stage 37's seeds). */
+static bool d135OriginInt(const Node &n, const std::string &nm) {
+    if (n.kind == NK::My || n.kind == NK::StateDecl) {
+        std::string b;
+        if (!n.name.empty()) {
+            b = n.name;
+            if (b[0] == '$') b = b.substr(1);
+            if (b == nm && n.right)
+                return rhsIsIntShapedCtx(*n.right, {}, {nm});
+        }
+    }
+    if (n.left  && !d135OriginInt(*n.left,  nm)) return false;
+    if (n.right && !d135OriginInt(*n.right, nm)) return false;
+    if (n.cond  && !d135OriginInt(*n.cond,  nm)) return false;
+    if (n.body  && !d135OriginInt(*n.body,  nm)) return false;
+    if (n.init  && !d135OriginInt(*n.init,  nm)) return false;
+    if (n.step  && !d135OriginInt(*n.step,  nm)) return false;
+    for (auto &a : n.args)
+        if (!d135OriginInt(*a, nm)) return false;
+    for (auto &b : n.branches) {
+        if (b.cond && !d135OriginInt(*b.cond, nm)) return false;
+        if (b.body && !d135OriginInt(*b.body, nm)) return false;
+    }
+    return true;
+}
+
 /* build the int-only set for a scan root by fixpoint iteration */
-static D135IntSet d135ComputeIntSet(const Node &root) {
+static D135IntSet d135ComputeIntSet(const CodeGen &cg, const Node &root,
+                                    const std::unordered_set<std::string> *seeds = nullptr) {
     std::set<std::string> all;
     d135CollectVarNames(root, all);
     D135IntSet cur;
+    if (seeds) cur.names = {seeds->begin(), seeds->end()};   /* Stage 37: call-site-proven @_-params */
     for (int round = 0; round < 32; round++) {
         D135IntSet next = cur;
         bool changed = false;
         for (const auto &nm : all) {
             if (cur.count(nm)) continue;
-            if (d135CheckVarWrites(root, nm, cur)) {
+            /* int set members must have an int-shaped declaration origin */
+            if (!d135OriginInt(root, nm)) continue;
+            if (d135CheckVarWrites(cg, root, root, nm, cur)) {
                 next.names.insert(nm);
                 changed = true;
             }
@@ -4358,6 +4547,578 @@ static D135IntSet d135ComputeIntSet(const Node &root) {
         if (!changed) break;
     }
     return cur;
+}
+
+/* Perf item 3 (2026-11-04): true iff 'nm' is used as the BASE of any deref
+   chain — `$nm->[...]` (ArrowDeref), `@$nm` / `$nm->@*` (DerefArray/
+   PostfixDeref), a method call on it, or `ref($nm->[...])`-style nesting —
+   or has its hash/array slots dereffed. Such a variable holds a REFERENCE
+   or ROW PV, not a scalar; pair-slot binding (and the float-var registration
+   that goes with it) is skipped for these so their PV cell keeps carrying
+   the row. */
+static bool isRowishUse(const Node &n, const std::string &nm) {
+    switch (n.kind) {
+    case NK::ArrowDeref:
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            return true;
+        if (n.left && isRowishUse(*n.left, nm)) return true;
+        /* also a rowish read of nm itself through deeper chains */
+        break;
+    case NK::DerefArray: case NK::DerefHash:
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            return true;
+        break;
+    case NK::PostfixDeref:
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            return true;
+        break;
+    case NK::MethodCall:
+        if (n.left && n.left->kind == NK::ScalarVar && n.left->name == nm)
+            return true;
+        break;
+    default:
+        break;
+    }
+    if (n.left  && isRowishUse(*n.left,  nm)) return true;
+    if (n.right && isRowishUse(*n.right, nm)) return true;
+    if (n.cond  && isRowishUse(*n.cond,  nm)) return true;
+    if (n.body  && isRowishUse(*n.body,  nm)) return true;
+    if (n.init  && isRowishUse(*n.init,  nm)) return true;
+    if (n.step  && isRowishUse(*n.step,  nm)) return true;
+    for (auto &a : n.args) if (isRowishUse(*a, nm)) return true;
+    for (auto &b : n.branches) {
+        if (b.cond && isRowishUse(*b.cond, nm)) return true;
+        if (b.body && isRowishUse(*b.body, nm)) return true;
+    }
+    return false;
+}
+
+/* ── Stage 37: @_-param int unboxing via whole-program call-site analysis ──
+ *
+ * Scope rules for this whole pass (2026-11-04):
+ *  - Each SubDef body is its own lexical world. A sub-local variable's
+ *    int-ness is derived ONLY from writes inside its own body (plus the
+ *    D135-style shape of those writes) — never mixed across subs, and a
+ *    sub-local name never advertises another body's same-named variable.
+ *  - File-scope variables (the program root's top-level `my` decls, plus
+ *    any `our` decl) are checked across every body, but writes made under
+ *    a SHADOWING lexical declaration do not count.
+ *  - A call site's argument expression lives in the CALLER's context: its
+ *    ScalarVar operands resolve against (enclosing-sub locals ∪ file-vars
+ *    ∪ the ENCLOSING sub's own candidate lattice) — never the callee's.
+ *    Self-recursion naturally works because the enclosing sub IS the
+ *    callee, so the candidate params participate through the owner's own
+ *    lattice (with writes through the unpack treated as the exact i64 the
+ *    sites are proving). The lattice iterates to a fixpoint; removing one
+ *    param cascades to dependent ones in later rounds.
+ *  - Reference-taken (\&name), method-name-shaped, or dynamic-dispatch
+ *    programs poison everything (the runtime can hand arbitrary args to
+ *    any sub through those shapes).
+ */
+
+static void collectSubDefs(const Node &n, std::vector<const Node*> &out);
+
+/* Does 'nm' appear in any position that cannot observe its unboxed + boxed-
+   on-demand value identically to the original PV?  For @_-params whose
+   call-site proof fixes the runtime value to an exact INT, boxing reproduces
+   the identical INT PV for reads/string contexts/arith/compares/returns —
+   these are all safe. The exotic positions below are not. */
+static bool at37ExoticUse(const Node &n, const std::string &nm) {
+    switch (n.kind) {
+    case NK::RefScalar: case NK::RefArray: case NK::RefHash:
+    case NK::RefSub:    case NK::Typeglob: case NK::SymbolicDeref:
+        /* \$$nm / *alias / ${"name"} — need the stable PV cell */
+        if (hasVar(n, nm)) return true;
+        break;
+    case NK::LocalStmt: case NK::LocalGlob:
+        if (n.name == nm) return true;   /* local $nm targets the PV cell */
+        break;
+    case NK::StateDecl:
+        if (n.name == nm) return true;
+        break;
+    default:
+        break;
+    }
+    if (n.left  && at37ExoticUse(*n.left,  nm)) return true;
+    if (n.right && at37ExoticUse(*n.right, nm)) return true;
+    if (n.cond  && at37ExoticUse(*n.cond,  nm)) return true;
+    if (n.body  && at37ExoticUse(*n.body,  nm)) return true;
+    if (n.init  && at37ExoticUse(*n.init,  nm)) return true;
+    if (n.step  && at37ExoticUse(*n.step,  nm)) return true;
+    for (auto &a : n.args) if (at37ExoticUse(*a, nm)) return true;
+    for (auto &b : n.branches) {
+        if (b.cond && at37ExoticUse(*b.cond, nm)) return true;
+        if (b.body && at37ExoticUse(*b.body, nm)) return true;
+    }
+    return false;
+}
+
+/* Does this call site's argument list flatten positionally (making @_
+   positions unprovable)?  Anything the arg-collection list-extends
+   (perl_array_extend path of emitArrayPtr) qualifies. */
+static bool at37FlatteningArg(const Node &a) {
+    switch (a.kind) {
+    case NK::ArrayVar: case NK::HashVar: case NK::DerefArray:
+    case NK::ArrayLit: case NK::Range:
+    case NK::KeysFunc: case NK::ValuesFunc:
+    case NK::MapFunc:  case NK::GrepFunc: case NK::SortFunc:
+    case NK::ReverseFunc:
+    case NK::HashSlice: case NK::ArraySlice:
+    case NK::Call:            /* a user sub's list-return spreads in arg ctx */
+    case NK::MethodCall: case NK::CallCodeRef:
+    case NK::PostfixDeref: case NK::FlatBlock:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Stage 37: shadow-aware write-shape check. 'shadows' = names whose lexical
+   declaration we have entered (their subtree writes belong to the NEW
+   variable). A My/StateDecl node for 'nm' shadows it for its own subtree;
+   the pass's trusted-unpack set permits proven @_-unpack elements. */
+static bool at37BareName(const Node &n, std::string &out) {
+    if (n.kind != NK::ScalarVar || n.name.empty()) return false;
+    std::string b = n.name;
+    if (b[0] == '$') b = b.substr(1);
+    out = b;
+    return true;
+}
+
+static bool at37WritesInt(const CodeGen &cg, const Node &root, const Node &n,
+                          const std::string &nm, const D135IntSet &intCtx,
+                          const std::unordered_set<std::string> &trustUnpack,
+                          std::set<std::string> shadows = {},
+                          const std::unordered_map<
+                              const Node *,
+                              std::unordered_map<std::string, long long>>
+                                  *unpacksOf = nullptr) {
+    /* entering a named sub's body: its own @_ unpack shadows those bare
+       names for the whole walk through that body */
+    if (n.kind == NK::SubDef && unpacksOf) {
+        auto u = unpacksOf->find(&n);
+        if (u != unpacksOf->end())
+            for (auto &[unm, _pos] : u->second)
+                if (!shadows.count(unm))
+                    shadows.insert(unm);
+    }
+    /* a declaring node shadows 'nm' for its own subtree */
+    std::set<std::string> here = shadows;
+    if (n.kind == NK::My || n.kind == NK::StateDecl) {
+        std::string b;
+        if (at37BareName(n, b) && b == nm && !shadows.count(nm))
+            here.insert(nm);
+    }
+    /* write checks for THIS node — skipped when 'nm' is shadowed here */
+    if (!shadows.count(nm)) {
+        switch (n.kind) {
+        case NK::Assign: {
+            std::string b;
+            if (n.left && at37BareName(*n.left, b) && b == nm)
+                return n.right && rhsIsIntShapedCtx(*n.right, intCtx, {nm});
+            if (n.left && n.left->kind == NK::ArrayLit) {
+                for (auto &e : n.left->args) {
+                    std::string eb;
+                    if (e && at37BareName(*e, eb) && eb == nm)
+                        return trustUnpack.count(nm) != 0;
+                }
+            }
+            break;
+        }
+        case NK::CompoundAssign: {
+            std::string b;
+            if (n.left && at37BareName(*n.left, b) && b == nm) {
+                if (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "%")
+                    return n.right && rhsIsIntShapedCtx(*n.right, intCtx, {nm});
+                return false;   /* /= **= %= .= x= |= &= ^= <<= >>= ++/-- */
+            }
+            break;
+        }
+        case NK::UnaryOp: {
+            /* ++/--: invisible to the D135 scan by convention (an admitted
+               variable's origin and other writes pin it integer exactly;
+               perls ++/-- of an integer stays integer). */
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    /* descend, threading the (possibly grown) shadow set */
+    if (n.cond  && !at37WritesInt(cg, root, *n.cond,  nm, intCtx, trustUnpack, here, unpacksOf)) return false;
+    if (n.init  && !at37WritesInt(cg, root, *n.init,  nm, intCtx, trustUnpack, here, unpacksOf)) return false;
+    if (n.step  && !at37WritesInt(cg, root, *n.step,  nm, intCtx, trustUnpack, here, unpacksOf)) return false;
+
+    if (n.left)  { if (!at37WritesInt(cg, root, *n.left,  nm, intCtx, trustUnpack, here, unpacksOf)) return false; }
+    if (n.right) { if (!at37WritesInt(cg, root, *n.right, nm, intCtx, trustUnpack, here, unpacksOf)) return false; }
+    if (n.body)  { if (!at37WritesInt(cg, root, *n.body,  nm, intCtx, trustUnpack, here, unpacksOf)) return false; }
+    for (auto &a : n.args)
+        if (!at37WritesInt(cg, root, *a, nm, intCtx, trustUnpack, here, unpacksOf)) return false;
+    for (auto &b : n.branches) {
+        if (b.cond && !at37WritesInt(cg, root, *b.cond, nm, intCtx, trustUnpack, here, unpacksOf)) return false;
+        if (b.body && !at37WritesInt(cg, root, *b.body, nm, intCtx, trustUnpack, here, unpacksOf)) return false;
+    }
+    return true;
+}
+
+/* collect the @_ unpacked scalar params for a sub body, mirroring Stage 25's
+   tryFindAtAssign scan (top-level statements + FlatBlock children; first
+   occurrence of a name wins; positional index preserved). Returns false when
+   MULTIPLE inconsistent unpack statements mention the same name at different
+   positions (Stage 25 keeps first-win per name — track that exactly). */
+static void at37CollectUnpacks(const Node &body,
+                               std::unordered_map<std::string, long long> &slots) {
+    auto tryOne = [&](const Node &stmt) {
+        const Node *asgn = nullptr;
+        if (stmt.kind == NK::ExprStmt && stmt.left) asgn = stmt.left.get();
+        else if (stmt.kind == NK::Assign) asgn = &stmt;
+        if (!asgn || asgn->kind != NK::Assign) return;
+        if (!asgn->left  || asgn->left->kind  != NK::ArrayLit) return;
+        if (!asgn->right || asgn->right->kind != NK::ArrayVar || asgn->right->name != "_") return;
+        long long i = 0;
+        for (auto &lhsElem : asgn->left->args) {
+            if (lhsElem->kind == NK::ScalarVar) {
+                std::string nm = lhsElem->name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (!slots.count(nm)) slots[nm] = i;   /* Stage 25: first wins */
+            }
+            i++;
+        }
+    };
+    for (auto &stmt : body.args) tryOne(*stmt);
+    for (auto &stmt : body.args)
+        if (stmt->kind == NK::FlatBlock)
+            for (auto &inner : stmt->args) tryOne(*inner);
+}
+
+/* find the SubDef the node belongs to during the site walk (track "current"
+   subdef; nested defs handled by descending order — the innermost def seen
+   most recently wins, matching lexical nesting when walked in order). */
+void CodeGen::analyzeAtArgIntUnboxing(const Node &program) {
+    atArgIntProvable_.clear();
+    atArgIntProvableByBody_.clear();
+
+    /* Dynamic shapes can hand arbitrary args to any sub at runtime: a
+       string eval re-compiles code that can call our subs (its calls
+       resolve through the runtime dispatch table), as can do FILE /
+       runtime require. Poison the whole analysis. */
+    if (hasEvalCall(program)) return;
+    {
+        bool poison = false;
+        [&] {
+            std::function<void(const Node &)> w = [&](const Node &n) {
+                if (n.kind == NK::DoFile || n.kind == NK::RequireStmt) poison = true;
+                if (poison) return;
+                if (n.kind != NK::SubDef) {
+                    if (n.left) w(*n.left);
+                    if (n.right) w(*n.right);
+                    if (n.cond) w(*n.cond);
+                    if (n.body) w(*n.body);
+                    if (n.init) w(*n.init);
+                    if (n.step) w(*n.step);
+                    for (auto &a : n.args) w(*a);
+                    for (auto &b : n.branches) { if (b.cond) w(*b.cond); if (b.body) w(*b.body); }
+                }
+            };
+            w(program);
+        }();
+        if (poison) return;
+    }
+    /* D192: computed typeglob assignment makes even "direct" calls dynamic
+       (perl_call_sub_maybe_dynamic consults the runtime table). */
+    if (dynamicGlobAssign_) return;
+
+    /* subdefs: collectSubDefs recurses through all nesting (D45). */
+    std::vector<const Node *> subdefs;
+    collectSubDefs(program, subdefs);
+
+    std::unordered_map<std::string, int> nameCount;
+    for (auto *sd : subdefs) {
+        if (sd->name.empty()) continue;
+        nameCount[sd->name]++;
+    }
+    /* call sites (+ their owning subdef AND enclosing body), ref-taking,
+       method-name collisions, unpacks: one walk */
+    std::unordered_map<std::string, std::vector<const Node *>> sites;
+    std::unordered_map<const Node *, const Node *> siteOwner;   /* call node -> SubDef */
+    std::unordered_map<const Node *, const Node *> siteBody;    /* call node -> enclosing body */
+    std::unordered_map<const Node *, std::unordered_map<std::string, long long>> unpacks;
+    std::unordered_set<std::string> refd;
+    std::unordered_set<std::string> methoded;
+    [&] {
+        std::function<void(const Node &, const Node *, const Node *)> w =
+            [&](const Node &n, const Node *curSub, const Node *curBody) {
+            if (n.kind == NK::SubDef) {
+                curSub = &n;
+                curBody = n.body ? n.body.get() : curBody;
+            }
+            switch (n.kind) {
+            case NK::Call:
+                if (!n.name.empty()) {
+                    sites[n.name].push_back(&n);
+                    siteOwner[&n] = curSub;
+                    siteBody[&n] = curBody;
+                }
+                break;
+            case NK::RefSub:
+                if (!n.name.empty()) refd.insert(n.name);
+                break;
+            case NK::Typeglob:
+                if (!n.name.empty() &&
+                    (n.right && (n.right->kind == NK::RefSub ||
+                                 n.right->kind == NK::RefScalar)))
+                    refd.insert(n.name);
+                break;
+            case NK::MethodCall:
+                if (!n.name.empty()) methoded.insert(n.name);
+                break;
+            default:
+                break;
+            }
+            if (n.left)  w(*n.left,  curSub, curBody);
+            if (n.right) w(*n.right, curSub, curBody);
+            if (n.cond)  w(*n.cond,  curSub, curBody);
+            if (n.body)  w(*n.body,  curSub, curBody);
+            if (n.init)  w(*n.init,  curSub, curBody);
+            if (n.step)  w(*n.step,  curSub, curBody);
+            for (auto &a : n.args) w(*a, curSub, curBody);
+            for (auto &b : n.branches) {
+                if (b.cond) w(*b.cond, curSub, curBody);
+                if (b.body) w(*b.body, curSub, curBody);
+            }
+        };
+        w(program, nullptr, &program);
+    }();
+    for (auto *sd : subdefs)
+        if (sd->body) at37CollectUnpacks(*sd->body, unpacks[sd]);
+
+    /* candidate lattice start: all unpacked, used, non-exotic params */
+    std::unordered_map<const Node *, std::set<std::string>> assumed;
+    for (auto *sd : subdefs) {
+        if (!sd->body || sd->name.empty()) continue;
+        if (nameCount[sd->name] != 1) continue;         /* barename ambiguity */
+        if (refd.count(sd->name)) continue;             /* \&name / glob alias */
+        if (methoded.count(sd->name)) continue;         /* method dispatch */
+        auto it = sites.find(sd->name);
+        if (it == sites.end() || it->second.empty()) continue;  /* never called */
+        for (auto &[nm, slot] : unpacks[sd]) {
+            if (!hasVar(*sd->body, nm)) continue;        /* unused */
+            if (at37ExoticUse(*sd->body, nm)) continue;  /* needs PV cell */
+            assumed[sd].insert(nm);
+        }
+    }
+
+    /* body -> owning SubDef (unpack shadow rule + proven-param seeds) */
+    std::unordered_map<const Node *, const Node *> bodyOwner;
+    for (auto *sd : subdefs) {
+        if (!sd->body) continue;
+        bodyOwner[sd->body.get()] = sd;
+        std::function<void(const Node &)> w = [&](const Node &n) {
+            if (n.kind == NK::SubDef && n.body) {
+                bodyOwner[n.body.get()] = &n;
+                w(*n.body);
+                return;
+            }
+            if (n.left) w(*n.left);
+            if (n.right) w(*n.right);
+            if (n.cond) w(*n.cond);
+            if (n.body) w(*n.body);
+            if (n.init) w(*n.init);
+            if (n.step) w(*n.step);
+            for (auto &a : n.args) w(*a);
+            for (auto &b : n.branches) {
+                if (b.cond) w(*b.cond);
+                if (b.body) w(*b.body);
+            }
+        };
+        w(*sd->body);
+    }
+
+    /* file-decl names: program-root top-level `my $...` + `our $...` anywhere */
+    std::unordered_set<std::string> fileDeclNames;
+    {
+        std::function<void(const Node &)> collectTop = [&](const Node &n) {
+            if (n.kind == NK::SubDef) return;   /* a sub's body is another lexical world */
+            if (n.kind == NK::My && !n.name.empty()) {
+                /* names may or may not carry the '$' sigil depending on
+                   which parse path built the decl; normalize */
+                std::string b = n.name;
+                if (b[0] == '$') b = b.substr(1);
+                if (b != "_") fileDeclNames.insert(b);
+                return; /* initializer is an expression, not a decl scope */
+            }
+            if (n.left) collectTop(*n.left);
+            if (n.right) collectTop(*n.right);
+            if (n.cond) collectTop(*n.cond);
+            if (n.body) collectTop(*n.body);
+            if (n.init) collectTop(*n.init);
+            if (n.step) collectTop(*n.step);
+            for (auto &a : n.args) collectTop(*a);
+            for (auto &b : n.branches) {
+                if (b.cond) collectTop(*b.cond);
+                if (b.body) collectTop(*b.body);
+            }
+        };
+        std::function<void(const Node &)> ourAnywhere = [&](const Node &n) {
+            if (getenv("PERLC_DEBUG_ST37") && n.kind == NK::My)
+                fprintf(stderr, "ST37 mynode '%s' ival=%lld\n",
+                        n.name.c_str(), (long long)n.ival);
+            if (n.kind == NK::My && !n.name.empty() && (n.ival & 2) &&
+                n.name[0] == '$') {
+                std::string b = n.name.substr(1);
+                if (b != "_") fileDeclNames.insert(b);
+            }
+            if (n.left) ourAnywhere(*n.left);
+            if (n.right) ourAnywhere(*n.right);
+            if (n.cond) ourAnywhere(*n.cond);
+            if (n.body) ourAnywhere(*n.body);
+            if (n.init) ourAnywhere(*n.init);
+            if (n.step) ourAnywhere(*n.step);
+            for (auto &a : n.args) ourAnywhere(*a);
+            for (auto &b : n.branches) {
+                if (b.cond) ourAnywhere(*b.cond);
+                if (b.body) ourAnywhere(*b.body);
+            }
+        };
+        /* collectTop's SubDef early-return keeps every sub body out of the
+           file set; ourAnywhere (below) walks the same tree (including sub
+           bodies) for `our`/package-global decls only */
+        [&] {
+            std::function<void(const Node &)> w = [&](const Node &n) {
+                if (n.kind == NK::SubDef) return;   /* own-lexical world */
+                collectTop(n);
+                if (n.left) w(*n.left);
+                if (n.right) w(*n.right);
+                if (n.cond) w(*n.cond);
+                if (n.body) w(*n.body);
+                if (n.init) w(*n.init);
+                if (n.step) w(*n.step);
+                for (auto &a : n.args) w(*a);
+                for (auto &b : n.branches) {
+                    if (b.cond) w(*b.cond);
+                    if (b.body) w(*b.body);
+                }
+            };
+            w(program);
+        }();
+        ourAnywhere(program);
+    }
+
+    /* the three-set global fixpoint */
+    D135IntSet fileInt;
+    std::unordered_map<const Node *, D135IntSet> localInts;  /* body-keyed */
+    std::unordered_map<const Node *, std::set<std::string>> proven = assumed;
+    for (auto &[sd, set] : proven) {
+        /* the sub's own body's writes must stay int for each candidate
+           (with the candidate's own unpack trusted = Stage-37's site proof) */
+        std::set<std::string> stillAssumed;
+        for (const auto &nm : set) {
+            std::unordered_set<std::string> trustedUnpack{nm};
+            if (d135CheckVarWrites(*this, *sd->body, *sd->body, nm, { }, &trustedUnpack))
+                stillAssumed.insert(nm);
+        }
+        set = stillAssumed;
+    }
+
+    for (int gRound = 0; gRound < 12; gRound++) {
+        bool changedAny = false;
+
+        /* (1) file-int: names whose non-shadowed writes are int-shaped */
+        {
+            D135IntSet cur = fileInt;
+            bool changed = false;
+            for (const auto &nm : fileDeclNames) {
+                if (cur.count(nm)) continue;
+                D135IntSet trial; trial.names = cur.names;
+                if (d135OriginInt(program, nm) &&
+                    at37WritesInt(*this, program, program, nm, trial, {}, {}, &unpacks))
+                    { cur.names.insert(nm); changed = true; }
+            }
+            changedAny = changedAny || changed;
+            fileInt = cur;
+        }
+
+        /* (2) sub-local int sets: D135 fixpoint over each own body,
+           seeded with fileInt + the sub's current proven params */
+        for (auto *sd : subdefs) {
+            if (!sd->body) continue;
+            auto pit = proven.find(sd);
+            std::unordered_set<std::string> seeds(fileInt.names.begin(), fileInt.names.end());
+            if (pit != proven.end())
+                seeds.insert(pit->second.begin(), pit->second.end());
+            D135IntSet s = d135ComputeIntSet(*this, *sd->body, &seeds);
+            auto lit = localInts.find(sd->body.get());
+            if (lit == localInts.end() || lit->second.names != s.names) {
+                changedAny = true;
+                localInts[sd->body.get()] = s;
+            }
+        }
+        /* the program body's own locals too (main's bare-block my counters) */
+        {
+            std::unordered_set<std::string> seeds(fileInt.names.begin(), fileInt.names.end());
+            D135IntSet s = d135ComputeIntSet(*this, program, &seeds);
+            auto lit = localInts.find(&program);
+            if (lit == localInts.end() || lit->second.names != s.names) {
+                changedAny = true;
+                localInts[&program] = s;
+            }
+            if (const char *dbg = getenv("PERLC_DEBUG_ST37")) {
+                fprintf(stderr, "ST37 fileDecls:");
+                for (auto &x : fileDeclNames) fprintf(stderr, " %s", x.c_str());
+                fprintf(stderr, "\nST37 fileInt:");
+                for (auto &x : fileInt.names) fprintf(stderr, " %s", x.c_str());
+                fprintf(stderr, "\nST37 progLocals:");
+                for (auto &x : s.names) fprintf(stderr, " %s", x.c_str());
+                fprintf(stderr, "\n");
+            }
+        }
+
+        /* (3) params: every call site passes an int-shaped arg, resolved in
+           the OWNER's context (owner locals + file vars). Self-recursion
+           resolves through the owner's (== the callee's) proven params via
+           its seeded local set. */
+        for (auto &[sd, set] : proven) {
+            if (set.empty()) continue;
+            std::set<std::string> keep;
+            for (const auto &nm : set) {
+                long long pos = unpacks[sd].count(nm) ? unpacks[sd][nm] : -1;
+                if (pos < 0) continue;
+                bool ok = true;
+                for (const Node *site : sites[sd->name]) {
+                    bool siteStable = true;
+                    for (auto &a : site->args)
+                        if (at37FlatteningArg(*a)) { siteStable = false; break; }
+                    if (!siteStable) { ok = false; break; }   /* positions shift */
+                    if ((long long)site->args.size() <= pos) { ok = false; break; }
+                    D135IntSet ctx;
+                    const Node *sb = (siteBody.count(site) && siteBody[site])
+                                         ? siteBody[site] : nullptr;
+                    if (sb && localInts.count(sb))
+                        ctx.names = localInts[sb].names;
+                    if (ctx.names.empty())
+                        ctx.names = fileInt.names;
+                    if (!rhsIsIntShapedCtx(*site->args[pos], ctx, {}))
+                        { ok = false; break; }
+                }
+                if (ok) keep.insert(nm); else changedAny = true;
+            }
+            set = keep;
+        }
+
+        if (!changedAny) break;
+    }
+
+    for (auto &[sd, set] : proven)
+        if (!set.empty()) {
+            if (const char *dbg = getenv("PERLC_DEBUG_ST37")) {
+                fprintf(stderr, "ST37 %s:", sd->name.c_str());
+                for (auto &nm2 : set) fprintf(stderr, " %s", nm2.c_str());
+                fprintf(stderr, "\n");
+            }
+            atArgIntProvable_[sd] = {set.begin(), set.end()};
+            if (sd->body)
+                atArgIntProvableByBody_[sd->body.get()] = atArgIntProvable_[sd];
+        }
 }
 
 /* D135: true iff 'nm' is ever the LHS/element target of an assignment or
@@ -5238,6 +5999,11 @@ void CodeGen::compile(const Node &program, const std::string &modName,
     collectGlobNames(program, globNames_);
     scanDynamicGlobs(program, dynamicGlobAssign_, dynamicCodeRef_);
 
+    /* Stage 37: whole-program @_-param int-unboxing analysis (hot numeric
+       kernels and recursion — e.g. bench/fibn.pl's `fib($n - 1)`). Runs
+       after scanDynamicGlobs because the dynamic-glob poison applies. */
+    analyzeAtArgIntUnboxing(program);
+
     evalPadScalars_.clear();
     evalPadArrays_.clear();
     evalPadHashes_.clear();
@@ -5940,15 +6706,20 @@ void CodeGen::emitSub(const Node &n) {
     }
 
     /* capture local() save depth at function entry.
-       Stage 24b: skip the alloca + perl_local_save_depth entirely when the
-       function has no local() AND no explicit return — in that case
-       localDepthAlloca_ is never read (implicit return skips restore, and
-       NK::Return is never emitted), so nullptr is safe. */
+       Stage 24b: skip the alloca + perl_local_save_depth when the function
+       has no local() anywhere in its body — the depth is only ever read to
+       restore this frame's OWN pushes, and a body with no local() pushes
+       nothing. (Perf item 4, 2026-11-04: the previous gate also forced the
+       save for any sub with an explicit `return` — fib-style recursion paid
+       perl_local_save_depth/perl_local_restore_to per call for nothing. Die
+       unwinding is unaffected: perl_die restores globally from the eval
+       frame's own capture before every longjmp, and eval-block frames carry
+       their own depth, so intermediate frames need no save for unwind
+       exactness.) */
     auto *i32Ty = Type::getInt32Ty(ctx_);
     auto *savedLocalDepth = localDepthAlloca_;
     bool subNeedsLocal = n.body && hasLocalStmt(*n.body);
-    bool subNeedsReturn = n.body && hasReturnStmt(*n.body);
-    if (subNeedsLocal || subNeedsReturn) {
+    if (subNeedsLocal) {
         localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
         builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
     } else {
@@ -5991,6 +6762,18 @@ void CodeGen::emitSub(const Node &n) {
                 if (lhsElem->kind != NK::ScalarVar) continue;
                 const std::string &nm = lhsElem->name;
                 if (prePromotedArgs_.count(nm)) continue;
+                /* Stage 37: whole-program call-site proof says this @_ param
+                   is always an exact i64 — no arg shape can make the unbox
+                   diverge (boxing reproduces the identical INT PV), so this
+                   precedes the float ladder entirely. */
+                auto aiIt = atArgIntProvable_.find(&n);
+                if (isOptStageEnabled("st37") &&
+                    aiIt != atArgIntProvable_.end() &&
+                    aiIt->second.count(nm) &&
+                    !capturedNamesInCurrentFn_.count(nm)) {
+                    prePromotedArgs_[nm] = PPKind::Int;
+                    continue;
+                }
                 /* Stage 27c: DerefAV pre-promotion.
                    If the arg is only used as an array-ref deref base ($x->[$i]),
                    skip the PV alloca entirely — call perl_deref_array_ro directly on
@@ -6337,12 +7120,22 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         }
     }
     /* Clone result before popScope() frees variables it may reference.
-       Also free the original if it was an owned temp (mirrors NK::Return logic). */
-    if (result && !llvm::isa<llvm::ConstantPointerNull>(result)) {
-        Value *orig = result;
+       Also free the original if it was an owned temp (mirrors NK::Return logic).
+       Perf (2026-11-04, same reasoning as the NK::Return path): a result that
+       is an OWNED TEMP (a fresh allocation — boxed arithmetic, sub return,
+       list wrapper, ...) is not one of popScope()'s tracked cell PVs, so the
+       clone-then-free round trip is skipped; cell/borrowed results still
+       clone (popScope would otherwise free their storage). */
+    /* Clone result before popScope() frees variables it may reference.
+       Perf (2026-11-04, mirrors the NK::Return path): the consumer treats a
+       sub-call result as a fresh owned allocation and frees it once — so a
+       return value that is already a FRESH owned temp (boxed arithmetic,
+       sub return list wrapper, ...) transfers ownership directly with no
+       clone; anything else here is a tracked my-var PV, a cell read, or a
+       borrowed pointer that outlives or dies with this scope, all of which
+       must be copied so the caller's later free is exactly once. */
+    if (result && !llvm::isa<llvm::ConstantPointerNull>(result) && !isOwnedTemp(result))
         result = callRT("perl_clone", {result});
-        freeIfOwned(orig);
-    }
     /* D189: perl_local_restore_to() MUST run BEFORE popScope() — a
        `local $ref->{key} = val;` target is a raw PerlValue* pointing
        INTO a container (e.g. a hash cell), not an independently-owned
@@ -6865,7 +7658,15 @@ void CodeGen::emitStmt(const Node &n) {
                        : (!atFileScope && mainBody_) ? mainBody_
                        : nullptr;
                        if (scanRoot) {
-                           D135IntSet intSet = d135ComputeIntSet(*scanRoot);
+                           /* Stage 37: proven @_-params seed the body's int set —
+                              their unpack write is exact-integer by the whole-
+                              program call-site proof. */
+                           auto st37it = atArgIntProvableByBody_.find(scanRoot);
+                           bool haveSeeds = st37it != atArgIntProvableByBody_.end() &&
+                                            !st37it->second.empty();
+                           D135IntSet intSet = haveSeeds
+                               ? d135ComputeIntSet(*this, *scanRoot, &st37it->second)
+                               : d135ComputeIntSet(*this, *scanRoot);
                            bool assignsFloat = assignsFloatLikeRhs(*this, *scanRoot, nm, &intSet);
                            bool readsFloat   = readsFloatSensitive(*scanRoot, nm);
                            if (assignsFloat || readsFloat) {
@@ -6933,6 +7734,38 @@ void CodeGen::emitStmt(const Node &n) {
                         break;
                     }
                     } /* !skipIntPromo */
+                }
+                /* Stage 36 (perf item 3, 2026-11-04): `my $v = $row->[idx]`
+                   — the RHS is a packed-row/flat-row ELEMENT read. Bind the
+                   scalar-half value through the pair machinery with NO PV
+                   cell when nothing in the enclosing body observes the
+                   variable as a PV (no ref-taking/symbolic use per
+                   floatVarUseSafe, never a deref-chain base per
+                   isRowishUse, not closure-captured): reads/arith go
+                   through the float slot, and boxing on demand reproduces
+                   exactly the FLOAT PV the old boxed read created for
+                   these numeric rows. tryBindCplxPair handles flat (direct
+                   GEP+load, zero runtime calls), CPLX_ROW (direct), and
+                   falls back to the boxed perl_cplx_elem read otherwise.
+                   Any failure falls through to the always-correct
+                   PV-cell path below. */
+                if (n.right && !atFileScope && n.right->kind == NK::ArrowDeref &&
+                    n.right->sval == "array" && n.right->left &&
+                    n.right->left->kind != NK::ArrowDeref) {
+                    const Node *scanRoot36 =
+                        currentSubBody_ ? currentSubBody_
+                      : mainBody_ ? mainBody_ : nullptr;
+                    if (scanRoot36 && !mayBeCaptured &&
+                        floatVarUseSafe(*scanRoot36, nm) &&
+                        !isRowishUse(*scanRoot36, nm)) {
+                        if (tryBindCplxPair(nm, *n.right)) {
+                            if (CplxPairSlots *sl = ensurePairSlots(nm))
+                                declareFloatVar(nm, sl->re);
+                            floatSqrtOf_.erase(nm);
+                            if (lastSqrtInput_) { floatSqrtOf_[nm] = lastSqrtInput_; lastSqrtInput_ = nullptr; }
+                            break;
+                        }
+                    }
                 }
                 /* Stage 25/27c: @_ arg pre-promoted to int/float/derefAV —
                    skip PV alloca entirely.
@@ -7597,6 +8430,9 @@ void CodeGen::emitStmt(const Node &n) {
                when that body is also numeric — unrolling mbs would bloat IR.
                D95: Disable unrolling by default to prevent LLVM IPO hangs. */
             bool vec = cforIsCountedNumeric(n);
+            if (getenv("PERLC_DEBUG_ST37"))
+                fprintf(stderr, "ST34 cfor vec=%d stmt=%d\n", (int)vec,
+                        (int)stmtIsUnboxedNumeric(*n.body));
             attachCountedLoopMD(backBr, false, vec);
         }
 
@@ -8067,16 +8903,22 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.CreateBr(target.endBB);
             break;
         }
-        /* restore any local()s before returning; clone retval first so
-           restore doesn't clobber the in-place PerlValue we're returning */
+        /* restore any local()s before returning; the retval may point INTO
+           this frame (a tracked my-var PV/cell read or a borrowed pointer
+           whose backing cell local-restore is about to rewrite) — everything
+           that is not already a fresh owned temp gets copied first so the
+           caller's one free is exactly once. Owned temps (boxed arithmetic,
+           freshly cloned results) transfer ownership directly, no extra
+           clone-then-free round trip. */
         if (localDepthAlloca_) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-            Value *cloned = callRT("perl_clone", {v});
-            freeIfOwned(v);
+            if (!isOwnedTemp(v)) {
+                Value *cloned = callRT("perl_clone", {v});
+                v = cloned;
+            }
             if (currentSubNeedsWantarray_) callRT("perl_pop_wantarray", {});
             callRT("perl_local_restore_to", {depth});
-            v = cloned;
         }
         emitScopeCleanup();  /* free tracked my-var pvs in all active scopes */
         /* In the main function (which returns i32), we can't emit `ret ptr`.
