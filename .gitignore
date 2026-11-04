@@ -1,6 +1,10 @@
 perlc
 perlc_tsan
 tests/realworld/last-report.txt
+src/.perlc_lto_cache/
+src/runtime.bc
+src/mini-gmp.bc
+src/native_stdlib.bc
 # Phase-0 gap detector: build stamp recording the TRACE flag (see Makefile)
 .perlc_trace_flag
 a.out

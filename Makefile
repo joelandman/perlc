@@ -127,6 +127,7 @@ $(SRCDIR)/llvm_early_init.o: $(SRCDIR)/llvm_early_init.cpp $(SRCDIR)/llvm_early_
 
 clean:
 	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.a $(TARGET) $(TSAN_TARGET) $(TRACE_FLAG)
+	rm -rf $(SRCDIR)/.perlc_lto_cache
 
 test: $(TARGET)
 	@set -e; \
