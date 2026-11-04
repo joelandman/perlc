@@ -1165,9 +1165,13 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_get_os_name",      pv);
 #undef RT
 
-    /* Mark pure read-only functions so GVN/LICM can eliminate redundant calls */
+    /* Pure read-only functions so GVN/LICM can eliminate redundant calls.
+       IMPORTANT: these must really be non-mutating (arg and global): with
+       -flto=thin the definitions get inlined into caller code and LLVM
+       freely reorders/CSEs calls under these effects — a mutating body
+       under memory(read) is a miscompile waiting to happen. */
     for (const char *nm : {"perl_array_get_ref", "perl_to_float", "perl_to_int",
-                            "perl_array_len", "perl_deref_array_ro",
+                            "perl_array_len_i64", "perl_array_is_all_flat",
                             "perl_is_bigint_pv"}) {
         auto *F = getRTFunc(nm);
         F->setMemoryEffects(MemoryEffects::readOnly());
@@ -1176,6 +1180,41 @@ RT("perl_clear_named_captures", voidTy);
 #endif
         F->addFnAttr(Attribute::WillReturn);
     }
+    /* perl_array_len (returns an ALLOCATED PV — mutates the TLS freelist) and
+       perl_deref_array_ro (mutates a CPLX_ROW's PV in place via the lazy
+       unpack) must NOT claim memory(read): under LLVM's readonly contract two
+       calls on the same argument may be CSE'd into one allocation (both
+       holders then free the same PV → double free) and inlined bodies may be
+       reordered across real mutations. Both keep NoInline semantics otherwise
+       and lose nothing but (unsound) IPA. */
+#if LLVM_VERSION_MAJOR >= 22
+    /* Leaf diet: these runtime functions are small enough that letting LLVM
+       inline them is a net win — but only materializes under -flto=thin when
+       runtime.c's bitcode is in the same LTO unit (cross-TU). Without LTO the
+       functions live in a separate TU and this removal is inert. Complex
+       dispatchers (io/hash/regex/method/dbi/bigint) stay NoInline. */
+    static const char *const inlineableLeaves[] = {
+        "perl_alloc_undef", "perl_alloc_int",  "perl_alloc_float",
+        "perl_free",        "perl_clone",      "perl_assign",
+        "perl_is_true",     "perl_add",        "perl_sub",
+        "perl_mul",         "perl_div",        "perl_num_eq",
+        "perl_num_ne",      "perl_num_lt",     "perl_num_gt",
+        "perl_num_le",      "perl_num_ge",     "perl_array_len_i64",
+        "perl_deref_array", "perl_flat_row_op_assign", "perl_cplx_elem",
+        "perl_sqrt_val",    "perl_flat_row_get_double",
+        "perl_array_new",   "perl_array_push", "perl_array_free",
+        "perl_push_call_frame", "perl_pop_call_frame",
+        "perl_push_wantarray", "perl_pop_wantarray",
+        "perl_local_save_depth", "perl_local_restore_to",
+        "perl_array_get_ref", "perl_array_len", "perl_deref_array_ro",
+        "perl_to_float",    "perl_to_int",     "perl_array_is_all_flat",
+        "perl_promote_ref_array",
+    };
+    for (const char *nm : inlineableLeaves) {
+        auto it = rtFuncs_.find(nm);
+        if (it != rtFuncs_.end()) it->second->removeFnAttr(Attribute::NoInline);
+    }
+#endif
 }
 
 Function *CodeGen::getRTFunc(const std::string &nm) {
