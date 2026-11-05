@@ -10199,6 +10199,8 @@ static void regex_cache_insert(const char *pattern, const char *flags, pcre2_cod
     dst->compiled = compiled;
 }
 
+static void pcre2_jit_stack_setup(void); /* E5d: persistent TLS jit match stack */
+
 static pcre2_code *regex_compile_cached(const char *pattern, const char *flags) {
     if (!pattern) pattern = "";
     if (!flags) flags = "";
@@ -10210,10 +10212,12 @@ static pcre2_code *regex_compile_cached(const char *pattern, const char *flags) 
                        pcre_flags(flags), &errcode, &erroffset, NULL);
     if (re) {
         (void)pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);
+        pcre2_jit_stack_setup();
         regex_cache_insert(pattern, flags, re);
     }
     return re;
 }
+
 
 typedef struct {
     PCRE2_SPTR ptr;
@@ -10238,9 +10242,15 @@ static ReSubj re_subject(const PerlValue *str) {
 
 static __thread pcre2_match_data *re_md_ = NULL;
 static __thread uint32_t re_md_pairs_ = 0;
+/* Perf round 2 (E5d, 2026-11-05): re_match_data re-asked PCRE2 for the
+   capture count on EVERY match (pcre2_pattern_info was 4.2% of regex3m's
+   runtime); memoize the pair-count per compiled pattern. Multi-pattern
+   programs just pay one info call on each pattern switch. */
+static __thread pcre2_code *re_md_code_ = NULL;
 
 static pcre2_match_data *re_match_data(pcre2_code *re) {
     uint32_t caps = 0;
+    if (re_md_ && re_md_code_ == re && re_md_pairs_ >= 32) return re_md_;
     pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &caps);
     uint32_t need = caps + 1;
     if (need < 32) need = 32;
@@ -10249,10 +10259,72 @@ static pcre2_match_data *re_match_data(pcre2_code *re) {
         re_md_ = pcre2_match_data_create(need, NULL);
         re_md_pairs_ = need;
     }
+    re_md_code_ = re;
     return re_md_;
 }
 
+/* Perf round 2 (E5d, 2026-11-05): without an assigned JIT stack,
+   pcre2_jit_match probes/establishes a 32 KiB match stack PER CALL (the
+   `orq $0x0,(%rsp)` stack-guard loop was 27.5% of regex3m's runtime).
+   Assign one persistent thread-local JIT stack per thread instead. */
+static __thread pcre2_jit_stack *s_pcre2_jit_stack_ = NULL;
+static pcre2_jit_stack *s_pcre2_jit_stack_cb(void *data) {
+    (void)data;
+    if (!s_pcre2_jit_stack_) {
+        s_pcre2_jit_stack_ =
+            pcre2_jit_stack_create(32 << 10, 512 << 10, NULL);
+    }
+    return s_pcre2_jit_stack_;
+}
+static void pcre2_jit_stack_setup(void) {
+    pcre2_jit_stack_assign(NULL, s_pcre2_jit_stack_cb, NULL);
+}
+
 static void install_match_captures(pcre2_match_data *md, const char *s, int rc, pcre2_code *re);
+
+static pcre2_code **s_regex_memos_ = NULL;
+static int          s_regex_memo_count_ = 0;
+#define REGEX_MEMO_CAP 4096
+
+static pcre2_code *regex_memo_compile(const char *pattern, const char *flags,
+                                      pcre2_code **memo) {
+    pcre2_code *re = *memo;
+    if (re) return re;
+    int errcode;
+    PCRE2_SIZE erroffset;
+    if (!pattern) pattern = "";
+    if (!flags) flags = "";
+    re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                       pcre_flags(flags), &errcode, &erroffset, NULL);
+    if (!re) return NULL;
+    (void)pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);
+    pcre2_jit_stack_setup();
+    *memo = re;   /* benign race: either winner is a usable equivalent */
+    if (s_regex_memo_count_ == 0)
+        s_regex_memos_ = (pcre2_code **)calloc(REGEX_MEMO_CAP, sizeof(pcre2_code *));
+    if (s_regex_memos_ && s_regex_memo_count_ < REGEX_MEMO_CAP)
+        s_regex_memos_[s_regex_memo_count_++] = re;
+    return re;
+}
+
+int perl_regex_match_bool_memo(PerlValue *str, const char *pattern,
+                               const char *flags, pcre2_code **memo) {
+    pcre2_code *re = regex_memo_compile(pattern, flags, memo);
+    if (!re) return 0;
+    ReSubj s = re_subject(str);
+    pcre2_match_data *md = re_match_data(re);
+    int rc = pcre2_match(re, s.ptr, s.len, 0, 0, md, NULL);
+    if (rc > 0 && (s_match_amp_needed || s_match_caps_needed))
+        install_match_captures(md, (const char *)s.ptr, rc, re);
+    if (s.owned) free(s.owned);
+    return rc > 0;
+}
+
+PerlValue *perl_regex_match_memo(PerlValue *str, const char *pattern,
+                                 const char *flags, pcre2_code **memo) {
+    return perl_alloc_bool(perl_regex_match_bool_memo(str, pattern, flags, memo));
+}
+
 
 int perl_regex_match_bool(PerlValue *str, const char *pattern, const char *flags) {
     pcre2_code *re = regex_compile_cached(pattern, flags);
@@ -18338,6 +18410,16 @@ void perl_cleanup(void) {
             e = next;
         }
         s_mutex_table[b] = NULL;
+    }
+
+    /* 1b. Pinned per-call-site regex memo patterns (perf item 2): compiled
+     *    once at first use, never LRU-cached, so free them here. */
+    if (s_regex_memos_) {
+        for (int i = 0; i < s_regex_memo_count_; i++)
+            if (s_regex_memos_[i]) pcre2_code_free(s_regex_memos_[i]);
+        free(s_regex_memos_);
+        s_regex_memos_ = NULL;
+        s_regex_memo_count_ = 0;
     }
 
     /* 2. Named-captures hash ($+) — may still hold the last match. */

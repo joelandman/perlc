@@ -179,6 +179,8 @@ eval STRING and eval-defined subs see outer `my`).
 |----|--------|-------|
 | D197 | **OPEN (2026-11-04)** | `defined($param)` lies for missing `@_` args when the param gets INT-promoted by Stage 25's ladder: `sub m2 { my ($y) = @_; return defined($y) ? "D" : "U"; }  print m2();` — perl: `U`, perlc: `D`; `m2(1)` correctly `D`. Confirmed identical on the pre-D197 binary, so pre-existing, untouched by Stages 36/37: `floatSafe` (the ladder's only body-use gate) doesn't know about `defined()`, an int-promoted alloca can't represent undef, and the unbox emits `perl_to_int(get_ref(args,0))` — the undef sentinel numerifies to 0 and boxes an INT, which is always defined. Same root class would misreport `defined` after an otherwise-int-only write sequence. Correct fix shape: refuse int promotion when the body can observe definedness (`defined($nm)` / list-assignment defaults / splice/each interactions), or keep an undef-capable side slot. Found by `tests/atarg_int_unbox_*` while landing the perf items; those tests scope it out and this row tracks it. |
 | D198 | **OPEN (2026-11-04)** | `wantarray()` inside a de-boxed prologue reads a stale/genuine-LIST context: `sub cq { my ($x) = @_; my @r = $x ? (1,2) : (3); return wantarray ? "want-list" : join("/", @r); }  print cq(1);` — perl: `1/2` (scalar ctx: wantarray false), perlc (pre-Session build, byte-identical): the call site pushes ctx=1 for some argument-collection shapes (print/list-assign arg collection), so the prologue-peeled wantarray reads LIST even though the statement context is scalar/void. Standalone `print cq(1);` compiles correctly (`r1[1/2]` in the isolated probe) — the fork needs the surrounding multi-sub context (fill_z/magnitude-style subs defined earlier), which suggests wantarray-stack depth accounting (Stage 24a's hasWantarrayOrUserCall gate vs call-site pushes) goes unbalanced for some multi-sub programs. Fix shape: audit Stage 24a's push/pop pairing across all argument-collection call sites (print/list-assign/map-grep args) or make wantarray() read the frame's ctx param rather than the shared stack top. Found while writing `tests/atarg_int_unbox_deep.pl`; that test scopes it out and this row tracks it. Same root would mis-dispatch `wantarray`-dependent subs in real scripts. |
+| D200 | **FIXED 2026-11-05** | **D186-class: canEmitF64's file-scope-global fallback read a STALE same-named file var when a nearer (function/block-local) lexical shadowed it.** Repro: `my $i = 0; for (my $i = 0; $i < 2; $i++) { print "i=$i\n"; }` — perl: `i=0,i=1`; perlc: `i=2,i=3,…` unbounded (71M+ lines before the watchdog). Root cause: for a ScalarVar outside a float-pool (int-promoted or PV lexical), `canEmitF64`/`emitExprF64` fell back to `fileScalarGlobals_` BY BARE NAME while an inner lexical of the same name was live — the fallback only checked large-int/blessed/special-var guards, never shadowing. Exposed 2026-11-05 when Stage 39's raw-FCmp compare fast path (a *new* consumer of canEmitF64 verdicts) ran the loop condition through it; the arithmetic fast paths had the same latent exposure. Fix: both `canEmitF64` and `emitExprF64`'s ScalarVar cases now refuse the file-global fallback whenever ANY scope deeper than `fileScopeDepth_` (scopes_ or intScopes_) declares the bare name; the file scope itself (same storage the fallback reads) is still allowed. MUST stay mirrored between the two functions (see D201). Verified against real Perl for: the exact loop repro (2 iterations), nested-block shadowing of float/int vars, unshadowed file-global float reads/compares unaffected (`tests/d96_flat_row_op_assign.pl` = nbody-shaped flat-row math still fully inline), and the full gate. Found by `tests/loop_var_shadow_{smoke,deep}.pl` (existing regression tests) during the Stage-39 landing; the landing made them fail for the first time, which is exactly what they existed to catch. |
+| D201 | **FIXED defensively 2026-11-05 (structural hazard closed)** | **canEmitF64/emitExprF64 verdict mismatch = instant compiler SIGSEGV** (CreateStore(Value* null) inside `emitArrayPtr`'s float-literal/AnonArray builder, `src/codegen.cpp`): the flat-array builder loops `for (e : args) if (!canEmitF64(e)) allFloat=false;` and then unconditionally `emitExprF64(e)` per child — ANY divergence between the verdict function and the emitter crashed the compiler (a null Value* store). Was reached exactly this way mid-landing on 2026-11-05 when only one of the two D186 shadow fixes was applied — `$solar_mass` (a file global) verdict TRUE + emit nullptr → segfault inside `CodeGen::emitExpr`. **Fix:** the flat-array builder now collects all f64 values first and bails to the generic boxed path if any `emitExprF64` returns null (before anything was built) — the verdict loop decides fast, the builder decides sound; a future verdict/emitter divergence can no longer segfault, only lose the flat form locally. All comment blocks in both functions reference the mirroring requirement. Found by `tests/d96_flat_row_op_assign.pl` (nbody-shaped, crashes at compile). |
 | D190 | **regression guard (test-only)** | A byte-for-byte regression guard for the `$;`-joined composite-key hash subscript (`$h{"a","b"}` / `$h{"a","b","c"}`) — the multi-key-subscript idiom where a subscript like `"a","b"` indexes the same entry real Perl does (the keys joined by `$SUBSEP`/`;`). The `$;`-joining is handled upstream (`perl_hash_get`/`perl_hash_set` build an `\x1c`-joined composite key for a comma-separated subscript), so this test locks in that behavior rather than fixing a defect: a write through a composite key is read back correctly, a fresh composite key is undef, two distinct composite keys don't collide (`$h{"ab",1}` vs `$h{"a","b1"}`), and an overwrite through the same key returns the new value. All composite-key lookups/round-trips pass in perlc; the one unrelated gap is that `ord($;)` (the `$;` scalar's VALUE) reports `0` in perlc rather than real Perl's `28` (`$SUBSEP` is used internally by the subscript join, but the `$;` special variable itself isn't readable) — a separate, pre-existing gap, not part of this guard. Tests: `tests/d190_composite_key_{smoke,deep}.pl`. |
 | D191 | **FIXED 2026-10-06** | A trailing comma with no following semicolon as the LAST statement of a block (`push @x, "a", "b",\n}`) was a hard parse error in several list-op/assignment forms. Root cause: `Parser::consumeTrailingComma()` (`src/parser.cpp`) returned a bool but never actually advanced past the comma, leaving it dangling so the next `parseStmt` choked on it — the shared fix was making `consumeTrailingComma()` advance. The list-operator arg loops each need their own trailing-comma guard, `atTrailingDelim()` (stop parsing args when the token after a consumed comma is `}`/`)`/`]`): `parsePush`/`parseUnshift` already had it, but `parsePrint`/`parseSay` were missing it (so `print "x",` still failed) — added there. **Covered shapes, byte-for-byte:** a trailing comma after a list operator that is the last statement of a sub, after a list operator in a nested bare block, after element assignments, and after a bareword `print`; **out of scope** (separate pre-existing gaps): a trailing comma after a statement modifier (`$x = 1 if C,`) is still a parse error (that's a modifier's trailing comma, not a list-op one — the modifier's own trailing comma isn't consumed), a void-context `my $x = 5,` as the last statement of a sub returns undef in perlc but the assigned value in real Perl (a separate `my`-decl-in-void-context limitation), and a trailing comma followed by another statement is a list-continuation (perl's normal list grammar), not a trailing comma. Tests: `tests/d191_trailing_comma_{smoke,deep}.pl`. |
 | D192 | **FIXED 2026-10-06** | Chained `our` used as a chainable assignment EXPRESSION — `our $a = our $b = ...;` (real Perl makes `our` return the assigned value, so the chain binds left-to-right). Was a hard parse error: `Parser::parsePrimary()` had a case for a plain `my` in expression context but none for `our`, so a leading `our` before a `my`-shaped decl was a parse error. Fixed by treating `our` like `my` in `parsePrimary()`'s expression-context handler (same `ival |= 2` "force package global" codegen path), so `our $a = our $b = N;` parses and evaluates correctly. **Covered, byte-for-byte:** a two-way scalar chain (`our $a = our $b = 5;`), a three-way chain, a chain with an expression RHS (`our $x = our $y = (2 + 3);`), and the exact `/usr/bin/splain` file-scope four-way chain (`our $opt_p = our $opt_d = our $opt_v = our $opt_f = '';`). **Out of scope** (separate pre-existing limitation): `our (@a, $b)`/`our (%h)` chained forms aren't handled — perlc's `our` model resolves a dynamic target only at compile time, so a chained array/hash `our` can't bind the intermediate target the way scalar chains do; scalar chains (the real-script shape, e.g. splain) are covered. Tests: `tests/d192_chained_our_{smoke,deep}.pl`. |
@@ -3515,6 +3517,77 @@ A failing `try` with no `catch` returns undef without rethrowing
   `perl_local_save_depth`/`perl_local_restore_to` when the body contains
   no `local()` (die-unwind depth is restored globally by perl_die from the
   capturing eval frame before longjmp).
+
+- **Stage 39 row-element de-boxing + fcmp + D186-class shadow rule**
+  (2026-11-05, perf round 2 E4):
+  * Row-element READ: `tryLoadCplxPairF64` gains a REF_ARRAY (tag 5)
+    branch — arrayref-backed rows (the runtime shape every
+    PerlArray-backend row takes; mbs640's rows were REF_ARRAY for all
+    332M accesses) read the two element PVs' fval slots directly behind
+    FLT-box tag checks. `perl_cplx_elem` calls dropped 200M → 156K on
+    mbs640.
+  * Row-element STORE (pair): `tryStoreCplxPair` gains the same
+    REF_ARRAY branch, updating both slot boxes' fval in place
+    (perl_array_update_float semantics for FLOAT slots). The boxed
+    fallback (perl_alloc_float_pair + perl_array_set_row, with its
+    internal free(old)+clone(new)) is preserved verbatim for every
+    other slot tag / OOB / negative index. alloc_float_pair 38.7M → 61.
+  * Row-element STORE (single float, F64 RHS): `emitRowElemStoreFast`
+    (promote-inline + REF-row in-place update; boxed fallback inside)
+    wired into the statement-context void path and the
+    ScalarVar-rooted plain-Assign dispatch. PerlValue boxes for these
+    stores dropped to zero on the hot path.
+  * Float COMPARES de-boxed: `tryEmitI1Cond` now emits raw
+    `fcmp O(o)GT/OLT/…` for locally-numeric (floatVar/lit/arith)
+    operands; ordered predicates reproduce perl's exact NaN behavior
+    (NaN comparisons false for < <= > >= ==, true for !=), and
+    ref-holding operands are excluded (the file-scope-global fallback
+    cannot verify numerics for compares — `$y == $h` stays boxed via
+    perl_num_eq's identity semantics).
+  * D186-class shadow-rule fix (canEmitF64/emitExprF64): the
+    file-scope-global fallback must NEVER win when a FUNCTION- or
+    BLOCK-local lexical of the same name exists in a scope deeper than
+    fileScopeDepth_ — previously `my $i = 0;` at file scope +
+    `for (my $i = 0; $i < 2; $i++)` read the STALE outer $i = 0 forever
+    in every float fast path that reached the fallback. Both predicates
+    are env-gate-removable (`PERLC_OPT_DISABLE=st39`) and MUST stay in
+    lockstep (emitArrayPtr's float-literal verdict loop crashes the
+    compiler on a canEmitF64/emitExprF64 mismatch — found and fixed in
+    the same landing).
+  * mbs640 (N=640, 80 iterations): 9.07s → **1.43s** at plain -O2
+    (perl 57.7s; 40× faster than real perl). Ablation: with the
+    Stage-39 row paths disabled the same build measures ~9s
+    (PERLC_OPT_DISABLE=cplxrow,st39). Tests:
+    `tests/d96_flat_row_op_assign.pl`, `tests/ref_base_pair_store_*.pl`,
+    `tests/loop_var_shadow_{smoke,deep}.pl`,
+    `tests/storable_freeze_deep.pl`, plus the full gate.
+- **Stage 40 known-arity @_ unpacks → i64-args direct-call variant**
+  (2026-11-05, perf round 2 E6): a whole-program pre-pass (Stage 37's
+  lattice machinery, re-used) qualifies a sub as `*_ai`-callable when its
+  ENTIRE @_ consumption is one contiguous `my (...) = @_` unpack list,
+  every call site passes exactly that arity of int-shaped (or
+  +/−-arith-shaped) args, no prototype, no \&ref/method-dispatch/
+  barename-ambiguity/captures/local()/dynamic-typeglob/eval poison. The
+  pass pre-declares `<sub>_ai(i64…, i32 ctx) → PV` and emitSub emits a
+  second body pass whose bind stores the raw i64 params straight into
+  the unboxed int allocas (no args array, no get_ref/to_int, no
+  perl_array_len probe). Call sites emit a raw-i64 direct call; arith
+  args (e.g. `$n - 1`) go through llvm.sadd/ssub.with.overflow with a
+  boxed fallback arm that preserves D103's overflow semantics exactly
+  (the boxed arm re-emits the arg via emitExpr and takes the full
+  generic call). Frames + the wantarray pair are kept (caller() and
+  die_croak locations stay exact); only the array+boxing machinery is
+  skipped. Arity mismatch falls back to the general path. Disable with
+  `PERLC_OPT_DISABLE=st40`. fibn(37): 10.0s → **4.41s** at plain -O2.
+- **Stage 38 D105 promote inline** (2026-11-05, perf round 2 E5):
+  the D105 choke-point promote on every PV-handed-out read path
+  (ScalarVar read, ArrayElem, HashElem, shared-ScalarVar load) is now
+  an inline two-tag-compare + branch (`emitPromoteInline`); the
+  `perl_promote_ref_array` call remains only behind it for
+  genuinely-FLAT/FLOAT_PAIR values. Previously this NoInline call broke
+  GVN/LICM of flat-row caches across every hot loop read (nb's j-loop
+  ran 17.7s → 0.7s with the inline alone). Same call-time semantics
+  (the promote is still a no-op for all other tags).
 
 ### Future: auto-parallel `map` / counted loops (2026-09-22, deferred)
 

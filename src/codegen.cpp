@@ -823,6 +823,11 @@ void CodeGen::declareRuntime() {
     /* regex */
     RT("perl_regex_match",     pv,  pv, i8p, i8p);
     RT("perl_regex_match_bool", Type::getInt32Ty(ctx_), pv, i8p, i8p);
+    /* Perf item 2: per-call-site compiled-pattern memo slots (pinned
+       patterns; see regex_memo_compile in runtime.c). The 4th arg is the
+       address of a codegen-owned global holding the compiled pattern. */
+    RT("perl_regex_match_bool_memo", Type::getInt32Ty(ctx_), pv, i8p, i8p, i8p);
+    RT("perl_regex_match_memo",     pv, pv, i8p, i8p, i8p);
     RT("perl_regex_match_g",   pv,  pv, i8p, i8p);
     RT("perl_regex_match_g_bool", Type::getInt32Ty(ctx_), pv, i8p, i8p);
     RT("perl_regex_match_all", av,  pv, i8p, i8p);
@@ -3157,7 +3162,25 @@ Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
     return callRT("perl_mod_i64", {lv, rv});
 }
 
-bool CodeGen::canEmitI64(const Node &n) {
+
+/* EXPERIMENT (perf round-2, 2026-11-04): single-element paren groups are
+   NK::ArrayLit with one arg (parser keeps `(expr)` unwrapped-by-nothing for
+   D95's `(f()) x N` list-repetition recognition). In VALUE positions a
+   one-element list without a trailing comma is observably just its element
+   (scalar context keeps the last — a single element keeps itself), so the
+   numeric fast paths may look through it. The node itself is untouched. */
+static inline bool isPackedPairRhsIsCalllike(const Node &rhs) {
+    return rhs.kind == NK::Call || rhs.kind == NK::MethodCall || rhs.kind == NK::CallCodeRef;
+}
+
+static const Node *singleArrayLitElem(const Node &n) {
+    if (n.kind == NK::ArrayLit && n.args.size() == 1 && n.args[0])
+        return n.args[0].get();
+    return &n;
+}
+
+bool CodeGen::canEmitI64(const Node &nRaw) {
+    const Node &n = *singleArrayLitElem(nRaw);
     switch (n.kind) {
     case NK::IntLit: return true;
     case NK::ScalarVar: {
@@ -3245,7 +3268,8 @@ bool CodeGen::canEmitI64(const Node &n) {
     }
 }
 
-Value *CodeGen::emitExprI64(const Node &n) {
+Value *CodeGen::emitExprI64(const Node &nRaw) {
+    const Node &n = *singleArrayLitElem(nRaw);
     auto *i64 = Type::getInt64Ty(ctx_);
     switch (n.kind) {
     case NK::IntLit:
@@ -3372,8 +3396,21 @@ Value *CodeGen::emitRegexMatchBool(const Node &n) {
         Value *pat = builder_.CreateGlobalStringPtr(n.sval, "re_pat");
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
         bool isG = n.name.find('g') != std::string::npos;
-        Value *hit = callRT(isG ? "perl_regex_match_g_bool" : "perl_regex_match_bool",
-                            {str, pat, flg});
+        Value *hit;
+        if (!isG) {
+            /* Perf item 2: a constant pattern+flags literal gets a
+               per-call-site pinned memo (compiled once, then straight to
+               pcre2_match; skips the LRU cache's key-build/strcmp/LRU
+               promotion per element in tight match loops). /g keeps the
+               iterator path. */
+            std::string mname = "re.memo." + std::to_string(regexMemoSeq_++);
+            auto *memo = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                ConstantPointerNull::get(perlPtrTy_), mname);
+            hit = callRT("perl_regex_match_bool_memo", {str, pat, flg, memo});
+        } else {
+            hit = callRT("perl_regex_match_g_bool", {str, pat, flg});
+        }
         if (n.ival)
             hit = builder_.CreateXor(hit, ConstantInt::get(i32, 1), "re_not");
         return hit;
@@ -3548,7 +3585,67 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     /* Indexing a FLOAT_PAIR as a 1-element "row" is not a pair-of-pairs.
        Fall through to boxed elem. */
     Value *isPair = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 13), "ispairr");
-    builder_.CreateCondBr(isPair, fBB, fBB);
+    /* Stage 39 (E4, perf round 2): PerlArray-backed row borrow — the runtime
+       shape rows actually take when a row was stored as an ordinary arrayref
+       (`$z->[$j] = @row-elements`; tag stays REF_ARRAY). The general path
+       below was perl_cplx_elem (+内部 deref + clone/free) per half-read —
+       ~200M calls in mbs640. Inline the two element reads when both slot PVs
+       are float boxes: a bounds check + two fval loads, zero calls. Any
+       other (INT/STRING/REF/CPLX) slot tag, negative index, or OOB pair
+       takes the boxed fallback unchanged. */
+    Value *isRefAR = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 5), "isrefr");
+    Value *refTry = builder_.CreateAnd(builder_.CreateNot(isPair), isRefAR, "ref.try");
+    auto *rchkBB = BasicBlock::Create(ctx_, "cplx.rchk", curFn);
+    builder_.CreateCondBr(refTry, rchkBB, fBB);
+
+    builder_.SetInsertPoint(rchkBB);
+    Value *refAvP = builder_.CreateGEP(i8, rowPv,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.ravp");
+    Value *rAv = builder_.CreateLoad(perlPtrTy_, refAvP, "cplx.rav");
+    Value *rElems = builder_.CreateLoad(perlPtrTy_, rAv, "cplx.relems");
+    setTBAA(rElems, tbaaAvElemsTag_);
+    Value *rLenP = builder_.CreateGEP(i8, rAv,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.rlenp");
+    Value *rLen = builder_.CreateLoad(i64, rLenP, "cplx.rlen");
+    Value *rNext = builder_.CreateAdd(idx,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 1), "cplx.rn1");
+    Value *rInRange = builder_.CreateAnd(
+        builder_.CreateICmpSGE(idx, ConstantInt::get(Type::getInt64Ty(ctx_), 0)),
+        builder_.CreateICmpSLT(rNext, rLen), "cplx.rir");
+    auto *rok0BB = BasicBlock::Create(ctx_, "cplx.rok0", curFn);
+    builder_.CreateCondBr(rInRange, rok0BB, fBB);
+
+    builder_.SetInsertPoint(rok0BB);
+    Value *e0 = builder_.CreateLoad(perlPtrTy_,
+        builder_.CreateGEP(perlPtrTy_, rElems, idx, "cplx.re0p"), "cplx.re0");
+    setTBAA(e0, tbaaAvElemTag_);
+    Value *t0 = builder_.CreateLoad(i32, e0, "cplx.rt0");
+    setTBAA(t0, tbaaPvTagTag_);
+    Value *f0 = builder_.CreateLoad(f64,
+        builder_.CreateGEP(i8, e0, ConstantInt::get(Type::getInt64Ty(ctx_), 8),
+            "cplx.rf0p"), "cplx.rf0");
+    setTBAA(f0, tbaaPvFvalTag_);
+    Value *ok0 = builder_.CreateICmpEQ(t0, ConstantInt::get(i32, 2), "cplx.rok0v");
+    auto *rok1BB = BasicBlock::Create(ctx_, "cplx.rok1", curFn);
+    builder_.CreateCondBr(ok0, rok1BB, fBB);
+
+    builder_.SetInsertPoint(rok1BB);
+    Value *e1 = builder_.CreateLoad(perlPtrTy_,
+        builder_.CreateGEP(perlPtrTy_, rElems, rNext, "cplx.re1p"), "cplx.re1");
+    setTBAA(e1, tbaaAvElemTag_);
+    Value *t1 = builder_.CreateLoad(i32, e1, "cplx.rt1");
+    setTBAA(t1, tbaaPvTagTag_);
+    Value *f1 = builder_.CreateLoad(f64,
+        builder_.CreateGEP(i8, e1, ConstantInt::get(Type::getInt64Ty(ctx_), 8),
+            "cplx.rf1p"), "cplx.rf1");
+    setTBAA(f1, tbaaPvFvalTag_);
+    Value *ok1 = builder_.CreateICmpEQ(t1, ConstantInt::get(i32, 2), "cplx.rok1v");
+    auto *rok2BB = BasicBlock::Create(ctx_, "cplx.rok2", curFn);
+    builder_.CreateCondBr(ok1, rok2BB, fBB);
+
+    builder_.SetInsertPoint(rok2BB);
+    builder_.CreateBr(mBB);
+    auto *rok2BBp = builder_.GetInsertBlock();
 
     builder_.SetInsertPoint(fBB);
     Value *elem = callRT("perl_cplx_elem", {rowPv, idx});
@@ -3562,12 +3659,14 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     auto *fBBp = builder_.GetInsertBlock();
 
     builder_.SetInsertPoint(mBB);
-    auto *rePhi = builder_.CreatePHI(f64, 3, "cplx.re.phi");
-    auto *imPhi = builder_.CreatePHI(f64, 3,  "cplx.im.phi");
+    auto *rePhi = builder_.CreatePHI(f64, 4, "cplx.re.phi");
+    auto *imPhi = builder_.CreatePHI(f64, 4,  "cplx.im.phi");
     rePhi->addIncoming(reC, okBBp);
     imPhi->addIncoming(imC, okBBp);
     rePhi->addIncoming(reFlat, fokBBp);
     imPhi->addIncoming(imFlat, fokBBp);
+    rePhi->addIncoming(f0, rok2BBp);
+    imPhi->addIncoming(f1, rok2BBp);
     rePhi->addIncoming(reF2, fBBp);
     imPhi->addIncoming(imF, fBBp);
     re = rePhi;
@@ -3621,10 +3720,14 @@ bool CodeGen::tryStoreCplxPair(Value *rowPv, Value *idx, Value *re, Value *im) {
     setTBAA(tag, tbaaPvTagTag_);
     Value *isCplx = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 19), "iscplx.st");
     auto *okBB = BasicBlock::Create(ctx_, "cplx.st.ok", curFn);
-    auto *fbBB = BasicBlock::Create(ctx_, "cplx.st.fb", curFn);
     auto *mBB  = BasicBlock::Create(ctx_, "cplx.st.m", curFn);
     auto *chkBB = BasicBlock::Create(ctx_, "cplx.st.chk", curFn);
-    builder_.CreateCondBr(isCplx, chkBB, fbBB);
+    /* Stage 39 (E4): tryRefBB = REF-row inline attempt; refFBSink = the
+       boxed alloc_float_pair + perl_array_set_row fallback (all non-19
+       shapes land here first). */
+    auto *tryRefBB = BasicBlock::Create(ctx_, "cplx.st.tref", curFn);
+    auto *refFBSink = BasicBlock::Create(ctx_, "cplx.st.fbs", curFn);
+    builder_.CreateCondBr(isCplx, chkBB, tryRefBB);
     builder_.SetInsertPoint(chkBB);
     Value *hdrPtr = builder_.CreateGEP(i8, rowPv, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.st.hp");
     Value *hdr = builder_.CreateLoad(perlPtrTy_, hdrPtr, "cplx.st.hdr");
@@ -3634,7 +3737,7 @@ bool CodeGen::tryStoreCplxPair(Value *rowPv, Value *idx, Value *re, Value *im) {
     Value *inRange = builder_.CreateAnd(
         builder_.CreateICmpSGE(idx, ConstantInt::get(Type::getInt64Ty(ctx_), 0)),
         builder_.CreateICmpSLT(idx, n), "cplx.st.ir");
-    builder_.CreateCondBr(inRange, okBB, fbBB);
+    builder_.CreateCondBr(inRange, okBB, refFBSink);
     builder_.SetInsertPoint(okBB);
     Value *two = ConstantInt::get(Type::getInt64Ty(ctx_), 2);
     Value *base = builder_.CreateMul(idx, two, "cplx.st.b");
@@ -3649,7 +3752,61 @@ bool CodeGen::tryStoreCplxPair(Value *rowPv, Value *idx, Value *re, Value *im) {
         s2->setMetadata(LLVMContext::MD_tbaa, tbaaFlatDoubleTag_);
     }
     builder_.CreateBr(mBB);
-    builder_.SetInsertPoint(fbBB);
+    /* Stage 39 (E4, perf round 2): REF_ARRAY-backed row borrow stores —
+       when both slot PVs (idx, idx+1) are float boxes, update them in
+       place (perl_array_update_float semantics for FLOAT slots: fval
+       store, tag already FLOAT). This replaces the boxed
+       perl_alloc_float_pair + perl_array_set_row path, whose
+       perl_array_set internally freed+re-clone'd the old/new boxes
+       (115M pair clone/free pairs in mbs640). Any other slot tag or an
+       OOB/negative pair index keeps the boxed fallback unchanged. */
+    builder_.SetInsertPoint(tryRefBB);
+    Value *stRefAR = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 5), "isrefr.st");
+    auto *schkBB = BasicBlock::Create(ctx_, "cplx.st.rchk", curFn);
+    builder_.CreateCondBr(stRefAR, schkBB, refFBSink);
+    builder_.SetInsertPoint(schkBB);
+    Value *stAvP = builder_.CreateGEP(i8, rowPv,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.st.ravp");
+    Value *stAv = builder_.CreateLoad(perlPtrTy_, stAvP, "cplx.st.rav");
+    Value *stElems = builder_.CreateLoad(perlPtrTy_, stAv, "cplx.st.relems");
+    setTBAA(stElems, tbaaAvElemsTag_);
+    Value *stLenP = builder_.CreateGEP(i8, stAv,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.st.rlenp");
+    Value *stLen = builder_.CreateLoad(i64, stLenP, "cplx.st.rlen");
+    Value *stNext = builder_.CreateAdd(idx,
+        ConstantInt::get(Type::getInt64Ty(ctx_), 1), "cplx.st.rn1");
+    Value *stInRange = builder_.CreateAnd(
+        builder_.CreateICmpSGE(idx, ConstantInt::get(Type::getInt64Ty(ctx_), 0)),
+        builder_.CreateICmpSLT(stNext, stLen), "cplx.st.rir");
+    auto *sok0BB = BasicBlock::Create(ctx_, "cplx.st.rok0", curFn);
+    builder_.CreateCondBr(stInRange, sok0BB, refFBSink);
+    builder_.SetInsertPoint(sok0BB);
+    Value *se0 = builder_.CreateLoad(perlPtrTy_,
+        builder_.CreateGEP(perlPtrTy_, stElems, idx, "cplx.st.re0p"), "cplx.st.re0");
+    setTBAA(se0, tbaaAvElemTag_);
+    Value *st0 = builder_.CreateLoad(i32, se0, "cplx.st.rt0");
+    setTBAA(st0, tbaaPvTagTag_);
+    Value *sok0 = builder_.CreateICmpEQ(st0, ConstantInt::get(i32, 2), "cplx.st.rok0v");
+    auto *sok1BB = BasicBlock::Create(ctx_, "cplx.st.rok1", curFn);
+    builder_.CreateCondBr(sok0, sok1BB, refFBSink);
+    builder_.SetInsertPoint(sok1BB);
+    Value *se1 = builder_.CreateLoad(perlPtrTy_,
+        builder_.CreateGEP(perlPtrTy_, stElems, stNext, "cplx.st.re1p"), "cplx.st.re1");
+    setTBAA(se1, tbaaAvElemTag_);
+    Value *st1 = builder_.CreateLoad(i32, se1, "cplx.st.rt1");
+    setTBAA(st1, tbaaPvTagTag_);
+    Value *sok1 = builder_.CreateICmpEQ(st1, ConstantInt::get(i32, 2), "cplx.st.rok1v");
+    auto *sok2BB = BasicBlock::Create(ctx_, "cplx.st.rok2", curFn);
+    builder_.CreateCondBr(sok1, sok2BB, refFBSink);
+    builder_.SetInsertPoint(sok2BB);
+    auto *rs1 = builder_.CreateStore(re,
+        builder_.CreateGEP(i8, se0, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.st.rf0p"));
+    auto *rs2 = builder_.CreateStore(im,
+        builder_.CreateGEP(i8, se1, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.st.rf1p"));
+    setTBAA(rs1, tbaaPvFvalTag_);
+    setTBAA(rs2, tbaaPvFvalTag_);
+    builder_.CreateBr(mBB);
+    builder_.SetInsertPoint(refFBSink);
     Value *pair = callRT("perl_alloc_float_pair", {re, im});
     callRT("perl_array_set_row", {rowPv, idx, pair});
     freeIfOwned(pair);
@@ -3783,6 +3940,127 @@ static std::string loopScalarNm(const Node &n) {
     return nm;
 }
 
+/* Stage 38 (perf round 2): inline the D105 promote's common case at read
+   time. perl_promote_ref_array is (tag == FLAT_ARRAY || tag == FLOAT_PAIR)
+   -> perl_deref_array, and for every string/int/array-ref value it is a
+   no-op; yet as a NoInline call on every hot-loop var/element read it
+   measurably broke nb's j-loop (17.7s vs 0.7s; GVN/LICM of the row caches
+   died across the unknown-effect call). The inline keeps the exact same
+   semantics: two tag compares with TBAA, the promote call only behind a
+   well-predicted branch. */
+void CodeGen::emitPromoteInline(Value *pv) {
+    if (!pv) return;
+    auto *curFn = builder_.GetInsertBlock()->getParent();
+    Value *tag = builder_.CreateLoad(Type::getInt32Ty(ctx_), pv, "prom.tag");
+    setTBAA(tag, tbaaPvTagTag_);
+    Value *isFlat = builder_.CreateICmpEQ(tag,
+        ConstantInt::get(Type::getInt32Ty(ctx_), 10), "prom.flat");
+    Value *isPair = builder_.CreateICmpEQ(tag,
+        ConstantInt::get(Type::getInt32Ty(ctx_), 13), "prom.pair");
+    Value *need = builder_.CreateOr(isFlat, isPair, "prom.need");
+    auto *slowBB = BasicBlock::Create(ctx_, "prom.slow", curFn);
+    auto *doneBB = BasicBlock::Create(ctx_, "prom.done", curFn);
+    builder_.CreateCondBr(need, slowBB, doneBB);
+    builder_.SetInsertPoint(slowBB);
+    callRT("perl_promote_ref_array", {pv});
+    builder_.CreateBr(doneBB);
+    builder_.SetInsertPoint(doneBB);
+}
+
+/* E1 caveat (perf round 2, 2026-11-05): every unboxed division site emits
+   this inline zero-divisor guard, keeping real perl's semantics:
+   division by a numerically-zero divisor (0.0 or -0.0; NaN divisors do not
+   count, x/NaN is NaN) raises the CATCHABLE die "Illegal division by zero
+   at FILE line N." exactly like the boxed perl path's die machinery. The
+   fast path is two compares + a well-predicted branch; the die branch is
+   unreachable in kernel loops. */
+void CodeGen::emitDivZeroGuard(Value *divisor, const Node &n) {
+    if (!divisor) return;
+    auto *curFn = builder_.GetInsertBlock()->getParent();
+    Value *isZero = builder_.CreateFCmpOEQ(divisor,
+        ConstantFP::get(Type::getDoubleTy(ctx_), 0.0), "divzero");
+    auto *dieBB = BasicBlock::Create(ctx_, "div.die", curFn);
+    auto *okBB  = BasicBlock::Create(ctx_, "div.ok", curFn);
+    builder_.CreateCondBr(isZero, dieBB, okBB);
+    builder_.SetInsertPoint(dieBB);
+    Value *msg = perlStr("Illegal division by zero");
+    Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "div.zfile");
+    Value *lineVal = ConstantInt::get(Type::getInt32Ty(ctx_),
+        n.line > 0 ? n.line : 1);
+    callRT("perl_die", {msg, fileStr, lineVal});
+    /* perl_die is declared noreturn; nothing flows past the die branch. */
+    builder_.CreateUnreachable();
+    builder_.SetInsertPoint(okBB);
+}
+
+/* Stage 39 (E4, perf round 2): inline float element store on row-typed PVs.
+   Mirrors emitScalarRootedAutovivAssign's boxed path exactly —
+   perl_promote_ref_array(base) + boxed RHS + perl_array_set_row + free —
+   with an in-place fval fast path for REF_ARRAY-backed rows whose target
+   slot holds a FLOAT box (the borrow shape every kernel's row actually
+   takes at runtime; the boxed path churned free(old)+clone(new) per store,
+   ~65M times in mbs640). Value semantics preserved for every tag: promote
+   first (as before), and only the REF+FLOAT-slot combination updates in
+   place — the slot box is never aliased outside the row (reads copy the
+   value), so in-place == box-replace observably. Any other tag / OOB /
+   negative index goes to the verbatim boxed fallback. */
+void CodeGen::emitRowElemStoreFast(Value *rowPv, Value *idx, Value *f) {
+    if (!rowPv || !idx || !f) return;
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *i32 = Type::getInt32Ty(ctx_);
+    auto *i8 = Type::getInt8Ty(ctx_);
+    emitPromoteInline(rowPv);
+    Value *tag = builder_.CreateLoad(i32, rowPv, "st39.tag");
+    setTBAA(tag, tbaaPvTagTag_);
+    Value *isRef = builder_.CreateICmpEQ(tag,
+        ConstantInt::get(i32, 5), "st39.ref");
+    auto *curFn = builder_.GetInsertBlock()->getParent();
+    auto *rchkBB = BasicBlock::Create(ctx_, "st39.rchk", curFn);
+    auto *slowBB = BasicBlock::Create(ctx_, "st39.slow", curFn);
+    auto *mBB    = BasicBlock::Create(ctx_, "st39.m", curFn);
+    builder_.CreateCondBr(isRef, rchkBB, slowBB);
+
+    builder_.SetInsertPoint(rchkBB);
+    Value *avP = builder_.CreateGEP(i8, rowPv,
+        ConstantInt::get(i64, 8), "st39.avp");
+    Value *av = builder_.CreateLoad(perlPtrTy_, avP, "st39.av");
+    Value *elems = builder_.CreateLoad(perlPtrTy_, av, "st39.elems");
+    setTBAA(elems, tbaaAvElemsTag_);
+    Value *lenP = builder_.CreateGEP(i8, av,
+        ConstantInt::get(i64, 8), "st39.lenp");
+    Value *len = builder_.CreateLoad(i64, lenP, "st39.len");
+    Value *inRange = builder_.CreateAnd(
+        builder_.CreateICmpSGE(idx, ConstantInt::get(i64, 0)),
+        builder_.CreateICmpSLT(idx, len), "st39.ir");
+    auto *okBB = BasicBlock::Create(ctx_, "st39.ok", curFn);
+    builder_.CreateCondBr(inRange, okBB, slowBB);
+
+    builder_.SetInsertPoint(okBB);
+    Value *e = builder_.CreateLoad(perlPtrTy_,
+        builder_.CreateGEP(perlPtrTy_, elems, idx, "st39.ep"), "st39.e");
+    setTBAA(e, tbaaAvElemTag_);
+    Value *et = builder_.CreateLoad(i32, e, "st39.et");
+    setTBAA(et, tbaaPvTagTag_);
+    Value *okF = builder_.CreateICmpEQ(et,
+        ConstantInt::get(i32, 2), "st39.okf");
+    auto *updB = BasicBlock::Create(ctx_, "st39.upd", curFn);
+    builder_.CreateCondBr(okF, updB, slowBB);
+
+    builder_.SetInsertPoint(updB);
+    auto *fst = builder_.CreateStore(f,
+        builder_.CreateGEP(i8, e, ConstantInt::get(i64, 8), "st39.fp"));
+    setTBAA(fst, tbaaPvFvalTag_);
+    builder_.CreateBr(mBB);
+
+    builder_.SetInsertPoint(slowBB);
+    Value *box = callRT("perl_alloc_float", {f});
+    callRT("perl_array_set_row", {rowPv, idx, box});
+    callRT("perl_free", {box});
+    builder_.CreateBr(mBB);
+
+    builder_.SetInsertPoint(mBB);
+}
+
 bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
     if (n.kind == NK::Block || n.kind == NK::FlatBlock) {
         for (auto &s : n.args)
@@ -3809,7 +4087,8 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
         if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
             n.right && isPackedPairRhs(*n.right))
             return true;
-        /* Perf item 3 (2026-11-04): a statement-context element store
+
+/* Perf item 3 (2026-11-04): a statement-context element store
            (`$row->[2i] = $new_re`, the mbs inner-loop shape) keeps the
            numeric domain when the row is a flat double[] (checked at
            runtime, not in this predicate) and the value is unboxed i64/f64 —
@@ -3819,6 +4098,16 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
            vectorization, so a false positive here costs nothing. */
         if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
             n.left->left && n.left->left->kind != NK::ArrowDeref && n.right &&
+            (canEmitF64(*n.right) || canEmitI64(*n.right)))
+            return true;
+        /* EXPERIMENT (perf round-2): 2D element store `$outer->[i][k] = / op= rhs`
+            — the nb velocity-update shape. The s18 flat-path emit lowers this to
+            GEP+fop+store when the row is flat, so the numeric domain holds iff
+            the RHS is unboxed-int/float (the same criterion as the 1D store above). */
+        if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
+            n.left->left && n.left->left->kind == NK::ArrowDeref &&
+            n.left->left->sval == "array" && n.right &&
+            !isPackedPairRhsIsCalllike(*n.right) &&
             (canEmitF64(*n.right) || canEmitI64(*n.right)))
             return true;
         if (getenv("PERLC_DEBUG_ST37") && n.left && n.left->kind == NK::ArrowDeref && n.right)
@@ -3840,6 +4129,15 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
            element-store case above. */
         if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
             n.left->left && n.left->left->kind != NK::ArrowDeref && n.right &&
+            (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") &&
+            (canEmitF64(*n.right) || canEmitI64(*n.right)))
+            return true;
+        /* EXPERIMENT (perf round-2): 2D element compound-assign
+           `$outer->[i][k] op= rhs` (the nb velocity-update shape) —
+           same rationale as the 1D case; the s18 flat-path emit is inline. */
+        if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
+            n.left->left && n.left->left->kind == NK::ArrowDeref &&
+            n.left->left->sval == "array" && n.right &&
             (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") &&
             (canEmitF64(*n.right) || canEmitI64(*n.right)))
             return true;
@@ -3867,6 +4165,25 @@ bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
     if (n.kind == NK::Assign && tryEmitPackedPairAssign(n))
         return true;
     if (n.kind == NK::Assign) {
+        /* Stage 39 (E4, perf round 2): statement-context `$row->[i] = f` —
+           void context means no assign-result PV is needed: run the
+           in-place store helper (promote + REF-row float-slot update;
+           boxed fallback inside) with ZERO allocations. The general
+           emitter below/elsewhere still produces and frees a fresh RHS
+           box per store. Ordered after the pair-store fast path. */
+        if (n.left && n.left->kind == NK::ArrowDeref &&
+            n.left->sval == "array" && n.left->left &&
+            n.left->left->kind == NK::ScalarVar && n.left->right &&
+            isOptStageEnabled("cplxrow") && n.right &&
+            canEmitF64(*n.right)) {
+            if (Value *fv = emitExprF64(*n.right)) {
+                Value *rowv = emitExpr(*n.left->left);
+                Value *idx = emitIdx(*n.left->right);
+                emitRowElemStoreFast(rowv, idx, fv);
+                freeIfOwned(rowv);
+                return true;
+            }
+        }
         if (!n.left || n.left->kind != NK::ScalarVar || !n.right) return false;
         std::string nm = loopScalarNm(*n.left);
         if (Value *ia = lookupIntVar(nm)) {
@@ -3913,6 +4230,9 @@ bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
             else if (n.sval == "*") res = builder_.CreateFMul(lv, rv);
             else res = builder_.CreateFDiv(lv, rv);
             if (!res) return false;
+            /* perl's div-by-zero die follows the unboxed fdiv (see
+               emitDivZeroGuard); the store below only runs when live. */
+            if (n.sval == "/") emitDivZeroGuard(rv, n);
             builder_.CreateStore(res, fa);
             return true;
         }
@@ -3994,6 +4314,58 @@ Value *CodeGen::tryEmitI1Cond(const Node &n) {
     else if (n.sval == "!=") pred = P::ICMP_NE;
     else return nullptr;
 
+    /* Stage 39 (E4, perf round 2): float-operand comparisons — both sides
+       provably numeric (can_emit_f64) → raw FCmp, no boxing. The boxed
+       path (2×perl_alloc_float + perl_num_lt + perl_is_true + 3×perl_free)
+       cost ~65M box pairs in mbs640's `if ($abs2 < 4.0)`. Ordered (O*)
+       predicates reproduce perl's exact NaN behavior: comparisons
+       involving NaN are false for < <= > >= ==, and != is true for NaN —
+       identical to how perl_num_lt/ne handle NaN inputs.
+
+       Restricted to LEXICAL/local numeric shapes only: canEmitF64's
+       FILE-SCOPE-GLOBAL fallback ("any file scalar is numeric") is
+       value-sound for arithmetic (the RHS box and to_float agree) but NOT
+       for comparisons of possibly-REF values — `my $y = thaw(…); $y == $h`
+       must stay on the boxed perl_num_eq identity path (its to_float of a
+       REF PV yields a constant, which an fcmp would call equal). */
+    {
+        P fpred;
+        if      (n.sval == "<")  fpred = P::FCMP_OLT;
+        else if (n.sval == "<=") fpred = P::FCMP_OLE;
+        else if (n.sval == ">")  fpred = P::FCMP_OGT;
+        else if (n.sval == ">=") fpred = P::FCMP_OGE;
+        else if (n.sval == "==") fpred = P::FCMP_OEQ;
+        else if (n.sval == "!=") fpred = P::FCMP_ONE;
+        auto f64LocalEmitableDeep = [&](auto &&self, const Node &nd) -> bool {
+            if (nd.kind == NK::FloatLit) return true;
+            if (nd.kind == NK::IntLit)
+                return nd.ival >= -9007199254740992LL &&
+                       nd.ival <=  9007199254740992LL;
+            if (nd.kind == NK::ScalarVar) {
+                std::string nm = nd.name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                return lookupFloatVar(nm) != nullptr;
+            }
+            if (nd.kind == NK::BinOp) {
+                if (nd.sval != "+" && nd.sval != "-" && nd.sval != "*")
+                    return false;
+                return nd.left && nd.right && self(self, *nd.left) &&
+                       self(self, *nd.right);
+            }
+            if (nd.kind == NK::UnaryOp && nd.sval == "-")
+                return nd.left && self(self, *nd.left);
+            return false;
+        };
+        if (isOptStageEnabled("st39") &&
+            f64LocalEmitableDeep(f64LocalEmitableDeep, *n.left) &&
+            f64LocalEmitableDeep(f64LocalEmitableDeep, *n.right)) {
+            Value *lv = emitExprF64(*n.left);
+            Value *rv = emitExprF64(*n.right);
+            if (lv && rv)
+                return builder_.CreateFCmp(fpred, lv, rv, "fcmp");
+        }
+    }
+
     /* Standard path: both operands expressible as bare i64. */
     if (canEmitI64(*n.left) && canEmitI64(*n.right)) {
         Value *lv = emitExprI64(*n.left);
@@ -4054,7 +4426,8 @@ Value *CodeGen::tryEmitI1Cond(const Node &n) {
    - int var → load from alloca (zero allocation)
    - float var → FPToSI (zero allocation)
    - anything else → emitExpr + perl_to_int + freeIfOwned */
-Value *CodeGen::emitIdx(const Node &n) {
+Value *CodeGen::emitIdx(const Node &nRaw) {
+    const Node &n = *singleArrayLitElem(nRaw);
     auto *i64 = Type::getInt64Ty(ctx_);
     if (n.kind == NK::IntLit)
         return ConstantInt::get(Type::getInt64Ty(ctx_), n.ival);
@@ -4067,6 +4440,43 @@ Value *CodeGen::emitIdx(const Node &n) {
             Value *d = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
             return builder_.CreateFPToSI(d, i64, nm + ".i");
         }
+    }
+    /* EXPERIMENT (perf round-2): raw-i64 index arithmetic. canEmitI64's
+       arithmetic BinOp was deliberately reverted for VALUE positions (D103
+       overflow exactness), but an INDEX is OOB-safe when it wraps (an
+       out-of-bounds element read is undef, matching Perl's own semantics —
+       see this function's comment above), so pure i64 +-/* index math may
+       emit raw here with NO overflow machinery. Unblocks the packed/flat
+       row idiom `$row->[$i*2+1]` (mbs/nb kernels) which otherwise pays a
+       full boxed alloc_int+mul/add+to_int+free pipeline per access.
+       Disabled via PERLC_OPT_DISABLE=rawidx. */
+    if (isOptStageEnabled("rawidx")) {
+        std::function<Value *(const Node &)> raw64 = [&](const Node &e) -> Value * {
+            if (e.kind == NK::IntLit)
+                return ConstantInt::get(i64, e.ival);
+            if (e.kind == NK::ScalarVar) {
+                std::string nm = e.name;
+                if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                if (Value *ia = lookupIntVar(nm))
+                    return builder_.CreateLoad(i64, ia, nm + ".i");
+            }
+            if (e.kind == NK::ArrayLit && e.args.size() == 1 && e.args[0])
+                return raw64(*e.args[0]);
+            if (e.kind == NK::BinOp &&
+                ((e.sval == "+") || (e.sval == "-") || (e.sval == "*") ||
+                 (e.sval == "<<" && e.right->kind == NK::IntLit &&
+                  e.right->ival >= 0 && e.right->ival <= 63))) {
+                Value *l = e.left  ? raw64(*e.left)  : nullptr;
+                Value *r = e.right ? raw64(*e.right) : nullptr;
+                if (!l || !r) return nullptr;
+                if (e.sval == "+") return builder_.CreateAdd(l, r, "idx.add");
+                if (e.sval == "-") return builder_.CreateSub(l, r, "idx.sub");
+                if (e.sval == "*") return builder_.CreateMul(l, r, "idx.mul");
+                return builder_.CreateShl(l, r, "idx.shl");
+            }
+            return nullptr;
+        };
+        if (Value *v = raw64(n)) return v;
     }
     /* Perf (2026-11-04) / Stage 37: pure-i64 arithmetic index (e.g. `$i * 2`)
        emits plain i64 math with NO overflow-carry machinery and NO boxing.
@@ -5119,6 +5529,95 @@ void CodeGen::analyzeAtArgIntUnboxing(const Node &program) {
             if (sd->body)
                 atArgIntProvableByBody_[sd->body.get()] = atArgIntProvable_[sd];
         }
+
+    /* ── Stage 40 (E6): known-arity @_ unpacks → i64-args direct-call ────
+       Additional entry `<sub>_ai` taking raw i64 params (+ ctx), body
+       binding params straight into the unboxed int allocas. Only for subs
+       whose ENTIRE @_ consumption is one contiguous my-bind unpack list,
+       with every call site exact-arity, int-shaped args, prototype-free.
+       All dynamic-dispatch poisoning already returned early (eval/do/
+       require/computed-typeglob). Recursion is fine: the variant is
+       pre-declared before any body is emitted. */
+    if (isOptStageEnabled("st40")) {
+        for (auto *sd : subdefs) {
+            if (!sd->body || sd->name.empty() || nameCount[sd->name] != 1)
+                continue;
+            if (refd.count(sd->name) || methoded.count(sd->name)) continue;
+            if (subCaptures_.count(sd->name)) continue;
+            const auto &unp = unpacks[sd];
+            if (unp.empty()) continue;
+            long long span = -1;
+            for (auto &kv : unp) span = std::max(span, kv.second);
+            if (span + 1 != (long long)unp.size()) continue; /* gaps: skip */
+            auto pit = proven.find(sd);
+            bool allProven = pit != proven.end() &&
+                             (long long)pit->second.size() == (long long)unp.size();
+            for (auto &kv : unp)
+                if (allProven && !pit->second.count(kv.first)) allProven = false;
+            if (!allProven) continue;
+            /* closures anywhere in the body could capture arg PVs — the
+               _ai body has no PV cells for them; conservative reject.
+               Same for any local()/state machinery beyond the args-free
+               norm, which stays supported but is pointless to duplicate. */
+            bool disqualify = false;
+            long long underbarUses = 0;
+            [&] {
+                std::function<void(const Node &)> w = [&](const Node &nd) {
+                    if (disqualify) return;
+                    if (nd.kind == NK::AnonSub) { disqualify = true; return; }
+                    if (nd.kind == NK::SubDef) return;
+                    if (nd.kind == NK::LocalStmt || nd.kind == NK::LocalGlob)
+                        { disqualify = true; return; }
+                    if (nd.kind == NK::ArrayVar && nd.name == "_")
+                        underbarUses++;
+                    if (nd.kind == NK::Call && nd.args.empty()) {
+                        /* implicit-@_ runtime arg consumers (shift/pop/
+                           splice/unshift with no explicit list target). */
+                        if (nd.name == "shift" || nd.name == "pop" ||
+                            nd.name == "splice" || nd.name == "unshift")
+                            { disqualify = true; return; }
+                    }
+                    if (nd.left)  w(*nd.left);
+                    if (nd.right) w(*nd.right);
+                    if (nd.cond)  w(*nd.cond);
+                    if (nd.body)  w(*nd.body);
+                    if (nd.init)  w(*nd.init);
+                    if (nd.step)  w(*nd.step);
+                    for (auto &a : nd.args) w(*a);
+                    for (auto &b : nd.branches) {
+                        if (b.cond) w(*b.cond);
+                        if (b.body) w(*b.body);
+                    }
+                };
+                w(*sd->body);
+            }();
+            /* exactly ONE @_ reference is allowed: the unpack bind itself */
+            if (disqualify || underbarUses > 1) continue;
+            bool arityOk = true;
+            for (const Node *site : sites[sd->name]) {
+                if (site->args.size() != unp.size() ||
+                    !(site->ival == 2 || site->sval.empty()))
+                    { arityOk = false; break; }
+            }
+            if (!arityOk) continue;
+            std::vector<std::string> pnames(unp.size());
+            for (auto &kv : unp) pnames[(size_t)kv.second] = kv.first;
+            subAiParams_[sd] = pnames;
+            std::string aiNm = subLLVMName(sd->name) + "_ai";
+            if (!mod_->getFunction(aiNm)) {
+                SmallVector<Type *, 8> ptys;
+                for (size_t k = 0; k < pnames.size(); k++)
+                    ptys.push_back(Type::getInt64Ty(ctx_));
+                ptys.push_back(Type::getInt32Ty(ctx_));   /* wantarray ctx */
+                FunctionType *fty = FunctionType::get(perlPtrTy_, ptys, false);
+                Function *fa = Function::Create(fty, Function::ExternalLinkage,
+                                                aiNm, mod_.get());
+                fa->addFnAttr(Attribute::AlwaysInline);
+            }
+            (void)subAiNames_.insert(aiNm);
+            (void)subAiArity_.emplace(aiNm, pnames.size());
+        }
+    }
 }
 
 /* D135: true iff 'nm' is ever the LHS/element target of an assignment or
@@ -5262,7 +5761,8 @@ static bool readsFloatSensitive(const Node &n, const std::string &nm) {
 
 /* Pure predicate — can this expression be computed as a bare LLVM double?
    Never emits any IR. Returns true iff emitExprF64 will succeed. */
-bool CodeGen::canEmitF64(const Node &n) {
+bool CodeGen::canEmitF64(const Node &nRaw) {
+     const Node &n = *singleArrayLitElem(nRaw);
      switch (n.kind) {
      case NK::FloatLit:
          return true;
@@ -5275,6 +5775,22 @@ bool CodeGen::canEmitF64(const Node &n) {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
         if (lookupFloatVar(nm)) return true;
+        /* D186-style shadow rule (landed 2026-11-05 with the Stage-39 fcmp
+           fast path which exposed it): a FUNCTION- or BLOCK-LOCAL lexical
+           of the same name — even an unboxed INT/PV one — must win the
+           lookup, since emitExprF64's fallback reads the file-scope global
+           while the actual variable is the nearer lexical (e.g.
+           `my $i = 0;` at file scope + `for (my $i = 0; $i < 2; $i++)`
+           read $i = 0 forever). MUST mirror emitExprF64's ScalarVar shadow
+           checks exactly (emitArrayPtr's float-literal verdict loop
+           crashes the compiler on any canEmitF64/emitExprF64 mismatch).
+           The FILE scope itself (scopes_ indexes below fileScopeDepth_) is
+           the same storage the fallback reads — only scopes DEEPER than
+           it are rejected. */
+        for (size_t si = (size_t)std::max(fileScopeDepth_, 0); si < scopes_.size(); si++)
+            if (scopes_[si].count(nm)) return false;
+        for (size_t si = (size_t)std::max(fileScopeDepth_, 0); si < intScopes_.size(); si++)
+            if (intScopes_[si].count(nm)) return false;
         /* D78: Don't use F64 fast path for file-scope vars initialized with
            large integer literals (> 2^53) — converting to double loses precision. */
         if (fileScalarLargeInt_.count(nm)) return false;
@@ -5363,7 +5879,8 @@ bool CodeGen::canEmitF64(const Node &n) {
     }
 }
 
-Value *CodeGen::emitExprF64(const Node &n) {
+Value *CodeGen::emitExprF64(const Node &nRaw) {
+    const Node &n = *singleArrayLitElem(nRaw);
     auto *f64 = Type::getDoubleTy(ctx_);
     switch (n.kind) {
     case NK::FloatLit:
@@ -5375,6 +5892,10 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
         if (Value *fa = lookupFloatVar(nm))
             return builder_.CreateLoad(f64, fa, nm + ".f");
+        for (size_t si = (size_t)std::max(fileScopeDepth_, 0); si < scopes_.size(); si++)
+            if (scopes_[si].count(nm)) return nullptr;
+        for (size_t si = (size_t)std::max(fileScopeDepth_, 0); si < intScopes_.size(); si++)
+            if (intScopes_[si].count(nm)) return nullptr;
         /* file-scope global: load PV* and coerce to double — skip special-accessor vars */
         {
             static const std::unordered_set<std::string> noFloat =
@@ -5420,8 +5941,15 @@ Value *CodeGen::emitExprF64(const Node &n) {
         if (n.sval == "+") return builder_.CreateFAdd(lv, rv, "fadd");
         if (n.sval == "-") return builder_.CreateFSub(lv, rv, "fsub");
         if (n.sval == "*") return builder_.CreateFMul(lv, rv, "fmul");
-        /* "/" — no div-by-zero check for unboxed (same as C) */
-        return builder_.CreateFDiv(lv, rv, "fdiv");
+        /* E1 caveat: keep perl's div-by-zero die on the unboxed path
+           (see emitDivZeroGuard); the raw fdiv itself is harmless and
+           only observable on the live (nonzero) path. */
+        if (n.sval == "/") {
+            Value *fdivV = builder_.CreateFDiv(lv, rv, "fdiv");
+            emitDivZeroGuard(rv, n);
+            return fdivV;
+        }
+        return nullptr;
     }
     case NK::UnaryOp:
         if (n.sval == "-") {
@@ -5984,6 +6512,7 @@ void CodeGen::compile(const Node &program, const std::string &modName,
     stateSeq_ = 0;
     endSeq_ = 0;
     globIterSeq_ = 0;
+    regexMemoSeq_ = 0;
     lastSqrtInput_ = nullptr;
     floatSqrtOf_.clear();
 
@@ -6825,9 +7354,132 @@ void CodeGen::emitSub(const Node &n) {
 
     /* restore insert point to end of main (for any remaining stmts) */
     /* caller will set insert point back */
+
+    /* Stage 40 (E6): also emit the known-arity i64-args variant for subs
+       the Stage-37 lattice qualified. */
+    if (isOptStageEnabled("st40")) {
+        auto aip = subAiParams_.find(&n);
+        if (aip != subAiParams_.end())
+            emitSubAiVariant(n, aip->second);
+    }
 }
 
 /* ── statement emission ──────────────────────────────────────────────────── */
+
+/* Stage 40 (E6): emit the known-arity i64-args variant body for a qualified
+   sub. Mirrors the generic emitSub body structure exactly — package/save-
+   state/scope handling, wantarray push from the ctx param, Stage 27a $_ —
+   except: the args array does not exist (the `my (...) = @_` bind is
+   intercepted in argsIntEntry_ mode and binds the raw i64 params into the
+   unboxed int allocas), and per-body IR caches/counters restart so emitted
+   constants/globals stay unique versus the generic pass. */
+void CodeGen::emitSubAiVariant(const Node &n, const std::vector<std::string> &pnames) {
+    std::string aiNm = subLLVMName(n.name) + "_ai";
+    Function *fnAi = mod_->getFunction(aiNm);
+    if (!fnAi || !n.body) return;
+
+    auto *entry = BasicBlock::Create(ctx_, "entry", fnAi);
+    builder_.SetInsertPoint(entry);
+
+    /* fresh unique global/label ids for this second pass (1M offset keeps
+       names collision-free with the generic pass in any realistic module) */
+    stateSeq_ += 1000000;
+    endSeq_ += 1000000;
+    globIterSeq_ += 1000000;
+    regexMemoSeq_ += 1000000;
+    substEvalCounter_ += 1000000;
+    sortCmpCounter_ += 1000000;
+
+    std::string savedPackage = currentPackage_;
+    {
+        auto sc = n.name.rfind("::");
+        currentPackage_ = (sc != std::string::npos) ? n.name.substr(0, sc) : "main";
+    }
+    auto savedCapturedNames = capturedNamesInCurrentFn_;
+    capturedNamesInCurrentFn_.clear();   /* qualification rejected captures */
+    bool savedAllCap = allNamesCaptured_;
+    allNamesCaptured_ = false;
+    auto *savedFn = currentFn_;
+    currentFn_ = fnAi;
+    std::string savedSubNm124 = currentSubName_;
+    currentSubName_ = n.name;
+    bool savedAnonEmit124 = inAnonSubEmit_;
+    inAnonSubEmit_ = false;
+    auto savedLabels = std::move(stmtLabels_);
+    stmtLabels_.clear();
+    if (n.body) collectGotoLabels(*n.body);
+    flatDoubleCache_.clear();
+    floatSqrtOf_.clear();
+    lastSqrtInput_ = nullptr;
+    pushScope();
+
+    aiParams_.clear();
+    Value *ctxArg = nullptr;
+    for (size_t k = 0; k < pnames.size(); k++)
+        aiParams_.push_back(fnAi->getArg(k));
+    ctxArg = fnAi->getArg(pnames.size());
+
+    bool subUsesDefaultVar = hasDefaultVarUse(*n.body);
+    if (subUsesDefaultVar) {
+        Value *cell = callRT("perl_get_dollar_under", {});
+        Value *udv  = callRT("perl_clone", {cell});
+        auto *slotUs = createEntryAlloca(perlPtrTy_, nullptr, "$_");
+        builder_.CreateStore(udv, slotUs);
+        declareVar("_", slotUs);
+        trackPv(udv);
+    }
+
+    bool subNeedsWantarray = hasWantarrayOrUserCall(*n.body);
+    bool savedNeedsWantarray = currentSubNeedsWantarray_;
+    currentSubNeedsWantarray_ = subNeedsWantarray;
+    if (subNeedsWantarray)
+        callRT("perl_push_wantarray", {ctxArg});
+
+    auto *i32Ty = Type::getInt32Ty(ctx_);
+    auto *savedLocalDepth = localDepthAlloca_;
+    bool subNeedsLocal = hasLocalStmt(*n.body);
+    if (subNeedsLocal) {
+        localDepthAlloca_ = createEntryAlloca(i32Ty, nullptr, "local.depth");
+        builder_.CreateStore(callRT("perl_local_save_depth", {}), localDepthAlloca_);
+    } else {
+        localDepthAlloca_ = nullptr;
+    }
+
+    auto *savedSubBody = currentSubBody_;
+    currentSubBody_ = n.body.get();
+
+    auto savedPrePromoted = prePromotedArgs_;
+    prePromotedArgs_.clear();
+    for (auto &pn : pnames) prePromotedArgs_[pn] = PPKind::Int;
+
+    argsIntEntry_ = true;
+    Value *lastVal = emitBlockLast(*n.body);
+    argsIntEntry_ = false;
+
+    if (!builder_.GetInsertBlock()->getTerminator()) {
+        if (subNeedsWantarray) callRT("perl_pop_wantarray", {});
+        if (subNeedsLocal) {
+            Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+            callRT("perl_local_restore_to", {depth});
+        }
+        popScope();
+        builder_.CreateRet(lastVal);
+    } else {
+        popScope();
+    }
+
+    prePromotedArgs_ = std::move(savedPrePromoted);
+    localDepthAlloca_ = savedLocalDepth;
+    currentSubNeedsWantarray_ = savedNeedsWantarray;
+    currentFn_ = savedFn;
+    currentPackage_ = savedPackage;
+    currentSubName_ = savedSubNm124;
+    inAnonSubEmit_ = savedAnonEmit124;
+    capturedNamesInCurrentFn_ = std::move(savedCapturedNames);
+    allNamesCaptured_ = savedAllCap;
+    stmtLabels_ = std::move(savedLabels);
+    aiParams_.clear();
+}
 
 /* Stage 24a: skip push/pop wantarray for functions with no wantarray expr and
    no user sub calls (NK::Call) — called functions read from the caller's push,
@@ -9384,7 +10036,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             if (sharedScalarNames_.count(nm)) {
                 Value *pv = builder_.CreateLoad(perlPtrTy_, slot, n.name);
                 Value *loaded = callRT("perl_atomic_load", {pv});
-                callRT("perl_promote_ref_array", {loaded});
+                emitPromoteInline(loaded);
                 return loaded;
             }
         }
@@ -9407,7 +10059,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                (e.g. tests/d96_flat_row_op_assign.pl, tests/d98_flat_row_2d.pl)
                is unaffected — see perl_promote_ref_array. */
             Value *pv = builder_.CreateLoad(perlPtrTy_, slot, n.name);
-            callRT("perl_promote_ref_array", {pv});
+            emitPromoteInline(pv);
             return pv;
         }
     }
@@ -9429,7 +10081,7 @@ Value *CodeGen::emitExpr(const Node &n) {
            through this one, so this promotion (a no-op for every other
            tag, exactly like D105's) cannot reach those FLAT_ARRAY-
            sensitive branches. */
-        callRT("perl_promote_ref_array", {elem});
+        emitPromoteInline(elem);
         return elem;
     }
 
@@ -10045,6 +10697,26 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         /* ($a,$b,...) = list */
         if (n.left->kind == NK::ArrayLit) {
+            /* Stage 40 (E6): in the `_ai` variant entry, the `my (...) = @_`
+               bind has no args array to emit — bind the raw i64 params
+               directly into the unboxed int allocas. Qualification
+               guarantees every LHS var is a provable-int unpack and the
+               body's only @_ reference is this bind. */
+            if (argsIntEntry_ && n.right && n.right->kind == NK::ArrayVar &&
+                n.right->name == "_") {
+                bool allPlain = !n.left->args.empty();
+                for (auto &le : n.left->args)
+                    if (le->kind != NK::ScalarVar) { allPlain = false; break; }
+                if (allPlain) {
+                    for (size_t i = 0; i < n.left->args.size(); i++) {
+                        std::string bnm = n.left->args[i]->name;
+                        if (!bnm.empty() && bnm[0] == '$') bnm = bnm.substr(1);
+                        if (Value *ia = lookupIntVar(bnm))
+                            builder_.CreateStore(aiParams_[i], ia);
+                    }
+                    return perlUndef();
+                }
+            }
             callCtx_ = 1;
             Value *rhsArr = emitArrayPtr(*n.right);
             if (!rhsArr) {
@@ -10388,6 +11060,21 @@ Value *CodeGen::emitExpr(const Node &n) {
                     This includes scalar-ref-rooted chains like $ref->[0][1],
                     and mixed chains like $ref->{a}[0][1]. */
                 if (needsScalarRootedAutoviv(*n.left)) {
+                    /* Stage 39 (E4): plain `$row->[i] = f` single-step store
+                       on a scalar-var-rooted row with an F64 RHS — inline
+                       the promote + REF-row in-place float update (boxed
+                       fallback inside the helper, semantics identical).
+                       Also hand back the boxed RHS as the assign value. */
+                    if (isOptStageEnabled("cplxrow") &&
+                        n.left->left->kind == NK::ScalarVar &&
+                        canEmitF64(*n.right)) {
+                        if (Value *fv = emitExprF64(*n.right)) {
+                            Value *rowv = emitExpr(*n.left->left);
+                            emitRowElemStoreFast(rowv, idx, fv);
+                            freeIfOwned(rowv);
+                            return callRT("perl_alloc_float", {fv});
+                        }
+                    }
                     return emitScalarRootedAutovivAssign(*n.left, false, rhs);
                 }
                 /* regular $ref->[i] = val */
@@ -10862,6 +11549,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *rv = emitPromotedF64(*n.right);
                 if (rv) {
                     Value *res = applyF64(lv, rv);
+                    if (res && n.sval == "/") emitDivZeroGuard(rv, n);
                     if (res) {
                         builder_.CreateStore(res, fa);
                         return boxF64(res);
@@ -10960,6 +11648,9 @@ Value *CodeGen::emitExpr(const Node &n) {
                                    emitExprF64 may itself emit sub-branches (e.g. for reads of other
                                    flat rows); isFlat18/flatPtr/idx18 remain available via SSA. */
                                 Value *rhsF = emitExprF64(*n.right);
+                                /* perl's div-by-zero die guard (E1 caveat),
+                                   evaluated on the single-emitted RHS */
+                                if (rhsF && n.sval == "/") emitDivZeroGuard(rhsF, n);
                                 if (rhsF) {
                                     auto *curFn18 = builder_.GetInsertBlock()->getParent();
                                     auto *fBB18   = BasicBlock::Create(ctx_, "s18.f", curFn18);
@@ -11102,6 +11793,8 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *lhsF  = builder_.CreateLoad(f64Ty, fvPtr, "lhsf");
                     setTBAA(lhsF, tbaaPvFvalTag_);
                     Value *rhsF  = emitExprF64(*n.right);
+                    /* perl's div-by-zero die guard (E1 caveat) */
+                    if (rhsF && n.sval == "/") emitDivZeroGuard(rhsF, n);
                     if (rhsF) {
                         Value *newF = applyF64op(lhsF, rhsF);
                         if (newF) {
@@ -11538,7 +12231,7 @@ Value *CodeGen::emitExpr(const Node &n) {
            return, rather than promoting inside the helper itself, keeps
            the change from reaching any of those. */
         Value *elem = emitHashGetRef(hv, *n.left);
-        callRT("perl_promote_ref_array", {elem});
+        emitPromoteInline(elem);
         return elem;
     }
 
@@ -12093,10 +12786,28 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *pvalPtr = builder_.CreateGEP(
                     i8Ty, flatPV, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "flat.pval.ptr");
                 Value *dblPtr  = builder_.CreateLoad(perlPtrTy_, pvalPtr, "flat.dbl");
-                for (int i = 0; i < (int)n.args.size(); i++) {
-                    Value *fv = emitExprF64(*n.args[i]);
-                    Value *ep = builder_.CreateConstInBoundsGEP1_64(f64Ty, dblPtr, i, "flat.ep");
-                    builder_.CreateStore(fv, ep);
+                {
+                    /* D201 (fixed 2026-11-05, defensive): the verdict loop
+                       decided allFloat from canEmitF64 verdicts, but
+                       emitExprF64 is what's trusted for the VALUE — any
+                       canEmitF64/emitExprF64 mismatch used to crash the
+                       compiler (CreateStore(nullptr)). Collect all f64
+                       values FIRST; a null bails to the generic boxed path
+                       before anything was built. The verdict loop decides
+                       fast, this decides sound. */
+                    SmallVector<Value *, 16> fvs;
+                    for (int i = 0; i < (int)n.args.size(); i++) {
+                        Value *fv = emitExprF64(*n.args[i]);
+                        if (!fv) { allFloat = false; break; }
+                        fvs.push_back(fv);
+                    }
+                    if (allFloat) {
+                        for (int i = 0; i < (int)fvs.size(); i++) {
+                            Value *ep = builder_.CreateConstInBoundsGEP1_64(
+                                f64Ty, dblPtr, i, "flat.ep");
+                            builder_.CreateStore(fvs[i], ep);
+                        }
+                    }
                 }
                 bool allInt = true;
                 for (auto &e : n.args) if (!canEmitI64(*e)) { allInt = false; break; }
@@ -12295,7 +13006,18 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *pat = builder_.CreateGlobalStringPtr(n.sval, "re_pat");
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
         bool isG   = n.name.find('g') != std::string::npos;
-        Value *res = callRT(isG ? "perl_regex_match_g" : "perl_regex_match", {str, pat, flg});
+        Value *res;
+        if (!isG) {
+            /* Perf item 2: same per-call-site pinned-pattern memo as the
+               i1 condition path (see emitRegexMatchBool). */
+            std::string mname = "re.memo." + std::to_string(regexMemoSeq_++);
+            auto *memo = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                ConstantPointerNull::get(perlPtrTy_), mname);
+            res = callRT("perl_regex_match_memo", {str, pat, flg, memo});
+        } else {
+            res = callRT("perl_regex_match_g", {str, pat, flg});
+        }
         return n.ival ? callRT("perl_not", {res}) : res;
     }
 
@@ -16648,6 +17370,154 @@ Value *CodeGen::emitCall(const Node &n) {
             resolvedSub = qual;
     }
     if (auto *fn = mod_->getFunction(subLLVMName(resolvedSub))) {
+        /* Stage 40 (E6): known-arity exact-int call site → the `_ai`
+           variant takes raw i64 params directly (no args array/push/
+           array_free, no per-arg box; frames + wantarray kept). Arity
+           mismatch or any non-i64-expressible arg keeps the boxed path
+           below untouched. */
+        if (isOptStageEnabled("st40") && !dynamicGlobAssign_ &&
+            (n.ival == 2 || n.sval.empty())) {
+            std::string aiNm = subLLVMName(resolvedSub) + "_ai";
+            auto arIt = subAiArity_.find(aiNm);
+            if (arIt != subAiArity_.end() && arIt->second == n.args.size()) {
+                /* Each arg is either exactly-i64 (canEmitI64 — direct raw
+                   value, no overflow semantics to preserve) or a pure
+                   int-typed arithmetic BinOp that emitExprI64 lowers with
+                   an llvm.*.with.overflow pair — the raw i64 only in the
+                   no-overflow arm; the overflow arm re-emits the arg boxed
+                   and takes the full generic path (that arm preserves the
+                   D103 UV/BigInt on-overflow semantics canEmitI64 rightly
+                   refuses to claim). Purity of arith args is implied by
+                   emitExprI64's operand proof; still, only BinOps of
+                   int-shaped operands are accepted here. */
+                struct AiArg {
+                    Value *fastV;          /* i64 for the _ai fast path */
+                    const Node *slowNode;  /* nullptr when arg is exact-i64 */
+                    Value *ovfBit;         /* overflow arm for arith args */
+                };
+                SmallVector<AiArg, 8> args40;
+                bool argsOk = true;
+                for (auto &a : n.args) {
+                    if (!a) { argsOk = false; break; }
+                    if (canEmitI64(*a)) {
+                        Value *v = emitExprI64(*a);
+                        if (!v) { argsOk = false; break; }
+                        args40.push_back({v, nullptr});
+                        continue;
+                    }
+                    if (a->kind == NK::BinOp && (a->sval == "+" || a->sval == "-") &&
+                        a->left && a->right &&
+                        canEmitI64(*a->left) && canEmitI64(*a->right)) {
+                        Value *lv = emitExprI64(*a->left);
+                        Value *rv = emitExprI64(*a->right);
+                        if (!lv || !rv) { argsOk = false; break; }
+                        Intrinsic::ID idA = a->sval == "+"
+                            ? Intrinsic::sadd_with_overflow
+                            : Intrinsic::ssub_with_overflow;
+                        Function *intrA = IntrinsicGetDeclaration(
+                            mod_.get(), idA, {Type::getInt64Ty(ctx_)});
+                        Value *pairA = builder_.CreateCall(intrA, {lv, rv});
+                        Value *iv = builder_.CreateExtractValue(pairA, 0);
+                        Value *ovfA = builder_.CreateExtractValue(pairA, 1);
+                        args40.push_back({iv, a.get(), ovfA});
+                        continue;
+                    }
+                    argsOk = false;
+                    break;
+                }
+                if (argsOk) {
+                    auto *i32T40 = Type::getInt32Ty(ctx_);
+                    Value *ctxV40;
+                    if (callCtx_ == 1)
+                        ctxV40 = ConstantInt::get(i32T40, 1);
+                    else if (callCtx_ == 2)
+                        ctxV40 = ConstantInt::get(i32T40, 2);
+                    else if (callCtx_ == 0)
+                        ctxV40 = ConstantInt::get(i32T40, 0);
+                    else if (currentSubNeedsWantarray_)
+                        ctxV40 = callRT("perl_current_wantarray_ctx", {});
+                    else
+                        ctxV40 = ConstantInt::get(i32T40, 0);
+                    callCtx_ = 0;
+                    Value *pkgStr40 = builder_.CreateGlobalStringPtr(
+                        currentPackage_, "caller.pkg");
+                    Value *fileStr40 = builder_.CreateGlobalStringPtr(
+                        sourceFile_, "caller.file");
+                    Value *lineVal40 = ConstantInt::get(i32T40, n.line);
+                    callRT("perl_push_call_frame",
+                           {pkgStr40, fileStr40, lineVal40});
+                    if (Function *fnAi = mod_->getFunction(aiNm)) {
+                        bool anySlow = false;
+                        for (auto &aa : args40)
+                            if (aa.slowNode) { anySlow = true; break; }
+                        if (!anySlow) {
+                            SmallVector<Value *, 8> argv;
+                            for (auto &aa : args40) argv.push_back(aa.fastV);
+                            argv.push_back(ctxV40);
+                            Value *retV = builder_.CreateCall(fnAi, argv);
+                            callRT("perl_pop_call_frame", {});
+                            return retV;
+                        }
+
+                        /* mixed: fast arm (all raw i64) + slow arm (boxed
+                           re-emission + the generic call) rejoined on PV.
+                           The fast arm requires every arith arg's
+                           no-overflow bit; any overflow re-routes into the
+                           boxed arm, preserving D103 promotion semantics. */
+                        auto *curFn40 = builder_.GetInsertBlock()->getParent();
+                        auto *fastBB = BasicBlock::Create(ctx_, "ai.fast", curFn40);
+                        auto *slowBB = BasicBlock::Create(ctx_, "ai.slow", curFn40);
+                        auto *joinBB = BasicBlock::Create(ctx_, "ai.join", curFn40);
+                        Value *noOvf = nullptr;
+                        for (auto &aa : args40) {
+                            if (!aa.ovfBit) continue;
+                            noOvf = noOvf
+                                ? builder_.CreateAnd(noOvf, builder_.CreateNot(aa.ovfBit, "ai.novf"), "ai.novfs")
+                                : builder_.CreateNot(aa.ovfBit, "ai.novf");
+                        }
+                        if (noOvf) {
+                            builder_.CreateCondBr(noOvf, fastBB, slowBB);
+                        } else {
+                            builder_.CreateBr(fastBB);
+                        }
+                        builder_.SetInsertPoint(slowBB);
+                        Value *argsArr40 = callRT("perl_array_new", {});
+                        for (auto &aa : args40) {
+                            if (Value *bv = emitExpr(*aa.slowNode)) {
+                                callRT("perl_array_push_nc", {argsArr40, bv});
+                                freeIfOwned(bv);
+                            } else {
+                                /* unpromotable arg mid-analysis — push undef so
+                                   IR stays well-formed. Reaching this requires
+                                   an arg that passed the shape checks above but
+                                   failed emitExpr — none today. */
+                                callRT("perl_array_push_nc", {argsArr40, perlUndef()});
+                            }
+                        }
+                        Value *slowRet = builder_.CreateCall(fn, {argsArr40, ctxV40});
+                        callRT("perl_array_free", {argsArr40});
+                        auto *slowBBp = builder_.GetInsertBlock();
+                        builder_.CreateBr(joinBB);
+
+                        builder_.SetInsertPoint(fastBB);
+                        SmallVector<Value *, 8> argv;
+                        for (auto &aa : args40) argv.push_back(aa.fastV);
+                        argv.push_back(ctxV40);
+                        Value *fastRet = builder_.CreateCall(fnAi, argv);
+                        auto *fastBBp = builder_.GetInsertBlock();
+                        builder_.CreateBr(joinBB);
+
+                        builder_.SetInsertPoint(joinBB);
+                        auto *phi40 = builder_.CreatePHI(perlPtrTy_, 2, "ai.ret");
+                        phi40->addIncoming(slowRet, slowBBp);
+                        phi40->addIncoming(fastRet, fastBBp);
+                        callRT("perl_pop_call_frame", {});
+                        return phi40;
+                    }
+                    callRT("perl_pop_call_frame", {});
+                }
+            }
+        }
         /* Use push_nc (no-clone) for scalar args so we skip 63M clone/free per
            mbs.pl run. Owned temps (e.g. cadd result) are collected and freed
            after the call; non-owned (ScalarVar, borrow) need no action. */

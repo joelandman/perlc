@@ -67,6 +67,38 @@ public:
        'nm' to be an exact-i64 @_-parameter for the scan-root 'body'. */
     bool atArgIntProvableByBody(const Node *body, const std::string &nm) const;
 
+    /* E1 caveat: inline zero-divisor guard for every unboxed division
+       site (catchable perl_die "Illegal division by zero at FILE line N."). */
+    void emitDivZeroGuard(llvm::Value *divisor, const Node &n);
+
+    /* Stage 39 (E4): inline in-place float element store on row-typed PVs
+       (promote + REF_ARRAY-of-float-boxes fast path; exact boxed fallback
+       to perl_array_set_row). */
+    void emitRowElemStoreFast(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *f);
+
+    /* Stage 40 (E6): known-arity @_ unpacks → per-sub i64-args variant
+       (`<sub>_ai`), whose body binds each raw i64 param straight into the
+       unboxed int alloca — no args array, no get_ref/to_int, no per-call
+       arg box. Qualified at the Stage-37 lattice: every unpacked param
+       provable, contiguous slots, all call sites exact-arity int-shaped,
+       no prototype, no captures/ref-taking/dynamic dispatch (frames and
+       the wantarray pair are kept — only the array+boxing machinery is
+       skipped). */
+    std::unordered_set<std::string> subAiNames_;        /* by subLLVMName */
+    std::unordered_map<std::string, size_t> subAiArity_;/* by subLLVMName */
+    std::unordered_map<const Node *, std::vector<std::string>> subAiParams_;
+    bool argsIntEntry_ = false;                          /* emitting an _ai variant */
+    std::vector<llvm::Value *> aiParams_;                /* the _ai i64 params */
+    void emitSubAiVariant(const Node &n, const std::vector<std::string> &pnames);
+
+    /* Inline the D105 promote's no-op fast path at read time (Stage 38).
+       perl_promote_ref_array as a call cost ~15% of regex-heavy and was on
+       every hot-loop var/element read (nb: the whole loop ran 24x slower
+       than with this inline). Inlined it's two tag compares + a branch;
+       the promote call sits behind it only for genuinely-FLAT/FLOAT_PAIR
+       values. Same semantics as the call. */
+    void emitPromoteInline(llvm::Value *pv);
+
 private:
     /* ctx_ is heap-allocated so it can be released to ThreadSafeModule
        while all ctx_ references in this class remain valid. */
@@ -130,6 +162,10 @@ private:
        v*v can be replaced by x and v*v*v can be replaced by x*v (1 fewer fmul on critical path) */
     llvm::Value *lastSqrtInput_ = nullptr;
     std::unordered_map<std::string, llvm::Value *> floatSqrtOf_;
+    /* Perf item 2: per-call-site memo slot for constant regex literals
+       (allocated as file-static globals; the runtime pins the compiled
+       pattern — never LRU-evicted, freed by perl_cleanup). */
+    int regexMemoSeq_ = 0;
     /* D10: per-compilation counters (reset in compile()) */
     int sortCmpCounter_ = 0;
     int substEvalCounter_ = 0; /* D38c: unique names for s///e eval fns */
