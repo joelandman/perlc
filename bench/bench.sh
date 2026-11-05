@@ -21,7 +21,8 @@ BENCH_DIR="$SCRIPT_DIR"
 RESULTS="$BENCH_DIR/results.csv"
 PERLC="$PROJECT_DIR/perlc"
 TIMEOUT_SEC=3600
-BENCH_OPT="${BENCH_OPT:--O2}"   # compile level for the recorded rows (-O2 = the prod default; matches bench/regress.sh)
+BENCH_OPT="${BENCH_OPT:--O2}"   # compile level for the recorded rows (-O2 = the shipped default,
+                                # which LTO-links at -O2+ since the round-2 landing; matches regress.sh)
 NUM_RUNS=1
 MODE="full"  # full, baseline, compare
 EXTRA_ARGS=""

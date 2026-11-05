@@ -1507,15 +1507,19 @@ static void usage(const char *prog) {
               << "              runtime to implement `do FILE`, D24)\n"
               << "  --eval-lib  Like --do-lib, plus bind outer `my` cells from the eval pad\n"
               << "              (internal use — invoked by perl_eval_string())\n"
-              << "  -O[level]   Optimization level 0-5 (default: 2; bare -O means 1)\n"
+              << "  -O[level]   Codegen/link level 0-5 (default: 0; bare -O means 1). Only\n"
+              << "              sets the clang link level — the emitted IR is identical at\n"
+              << "              every level\n"
               << "  -v          Verbose\n"
               << "  -pm         Download and install missing Perl modules via cpanm\n"
               << "  -I<dir>     Add <dir> to the module search path (also: PERL5LIB, use lib)\n"
               << "  -g          Generate debugging symbols\n"
-              << "  -flto       Link with full LTO: runtime precompiled to bitcode (cache in\n"
-              << "              src/.perlc_lto_cache) so hot leaf runtime ops inline into the\n"
-              << "              generated code (slower link, faster binary)\n"
-              << "  -noflto     Force off the LTO link even with PERLC_LTO set\n"
+              << "  -flto       Force the LTO link (runtime as cached -O2 bitcode so hot leaf\n"
+              << "              runtime ops inline into the generated code; slower link,\n"
+              << "              faster binary). Default on at -O2+. At -O0 the runtime ships\n"
+              << "              as prebuilt -O2 objects; PERLC_NO_PREBUILT_RT=1 links it from\n"
+              << "              source instead (full -O0 binary)\n"
+              << "  -noflto     Force off the LTO link (also where it is the default at -O2+)\n"
               << "  --mini-gmp  Confirm mini-gmp is used for Math::BigInt (default; no external GMP)\n";
 }
 
@@ -1530,7 +1534,9 @@ int main(int argc, char **argv) {
     std::string outputFile = "a.out";
     bool emitIR = false, emitBC = false, verbose = false, installPM = false, debugSymbols = false;
     bool doLib = false, evalLib = false;
-    int optLevel = 0;  /* O1+ hangs clang-18 on our IR; disabled PM in codegen too */
+    int optLevel = 0;  /* default -O0: only the clang link level differs; the
+                          emitted IR is byte-identical at every level (see
+                          docs §2 "Where the -O levels live") */
 
     /* D113: PERL5LIB (colon-separated) is honored the same way real perl
        honors it — prepended to the module search path. */
@@ -1775,31 +1781,72 @@ int main(int argc, char **argv) {
 
         /* String-eval (JIT) removed; eval EXPR sets $@ and returns undef. */
 
-        /* Selective LTO link (perf item 1): when `-flto` is given (or
-           PERLC_LTO=1), the three runtime sources are compiled ONCE to LLVM
-           bitcode into a small cache next to the sources, then LTO-linked
-           with the generated IR at -O1+. That lets clang inline the small
-           hot leaf runtime functions (alloc, clone, free, num_*, array_get_ref, ...)
-           into the generated code — measured: fibn -34%, nb/reg -9..12%, mbs
-           -3% (docs/optimization_findings_2026-11-04.md §4).
-           Default OFF: full-LTO link costs +6..30s per compile on
-           call-dense programs (and up to ~2min on the worst offenders
-           before codegen de-boxing), so production builds and CI gates
-           stay at the historical ~20s; -flto is the opt-in for
-           performance-critical builds. -O0 always links from source.
-           PERLC_NO_LTO=1 overrides the flag; PERLC_LTO=thin selects the
-           summary-based pipeline (cheap links, weaker inlining). */
-        bool ltoFlag = false;
+        /* LTO + prebuilt-runtime asset cache (perf round-1 item 1 and
+           round-2 E3): the three runtime sources are compiled ONCE into a
+           small asset cache next to the sources, then linked into every
+           user binary instead of a fresh per-compile source build. Assets
+           are keyed by (basename, size, mtime, self-path); concurrent perlc
+           processes share the cache safely via atomic renames. Two flavors
+           with independent keys and pruning:
+
+           "lto-bc" — clang -O2 -flto -c → .bc, used by the LTO link: the
+             link's LTO pipeline re-optimizes and inlines the small hot leaf
+             runtime functions (alloc, clone, free, num_*, array_get_ref, ...)
+             into the generated code. Measured: fibn -34%, nb/reg -9..12%,
+             mbs -3% (docs/optimization_findings_2026-11-04.md §4). Default
+             ON at -O2+ (round-2 item 5), opt-in `-flto` at -O1, -noflto /
+             PERLC_NO_LTO=1 opts out; PERLC_LTO=thin selects the
+             summary-based pipeline (cheap links, weaker inlining). Warm
+             full-LTO link cost: +6..7 s per compile on call-dense programs.
+             D24 soundness: PERLC_SELF_PATH is baked into the bitcode by the
+             asset build itself — a plain -D on the link line never reaches
+             pre-compiled bitcode/IR inputs, so linking only with the define
+             on the command line silently fell back to bare "perlc"
+             (do-FILE self-reinvocation resolved through $PATH).
+           "o2-obj" — clang -O2 [-g] -march=native -c → .o, the E3
+             mixed-level link (round-2 queue item 3, default at -O0): the
+             generated IR still compiles in the same fast -O0 pass, but the
+             runtime ships pre-optimized — measured ~2x faster -O0 runtimes
+             with unchanged compile time. PERLC_NO_PREBUILT_RT=1 links the
+             runtime from source at -O0 (full -O0 binary for
+             debug-into-the-runtime / miscompile-repro workflows). */
+        /* Compiler builds carrying the Phase-0 gap detector (`make TRACE=1`)
+           skip the cache entirely: the runtime objects must be compiled with
+           -DPERLC_GAP_TRACE, which describes the compiler build, not the
+           produced binary. */
+        bool gapTraceBuild = false;
+#if defined(PERLC_GAP_TRACE)
+        gapTraceBuild = true;
+#endif
+        const char *ltoEnv = getenv("PERLC_LTO");
+        bool ltoEnvOff = ltoEnv && (!*ltoEnv || !strcmp(ltoEnv, "0") ||
+                                    !strcmp(ltoEnv, "off"));
+        bool ltoEnvOn = ltoEnv && *ltoEnv && !ltoEnvOff;
+        const char *noLtoEnv = getenv("PERLC_NO_LTO");
+        bool noLtoOn = noLtoEnv && *noLtoEnv && strcmp(noLtoEnv, "0") != 0;
+        const char *npEnv = getenv("PERLC_NO_PREBUILT_RT");
+        bool noPrebuilt = npEnv && *npEnv && strcmp(npEnv, "0") != 0;
+        bool useLto = optLevel >= 1 && !gapTraceBuild && !noLtoOn && !ltoEnvOff &&
+                      (optLevel >= 2 || ltoEnvOn);
+        bool usePrebuiltRt = optLevel == 0 && !gapTraceBuild && !noPrebuilt;
+        const char *ltoFlavor = ltoEnv;   /* "thin" selects the thin pipeline */
+        /* FNV-1a of the self path — PERLC_SELF_PATH is baked into the cached
+           assets, so it must be part of the key. */
+        std::string spHex;
         {
-            const char *l = getenv("PERLC_LTO");
-            ltoFlag = l && *l && strcmp(l, "0") != 0 && strcmp(l, "off") != 0;
+            uint64_t h = 1469598103934665603ULL;
+            for (unsigned char c : selfPath) { h ^= c; h *= 0x100000001b3ULL; }
+            char spHexBuf[17];
+            snprintf(spHexBuf, sizeof(spHexBuf), "%016llx", (unsigned long long)h);
+            spHex = spHexBuf;
         }
-        const char *noLto = getenv("PERLC_NO_LTO");
-        bool useLto = ltoFlag && optLevel >= 1 &&
-                      (!noLto || !*noLto || strcmp(noLto, "0") == 0);
-        const char *ltoFlavor = getenv("PERLC_LTO");   /* "thin" selects the thin pipeline */
-        auto ltoBitcodeFor = [&](const std::string &src) -> std::string {
-            if (!useLto) return src;
+        /* Same spelling the from-source link line uses (D24): the
+           backslash-escapes survive as \" so the -D macro expands to a C
+           string literal. */
+        std::string selfDefine =
+            " -DPERLC_SELF_PATH=\"\\\"" + selfPath + "\\\"\"";
+        auto runtimeAssetFor = [&](const std::string &src, const char *flavor,
+                                   bool withG) -> std::string {
             struct stat st;
             if (::stat(src.c_str(), &st) != 0) return src;
             auto slash = src.rfind('/');
@@ -1807,49 +1854,64 @@ int main(int argc, char **argv) {
             std::string base = (slash == std::string::npos) ? src : src.substr(slash + 1);
             std::string cacheDir = dir + "/.perlc_lto_cache";
             ::mkdir(cacheDir.c_str(), 0755);
-            /* FNV-1a of the self path: runtime.c's PERLC_SELF_PATH define is
-               baked into the cached bitcode, so it must be part of the key. */
-            std::string sp = selfPath;
-            uint64_t h = 1469598103934665603ULL;
-            for (unsigned char c : sp) { h ^= c; h *= 0x100000001b3ULL; }
-            char spHex[17];
-            snprintf(spHex, sizeof(spHex), "%016llx", (unsigned long long)h);
+            bool isLto = !strcmp(flavor, "lto-bc");
             std::ostringstream key;
-            key << base << "." << (long long)st.st_size << "." << (long long)st.st_mtime
-                << "." << spHex;
-            std::string cached = cacheDir + "/" + key.str() + ".bc";
+            key << base << "." << (long long)st.st_size << "."
+                << (long long)st.st_mtime << "." << spHex << ".v2";
+            /* Distinct tails per (flavor, -g) so a stale asset of one flavor
+               is never pruned by a rebuild of the other: ".o2.o" is not a
+               suffix of ".o2.g.o" nor vice versa. */
+            std::string suffix = isLto ? ".bc" : (withG ? ".o2.g.o" : ".o2.o");
+            std::string cached = cacheDir + "/" + key.str() + suffix;
             struct stat cst;
             if (::stat(cached.c_str(), &cst) == 0 && access(cached.c_str(), R_OK) == 0)
                 return cached;
-            /* Build once: front-end IR at -O2 (the LTO pipeline re-optimizes
-               at the link's -O level). Atomic rename so concurrent perlc
-               processes can share the cache safely. */
-            std::string tmp = cacheDir + "/." + key.str() + ".tmp" +
-                              std::to_string(getpid());
+            /* Build once; atomic rename so concurrent perlc processes can
+               share the cache safely. The LTO pipeline re-optimizes the
+               bitcode at the link's -O level. */
+            std::string tmp = cacheDir + "/._" + key.str() + ".tmp" + suffix +
+                              "." + std::to_string(getpid());
             std::ostringstream c;
-            c << "clang-22 -O2 -flto -c " << src << " -o " << tmp << " 2>/dev/null";
+            c << "clang-22 -O2";
+            if (isLto)
+                c << " -flto";
+            else
+                c << (withG ? " -g" : "") << " -march=native -Wno-atomic-alignment";
+            c << selfDefine << " -c " << src << " -o " << tmp << " 2>/dev/null";
             if (system(c.str().c_str()) != 0 || rename(tmp.c_str(), cached.c_str()) != 0) {
                 unlink(tmp.c_str());
                 return src;   /* fall back to from-source linking */
             }
-            /* Prune superseded versions of the same base file. */
+            /* Prune superseded versions of the same base file — per flavor
+               (and per -g state), never across them; skip in-flight tmp
+               files of concurrent processes (leading dot). */
             if (DIR *d = opendir(cacheDir.c_str())) {
                 std::string thisFile = cached.substr(cached.rfind('/') + 1);
                 std::string prefix = base + ".";
                 while (struct dirent *e = readdir(d)) {
                     std::string nm = e->d_name;
-                    if (nm == thisFile) continue;
+                    if (nm == thisFile || nm.empty() || nm[0] == '.') continue;
                     if (nm.compare(0, prefix.size(), prefix) == 0 &&
-                        nm.size() > prefix.size() && nm.substr(nm.size() - 3) == ".bc")
+                        nm.size() > suffix.size() &&
+                        nm.compare(nm.size() - suffix.size(), suffix.size(), suffix) == 0)
                         unlink((cacheDir + "/" + nm).c_str());
                 }
                 closedir(d);
             }
             return cached;
         };
-        std::string rtIn  = ltoBitcodeFor(rtSrc);
-        std::string mgIn  = ltoBitcodeFor(mgmpSrc);
-        std::string nstIn = ltoBitcodeFor(nstSrc);
+        std::string rtIn, mgIn, nstIn;
+        if (useLto) {
+            rtIn  = runtimeAssetFor(rtSrc,   "lto-bc", false);
+            mgIn  = runtimeAssetFor(mgmpSrc, "lto-bc", false);
+            nstIn = runtimeAssetFor(nstSrc,  "lto-bc", false);
+        } else if (usePrebuiltRt) {
+            rtIn  = runtimeAssetFor(rtSrc,   "o2-obj", debugSymbols);
+            mgIn  = runtimeAssetFor(mgmpSrc, "o2-obj", debugSymbols);
+            nstIn = runtimeAssetFor(nstSrc,  "o2-obj", debugSymbols);
+        } else {
+            rtIn = rtSrc; mgIn = mgmpSrc; nstIn = nstSrc;
+        }
 
         std::string cmd = "clang-22 -O" + std::to_string(optLevel);
         if (useLto && ltoFlavor && !strcmp(ltoFlavor, "thin"))

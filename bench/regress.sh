@@ -18,7 +18,9 @@
 #   ./bench/regress.sh --fix      # re-record the baseline from current perlc
 #
 # Config via env (all optional):
-#   BENCH_OPT        opt level to compile at          (default -O2; perlc's prod default)
+#   BENCH_OPT        opt level to compile at          (default -O2; measures the shipped
+#                                                     default, which LTO-links at -O2+.
+#                                                     PERLC_NO_LTO=1 gives the plain -O2 for A/B)
 #   BENCH_RUNS       per-benchmark runs, averaged     (default 3)
 #   BENCH_TOLERANCE  max allowed regression, percent  (default 10)
 #   BENCH_BASELINE   baseline file path               (default bench/baseline.csv)

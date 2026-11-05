@@ -165,3 +165,99 @@ the GENERAL body (today's verbatim machinery) as the fallback.
   `tests/lib/**` un-ignore or explicit `git add -f`.
 - `bench/baseline.csv` and `bench/results.csv` must be re-recorded
   after this lands (`./bench/regress.sh --fix`, then `bench/bench.sh`).
+
+## E3 mixed-level `-O0` link + default-on `-flto` (2026-11-05, this session)
+
+Completes the last two small items of the round-2 queue (§5 items 1 and
+5), both driver-only changes in `src/main.cpp`:
+
+- **E3 — prebuilt `-O2` runtime objects at `-O0`** (the mixed-level
+  link): the three runtime sources are compiled once with
+  `clang-22 -O2 -march=native -c` into a small asset cache
+  (`src/.perlc_lto_cache` — the LTO cache directory; `make clean`
+  clears it) and linked as plain objects into every `-O0` binary. The
+  generated IR still compiles in the same fast `-O0` pass; the runtime
+  ships pre-optimized. `PERLC_NO_PREBUILT_RT=1` links the runtime from
+  source (full `-O0` binary, for debug-into-the-runtime /
+  miscompile-repro workflows). Assets are suffix-distinguished per
+  flavor and debug state (`.o2.o` / `.o2.g.o`; `-g` users get
+  `-g`-compiled runtime objects), keys are
+  (basename, size, mtime, self-path-hash, `.v2` schema), pruning never
+  crosses flavors, and concurrent perlc processes share the cache via
+  atomic renames (the LTO cache's existing discipline).
+- **Default-on `-flto` at `-O2+`**: every `-O2`+ build LTO-links unless
+  `-noflto` / `PERLC_NO_LTO=1` / `PERLC_LTO=0|off`; explicit `-flto`
+  still forces it at `-O1`; `PERLC_LTO=thin` selects the summary-based
+  pipeline (measured: nb `-O2` thin compile 22.9 s vs full 25.3 s —
+  cheap link, weaker inlining; full stays the default).
+- **D202 (see TESTS.md) — cached LTO assets now bake `PERLC_SELF_PATH`**: a
+  link-line `-D` never reaches precompiled bitcode inputs, so the old
+  cached bitcode was built without the D24 define and every LTO binary
+  silently carried the `"perlc"` fallback (verified: the pre-fix binary
+  FAILs `test_do_filename.pl` under `PERLC_FLAGS="-O2 -flto"`, PASSes at
+  the from-source level). The asset builder now passes the identical
+  define at compile time, and the `.v2` key bump discards (never
+  reuses) pre-fix, define-less cached bitcode.
+- **Trace builds skip the cache**: `make TRACE=1` compilers
+  (`-DPERLC_GAP_TRACE`) link the runtime from source at every level —
+  the detector's define must reach the runtime compile.
+- **Usage text fixed**: the CLI default was (and is) `-O0` — the
+  emitted IR is byte-identical at every level, only the clang link
+  level differs; the old usage claimed "default: 2".
+
+### Measured (same shapes as the landing headline, warm caches)
+
+Compile times (best-of-1):
+
+| | before (d296301) | after |
+|---|---|---|
+| `-O0` compile, any program | 2.32–2.46 s | **0.2–0.3 s (~9–11×)** |
+| `-O0` w/ `PERLC_NO_PREBUILT_RT=1` | 2.32 s | 2.31 s (parity) |
+| `-O2` from-source (`-noflto`) | 19.3 s | 19.2 s (parity) |
+| `-O2` default (now LTO) | 25.2–30.8 s as `-O2 -flto` | 25.2–30.8 s (parity) |
+| `-O2` `PERLC_LTO=thin` | — | 22.9 s |
+
+Runtimes (best-of-1, sequential):
+
+| workload | -O0 before | -O0 after (E3) | -O2+LTO before/after |
+|---|---|---|---|
+| fibn 37 | 13.56 s | **5.24 s (2.6×)** | 3.30 / 3.26 s |
+| nb 4M | 2.27 s | 1.95 s (1.16×) | 0.66 / 0.67 s |
+| mbs 640 | 4.22 s | 3.89 s (1.08×) | 1.43 / 1.43 s |
+| regex 3M×70 | 24.44 s | **16.56 s (1.48×)** | 16.55 / 16.88 s |
+
+The old `-O0` cliff is mostly closed: the generated IR is
+level-independent, and the previously per-compile `-O0` runtime build
+was the bulk of the gap — `-O0` runtimes now land at (regex) or near
+(fibn 1.6×) the `-O2`+LTO numbers, with `-O0` compiles ~9–11× faster.
+Outputs byte-verified vs perl 5.44 at both levels (mbs's own four
+`Time::HiRes` self-timing lines excluded, as at landing).
+
+### Gates
+
+- `tests/harness.sh --assertion-only` (incl. the do-FILE
+  self-reinvocation path through both new asset flavors) PASS at the
+  default level and at `OPT_LEVEL=2`; `dbi_sqlite.pl` unchanged on
+  pre- and post-change binaries at both levels (pre-existing
+  external-deps gap, skip-by-default in `test-all`).
+- `make test-all` (611 tests, default level = the E3 path) **611/611
+  PASS in 4m01s** (per-test compile ~2.3 s → ~0.25 s via the cached
+  objects).
+- `bench/regress.sh --fix` re-recorded with `BENCH_OPT=-O2` now
+  measuring the shipped default (LTO-on), then PASS.
+
+### Notes / follow-ups
+
+- The remaining `-O0` vs `-O2` runtime gap is clang's per-program
+  optimization of the produced IR itself (loop opts/lifetime on the
+  `.ll`); E3 by design changes only how the runtime is compiled and
+  linked.
+- The `o2-obj` assets could also serve `-O1` (and plain `-noflto -O2`)
+  to remove the ~17 s from-source runtime recompile there — a one-line
+  driver flip, not done now: plain `-O2` is the LTO path by default and
+  `-O1` is unused.
+- Round-2 queue state after this session: items 1 (E3) and 5 (-flto
+  default) done; item 6 (-march=native keeps) already standing policy.
+  Remaining strategic: the packed-rows representation (Stage 41's
+  lever), auto-parallel counted loops, and the D197/D198
+  unboxing-safety classes.
