@@ -1,4 +1,19 @@
 #!/usr/bin/env perl
+# flat_fill_pair in pure-perl: perlc compiles it (the row-packing machinery
+# exercises the same paths the runtime helper would); kept here so the
+# benchmark is self-contained (bench.sh has no stub-prepending step).
+
+sub flat_fill_pair {
+    my ($re_base, $im_base, $re_stride, $im_stride, $n) = @_;
+    my @r;
+    return \@r if $n <= 0;
+    $#r = $n * 2 - 1;
+    for my $i (0..$n-1) {
+        $r[$i*2]   = $re_base + $i * $re_stride;
+        $r[$i*2+1] = $im_base + $i * $im_stride;
+    }
+    return \@r;
+}
 
 # using TimerOutputs  -- cannot be converted directly (no equivalent module used; manual timing with Time::HiRes below)
 # using PyPlot  -- cannot be converted (no PyPlot/ plotting library used; plotting section omitted)
@@ -8,7 +23,7 @@ use strict;
 use warnings;
 use Time::HiRes qw(time);
 
-my $N    = 4096;
+my $N    = 640;
 my $NP   = $N * 1.0;
 my $xmin = -1.5;
 my $xmax = 1.0;

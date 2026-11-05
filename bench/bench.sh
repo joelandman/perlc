@@ -21,6 +21,7 @@ BENCH_DIR="$SCRIPT_DIR"
 RESULTS="$BENCH_DIR/results.csv"
 PERLC="$PROJECT_DIR/perlc"
 TIMEOUT_SEC=3600
+BENCH_OPT="${BENCH_OPT:--O2}"   # compile level for the recorded rows (-O2 = the prod default; matches bench/regress.sh)
 NUM_RUNS=1
 MODE="full"  # full, baseline, compare
 EXTRA_ARGS=""
@@ -101,15 +102,22 @@ measure_time_ms() {
         ms=$(cat "$tmpfile" 2>/dev/null || echo "0")
         # /usr/bin/time -f "%e" gives seconds (e.g. "1.57" or "0.003")
         # Convert to integer ms
-        if [[ "$ms" == *.* ]]; then
-            local sec=${ms%%.*}
-            local frac=${ms#*.}
-            # Pad frac to 3 digits
-            while [[ ${#frac} -lt 3 ]]; do frac="${frac}0"; done
-            frac="${frac:0:3}"
-            ELAPSED_MS=$(( 10#${sec:-0} * 1000 + 10#${frac:-0} ))
+        if [[ "$ms" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            if [[ "$ms" == *.* ]]; then
+                local sec=${ms%%.*}
+                local frac=${ms#*.}
+                # Pad frac to 3 digits
+                while [[ ${#frac} -lt 3 ]]; do frac="${frac}0"; done
+                frac="${frac:0:3}"
+                ELAPSED_MS=$(( 10#${sec:-0} * 1000 + 10#${frac:-0} ))
+            else
+                ELAPSED_MS=$(( 10#${ms:-0} * 1000 ))
+            fi
         else
-            ELAPSED_MS=$(( 10#${ms:-0} * 1000 ))
+            # Non-numeric elapsed (program died; its stderr beat time -f's
+            # write into the same file handle). Report as failure.
+            echo "bench.sh: '$*' did not produce a timing (stderr: $(head -c 200 "$tmpfile" | head -2 | tr '\n' ' '))" >&2
+            ELAPSED_MS=0
         fi
     else
         # Fallback: use bash builtin with date
@@ -133,8 +141,8 @@ compile_test() {
     basename=$(basename "$testfile" .pl)
     local outfile="$TMPDIR_BENCH/${basename}_perlc"
 
-    # Compile - suppress all output (LLVM warnings go to stdout)
-    if ! "$PERLC" "$testfile" -o "$outfile" >/dev/null 2>&1; then
+    # Compile at the recorded level; suppress output (LLVM warnings go to stdout)
+    if ! "$PERLC" "$testfile" "$BENCH_OPT" -o "$outfile" >/dev/null 2>&1; then
         echo "FAIL"
         return 1
     fi
@@ -160,9 +168,10 @@ run_test() {
     # fibn.pl: exponential, use N=20 (fib(20)=6765, fast)
     # nb.pl: O(N) iterations, use N=100000 (runs in ~7ms)
     case "$basename" in
-        fibn)   [[ -z "$args" ]] && args="38" ;;
-        nb)     [[ -z "$args" ]] && args="50000000" ;;
-        mbs)    args="" ;;  # hardcoded in source
+        fibn)        [[ -z "$args" ]] && args="38" ;;
+        nb)          [[ -z "$args" ]] && args="50000000" ;;
+        mbs)         args="" ;;                      # hardcoded in source (640)
+        regex_heavy) [[ -z "$args" ]] && args="3000000 70" ;;  # ~60s perl shape
     esac
 
     # ── perlc timing ────────────────────────────────────────────────────
