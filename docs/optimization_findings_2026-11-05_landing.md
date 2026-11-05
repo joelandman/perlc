@@ -78,7 +78,24 @@ further without a different match strategy.
   nearer lexical (D186-style); the file scope itself (same storage) is
   still allowed.
 
-## Worktree / merge notes
+## Integration record (2026-11-05)
+
+- Landed in this worktree from parent `4c44eb6`, then main (`301b2d8`,
+  = E1/E2 + the div-zero die) was merged in; the conflict resolution
+  kept main's div-zero variant (the shared `__perlc_div_zero_die`
+  noreturn helper + constant-nonzero-divisor elimination) and this
+  tree's stages/tests. Main fast-forwarded to the merge commit
+  (`bf2ea88`) and re-passed both gates there (test-all 611/611,
+  bench-regress PASS).
+- `tests/lib/E/Tagged.pm` was untracked (the `.gitignore` `lib/`
+  pattern); now tracked (`git add -f`, commit `48ec79d`) so fresh
+  clones/worktrees pass test-all.
+- bench.sh's recorded rows were being measured at the implicit -O0
+  default; it now compiles at `-O2` (matching regress.sh) and carries
+  ~60-s shapes (regex_heavy 3M×70 via args; mbs stubbed at N=640).
+  `bench/results.csv` refreshed accordingly (commit `b73cdca`).
+
+## Worktree / merge notes (original state before integration)
 
 - This worktree sits at parent commit `4c44eb6` with one uncommitted
   landing patch. Main repo moved to `301b2d8` (E1/E2 + a slightly
