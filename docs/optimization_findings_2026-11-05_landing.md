@@ -19,10 +19,14 @@ run against real perl, byte-for-byte.
 
 ## Final numbers (all outputs byte-verified vs perl 5.44)
 
-- `fibn.pl 37`:   perl 49.3 s → **4.41 s** (11.2×)
-- `nb.pl 4000000`: perl 63.5 s → **0.70 s** (≈90×)
-- `regex_3m70.pl`: perl ~50 s → **17.0 s** (2.9×)
-- `mbs640p.pl`:    perl 57.7 s → **1.43 s** (40×)
+At plain `-O2` (best of 3, sequential): `fibn.pl 37` 4.87s (perl 49.3 —
+10.1×), `nb.pl 4000000` 0.72s (perl 63.5 — 88×), `regex_3m70.pl` 17.08s
+(perl ~50 — 2.9×), `mbs640p.pl` 1.43s (perl 57.7 — 40×).
+
+With -O3+flto: 3.21 / 0.54 / 17.04 / 1.40 (the lto bitcode cache made the
+link ~24s/benchmark after the first cold ~50s). regex3m is pcre2-bound —
+after E5d its profile is ~90% inside libpcre2, so LTO can't help it
+further without a different match strategy.
 
 ## Mechanism notes (for the record)
 
@@ -47,8 +51,10 @@ run against real perl, byte-for-byte.
    existing pair machinery, zero-box void-context stores, and a raw
    fcmp for the `abs2 < 4` test. RT churn collapsed: clone 335M→3.0M,
    free 569M→198M, setrow 132.7M→762, cplx_elem 200M→156K, deref
-   332M→159K.
-4. **fib (10.0→4.41)**: recursive `fib($n-1)` calls are i64-expressible
+   332M→159K. Ablation on the landed tree
+   (`PERLC_OPT_DISABLE=st39,cplxrow`): 17.4s = the pre-Stage-39 class.
+4. **fib (10.06→4.87 at -O2; ablation PERLC_OPT_DISABLE=st40 → 10.06)**:
+   recursive `fib($n-1)` calls are i64-expressible
    but canEmitI64 rightly refuses arithmetic (D103 overflow); Stage 40's
    call sites emit `llvm.ssub.with.overflow` and pick the `_ai` direct
    call on the no-overflow arm, re-routing the overflow arm into the
