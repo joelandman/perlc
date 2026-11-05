@@ -3732,6 +3732,12 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
 /* forward: defined after tryLoadCplxPairF64 (see Stage 37 section) */
 static bool isRowishUse(const Node &n, const std::string &nm);
 
+/* Strip a leading sigil from a variable name (the "$name"/"name" duality
+   the parser produces depending on which parse path built the node). */
+static std::string bareVarName(const std::string &s) {
+    return (!s.empty() && s[0] == '$') ? s.substr(1) : s;
+}
+
 bool CodeGen::tryBindCplxPair(const std::string &nm, const Node &rhs) {
     if (!isOptStageEnabled("cplxrow")) return false;
     if (rhs.kind != NK::ArrowDeref || rhs.sval != "array" || !rhs.left || !rhs.right)
@@ -3746,6 +3752,31 @@ bool CodeGen::tryBindCplxPair(const std::string &nm, const Node &rhs) {
        bindings, which register the .re slot as the scalar). */
     if (currentSubBody_ && isRowishUse(*currentSubBody_, nm)) return false;
     if (!currentSubBody_ && mainBody_ && isRowishUse(*mainBody_, nm)) return false;
+    /* Stage 41: inside a guarded kernel body, the row variable's shape is
+       proven by the loop prelude and invariant across the loop (the
+       guarded emitters never touch the tag payload). Take the direct paths
+       — no promote (the prelude guarantees the shape!), no tag dispatch,
+       no per-access bounds checks, no calls. */
+    if ((flatKernelMode_ || refKernelMode_) && rhs.left->kind == NK::ScalarVar &&
+        isOptStageEnabled("st41")) {
+        std::string rbn = (!rhs.left->name.empty() && rhs.left->name[0] == '$')
+                              ? rhs.left->name.substr(1) : rhs.left->name;
+        if (knownFlatRows_.count(rbn) || knownRefRows_.count(rbn)) {
+            if (Value *base = scalarVarRawPv(rhs.left->name)) {
+                Value *idx = emitIdx(*rhs.right);
+                Value *re = nullptr, *im = nullptr;
+                if (knownFlatRows_.count(rbn))
+                    emitFlatPairLoad(base, idx, re, im);
+                else
+                    emitRefPairLoad(base, idx, re, im);
+                CplxPairSlots *sl = ensurePairSlots(nm);
+                if (!sl) return false;
+                builder_.CreateStore(re, sl->re);
+                builder_.CreateStore(im, sl->im);
+                return true;
+            }
+        }
+    }
     Value *base = emitExpr(*rhs.left);
     Value *idx = emitIdx(*rhs.right);
     Value *re = nullptr, *im = nullptr;
@@ -7390,6 +7421,400 @@ void CodeGen::emitSub(const Node &n) {
 
 /* ── statement emission ──────────────────────────────────────────────────── */
 
+/* ── Stage 41: flat-row kernel loop dual-emit (2026-11-05, per round-2
+   "vectorization" item) ────────────────────────────────────────────────────
+
+   The mbs-shaped inner kernels: a counted for-loop whose body is pure
+   flat-row pair arithmetic over row variables bound in the enclosing
+   iteration. Today's per-access machinery is a 4-way tag dispatch chain
+   plus promote checks per element read/store — fast serial (branch-
+   predicted, zero runtime calls after Stage 39) but with a per-element
+   CFG that blocks LLVM's loop vectorizer.
+
+   This emits the loop TWICE behind a per-iteration prelude:
+
+     - a FLAT body: every row access is a direct indexed GEP into the
+       packed double[] with no tag load, no promote, no bounds check and
+       no runtime call; carries the Stage-34 counted-loop vectorize hint.
+     - the GENERAL body: today's machinery, verbatim.
+
+   Selection (the "known-tag" proof, all resolved at the prelude):
+     tag(pv) == PERL_FLAT_ARRAY
+     pv->matchpos >= 2 * loopBound          (indices are (2i | 2i+1))
+     the rows' packed data pointers are pairwise distinct
+                                            (WAR versioning: loop bodies
+                                             read two rows and write a
+                                             third; pairwise-distinct data
+                                             pointers disprove any
+                                             read/write overlap for LLVM)
+
+   Sound by construction: anything else falls to the general body with
+   today's exact semantics, including OOB/negative indices and rows in
+   every other representation (REF/CPLX/PAIR). */
+
+/* Raw PV-cell load for a scalar variable — scopes_ lookup, NO D105
+   promote. The Stage-41 prelude guard has already proven the row's shape;
+   the promote (which converts flat rows to alias-capable REFs) must not
+   run inside the guarded body, or the prelude's answer would be stale. */
+llvm::Value *CodeGen::scalarVarRawPv(const std::string &rawNm) {
+    std::string nm = rawNm;
+    if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+    Value *slot = lookupVar(nm);
+    return slot ? builder_.CreateLoad(perlPtrTy_, slot, nm + ".rpv") : nullptr;
+}
+
+/* The Stage-39 REF-row pair-read core (boxes-direct), without tagging:
+   av(idx, idx+1) element boxes must already be proven FLOAT by the caller
+   (the Stage 41 REF-mode prelude proves... nothing per-box! — the two tag
+   loads at the end are kept: they gate the (speculative-safe) fval loads
+   against genuinely boxed values; for non-float boxes this function still
+   succeeds but only after re-reading the tag — the per-BOX tag check = the
+   cheapest provably-correct box read that can't misread an int/undef slot
+   as garbage doubles in vectorized form — for the serial REF mode this is
+   two loads + compares behind the row's own guard. */
+void CodeGen::emitRefPairLoad(Value *rowPv, Value *idx, Value *&re, Value *&im) {
+    auto *i8 = Type::getInt8Ty(ctx_);
+    auto *i32 = Type::getInt32Ty(ctx_);
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *f64 = Type::getDoubleTy(ctx_);
+    Value *av = builder_.CreateLoad(perlPtrTy_, rowPv, "fk.rav");
+    Value *elems = builder_.CreateLoad(perlPtrTy_, av, "fk.relems");
+    setTBAA(elems, tbaaAvElemsTag_);
+    Value *e0P = builder_.CreateGEP(perlPtrTy_, elems, idx, "fk.re0p");
+    Value *e0 = builder_.CreateLoad(perlPtrTy_, e0P, "fk.re0");
+    setTBAA(e0, tbaaAvElemTag_);
+    Value *t0 = builder_.CreateLoad(i32, e0, "fk.rt0");
+    setTBAA(t0, tbaaPvTagTag_);
+    Value *t0f = builder_.CreateICmpEQ(t0, ConstantInt::get(i32, 2), "fk.rt0f");
+    Value *f0 = builder_.CreateLoad(f64,
+        builder_.CreateGEP(i8, e0, ConstantInt::get(i64, 8), "fk.rf0p"), "fk.rf0");
+    setTBAA(f0, tbaaPvFvalTag_);
+    re = builder_.CreateSelect(t0f, f0,
+        ConstantFP::get(f64, 0.0), "fk.rsel0");
+
+    Value *n1 = builder_.CreateAdd(idx, ConstantInt::get(i64, 1), "fk.rn1");
+    Value *e1 = builder_.CreateLoad(perlPtrTy_,
+        builder_.CreateGEP(perlPtrTy_, elems, n1, "fk.re1p"), "fk.re1");
+    setTBAA(e1, tbaaAvElemTag_);
+    Value *t1 = builder_.CreateLoad(i32, e1, "fk.rt1");
+    setTBAA(t1, tbaaPvTagTag_);
+    Value *t1f = builder_.CreateICmpEQ(t1, ConstantInt::get(i32, 2), "fk.rt1f");
+    Value *f1 = builder_.CreateLoad(f64,
+        builder_.CreateGEP(i8, e1, ConstantInt::get(i64, 8), "fk.rf1p"), "fk.rf1");
+    setTBAA(f1, tbaaPvFvalTag_);
+    im = builder_.CreateSelect(t1f, f1,
+        ConstantFP::get(f64, 0.0), "fk.rsel1");
+}
+
+/* The flat-branch body of tryLoadCplxPairF64, without any tagging:
+   "pair at idx" of a flat element row = (pv.data[idx], pv.data[idx+1]) —
+   exactly what the general machinery's flat path produces, now as two
+   GEP+loads with nothing else. */
+void CodeGen::emitFlatPairLoad(Value *rowPv, Value *idx, Value *&re, Value *&im) {
+    auto *i8 = Type::getInt8Ty(ctx_);
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *f64 = Type::getDoubleTy(ctx_);
+    Value *pvalP = builder_.CreateGEP(i8, rowPv,
+        ConstantInt::get(i64, 8), "fk.pvalp");
+    Value *data = builder_.CreateLoad(perlPtrTy_, pvalP, "fk.data");
+    Value *reP = builder_.CreateGEP(f64, data, idx, "fk.rep");
+    Value *imP = builder_.CreateGEP(f64, data,
+        builder_.CreateAdd(idx, ConstantInt::get(i64, 1), "fk.n1"), "fk.imp");
+    re = builder_.CreateLoad(f64, reP, "fk.re");
+    im = builder_.CreateLoad(f64, imP, "fk.im");
+    setTBAA(re, tbaaFlatDoubleTag_);
+    setTBAA(im, tbaaFlatDoubleTag_);
+}
+
+/* Pure float-domain nodes allowed inside a guarded flat-kernel body (as
+   the *only* thing an arithmetic sub-tree may touch): literals, plain
+   scalar slot reads, and their + - * / and unary +/- compositions. No
+   arrow derefs, array elements, hash touches, calls, or any construct
+   with side effects — the guarded body must be side-effect-free with
+   respect to every PV. */
+static bool fkNoRowTouch(const Node &n) {
+    switch (n.kind) {
+    case NK::FloatLit:
+    case NK::IntLit:
+    case NK::ScalarVar:
+        return true;
+    case NK::BinOp:
+        if (n.sval != "+" && n.sval != "-" && n.sval != "*" && n.sval != "/")
+            return false;
+        return n.left && n.right && fkNoRowTouch(*n.left) && fkNoRowTouch(*n.right);
+    case NK::UnaryOp:
+        if (n.sval != "-" && n.sval != "+") return false;
+        return n.left && fkNoRowTouch(*n.left);
+    default:
+        return false;
+    }
+}
+
+/* The exact index forms the prelude guards: (2*i) or (2*i + 1) or their
+   commuted spellings, where `i` is the loop index variable bound by the
+   counted-loop init. */
+static bool fkIndexForm(const Node &idxN, const std::string &loopVarBare) {
+    auto bare = [](const std::string &s) {
+        return (!s.empty() && s[0] == '$') ? s.substr(1) : s;
+    };
+    if (idxN.kind != NK::BinOp) return false;
+    bool isMul = idxN.sval == "*";
+    bool isAdd = idxN.sval == "+";
+    if (!isMul && !isAdd) return false;
+    auto twoForm = [&](const Node &m) {
+        return m.kind == NK::BinOp && m.sval == "*" && m.left && m.right &&
+               ((m.left->kind == NK::IntLit && m.left->ival == 2 &&
+                 m.right->kind == NK::ScalarVar &&
+                 bare(m.right->name) == loopVarBare) ||
+                (m.right->kind == NK::IntLit && m.right->ival == 2 &&
+                 m.left->kind == NK::ScalarVar &&
+                 bare(m.left->name) == loopVarBare));
+    };
+    if (isMul) return twoForm(idxN);
+    return (idxN.left && idxN.right) &&
+           ((twoForm(*idxN.left) &&
+             idxN.right->kind == NK::IntLit && idxN.right->ival == 1) ||
+            (twoForm(*idxN.right) &&
+             idxN.left->kind == NK::IntLit && idxN.left->ival == 1));
+}
+
+/* The Stage-41 prelude + dual emission of a qualifying counted loop. */
+bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
+    /* the re-emitted copies inside this function's own two variants come
+       back through emitStmt→here; they must take the ordinary machinery */
+    if (fkEmitting_) return false;
+    if (!isOptStageEnabled("st41") || !isOptStageEnabled("cplxrow"))
+        return false;
+    if (!n.init || !n.cond || !n.step || !n.body) return false;
+    if (!n.sval.empty() || n.contBlock) return false;   /* labels / continue keep the general path */
+    /* counted shape: my $i = 0; $i < BOUND; $i++ */
+    if (n.init->kind != NK::My || !n.init->right ||
+        n.init->right->kind != NK::IntLit || n.init->right->ival != 0)
+        return false;
+    if (n.cond->kind != NK::BinOp || n.cond->sval != "<" ||
+        !n.cond->left || !n.cond->right ||
+        n.cond->left->kind != NK::ScalarVar || !canEmitI64(*n.cond->right))
+        return false;
+    if (n.step->kind != NK::UnaryOp ||
+        (n.step->sval != "post++" && n.step->sval != "pre++") ||
+        !n.step->left || n.step->left->kind != NK::ScalarVar)
+        return false;
+    auto bare = [](const std::string &s) {
+        return (!s.empty() && s[0] == '$') ? s.substr(1) : s;
+    };
+    std::string idxBare = bare(n.cond->left->name);
+    if (idxBare != bare(n.step->left->name) ||
+        idxBare != bare(n.init->name))
+        return false;
+
+    /* Walk the body collecting the row variables and checking the allowed
+       statement shapes (v1: the mbs-pair kernel class). */
+    std::unordered_set<std::string> rows;
+    std::function<bool(const Node &)> walk = [&](const Node &s) -> bool {
+        if (s.kind == NK::FlatBlock || s.kind == NK::Block) {
+            for (auto &sub : s.args)
+                if (!walk(*sub)) return false;
+            return true;
+        }
+        const Node *st = &s;
+        if (st->kind == NK::ExprStmt && st->left) st = st->left.get();
+        if (st->kind == NK::If) {
+            /* the If shape: a branch list ({cond, body}); an else arm has
+               cond == nullptr. Every conditional arm must be a relational
+               over two pure-f64 ops; every arm's body must itself qualify. */
+            for (auto &br : st->branches) {
+                if (br.cond) {
+                    if (br.cond->kind != NK::BinOp) return false;
+                    const std::string &op = br.cond->sval;
+                    if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
+                        op != "==" && op != "!=")
+                        return false;
+                    if (!fkNoRowTouch(*br.cond)) return false;
+                }
+                if (br.body && !walk(*br.body)) return false;
+            }
+            return true;
+        }
+        /* the pair-READ bind: my $v = $row->[2i (+1)] */
+        if (st->kind == NK::My && st->right &&
+            st->right->kind == NK::ArrowDeref &&
+            st->right->sval == "array" && st->right->left &&
+            st->right->left->kind == NK::ScalarVar && st->right->right &&
+            fkIndexForm(*st->right->right, idxBare)) {
+            std::string bn = bare(st->name);
+            if (rows.count(bn)) return false;   /* re-binding a row var: no */
+            rows.insert(bare(st->right->left->name));
+            return true;
+        }
+        /* the float-arith bind: my $v = <pure f64 arithmetic over slots> */
+        if (st->kind == NK::My && st->right && fkNoRowTouch(*st->right))
+            return true;
+        /* the element-STORE: ExprStmt($row->[2i (+1)] = pure-f64) */
+        if (st->kind == NK::Assign && st->left &&
+            st->left->kind == NK::ArrowDeref && st->left->sval == "array" &&
+            st->left->left && st->left->left->kind == NK::ScalarVar &&
+            st->left->right && fkIndexForm(*st->left->right, idxBare) &&
+            fkNoRowTouch(*st->right)) {
+            rows.insert(bare(st->left->left->name));
+            return true;
+        }
+        /* any other statement shape keeps the general path */
+        return false;
+    };
+    if (!walk(*n.body)) {
+        {
+            /* which shape rejected: run the walk again instrumented */
+            std::function<const char *(const Node &)> why = [&](const Node &s) -> const char * {
+                if (getenv("PERLC_DEBUG_ST41"))
+                    fprintf(stderr, "  ST41 walk: kind=%d sval=%s name=%s line=%d args=%zu\n",
+                            (int)s.kind, s.sval.c_str(), s.name.c_str(), s.line, s.args.size());
+                if (s.kind == NK::FlatBlock || s.kind == NK::Block) {
+                    for (auto &sub : s.args) {
+                        const char *r = why(*sub);
+                        if (r) return r;
+                    }
+                    return nullptr;
+                }
+                const Node *st = &s;
+                if (st->kind == NK::ExprStmt && st->left) st = st->left.get();
+                if (st->kind == NK::If) {
+                    if (!st->cond || st->cond->kind != NK::BinOp) return "if-cond-not-binop";
+                    const std::string &op = st->cond->sval;
+                    if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
+                        op != "==" && op != "!=") return "if-op-not-relational";
+                    if (!fkNoRowTouch(*st->cond)) return "if-cond-row-touch";
+                    if (st->body) {
+                        const char *r = why(*st->body);
+                        if (r) return r;
+                    }
+                    for (auto &br : st->branches)
+                        if (br.body) {
+                            const char *r2 = why(*br.body);
+                            if (r2) return r2;
+                        }
+                    return nullptr;
+                }
+                if (st->kind == NK::My && st->right &&
+                    st->right->kind == NK::ArrowDeref &&
+                    st->right->sval == "array" && st->right->left &&
+                    st->right->left->kind == NK::ScalarVar && st->right->right) {
+                    if (!fkIndexForm(*st->right->right, idxBare)) return "bind-idx-form";
+                    std::string bn = bare(st->name);
+                    if (rows.count(bn)) return "rebin-row-var";
+                    return nullptr;
+                }
+                if (st->kind == NK::My && getenv("PERLC_DEBUG_ST41") && st->right)
+                    fprintf(stderr, "  ST41 my %s: right kind=%d sval=%s\n",
+                            st->name.c_str(), (int)st->right->kind, st->right->sval.c_str());
+                if (st->kind == NK::Assign && st->left &&
+                    st->left->kind == NK::ArrowDeref && st->left->sval == "array" &&
+                    st->left->left && st->left->left->kind == NK::ScalarVar &&
+                    st->left->right) {
+                    if (!fkIndexForm(*st->left->right, idxBare)) return "st-idx-form";
+                    if (!fkNoRowTouch(*st->right)) return "st-rhs-row-touch";
+                    return nullptr;
+                }
+                return "other-stmt-shape";
+            };
+            if (getenv("PERLC_DEBUG_ST41")) {
+                const char *w = why(*n.body);
+                (void)w;
+            }
+        }
+        return false;
+    }
+    if (rows.empty()) {
+        if (getenv("PERLC_DEBUG_ST41"))
+            fprintf(stderr, "ST41: loop line %d rejected (no row uses)\n", n.line);
+        return false;
+    }
+
+    fkEmitting_ = true;
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *i1  = Type::getInt1Ty(ctx_);
+    auto *fn  = builder_.GetInsertBlock()->getParent();
+
+    /* ── per-iteration prelude: prove every row flat + long enough ── */
+    Value *bound64 = emitExprI64(*n.cond->right);
+    if (!bound64) return false;
+    Value *twoBound = builder_.CreateMul(bound64,
+        ConstantInt::get(i64, 2), "fk.twobound");
+    Value *allOk = ConstantInt::get(i1, 1);
+    std::unordered_map<std::string, Value *> rowPvs;
+    for (const auto &rnm : rows) {
+        Value *pv = scalarVarRawPv(rnm);
+        if (!pv) return false;
+        rowPvs[rnm] = pv;
+        Value *tag = builder_.CreateLoad(Type::getInt32Ty(ctx_), pv, "fk.tag");
+        setTBAA(tag, tbaaPvTagTag_);
+        Value *isFlat = builder_.CreateICmpEQ(tag,
+            ConstantInt::get(Type::getInt32Ty(ctx_), 10), "fk.flatq");
+        Value *lenP = builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
+            ConstantInt::get(i64, 16), "fk.lenp");
+        Value *len = builder_.CreateLoad(i64, lenP, "fk.len");
+        Value *lenOk = builder_.CreateICmpSGE(len, twoBound, "fk.lenok");
+        allOk = builder_.CreateAnd(allOk,
+            builder_.CreateAnd(isFlat, lenOk, "fk.rowok"), "fk.ok");
+    }
+    auto *flatBB      = BasicBlock::Create(ctx_, "fk.pre",     fn);
+    auto *generalBB   = BasicBlock::Create(ctx_, "fk.general", fn);
+    auto *flatLoopBB  = BasicBlock::Create(ctx_, "fk.flatin",  fn);
+    auto *afterBB     = BasicBlock::Create(ctx_, "fk.after",   fn);
+    builder_.CreateCondBr(allOk, flatBB, generalBB);
+
+    builder_.SetInsertPoint(flatBB);
+    /* WAR versioning: pairwise-distinct data pointers disprove any
+       read/write overlap between the row buffers inside the flat body —
+       LLVM's dependence analysis consumes this branch directly. */
+    Value *allDist = ConstantInt::get(i1, 1);
+    std::vector<Value *> datas;
+    for (const auto &rnm : rows) {
+        Value *pv = rowPvs[rnm];
+        Value *pvalP = builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
+            ConstantInt::get(i64, 8), "fk.dp");
+        Value *d = builder_.CreateLoad(perlPtrTy_, pvalP, "fk.ddata");
+        datas.push_back(d);
+    }
+    for (size_t a = 0; a < datas.size(); a++)
+        for (size_t b = a + 1; b < datas.size(); b++)
+            allDist = builder_.CreateAnd(allDist,
+                builder_.CreateICmpNE(datas[a], datas[b], "fk.dist"),
+                "fk.distall");
+    builder_.CreateCondBr(allDist, flatLoopBB, generalBB);
+
+    /* ── the FLAT variant ── */
+    builder_.SetInsertPoint(flatLoopBB);
+    {
+        for (const auto &rnm : rows) knownFlatRows_.insert(rnm);
+        flatKernelMode_ = true;
+        flatDoubleCache_.clear();   /* the general variant's SSA doesn't dominate here */
+        floatSqrtOf_.clear();
+        lastSqrtInput_ = nullptr;
+        emitStmt(n);               /* a re-emission of the same counted loop */
+        flatKernelMode_ = false;
+        for (const auto &rnm : rows) knownFlatRows_.erase(rnm);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(afterBB);
+    }
+    auto *flatEndBB = builder_.GetInsertBlock();
+
+    /* ── the GENERAL variant (today's machinery, verbatim) ── */
+    builder_.SetInsertPoint(generalBB);
+    {
+        flatDoubleCache_.clear();
+        floatSqrtOf_.clear();
+        lastSqrtInput_ = nullptr;
+        emitStmt(n);
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateBr(afterBB);
+    }
+    auto *generalEndBB = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(afterBB);
+    fkEmitting_ = false;
+    return true;
+}
+
 /* Stage 40 (E6): emit the known-arity i64-args variant body for a qualified
    sub. Mirrors the generic emitSub body structure exactly — package/save-
    state/scope handling, wantarray push from the ctx param, Stage 27a $_ —
@@ -8968,6 +9393,11 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::For: {
+        /* Stage 41: the flat-row kernel dual-emit for qualifying counted
+           loops (the mbs pair-arithmetic inner bodies). On any rejection
+           this falls straight through to the ordinary machinery. */
+        if (tryEmitFlatKernelFor(n))
+            break;
         if (!n.sval.empty()) {
             auto *lbb = labelBB(n.sval);
             if (!builder_.GetInsertBlock()->getTerminator())
@@ -11084,6 +11514,28 @@ Value *CodeGen::emitExpr(const Node &n) {
                     This includes scalar-ref-rooted chains like $ref->[0][1],
                     and mixed chains like $ref->{a}[0][1]. */
                 if (needsScalarRootedAutoviv(*n.left)) {
+                    /* Stage 41: inside a guarded flat-kernel body the row
+                       variable is proven FLAT and its index in range by
+                       the loop prelude — write straight into the packed
+                       buffer (no promote, no dispatch, no fallback). */
+                    if (flatKernelMode_ && isOptStageEnabled("st41") &&
+                        n.left->left->kind == NK::ScalarVar &&
+                        knownFlatRows_.count(bareVarName(n.left->left->name))) {
+                        if (Value *fv = emitExprF64(*n.right)) {
+                            Value *row = scalarVarRawPv(n.left->left->name);
+                            Value *dP = builder_.CreateGEP(
+                                Type::getInt8Ty(ctx_), row,
+                                ConstantInt::get(Type::getInt64Ty(ctx_), 8),
+                                "fk.st.pvalp");
+                            Value *data = builder_.CreateLoad(perlPtrTy_, dP, "fk.st.data");
+                            Value *idxS = emitIdx(*n.left->right);
+                            auto *fst = builder_.CreateStore(fv,
+                                builder_.CreateGEP(Type::getDoubleTy(ctx_), data,
+                                    idxS, "fk.st.ep"));
+                            setTBAA(fst, tbaaFlatDoubleTag_);
+                            return callRT("perl_alloc_float", {fv});
+                        }
+                    }
                     /* Stage 39 (E4): plain `$row->[i] = f` single-step store
                        on a scalar-var-rooted row with an F64 RHS — inline
                        the promote + REF-row in-place float update (boxed

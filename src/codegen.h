@@ -87,6 +87,25 @@ public:
     std::vector<llvm::Value *> aiParams_;                /* the _ai i64 params */
     void emitSubAiVariant(const Node &n, const std::vector<std::string> &pnames);
 
+    /* Stage 41 (flat-row kernel loop dual-emit, 2026-11-05): while emitting
+       the FLAT variant of a qualified counted loop, the pair-read and
+       element-store emitters short-circuit to direct indexed GEPs — no tag
+       dispatch, no promote, no calls. Soundness: a per-iteration prelude
+       AND-proves every row variable's tag == PERL_FLAT_ARRAY, its element
+       count covers the loop bound, and (WAR versioning for the vectorizer)
+       the three packed data pointers are pairwise distinct. The general
+       variant (the ordinary machinery, verbatim) covers all other runtime
+       shapes. Disable with PERLC_OPT_DISABLE=st41. */
+    bool flatKernelMode_ = false;   /* rows are proven PERL_FLAT_ARRAY + in-range */
+    bool refKernelMode_ = false;    /* rows are proven REF_ARRAY + in-range (boxes) */
+    bool fkEmitting_ = false;       /* inside tryEmitFlatKernelFor's own re-emissions */
+    std::unordered_set<std::string> knownFlatRows_;
+    std::unordered_set<std::string> knownRefRows_;
+    bool tryEmitFlatKernelFor(const Node &n);
+    llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
+    void emitFlatPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
+    void emitRefPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
+
     /* Inline the D105 promote's no-op fast path at read time (Stage 38).
        perl_promote_ref_array as a call cost ~15% of regex-heavy and was on
        every hot-loop var/element read (nb: the whole loop ran 24x slower

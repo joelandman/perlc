@@ -78,6 +78,62 @@ further without a different match strategy.
   nearer lexical (D186-style); the file scope itself (same storage) is
   still allowed.
 
+## Stage 41 vectorization evidence (2026-11-05, this session)
+
+Built and landed the "flat-row kernel dual-emit" engine (gated by
+`PERLC_OPT_DISABLE=st41`): for a qualifying counted loop (`my $i = 0; $i <
+BOUND; $i++`, body = pure pair-arithmetic over row variables bound in the
+enclosing iteration), the compiler emits the loop twice behind a
+per-iteration prelude that AND-proves, per row variable:
+
+- `tag(pv) == PERL_FLAT_ARRAY` (element-indexed packed doubles),
+- `pv->matchpos >= 2 * bound` (every loop index `(2i | 2i+1)` is in range),
+- the rows' packed data pointers are pairwise distinct (WAR versioning —
+  read rows / written rows never overlap; LLVM's dependence analysis
+  consumes this branch directly),
+
+then runs a FLAT body (direct indexed GEPs, no tag load, no promote, no
+bounds check, no runtime call, plus the counted-loop vectorize hint) with
+the GENERAL body (today's verbatim machinery) as the fallback.
+
+**What blocked the actual vectorization, measured on mbs640:**
+
+1. **The rows are not packed at runtime.** Instrumented probe: every row
+   value stored into `@z`/`@zzzp` is a REF_ARRAY (1,280 REF-tagged
+   row-stores; the fill's `flat_fill_pair` returns `\@r` — an anon PerlArray
+   wrapper — and every boxed element store inside it materializes real PV
+   boxes). The prelude's tag check is false for every iteration, so the
+   general body (already call-free after Stage 39) runs and FK is a
+   no-op there. Checksum-verified: identical field values with and without
+   st41 and identical to real perl.
+2. **Even the literal-row probe (tag-10 flat rows, 16-element rows, the
+   exact qualification shape) doesn't vectorize at -O3+flto**: the only
+   vector ops in the binary are the zero-initialization fills (157
+   `vmovupd` = memset patterns, none in the loops). No `!llvm.loop`
+   metadata attached because the counted-loop vectorize hint predicate
+   (`cforIsCountedNumeric`) doesn't classify this body shape either.
+
+**What the packed-rows lever would take (the honest design ledger):**
+
+- *Representation*: rows whose backing is a refcounted packed buffer
+  (mirroring `PerlCplxRow`'s alias model: every PV alias shares the
+  buffer; writes through any alias are visible to all; derefs
+  materialize-on-demand). The PV-cell shape can stay `{tag, pval(double*),
+  matchpos}` with the refcount in a malloc header — that keeps every
+  codegen fast path unchanged and makes the D105 promote an O(1)
+  header-ize instead of an unpack.
+- *Fork hazard*: any representation conversion (packed → boxes or
+  boxes → packed) while multiple aliases share the value forks the
+  view. Today this is managed by the D105 promote being the single
+  conversion point (unpack at the first handout, then everything is
+  REF-aliased, which is why the kernel ends up boxed). A packed world
+  needs the same discipline in reverse and a loudly-documented D-row for
+  multi-holder materialization.
+- *Once rows are packed*: the Stage-41 engine above becomes live for
+  these loops; the remaining LV conditions are the uniform branch
+  (`if (abs2 < 4.0)`, if-convertible) and pointer-distinctness (the
+  prelude already proves it).
+
 ## Integration record (2026-11-05)
 
 - Landed in this worktree from parent `4c44eb6`, then main (`301b2d8`,
