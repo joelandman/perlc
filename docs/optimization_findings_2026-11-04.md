@@ -1,5 +1,9 @@
 # perlc — Generated-Code Performance Study (2026-11-04)
 
+> **Round 2 (same day, after items 1/3/4 below landed):**
+> `docs/optimization_findings_2026-11-04_round2.md` — fresh -O matrix,
+> profiles, and two measured fix-experiments (nb 26×, mbs −36…−40%).
+
 Status: benchmark + profile pass over the current `./perlc` (LLVM 22
 codegen, clang-22 link). Includes one correctness fix found by the
 benchmark work (REF-base element stores — D196), with `make test-all`

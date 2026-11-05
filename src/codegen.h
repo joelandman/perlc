@@ -459,6 +459,9 @@ private:
     llvm::AllocaInst *createEntryAlloca(llvm::Type *ty, llvm::Value *arraySize,
                                         const llvm::Twine &name);
     llvm::Value *emitFlooredMod(llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem */
+    void emitDivZeroGuard(const Node &n, llvm::Value *rv); /* unboxed `/`: branch to a catchable zero-divisor die */
+    llvm::Function *getDivZeroDieFn();   /* shared per-module cold die helper for the guard */
+    llvm::Function *divZeroDieFn_ = nullptr;
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons / boolean =~, else nullptr */
     /* Stage 34: llvm.loop.vectorize.width=4 hint on counted unboxed i64/f64
        loops. innerUnroll keeps Stage 28's unroll+interleave on nested loops. */
