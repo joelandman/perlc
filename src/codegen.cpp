@@ -3162,14 +3162,69 @@ Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
     return callRT("perl_mod_i64", {lv, rv});
 }
 
+/* Soundness for the unboxed `/` paths: real Perl dies on a zero division
+   divisor, and the boxed runtime (perl_div, runtime.c:2811) mirrors that,
+   but the unboxed paths emit the division inline and would silently yield
+   inf/nan and keep running. One compare+branch per division site: the die
+   block is cold (a call to the catchable perl_die with the source
+   location, exactly like NK::DieStmt) and the fast path pays a
+   well-predicted fcmp. The check is an ORDERED compare against 0.0 —
+   matches perl_div's `bv == 0.0` C comparison, so it dies for +0.0 and
+   -0.0 and passes NaN (unreachable from perlc arithmetic). Call this with
+   the divisor AFTER it is emitted, BEFORE the quotient is consumed. */
+void CodeGen::emitDivZeroGuard(const Node &n, Value *rv) {
+    auto *f64 = Type::getDoubleTy(ctx_);
+    /* Known-nonzero constant divisors need no check. */
+    if (auto *c = dyn_cast<ConstantFP>(rv))
+        if (!c->isZero()) return;
+    Value *isZero = builder_.CreateFCmpOEQ(rv, ConstantFP::get(f64, 0.0), "divz");
+    Function *fn = builder_.GetInsertBlock()->getParent();
+    auto *dieBB = BasicBlock::Create(ctx_, "div.zero.die", fn);
+    auto *okBB = BasicBlock::Create(ctx_, "div.zero.ok", fn);
+    builder_.CreateCondBr(isZero, dieBB, okBB);
+    builder_.SetInsertPoint(dieBB);
+    Function *dz = getDivZeroDieFn();
+    builder_.CreateCall(dz, {ConstantInt::get(Type::getInt32Ty(ctx_), n.line)});
+    builder_.CreateUnreachable();
+    builder_.SetInsertPoint(okBB);
+}
 
-/* EXPERIMENT (perf round-2, 2026-11-04): single-element paren groups are
-   NK::ArrayLit with one arg (parser keeps `(expr)` unwrapped-by-nothing for
-   D95's `(f()) x N` list-repetition recognition). In VALUE positions a
-   one-element list without a trailing comma is observably just its element
-   (scalar context keeps the last — a single element keeps itself), so the
-   numeric fast paths may look through it. The node itself is untouched. */
-static inline bool isPackedPairRhsIsCalllike(const Node &rhs) {
+/* One shared noreturn helper per module for all unboxed zero-divisor dies:
+   keeps the per-site guard IR to a compare+branch+call and the message/
+   location construction in a single cold function. Calls the catchable
+   perl_die with the real division source line. */
+Function *CodeGen::getDivZeroDieFn() {
+    if (divZeroDieFn_) return divZeroDieFn_;
+    auto *i32 = Type::getInt32Ty(ctx_);
+    FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_), {i32}, false);
+    Function *fn = Function::Create(fty, Function::InternalLinkage,
+                                    "__perlc_div_zero_die", mod_.get());
+    fn->addFnAttr(Attribute::NoReturn);
+    BasicBlock *bb = BasicBlock::Create(ctx_, "entry", fn);
+    IRBuilder<> b(bb);
+    Value *line = &*fn->arg_begin();
+    const std::string msg = "Illegal division by zero";
+    auto *gv = b.CreateGlobalString(msg, ".str");
+    Value *m = b.CreateCall(getRTFunc("perl_alloc_string_len"),
+                            {gv, ConstantInt::get(Type::getInt64Ty(ctx_),
+                                                  (long long)msg.size())});
+    Value *fileStr = b.CreateGlobalString(sourceFile_, "die.file");
+    b.CreateCall(getRTFunc("perl_die"), {m, fileStr, line});
+    b.CreateUnreachable();
+    divZeroDieFn_ = fn;
+    return fn;
+}
+
+/* Perf (2026-11-04): single-element paren groups are NK::ArrayLit with one
+   arg (the parser keeps `(expr)` unwrapped so that D95's `(f()) x N`
+   list-repetition is recognized). In VALUE positions a one-element list
+   without a trailing comma is observably just its element (scalar context
+   keeps the last — a single element keeps itself), so the numeric fast
+   paths may look through it. The node itself is untouched — D95's
+   `(f()) x N` recognition and list contexts keep their semantics.
+   Measured (bench round 2): nb.pl 17.52 → 0.67 s at -O2, 16.26 → 0.55 s
+   at -O2-flto; all other benchmarks neutral. */
+static inline bool rhsIsCalllike(const Node &rhs) {
     return rhs.kind == NK::Call || rhs.kind == NK::MethodCall || rhs.kind == NK::CallCodeRef;
 }
 
@@ -3967,32 +4022,6 @@ void CodeGen::emitPromoteInline(Value *pv) {
     builder_.SetInsertPoint(doneBB);
 }
 
-/* E1 caveat (perf round 2, 2026-11-05): every unboxed division site emits
-   this inline zero-divisor guard, keeping real perl's semantics:
-   division by a numerically-zero divisor (0.0 or -0.0; NaN divisors do not
-   count, x/NaN is NaN) raises the CATCHABLE die "Illegal division by zero
-   at FILE line N." exactly like the boxed perl path's die machinery. The
-   fast path is two compares + a well-predicted branch; the die branch is
-   unreachable in kernel loops. */
-void CodeGen::emitDivZeroGuard(Value *divisor, const Node &n) {
-    if (!divisor) return;
-    auto *curFn = builder_.GetInsertBlock()->getParent();
-    Value *isZero = builder_.CreateFCmpOEQ(divisor,
-        ConstantFP::get(Type::getDoubleTy(ctx_), 0.0), "divzero");
-    auto *dieBB = BasicBlock::Create(ctx_, "div.die", curFn);
-    auto *okBB  = BasicBlock::Create(ctx_, "div.ok", curFn);
-    builder_.CreateCondBr(isZero, dieBB, okBB);
-    builder_.SetInsertPoint(dieBB);
-    Value *msg = perlStr("Illegal division by zero");
-    Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_, "div.zfile");
-    Value *lineVal = ConstantInt::get(Type::getInt32Ty(ctx_),
-        n.line > 0 ? n.line : 1);
-    callRT("perl_die", {msg, fileStr, lineVal});
-    /* perl_die is declared noreturn; nothing flows past the die branch. */
-    builder_.CreateUnreachable();
-    builder_.SetInsertPoint(okBB);
-}
-
 /* Stage 39 (E4, perf round 2): inline float element store on row-typed PVs.
    Mirrors emitScalarRootedAutovivAssign's boxed path exactly —
    perl_promote_ref_array(base) + boxed RHS + perl_array_set_row + free —
@@ -4100,14 +4129,16 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
             n.left->left && n.left->left->kind != NK::ArrowDeref && n.right &&
             (canEmitF64(*n.right) || canEmitI64(*n.right)))
             return true;
-        /* EXPERIMENT (perf round-2): 2D element store `$outer->[i][k] = / op= rhs`
-            — the nb velocity-update shape. The s18 flat-path emit lowers this to
+        /* Perf (2026-11-04): 2D element store `$outer->[i][k] = rhs` —
+            the nb velocity-update shape. The s18 flat-path emit lowers this to
             GEP+fop+store when the row is flat, so the numeric domain holds iff
-            the RHS is unboxed-int/float (the same criterion as the 1D store above). */
+            the RHS is unboxed-int/float (the same criterion as the 1D store above).
+            Call-shaped RHS is kept out: a returned PV may be a packed pair/list,
+            which the unboxed numeric domain can't represent. */
         if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
             n.left->left && n.left->left->kind == NK::ArrowDeref &&
             n.left->left->sval == "array" && n.right &&
-            !isPackedPairRhsIsCalllike(*n.right) &&
+            !rhsIsCalllike(*n.right) &&
             (canEmitF64(*n.right) || canEmitI64(*n.right)))
             return true;
         if (getenv("PERLC_DEBUG_ST37") && n.left && n.left->kind == NK::ArrowDeref && n.right)
@@ -4132,7 +4163,7 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
             (n.sval == "+" || n.sval == "-" || n.sval == "*" || n.sval == "/") &&
             (canEmitF64(*n.right) || canEmitI64(*n.right)))
             return true;
-        /* EXPERIMENT (perf round-2): 2D element compound-assign
+        /* Perf (2026-11-04): 2D element compound-assign
            `$outer->[i][k] op= rhs` (the nb velocity-update shape) —
            same rationale as the 1D case; the s18 flat-path emit is inline. */
         if (n.left && n.left->kind == NK::ArrowDeref && n.left->sval == "array" &&
@@ -4224,15 +4255,13 @@ bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
             Value *lv = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
             Value *rv = emitPromotedF64(*n.right);
             if (!rv) return false;
+            if (n.sval == "/") emitDivZeroGuard(n, rv);
             Value *res = nullptr;
             if (n.sval == "+") res = builder_.CreateFAdd(lv, rv);
             else if (n.sval == "-") res = builder_.CreateFSub(lv, rv);
             else if (n.sval == "*") res = builder_.CreateFMul(lv, rv);
             else res = builder_.CreateFDiv(lv, rv);
             if (!res) return false;
-            /* perl's div-by-zero die follows the unboxed fdiv (see
-               emitDivZeroGuard); the store below only runs when live. */
-            if (n.sval == "/") emitDivZeroGuard(rv, n);
             builder_.CreateStore(res, fa);
             return true;
         }
@@ -4441,15 +4470,15 @@ Value *CodeGen::emitIdx(const Node &nRaw) {
             return builder_.CreateFPToSI(d, i64, nm + ".i");
         }
     }
-    /* EXPERIMENT (perf round-2): raw-i64 index arithmetic. canEmitI64's
-       arithmetic BinOp was deliberately reverted for VALUE positions (D103
-       overflow exactness), but an INDEX is OOB-safe when it wraps (an
-       out-of-bounds element read is undef, matching Perl's own semantics —
-       see this function's comment above), so pure i64 +-/* index math may
-       emit raw here with NO overflow machinery. Unblocks the packed/flat
-       row idiom `$row->[$i*2+1]` (mbs/nb kernels) which otherwise pays a
-       full boxed alloc_int+mul/add+to_int+free pipeline per access.
-       Disabled via PERLC_OPT_DISABLE=rawidx. */
+    /* Perf (2026-11-04): raw-i64 index arithmetic. canEmitI64's arithmetic
+       BinOp was deliberately reverted for VALUE positions (D103 overflow
+       exactness), but an INDEX is OOB-safe when it wraps (an out-of-bounds
+       element read is undef, matching Perl's own semantics — see this
+       function's comment above), so pure i64 +-/* index math may emit raw
+       here with NO overflow machinery. Unblocks the packed/flat row idiom
+       `$row->[$i*2+1]` (mbs/nb kernels) which otherwise pays a full boxed
+       alloc_int+mul/add+to_int+free pipeline per access (bench round 2:
+       mbs640 15.53 → 9.39 s at -O2). Disabled via PERLC_OPT_DISABLE=rawidx. */
     if (isOptStageEnabled("rawidx")) {
         std::function<Value *(const Node &)> raw64 = [&](const Node &e) -> Value * {
             if (e.kind == NK::IntLit)
@@ -4478,15 +4507,15 @@ Value *CodeGen::emitIdx(const Node &nRaw) {
         };
         if (Value *v = raw64(n)) return v;
     }
-    /* Perf (2026-11-04) / Stage 37: pure-i64 arithmetic index (e.g. `$i * 2`)
-       emits plain i64 math with NO overflow-carry machinery and NO boxing.
-       Element accessors take i64 indexes anyway, so the old path — emitExpr
-       (which boxes every intermediate sub-expression through the overflow→
-       BigInt pipeline, several alloc_int/perl_free round trips per access)
-       followed by perl_to_int — was pure waste: an i64-wrapped index is
-       simply an out-of-bounds element (undef), which for an index position
-       is unobservable vs Perl's own OOB element semantics. emitExprI64's own
-       operand checks still return nullptr for anything not exact-i64. */
+    /* The rawidx walker above covers + - * <<; this emitExprI64 attempt is
+       the second layer (exact-i64 leaf shapes only — its operand checks
+       return nullptr for arithmetic BinOps at value positions, D103), and
+       anything left falls back to the boxed pipeline: emitExpr (which boxes
+       every intermediate sub-expression through the overflow→BigInt
+       pipeline, several alloc_int/perl_free round trips per access)
+       followed by perl_to_int — an i64-wrapped index is simply an
+       out-of-bounds element (undef), which for an index position is
+       unobservable vs Perl's own OOB element semantics. */
     if (Value *iv = emitExprI64(n)) return iv;
     Value *pv = emitExpr(n);
     Value *i  = callRT("perl_to_int", {pv});
@@ -5941,15 +5970,10 @@ Value *CodeGen::emitExprF64(const Node &nRaw) {
         if (n.sval == "+") return builder_.CreateFAdd(lv, rv, "fadd");
         if (n.sval == "-") return builder_.CreateFSub(lv, rv, "fsub");
         if (n.sval == "*") return builder_.CreateFMul(lv, rv, "fmul");
-        /* E1 caveat: keep perl's div-by-zero die on the unboxed path
-           (see emitDivZeroGuard); the raw fdiv itself is harmless and
-           only observable on the live (nonzero) path. */
-        if (n.sval == "/") {
-            Value *fdivV = builder_.CreateFDiv(lv, rv, "fdiv");
-            emitDivZeroGuard(rv, n);
-            return fdivV;
-        }
-        return nullptr;
+        /* "/" — keep real Perl's zero-divisor die (the boxed perl_div does
+           exactly this); a bare fdiv would yield inf and keep running. */
+        emitDivZeroGuard(n, rv);
+        return builder_.CreateFDiv(lv, rv, "fdiv");
     }
     case NK::UnaryOp:
         if (n.sval == "-") {
@@ -11542,14 +11566,13 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
                     if (n.sval == "-") return builder_.CreateFSub(lv, rv);
                     if (n.sval == "*") return builder_.CreateFMul(lv, rv);
-                    if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
+                    if (n.sval == "/") { emitDivZeroGuard(n, rv); return builder_.CreateFDiv(lv, rv); }
                     return nullptr;
                 };
                 Value *lv = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
                 Value *rv = emitPromotedF64(*n.right);
                 if (rv) {
                     Value *res = applyF64(lv, rv);
-                    if (res && n.sval == "/") emitDivZeroGuard(rv, n);
                     if (res) {
                         builder_.CreateStore(res, fa);
                         return boxF64(res);
@@ -11631,7 +11654,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                                     if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
                                     if (n.sval == "-") return builder_.CreateFSub(lv, rv);
                                     if (n.sval == "*") return builder_.CreateFMul(lv, rv);
-                                    if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
+                                    if (n.sval == "/") { emitDivZeroGuard(n, rv); return builder_.CreateFDiv(lv, rv); }
                                     return nullptr;
                                 };
                                 auto *f64Ty18 = Type::getDoubleTy(ctx_);
@@ -11648,9 +11671,6 @@ Value *CodeGen::emitExpr(const Node &n) {
                                    emitExprF64 may itself emit sub-branches (e.g. for reads of other
                                    flat rows); isFlat18/flatPtr/idx18 remain available via SSA. */
                                 Value *rhsF = emitExprF64(*n.right);
-                                /* perl's div-by-zero die guard (E1 caveat),
-                                   evaluated on the single-emitted RHS */
-                                if (rhsF && n.sval == "/") emitDivZeroGuard(rhsF, n);
                                 if (rhsF) {
                                     auto *curFn18 = builder_.GetInsertBlock()->getParent();
                                     auto *fBB18   = BasicBlock::Create(ctx_, "s18.f", curFn18);
@@ -11778,7 +11798,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                         if (n.sval == "+") return builder_.CreateFAdd(lv, rv);
                         if (n.sval == "-") return builder_.CreateFSub(lv, rv);
                         if (n.sval == "*") return builder_.CreateFMul(lv, rv);
-                        if (n.sval == "/") return builder_.CreateFDiv(lv, rv);
+                        if (n.sval == "/") { emitDivZeroGuard(n, rv); return builder_.CreateFDiv(lv, rv); }
                         return nullptr;
                     };
                     auto *i8Ty  = Type::getInt8Ty(ctx_);
@@ -11793,8 +11813,6 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *lhsF  = builder_.CreateLoad(f64Ty, fvPtr, "lhsf");
                     setTBAA(lhsF, tbaaPvFvalTag_);
                     Value *rhsF  = emitExprF64(*n.right);
-                    /* perl's div-by-zero die guard (E1 caveat) */
-                    if (rhsF && n.sval == "/") emitDivZeroGuard(rhsF, n);
                     if (rhsF) {
                         Value *newF = applyF64op(lhsF, rhsF);
                         if (newF) {
