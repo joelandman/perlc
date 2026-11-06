@@ -525,9 +525,9 @@ void CodeGen::declareRuntime() {
     RT("perl_add",           pv,  pv, pv);
     RT("perl_sub",           pv,  pv, pv);
     RT("perl_mul",           pv,  pv, pv);
-    RT("perl_div",           pv,  pv, pv);
-    RT("perl_mod",           pv,  pv, pv);
-    RT("perl_mod_i64",       i64, i64, i64);
+    RT("perl_div",           pv,  pv, pv, i8p, i32);
+    RT("perl_mod",           pv,  pv, pv, i8p, i32);
+    RT("perl_mod_i64",       i64, i64, i64, i8p, i32);
     RT("perl_pow",           pv,  pv, pv);
     RT("perl_negate",        pv,  pv);
     RT("perl_bitand",        pv,  pv, pv);
@@ -568,7 +568,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get",     pv,  av, i64);
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
-    RT("perl_flat_row_op_assign", pv,     pv, i64, pv, Type::getInt32Ty(ctx_));
+    RT("perl_flat_row_op_assign", pv,     pv, i64, pv, Type::getInt32Ty(ctx_), i8p, i32);
     RT("perl_array_set_row",      pv,     pv, i64, pv);
     RT("perl_array_ensure_slot",  voidTy, av, i64);
     RT("perl_cplx_elem",          pv,     pv, i64);
@@ -793,6 +793,11 @@ void CodeGen::declareRuntime() {
     RT("perl_backtick",   pv, pv);
     RT("perl_init_argv",   av, Type::getInt32Ty(ctx_), i8p);
     RT("perl_get_dollar0", pv);
+    RT("perl_set_dollar0", voidTy, i8p);
+    /* Stage 45 (autopar): persistent-pool fan-out for FK counted loops */
+    RT("perl_autopar_run", voidTy, pv, pv, i64);
+    RT("perl_fk_cert_dbg", voidTy, i64, i64, i64, i64, i8p);
+    RT("perl_pv_dbg", voidTy, pv, i8p);
     RT("perl_make_code_ref",  pv, i8p);
     RT("perl_call_code_ref",  pv, pv, av);
     RT("perl_get_current_code_ref", pv);
@@ -3226,7 +3231,7 @@ AllocaInst *CodeGen::createEntryAlloca(Type *ty, Value *arraySize,
     return eb.CreateAlloca(ty, arraySize, name);
 }
 
-Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
+Value *CodeGen::emitFlooredMod(const Node &n, Value *lv, Value *rv) {
     /* Perl's %, unlike C's, uses floored-division semantics: the result
        always has the same sign as the right operand (or is zero) — e.g.
        -7 % 3 == 2, 7 % -3 == -2. LLVM's SRem (like C's %) truncates toward
@@ -3235,8 +3240,10 @@ Value *CodeGen::emitFlooredMod(Value *lv, Value *rv) {
        perl_mod's boxed-value equivalent in runtime.c.
 
        D84: Zero-divisor check is handled by a runtime helper that calls
-       perl_die (eval-catchable) instead of exit(1). */
-    return callRT("perl_mod_i64", {lv, rv});
+       perl_die (eval-catchable) instead of exit(1). D199 tail: the source
+       location rides along so the die text matches real Perl exactly. */
+    return callRT("perl_mod_i64", {lv, rv, srcFileGV(),
+        ConstantInt::get(Type::getInt32Ty(ctx_), n.line)});
 }
 
 /* Soundness for the unboxed `/` paths: real Perl dies on a zero division
@@ -3290,6 +3297,15 @@ Function *CodeGen::getDivZeroDieFn() {
     b.CreateUnreachable();
     divZeroDieFn_ = fn;
     return fn;
+}
+
+/* D199 tail: one cached module global holding the source-file path, passed
+   by the boxed / and % call sites so their zero-divisor dies report the
+   real Perl source location (the line still rides per call site). */
+Value *CodeGen::srcFileGV() {
+    if (sourceFileGv_) return sourceFileGv_;
+    sourceFileGv_ = builder_.CreateGlobalString(sourceFile_, "srcfile");
+    return sourceFileGv_;
 }
 
 /* Perf (2026-11-04): single-element paren groups are NK::ArrayLit with one
@@ -3490,7 +3506,7 @@ Value *CodeGen::emitExprI64(const Node &nRaw) {
         if (n.sval == "+") return builder_.CreateAdd(lv, rv, "iadd");
         if (n.sval == "-") return builder_.CreateSub(lv, rv, "isub");
         if (n.sval == "*") return builder_.CreateMul(lv, rv, "imul");
-        return emitFlooredMod(lv, rv);
+        return emitFlooredMod(n, lv, rv);
     }
     case NK::UnaryOp:
         if (n.sval == "-" && n.left && canEmitI64(*n.left)) {
@@ -3833,32 +3849,41 @@ bool CodeGen::tryBindCplxPair(const std::string &nm, const Node &rhs) {
        proven by the loop prelude and invariant across the loop (the
        guarded emitters never touch the tag payload). Take the direct paths
        — no promote (the prelude guarantees the shape!), no tag dispatch,
-       no per-access bounds checks, no calls. */
+       no per-access bounds checks, no calls. Stage 45: the certified FLAT
+       path resolves through fkKernelData_ alone — inside the auto-parallel
+       worker the row variable has no PerlValue slot at all (workers get
+       raw data pointers), so the fkKernelData_-found case must not fall
+       back to the boxed path there. The REF-row case still needs the row's
+       PerlValue* (a ref row can lazy-convert — no worker eligibility). */
     if ((flatKernelMode_ || refKernelMode_) && rhs.left->kind == NK::ScalarVar &&
         isOptStageEnabled("st41")) {
         std::string rbn = (!rhs.left->name.empty() && rhs.left->name[0] == '$')
                               ? rhs.left->name.substr(1) : rhs.left->name;
-        if (knownFlatRows_.count(rbn) || knownRefRows_.count(rbn)) {
-            if (Value *base = scalarVarRawPv(rhs.left->name)) {
-                Value *idx = emitIdx(*rhs.right);
-                Value *re = nullptr, *im = nullptr;
-                if (knownFlatRows_.count(rbn)) {
-                    /* Stage 42: the certified packed buffer (FLAT pval or
-                       CPLX pval->data) was resolved at the fk.pre branch. */
-                    auto dit = fkKernelData_.find(rbn);
-                    if (dit != fkKernelData_.end())
-                        emitFlatPairLoad(dit->second, idx, re, im);
-                    else
-                        return false;
-                }
-                else
-                    emitRefPairLoad(base, idx, re, im);
-                CplxPairSlots *sl = ensurePairSlots(nm);
-                if (!sl) return false;
-                builder_.CreateStore(re, sl->re);
-                builder_.CreateStore(im, sl->im);
-                return true;
-            }
+        if (knownFlatRows_.count(rbn)) {
+            /* Stage 42: the certified packed buffer (FLAT pval or
+               CPLX pval->data) was resolved at the fk.pre branch. */
+            auto dit = fkKernelData_.find(rbn);
+            if (dit == fkKernelData_.end()) return false;
+            Value *idx = emitIdx(*rhs.right);
+            Value *re = nullptr, *im = nullptr;
+            emitFlatPairLoad(dit->second, idx, re, im);
+            CplxPairSlots *sl = ensurePairSlots(nm);
+            if (!sl) return false;
+            builder_.CreateStore(re, sl->re);
+            builder_.CreateStore(im, sl->im);
+            return true;
+        }
+        if (knownRefRows_.count(rbn)) {
+            Value *base = scalarVarRawPv(rhs.left->name);
+            if (!base) return false;
+            Value *idx = emitIdx(*rhs.right);
+            Value *re = nullptr, *im = nullptr;
+            emitRefPairLoad(base, idx, re, im);
+            CplxPairSlots *sl = ensurePairSlots(nm);
+            if (!sl) return false;
+            builder_.CreateStore(re, sl->re);
+            builder_.CreateStore(im, sl->im);
+            return true;
         }
     }
     Value *base = emitExpr(*rhs.left);
@@ -4063,6 +4088,20 @@ bool CodeGen::tryEmitPackedPairAssign(const Node &n) {
         return false;
     if (n.left->left->kind == NK::ArrowDeref)
         return false; /* 2D `$x->[$i][$k] =` stays on the existing set_row path */
+    /* 2026-11-06: a store index in the flat-kernel pair form (`2i` / `2i+1`
+       over some loop var) means FLAT-SCALAR indexing on the interleaved
+       2N-element row, NOT pair-number indexing — `tryStoreCplxPair` writes
+       data[2*idx], data[2*idx+1], which for idx=2i lands at data[4i] and
+       corrupts/overruns the row (masked byte-identically whenever an FK
+       loop certified and if-converted these stores; corrupts any kernel
+       that runs the general path, e.g. one whose rows D105-promoted out of
+       certification). Refuse the pair-store for those index forms — the
+       ordinary scalar element-store path (perl_array_set_row →
+       data[idx] = numified) is the correct meaning. Plain/uncorrelated
+       indexes keep the "row is a list of pairs" D89 model. */
+    if (n.left->right->kind == NK::BinOp &&
+        (n.left->right->sval == "*" || n.left->right->sval == "+"))
+        return false;
     Value *re = nullptr, *im = nullptr;
     if (!emitPackedPairComponents(*n.right, re, im)) return false;
     Value *base = emitExpr(*n.left->left);
@@ -4378,7 +4417,7 @@ bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
             if (n.sval == "+") res = builder_.CreateAdd(lv, rv);
             else if (n.sval == "-") res = builder_.CreateSub(lv, rv);
             else if (n.sval == "*") res = builder_.CreateMul(lv, rv);
-            else res = emitFlooredMod(lv, rv);
+            else res = emitFlooredMod(n, lv, rv);
             if (!res) return false;
             builder_.CreateStore(res, ia);
             return true;
@@ -7015,9 +7054,25 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             }
 
             Value *dollar0 = callRT("perl_get_dollar0", {});
-            auto *slot0 = createEntryAlloca(perlPtrTy_, nullptr, "$0");
-            builder_.CreateStore(dollar0, slot0);
-            declareVar("0", slot0);
+            /* $0 must read as the SCRIPT path (byte-identical to real perl,
+               whose $0 is the script name) — argv[0] of the compiled binary
+               is the binary path and would diverge every script that prints
+               $0. Seed $0 with the source path after init_argv's fallback. */
+            callRT("perl_set_dollar0",
+                   {builder_.CreateGlobalString(sourceFile_, "$0.path")});
+            /* $0 must live in a module-level global, NOT an alloca: this
+               code runs in init(), whose stack frame dies when it returns,
+               so an alloca-based slot is a dangling pointer by the first
+               read from main() (observed as $0 printing "" — pre-existing;
+               @ARGV in the same function already uses a GlobalVariable
+               correctly). $0 reads now dispatch straight to
+               perl_get_dollar0, so this global is only the lookupVar("0")
+               fallback for local()-style paths. */
+            auto *gvDollar0 = new GlobalVariable(*mod_, perlPtrTy_, false,
+                GlobalValue::InternalLinkage,
+                Constant::getNullValue(perlPtrTy_), "g.pv.dollar0");
+            builder_.CreateStore(dollar0, gvDollar0);
+            declareVar("0", gvDollar0);
 
             if (hasDataSection_) {
                 Value *ds = builder_.CreateGlobalStringPtr(dataSection_, ".data");
@@ -7325,7 +7380,16 @@ void CodeGen::flattenArgInto(Value *argsArr, const Node &arg) {
 void CodeGen::fillCallArgs(Value *argsArr, const Node &n) {
     /* ival==2 is &name() — bypass prototype. Empty sval = no prototype. */
     if (n.ival == 2 || n.sval.empty()) {
-        for (auto &arg : n.args) flattenArgInto(argsArr, *arg);
+        for (auto &arg : n.args) {
+            flattenArgInto(argsArr, *arg);
+            if (getenv("PERLC_DEBUG_FKRT") && arg->kind == NK::ScalarVar) {
+                Value *pv = scalarVarRawPv(arg->name);
+                if (pv)
+                    callRT("perl_pv_dbg", {pv,
+                        builder_.CreateGlobalString(
+                            "srcarg:" + n.name + ":" + arg->name, "fkpv.arg")});
+            }
+        }
         return;
     }
     const std::string &proto = n.sval;
@@ -7717,6 +7781,13 @@ static bool fkNoRowTouch(const Node &n) {
     case NK::IntLit:
     case NK::ScalarVar:
         return true;
+    case NK::ArrayLit:
+        /* Single-element paren groups: the parser keeps `(expr)` wrapped in
+           a 1-element ArrayLit (E1), and every unboxed f64 emission path
+           looks through it in value positions. The FK walk must too, or any
+           paren-grouped sub-expression (`(...)*0.5` chains in heavy
+           kernels) silently kicks the whole loop off the flat path. */
+        return n.args.size() == 1 && n.args[0] && fkNoRowTouch(*n.args[0]);
     case NK::BinOp:
         if (n.sval != "+" && n.sval != "-" && n.sval != "*" && n.sval != "/")
             return false;
@@ -7945,6 +8016,7 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
        matchpos >= 2*bound. Thread-shared rows never take the flat body. */
     Value *bound64 = emitExprI64(*n.cond->right);
     if (!bound64) return false;
+    bool dbgCert = getenv("PERLC_DEBUG_FKRT") != nullptr;
     Value *twoBound = builder_.CreateMul(bound64,
         ConstantInt::get(i64, 2), "fk.twobound");
     Value *allOk = ConstantInt::get(i1, 1);
@@ -7959,6 +8031,24 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
         Value *isFlat = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 10), "fk.flatq");
         auto *isCplx = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 19), "fk.cplxpq");
         rowFlatQ[rnm.first] = isFlat;
+        if (dbgCert) {
+            /* cert inputs dump (see perl_fk_cert_dbg): row PV address comes
+               along as the row name's index — kept simple: name string only */
+            callRT("perl_fk_cert_dbg",
+                   {builder_.CreateZExt(tag, Type::getInt64Ty(ctx_)),
+                    builder_.CreateZExt(
+                        builder_.CreateLoad(i32,
+                            builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
+                                ConstantInt::get(i64, 4))),
+                        Type::getInt64Ty(ctx_)),
+                    builder_.CreateLoad(i64,
+                        builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
+                            ConstantInt::get(i64, 16))),
+                    bound64,
+                    builder_.CreateGlobalString(rnm.first, "fkcert.row")});
+            callRT("perl_pv_dbg", {pv,
+                builder_.CreateGlobalString("cert:" + rnm.first, "fkpv.row")});
+        }
         /* PV_FLAG_SHARED rows (threads::shared) keep the general body. */
         Value *flagP = builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
             ConstantInt::get(i64, 4), "fk.flgp");
@@ -8023,6 +8113,59 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
 
     /* ── the FLAT variant ── */
     builder_.SetInsertPoint(flatLoopBB);
+
+    /* Stage 45 (autopar): the parallel dispatch. Certified shape (see
+       fkParBodyPurity) + bound over the parallel threshold → the shared
+       persistent pool fans [0, bound) out over contiguous chunks of a
+       worker that re-emits this same body under the flat hooks; below the
+       threshold the sequential flat body right below runs exactly as
+       Stage 42 built it, so small-N kernels keep today's inline shape. */
+    bool canPar = false;
+    std::vector<std::string> parRowNames;
+    if (isOptStageEnabled("autopar") && !rows.empty()) {
+        std::unordered_set<std::string> localNames;
+        for (const auto &rnm : rows) parRowNames.push_back(rnm.first);
+        std::unordered_set<std::string> rowSet(parRowNames.begin(),
+                                               parRowNames.end());
+        canPar = fkParBodyPurity(*n.body, rowSet, idxBare, localNames);
+        if (getenv("PERLC_DEBUG_AUTOPAR")) {
+            std::string rlist;
+            for (const auto &rnm : rows)
+                rlist += rnm.first + ":" + std::to_string((int)rnm.second) + " ";
+            fprintf(stderr, "ST45: loop line %d par=%s rows=%zu [%s]\n",
+                    n.line, canPar ? "YES" : "no", parRowNames.size(),
+                    rlist.c_str());
+        }
+    }
+    BasicBlock *seqFlatBB = flatLoopBB;
+    if (canPar) {
+        auto *parBB = BasicBlock::Create(ctx_, "fk.par", fn);
+        seqFlatBB = BasicBlock::Create(ctx_, "fk.flatin.seq", fn);
+        auto *enough = builder_.CreateICmpSGE(bound64,
+            ConstantInt::get(i64, 8192), "fkpar.enough");
+        builder_.CreateCondBr(enough, parBB, seqFlatBB);
+        builder_.SetInsertPoint(parBB);
+        auto *rowsArr = builder_.CreateAlloca(perlPtrTy_,
+            ConstantInt::get(i64, parRowNames.size()), "fkpar.rows");
+        for (size_t k = 0; k < parRowNames.size(); k++) {
+            auto dit = fkKernelData_.find(parRowNames[k]);
+            if (dit == fkKernelData_.end()) { canPar = false; break; }
+            builder_.CreateStore(dit->second,
+                builder_.CreateGEP(perlPtrTy_, rowsArr,
+                    ConstantInt::get(i64, k), "fkpar.cell"));
+        }
+        if (canPar) {
+            Function *wfn = emitFkParWorker(n, parRowNames, idxBare);
+            callRT("perl_autopar_run", {wfn, rowsArr, bound64});
+            builder_.CreateBr(afterBB);
+        } else {
+            /* row binding vanished (shouldn't happen after the prelude):
+               fold this block away by branching to the sequential body */
+            builder_.CreateBr(seqFlatBB);
+        }
+        builder_.SetInsertPoint(seqFlatBB);
+    }
+
     {
         for (const auto &rnm : rows) knownFlatRows_.insert(rnm.first);
         flatKernelMode_ = true;
@@ -8190,11 +8333,16 @@ llvm::Value *CodeGen::tryFkRowElemStore(const Node &n, bool needValue) {
         /* void-context statement stores (the FK kernel shape) need no result
            PV at all — the alloc_float the value-context path hands back is
            a call inside the loop and blocks LV on itself. The void caller
-           only checks the pointer for non-nullness, so a true LLVM null
-           constant (not a runtime undef allocation, and distinct from the
-           nullptr refusal sentinel) is the zero-cost discard. */
-        return needValue ? callRT("perl_alloc_float", {fv})
-                         : llvm::ConstantPointerNull::get(perlPtrTy_);
+           only checks the pointer for non-nullness, so the success value
+           must be a NON-NULL constant: a module-global dummy (a NULL here
+           would read as "refused" and drop the raw store to the boxed
+           path — heap ops inside a pool worker). */
+        if (!fkVoidSentinel_) {
+            fkVoidSentinel_ = new llvm::GlobalVariable(
+                *mod_, perlPtrTy_, false, llvm::GlobalValue::InternalLinkage,
+                llvm::Constant::getNullValue(perlPtrTy_), "fkpar.void.discard");
+        }
+        return needValue ? callRT("perl_alloc_float", {fv}) : fkVoidSentinel_;
     }
     return nullptr;
 }
@@ -8273,9 +8421,240 @@ bool CodeGen::tryEmitFkIfConvert(const Node &n) {
     return true;
 }
 
+/* ── Stage 45 (autopar): certified parallel counted loops ─────────────────
+   The FK walk already proves the memory shape the pool needs: every row
+   access in the body is fkIndexForm (2i or 2i+1), so iteration i touches
+   exactly the slot pair {2i, 2i+1} of its rows — chunks of consecutive
+   iterations write disjoint buffers, and body `my` locals are fresh per
+   iteration, so fanning the range out to worker threads is
+   observability-identical by construction. On top of the FK guarantees
+   the parallel body additionally requires:
+     - no division anywhere (the unboxed zero-divisor die longjmps to the
+       nearest eval; a pool worker has none, so `/` keeps loops on the
+       sequential flat body, which retains its D199 guard),
+     - closed-body reads: every scalar the body reads is a `my` bound
+       INSIDE the body, or the loop index inside an fkIndexForm tree —
+       outer lexical reads would need the parent's frame (branch-local
+       declarations are validated per branch, since only one arm runs).
+   The sequential flat body remains fully emitted and reachable: the
+   runtime dispatch takes it whenever the bound is below the parallel
+   threshold (PERLC_AUTOPAR_MIN, default 8192) so small-N kernels keep
+   today's inline shape, hint, and vectorization. */
+bool CodeGen::fkParBodyPurity(const Node &s,
+                              const std::unordered_set<std::string> &rowSet,
+                              const std::string &idxBare,
+                              std::unordered_set<std::string> &locals) {
+    auto f64Pure = [&](const Node &e) -> bool {
+        if (!fkNoRowTouch(e)) return false;
+        if (fkHasDivClass(e)) return false;
+        std::function<bool(const Node &)> leaves = [&](const Node &t) -> bool {
+            if (t.kind == NK::ScalarVar)
+                return locals.count(bareVarName(t.name)) != 0;
+            if (t.left && !leaves(*t.left)) return false;
+            if (t.right && !leaves(*t.right)) return false;
+            return true;
+        };
+        return leaves(e);
+    };
+    std::function<bool(const Node &, std::unordered_set<std::string> &)>
+        walk = [&](const Node &st, std::unordered_set<std::string> &loc) -> bool {
+        if (st.kind == NK::FlatBlock || st.kind == NK::Block) {
+            for (auto &sub : st.args)
+                if (!walk(*sub, loc)) return false;
+            return true;
+        }
+        const Node *e = &st;
+        if (e->kind == NK::ExprStmt && e->left) e = e->left.get();
+        if (e->kind == NK::If) {
+            for (auto &br : e->branches) {
+                if (br.cond) {
+                    if (br.cond->kind != NK::BinOp) return false;
+                    const std::string &op = br.cond->sval;
+                    if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
+                        op != "==" && op != "!=")
+                        return false;
+                    if (!br.cond->left || !br.cond->right ||
+                        !f64Pure(*br.cond->left) || !f64Pure(*br.cond->right))
+                        return false;
+                }
+                if (br.body) {
+                    /* only one arm executes per iteration — validate each
+                       arm's declarations against the pre-if local set */
+                    auto armLoc = loc;
+                    if (!walk(*br.body, armLoc)) return false;
+                }
+            }
+            return true;
+        }
+        /* the pair-read bind: my $v = $row->[2i (+1)] */
+        if (e->kind == NK::My && e->right &&
+            e->right->kind == NK::ArrowDeref &&
+            e->right->sval == "array" && e->right->left &&
+            e->right->left->kind == NK::ScalarVar && e->right->right &&
+            fkIndexForm(*e->right->right, idxBare)) {
+            std::string bn = bareVarName(e->name);
+            if (bn.empty() || bn == idxBare) return false;
+            if (rowSet.count(bn)) return false;   /* bind var is itself a row: no */
+            if (!rowSet.count(bareVarName(e->right->left->name))) return false;
+            if (bn == bareVarName(e->right->left->name)) return false;
+            loc.insert(bn);
+            return true;
+        }
+        /* the float-arith bind: my $v = <pure f64 arithmetic over locals> */
+        if (e->kind == NK::My && e->right && f64Pure(*e->right)) {
+            std::string bn = bareVarName(e->name);
+            if (bn.empty() || bn == idxBare) return false;
+            loc.insert(bn);
+            return true;
+        }
+        /* the element-STORE: $row->[2i (+1)] = <pure f64> */
+        if (e->kind == NK::Assign && e->left &&
+            e->left->kind == NK::ArrowDeref && e->left->sval == "array" &&
+            e->left->left && e->left->left->kind == NK::ScalarVar &&
+            e->left->right && fkIndexForm(*e->left->right, idxBare) &&
+            f64Pure(*e->right)) {
+            std::string wn = bareVarName(e->left->left->name);
+            if (wn.empty() || wn == idxBare) return false;
+            if (!rowSet.count(wn)) return false;
+            return true;
+        }
+        return false;
+    };
+    return walk(s, locals);
+}
+
+/* Stage 45: the per-site worker — void (ptr rows, i64 lo, i64 hi). rows[k]
+   are the prelude-resolved flat data pointers; the body re-emits under the
+   flat hooks exactly like the sequential variant (raw fkKernelData_
+   binding, fkIndexForm index math, tryFkRowElemStore/tryEmitFkIfConvert),
+   looping i over [lo, hi). Pure f64 — no runtime calls, no PV touches. */
+llvm::Function *CodeGen::emitFkParWorker(const Node &n,
+        const std::vector<std::string> &rowNames, const std::string &idxBare) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
+        {perlPtrTy_, i64, i64}, false);
+    static unsigned parSeq = 0;
+    Function *wfn = Function::Create(fty, Function::InternalLinkage,
+        "__perlc_fkpar_" + std::to_string(++parSeq), mod_.get());
+
+    /* save codegen state — same disciplines as the sort-comparator emitter */
+    auto *savedFn   = currentFn_;
+    auto *savedBB   = builder_.GetInsertBlock();
+    auto  savedScopes = scopes_;
+    auto  savedArr  = arrayScopes_;
+    auto  savedHash = hashScopes_;
+    auto  savedPv   = pvScopes_;
+    auto  savedFloat = floatScopes_;
+    auto  savedInt  = intScopes_;
+    auto  savedDerefAV = derefAVScopes_;
+    auto  savedRowAV = rowAVScopes_;
+    auto  savedFlatRow = flatRowScopes_;
+    auto  savedPair = pairScopes_;
+    auto *savedLDep = localDepthAlloca_;
+    auto *savedBody = currentSubBody_;
+    bool  savedFkEmit = fkEmitting_;
+    bool  savedFkVec  = fkKernelVec_;
+    auto  savedFKData = fkKernelData_;
+    auto  savedKnownRows = knownFlatRows_;
+    bool  savedMainBody_ = inMainBody_;
+    int   savedFileDepth_ = fileScopeDepth_;
+
+    scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+    floatScopes_ = {}; intScopes_ = {}; derefAVScopes_ = {};
+    rowAVScopes_ = {}; flatRowScopes_ = {}; pairScopes_ = {};
+    localDepthAlloca_ = nullptr;
+    /* main-body context must NOT leak in: par1b-style kernels sit at file
+       scope, and a body `my $z_re = ...` emitted with inMainBody_ still set
+       was classified as a file-scope global decl (boxed clones +
+       perl_glob_set_scalar per iteration — heap ops in pool workers). */
+    inMainBody_ = false;
+    fileScopeDepth_ = 0;
+    currentFn_ = wfn;
+    fkEmitting_ = true;
+    flatDoubleCache_.clear();
+    floatSqrtOf_.clear();
+    lastSqrtInput_ = nullptr;
+
+    pushScope();
+
+    auto *entry = BasicBlock::Create(ctx_, "entry", wfn);
+    auto *cond  = BasicBlock::Create(ctx_, "fkpar.cond", wfn);
+    auto *body  = BasicBlock::Create(ctx_, "fkpar.body", wfn);
+    auto *step  = BasicBlock::Create(ctx_, "fkpar.step", wfn);
+    auto *done  = BasicBlock::Create(ctx_, "fkpar.done", wfn);
+
+    builder_.SetInsertPoint(entry);
+    Value *rowsArg = wfn->getArg(0);
+    Value *lo = wfn->getArg(1);
+    Value *hi = wfn->getArg(2);
+    fkKernelData_.clear();
+    for (size_t k = 0; k < rowNames.size(); k++) {
+        Value *cell = builder_.CreateGEP(perlPtrTy_, rowsArg,
+            ConstantInt::get(i64, k), "fkpar.rowp");
+        fkKernelData_[rowNames[k]] = builder_.CreateLoad(perlPtrTy_, cell,
+            "fkpar.rowd");
+    }
+    auto *iSlot = createEntryAlloca(i64, nullptr, "fkpar." + idxBare);
+    builder_.CreateStore(lo, iSlot);
+    declareIntVar(idxBare, iSlot);
+    for (auto &r : rowNames) knownFlatRows_.insert(r);
+    flatKernelMode_ = true;
+    builder_.CreateBr(cond);
+
+    builder_.SetInsertPoint(cond);
+    Value *cur = builder_.CreateLoad(i64, iSlot, "fkpar.cur");
+    builder_.CreateCondBr(builder_.CreateICmpSLT(cur, hi, "fkpar.more"),
+                          body, done);
+
+    builder_.SetInsertPoint(body);
+    emitStmt(*n.body);
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(step);
+
+    builder_.SetInsertPoint(step);
+    Value *cur2 = builder_.CreateLoad(i64, iSlot, "fkpar.cur2");
+    builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1),
+                                            "fkpar.nxt"), iSlot);
+    auto *backBr = builder_.CreateBr(cond);
+    fkKernelVec_ = true;
+    attachCountedLoopMD(backBr, false, true);
+
+    builder_.SetInsertPoint(done);
+    builder_.CreateRetVoid();
+
+    /* restore */
+    flatKernelMode_ = false;
+    for (auto &r : rowNames) knownFlatRows_.erase(r);
+    fkKernelData_ = savedFKData;
+    fkEmitting_ = savedFkEmit;
+    fkKernelVec_ = savedFkVec;
+    currentFn_ = savedFn;
+    builder_.SetInsertPoint(savedBB);
+    scopes_ = savedScopes; arrayScopes_ = savedArr; hashScopes_ = savedHash;
+    pvScopes_ = savedPv; floatScopes_ = savedFloat; intScopes_ = savedInt;
+    derefAVScopes_ = savedDerefAV; rowAVScopes_ = savedRowAV;
+    flatRowScopes_ = savedFlatRow; pairScopes_ = savedPair;
+    localDepthAlloca_ = savedLDep;
+    currentSubBody_ = savedBody;
+    inMainBody_ = savedMainBody_;
+    fileScopeDepth_ = savedFileDepth_;
+    return wfn;
+}
+
+
+/* packflat scan name normalization: declaration nodes carry sigils ("@r",
+   "%h", "$x"), while use-site nodes (RefArray/ArrayVar/HashVar) carry the
+   bare name ("r"). bareVarName() only strips '$' — the sigil-agnostic form
+   is what the scan's name comparisons need. */
+static std::string pkBareName(const std::string &s) {
+    std::string t = s;
+    if (!t.empty() && (t[0] == '$' || t[0] == '@' || t[0] == '%'))
+        t = t.substr(1);
+    return t;
+}
 
 static bool packFlatMentionsName(const Node &n, const std::string &anm) {
-    if (n.name == anm) return true;
+    if (pkBareName(n.name) == anm) return true;
     if (n.left && packFlatMentionsName(*n.left, anm)) return true;
     if (n.right && packFlatMentionsName(*n.right, anm)) return true;
     if (n.cond && packFlatMentionsName(*n.cond, anm)) return true;
@@ -8301,11 +8680,12 @@ static bool packFlatMentionsName(const Node &n, const std::string &anm) {
    sub-local my-declaration of the array. */
 static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
                            bool directReturnLeft) {
-    if (n.kind == NK::RefArray && n.name == anm) return directReturnLeft;
+    if (n.kind == NK::RefArray && pkBareName(n.name) == anm)
+        return directReturnLeft;
     if ((n.kind == NK::Our || n.kind == NK::LocalStmt || n.kind == NK::LockStmt) &&
-        n.name == anm)
+        pkBareName(n.name) == anm)
         return false;
-    if (n.kind == NK::My && n.name == anm) foundMy = true;
+    if (n.kind == NK::My && pkBareName(n.name) == anm) foundMy = true;
     if ((n.kind == NK::SubDef || n.kind == NK::AnonSub) && n.body &&
         packFlatMentionsName(*n.body, anm))
         return false;
@@ -8339,11 +8719,31 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
    element / thread-shared / refcount > 1) falls back to the plain REF_ARRAY
    hand-out — byte-identical to today. */
 void CodeGen::tryPackFlatReturnHook(const Node &ret, llvm::Value *&v) {
+    /* OPT-IN (PERLC_PACK_RET=1). The packed row hand-out fixes three
+       pre-2026-11-06 dead-bugs (the pkBareName sigil-mismatched scan, the
+       emitBlockLast duplicate arm missing the hook, and FLAT element-view
+       semantics), but the packed-PV VALUE MODEL is not yet fully
+       REF-faithful for every observable (`@$row` list views, list-position
+       consumption, `ref()`-class surface — the row D203 family), so until
+       that work lands the producer packing stays off, exactly as the
+       hook's never-firing pre-fix behavior (which the byte gates were
+       actually testing). */
+    if (!getenv("PERLC_PACK_RET")) return;
     if (!ret.left || ret.left->kind != NK::RefArray) return;
-    const std::string &anm = ret.left->name;
-    if (anm.size() < 2 || anm[0] != '@') return;
+    /* Parser-produced RefArray names carry no sigil ("r"), and neither do
+       ArrayVar uses inside the body — while the declaring `my @r` (and
+       Our/Local/Lock) nodes store "@r". BARE-name normalization on both
+       sides is what makes the scan match; the old sigil-expecting guard
+       ("anm[0] != '@'") rejected every parser-produced ref, so this hook
+       could never fire and packed producer rows never materialized. */
+    std::string anm = pkBareName(ret.left->name);
+    if (anm.empty()) return;
     bool foundMy = false;
-    if (!packFlatScanOk(*currentSubBody_, anm, foundMy, false)) return;
+    bool scanOk = packFlatScanOk(*currentSubBody_, anm, foundMy, false);
+    if (getenv("PERLC_DEBUG_PACK"))
+        fprintf(stderr, "PKSCAN: %s ok=%d foundMy=%d\n", anm.c_str(),
+                scanOk, foundMy);
+    if (!scanOk) return;
     if (!foundMy) return;   /* not a sub-local my @r — packing could fork it */
     Value *packed = callRT("perl_pack_flat_row", {v});   /* fresh owned temp */
     auto *nullpv = ConstantPointerNull::get(perlPtrTy_);
@@ -8756,6 +9156,17 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                 result = emitExpr(*work->left);
                 callCtx_ = savedCtx;
             }
+            /* Stage 42 (packflat): the pack hook must ALSO fire for a sub's
+               last-statement return — this emitBlockLast arm duplicates
+               case NK::Return's value logic and previously missed the hook,
+               so row-producing subs shaped `... ; return \@r;` (the
+               flat_fill_pair/mbs producer!) handed out plain REF_ARRAYs and
+               every downstream FK loop failed its tag certification at
+               runtime (compiled flat bodies that never executed). Same
+               gating and runtime NULL-fallback as the emitStmt hook. */
+            if (isOptStageEnabled("packflat") && work->left &&
+                work->left->kind == NK::RefArray && currentSubBody_ && result)
+                tryPackFlatReturnHook(*work, result);
         } else {
             emitStmt(*work);
             /* An unconditional terminator (a `return;` / `die` mid-body) makes
@@ -10527,6 +10938,9 @@ void CodeGen::emitStmt(const Node &n) {
         break;
 
     case NK::Return: {
+        if (getenv("PERLC_DEBUG_PACK"))
+            fprintf(stderr, "PKRET: line %d kind=%d\n", n.line,
+                    n.left ? (int)n.left->kind : -1);
         Value *v;
         if (n.left && (n.left->kind == NK::ArrayLit || n.left->kind == NK::ArrayVar ||
                        n.left->kind == NK::MapFunc  || n.left->kind == NK::GrepFunc ||
@@ -10572,6 +10986,11 @@ void CodeGen::emitStmt(const Node &n) {
         /* Stage 42 (packflat): `return \@r;` of a sub-local, provably
            alias-safe numeric row packs to a refcounted CPLX_ROW before the
            hand-out. */
+        if (getenv("PERLC_DEBUG_PACK"))
+            fprintf(stderr, "PKHOOK: line %d left=%d ref=%d csb=%p\n",
+                    n.line, n.left ? (int)n.left->kind : -1,
+                    n.left && n.left->kind == NK::RefArray ? 1 : 0,
+                    (void *)currentSubBody_);
         if (isOptStageEnabled("packflat") && n.left &&
             n.left->kind == NK::RefArray && currentSubBody_ && v)
             tryPackFlatReturnHook(n, v);
@@ -10989,6 +11408,13 @@ Value *CodeGen::emitExpr(const Node &n) {
         if (n.name == "?")  return callRT("perl_get_dollar_question", {});
         if (n.name == "]")  return callRT("perl_get_dollar_rbracket", {});
         if (n.name == "+")  return callRT("perl_get_dollar_plus", {});
+        /* $0 — the program name. Its runtime storage (perl_dollar0_val) is
+           seeded by perl_init_argv from argv[0]; reads here previously fell
+           through to lookupVar("0"), but the slot init() registers is
+           dropped from the codegen scope map by popScope before main()'s
+           body is emitted — so plain $0 reads (and every interpolation of
+           it) yielded undef while real Perl prints the script path. */
+        if (n.name == "0")  return callRT("perl_get_dollar0", {});
         /* $AUTOLOAD — set by dispatch when AUTOLOAD is called */
         if (n.name == "AUTOLOAD") return callRT("perl_get_autoload_name", {});
         if (n.name == "ARGV") return callRT("perl_get_dollar_argv", {});
@@ -12532,13 +12958,16 @@ Value *CodeGen::emitExpr(const Node &n) {
             return lhsVal;
         }
         auto applyOp = [&](Value *lv, Value *rv) -> Value * {
+            /* D199 tail: the boxed / and % sites pass the source location
+               so a zero divisor dies catchably with the real Perl text. */
+            if (n.sval == "/" || n.sval == "%")
+                return callRT(n.sval == "/" ? "perl_div" : "perl_mod",
+                              {lv, rv, srcFileGV(),
+                               ConstantInt::get(Type::getInt32Ty(ctx_), n.line)});
             if      (n.sval == "+")  return callRT("perl_add",        {lv, rv});
             else if (n.sval == "-")  return callRT("perl_sub",        {lv, rv});
             else if (n.sval == "*")  return callRT("perl_mul",        {lv, rv});
-            else if (n.sval == "/")  return callRT("perl_div",        {lv, rv});
             else if (n.sval == ".")  return callRT("perl_concat",     {lv, rv});
-            else if (n.sval == "%")  return callRT("perl_mod",        {lv, rv});
-            else if (n.sval == "**") return callRT("perl_pow",        {lv, rv});
             else if (n.sval == "x")  return callRT("perl_repeat_str", {lv, rv});
             else if (n.sval == "&")  return callRT("perl_bitand",     {lv, rv});
             else if (n.sval == "|")  return callRT("perl_bitor",      {lv, rv});
@@ -12556,7 +12985,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     if (n.sval == "+") return builder_.CreateAdd(lv, rv);
                     if (n.sval == "-") return builder_.CreateSub(lv, rv);
                     if (n.sval == "*") return builder_.CreateMul(lv, rv);
-                    if (n.sval == "%") return emitFlooredMod(lv, rv);
+                    if (n.sval == "%") return emitFlooredMod(n, lv, rv);
                     /* W1 note: `&=`/`|=`/`^=` stay boxed — a bit-63 result is
                        UV in real Perl and the runtime has no UV storage. */
                     return nullptr;
@@ -12782,8 +13211,11 @@ Value *CodeGen::emitExpr(const Node &n) {
                             int opCode = (n.sval == "+") ? 0 : (n.sval == "-") ? 1 :
                                          (n.sval == "*") ? 2 : (n.sval == "/") ? 3 : 0;
                             Value *opV = ConstantInt::get(Type::getInt32Ty(ctx_), opCode);
+                            /* D199 tail: the flat-row compound-assign / zero
+                               divisor dies catchably with the source line. */
                             Value *res = callRT("perl_flat_row_op_assign",
-                                {rowRef, idxOp, rhsValOp, opV});
+                                {rowRef, idxOp, rhsValOp, opV, srcFileGV(),
+                                 ConstantInt::get(Type::getInt32Ty(ctx_), n.line)});
                             /* rowRef is a borrowed reference from perl_array_get_ref
                                (never free it — see runtime.h comment).  rhsValOp
                                is owned and must be freed. */
@@ -16436,7 +16868,15 @@ Value *CodeGen::emitBinOp(const Node &n) {
     };
     for (auto *p = OPS; p->op; p++) {
         if (n.sval == p->op) {
-            Value *result = callRT(p->rt, {lv, rv});
+            /* D199 tail: boxed / and % pass the source location so a zero
+               divisor dies catchably with the exact real Perl text. */
+            bool needsLoc = !strcmp(p->op, "/") || !strcmp(p->op, "%");
+            Value *result =
+                needsLoc ? callRT(p->rt,
+                                  {lv, rv, srcFileGV(),
+                                   ConstantInt::get(Type::getInt32Ty(ctx_),
+                                                    n.line)})
+                         : callRT(p->rt, {lv, rv});
             freeIfOwned(lv);
             freeIfOwned(rv);
             return result;
@@ -16746,7 +17186,11 @@ Value *CodeGen::emitCall(const Node &n) {
         Value *reStr  = n.args.size() > 2 ? callRT("perl_to_float", {emitExpr(*n.args[2])}) : perlFloat(0.0);
         Value *imStr  = n.args.size() > 3 ? callRT("perl_to_float", {emitExpr(*n.args[3])}) : perlFloat(0.0);
         Value *count  = n.args.size() > 4 ? callRT("perl_to_int", {emitExpr(*n.args[4])}) : perlInt(0);
-        return callRT("perl_flat_fill_pair", {re, im, reStr, imStr, count});
+        Value *fill = callRT("perl_flat_fill_pair", {re, im, reStr, imStr, count});
+        if (getenv("PERLC_DEBUG_FKRT"))
+            callRT("perl_pv_dbg", {fill,
+                builder_.CreateGlobalString("fill-ret:" + n.name, "fkpv.fill")});
+        return fill;
     }
     if (n.name == "POSIX::floor" || n.name == "floor") {
         Value *v = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);

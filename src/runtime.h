@@ -187,10 +187,16 @@ void perl_assign(PerlValue *dst, const PerlValue *src);
 PerlValue *perl_add(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_sub(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_mul(const PerlValue *a, const PerlValue *b);
-PerlValue *perl_div(const PerlValue *a, const PerlValue *b);
-PerlValue *perl_mod(const PerlValue *a, const PerlValue *b);
+/* D199 tail (2026-11-06): the boxed / and % zero-divisor dies take the
+   division's own source location (from the codegen call site) so they die
+   catchably with the exact real-perl "$@"/stderr text, instead of the old
+   uncatchable fprintf+exit(255) ("Illegal division by zero\n", no location). */
+PerlValue *perl_div(const PerlValue *a, const PerlValue *b,
+                    const char *dfile, int dline);
+PerlValue *perl_mod(const PerlValue *a, const PerlValue *b,
+                    const char *dfile, int dline);
 /* D84: i64 fast-path modulo with eval-catchable zero-divisor check */
-long long perl_mod_i64(long long a, long long b);
+long long perl_mod_i64(long long a, long long b, const char *dfile, int dline);
 PerlValue *perl_pow(const PerlValue *a, const PerlValue *b);
 PerlValue *perl_negate(const PerlValue *a);
 PerlValue *perl_bitand(const PerlValue *a, const PerlValue *b);
@@ -567,6 +573,22 @@ void       perl_sig_poll(void);
 /* ── command-line arguments ─────────────────────────────────────────────── */
 PerlArray *perl_init_argv(int argc, char **argv); /* call at program start; sets $0, returns @ARGV */
 PerlValue *perl_get_dollar0(void);               /* returns stable $0 PerlValue* */
+void perl_set_dollar0(const char *path);         /* $0 = script path (byte-parity with perl) */
+
+/* Stage 45 (autopar): run a compiled counted-loop worker over disjoint
+   contiguous ranges. fn receives the row-data pointer array (one entry per
+   kernel row variable) and its [lo,hi) half-open index range. The pool is
+   persistent (created lazily, at most PERLC_AUTOPAR_WORKERS threads, max
+   16); bounds below PERLC_AUTOPAR_MIN (default 8192) or a 1-CPU host run
+   the whole range on the calling thread — byte-identical semantics either
+   way, since every chunk computes independent elements. */
+typedef void (*perlc_autopar_fn)(void **rows, long long lo, long long hi);
+void perl_autopar_run(perlc_autopar_fn fn, void **rows, long long bound);
+
+/* Stage 45 debug: per-row FK prelude certification inputs */
+void perl_fk_cert_dbg(long long tag, long long flags, long long len,
+                      long long bound, const char *row);
+void perl_pv_dbg(const void *pv, const char *where); /* debug: PV tag + address */
 
 /* ── file test operators ─────────────────────────────────────────────────── */
 PerlValue *perl_filetest(int op, PerlValue *path);
@@ -1098,7 +1120,8 @@ PerlValue *perl_glob_slot(const char *name, const char *slot);
    stale flat-row cache (the row may have been lazy-converted by an earlier read
    in the same loop body).  op: 0=+,1=-,2=*,3=/.  Returns the boxed result. */
  PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
-                                    PerlValue *rhs_pv, int op);
+                                    PerlValue *rhs_pv, int op,
+                                    const char *dfile, int dline);
  /* D98: set one element in a 2D row that may be FLAT_ARRAY, CPLX_ROW, or
     REF_ARRAY.  Keeps FLAT_ARRAY rows flat (writes the numified value into
     the backing double[] in bounds).  A FLOAT_PAIR store into an empty or

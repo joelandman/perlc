@@ -114,6 +114,14 @@ public:
     bool tryEmitFlatKernelFor(const Node &n);
     bool tryEmitFkIfConvert(const Node &n);  /* FK uniform-branch if-conversion (LV lever) */
     llvm::Value *tryFkRowElemStore(const Node &n, bool needValue); /* certified FK row store (LV lever) */
+    llvm::GlobalVariable *fkVoidSentinel_ = nullptr; /* non-null discard PV for void FK stores */
+    bool fkParBodyPurity(const Node &s,   /* Stage 45 autopar: parallel-eligibility certification */
+                         const std::unordered_set<std::string> &rowSet,
+                         const std::string &idxBare,
+                         std::unordered_set<std::string> &locals);
+    llvm::Function *emitFkParWorker(const Node &n,
+                                    const std::vector<std::string> &rowNames,
+                                    const std::string &idxBare);
     llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
     void emitFlatPairLoad(llvm::Value *dataPtr, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
     void emitRefPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
@@ -534,10 +542,12 @@ private:
        every iteration (mbs fill_z inlined cplx: SIGSEGV in perl_mul). */
     llvm::AllocaInst *createEntryAlloca(llvm::Type *ty, llvm::Value *arraySize,
                                         const llvm::Twine &name);
-    llvm::Value *emitFlooredMod(llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem */
+    llvm::Value *emitFlooredMod(const Node &n, llvm::Value *lv, llvm::Value *rv); /* Perl % semantics, not C's truncating SRem; D199 tail: zero-divisor die carries the source line */
     void emitDivZeroGuard(const Node &n, llvm::Value *rv); /* unboxed `/`: branch to a catchable zero-divisor die */
     llvm::Function *getDivZeroDieFn();   /* shared per-module cold die helper for the guard */
     llvm::Function *divZeroDieFn_ = nullptr;
+    llvm::Value *srcFileGV();            /* D199 tail: cached source-file path global for boxed / % dies */
+    llvm::Value *sourceFileGv_ = nullptr;
     llvm::Value *tryEmitI1Cond(const Node &n);  /* i1 for int comparisons / boolean =~, else nullptr */
     /* Stage 34: llvm.loop.vectorize.width=4 hint on counted unboxed i64/f64
        loops. innerUnroll keeps Stage 28's unroll+interleave on nested loops. */

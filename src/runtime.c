@@ -2859,7 +2859,8 @@ HOTX PerlValue *perl_mul(const PerlValue *a, const PerlValue *b) {
     return perl_alloc_float(perl_to_float(a) * perl_to_float(b));
 }
 
-HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
+HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b,
+                         const char *dfile, int dline) {
     if (a && a->blessed_class) {
         PerlValue *r = perl_dispatch_overload(a, "/", (PerlValue*)a, (PerlValue*)b);
         if (r) return r;
@@ -2869,13 +2870,27 @@ HOTX PerlValue *perl_div(const PerlValue *a, const PerlValue *b) {
         if (r) return r;
     }
     double bv = perl_to_float(b);
-    if (bv == 0.0) { fprintf(stderr, "Illegal division by zero\n"); exit(255); }
+    if (bv == 0.0) {
+        /* D199 tail (2026-11-06): this used to be fprintf+exit(255) —
+           uncatchable by eval{} and with no source location, while real
+           perl dies "Illegal division by zero at FILE line N." catchably.
+           The unboxed guard (D199) covers f64-shaped divisions; every call
+           site of the boxed / now passes the division's own source
+           location, so a division that reaches the BOXED path (array
+           element / string-shaped / non-promotable operands) dies exactly
+           like real perl: into the nearest eval as $@, or top-level with
+           the location on stderr + exit 255. NULL/0 keeps the location-less
+           fallback for any runtime-internal caller (none today). */
+        PerlValue *msg = perl_alloc_string("Illegal division by zero");
+        perl_die(msg, dfile, dline);
+    }
     if (both_int(a, b) && a->ival % b->ival == 0)
         return perl_alloc_int(a->ival / b->ival);
     return perl_alloc_float(perl_to_float(a) / bv);
 }
 
-PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
+PerlValue *perl_mod(const PerlValue *a, const PerlValue *b,
+                    const char *dfile, int dline) {
      if (a && a->blessed_class) {
          PerlValue *r = perl_dispatch_overload(a, "%", (PerlValue*)a, (PerlValue*)b);
          if (r) return r;
@@ -2886,8 +2901,9 @@ PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
      }
      long long bv = perl_to_int(b);
      if (bv == 0) {
+         /* D199 tail: pass the source location through like perl_div above. */
          PerlValue *msg = perl_alloc_string("Illegal modulus zero");
-         perl_die(msg, NULL, 0);
+         perl_die(msg, dfile, dline);
      }
     long long av = perl_to_int(a);
     /* Perl's %, unlike C's, uses floored-division semantics: the result
@@ -2902,10 +2918,13 @@ PerlValue *perl_mod(const PerlValue *a, const PerlValue *b) {
 
 /* D84: i64 fast-path modulo with eval-catchable zero-divisor check.
     Returns the floored modulo result, or calls perl_die if divisor is zero. */
- HOTX long long perl_mod_i64(long long a, long long b) {
+ HOTX long long perl_mod_i64(long long a, long long b,
+                            const char *dfile, int dline) {
      if (b == 0) {
+         /* D199 tail: location passed from the codegen % site (D84 made
+            this catchable; the source line now rides along too). */
          PerlValue *msg = perl_alloc_string("Illegal modulus zero");
-         perl_die(msg, NULL, 0);
+         perl_die(msg, dfile, dline);
      }
     long long r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) r += b;
@@ -3487,6 +3506,14 @@ __attribute__((pure)) HOTX PerlValue *perl_array_get_ref(PerlArray *a, long long
 
 void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
     if (idx < 0) idx += a->len;
+    {
+        static int dbg = -1;
+        if (dbg < 0) dbg = getenv("PERLC_DEBUG_FKRT") ? 1 : 0;
+        if (dbg && v) {
+            fprintf(stderr, "ST45set: slot=%p idx=%lld tag=%d len=%lld\n",
+                    (void *)a, idx, v->tag, v->matchpos);
+        }
+    }
     /* extend if needed */
     while (idx >= a->cap) {
         a->cap *= 2;
@@ -12453,6 +12480,196 @@ PerlValue *perl_get_dollar0(void) {
     return &perl_dollar0_val;
 }
 
+/* ── Stage 45 (autopar): FK counted-loop worker pool ──────────────────────
+   A small persistent pthread pool over contiguous index ranges. The workers
+   execute pure-native f64 code emitted per kernel site — the codegen
+   predicate refuses any statement shape that would lower to a Perl runtime
+   call — so no PV, freelist, wantarray, or eval TLS state is ever touched
+   here: the pool is independent of the Perl threads machinery and needs no
+   interaction with it. Byte-parity with the sequential body is structural:
+   every chunk computes its own iterations' (2i, 2i+1) slots independently
+   with the identical instruction sequence. (perlc_autopar_fn comes from
+   runtime.h.) */
+
+#define PERLC_AUTOPAR_MAX_THREADS 16
+static pthread_mutex_t s_ap_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_ap_run_cv  = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  s_ap_done_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t       s_ap_threads[PERLC_AUTOPAR_MAX_THREADS];
+static int             s_ap_nthread = 0;      /* pool threads (main excluded) */
+static int             s_ap_nw = 0;           /* total workers (main included) */
+static long long       s_ap_lo[PERLC_AUTOPAR_MAX_THREADS + 1];
+static long long       s_ap_hi[PERLC_AUTOPAR_MAX_THREADS + 1];
+static long long       s_ap_gen = 0;
+static long long       s_ap_done = 0;
+static int             s_ap_stop = 0;
+static perlc_autopar_fn s_ap_fn = NULL;
+static void           **s_ap_rows = NULL;
+static double          s_ap_chunk_sum = 0;   /* debug: total worker chunk time */
+
+static void *ap_worker_main(void *argp) {
+    long long id = (long long)(intptr_t)argp;   /* 1..nthread */
+    long long mygen = 0;
+    pthread_mutex_lock(&s_ap_mu);
+    for (;;) {
+        while (!s_ap_stop && s_ap_gen == mygen)
+            pthread_cond_wait(&s_ap_run_cv, &s_ap_mu);
+        if (s_ap_stop) break;
+        mygen = s_ap_gen;
+        long long lo = s_ap_lo[id], hi = s_ap_hi[id];
+        pthread_mutex_unlock(&s_ap_mu);
+        if (hi > lo) {
+            struct timespec ts0, ts1;
+            clock_gettime(CLOCK_MONOTONIC, &ts0);
+            s_ap_fn(s_ap_rows, lo, hi);
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            double dt = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) / 1e9;
+            pthread_mutex_lock(&s_ap_mu);
+            s_ap_chunk_sum += dt;
+            pthread_mutex_unlock(&s_ap_mu);
+        }
+        pthread_mutex_lock(&s_ap_mu);
+        if (++s_ap_done >= s_ap_nthread)
+            pthread_cond_signal(&s_ap_done_cv);
+    }
+    pthread_mutex_unlock(&s_ap_mu);
+    return NULL;
+}
+
+static void ap_shutdown(void) {
+    pthread_mutex_lock(&s_ap_mu);
+    s_ap_stop = 1;
+    pthread_cond_broadcast(&s_ap_run_cv);
+    pthread_mutex_unlock(&s_ap_mu);
+    for (int i = 0; i < s_ap_nthread; i++)
+        pthread_join(s_ap_threads[i], NULL);
+    s_ap_nthread = 0;
+}
+
+/* Stage 45 debug: per-row certification inputs for the FK prelude, printed
+   only when the compile embedded the probe (PERLC_DEBUG_FKRT at codegen)
+   AND this env is set at runtime. */
+void perl_fk_cert_dbg(long long tag, long long flags, long long len,
+                      long long bound, const char *row) {
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("PERLC_DEBUG_FKRT") ? 1 : 0;
+    if (!dbg) return;
+    fprintf(stderr,
+            "ST45cert: row=%s tag=%lld flags=%lld len=%lld bound=%lld "
+            "flat=%d cplx=%d unshared=%d flatlen=%d cplxlen=%d\n",
+            row ? row : "?", tag, flags, len, bound,
+            tag == 10, tag == 19, (flags & 1) == 0,
+            tag == 10 && len >= 2 * bound, tag == 19 && len >= bound);
+}
+
+/* Stage 45 debug: identity probe for any PV (tag + address), used to
+   trace where a packed row loses its tag on the way into a sub. */
+void perl_pv_dbg(const void *pv, const char *where) {
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("PERLC_DEBUG_FKRT") ? 1 : 0;
+    if (!dbg) return;
+    const PerlValue *v = (const PerlValue *)pv;
+    fprintf(stderr, "ST45pv: %s pv=%p tag=%d len=%lld\n",
+            where ? where : "?", (void *)pv, v ? v->tag : -1,
+            v ? v->matchpos : -1LL);
+}
+
+void perl_autopar_run(perlc_autopar_fn fn, void **rows, long long bound) {
+    if (bound <= 0) return;
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("PERLC_DEBUG_AUTOPAR") ? 1 : 0;    /* Threshold: below PERLC_AUTOPAR_MIN (default 8192 index iterations)
+       a chunked fan-out cannot pay for the wake latency — run the whole
+       range inline (structurally identical results). */
+    long long minb = 8192;
+    {
+        const char *e = getenv("PERLC_AUTOPAR_MIN");
+        if (e) {
+            long long v = atoll(e);
+            if (v > 0) minb = v;
+        }
+    }
+    if (bound < minb) {
+        if (dbg) fprintf(stderr, "ST45: run seq bound=%lld\n", bound);
+        fn(rows, 0, bound);
+        return;
+    }
+
+    pthread_mutex_lock(&s_ap_mu);
+    if (s_ap_nthread == 0) {
+        long long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu < 1) ncpu = 1;
+        long long want = ncpu > PERLC_AUTOPAR_MAX_THREADS
+                             ? PERLC_AUTOPAR_MAX_THREADS : ncpu;
+        {
+            const char *e = getenv("PERLC_AUTOPAR_WORKERS");
+            if (e) {
+                long long v = atoll(e);
+                if (v > 0)
+                    want = v > PERLC_AUTOPAR_MAX_THREADS
+                               ? PERLC_AUTOPAR_MAX_THREADS : v;
+            }
+        }
+        while (s_ap_nthread < (int)want - 1) {
+            if (pthread_create(&s_ap_threads[s_ap_nthread], NULL,
+                               ap_worker_main,
+                               (void *)(intptr_t)(s_ap_nthread + 1)) != 0)
+                break;
+            s_ap_nthread++;
+        }
+        if (s_ap_nthread > 0)
+            atexit(ap_shutdown);
+        s_ap_nw = s_ap_nthread + 1;
+    }
+    if (s_ap_nw < 2) {
+        pthread_mutex_unlock(&s_ap_mu);
+        fn(rows, 0, bound);
+        return;
+    }
+    /* chunk [c*sz, min((c+1)*sz, bound)) — worker id 0 is the calling thread */
+    long long sz = (bound + s_ap_nw - 1) / s_ap_nw;
+    for (long long c = 0; c < s_ap_nw; c++) {
+        s_ap_lo[c] = c * sz;
+        s_ap_hi[c] = s_ap_lo[c] + sz < bound ? s_ap_lo[c] + sz : bound;
+    }
+    if (dbg)
+        fprintf(stderr, "ST45: run par bound=%lld nw=%d chunk=%lld\n",
+                bound, s_ap_nw, sz);
+    s_ap_fn = fn;
+    s_ap_rows = rows;
+    s_ap_done = 0;
+    s_ap_gen++;
+    pthread_cond_broadcast(&s_ap_run_cv);
+    pthread_mutex_unlock(&s_ap_mu);
+
+    struct timespec apT0;
+    clock_gettime(CLOCK_MONOTONIC, &apT0);
+    fn(rows, s_ap_lo[0], s_ap_hi[0]);    /* the calling thread takes chunk 0 */
+
+    pthread_mutex_lock(&s_ap_mu);
+    while (s_ap_done < s_ap_nthread)
+        pthread_cond_wait(&s_ap_done_cv, &s_ap_mu);
+    if (dbg) {
+        struct timespec tsEnd;
+        clock_gettime(CLOCK_MONOTONIC, &tsEnd);
+        double elapsed = (tsEnd.tv_sec - apT0.tv_sec) + (tsEnd.tv_nsec - apT0.tv_nsec) / 1e9;
+        fprintf(stderr, "ST45: dispatch elapsed=%.4f chunk_sum=%.4f nw=%d\n",
+                elapsed, s_ap_chunk_sum, s_ap_nw);
+        s_ap_chunk_sum = 0;
+    }
+    pthread_mutex_unlock(&s_ap_mu);
+}
+
+/* D199-tail session: $0 must read as the SCRIPT path byte-identically to
+   real perl (perl runs `perl prog.pl` → $0="prog.pl"; perlc's compiled
+   binary's argv[0] is the binary path, which would diverge every script
+   that prints $0). The driver calls this from init() with the source path;
+   perl_init_argv's argv[0] seed remains the fallback for do-FILE libs. */
+void perl_set_dollar0(const char *path) {
+    free(perl_dollar0_val.sval);
+    perl_dollar0_val.sval = strdup(path ? path : "");
+    perl_dollar0_val.slen = (long long)strlen(perl_dollar0_val.sval);
+}
+
 /* ── file test operators ─────────────────────────────────────────────────── */
 
 PerlValue *perl_filetest(int op, PerlValue *path_pv) {
@@ -18885,7 +19102,8 @@ PerlValue *perl_dbi_error(PerlValue *dbh_pv) {
    by an earlier read in the same loop body, freeing the original double[]).
    op: 0=+, 1=-, 2=*, 3=/.  Returns the boxed result. */
 PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
-                                   PerlValue *rhs_pv, int op) {
+                                   PerlValue *rhs_pv, int op,
+                                   const char *dfile, int dline) {
     double rhs = perl_to_float(rhs_pv);
     double r;
     if (row_pv && row_pv->tag == PERL_FLAT_ARRAY) {
@@ -18896,7 +19114,7 @@ PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
             case 1: r = lhs - rhs; break;
             case 2: r = lhs * rhs; break;
             case 3:
-                if (rhs == 0.0) { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, __FILE__, __LINE__); }
+                if (rhs == 0.0) { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, dfile, dline); }
                 r = lhs / rhs; break;
             default: r = lhs;
         }
@@ -18910,7 +19128,7 @@ PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
             case 1: r = lhs - rhs; break;
             case 2: r = lhs * rhs; break;
             case 3:
-                if (rhs == 0.0) { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, __FILE__, __LINE__); }
+                if (rhs == 0.0) { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, dfile, dline); }
                 r = lhs / rhs; break;
             default: r = lhs;
         }

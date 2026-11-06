@@ -395,9 +395,7 @@ the win is structural — the certified kernels are now genuinely
 vectorized, which the Stage-45+ work (wider grids, kernel reshaping,
 auto-parallel) inherits without further codegen-side blocks.
 
-### Stage 44 (D198) — the wantarray/ctx family item closes as ternary context propagation
-
-Same session. The D198 row as filed ("wantarray() inside a de-boxed
+### Stage 44 (D198) — the wantarray/ctx family item closes as ternary context propagation ("wantarray() inside a de-boxed
 prologue reads a stale LIST ctx") did NOT reproduce: real perl prints
 `want-list` for the row's own `print cq(1)` repro (print args are list
 context — the row's perl-side expectation was wrong), and a 28-position
@@ -416,3 +414,44 @@ expansion. Tests `tests/d198_ternary_ctx_{smoke,deep}.pl` byte-identical;
 `make test-all` 617/617 incl. the new pair. The one open unboxing-safety
 row is now closed; the remaining strategic items are auto-parallel
 counted loops and D199's boxed-path div-zero tail.
+
+### Stage 45 + D199 tail — both remaining items to completion (2026-11-06, this session)
+
+Both closed same-session; full forensics in TESTS.md
+(D199-tail row + D204 `$0`, D205 pack-pair store corruption, D206
+paren-blind FK walk, D207 the packed-PV/promote boundary, and the Stage-45
+section in the auto-parallel exploration note). Summary:
+
+- **D199 tail (boxed division/modulo dies)**: the runtime entries
+  `perl_div`/`perl_mod`/`perl_mod_i64`/`perl_flat_row_op_assign` now take
+  `(file, line)` from codegen (`srcFileGV()` + the statement's `n.line`),
+  so every boxed-path zero divisor — array-element divisors, string-shaped
+  operands, sub-call returns, `/=`, `%=`, 2D flat-row op `/=` — dies
+  catchably with the exact real-perl `$@`/stderr text instead of the old
+  uncatchable `fprintf+exit(255)` without location. `**` verified out of
+  scope (real perl `0**-1` → `Inf`). Tests `tests/d199_boxed_div_{smoke,deep}.pl`
+  byte-identical incl. rc.
+- **D204 `$0`**: reads dispatched to `perl_get_dollar0` + the driver seeds
+  the script path (`perl_set_dollar0`) and the storage became a module
+  global (was a dangling init()-frame alloca) — `$0` byte-parity with perl.
+- **Stage 45 auto-parallel counted loops** (`autopar` knob): certified FK
+  loops gain a parallel variant — worker re-emission under the flat hooks
+  + a persistent pthread pool (`perl_autopar_run`) + the runtime threshold
+  (`PERLC_AUTOPAR_MIN` 8192) with the sequential flat body kept verbatim
+  below it. Safety is structural (fkIndexForm slot-pair disjointness +
+  closed bodies + no division). Measured 9.3× pool-level parallel speedup
+  (20 dispatches: 12 ms wall vs 113 ms chunk compute) and byte-identical
+  results at every worker count and tiny-chunk stress;
+  `tests/autopar_{smoke,deep}.pl` cover it.
+- **D205/D206** (correctness, exposed by the probe battery): the packed-
+  pair store no longer fires on flat-scalar index forms (`data[4i]`
+  corruption/overrun on mbs-shaped stores via the general path), and the
+  FK purity walk now looks through E1 paren groups (paren-rich kernel
+  bodies no longer drop off the flat path).
+- **Stage-43 retrospective (D207)**: the cert probes proved the certified
+  flat bodies never executed for promote-touching rows (D105 converts
+  read rows to REF in place), and the packflat producer hook had never
+  fired (three stacked dead-bugs, now fixed + gated behind
+  `PERLC_PACK_RET=1` pending D203's value-model work). Stages 41–43
+  remain net-positive through their general-path effects; the flat-
+  eligible end-to-end story is D207/D203's.

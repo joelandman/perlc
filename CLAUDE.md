@@ -34,23 +34,30 @@ certified-body raw-store routing + kernel if-conversion (`fkifconv`)
 make the certified flat loops genuinely vectorize (and remove the
 `-Wpass-failed` stderr noise on FK-listing `-O2` compiles). Every
 stage has a `PERLC_OPT_DISABLE=` knob
-(`st41`/`st39`/`cplxrow`/`packflat`/`fkifconv`/…).
+(`st41`/`st39`/`cplxrow`/`packflat`/`fkifconv`/`autopar`/…).
 Findings/method/
 ablations: `docs/optimization_findings_2026-11-04.md`,
 `docs/optimization_findings_2026-11-04_round2.md`,
 `docs/optimization_findings_2026-11-05_landing.md` (the landing
-record). Correctness gates: `make test-all` **617/617 PASS** vs real
+record). Correctness gates: `make test-all` **621/621 PASS** vs real
 perl plus `make bench-regress` PASS (the perlc-vs-perlc runtime
-regression gate). **Open perf follow-ups:** auto-parallel counted
-loops (precondition now materially closer with packed rows and
-vectorizing kernels), and D199's still-open boxed-path div-by-zero
-tail. **D198** — the last unboxing-safety class — closed 2026-11-06 as
-ternary context propagation (TESTS.md D198: real Perl's `?:` shares
-its own context with the chosen branch; perlc was consulting the
-wantarray stack instead). Tests: `tests/packflat_{smoke,deep}.pl`,
+regression gate). **Open perf follow-ups:** D207/D203 (making real
+programs FK-certifiable end-to-end — D105's promote-inline converts read
+rows to REF in place, which currently keeps the certified flat bodies
+off every promote-touching loop; needs the packed-PV value model to
+become REF-faithful; the packflat producer hook is fixed but gated
+behind `PERLC_PACK_RET=1` for the same reason); map/grep parallelism.
+**Closed 2026-11-06:** D199's boxed-path tail (all boxed division/modulo
+paths die catchably with the realPerl location — D204 `$0` fixed
+adjacent), Stage 45 auto-parallel counted loops (`autopar` knob,
+persistent pool, 9.3× pool-level parallel, `tests/autopar_*`) and D205
+(pack-pair store corruption) + D206 (paren-blind FK walk). Tests:
+`tests/packflat_{smoke,deep}.pl`,
 `tests/div_zero_paren_{smoke,deep}.pl`,
 `tests/d197_defined_promo_{smoke,deep}.pl`,
-`tests/d198_ternary_ctx_{smoke,deep}.pl`.
+`tests/d198_ternary_ctx_{smoke,deep}.pl`,
+`tests/d199_boxed_div_{smoke,deep}.pl`,
+`tests/autopar_{smoke,deep}.pl`.
 
 Previous state (2026-10-16):
 
