@@ -667,6 +667,7 @@ void CodeGen::declareRuntime() {
     RT("perl_mark_int_elems",    voidTy, pv, i64);  /* FLAT_ARRAY n-element (used by FLAT_ARRAY literal path) */
     RT("perl_ref_scalar",   pv, pv);
     RT("perl_ref_array",    pv, av);
+    RT("perl_pack_flat_row", pv, pv);   /* Stage 42: REF'd numeric row -> CPLX_ROW */
     RT("perl_ref_hash",     pv, av);  /* PerlHash* treated as opaque av */
     RT("perl_deref_scalar", pv, pv);
     RT("perl_deref_array",    av, pv);
@@ -2984,6 +2985,7 @@ bool CodeGen::isOwnedTemp(llvm::Value *v) {
         "perl_spaceship", "perl_str_spaceship",
         "perl_array_get", "perl_hash_get_sv",
         "perl_ref_type", "perl_ref_array", "perl_ref_scalar",
+        "perl_pack_flat_row", 
         "perl_clone", "perl_sprintf", "perl_array_len", "perl_array_len_f64",
         "perl_regex_match", "perl_regex_match_g", "perl_regex_match_sv",
         "perl_alloc_bool",
@@ -3765,8 +3767,15 @@ bool CodeGen::tryBindCplxPair(const std::string &nm, const Node &rhs) {
             if (Value *base = scalarVarRawPv(rhs.left->name)) {
                 Value *idx = emitIdx(*rhs.right);
                 Value *re = nullptr, *im = nullptr;
-                if (knownFlatRows_.count(rbn))
-                    emitFlatPairLoad(base, idx, re, im);
+                if (knownFlatRows_.count(rbn)) {
+                    /* Stage 42: the certified packed buffer (FLAT pval or
+                       CPLX pval->data) was resolved at the fk.pre branch. */
+                    auto dit = fkKernelData_.find(rbn);
+                    if (dit != fkKernelData_.end())
+                        emitFlatPairLoad(dit->second, idx, re, im);
+                    else
+                        return false;
+                }
                 else
                     emitRefPairLoad(base, idx, re, im);
                 CplxPairSlots *sl = ensurePairSlots(nm);
@@ -4007,11 +4016,24 @@ void CodeGen::attachCountedLoopMD(Instruction *backBr, bool innerUnroll, bool ve
     if (vectorize && isOptStageEnabled("loopvec")) {
         /* Width is a hint (not llvm.loop.vectorize.enable). enable=true
            warns when the cost model skips a short trip count. Clang
-           -march=native then vectorizes the store-only body. */
-        ops.push_back(MDNode::get(ctx_, {
-            MDString::get(ctx_, "llvm.loop.vectorize.width"),
-            ConstantAsMetadata::get(ConstantInt::get(i32, 4))
-        }));
+           -march=native then vectorizes the store-only body.
+           fkKernelVec_: Stage-42's certified flat-kernel bodies carry
+           ONLY llvm.loop.vectorize.enable (no width): the forced width=4
+           hint regressed the mbs kernel ~2.8x at -O2+LTO (the vector
+           pipeline displaced the SLP-packed scalar code the general path
+           already gets — 357 vs ~992 vector ops in the LTO'd binary), while
+           enable-only is measured neutral-to-positive. */
+        if (fkKernelVec_) {
+            ops.push_back(MDNode::get(ctx_, {
+                MDString::get(ctx_, "llvm.loop.vectorize.enable"),
+                ConstantAsMetadata::get(ConstantInt::get(Type::getInt1Ty(ctx_), 1))
+            }));
+        } else {
+            ops.push_back(MDNode::get(ctx_, {
+                MDString::get(ctx_, "llvm.loop.vectorize.width"),
+                ConstantAsMetadata::get(ConstantInt::get(i32, 4))
+            }));
+        }
     }
     if (ops.size() == 1) return;
     auto *loopID = MDNode::getDistinct(ctx_, ops);
@@ -7507,18 +7529,16 @@ void CodeGen::emitRefPairLoad(Value *rowPv, Value *idx, Value *&re, Value *&im) 
 }
 
 /* The flat-branch body of tryLoadCplxPairF64, without any tagging:
-   "pair at idx" of a flat element row = (pv.data[idx], pv.data[idx+1]) —
+   "pair at idx" of a packed element row = (data[idx], data[idx+1]) —
    exactly what the general machinery's flat path produces, now as two
-   GEP+loads with nothing else. */
-void CodeGen::emitFlatPairLoad(Value *rowPv, Value *idx, Value *&re, Value *&im) {
-    auto *i8 = Type::getInt8Ty(ctx_);
+   GEP+loads with nothing else. dataPtr is the row's certified packed
+   buffer (pval directly for FLAT rows, pval->data for Stage-42 CPLX
+   rows — fkKernelData_ resolved it at the fk.pre branch). */
+void CodeGen::emitFlatPairLoad(Value *dataPtr, Value *idx, Value *&re, Value *&im) {
     auto *i64 = Type::getInt64Ty(ctx_);
     auto *f64 = Type::getDoubleTy(ctx_);
-    Value *pvalP = builder_.CreateGEP(i8, rowPv,
-        ConstantInt::get(i64, 8), "fk.pvalp");
-    Value *data = builder_.CreateLoad(perlPtrTy_, pvalP, "fk.data");
-    Value *reP = builder_.CreateGEP(f64, data, idx, "fk.rep");
-    Value *imP = builder_.CreateGEP(f64, data,
+    Value *reP = builder_.CreateGEP(f64, dataPtr, idx, "fk.rep");
+    Value *imP = builder_.CreateGEP(f64, dataPtr,
         builder_.CreateAdd(idx, ConstantInt::get(i64, 1), "fk.n1"), "fk.imp");
     re = builder_.CreateLoad(f64, reP, "fk.re");
     im = builder_.CreateLoad(f64, imP, "fk.im");
@@ -7608,8 +7628,12 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
         return false;
 
     /* Walk the body collecting the row variables and checking the allowed
-       statement shapes (v1: the mbs-pair kernel class). */
-    std::unordered_set<std::string> rows;
+       statement shapes (v1: the mbs-pair kernel class). Roles: bit0 = read
+       (a pair-READ bind), bit1 = written (an element store) — a row can be
+       both. The WAR distinctness proof below only needs (writer, anything)
+       pairs: reader/reader sharing of one packed buffer is conflict-free
+       (the mbs shapes alias the c rows with the z rows on purpose). */
+    std::unordered_map<std::string, uint8_t> rows;   /* bare name -> 1|2|3 */
     std::function<bool(const Node &)> walk = [&](const Node &s) -> bool {
         if (s.kind == NK::FlatBlock || s.kind == NK::Block) {
             for (auto &sub : s.args)
@@ -7621,7 +7645,13 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
         if (st->kind == NK::If) {
             /* the If shape: a branch list ({cond, body}); an else arm has
                cond == nullptr. Every conditional arm must be a relational
-               over two pure-f64 ops; every arm's body must itself qualify. */
+               over two pure-f64 op trees (the abs2 < 4.0 uniform-branch
+               shape) — note the top-level operator here is a RELATIONAL,
+               which fkNoRowTouch alone would refuse (it accepts only the
+               arithmetic ops); the operands must be row-pure f64 trees.
+               Stage 42 also fixes the pre-existing self-contradiction that
+               made this branch shape unreachable (the relational condition
+               was handed to fkNoRowTouch, which rejects every relational). */
             for (auto &br : st->branches) {
                 if (br.cond) {
                     if (br.cond->kind != NK::BinOp) return false;
@@ -7629,7 +7659,10 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
                     if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
                         op != "==" && op != "!=")
                         return false;
-                    if (!fkNoRowTouch(*br.cond)) return false;
+                    if (!br.cond->left || !br.cond->right ||
+                        !fkNoRowTouch(*br.cond->left) ||
+                        !fkNoRowTouch(*br.cond->right))
+                        return false;
                 }
                 if (br.body && !walk(*br.body)) return false;
             }
@@ -7642,8 +7675,9 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
             st->right->left->kind == NK::ScalarVar && st->right->right &&
             fkIndexForm(*st->right->right, idxBare)) {
             std::string bn = bare(st->name);
-            if (rows.count(bn)) return false;   /* re-binding a row var: no */
-            rows.insert(bare(st->right->left->name));
+            if (bn == bare(st->right->left->name)) return false;
+            if (rows.count(bn)) return false;   /* bind var is itself a row: no */
+            rows[bare(st->right->left->name)] |= 1;
             return true;
         }
         /* the float-arith bind: my $v = <pure f64 arithmetic over slots> */
@@ -7655,7 +7689,9 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
             st->left->left && st->left->left->kind == NK::ScalarVar &&
             st->left->right && fkIndexForm(*st->left->right, idxBare) &&
             fkNoRowTouch(*st->right)) {
-            rows.insert(bare(st->left->left->name));
+            std::string wn = bare(st->left->left->name);
+            if (wn == idxBare) return false;
+            rows[wn] |= 2;
             return true;
         }
         /* any other statement shape keeps the general path */
@@ -7678,20 +7714,24 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
                 const Node *st = &s;
                 if (st->kind == NK::ExprStmt && st->left) st = st->left.get();
                 if (st->kind == NK::If) {
-                    if (!st->cond || st->cond->kind != NK::BinOp) return "if-cond-not-binop";
-                    const std::string &op = st->cond->sval;
-                    if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
-                        op != "==" && op != "!=") return "if-op-not-relational";
-                    if (!fkNoRowTouch(*st->cond)) return "if-cond-row-touch";
-                    if (st->body) {
-                        const char *r = why(*st->body);
-                        if (r) return r;
-                    }
-                    for (auto &br : st->branches)
+                    for (auto &br : st->branches) {
+                        if (br.cond) {
+                            if (!br.cond || br.cond->kind != NK::BinOp)
+                                return "if-cond-not-binop";
+                            const std::string &op = br.cond->sval;
+                            if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
+                                op != "==" && op != "!=")
+                                return "if-op-not-relational";
+                            if (!br.cond->left || !br.cond->right ||
+                                !fkNoRowTouch(*br.cond->left) ||
+                                !fkNoRowTouch(*br.cond->right))
+                                return "if-cond-row-touch";
+                        }
                         if (br.body) {
                             const char *r2 = why(*br.body);
                             if (r2) return r2;
                         }
+                    }
                     return nullptr;
                 }
                 if (st->kind == NK::My && st->right &&
@@ -7700,9 +7740,13 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
                     st->right->left->kind == NK::ScalarVar && st->right->right) {
                     if (!fkIndexForm(*st->right->right, idxBare)) return "bind-idx-form";
                     std::string bn = bare(st->name);
+                    if (bn == bare(st->right->left->name)) return "bind-self-row";
                     if (rows.count(bn)) return "rebin-row-var";
                     return nullptr;
                 }
+                /* float-arith bind (mirror the real walk's acceptance) */
+                if (st->kind == NK::My && st->right && fkNoRowTouch(*st->right))
+                    return nullptr;
                 if (st->kind == NK::My && getenv("PERLC_DEBUG_ST41") && st->right)
                     fprintf(stderr, "  ST41 my %s: right kind=%d sval=%s\n",
                             st->name.c_str(), (int)st->right->kind, st->right->sval.c_str());
@@ -7718,7 +7762,8 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
             };
             if (getenv("PERLC_DEBUG_ST41")) {
                 const char *w = why(*n.body);
-                (void)w;
+                if (w)
+                    fprintf(stderr, "ST41: loop line %d rejected (%s)\n", n.line, w);
             }
         }
         return false;
@@ -7732,29 +7777,47 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
     fkEmitting_ = true;
     auto *i64 = Type::getInt64Ty(ctx_);
     auto *i1  = Type::getInt1Ty(ctx_);
+    auto *i32 = Type::getInt32Ty(ctx_);
     auto *fn  = builder_.GetInsertBlock()->getParent();
 
-    /* ── per-iteration prelude: prove every row flat + long enough ── */
+    /* ── per-iteration prelude: prove every row packed + long enough ──
+       Stage 42: PERL_CPLX_ROW counts pairs (matchpos = n) and needs
+       matchpos >= bound; PERL_FLAT_ARRAY counts elements and needs
+       matchpos >= 2*bound. Thread-shared rows never take the flat body. */
     Value *bound64 = emitExprI64(*n.cond->right);
     if (!bound64) return false;
     Value *twoBound = builder_.CreateMul(bound64,
         ConstantInt::get(i64, 2), "fk.twobound");
     Value *allOk = ConstantInt::get(i1, 1);
     std::unordered_map<std::string, Value *> rowPvs;
+    std::unordered_map<std::string, Value *> rowFlatQ;
     for (const auto &rnm : rows) {
-        Value *pv = scalarVarRawPv(rnm);
+        Value *pv = scalarVarRawPv(rnm.first);
         if (!pv) return false;
-        rowPvs[rnm] = pv;
-        Value *tag = builder_.CreateLoad(Type::getInt32Ty(ctx_), pv, "fk.tag");
+        rowPvs[rnm.first] = pv;
+        Value *tag = builder_.CreateLoad(i32, pv, "fk.tag");
         setTBAA(tag, tbaaPvTagTag_);
-        Value *isFlat = builder_.CreateICmpEQ(tag,
-            ConstantInt::get(Type::getInt32Ty(ctx_), 10), "fk.flatq");
+        Value *isFlat = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 10), "fk.flatq");
+        auto *isCplx = builder_.CreateICmpEQ(tag, ConstantInt::get(i32, 19), "fk.cplxpq");
+        rowFlatQ[rnm.first] = isFlat;
+        /* PV_FLAG_SHARED rows (threads::shared) keep the general body. */
+        Value *flagP = builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
+            ConstantInt::get(i64, 4), "fk.flgp");
+        Value *flags = builder_.CreateLoad(i32, flagP, "fk.flg");
+        Value *unshared = builder_.CreateICmpEQ(
+            builder_.CreateAnd(flags, ConstantInt::get(i32, 1)),
+            ConstantInt::get(i32, 0), "fk.unshared");
         Value *lenP = builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
             ConstantInt::get(i64, 16), "fk.lenp");
         Value *len = builder_.CreateLoad(i64, lenP, "fk.len");
-        Value *lenOk = builder_.CreateICmpSGE(len, twoBound, "fk.lenok");
+        Value *lenOK = builder_.CreateOr(
+            builder_.CreateAnd(isFlat, builder_.CreateICmpSGE(len, twoBound, "fk.flatlen")),
+            builder_.CreateAnd(isCplx, builder_.CreateICmpSGE(len, bound64, "fk.cplxlen")),
+            "fk.lenok");
+        Value *isFlatOrCplx = builder_.CreateAnd(
+            builder_.CreateOr(isFlat, isCplx, "fk.packedq"), unshared, "fk.rowok");
         allOk = builder_.CreateAnd(allOk,
-            builder_.CreateAnd(isFlat, lenOk, "fk.rowok"), "fk.ok");
+            builder_.CreateAnd(lenOK, isFlatOrCplx, "fk.ok"), "fk.all");
     }
     auto *flatBB      = BasicBlock::Create(ctx_, "fk.pre",     fn);
     auto *generalBB   = BasicBlock::Create(ctx_, "fk.general", fn);
@@ -7763,36 +7826,54 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
     builder_.CreateCondBr(allOk, flatBB, generalBB);
 
     builder_.SetInsertPoint(flatBB);
-    /* WAR versioning: pairwise-distinct data pointers disprove any
-       read/write overlap between the row buffers inside the flat body —
-       LLVM's dependence analysis consumes this branch directly. */
-    Value *allDist = ConstantInt::get(i1, 1);
-    std::vector<Value *> datas;
+    /* Resolve every row to its packed-double pointer: FLAT rows carry the
+       double[] directly in pval; CPLX rows carry a PerlCplxRow* whose data
+       field is the same interleaved layout (data[2i]=re, data[2i+1]=im). */
     for (const auto &rnm : rows) {
-        Value *pv = rowPvs[rnm];
+        Value *pv = rowPvs[rnm.first];
         Value *pvalP = builder_.CreateGEP(Type::getInt8Ty(ctx_), pv,
             ConstantInt::get(i64, 8), "fk.dp");
-        Value *d = builder_.CreateLoad(perlPtrTy_, pvalP, "fk.ddata");
-        datas.push_back(d);
+        Value *pval = builder_.CreateLoad(perlPtrTy_, pvalP, "fk.ddata");
+        Value *dpp = builder_.CreateGEP(Type::getInt8Ty(ctx_), pval,
+            ConstantInt::get(i64, 0), "fk.cd");
+        Value *cplxData = builder_.CreateLoad(perlPtrTy_, dpp, "fk.cplxdata");
+        Value *dptr = builder_.CreateSelect(rowFlatQ[rnm.first], pval,
+            cplxData, "fk.dsel");
+        fkKernelData_[rnm.first] = dptr;
     }
-    for (size_t a = 0; a < datas.size(); a++)
-        for (size_t b = a + 1; b < datas.size(); b++)
+    /* WAR versioning: distinctness between every (writer, other) pair of
+       packed data pointers disprove any read/write overlap between the row
+       buffers inside the flat body — LLVM's dependence analysis consumes
+       this branch directly. Reader/reader pairs are exempt: loads never
+       conflict, so two readers of the same buffer (the mbs c-aliased rows)
+       are safe. */
+    Value *allDist = ConstantInt::get(i1, 1);
+    for (const auto &a : rows) {
+        for (const auto &b : rows) {
+            if (a.first == b.first) continue;   /* same row = self-dependence */
+            bool aW = (a.second & 2) != 0;
+            bool bW = (b.second & 2) != 0;
+            if (!aW && !bW) continue;           /* read/read: no conflict */
             allDist = builder_.CreateAnd(allDist,
-                builder_.CreateICmpNE(datas[a], datas[b], "fk.dist"),
+                builder_.CreateICmpNE(fkKernelData_[a.first],
+                                      fkKernelData_[b.first], "fk.dist"),
                 "fk.distall");
+        }
+    }
     builder_.CreateCondBr(allDist, flatLoopBB, generalBB);
 
     /* ── the FLAT variant ── */
     builder_.SetInsertPoint(flatLoopBB);
     {
-        for (const auto &rnm : rows) knownFlatRows_.insert(rnm);
+        for (const auto &rnm : rows) knownFlatRows_.insert(rnm.first);
         flatKernelMode_ = true;
         flatDoubleCache_.clear();   /* the general variant's SSA doesn't dominate here */
         floatSqrtOf_.clear();
         lastSqrtInput_ = nullptr;
         emitStmt(n);               /* a re-emission of the same counted loop */
         flatKernelMode_ = false;
-        for (const auto &rnm : rows) knownFlatRows_.erase(rnm);
+        for (const auto &rnm : rows) knownFlatRows_.erase(rnm.first);
+        fkKernelData_.clear();
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(afterBB);
     }
@@ -7804,6 +7885,7 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
         flatDoubleCache_.clear();
         floatSqrtOf_.clear();
         lastSqrtInput_ = nullptr;
+        fkKernelData_.clear();
         emitStmt(n);
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateBr(afterBB);
@@ -7813,6 +7895,100 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
     builder_.SetInsertPoint(afterBB);
     fkEmitting_ = false;
     return true;
+}
+
+/* Stage 42 (packflat): does any node in this subtree name @anm — used to
+   refuse the specialization when a nested sub definition (named or
+   anonymous) can see the row array. */
+static bool packFlatMentionsName(const Node &n, const std::string &anm) {
+    if (n.name == anm) return true;
+    if (n.left && packFlatMentionsName(*n.left, anm)) return true;
+    if (n.right && packFlatMentionsName(*n.right, anm)) return true;
+    if (n.cond && packFlatMentionsName(*n.cond, anm)) return true;
+    if (n.body && packFlatMentionsName(*n.body, anm)) return true;
+    if (n.init && packFlatMentionsName(*n.init, anm)) return true;
+    if (n.step && packFlatMentionsName(*n.step, anm)) return true;
+    if (n.contBlock && packFlatMentionsName(*n.contBlock, anm)) return true;
+    for (const auto &a : n.args)
+        if (packFlatMentionsName(*a, anm)) return true;
+    for (const auto &br : n.branches) {
+        if (br.cond && packFlatMentionsName(*br.cond, anm)) return true;
+        if (br.body && packFlatMentionsName(*br.body, anm)) return true;
+    }
+    return false;
+}
+
+/* Stage 42 (packflat): true when @anm has no alias/reference escape in this
+   subtree except `return \@anm;` itself — RefArray(@anm) appears only as the
+   DIRECT left of a Return node; never under \ (element refs), never
+   local'd/our'd/locked, not mentioned by a nested sub definition. Reads
+   (element accesses, @r in list context, $#r) are harmless: the pack
+   happens at the escape, after all of them. foundMy (in/out) records a
+   sub-local my-declaration of the array. */
+static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
+                           bool directReturnLeft) {
+    if (n.kind == NK::RefArray && n.name == anm) return directReturnLeft;
+    if ((n.kind == NK::Our || n.kind == NK::LocalStmt || n.kind == NK::LockStmt) &&
+        n.name == anm)
+        return false;
+    if (n.kind == NK::My && n.name == anm) foundMy = true;
+    if ((n.kind == NK::SubDef || n.kind == NK::AnonSub) && n.body &&
+        packFlatMentionsName(*n.body, anm))
+        return false;
+    if (n.kind == NK::Return && n.left) {
+        if (!packFlatScanOk(*n.left, anm, foundMy, true)) return false;
+    } else if (n.left && !packFlatScanOk(*n.left, anm, foundMy, false)) {
+        return false;
+    }
+    if (n.right && !packFlatScanOk(*n.right, anm, foundMy, false)) return false;
+    if (n.cond && !packFlatScanOk(*n.cond, anm, foundMy, false)) return false;
+    if (n.body && !packFlatScanOk(*n.body, anm, foundMy, false)) return false;
+    if (n.init && !packFlatScanOk(*n.init, anm, foundMy, false)) return false;
+    if (n.step && !packFlatScanOk(*n.step, anm, foundMy, false)) return false;
+    if (n.contBlock && !packFlatScanOk(*n.contBlock, anm, foundMy, false)) return false;
+    for (const auto &a : n.args)
+        if (!packFlatScanOk(*a, anm, foundMy, false)) return false;
+    for (const auto &br : n.branches) {
+        if (br.cond && !packFlatScanOk(*br.cond, anm, foundMy, false)) return false;
+        if (br.body && !packFlatScanOk(*br.body, anm, foundMy, false)) return false;
+    }
+    return true;
+}
+
+/* Stage 42 (packflat): at a sub's `return \@r;` site — when the scan above
+   proves @r is a sub-local row-fill array with no alias escapes outside
+   return positions — pack the boxed interleaved numeric row into a
+   refcounted PERL_CPLX_ROW (perl_pack_flat_row) before the value is handed
+   out. The row is observably a REF-like value (clone shares the packed
+   buffer; perl_promote_ref_array skips CPLX_ROW), the boxed array keeps
+   today's lifetimes, and a NULL from the runtime (odd length / non-numeric
+   element / thread-shared / refcount > 1) falls back to the plain REF_ARRAY
+   hand-out — byte-identical to today. */
+void CodeGen::tryPackFlatReturnHook(const Node &ret, llvm::Value *&v) {
+    if (!ret.left || ret.left->kind != NK::RefArray) return;
+    const std::string &anm = ret.left->name;
+    if (anm.size() < 2 || anm[0] != '@') return;
+    bool foundMy = false;
+    if (!packFlatScanOk(*currentSubBody_, anm, foundMy, false)) return;
+    if (!foundMy) return;   /* not a sub-local my @r — packing could fork it */
+    Value *packed = callRT("perl_pack_flat_row", {v});   /* fresh owned temp */
+    auto *nullpv = ConstantPointerNull::get(perlPtrTy_);
+    Value *ok = builder_.CreateICmpNE(packed, nullpv, "pk.ok");
+    auto *fnx  = builder_.GetInsertBlock()->getParent();
+    auto *takeBB  = BasicBlock::Create(ctx_, "pk.take", fnx);
+    auto *keepBB  = BasicBlock::Create(ctx_, "pk.keep", fnx);
+    auto *afterBB = BasicBlock::Create(ctx_, "pk.after", fnx);
+    builder_.CreateCondBr(ok, takeBB, keepBB);
+    builder_.SetInsertPoint(takeBB);
+    freeIfOwned(v);   /* the REF temp is consumed by the packed hand-out */
+    builder_.CreateBr(afterBB);
+    builder_.SetInsertPoint(keepBB);
+    builder_.CreateBr(afterBB);
+    builder_.SetInsertPoint(afterBB);
+    auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "pk.row");
+    phi->addIncoming(packed, takeBB);
+    phi->addIncoming(v, keepBB);
+    v = phi;
 }
 
 /* Stage 40 (E6): emit the known-arity i64-args variant body for a qualified
@@ -9534,8 +9710,15 @@ void CodeGen::emitStmt(const Node &n) {
             /* Stage 34: vectorize only counted unboxed i64/f64 bodies (mbs's
                boxed FLOAT_PAIR inner for stays scalar). Inner unroll only
                when that body is also numeric — unrolling mbs would bloat IR.
-               D95: Disable unrolling by default to prevent LLVM IPO hangs. */
-            bool vec = cforIsCountedNumeric(n);
+               D95: Disable unrolling by default to prevent LLVM IPO hangs.
+               Stage 42: inside the certified FLAT variant's own emission the
+               body shape is already proven row-pure by the dual-emit walk
+               and prelude, so the vectorize hint attaches unconditionally —
+               the plain cfor predicate can't classify the kernel row shapes
+               from here. The general variant (fkEmitting_ but
+               flatKernelMode_ false) keeps the plain predicate. */
+            bool vec = cforIsCountedNumeric(n) || flatKernelMode_;
+            fkKernelVec_ = flatKernelMode_;
             if (getenv("PERLC_DEBUG_ST37"))
                 fprintf(stderr, "ST34 cfor vec=%d stmt=%d\n", (int)vec,
                         (int)stmtIsUnboxedNumeric(*n.body));
@@ -9993,6 +10176,12 @@ void CodeGen::emitStmt(const Node &n) {
                 v = emitExpr(*n.left);
                 callCtx_ = savedCtx;
             }
+        /* Stage 42 (packflat): `return \@r;` of a sub-local, provably
+           alias-safe numeric row packs to a refcounted CPLX_ROW before the
+           hand-out. */
+        if (isOptStageEnabled("packflat") && n.left &&
+            n.left->kind == NK::RefArray && currentSubBody_ && v)
+            tryPackFlatReturnHook(n, v);
         /* `return` inside eval{} exits just that eval block with this value
            (real Perl semantics — NOT die, and NOT a return from any
            enclosing sub even if one exists; execution resumes after the
@@ -11515,19 +11704,27 @@ Value *CodeGen::emitExpr(const Node &n) {
                     and mixed chains like $ref->{a}[0][1]. */
                 if (needsScalarRootedAutoviv(*n.left)) {
                     /* Stage 41: inside a guarded flat-kernel body the row
-                       variable is proven FLAT and its index in range by
-                       the loop prelude — write straight into the packed
-                       buffer (no promote, no dispatch, no fallback). */
+                       variable is proven FLAT (or Stage-42 CPLX) and its
+                       index in range by the loop prelude — write straight
+                       into the packed buffer (no promote, no dispatch, no
+                       fallback). */
                     if (flatKernelMode_ && isOptStageEnabled("st41") &&
                         n.left->left->kind == NK::ScalarVar &&
                         knownFlatRows_.count(bareVarName(n.left->left->name))) {
                         if (Value *fv = emitExprF64(*n.right)) {
-                            Value *row = scalarVarRawPv(n.left->left->name);
-                            Value *dP = builder_.CreateGEP(
-                                Type::getInt8Ty(ctx_), row,
-                                ConstantInt::get(Type::getInt64Ty(ctx_), 8),
-                                "fk.st.pvalp");
-                            Value *data = builder_.CreateLoad(perlPtrTy_, dP, "fk.st.data");
+                            auto dit = fkKernelData_.find(
+                                bareVarName(n.left->left->name));
+                            Value *data;
+                            if (dit != fkKernelData_.end()) {
+                                data = dit->second;
+                            } else {
+                                Value *row = scalarVarRawPv(n.left->left->name);
+                                Value *dP = builder_.CreateGEP(
+                                    Type::getInt8Ty(ctx_), row,
+                                    ConstantInt::get(Type::getInt64Ty(ctx_), 8),
+                                    "fk.st.pvalp");
+                                data = builder_.CreateLoad(perlPtrTy_, dP, "fk.st.data");
+                            }
                             Value *idxS = emitIdx(*n.left->right);
                             auto *fst = builder_.CreateStore(fv,
                                 builder_.CreateGEP(Type::getDoubleTy(ctx_), data,

@@ -142,6 +142,7 @@ PerlValue *perl_alloc_float_array(long long n); /* alloc FLAT_ARRAY with n zero 
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
 PerlValue *perl_alloc_cplx_row(long long n); /* PERL_CPLX_ROW of n zero pairs */
 PerlValue *perl_cplx_elem(PerlValue *row, long long idx); /* $row->[$i] as FLOAT_PAIR (clone) */
+PerlValue *perl_pack_flat_row(PerlValue *refpv); /* Stage 42: REF'd interleaved numeric row -> CPLX_ROW (NULL = refuse, untouched) */
 PerlValue *perl_alloc_xs_ptr(void *p);
 PerlValue *perl_clone(const PerlValue *v);
 void       perl_free(PerlValue *v);

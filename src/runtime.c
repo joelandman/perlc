@@ -1307,6 +1307,61 @@ static int cplx_row_maybe_convert(PerlValue *row) {
     return 1;
 }
 
+/* Stage 42 (packflat): pack a borrow-safe PerlArray of interleaved numeric
+   PV boxes (the sub-returned row shape: element 2i is the re half, 2i+1 the
+   im half) into ONE refcounted PERL_CPLX_ROW PV, so row-valued subs hand out
+   packed rows directly instead of REF'd box arrays. The alias model is the
+   standard CPLX_ROW one (clone = refcount++ share; writes through any alias
+   hit the same buffer), which is also why no D105 promote is needed at the
+   hand-out: perl_promote_ref_array already skips CPLX_ROW, so every clone
+   made from this value shares the packed buffer exactly like a REF_ARRAY
+   would share its PerlArray.
+   Refuses (returns NULL, input completely untouched) when:
+   - refpv is not a REF_ARRAY (or has no backing array),
+   - the array is thread-shared (mu set) or refcount > 1 (another PV aliasing
+     this array would keep the box view while this PV shows packed — a fork),
+   - the length is odd (not a whole number of interleaved pairs),
+   - any element is not INT/FLOAT (undef, strings, refs, blessed values have
+     no byte-exact packed round trip), or
+   - INT elements appear mixed with floats WITHIN one half (re half / im half).
+   Homogeneous int halves are carried by the row PV's D154 bits
+   (PV_FLAG_INT_ELEMS = every re-half element was an INT, PV_FLAG_INT_ELEM2 =
+   every im-half element was an INT) and are honored by the CPLX branches of
+   perl_cplx_elem / perl_deref_array below, so the box-up round trip
+   reproduces the original element values (including IV-ness) exactly. */
+PerlValue *perl_pack_flat_row(PerlValue *refpv) {
+    if (!refpv || refpv->tag != PERL_REF_ARRAY || !refpv->pval) return NULL;
+    PerlArray *a = (PerlArray *)refpv->pval;
+    if (!a || a->mu || a->refcount > 1) return NULL;
+    long long n = a->len;
+    if (n < 0 || (n & 1L)) return NULL;
+    long long pairs = n / 2;
+    int allReInt = 1, allImInt = 1;
+    for (long long i = 0; i < n; i++) {
+        PerlValue *e = a->elems[i];
+        if (!e || (e->tag != PERL_INT && e->tag != PERL_FLOAT)) return NULL;
+        if (i % 2 == 0) { if (e->tag != PERL_INT) allReInt = 0; }
+        else            { if (e->tag != PERL_INT) allImInt = 0; }
+    }
+    int bits = 0;
+    if (allReInt && pairs > 0) bits |= PV_FLAG_INT_ELEMS;
+    if (allImInt && pairs > 0) bits |= PV_FLAG_INT_ELEM2;
+    PerlCplxRow *r = cplx_row_new(pairs, pairs > 0 ? pairs : 8);
+    if (!r) return NULL;
+    for (long long i = 0; i < n; i++) {
+        PerlValue *e = a->elems[i];
+        if (e->tag == PERL_INT) r->data[i] = (double)e->ival;
+        else                    r->data[i] = e->fval;
+    }
+    PerlValue *out = pv_alloc();
+    out->tag = PERL_CPLX_ROW;
+    out->blessed_class = NULL;
+    out->pval = r;
+    out->matchpos = pairs;
+    out->flags = (unsigned int)bits;
+    return out;
+}
+
 HOTX PerlValue *perl_cplx_elem(PerlValue *row, long long idx) {
     if (!row) return perl_alloc_undef();
     if (row->tag == PERL_CPLX_ROW) {
@@ -1314,7 +1369,13 @@ HOTX PerlValue *perl_cplx_elem(PerlValue *row, long long idx) {
         if (!r) return perl_alloc_undef();
         if (idx < 0) idx += r->n;
         if (idx < 0 || idx >= r->n) return perl_alloc_undef();
-        return perl_alloc_float_pair(r->data[2 * idx], r->data[2 * idx + 1]);
+        PerlValue *pv = perl_alloc_float_pair(r->data[2 * idx], r->data[2 * idx + 1]);
+        /* Stage 42: a packed row's re/im halves remember IV-ness (D154
+           bits) — re-boxed elements must present the same int-ness the
+           original boxes did. */
+        if (row->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2))
+            pv->flags |= (row->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2));
+        return pv;
     }
     if (row->tag == PERL_FLOAT_PAIR) {
         if (idx < 0) idx += 2;
@@ -4785,6 +4846,10 @@ PerlArray *perl_deref_array(PerlValue *ref) {
         long long n = r ? r->n : 0;
         for (long long i = 0; i < n; i++) {
             PerlValue *p = perl_alloc_float_pair(r->data[2 * i], r->data[2 * i + 1]);
+            /* Stage 42: carry the packed row's D154 int-half bits onto the
+               re-boxed pairs so promotion reproduces the original elements. */
+            if (ref->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2))
+                p->flags |= (ref->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2));
             perl_array_push(av, p);
             perl_free(p);
         }

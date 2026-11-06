@@ -91,20 +91,42 @@ public:
        the FLAT variant of a qualified counted loop, the pair-read and
        element-store emitters short-circuit to direct indexed GEPs — no tag
        dispatch, no promote, no calls. Soundness: a per-iteration prelude
-       AND-proves every row variable's tag == PERL_FLAT_ARRAY, its element
-       count covers the loop bound, and (WAR versioning for the vectorizer)
-       the three packed data pointers are pairwise distinct. The general
-       variant (the ordinary machinery, verbatim) covers all other runtime
-       shapes. Disable with PERLC_OPT_DISABLE=st41. */
-    bool flatKernelMode_ = false;   /* rows are proven PERL_FLAT_ARRAY + in-range */
+       AND-proves every row variable's tag is a packed pair row
+       (PERL_FLAT_ARRAY with >= 2*bound elements, or PERL_CPLX_ROW — Stage
+       42 — with >= bound pairs), the PV is not thread-shared, and (WAR
+       versioning for the vectorizer) every (writer, other) pair of packed
+       data pointers is distinct — reader/reader sharing is exempt (loads
+       never conflict; the mbs shapes alias the c rows with the z rows).
+       The general variant (the ordinary machinery, verbatim) covers all
+       other runtime shapes. Disable with PERLC_OPT_DISABLE=st41. */
+    bool flatKernelMode_ = false;   /* rows are proven packed pair rows + in-range */
+    bool fkKernelVec_ = false;      /* Stage 42: the FLAT variant's loop carries the enable-only vec hint */
     bool refKernelMode_ = false;    /* rows are proven REF_ARRAY + in-range (boxes) */
     bool fkEmitting_ = false;       /* inside tryEmitFlatKernelFor's own re-emissions */
     std::unordered_set<std::string> knownFlatRows_;
     std::unordered_set<std::string> knownRefRows_;
+    /* Stage 42: per-row certified packed-buffer pointer inside the FLAT
+       variant (select(tag==FLAT, pv.pval, pv.pval->data)) — consumed by the
+       pair-read/store emitters so they index raw doubles for FLAT and CPLX
+       rows alike. Filled at the fk.pre branch; cleared with the other
+       per-variant IR caches. */
+    std::unordered_map<std::string, llvm::Value *> fkKernelData_;
     bool tryEmitFlatKernelFor(const Node &n);
     llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
-    void emitFlatPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
+    void emitFlatPairLoad(llvm::Value *dataPtr, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
     void emitRefPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
+
+    /* Stage 42 (packflat): at a sub's `return \@r;` site — when a codegen
+       scan proves @r is sub-local with no alias escapes outside return
+       positions (no other \refs, no element refs, no local(), no nested
+       subs referencing it) — pack the boxed interleaved numeric row into a
+       refcounted PERL_CPLX_ROW (perl_pack_flat_row) before the value is
+       handed out. Observed as a REF-like aliasable value (clone shares the
+       packed buffer); the boxed array keeps today's lifetimes. On refusal
+       (NULL from runtime, e.g. odd length / non-numeric element) the plain
+       REF_ARRAY hand-out stays — byte-identical to today. Gate:
+       PERLC_OPT_DISABLE=packflat. */
+    void tryPackFlatReturnHook(const Node &ret, llvm::Value *&v);
 
     /* Inline the D105 promote's no-op fast path at read time (Stage 38).
        perl_promote_ref_array as a call cost ~15% of regex-heavy and was on

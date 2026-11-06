@@ -3590,6 +3590,54 @@ A failing `try` with no `catch` returns undef without rethrowing
   GVN/LICM of flat-row caches across every hot loop read (nb's j-loop
   ran 17.7s → 0.7s with the inline alone). Same call-time semantics
   (the promote is still a no-op for all other tags).
+- **Stage 42 packflat rows + flat-kernel pair-row prelude** (2026-11-06,
+  strategic packed-rows item): sub-returned interleaved numeric rows
+  (the `flat_fill_pair`-shaped producers) are packed at the
+  `return \@r;` site into ONE refcounted `PERL_CPLX_ROW`
+  (`perl_pack_flat_row`), so the row VALUES that reach hot kernels are
+  packed doubles with REF-share clone semantics (clone = refcount++,
+  writes through any alias hit the same buffer, and
+  `perl_promote_ref_array` already skips CPLX_ROW) — the D105 alias
+  contract needs no extra promote at the hand-out. Refusal (NULL)
+  returns the plain REF_ARRAY hand-out byte-identical: non-REF_ARRAY
+  input, thread-shared (mu) or refcount>1 arrays (the fork guard),
+  odd length, non-INT/FLOAT elements (undef/strings/refs/blessed), or
+  INTs mixed with floats within one half; homogeneous int halves
+  re-box byte-exactly via the row PV's D154 bits
+  (`PV_FLAG_INT_ELEMS`/`INT_ELEM2`, honored by the CPLX branches of
+  `perl_cplx_elem`/`perl_deref_array`). Gate
+  `PERLC_OPT_DISABLE=packflat`. The codegen-side qualification (no
+  other RefArray escapes outside `return` positions, no element refs,
+  no local()/lock/our, no nested subs mentioning the array, is a
+  sub-local `my`) is the scan `packFlatScanOk`. Soundness note: the
+  packed row's alias discipline is exactly Stage 35's — one buffer,
+  refcount-shared, so any alias made from it (the `@c[$j] = $z[$j]`
+  copy) sees mutations, matching real perl; element values read back
+  byte-identically (IV-hinted pair boxes for int halves).
+  The Stage-41 flat-kernel prelude now certifies BOTH packed row tags
+  (FLAT: `matchpos >= 2*bound`; CPLX: `matchpos >= bound` pairs),
+  refuses `PV_FLAG_SHARED` rows, and replaces the old ALL-pairs data
+  distinctness with role-aware WAR (writer-vs-anything distinct;
+  reader/reader buffer sharing is conflict-free — the mbs shapes alias
+  the c rows with the z rows). Row pair-loads/stores inside the
+  certified body resolve the packed buffer once (`fkKernelData_`:
+  select(tag==FLAT, pval, pval->data)), so FLAT and CPLX rows take
+  the same raw-double body. ALSO FIXED (pre-existing Stage-41 bug):
+  the kernel walk handed the If arm's RELATIONAL condition to
+  `fkNoRowTouch`, which only accepts +-*/ — so every
+  `if ($abs2 < 4.0)`-shaped kernel was structurally unreachable; the
+  condition's OPERANDS are now checked instead. The vec hint on the
+  certified FLAT loops is enable-only (`llvm.loop.vectorize.enable`,
+  no width): the width=4 forced hint regressed mbs ~2.8x at -O2+LTO
+  (the vector pipeline displaced the SLP-packed scalar code the
+  general path already gets — 357 vs ~992 vector ops in the LTO'd
+  binary); the width-forced path is recorded here for the follow-up
+  (LLVM's LV currently declines the certified loops anyway —
+  "control flow cannot be substituted for a select"/pass-ordering —
+  so the hint is measured-neutral until that clears). Tests:
+  `tests/packflat_{smoke,deep}.pl` (alias share through packed rows,
+  element round-trips, refusal fallbacks, kernel-1/kernel-2 agreement,
+  push hand-out aliasing), plus the full gate.
 
 ### Future: auto-parallel `map` / counted loops (2026-09-22, deferred)
 

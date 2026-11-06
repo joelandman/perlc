@@ -261,3 +261,73 @@ Outputs byte-verified vs perl 5.44 at both levels (mbs's own four
   Remaining strategic: the packed-rows representation (Stage 41's
   lever), auto-parallel counted loops, and the D197/D198
   unboxing-safety classes.
+
+## Stage 42 — packed rows + live flat-kernel prelude (2026-11-06, this session)
+
+The strategic "packed-rows" item, landed. The design ledger's
+representation already existed — `PERL_CPLX_ROW` (Stage 35) IS the
+refcounted packed-buffer row model (clone = refcount++ share, writes
+through any alias in place, promote skips it) — so the work collapsed
+to three contained pieces:
+
+1. **Producers** (`packflat`, gated `PERLC_OPT_DISABLE=packflat`): a
+   sub's `return \@r;` — when a codegen scan proves @r is a sub-local
+   row-fill array with no alias escapes outside return positions — packs
+   the boxed interleaved numeric row into a refcounted CPLX_ROW
+   (`perl_pack_flat_row`) before the hand-out. Every refusal path
+   returns the plain REF hand-out byte-identical (odd length /
+   non-numeric elements / thread-shared / refcount > 1 / mixed int
+   halves — the last carried by D154 bits on the row PV and honored on
+   re-boxing). The alias contract needs NO promote at the hand-out
+   (promote already skips CPLX_ROW): clones share the packed buffer
+   exactly like REFs share a PerlArray.
+2. **FK prelude over packed rows**: certifies FLAT (`>= 2*bound`
+   elements) AND CPLX (`>= bound` pairs) rows, refuses thread-shared
+   rows, and replaces the all-pairs data-distinctness with role-aware
+   WAR (writer-vs-anything distinct; reader/reader sharing is
+   conflict-free — required by the mbs shapes, where the c rows alias
+   the z rows). Row pair-load/store emitters resolve the packed buffer
+   once (`fkKernelData_`) so FLAT and CPLX rows share one body.
+3. **Pre-existing Stage-41 bug fixed**: the If arm's relational
+   condition was handed to `fkNoRowTouch` (which only accepts +-*/), so
+   every `if ($abs2 < 4.0)`-shaped kernel was structurally unreachable.
+   The operands are checked instead; kernel-2 class certified live.
+
+### Measured (mbs640, plain -O2 default build)
+
+| config | mbs runtime |
+|---|---|
+| old tree (= 8cd0c4b) | 1.43 s |
+| Stage 42, packflat on, FK off | **1.43 s** (rows packed, zero regression) |
+| Stage 42, everything on (enable-only hint) | **1.44 s** |
+| Stage 42, **width=4 forced hint** | 3.98 s (reverted — see below) |
+
+Outputs byte-verified vs perl 5.44 in every configuration. New tests
+`tests/packflat_{smoke,deep}.pl` byte-identical (alias-share through
+packed rows, element round-trips, IV-hint re-boxing, refusal fallbacks,
+kernel-1/kernel-2 agreement, push hand-out aliasing).
+
+### The hint finding (recorded for the follow-up)
+
+Forcing `llvm.loop.vectorize.width=4` on the certified flat-loops
+REGRESSED mbs ~2.8× at -O2+LTO — the vector pipeline displaced the
+SLP-packed scalar code the general path already gets (357 vs ~992
+vector ops in the LTO'd binary). The landed hint is `enable`-only,
+measured neutral: LLVM's LV currently declines these loops anyway
+("control flow cannot be substituted for a select" / pass-ordering —
+captured via `-Rpass-analysis=loop-vectorize`), so the flat body runs
+and the SLP-packed general code is preserved. The actual SIMD win now
+hinges on clearing THAT LV refusal (loop-versioning/if-convert ordering
+over the certified data pointers) — the next LLVM-side iteration, not
+a codegen-side one.
+
+### Strategic state after Stage 42
+
+- Packed rows: **landed, live, no regression** — producers emit packed
+  rows and every consumer (Stage 35/36/39/41 machinery) handles them.
+- Flat-kernel dual-emit: **live over packed rows** (both kernel
+  classes), byte-exact, neutral today pending the LV work above.
+- Auto-parallel counted loops: unchanged from the 2026-09-22 design
+  note (TESTS.md §"Future: auto-parallel"); its precondition ("a packed
+  FLAT/CPLX C worker over double[]") is now materially closer.
+- D197/D198 remain open (unboxing-safety classes).
