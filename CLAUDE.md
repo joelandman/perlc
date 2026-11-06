@@ -41,17 +41,29 @@ ablations: `docs/optimization_findings_2026-11-04.md`,
 `docs/optimization_findings_2026-11-05_landing.md` (the landing
 record). Correctness gates: `make test-all` **621/621 PASS** vs real
 perl plus `make bench-regress` PASS (the perlc-vs-perlc runtime
-regression gate). **Open perf follow-ups:** D207/D203 (making real
-programs FK-certifiable end-to-end — D105's promote-inline converts read
-rows to REF in place, which currently keeps the certified flat bodies
-off every promote-touching loop; needs the packed-PV value model to
-become REF-faithful; the packflat producer hook is fixed but gated
-behind `PERLC_PACK_RET=1` for the same reason); map/grep parallelism.
-**Closed 2026-11-06:** D199's boxed-path tail (all boxed division/modulo
-paths die catchably with the realPerl location — D204 `$0` fixed
-adjacent), Stage 45 auto-parallel counted loops (`autopar` knob,
-persistent pool, 9.3× pool-level parallel, `tests/autopar_*`) and D205
-(pack-pair store corruption) + D206 (paren-blind FK walk). Tests:
+regression gate). **Closed 2026-11-06 evening — D207 (refcounted FLAT
+backings):** every FLAT row's double[] sits behind an atomic refcount
+header; clones/assigns/local-saves SHARE the backing (the arrayref alias
+contract), so D105's promote lost its FLAT arm — rows stay tag-10
+through reads and the FK flat certification finally runs on real
+programs (**mbs640 -O2 1.41 s → 0.22 s, ≈6.4×**, content byte-identical;
+`fk.flatin.seq` executing with rows tag-10 at the kernel). The packflat
+producer hook is default-ON (knob `packflat`) handing out shared-backed
+2N-scalar FLAT rows; nested 2D scalar stores write through the backing
+(`perl_array_set_row`, no autoviv fork); storable/json/dumper/mesh box
+FLAT rows explicitly. Known v1 limitation: boxed-view conversion
+(`@$row`-style paths, non-numeric 2D stores) on a shared row still
+forks views. **Open perf follow-ups:** D203 (packed-literal
+list-position surface: `print "@z"`, list-assign element identity —
+clone-fork half already fixed by D207); map/grep parallelism; worker-
+body codegen parity (worker chunks ≈2× slower per element than the
+inline sequential flat body, which caps end-to-end auto-parallel wins
+at ≈1.2× on small shapes — pool-level 9.3× stands).
+**Closed 2026-11-06 (earlier):** D199's boxed-path tail (all boxed
+division/modulo paths die catchably with the realPerl location — D204
+`$0` fixed adjacent), Stage 45 auto-parallel counted loops (`autopar`
+knob, persistent pool, 9.3× pool-level parallel, `tests/autopar_*`) and
+D205 (pack-pair store corruption) + D206 (paren-blind FK walk). Tests:
 `tests/packflat_{smoke,deep}.pl`,
 `tests/div_zero_paren_{smoke,deep}.pl`,
 `tests/d197_defined_promo_{smoke,deep}.pl`,

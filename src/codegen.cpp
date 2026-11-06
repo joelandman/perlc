@@ -8719,17 +8719,20 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
    element / thread-shared / refcount > 1) falls back to the plain REF_ARRAY
    hand-out — byte-identical to today. */
 void CodeGen::tryPackFlatReturnHook(const Node &ret, llvm::Value *&v) {
-    /* OPT-IN (PERLC_PACK_RET=1). The packed row hand-out fixes three
-       pre-2026-11-06 dead-bugs (the pkBareName sigil-mismatched scan, the
-       emitBlockLast duplicate arm missing the hook, and FLAT element-view
-       semantics), but the packed-PV VALUE MODEL is not yet fully
-       REF-faithful for every observable (`@$row` list views, list-position
-       consumption, `ref()`-class surface — the row D203 family), so until
-       that work lands the producer packing stays off, exactly as the
-       hook's never-firing pre-fix behavior (which the byte gates were
-       actually testing). */
-    if (!getenv("PERLC_PACK_RET")) return;
+    /* D207 (2026-11-06) — default ON. The three pre-2026-11-06 dead-bugs
+       (the pkBareName sigil-mismatched scan, the emitBlockLast
+       last-statement-Return duplicate missing the hook, and the pair-view
+       hand-out shape) are fixed, and with D207's refcounted FLAT backings
+       the packed hand-out is observably the producer's own 2N-element
+       array (clones share; element reads box data[i] with D154 IV bits;
+       the FK flat certification accepts it). The pack was opt-in
+       (PERLC_PACK_RET=1) only while the value model was still
+       diverging; those gates now pass with the hook live. */
     if (!ret.left || ret.left->kind != NK::RefArray) return;
+    /* Stage knob: PERLC_OPT_DISABLE=packflat restores the plain REF-array
+       hand-out (pre-D207 packflat behavior). PERLC_PACK_RET=1 is kept as
+       a historical no-op acceptor so old scripts don't error. */
+    if (!isOptStageEnabled("packflat")) return;
     /* Parser-produced RefArray names carry no sigil ("r"), and neither do
        ArrayVar uses inside the body — while the declaring `my @r` (and
        Our/Local/Lock) nodes store "@r". BARE-name normalization on both
@@ -12480,15 +12483,51 @@ Value *CodeGen::emitExpr(const Node &n) {
                 if (n.left->left->kind == NK::HashElem) {
                     Value *outerHv = lookupHash(n.left->left->name);
                     if (!outerHv) return perlUndef();
-                    Value *innerAv;
-                    if (Value *kp = constKeyPtr(*n.left->left->left, builder_))
-                        innerAv = callRT("perl_hash_autoviv_array", {outerHv, kp});
-                    else {
+                    /* D207: if the slot already holds a FLAT row, store into
+                       the refcounted backing via perl_array_set_row (keeps
+                       the row FLAT, in place, visible to every alias —
+                       d106 deep's $hy = $h{k} must see $h{k}[1] = 66).
+                       Boxing via the autoviv path would fork the shared
+                       backing's view. Missing/undef/REF rows keep the
+                       autovivifying original path (get_*_ref returns the
+                       undef sentinel for missing keys — never tag 10). */
+                    Value *rowRef;
+                    if (Value *kp = constKeyPtr(*n.left->left->left, builder_)) {
+                        rowRef = callRT("perl_hash_get_str_ref", {outerHv, kp});
+                    } else {
                         Value *key = emitExpr(*n.left->left->left);
-                        innerAv = callRT("perl_hash_autoviv_array_sv", {outerHv, key});
+                        rowRef = callRT("perl_hash_get_sv_ref", {outerHv, key});
                         freeIfOwned(key);
                     }
-                    callRT("perl_array_set", {innerAv, idx, rhs});
+                    Value *r2dTag = builder_.CreateLoad(
+                        Type::getInt32Ty(ctx_), rowRef, "h2d.tag");
+                    setTBAA(r2dTag, tbaaPvTagTag_);
+                    Value *r2dFlat = builder_.CreateICmpEQ(
+                        r2dTag, ConstantInt::get(Type::getInt32Ty(ctx_), 10),
+                        "h2d.flat");
+                    Function *h2dFn = builder_.GetInsertBlock()->getParent();
+                    auto *h2dF = BasicBlock::Create(ctx_, "h2d.f", h2dFn);
+                    auto *h2dN = BasicBlock::Create(ctx_, "h2d.n", h2dFn);
+                    auto *h2dM = BasicBlock::Create(ctx_, "h2d.m", h2dFn);
+                    builder_.CreateCondBr(r2dFlat, h2dF, h2dN);
+                    builder_.SetInsertPoint(h2dF);
+                    callRT("perl_array_set_row", {rowRef, idx, rhs});
+                    builder_.CreateBr(h2dM);
+                    auto *h2dFp = builder_.GetInsertBlock();
+                    builder_.SetInsertPoint(h2dN);
+                    Value *innerAvH;
+                    if (Value *kp2 = constKeyPtr(*n.left->left->left, builder_))
+                        innerAvH = callRT("perl_hash_autoviv_array", {outerHv, kp2});
+                    else {
+                        Value *key2 = emitExpr(*n.left->left->left);
+                        innerAvH = callRT("perl_hash_autoviv_array_sv", {outerHv, key2});
+                        freeIfOwned(key2);
+                    }
+                    callRT("perl_array_set", {innerAvH, idx, rhs});
+                    builder_.CreateBr(h2dM);
+                    auto *h2dNp = builder_.GetInsertBlock();
+                    builder_.SetInsertPoint(h2dM);
+                    (void)h2dFp; (void)h2dNp;
                     return rhs;
                 }
                 /* autovivify $a[i][j] = val */
@@ -12496,8 +12535,34 @@ Value *CodeGen::emitExpr(const Node &n) {
                     Value *outerAv = lookupArray(n.left->left->name);
                     if (!outerAv) return perlUndef();
                     Value *outerIdx = emitIdx(*n.left->left->left);
-                    Value *innerAv  = callRT("perl_array_autoviv_array", {outerAv, outerIdx});
+                    /* D207: same FLAT-aware routing as the hash-element
+                       root above — an existing FLAT row is written through
+                       its refcounted backing (perl_array_set_row), not
+                       boxed into a fresh PerlArray that forks the storage
+                       away from aliases taken before the write. */
+                    Value *rowRef = callRT("perl_array_get_ref", {outerAv, outerIdx});
+                    Value *r2dTag = builder_.CreateLoad(
+                        Type::getInt32Ty(ctx_), rowRef, "r2d.tag");
+                    setTBAA(r2dTag, tbaaPvTagTag_);
+                    Value *r2dFlat = builder_.CreateICmpEQ(
+                        r2dTag, ConstantInt::get(Type::getInt32Ty(ctx_), 10),
+                        "r2d.flat");
+                    Function *r2dFn = builder_.GetInsertBlock()->getParent();
+                    auto *r2dF = BasicBlock::Create(ctx_, "r2d.f", r2dFn);
+                    auto *r2dN = BasicBlock::Create(ctx_, "r2d.n", r2dFn);
+                    auto *r2dM = BasicBlock::Create(ctx_, "r2d.m", r2dFn);
+                    builder_.CreateCondBr(r2dFlat, r2dF, r2dN);
+                    builder_.SetInsertPoint(r2dF);
+                    callRT("perl_array_set_row", {rowRef, idx, rhs});
+                    builder_.CreateBr(r2dM);
+                    auto *r2dFp = builder_.GetInsertBlock();
+                    builder_.SetInsertPoint(r2dN);
+                    Value *innerAv = callRT("perl_array_autoviv_array", {outerAv, outerIdx});
                     callRT("perl_array_set", {innerAv, idx, rhs});
+                    builder_.CreateBr(r2dM);
+                    auto *r2dNp = builder_.GetInsertBlock();
+                    builder_.SetInsertPoint(r2dM);
+                    (void)r2dFp; (void)r2dNp;
                     return rhs;
                 }
                 /* autovivify $h{a}{b}[i] = val or deeper chains — base is

@@ -101,6 +101,41 @@ static inline void pv_free_track(PerlValue *v)  {}
  * the cache-miss penalty that dominates perl_clone time in tight loops. */
 #define PV_SLAB 512
 
+/* ── refcounted FLAT_ARRAY backings (D207, 2026-11-06) ────────────────────
+   A FLAT row's double[] lives behind a refcount header; pv->pval points at
+   the DATA (every existing reader of pval-as-double* is unchanged). Clones
+   of a FLAT row SHARE the backing (bump the refcount) instead of memcpy-
+   forking it, which is exactly an arrayref's alias contract and what
+   D105's promote-inline existed to manufacture by converting rows to REF
+   arrays. With shares instead of forks, rows stay tag-10 through reads —
+   the FK flat-loop certification (tag 10/19 + length) can pass on real
+   programs — and the promote keeps FLOAT_PAIR handling only. The header
+   is 8 bytes so data stays 8-aligned; refcount updates are atomic so
+   thread-shared rows still refuse certification but plain clones from
+   multiple threads cannot corrupt the count. */
+typedef struct FlatHeader { long long refcount; } FlatHeader;
+
+static double *flat_data_alloc(long long n) {
+    FlatHeader *h =
+        (FlatHeader *)malloc(sizeof(FlatHeader) + (size_t)n * sizeof(double));
+    if (!h) return NULL;
+    h->refcount = 1;
+    return (double *)(h + 1);
+}
+
+static void flat_release(double *data) {
+    if (!data) return;
+    FlatHeader *h = (FlatHeader *)data - 1;
+    if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) == 0)
+        free(h);
+}
+
+static void flat_share(double *data) {
+    if (!data) return;
+    FlatHeader *h = (FlatHeader *)data - 1;
+    __atomic_add_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL);
+}
+
 static inline PerlValue *pv_alloc(void) {
     if (__builtin_expect(pv_freelist_ != NULL, 1)) {
         PerlValue *v  = pv_freelist_;
@@ -388,6 +423,7 @@ static __thread PerlValue s_dollar_under;
 /* Forward declarations for die-related functions — needed so calls before
    the definition (perl_mod, div-by-zero, substr) see the correct signature. */
 static char *appendDieLocation(char *msg, const char *filename, int line);
+static PerlValue *flat_elem_box(double d, int intElems);
 static int call_sig_handler(const char *name, PerlValue *msg_pv);
 static int perl_parse_signal(PerlValue *v);
 static void perl_sig_install(const char *key, PerlValue *val);
@@ -1307,35 +1343,34 @@ static int cplx_row_maybe_convert(PerlValue *row) {
     return 1;
 }
 
-/* Stage 42 (packflat): pack a borrow-safe PerlArray of interleaved numeric
+/* Stage 42 / D207: pack a borrow-safe PerlArray of interleaved numeric
    PV boxes (the sub-returned row shape: element 2i is the re half, 2i+1 the
-   im half) into ONE refcounted PERL_CPLX_ROW PV, so row-valued subs hand out
-   packed rows directly instead of REF'd box arrays. The alias model is the
-   standard CPLX_ROW one (clone = refcount++ share; writes through any alias
-   hit the same buffer), which is also why no D105 promote is needed at the
-   hand-out: perl_promote_ref_array already skips CPLX_ROW, so every clone
-   made from this value shares the packed buffer exactly like a REF_ARRAY
-   would share its PerlArray.
-   Refuses (returns NULL, input completely untouched) when:
+   im half) into ONE refcounted SHARED-BACKED FLAT_ARRAY PV, so row-valued
+   subs hand out packed rows directly instead of REF'd box arrays. The
+   model is the plain packed-element one: 2N scalar elements, clones share
+   the backing (refcount), element reads box data[i] with the D154 int-half
+   bits reproducing IV-ness — i.e. observably the array the producer
+   built, just packed. (An earlier iteration handed the pack out as a
+   pair-viewed CPLX_ROW, which broke @{} length/element views — the packflat
+   tests pin this.) The alias model is the standard FLAT one (clone = share;
+   writes through any alias hit the same buffer), which is why no promote
+   is needed at the hand-out any more. Refuses (returns NULL, input
+   untouched) when:
    - refpv is not a REF_ARRAY (or has no backing array),
    - the array is thread-shared (mu set) or refcount > 1 (another PV aliasing
      this array would keep the box view while this PV shows packed — a fork),
    - the length is odd (not a whole number of interleaved pairs),
    - any element is not INT/FLOAT (undef, strings, refs, blessed values have
-     no byte-exact packed round trip), or
-   - INT elements appear mixed with floats WITHIN one half (re half / im half).
+     no byte-exact packed round trip).
    Homogeneous int halves are carried by the row PV's D154 bits
    (PV_FLAG_INT_ELEMS = every re-half element was an INT, PV_FLAG_INT_ELEM2 =
-   every im-half element was an INT) and are honored by the CPLX branches of
-   perl_cplx_elem / perl_deref_array below, so the box-up round trip
-   reproduces the original element values (including IV-ness) exactly. */
+   every im-half element was an INT) and are honored by the flat reads. */
 PerlValue *perl_pack_flat_row(PerlValue *refpv) {
     if (!refpv || refpv->tag != PERL_REF_ARRAY || !refpv->pval) return NULL;
     PerlArray *a = (PerlArray *)refpv->pval;
     if (!a || a->mu || a->refcount > 1) return NULL;
     long long n = a->len;
-    if (n < 0 || (n & 1L)) return NULL;
-    long long pairs = n / 2;
+    if (n < 2 || (n & 1L)) return NULL;
     int allReInt = 1, allImInt = 1;
     for (long long i = 0; i < n; i++) {
         PerlValue *e = a->elems[i];
@@ -1344,20 +1379,19 @@ PerlValue *perl_pack_flat_row(PerlValue *refpv) {
         else            { if (e->tag != PERL_INT) allImInt = 0; }
     }
     int bits = 0;
-    if (allReInt && pairs > 0) bits |= PV_FLAG_INT_ELEMS;
-    if (allImInt && pairs > 0) bits |= PV_FLAG_INT_ELEM2;
-    PerlCplxRow *r = cplx_row_new(pairs, pairs > 0 ? pairs : 8);
-    if (!r) return NULL;
+    if (allReInt) bits |= PV_FLAG_INT_ELEMS;
+    if (allImInt) bits |= PV_FLAG_INT_ELEM2;
+    double *data = flat_data_alloc(n);
+    if (!data) return NULL;
     for (long long i = 0; i < n; i++) {
         PerlValue *e = a->elems[i];
-        if (e->tag == PERL_INT) r->data[i] = (double)e->ival;
-        else                    r->data[i] = e->fval;
+        data[i] = e->tag == PERL_INT ? (double)e->ival : e->fval;
     }
     PerlValue *out = pv_alloc();
-    out->tag = PERL_CPLX_ROW;
+    out->tag = PERL_FLAT_ARRAY;
     out->blessed_class = NULL;
-    out->pval = r;
-    out->matchpos = pairs;
+    out->pval = data;
+    out->matchpos = n;         /* element count */
     out->flags = (unsigned int)bits;
     return out;
 }
@@ -1391,7 +1425,11 @@ HOTX PerlValue *perl_cplx_elem(PerlValue *row, long long idx) {
         if (idx < 0) idx += row->matchpos;
         if (idx < 0 || idx >= row->matchpos) return perl_alloc_undef();
         double *d = (double *)row->pval;
-        return perl_alloc_float(d ? d[idx] : 0.0);
+        /* D154 half bits ride on packed rows (the D207 pack hand-out sets
+           them) — the boxed element round trip must reproduce IV-ness. */
+        int ie = (idx % 2 == 0) ? (row->flags & PV_FLAG_INT_ELEMS)
+                                : (row->flags & PV_FLAG_INT_ELEM2);
+        return flat_elem_box(d ? d[idx] : 0.0, ie != 0);
     }
     PerlArray *av = perl_deref_array(row);
     return perl_array_get(av, idx);
@@ -1400,7 +1438,7 @@ HOTX PerlValue *perl_cplx_elem(PerlValue *row, long long idx) {
 PerlValue *perl_alloc_flat_array(long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLAT_ARRAY;
-    v->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
+    v->pval = n > 0 ? flat_data_alloc(n) : NULL;
     v->matchpos = n;
     v->blessed_class = NULL;
     return v;
@@ -1410,7 +1448,9 @@ PerlValue *perl_alloc_float_array(long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLAT_ARRAY;
     if (n > 0) {
-        v->pval = calloc((size_t)n, sizeof(double));  /* zero-initialized */
+        v->pval = flat_data_alloc(n);  /* zero-initialized */
+        if (v->pval)
+            memset(v->pval, 0, (size_t)n * sizeof(double));
     }
     v->matchpos = n;
     v->blessed_class = NULL;
@@ -1424,9 +1464,10 @@ PerlValue *perl_repeat_flat_array(double value, long long n) {
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLAT_ARRAY;
     if (n > 0) {
-        double *arr = (double *)malloc(sizeof(double) * (size_t)n);
-        for (long long i = 0; i < n; i++)
-            arr[(size_t)i] = value;
+        double *arr = flat_data_alloc(n);
+        if (arr)
+            for (long long i = 0; i < n; i++)
+                arr[(size_t)i] = value;
         v->pval = arr;
     } else {
         v->pval = NULL;
@@ -1446,10 +1487,12 @@ PerlValue *perl_flat_fill_pair(double re_base, double im_base,
     PerlValue *v = pv_alloc();
     v->tag = PERL_FLAT_ARRAY;
     if (n > 0) {
-        double *arr = (double *)malloc(sizeof(double) * (size_t)(n * 2));
-        for (long long i = 0; i < n; i++) {
-            arr[(size_t)(i * 2)]     = re_base + (double)i * re_stride;
-            arr[(size_t)(i * 2 + 1)] = im_base + (double)i * im_stride;
+        double *arr = flat_data_alloc(n * 2);
+        if (arr) {
+            for (long long i = 0; i < n; i++) {
+                arr[(size_t)(i * 2)]     = re_base + (double)i * re_stride;
+                arr[(size_t)(i * 2 + 1)] = im_base + (double)i * im_stride;
+            }
         }
         v->pval = arr;
     } else {
@@ -1523,13 +1566,18 @@ PerlValue *perl_clone(const PerlValue *src) {
         return v;
     }
     if (src->tag == PERL_FLAT_ARRAY) {
+        /* D207: SHARE the refcounted backing instead of memcpy-forking —
+           clones of an arrayref alias the same array in real perl, and
+           (unlike the fork) this keeps rows FLAT through reads, so FK
+           certification survives. The D105 promote no longer needs to
+           manufacture sharing by converting rows to REF arrays. */
         long long n = src->matchpos;
         PerlValue *v = pv_alloc();
         v->tag = PERL_FLAT_ARRAY;
         v->matchpos = n;
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
-        v->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
-        if (n > 0) memcpy(v->pval, src->pval, sizeof(double) * (size_t)n);
+        v->pval = src->pval;
+        if (n > 0 && v->pval) flat_share((double *)v->pval);
         v->flags |= (src->flags & PV_FLAG_INT_ELEMS);   /* D154 */
         return v;
     }
@@ -1658,7 +1706,7 @@ HOTX void perl_free(PerlValue *v) {
         return;
     }
     if (v->tag == PERL_STRING) free(v->sval);
-    if (v->tag == PERL_FLAT_ARRAY) free(v->pval);
+    if (v->tag == PERL_FLAT_ARRAY) flat_release((double *)v->pval);
     if (v->tag == PERL_CPLX_ROW && v->pval) {
         cplx_row_release((PerlCplxRow *)v->pval);
         v->pval = NULL;
@@ -2454,6 +2502,12 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (src && src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
         if (av->refcount > 0) av->refcount++;
+    } else if (src && src->tag == PERL_FLAT_ARRAY && src->pval) {
+        /* D207: acquiring the refcounted backing here (before dst's old
+           payload is released) makes $a = $b an alias of the row — the
+           same contract as a REF_ARRAY assignment and exactly what real
+           perl does when a packed row's ref is copied between cells. */
+        flat_share((double *)src->pval);
     } else if (src && src->tag == PERL_REF_HASH && src->pval) {
         PerlHash *hv = (PerlHash *)src->pval;
         if (hv->refcount > 0) hv->refcount++;
@@ -2475,7 +2529,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     }
     /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
-    if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { free(dst->pval); dst->pval = NULL; }
+    if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { flat_release((double *)dst->pval); dst->pval = NULL; }
     if (dst->tag == PERL_CPLX_ROW && dst->pval) {
         cplx_row_release((PerlCplxRow *)dst->pval);
         dst->pval = NULL;
@@ -2575,13 +2629,10 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         dst->sval[n] = '\0';
         dst->slen = n;
         dst->matchpos = 0;
-    } else if (src->tag == PERL_FLAT_ARRAY && src->pval) {
-        /* Deep-copy the double[] so src and dst each own their own buffer.
-           matchpos is the element count for FLAT_ARRAY — must NOT be zeroed. */
-        long long n = src->matchpos;
-        double *copy = (double *)malloc((size_t)n * sizeof(double));
-        memcpy(copy, (double *)src->pval, (size_t)n * sizeof(double));
-        dst->pval = copy;
+    } else if (src->tag == PERL_FLAT_ARRAY) {
+        /* D207: pval (the shared refcounted backing) was already acquired
+           in the acquire-first block above; *dst = *src copied the data
+           pointer. Nothing to deep-copy — the assignment aliases. */
     } else if (src->tag == PERL_FLOAT_PAIR) {
         /* matchpos holds the imaginary part as double bits — must NOT be zeroed. */
     } else if (src->tag == PERL_CPLX_ROW) {
@@ -4844,7 +4895,7 @@ PerlArray *perl_deref_array(PerlValue *ref) {
             perl_array_push(av, fv);
             perl_free(fv);
         }
-        free(dbl);
+        flat_release(dbl);
         ref->flags &= ~PV_FLAG_INT_MASK;
         ref->tag   = PERL_REF_ARRAY;
         ref->pval  = av;
@@ -4915,11 +4966,18 @@ HOTX PerlArray *perl_deref_array_ro(PerlValue *ref) {
    element (codegen.cpp), and copying a whole array's elements into
    another array (`my @b = @a;`, D99). A no-op for every other tag. */
 void perl_promote_ref_array(PerlValue *pv) {
-    /* CPLX_ROW aliases share a PerlCplxRow; promoting one PV would fork
-       it into a private REF_ARRAY (D105-style) while other aliases keep
-       the packed buffer. Leave CPLX_ROW packed; @$row still unpacks via
-       perl_deref_array. */
-    if (pv && (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR))
+    /* D207 (2026-11-06): the FLAT arm is GONE. Row clones now share the
+       refcounted backing (see perl_clone's FLAT branch), so the alias
+       contract D105 was manufacturing — "every alias/clone shares one
+       storage" — holds without converting rows to REF arrays. Leaving
+       FLAT rows FLAT through reads is the whole point: the FK flat-loop
+       certification (tag 10/19 + length) can pass on real programs, and
+       Stages 34-45's flat bodies actually run. FLOAT_PAIR keeps its
+       promote (2-double value PVs are not the row surface). CPLX_ROW alias
+       shares a PerlCplxRow; promoting one PV would fork it into a private
+       REF_ARRAY (D105-style) while other aliases keep the packed buffer.
+       Leave CPLX_ROW packed; @$row still unpacks via perl_deref_array. */
+    if (pv && pv->tag == PERL_FLOAT_PAIR)
         perl_deref_array(pv);
 }
 
@@ -5479,10 +5537,13 @@ static PerlValue *clone_code_ref_for_thread(PerlValue *code_pv) {
             ns->sval[n] = '\0';
             ns->slen = n;
         } else if (os->tag == PERL_FLAT_ARRAY) {
-            long long n = os->matchpos;
-            ns->matchpos = n;
-            ns->pval = n > 0 ? malloc(sizeof(double) * (size_t)n) : NULL;
-            if (n > 0) memcpy(ns->pval, os->pval, sizeof(double) * (size_t)n);
+            /* D207: local() saves share the packed backing (the save keeps
+               the row alive while the live cell is reassigned; restore
+               re-shares) — matching the clone contract. */
+            ns->matchpos = os->matchpos;
+            ns->pval = os->pval;
+            if (os->matchpos > 0 && ns->pval)
+                flat_share((double *)ns->pval);
         } else if (os->tag == PERL_REF_ARRAY && os->pval) {
             ((PerlArray *)os->pval)->refcount++;  /* shared array */
         } else if (os->tag == PERL_REF_HASH && os->pval) {
@@ -7636,18 +7697,13 @@ static PerlValue *storable_dclone_pv(struct DCloneCtx *ctx, PerlValue *pv,
     if (!pv || pv->tag == PERL_UNDEF) { *owned = 1; return perl_alloc_undef(); }
     if (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR ||
         pv->tag == PERL_CPLX_ROW) {
-        /* Stage 22/23 compact numeric row — promote to a real REF_ARRAY
-           (D105) so the clone is a proper independent array ref. Memo on
-           the original buffer pointer: two hash entries sharing one FLAT
-           row must share the promoted clone too. */
+        /* Stage 22/23 compact numeric row — D207: clones share the packed
+           backing, so the memo'd copy IS a shared alias (no fork to dodge);
+           keep it packed. */
         void *orig = pv->pval;
         PerlValue *memo = storable_memo_lookup(ctx, orig);
         if (memo) { *owned = 0; return memo; }
         PerlValue *copy = perl_clone(pv);
-        if (copy->tag == PERL_CPLX_ROW)
-            perl_deref_array(copy);
-        else
-            perl_promote_ref_array(copy);
         storable_memo_add(ctx, orig, copy);
         *owned = 0; /* memo'd — freed only with the whole clone graph */
         return copy;
@@ -7902,8 +7958,11 @@ static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
             perl_die_croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
         jb_putstr(b, "null"); return;
     }
-    perl_promote_ref_array(v); /* D105: FLAT_ARRAY/FLOAT_PAIR -> real REF_ARRAY */
-    if (v->tag == PERL_CPLX_ROW) perl_deref_array(v);
+    perl_promote_ref_array(v); /* FLOAT_PAIR -> real REF_ARRAY (D207: FLAT
+                                  rows are kept FLAT through reads and are
+                                  boxed right below, exactly like CPLX_ROW) */
+    if (v->tag == PERL_CPLX_ROW || v->tag == PERL_FLAT_ARRAY)
+        perl_deref_array(v);
     if (depth == 0 && !b->allow_nonref && !json_is_ref_value(v)) {
         perl_die_croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
     }
@@ -13606,7 +13665,10 @@ static void dumper_hash(DumperBuf *b, PerlHash *h) {
 
 static void dumper_value(DumperBuf *b, PerlValue *v) {
     if (!v || v->tag == PERL_UNDEF) { dumper_putstr(b, "undef"); return; }
-    perl_promote_ref_array(v); /* D105: FLAT_ARRAY/FLOAT_PAIR → real REF_ARRAY */
+    perl_promote_ref_array(v); /* FLOAT_PAIR → real REF_ARRAY (D207: FLAT
+                                  rows stay FLAT through reads and are
+                                  boxed right below, like CPLX_ROW) */
+    if (v->tag == PERL_FLAT_ARRAY) perl_deref_array(v);
     const char *cls = v->blessed_class;
     if (cls) dumper_putstr(b, "bless( ");
     switch (v->tag) {
@@ -16197,6 +16259,48 @@ static void st_enc(StBuf *b, PerlValue *v) {
     case PERL_STRING:
         st_enc_pv(b, v->sval ? v->sval : "", (size_t)v->slen);
         break;
+    case PERL_FLAT_ARRAY: {
+        /* D207: rows now stay FLAT through reads (promote is a no-op for
+           tag 10), so the freeze walk meets raw FLAT rows here. Encode
+           exactly the boxed REF-faithful form — SX_REF + SX_ARRAY + n
+           boxed elements — memo-sharing on the refcounted BACKING
+           pointer so aliases of one row (clones share the backing) thaw
+           as refs to one array, the real-perl aliasing contract. */
+        int id = st_find(b, v->pval ? (void *)v->pval : (void *)v);
+        if (id >= 0) { st_u8(b, SX_REF); st_be32(b, (uint32_t)id); return; }
+        if (v->blessed_class && v->blessed_class[0]) {
+            size_t clen = strlen(v->blessed_class);
+            st_u8(b, SX_BLESS);
+            st_u8(b, clen < 256 ? (unsigned char)clen : 255);
+            st_put(b, v->blessed_class, clen < 256 ? clen : 255);
+            char *save = v->blessed_class; v->blessed_class = NULL;
+            st_enc(b, v);   /* recursive FLAT case registers + encodes */
+            v->blessed_class = save;
+            return;
+        }
+        st_u8(b, SX_REF);
+        if (b->nseen < 512) b->seen[b->nseen++] = v->pval ? (void *)v->pval : (void *)v;
+        st_u8(b, SX_ARRAY);
+        st_be32(b, (uint32_t)(v->matchpos > 0 ? v->matchpos : 0));
+        if (v->pval && v->matchpos > 0) {
+            double *d = (double *)v->pval;
+            for (long long i = 0; i < v->matchpos; i++) {
+                /* D154 half bits: re-half vs im-half integer-ness. */
+                int ie = (i % 2 == 0) ? (v->flags & PV_FLAG_INT_ELEMS)
+                                      : (v->flags & PV_FLAG_INT_ELEM2);
+                double ev = d[i];
+                if (ie && ev == (double)(long long)ev &&
+                    ev > -9.2e18 && ev < 9.2e18)
+                    st_enc_int(b, (long long)ev);
+                else {
+                    char tmp[64];
+                    snprintf(tmp, sizeof tmp, "%.15g", ev);
+                    st_enc_pv(b, tmp, strlen(tmp));
+                }
+            }
+        }
+        break;
+    }
     case PERL_REF_ARRAY: {
         int id = st_find(b, v->pval);
         if (id >= 0) { st_u8(b, SX_REF); st_be32(b, (uint32_t)id); return; }
@@ -16652,6 +16756,10 @@ PerlValue *perl_list_moreutils(const char *name, PerlArray *args) {
         for (long long i = 0; i < n; i++) {
             PerlValue *v = args->elems[i];
             perl_promote_ref_array(v);
+            /* D207: FLAT rows stay FLAT through reads (promote is a no-op
+               for tag 10) — box them exactly like the old promote did so
+               mesh/zip still see their element lists. */
+            if (v->tag == PERL_FLAT_ARRAY) perl_deref_array(v);
             if (v->tag == PERL_REF_ARRAY) avs[i] = (PerlArray *)v->pval;
             if (avs[i] && avs[i]->len > max) max = avs[i]->len;
         }

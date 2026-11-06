@@ -455,3 +455,38 @@ section in the auto-parallel exploration note). Summary:
   `PERLC_PACK_RET=1` pending D203's value-model work). Stages 41–43
   remain net-positive through their general-path effects; the flat-
   eligible end-to-end story is D207/D203's.
+
+### D207 — refcounted FLAT backings, packflat hook default-ON (2026-11-06 evening, this session)
+
+D207 landed to completion; full detail in the TESTS.md D207 row. The
+value-model decision: **FLAT rows are share-backed REFs, not forks.**
+
+- Every FLAT row's `double[]` lives behind an 8-byte refcount header
+  (`flat_data_alloc`/`flat_share`/`flat_release`, atomic); `pval` still
+  points at the data. Clones (`perl_clone`, `perl_assign`, local-save)
+  **share** the backing — the arrayref alias contract — so D105's
+  promote lost its FLAT arm: rows stay tag-10 through reads and the FK
+  certification (tag 10/19 + length) passes on real programs for the
+  first time.
+- The packflat producer hook is **default-ON**
+  (`PERLC_OPT_DISABLE=packflat` restores the old hand-out;
+  `PERLC_PACK_RET=1` tolerated as a no-op) and hands out shared-backed
+  FLAT rows in the 2N-scalar layout (no CPLX pair-view), D154 half
+  bits riding the row PV for IV-ness.
+- Choke-point fixes the sharing model forced: nested 2D scalar stores
+  (`$a[i][j]`, `$h{k}[j]`) write through the backing via
+  `perl_array_set_row` instead of autoviv-boxing a fork;
+  `st_enc` grew a FLAT case (memo-shared by backing, REF-faithful
+  encode); `json_encode_value`/`dumper_value`/`mesh|zip` box FLAT rows
+  explicitly instead of leaning on the (now FLAT-neutral) promote.
+- **Measured:** `make test-all` **621/621**; `bench/regress.sh` PASS
+  (within 10%). **mbs640 -O2: 1.41 s → 0.22 s (≈6.4×)**, content
+  byte-identical, `fk.flatin.seq` genuinely executing (rows tag-10,
+  len 1280 at the kernel). pcA/pcflops/pcu: byte-identical with 20
+  parallel dispatches; end-to-end par-vs-seq ≈1.2× at these sizes
+  (worker-body 2× codegen penalty — see Stage-45 note) with the
+  9.3× pool-level number unchanged.
+- Remaining value-model work narrows to **D203's list-position surface**
+  (`print "@z"`, list-assign element identity for packed literals) and
+  the documented deref-while-shared v1 limitation (boxed-view conversion
+  through `@$row`-style paths on a shared row still forks views).
