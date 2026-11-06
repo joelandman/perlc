@@ -1,11 +1,11 @@
 # perlc — Perl to Native Binary Compiler
 
-A Perl compiler that translates Perl source to LLVM IR and links a C runtime to produce native executables. Written in C++17 using LLVM 18.
+A Perl compiler that translates Perl source to LLVM IR and links a C runtime to produce native executables. Written in C++17 using LLVM 22.
 
 ## Requirements
 
-- `g++` (any recent version; verified with 15.2.0) and `clang-18` (used to link generated programs)
-- `llvm-config-18`
+- `g++` (any recent version; verified with 15.2.0) and `clang-22` (used to link generated programs)
+- `llvm-config-22`
 - `libpcre2-8` (`apt install libpcre2-dev`)
 - `libsqlite3-dev` (for DBI/SQLite integration, `apt install libsqlite3-dev`)
 
@@ -189,7 +189,7 @@ It does not replace `./perlc`. It then compiles and runs only:
 - `tests/destroy.pl`
 
 The compile step sets `TSAN_OPTIONS=die_after_fork=0` (the compiler
-itself forks `clang-18`). The run step sets
+itself forks `clang-22`). The run step sets
 `TSAN_OPTIONS=halt_on_error=1`. Output is the program's own prints.
 There is no diff against `perl`.
 
@@ -298,9 +298,11 @@ With no script, `./perlc` prints this option list and exits 1.
 | `--emit-bc` | Write LLVM bitcode and do not link. |
 | `--do-lib` | Write a shared library for runtime `do FILE`. The runtime invokes this itself. The library is not linked with `runtime.c`; it uses the caller's runtime when loaded. |
 | `--eval-lib` | Same as `--do-lib`, and bind outer `my` cells from the eval pad. The runtime invokes this for string `eval`. |
-| `-O` / `-O0` … `-O5` | Optimization. No flag means level **2**. A bare `-O` means level **1**. `-O0` skips the LLVM IR passes. `-O1` uses the LLVM O1 pipeline. `-O2` uses O2. `-O3`, `-O4`, and `-O5` use the LLVM O3 pipeline. The same digit is passed to `clang-18 -O<digit> -march=native` when linking. `clang-18` warns that `-O4` is deprecated, and it rejects `-O5`. |
+| `-O` / `-O0` … `-O5` | Optimization. No flag means level **0**. A bare `-O` means level **1**. The digit only sets the `clang-22 -O<digit> -march=native` level on the link line (which compiles the generated IR and the runtime sources together); the emitted IR is byte-identical at every level, so `-O` chooses link-time optimization only. `-O4` and `-O5` map to `clang -O3`. |
+| `-flto` | Force the LTO link: the runtime ships as cached `-O2` bitcode, so small hot leaf runtime functions inline into the generated code at link time (slower link, faster binary — measured −20–27% vs the same level without). Default **on** at `-O2`+; opt-in at `-O1`. `PERLC_LTO=thin` selects the thinner summary-based pipeline (cheaper link, weaker inlining); `PERLC_NO_LTO=1` opts out. `make clean` clears the bitcode cache. |
+| `-noflto` | Force the LTO link off, including where it is the default at `-O2`+. At `-O0` the runtime still ships as prebuilt `-O2` objects (making `-O0` binaries run at or near `-O2` speeds); `PERLC_NO_PREBUILT_RT=1` links the runtime from source instead (full `-O0` binary, for debug-into-the-runtime workflows). |
 | `-g` | Debugging symbols, so a debugger can show Perl source lines. |
-| `-v` | Print the `clang-18` link command. |
+| `-v` | Print the `clang-22` link command. |
 | `-pm` | Run `cpanm` for modules the script `use`s and that are not found, then compile. |
 | `-I<dir>` | Add `<dir>` to the module search path. `-I <dir>` is the same. `PERL5LIB` (colon-separated) is prepended as well, and `use lib` inside the script is honored. |
 | `--mini-gmp` | Accepted and ignored as a switch. Math::BigInt always uses the bundled mini-gmp. System GMP is not linked. It also turns on `-v`. |
@@ -321,55 +323,46 @@ directory beside the binary you copied.
 ## Performance
 
 perlc compiles to a native binary via LLVM, so `-O` level matters.
-Benchmarked 2026-10-01 against the host's real `perl` (5.42) on the
-same machine, using `bench/fibn.pl`, `bench/nb.pl`, `bench/mbs.pl`,
-and `bench/regex_heavy.pl` (the last two scaled up from their
-checked-in defaults — see footnotes — since sub-30-second native
-`perl` runs are too noisy for a meaningful comparison):
+Latest numbers (2026-11-05/06, after the stages-34–42 optimization
+program; see the docs in the table note below for methodology, profiles,
+and per-stage ablations): four workloads each sized so native `perl`
+runs 50–65 s on the host (Perl 5.44), outputs byte-verified vs `perl`,
+best-of-3. The default `-O2` build LTO-links; `2f` = `-O2 -flto`, and
+`-O3f` = `-O3 -flto`:
 
-| Benchmark | Opt | perlc (ms) | perl (ms) | Speedup (perl/perlc) |
+| Benchmark | perlc -O2 | perlc -O3f | perl | Speedup |
 |---|---|---|---|---|
-| **fibn(39)** — recursive, exponential | O0 | 69,841 | 39,240 | 0.56× (perlc slower) |
-| | O1 | 26,966 | 39,240 | 1.46× |
-| | O2 | 25,292 | 39,240 | 1.55× |
-| | O3 | 25,071 | 39,240 | **1.57×** |
-| **nb(50,000,000)** — N-body, tight numeric loop | O0 | 25,955 | 250,395 | 9.65× |
-| | O1 | 14,739 | 250,395 | 16.99× |
-| | O2 | 13,494 | 250,395 | **18.56×** |
-| | O3 | 14,790 | 250,395 | 16.93× |
-| **mbs** †(Mandelbrot grid, N=1024) | O0 | 22,587 | 65,789 | 2.91× |
-| | O1 | 9,076 | 65,789 | 7.25× |
-| | O2 | 8,451 | 65,789 | **7.79×** |
-| | O3 | 8,497 | 65,789 | 7.74× |
-| **regex_heavy** ‡(6M-item corpus × 70 passes, 420M matches) | O0 | 28,807 | 30,578 | 1.06× |
-| | O1 | 11,676 | 30,578 | 2.62× |
-| | O2 | 11,698 | 30,578 | 2.61× |
-| | O3 | 11,671 | 30,578 | **2.62×** |
-
-† `bench/mbs.pl` ships with a hardcoded `$N=4096` grid, too expensive
-to run under native `perl` in a reasonable time/memory budget for
-benchmarking (12+ minutes, 6+ GB RSS). The table uses a `$N=1024`
-copy of the same code instead.
-‡ `bench/regex_heavy.pl` ships with a 100,000-item corpus × 50
-passes (5M matches); the table uses a scaled-up 6,000,000-item
-corpus × 70 passes (420M matches) to get a stable, non-noisy native
-`perl` baseline.
+| **fibn(37)** — recursive, call-dense | 4.87 s | 3.21 s | 49.3 s | 10–15× |
+| **nb(4 M iters)** — N-body, tight numeric loop | 0.72 s | 0.54 s | 63.5 s | 88–118× |
+| **regex(3 M-item corpus × 70 passes)** — 210 M PCRE2 matches | 17.1 s | 17.0 s | ~50 s | ~2.9× |
+| **mbs(N=640)** — Mandelbrot grid | 1.43 s | 1.40 s | 57.7 s | ~40× |
 
 **Takeaways:**
-- Once past `-O0`, perlc beats native `perl` by **1.6×–18.6×** across
-  these benchmarks — the N-body numeric loop sees the largest win.
-- `-O0` → `-O1` captures nearly all the available speedup; `-O2`/`-O3`
-  add only a few more percent on top of `-O1` here (and `-O3` is
-  within noise of `-O2`, sometimes marginally behind it).
-- `fibn` (pure recursive call/return, no loop to optimize) is the one
-  case where perlc's unoptimized (`-O0`) output is slower than real
-  Perl's mature interpreter loop — it needs at least `-O1`'s call
-  overhead cleanup/inlining to pull ahead, and even then the margin
-  is the smallest of the four benchmarks.
-- `regex_heavy`'s lower ceiling (~2.6×) reflects that both perlc and
-  Perl bottleneck on the same underlying PCRE2 engine for the actual
-  matching; perlc's edge there is purely from avoiding Perl's
-  per-iteration interpreter dispatch overhead around each match call.
+- Hot numeric loops dominate: the flat-row/float-pair unboxing stages
+  (raw i64/f64 locals, flat-row binding, row de-boxing, packed rows)
+  emit raw scalar + SLP-packed arithmetic instead of boxed `perl_*`
+  runtime calls, so nb and mbs see the largest wins.
+- `fibn` is call-overhead-bound; known-arity direct `_ai` calls plus
+  LTO inlining of the runtime leaf functions carry it to 10–15×.
+- `regex` is pcre2-bound (~90% of profile inside libpcre2 after the
+  per-callsite pattern memo) — the remaining gap is inside the match
+  engine itself.
+- Compile times: `-O0` is 0.2–0.3 s (the runtime links as prebuilt
+  `-O2` objects, so `-O0` binaries run at or near `-O2` speeds);
+  `-O2` runs a full-LTO link at ~25–31 s per binary with a warm
+  runtime-bitcode cache (`-noflto` ≈ 19 s; `PERLC_LTO=thin` ≈ 23 s).
+
+Methodology, per-stage measurements and ablations
+(`PERLC_OPT_DISABLE=...`), IR censuses, and profiles:
+`docs/optimization_findings_2026-11-04.md` (round 1),
+`docs/optimization_findings_2026-11-04_round2.md` (round 2: root
+causes + experiments), `docs/optimization_findings_2026-11-05_landing.md`
+(landing record + current state). `make bench` runs the informational
+benchmark set; `make bench-regress` is the gate that fails when perlc
+regresses >10% against its committed baseline (`bench/regress.sh`).
+
+Run it yourself: `make bench`, or compile a benchmark directly with an
+explicit level, e.g. `./perlc bench/nb.pl -O3 -o nb_opt3`.
 
 Run it yourself: `make bench` (see `bench/bench.sh`), or compile a
 benchmark directly with an explicit level, e.g.
@@ -548,7 +541,7 @@ benchmark directly with an explicit level, e.g.
   XSUB `.so`s (SV* ABI) can't load
 - DBI is the SQLite subset in the contract tests
 - Complex CPAN (advanced OO / `our`) may fail to parse; POD is skipped
-- String `eval` / `do FILE` at runtime re-invoke `perlc` + `clang-18`
+- String `eval` / `do FILE` at runtime re-invoke `perlc` + `clang-22`
 
 **Debugging**: `-g` flag now produces binaries with debugging symbols + Perl source line information (via LLVM debug metadata). Use with `gdb` to see original `.pl` lines.
 
@@ -581,7 +574,7 @@ benchmark directly with an explicit level, e.g.
 ## Architecture
 
 ```
-source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  clang-18  →  binary
+source.pl  →  Lexer  →  Parser  →  AST  →  Codegen  →  LLVM IR  →  clang-22  →  binary
                                                                             ↑
                                                                       runtime.c (linked in)
 ```
@@ -609,5 +602,5 @@ typedef struct PerlValue {
 - `src/parser.h/cpp`: Recursive-descent parser → AST
 - `src/codegen.h/cpp`: AST → LLVM IR via IRBuilder
 - `src/runtime.h/c`: C runtime: `PerlValue` tagged union and all operations
-- `src/main.cpp`: Driver: lex → parse → codegen → clang-18 link
+- `src/main.cpp`: Driver: lex → parse → codegen → clang-22 link
 - `src/mini-gmp.c`: Math::BigInt backend

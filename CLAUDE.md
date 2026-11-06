@@ -1,17 +1,52 @@
 # perlc — Perl→LLVM Compiler
 
-AOT compiler for a large Perl 5 subset. C++17 + LLVM 18 (`clang-18` /
-`llvm-config-18`). Host Perl is 5.42. All operations lower to a C runtime
+AOT compiler for a large Perl 5 subset. C++17 + LLVM 22 (`clang-22` /
+`llvm-config-22`). Host Perl is 5.44. All operations lower to a C runtime
 (`src/runtime.c`). **No JIT, no REPL.** String `eval EXPR` and
 `eval { BLOCK }` both work (outer `my` is visible to eval STRING).
 
 ```
-.pl → lexer → parser → AST (128 NK) → LLVM IR → clang-18 link → binary
+.pl → lexer → parser → AST (128 NK) → LLVM IR → clang-22 link → binary
                                            ↑
-                                      runtime.c
+                                       runtime.c
 ```
 
-## Current state (2026-10-16)
+## Current state (2026-11-06)
+
+**The generated-code performance program, stages 34–42 (landed
+2026-11-04…11-06, commits through `84f019b`).** A three-round
+benchmark+profile+landing effort over four workloads sized so native
+perl runs 50–65 s (fibn 37 recursion, nb 4M-iteration N-body, regex
+3M×70 corpus-matching, mbs 640 Mandelbrot). Final byte-verified
+ratios vs perl 5.44 at the default `-O2` (LTO-on) build: fibn **10.1×**
+(4.87 s), nb **88×** (0.72 s), regex **2.9×** (17.1 s, pcre2-bound),
+mbs **40×** (1.43 s); `-O3`+LTO: 3.21/0.54/17.04/1.40 s. `-O0`
+compiles in 0.2–0.3 s and ships a prebuilt `-O2` runtime (E3), so
+`-O0` binaries run at or near `-O2` speeds; `-O2`+ default to a
+full-LTO link (`-noflto`/`PERLC_NO_LTO=1` opt out). The machinery:
+raw i64/f64 scalar unboxing, flat-row (FLAT_ARRAY) and float-pair
+(FLOAT_PAIR) binding, D105 promote-inline, row de-boxing (Stage 39),
+known-arity `_ai` direct calls (Stage 40), flat-kernel dual-emit with
+loop-certification prelude (Stages 41/42), packed CPLX_ROW producer
+rows (`packflat`), per-callsite regex pattern memo, catchable
+unboxed-division zero-divisor die (D199), opt level decoupled from IR
+(E3). Every stage has a `PERLC_OPT_DISABLE=` knob. Findings/method/
+ablations: `docs/optimization_findings_2026-11-04.md`,
+`docs/optimization_findings_2026-11-04_round2.md`,
+`docs/optimization_findings_2026-11-05_landing.md` (the landing
+record). Correctness gates: `make test-all` **615/615 PASS** vs real
+perl plus `make bench-regress` PASS (the perlc-vs-perlc runtime
+regression gate). **Open perf follow-ups:** D198 (wantarray stale ctx
+— the last unboxing-safety class), the LLVM-side loop-vectorizer
+pass-ordering/refusal work on the already-certified flat kernel loops
+(the codegen side is live and neutral; forcing the width hint
+regressed), auto-parallel counted loops (precondition now materially
+closer with packed rows), and D199's still-open boxed-path div-by-zero
+tail. Tests: `tests/packflat_{smoke,deep}.pl`,
+`tests/div_zero_paren_{smoke,deep}.pl`,
+`tests/d197_defined_promo_{smoke,deep}.pl`.
+
+Previous state (2026-10-16):
 
 **D193, D194, D195 (2026-10-16).** Three parser/lexer items from the
 compile-only corpus, after D190–D192.
@@ -1307,7 +1342,7 @@ workflows, success lines, skips, and `./perlc` flags are in README.md
 → "Build and test" and TESTS.md → "Gate".
 
 ```bash
-make                 # ./perlc only (g++ 15 + LLVM 18.1). Default goal.
+make                 # ./perlc only (g++ 15 + LLVM 22). Default goal.
 make test            # 4 assertion programs, exit code only (do/require/DBI/XS)
 make test-all        # harness vs real perl — mandatory pre-commit gate
 make test-smoke      # harness, *_smoke.pl only
@@ -1319,6 +1354,7 @@ make test-valgrind   # memcheck; skips DBI/XS; SIGILL on this host is environmen
 make test-opt2       # full diff gate at perlc -O2 (digit 0-5)
 make test-opt-matrix # full diff gate at -O0, -O2, -O3
 make bench           # bench/bench.sh; BENCH_ARGS='-n 3 bench/nb.pl'
+make bench-regress   # the perf gate: regress.sh vs bench/baseline.csv (>10% slower = FAIL)
 make clean
 ```
 
@@ -1336,6 +1372,9 @@ Every fix ships a **smoke + deep** test compared against real Perl.
 - **Unboxing:** i64 / f64 locals, FLAT_ARRAY, FLOAT_PAIR, AST inliner,
   DerefAV cache. Fast paths are the historical source of silent-wrong-data
   bugs — new unbox paths need a byte-for-byte deep test.
+- **Optimization stages (34–42):** de-boxing, flat-kernel dual-emit,
+  packed rows, staged numeric fast paths — every stage gated by
+  `PERLC_OPT_DISABLE=<stage>`; see `docs/optimization_findings_2026-11-05_landing.md`.
 - **threads::shared:** acquire/release + lock-free 16-byte CAS on int/float
   RMW. See `THREADS_SHARED_ATOMIC.md`.
 - **`do FILE`:** re-invoke `perlc --do-lib`, `dlopen` into the host runtime.
@@ -1397,7 +1436,13 @@ plus `__WARN__`/`__DIE__`); `$?`; Math::BigInt; threads + threads::shared.
 | `CLAUDE.md` | This file — project state + agent workflow |
 | `TESTS.md` | Test policy + open items |
 | `MVP_ROADMAP.md` | 2026-09-10 multi-agent MVP assessment + CPAN-module plan |
-| `THREADS_SHARED_ATOMIC.md` | Shared-scalar memory model |
+| `THREADS_SHARED_ATOMIC.md` | Shared-scalar atomic memory model (landed) |
+| `SHARED_ARRAY_HASH_ATOMIC_DESIGN.md` | Lock-free shared array/hash ops — design draft, not implemented (MVP blocker #14) |
+| `docs/optimization_findings_2026-11-04.md` | Perf round 1: methodology, O-matrix, profiles, item 1/3/4 landings |
+| `docs/optimization_findings_2026-11-04_round2.md` | Perf round 2: root causes E1–E6, measured experiments, landing queue |
+| `docs/optimization_findings_2026-11-05_landing.md` | The landing record: stages 38–42, E3/-flto, current headline numbers, open follow-ups |
+| `docs/mbs_memory_analysis.md` | Memory analysis behind the mbs (Mandelbrot) workload |
+| `docs/llvm_optimization_analysis.md` | LLVM-level optimization analysis |
 
 Historical defect write-ups (D1–D98) live in git, not in-tree.
 
