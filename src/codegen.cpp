@@ -1541,6 +1541,31 @@ Value *CodeGen::perlFloat(double v) {
 
 /* Returns a PerlArray* Value for expressions that produce arrays.
    Used by foreach and array-context assignments. */
+/* D198 helper: evaluate `branch` in LIST context into a fresh independent
+   PerlArray (never a borrowed pointer — the extend/push both clone), so the
+   BinOp "?: case in emitArrayPtr can hand its result to any consumer
+   (including the `av = rhsArr` non-borrowed backing-store path) without the
+   D99 aliasing hazard. Scalar-shaped branches become their 1-element list,
+   exactly like real Perl's scalar-in-list-context rule and the ArrayLit
+   element fallback that precedes this case. Termination discipline mirrors
+   emitExpr's own ternary: a branch that ends with control flow is not given
+   a redundant branch to endBB. */
+Value *CodeGen::collectTernListBranch(const Node &branch, llvm::BasicBlock *endBB) {
+    Value *res = callRT("perl_array_new", {});
+    if (Value *src = emitArrayPtr(branch)) {
+        callRT("perl_array_extend", {res, src});
+    } else {
+        int savedCtx = callCtx_;
+        callCtx_ = 1;
+        Value *v = emitExpr(branch);
+        callCtx_ = savedCtx;
+        callRT("perl_array_push_list_or_scalar", {res, v});
+    }
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(endBB);
+    return res;
+}
+
 Value *CodeGen::emitArrayPtr(const Node &n) {
     /* LO..HI range in list context → perl_range returns PerlArray* */
     if (n.kind == NK::Range) {
@@ -2491,6 +2516,56 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             }
         }
         return res;
+    }
+    /* D198: a conditional operator consumed in LIST context propagates list
+       context to its chosen branch (real Perl: `?:` shares its own context
+       with whichever branch runs, INDEPENDENT of what wantarray() reports
+       about the enclosing sub's call context). `my @r = $x ? (1,2) : (3);`
+       inside a sub called in scalar context must still give @r = (1,2); the
+       branch collection here is purely syntactic-list, always yielding a
+       fresh PerlArray. The value/scalar-context ternary (emitExpr's case)
+       keeps its wantarray-stack consult when callCtx_==-1, which is exactly
+       what `return COND ? ... : ...`'s caller-context inheritance (D87)
+       needs — the two never disagree with real Perl because real Perl
+       propagates the immediate expression context too (return EXPR =
+       wantarray ctx, list-assign RHS = list, scalar RHS = scalar). */
+    if (n.kind == NK::BinOp && n.sval == "?:") {
+        auto *fn  = builder_.GetInsertBlock()->getParent();
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        auto *thenBB = BasicBlock::Create(ctx_, "ternl.then", fn);
+        auto *elseBB = BasicBlock::Create(ctx_, "ternl.else", fn);
+        auto *endBB  = BasicBlock::Create(ctx_, "ternl.end",  fn);
+        Value *ctrue = tryEmitI1Cond(*n.cond);
+        if (!ctrue) {
+            Value *cv   = emitExpr(*n.cond);
+            Value *cb   = callRT("perl_is_true", {cv});
+            freeIfOwned(cv);
+            ctrue = builder_.CreateICmpNE(cb, ConstantInt::get(i32Ty, 0));
+        }
+        builder_.CreateCondBr(ctrue, thenBB, elseBB);
+        /* Fresh independent array per branch (extend clones; push clones) so
+           the consumer's `av = rhsArr` non-borrowed backing path can never
+           alias a source variable (`my @r = $c ? @x : @y;` must copy — D99).
+           Scalar branches become their 1-element list (real Perl: a scalar
+           in list context is a 1-elem list), via the same
+           perl_array_push_list_or_scalar the ArrayLit element fallback uses.
+           Branches may contain emitted calls that switch blocks (and, as in
+           emitExpr's own ternary, may even terminate) — so the incoming edge
+           is the insert block AFTER the branch's own emission. */
+        int savedCallCtx = callCtx_;
+        callCtx_ = 1;   /* calls inside the chosen branch see list context */
+        builder_.SetInsertPoint(thenBB);
+        Value *tv = collectTernListBranch(*n.left, endBB);
+        BasicBlock *tb = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(elseBB);
+        Value *ev = collectTernListBranch(*n.right, endBB);
+        BasicBlock *eb = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(endBB);
+        callCtx_ = savedCallCtx;
+        auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "ternl.av");
+        phi->addIncoming(tv, tb);
+        phi->addIncoming(ev, eb);
+        return phi;
     }
     if (n.kind == NK::CallerFunc) {
         auto *i32Ty = Type::getInt32Ty(ctx_);
@@ -4246,9 +4321,15 @@ bool CodeGen::stmtIsUnboxedNumeric(const Node &n) {
 }
 
 bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
-    if (n.kind == NK::Assign && tryEmitPackedPairAssign(n))
-        return true;
     if (n.kind == NK::Assign) {
+        /* FK: inside the certified flat-kernel body a row-element store
+           writes the packed buffer directly (no promote, no tag check, no
+           runtime call) — the tag-check branch the st39 helper would emit
+           per iteration blocks LV on the otherwise flat kernel. */
+        if (flatKernelMode_ && tryFkRowElemStore(n, /*needValue=*/false))
+            return true;
+        if (tryEmitPackedPairAssign(n))
+            return true;
         /* Stage 39 (E4, perf round 2): statement-context `$row->[i] = f` —
            void context means no assign-result PV is needed: run the
            in-place store helper (promote + REF-row float-slot update;
@@ -7975,9 +8056,224 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
     return true;
 }
 
-/* Stage 42 (packflat): does any node in this subtree name @anm — used to
-   refuse the specialization when a nested sub definition (named or
-   anonymous) can see the row array. */
+/* ── FK if-conversion (the LV pass-ordering lever) ────────────────────────
+   Postlink, LLVM's LoopVectorize declined the certified kernel-2 flat loop
+   with "control flow cannot be substituted for a select": the body's
+   uniform `if (abs2 < 4.0) { 2 stores } else { 2 stores }` needs to reach
+   LV as branchless predicated stores (the classic if-convert), which the
+   pass-ordering never produced. Emitting the select FORM here removes that
+   refusal structurally.
+
+   Shape (both arms must be pure — the same row-pure class the Stage-42 walk
+   already certified, no division anywhere so the unboxed `/` zero-divisor
+   die semantics can never change):
+     if (<relational over row-pure f64 trees>) { $row->[2i(+1)] = <pure>; ... }
+     else                                      { $row->[2i(+1)] = <pure>; ... }
+   with the arms' (row, index-tree, order) lists pairwise identical. Values
+   are computed for BOTH arms and picked per element with one select; the
+   single unconditional store lands exactly where the taken arm would have
+   (same address, same value — NaN semantics ride the same ordered fcmp the
+   general path builds via tryEmitI1Cond). Only fires inside the guarded
+   flat re-emission (flatKernelMode_ && fkEmitting_, fkKernelData_ live),
+   always behind its enable knob (PERLC_OPT_DISABLE=fkifconv). */
+struct FkStoreSpec {
+    std::string row;      /* bare row variable name */
+    std::string idxKey;   /* structural key of the index tree */
+    const Node *rhs;      /* the stored value expression (row-pure f64) */
+    const Node *idxNode;  /* the index tree (fkIndexForm-valid) */
+};
+
+/* refuses the conversion (not the general path) when `/` appears — the
+   unboxed-division zero-divisor die must stay exactly where the general
+   (taken-arm-only) evaluation puts it. */
+static bool fkHasDivClass(const Node &n) {
+    if (n.kind == NK::BinOp && n.sval == "/") return true;
+    if (n.left  && fkHasDivClass(*n.left))  return true;
+    if (n.right && fkHasDivClass(*n.right)) return true;
+    for (const auto &a : n.args)
+        if (fkHasDivClass(*a)) return true;
+    return false;
+}
+
+/* structural key of an fkIndexForm-valid index tree (IntLit / ScalarVar /
+   BinOp + - *) so the two arms' store addresses can be proven identical
+   without interpreting them. Anything unexpected refuses (v1). */
+static bool fkIdxTreeKey(const Node &n, std::string &out) {
+    switch (n.kind) {
+    case NK::IntLit:
+        out += "i" + std::to_string(n.ival);
+        return true;
+    case NK::ScalarVar:
+        out += "v" + n.name;
+        return true;
+    case NK::BinOp:
+        if (n.sval != "+" && n.sval != "-" && n.sval != "*") return false;
+        out += "(" + n.sval;
+        if (!n.left || !fkIdxTreeKey(*n.left, out)) return false;
+        if (!n.right || !fkIdxTreeKey(*n.right, out)) return false;
+        out += ")";
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* flatten one arm to its element-store list; anything else refuses. The
+   canEmitF64 verdicts happen in the member (private call); here the shapes
+   are checked structurally. */
+static bool fkArmStores(const Node *arm, std::vector<FkStoreSpec> &out) {
+    if (!arm) return false;
+    std::function<bool(const Node &)> walk = [&](const Node &st) -> bool {
+        if (st.kind == NK::Block || st.kind == NK::FlatBlock) {
+            for (const auto &sub : st.args)
+                if (!walk(*sub)) return false;
+            return !st.args.empty();
+        }
+        const Node *e = &st;
+        if (e->kind == NK::ExprStmt && e->left) e = e->left.get();
+        if (e->kind == NK::Assign && e->left &&
+            e->left->kind == NK::ArrowDeref &&
+            e->left->sval == "array" &&
+            e->left->left && e->left->left->kind == NK::ScalarVar &&
+            e->left->right && e->right &&
+            !fkHasDivClass(*e->right)) {
+            FkStoreSpec spec;
+            spec.row = e->left->left->name;
+            if (!spec.row.empty() && spec.row[0] == '$')
+                spec.row = spec.row.substr(1);
+            std::string key;
+            if (!fkIdxTreeKey(*e->left->right, key)) return false;
+            spec.idxKey = key;
+            spec.idxNode = e->left->right.get();
+            spec.rhs = e->right.get();
+            out.push_back(std::move(spec));
+            return true;
+        }
+        return false;
+    };
+    return walk(*arm) && !out.empty();
+}
+
+/* FK flat row-element store: inside the certified loop body, `$row->[idx] = <f64>`
+   writes the packed buffer directly (fkKernelData_ resolved by the prelude;
+   the raw-pval fallback covers rows the prelude bound later). Returns the
+   boxed assign-value PV (the store leaves the row's packed slot in place —
+   observability-equal to the st39 in-place float update, see the Stage-39
+   contract), or nullptr when this shape isn't a certified FK row store. */
+llvm::Value *CodeGen::tryFkRowElemStore(const Node &n, bool needValue) {
+    if (!flatKernelMode_ || !isOptStageEnabled("st41")) return nullptr;
+    if (n.kind != NK::Assign || !n.left || !n.right) return nullptr;
+    if (n.left->kind != NK::ArrowDeref || n.left->sval != "array") return nullptr;
+    if (!n.left->left || n.left->left->kind != NK::ScalarVar) return nullptr;
+    if (!n.left->right) return nullptr;
+    if (!knownFlatRows_.count(bareVarName(n.left->left->name))) return nullptr;
+    if (Value *fv = emitExprF64(*n.right)) {
+        auto dit = fkKernelData_.find(bareVarName(n.left->left->name));
+        Value *data;
+        if (dit != fkKernelData_.end()) {
+            data = dit->second;
+        } else {
+            Value *row = scalarVarRawPv(n.left->left->name);
+            if (!row) return nullptr;
+            Value *dP = builder_.CreateGEP(
+                Type::getInt8Ty(ctx_), row,
+                ConstantInt::get(Type::getInt64Ty(ctx_), 8),
+                "fk.st.pvalp");
+            data = builder_.CreateLoad(perlPtrTy_, dP, "fk.st.data");
+        }
+        Value *idxS = emitIdx(*n.left->right);
+        if (!idxS) return nullptr;
+        auto *fst = builder_.CreateStore(fv,
+            builder_.CreateGEP(Type::getDoubleTy(ctx_), data,
+                idxS, "fk.st.ep"));
+        setTBAA(fst, tbaaFlatDoubleTag_);
+        /* void-context statement stores (the FK kernel shape) need no result
+           PV at all — the alloc_float the value-context path hands back is
+           a call inside the loop and blocks LV on itself. The void caller
+           only checks the pointer for non-nullness, so a true LLVM null
+           constant (not a runtime undef allocation, and distinct from the
+           nullptr refusal sentinel) is the zero-cost discard. */
+        return needValue ? callRT("perl_alloc_float", {fv})
+                         : llvm::ConstantPointerNull::get(perlPtrTy_);
+    }
+    return nullptr;
+}
+
+bool CodeGen::tryEmitFkIfConvert(const Node &n) {
+    if (!flatKernelMode_ || !fkEmitting_) return false;
+    if (!isOptStageEnabled("st41") || !isOptStageEnabled("fkifconv")) return false;
+    if (n.kind != NK::If || n.branches.size() != 2) return false;
+    const auto &thenBr = n.branches[0];
+    const auto &elseBr = n.branches[1];
+    if (!thenBr.cond || elseBr.cond) return false;   /* exactly one if + one else */
+    if (thenBr.cond->kind != NK::BinOp) return false;
+    const std::string &op = thenBr.cond->sval;
+    if (op != "<" && op != "<=" && op != ">" && op != ">=" &&
+        op != "==" && op != "!=")
+        return false;
+    if (!thenBr.cond->left || !thenBr.cond->right ||
+        !fkNoRowTouch(*thenBr.cond->left) || !fkNoRowTouch(*thenBr.cond->right))
+        return false;
+    if (fkHasDivClass(*thenBr.cond)) return false;
+    if (!canEmitF64(*thenBr.cond->left) || !canEmitF64(*thenBr.cond->right))
+        return false;
+
+    std::vector<FkStoreSpec> thenStores, elseStores;
+    if (!fkArmStores(thenBr.body.get(), thenStores)) return false;
+    if (!fkArmStores(elseBr.body.get(), elseStores)) return false;
+    if (thenStores.size() != elseStores.size()) return false;
+    for (size_t k = 0; k < thenStores.size(); k++) {
+        if (thenStores[k].row != elseStores[k].row ||
+            thenStores[k].idxKey != elseStores[k].idxKey)
+            return false;   /* different store addresses between arms: no */
+        if (!canEmitF64(*thenStores[k].rhs) || !canEmitF64(*elseStores[k].rhs))
+            return false;
+    }
+
+    /* cond: the exact same ordered fcmp the general If path builds. */
+    Value *cond = tryEmitI1Cond(*thenBr.cond);
+    if (!cond) return false;
+
+    /* both arms' values (pure — no div class, no calls, no row writes). */
+    SmallVector<Value *, 4> tv, ev;
+    for (size_t k = 0; k < thenStores.size(); k++) {
+        Value *t = emitExprF64(*thenStores[k].rhs);
+        Value *e = emitExprF64(*elseStores[k].rhs);
+        if (!t || !e) return false;
+        tv.push_back(t);
+        ev.push_back(e);
+    }
+
+    auto *dTy = Type::getDoubleTy(ctx_);
+    (void)dTy;
+    for (size_t k = 0; k < thenStores.size(); k++) {
+        const FkStoreSpec &spec = thenStores[k];
+        auto dit = fkKernelData_.find(spec.row);
+        Value *data;
+        if (dit != fkKernelData_.end()) {
+            data = dit->second;
+        } else {
+            Value *row = scalarVarRawPv(spec.row);
+            if (!row) return false;
+            Value *dP = builder_.CreateGEP(
+                Type::getInt8Ty(ctx_), row,
+                ConstantInt::get(Type::getInt64Ty(ctx_), 8), "fk.ifc.pvalp");
+            data = builder_.CreateLoad(perlPtrTy_, dP, "fk.ifc.data");
+        }
+        /* one unconditional store per position, value picked per element;
+           index emitted identically to the flat store path (emitIdx under
+           the prelude's proven-range guarantee) */
+        Value *sel = builder_.CreateSelect(cond, tv[k], ev[k], "fk.ifc.sel");
+        Value *idx = emitIdx(*spec.idxNode);
+        if (!idx) return false;
+        auto *fst = builder_.CreateStore(sel,
+            builder_.CreateGEP(dTy, data, idx, "fk.ifc.ep"));
+        setTBAA(fst, tbaaFlatDoubleTag_);
+    }
+    return true;
+}
+
+
 static bool packFlatMentionsName(const Node &n, const std::string &anm) {
     if (n.name == anm) return true;
     if (n.left && packFlatMentionsName(*n.left, anm)) return true;
@@ -9326,9 +9622,20 @@ void CodeGen::emitStmt(const Node &n) {
         Value *av  = callRT("perl_array_new", {});
         for (auto &a : n.args) {
             if (isCallLikeForContext(*a)) callCtx_ = 1;
-            Value *v = emitExpr(*a);
-            callCtx_ = 0;
-            callRT("perl_array_push_list_or_scalar", {av, v});
+            /* List-producing arguments expand (D145); with D198, that
+               includes a `?:` whose branch collection is list-shaped —
+               real Perl's printf args are list context, so
+               `printf "%d %d", $c ? (1,2) : (3,4)` prints "1 2". Mirrors
+               the print-filehandle argument loop above. */
+            Value *sub = isExplicitListKind(*a) ? emitArrayPtr(*a) : nullptr;
+            if (sub) {
+                callCtx_ = 0;
+                callRT("perl_array_extend", {av, sub});
+            } else {
+                Value *v = emitExpr(*a);
+                callCtx_ = 0;
+                callRT("perl_array_push_list_or_scalar", {av, v});
+            }
         }
         if (n.name == "STDERR") {
             callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
@@ -9411,6 +9718,14 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::If: {
+        /* FK if-conversion: inside the certified flat-kernel body, a
+           uniform if/else that only stores to identical (row, index)
+           positions in both arms emits as value selects + unconditional
+           flat stores (removes LV's "control flow cannot be substituted
+           for a select" refusal). Refuses by falling through to the
+           ordinary If emission on any shape mismatch. */
+        if (tryEmitFkIfConvert(n))
+            break;
         auto *fn   = builder_.GetInsertBlock()->getParent();
         auto *merge = BasicBlock::Create(ctx_, "if.end", fn);
 
@@ -11785,32 +12100,11 @@ Value *CodeGen::emitExpr(const Node &n) {
                        variable is proven FLAT (or Stage-42 CPLX) and its
                        index in range by the loop prelude — write straight
                        into the packed buffer (no promote, no dispatch, no
-                       fallback). */
-                    if (flatKernelMode_ && isOptStageEnabled("st41") &&
-                        n.left->left->kind == NK::ScalarVar &&
-                        knownFlatRows_.count(bareVarName(n.left->left->name))) {
-                        if (Value *fv = emitExprF64(*n.right)) {
-                            auto dit = fkKernelData_.find(
-                                bareVarName(n.left->left->name));
-                            Value *data;
-                            if (dit != fkKernelData_.end()) {
-                                data = dit->second;
-                            } else {
-                                Value *row = scalarVarRawPv(n.left->left->name);
-                                Value *dP = builder_.CreateGEP(
-                                    Type::getInt8Ty(ctx_), row,
-                                    ConstantInt::get(Type::getInt64Ty(ctx_), 8),
-                                    "fk.st.pvalp");
-                                data = builder_.CreateLoad(perlPtrTy_, dP, "fk.st.data");
-                            }
-                            Value *idxS = emitIdx(*n.left->right);
-                            auto *fst = builder_.CreateStore(fv,
-                                builder_.CreateGEP(Type::getDoubleTy(ctx_), data,
-                                    idxS, "fk.st.ep"));
-                            setTBAA(fst, tbaaFlatDoubleTag_);
-                            return callRT("perl_alloc_float", {fv});
-                        }
-                    }
+                       fallback). Shared implementation with the void-context
+                       (emitUnboxedNumericVoid) route above; value-context
+                       keeps the boxed hand-back. */
+                    if (Value *boxed = tryFkRowElemStore(n, /*needValue=*/true))
+                        return boxed;
                     /* Stage 39 (E4): plain `$row->[i] = f` single-step store
                        on a scalar-var-rooted row with an F64 RHS — inline
                        the promote + REF-row in-place float update (boxed
@@ -14841,6 +15135,13 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Value *av = lookupArray(arg->name);
                 if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
             }
+            /* D198: method args are list context like sub-call args — a
+               ternary argument must flatten through the same list branch
+               collection (emitExpr would scalar-collapse the branch). */
+            if (arg->kind == NK::BinOp && arg->sval == "?:") {
+                Value *sub = emitArrayPtr(*arg);
+                if (sub) { callRT("perl_array_extend", {argsArr, sub}); continue; }
+            }
             Value *v = emitExpr(*arg);
             /* read/sysread mutate the buffer scalar in place. */
             if ((n.sval == "read" || n.sval == "sysread") && arg == n.args[0])
@@ -15554,6 +15855,12 @@ bool CodeGen::isExplicitListKind(const Node &n) {
        `scalar reverse` (sval "scalar_ctx") stays on the scalar path. The array forms (ArrayVar/DerefArray/slices/PostfixDeref) are
        retained so this stays a superset of the pre-existing per-site gate. */
     NK k = n.kind;
+    /* D198: a `?:` in a list-consuming position now collects through
+       emitArrayPtr's own "?: case, which always yields a PerlArray (scalar
+       branches become their 1-element list) — so print/say/sprintf must
+       expand it (`print 1 ? (1,2) : (3)` prints "12" like real Perl, not
+       the scalar-context "2"). */
+    if (k == NK::BinOp && n.sval == "?:") return true;
     return k == NK::ArrayVar        || k == NK::DerefArray     ||
            k == NK::ArraySlice      || k == NK::HashSlice      ||
            (k == NK::PostfixDeref  && n.sval == "all_array")   ||
@@ -16016,12 +16323,27 @@ Value *CodeGen::emitBinOp(const Node &n) {
          }
          builder_.CreateCondBr(ctrue, thenBB, elseBB);
 
-        /* Helper: emit a ternary branch. ArrayLit/list-producers need
-           wantarray-aware wrapping. For ArrayLit/ArrayVar/DerefArray,
-           perl_array_to_list_return already picks list-wrap vs last-elem
-           from the wantarray stack (same as `return (1,2)`). Map/grep/
-           sort need the count/undef scalar special cases. */
+        /* Helper: emit a ternary branch. D198: real Perl propagates the
+           ternary's OWN context to whichever branch runs. In this
+           value/scalar position (`my $v = cond ? ... : ...`, an operator
+           operand, a condition) that context is scalar, so the branch gets
+           plain emitExpr — a list-shaped branch collapses to its scalar
+           value (last element for ArrayLit comma-chains, the count for
+           map/grep, undef for sort, the D29/D145 rules emitExpr already
+           implements) exactly like the same expression written without the
+           ternary. Only the D87 `return EXPR` positions (callCtx_==-1)
+           keep the old wantarray-stack consult: there the branch's context
+           IS the sub's call context at runtime, so list-shaped branches
+           wrap per the runtime stack exactly as before. List-position
+           consumption went to emitArrayPtr's sibling "?: case (syntactic
+           list collection), so the runtime-stack consult here can no longer
+           disagree with the local context the way the O-division of this
+           fix's repro did (`my $v = 1 ? (1,2) : (3);` inside a list-called
+           sub). */
+        bool dynCtx = (callCtx_ == -1);
         auto emitBranch = [&](const Node &branchNode) -> Value * {
+            if (!dynCtx)
+                return emitExpr(branchNode);
             if (branchNode.kind == NK::ArrayLit || branchNode.kind == NK::ArrayVar ||
                 branchNode.kind == NK::DerefArray) {
                 Value *av = emitArrayPtr(branchNode);

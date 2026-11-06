@@ -335,4 +335,84 @@ a codegen-side one.
 - Auto-parallel counted loops: unchanged from the 2026-09-22 design
   note (TESTS.md §"Future: auto-parallel"); its precondition ("a packed
   FLAT/CPLX C worker over double[]") is now materially closer.
-- D198 (wantarray stale ctx) remains the one open unboxing-safety row.
+- D198 (ternary context propagation, see Stage 44 below) — the last
+  open unboxing-safety row — closes same-day (2026-11-06).
+
+## Stage 43 — FK kernel store/if-conversion: filling the LV refusal (2026-11-06, this session)
+
+Root-caused on the round-2 isolated-module
+setup (`llvm-extract --func=perlsub_mbi` + `opt -passes="lto-pre-link<O2>"
+-pass-remarks-analysis=loop-vectorize`), the certified flat loops declined
+for three stacked reasons, of which two were codegen-side:
+
+1. **Kernel-1's flat body carried a per-iteration row tag-check branch and
+   two boxed store-value allocations** (`perl_alloc_float` per store via
+   the Stage-39 `emitRowElemStoreFast` void-store route, which intercepts
+   before anything asks whether the row is a certified FK row). Postlink,
+   with the runtime leaves inlined, this branch+call ladder is what LV
+   actually refused; the general variant's ladder is the same shape, so
+   cleaning only the flat variant is observability-free.
+2. **Kernel-2's uniform `if (abs2 < 4.0)` reached LV as an if/else pair of
+   stores** — the "control flow cannot be substituted for a select"
+   refusal — at least in the prelink pipeline; postlink LLVM if-converts
+   that much by itself once the stores are clean.
+3. LV's own pointer-group memcheck handles the rest (the fk prelude's WAR
+   proof is informational for LV; its own versioning is what fires).
+
+Fixes (both inside the guarded flat re-emission only, `PERLC_OPT_DISABLE`
+knobs kept):
+
+- **`tryFkRowElemStore(n, needValue)`** — certified FK rows store directly
+  into `fkKernelData_[row]` (no promote, no tag check); void-context
+  statement stores skip the result PV entirely (the alloc_float call lived
+  inside the loop and blocked LV by itself). Routed from
+  `emitUnboxedNumericVoid` (kernel-1's void stores) and the
+  chain-assign FK branch (deduped, value-context keeps the boxed hand-back).
+- **`tryEmitFkIfConvert`** (`fkifconv` knob) — inside the certified body,
+  an if/else whose arms are *only* pairwise-(row, index)-identical
+  element stores of row-pure f64 values (no `/` anywhere — the unboxed
+  zero-divisor die must stay exactly where the taken-arm evaluation puts
+  it) emits as per-element `select` + one unconditional flat store; the
+  condition is the same ordered fcmp the general path builds
+  (`tryEmitI1Cond`), so NaN semantics are unchanged.
+
+### Measured (mbs640, plain -O2 default build, byte-verified vs perl)
+
+| config | mbs runtime | perlsub_mbi packed-double ops | -Wpass-failed noise |
+|---|---|---|---|
+| Stage 42 tree (= 84f019b) | 1.43–1.44 s | 0 (all-scalar sd math in the kernels) | 2–3 warnings per compile |
+| Stage 43 | **1.42–1.43 s** | 32 (vmulpd/vaddpd/vunpck/vshuf/vpermpd in the kernels — the flat loops now vectorize) | **0** |
+
+The isolated prelink A/B shows the refusal ladder closing:
+2× "control flow cannot be substituted for a select" → 1× (after
+if-conv) → 0 (after the raw store routing). At the real link both
+`llvm.loop.vectorize.enable` demands are now fulfilled, which also removes
+the user-visible `-Wpass-failed` stderr noise every FK-program `-O2`
+compile used to print.
+
+The mbs runtime is unchanged (memory-bound at N=640 with LTO inlining);
+the win is structural — the certified kernels are now genuinely
+vectorized, which the Stage-45+ work (wider grids, kernel reshaping,
+auto-parallel) inherits without further codegen-side blocks.
+
+### Stage 44 (D198) — the wantarray/ctx family item closes as ternary context propagation
+
+Same session. The D198 row as filed ("wantarray() inside a de-boxed
+prologue reads a stale LIST ctx") did NOT reproduce: real perl prints
+`want-list` for the row's own `print cq(1)` repro (print args are list
+context — the row's perl-side expectation was wrong), and a 28-position
+probe battery of wantarray-reading subs in every call position is
+byte-identical perlc vs perl. Re-deriving the family empirically found
+the real defect hiding under the same repro: the conditional operator's
+branch context (full write-up in the TESTS.md D198 row). Real Perl
+propagates the ternary's OWN immediate context to whichever branch runs;
+perlc was consulting the wantarray stack (the sub's CALL context) in
+both directions — wrong for list-position ternaries inside scalar-called
+subs and for scalar-position ternaries inside list-called subs. Fixed
+with a syntactic-context model (emitArrayPtr "?: case for list positions
++ scalar-context emitExpr branches + the D87 runtime consult kept only
+for return-EXPR positions), plus print/sprintf/printf/method-arg
+expansion. Tests `tests/d198_ternary_ctx_{smoke,deep}.pl` byte-identical;
+`make test-all` 617/617 incl. the new pair. The one open unboxing-safety
+row is now closed; the remaining strategic items are auto-parallel
+counted loops and D199's boxed-path div-zero tail.

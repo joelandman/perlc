@@ -112,6 +112,8 @@ public:
        per-variant IR caches. */
     std::unordered_map<std::string, llvm::Value *> fkKernelData_;
     bool tryEmitFlatKernelFor(const Node &n);
+    bool tryEmitFkIfConvert(const Node &n);  /* FK uniform-branch if-conversion (LV lever) */
+    llvm::Value *tryFkRowElemStore(const Node &n, bool needValue); /* certified FK row store (LV lever) */
     llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
     void emitFlatPairLoad(llvm::Value *dataPtr, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
     void emitRefPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
@@ -468,6 +470,7 @@ private:
     void emitBareFhPrintProbe(const Node &n);
     bool inBareFhProbe_ = false;
     bool isExplicitListKind(const Node &n);   /* unambiguously list-producing, so expand via emitArrayPtr in print/say/sprintf arg collection */
+    llvm::Value *collectTernListBranch(const Node &branch, llvm::BasicBlock *endBB); /* D198: list-context `?:` branch collection (see emitArrayPtr) */
     llvm::Value *emitCall(const Node &n);
     void fillCallArgs(llvm::Value *argsArr, const Node &n);
     void flattenArgInto(llvm::Value *argsArr, const Node &arg);
