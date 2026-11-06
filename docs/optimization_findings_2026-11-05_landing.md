@@ -327,7 +327,12 @@ a codegen-side one.
   rows and every consumer (Stage 35/36/39/41 machinery) handles them.
 - Flat-kernel dual-emit: **live over packed rows** (both kernel
   classes), byte-exact, neutral today pending the LV work above.
+- **D197 fixed** (2026-11-06, TESTS.md row): the defined()-observer
+  refusal in the Stage-25 ladder + Stage-37 pre-pass (with the
+  pre-existing ternary-condition walk gap found and fixed in the same
+  pass — the ladder's binOp walk never reached `n->cond`). One of the
+  two open unboxing-safety classes now closed.
 - Auto-parallel counted loops: unchanged from the 2026-09-22 design
   note (TESTS.md §"Future: auto-parallel"); its precondition ("a packed
   FLAT/CPLX C worker over double[]") is now materially closer.
-- D197/D198 remain open (unboxing-safety classes).
+- D198 (wantarray stale ctx) remains the one open unboxing-safety row.

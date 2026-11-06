@@ -4662,6 +4662,26 @@ static bool floatSafe(const Node &n, const std::string &nm, bool inNum) {
         return inNum;
 
     switch (n.kind) {
+    case NK::DefinedFunc:
+        /* D197 (2026-11-06): a defined($p) read is an observation the
+           int-promoted alloca cannot reproduce (the undef sentinel
+           numerified to 0 makes defined() always-true). Refuse promotion
+           when the body checks defined() on this param — the ladder's
+           gate was previously "the only body-use gate" and had no
+           definedness row at all (D197: sub m2 { my ($y) = @_; ... }
+           answered "D" for missing args). NOTE: the unpack-param `nm`
+           arrives BARE (the My-array-literal LHS elements carry bare
+           names) while body ScalarVar reads carry the sigil — match both
+           spellings. Non-param defined() operands fall through to the
+           generic children walk. */
+        if (n.left && n.left->kind == NK::ScalarVar) {
+            const std::string &on = n.left->name;
+            std::string ob = on;
+            if (!ob.empty() && ob[0] == '$') ob = ob.substr(1);
+            if (on == nm || ob == nm)
+                return false;
+        }
+        return true;
     case NK::BinOp: {
         bool isNum = (n.sval=="+"||n.sval=="-"||n.sval=="*"||n.sval=="/"||
                       n.sval=="**"||n.sval=="%"||n.sval=="<"||n.sval=="<="||
@@ -4669,6 +4689,10 @@ static bool floatSafe(const Node &n, const std::string &nm, bool inNum) {
         bool ok = true;
         if (n.left)  ok = ok && floatSafe(*n.left,  nm, isNum);
         if (n.right) ok = ok && floatSafe(*n.right, nm, isNum);
+        /* D197: the ternary ("?:") stores its condition in n->cond — that
+           operand was invisible to this walk (the definedness check inside
+           a ternary condition never refused the promotion). */
+        if (n.cond)  ok = ok && floatSafe(*n.cond, nm, false);
         return ok;
     }
     case NK::UnaryOp: {
@@ -4913,6 +4937,41 @@ static bool rhsIsIntShapedCtx(const Node &n, const D135IntSet &cur,
     default:
         return false;
     }
+}
+
+/* D197 (2026-11-06): does this subtree observe a variable's DEFINEDNESS
+   (a `defined($nm)` read)? On an @_-bound param this is the one observable
+   an int-promoted alloca cannot reproduce: the unboxed bind numerifies the
+   undef sentinel to 0 and the produced INT box is always defined —
+   `sub m2 { my ($y) = @_; defined($y) ? "D" : "U" }` answered "D" for a
+   missing arg where perl says "U". Any body that checks defined() on a
+   proven param keeps that param fully BOXED (generic machinery,
+   byte-exact). Splice/each adjacency stays scoped out (D197's row note
+   tracks that follow-up class); defined() is the observed real-script
+   shape. */
+
+static bool definedObservesName(const Node &n, const std::string &nm) {
+    if (n.kind == NK::DefinedFunc) {
+        const Node *op = n.left.get();
+        if (op && op->kind == NK::ScalarVar) {
+            const std::string &on = op->name;
+            if (on == nm || (!nm.empty() && nm[0] != '$' && on == "$" + nm)) return true;
+        }
+    }
+    if (n.left && definedObservesName(*n.left, nm)) return true;
+    if (n.right && definedObservesName(*n.right, nm)) return true;
+    if (n.cond && definedObservesName(*n.cond, nm)) return true;
+    if (n.body && definedObservesName(*n.body, nm)) return true;
+    if (n.init && definedObservesName(*n.init, nm)) return true;
+    if (n.step && definedObservesName(*n.step, nm)) return true;
+    if (n.contBlock && definedObservesName(*n.contBlock, nm)) return true;
+    for (const auto &a : n.args)
+        if (definedObservesName(*a, nm)) return true;
+    for (const auto &br : n.branches) {
+        if (br.cond && definedObservesName(*br.cond, nm)) return true;
+        if (br.body && definedObservesName(*br.body, nm)) return true;
+    }
+    return false;
 }
 
 /* does a write to 'nm' with this RHS keep the var int-only under 'cur'? */
@@ -5599,6 +5658,21 @@ void CodeGen::analyzeAtArgIntUnboxing(const Node &program) {
 
         if (!changedAny) break;
     }
+
+    /* D197 (2026-11-06): before a proven param commits to the atArgInt
+       sets, refuse any param whose body can observe its DEFINEDNESS
+       (definedObservesName above) — the promoted alloca cannot represent
+       "missing arg" and the lie propagates to every defined() check.
+       Splice/each adjacency stays scoped out (D197's row note for the
+       follow-up class); defined() is the observed real-script shape. */
+    for (auto &[sd, set] : proven)
+        if (!set.empty()) {
+            std::set<std::string> keep197;
+            for (const auto &nm2 : set)
+                if (!(sd->body && definedObservesName(*sd->body, nm2)))
+                    keep197.insert(nm2);
+            set = keep197;
+        }
 
     for (auto &[sd, set] : proven)
         if (!set.empty()) {
@@ -7367,6 +7441,8 @@ void CodeGen::emitSub(const Node &n) {
             for (auto &lhsElem : asgn->left->args) {
                 if (lhsElem->kind != NK::ScalarVar) continue;
                 const std::string &nm = lhsElem->name;
+                if (getenv("PERLC_DEBUG_ST37"))
+                    fprintf(stderr, "  ST37 ladder candidate nm=[%s]\n", nm.c_str());
                 if (prePromotedArgs_.count(nm)) continue;
                 /* Stage 37: whole-program call-site proof says this @_ param
                    is always an exact i64 — no arg shape can make the unbox
@@ -7392,7 +7468,9 @@ void CodeGen::emitSub(const Node &n) {
                 bool safe   = floatSafe(*n.body, nm, false);
                 bool needFP = needsFloatPrec(*n.body, nm);
                 bool used   = hasVar(*n.body, nm);
-                if (safe && needFP)
+                if (getenv("PERLC_DEBUG_ST37"))
+                    fprintf(stderr, "  ST37 ladder %s: safe=%d needFP=%d used=%d\n",
+                            nm.c_str(), (int)safe, (int)needFP, (int)used);                if (safe && needFP)
                     prePromotedArgs_[nm] = PPKind::Float;
                 else if (safe && !needFP && used)
                     prePromotedArgs_[nm] = PPKind::Int;
