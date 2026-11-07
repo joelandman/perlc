@@ -5077,7 +5077,18 @@ NodePtr Parser::parsePrimary() {
         } else if (check(TK::LBRACE)) {
             n->body = parseBlock();
         } else {
-            n->left = parseExpr(); /* expr form: map EXPR, LIST */
+            /* Perl's `+{ ... }` block/hashref disambiguator: a leading `+`
+               before the opening brace (e.g. `map +{ a => $_ }, @list`)
+               forces a SINGLE hashref per element instead of the key/value
+               PAIRS a bare `{ k => v }` block yields. Record it on n.ival so
+               codegen pushes one scalar rather than the pairs. Without the
+               mark, parseUnary's no-op unary-plus strips the `+`, the body
+               parses to AnonHash, and the map pairs path (which keys only on
+               AnonHash) double-counts every element. */
+            bool plusHashref = check(TK::PLUS) && peek(1).kind == TK::LBRACE;
+            if (plusHashref) advance();  /* consume the disambiguating '+' */
+            n->left = parseExpr();        /* expr form: map EXPR, LIST */
+            if (plusHashref) n->ival = 1;
         }
         match(TK::COMMA);
         /* parse the input list (array, range, or explicit list) */

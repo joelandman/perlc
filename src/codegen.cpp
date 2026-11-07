@@ -2202,10 +2202,11 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 if (e) { mapAv = emitArrayPtr(*e); if (!mapAv) mapPv = emitExpr(*e); }
                 else   emitStmt(last);
             } else if (n.left) {
-                if (n.left->kind == NK::AnonHash) {
-                    /* `map { $_ => 1 } @list` — the braces are the hash
-                       constructor itself (parser put it in n.left): real
-                       Perl yields the key/value PAIRS in list context. */
+                /* Bare `{ k => v }` (n.ival unset) yields the key/value
+                   PAIRS in list context. `map +{...} @list` (n.ival set by
+                   the parser for the disambiguating form) yields a SINGLE
+                   hashref instead — so skip the pairs path when n.ival. */
+                if (n.left->kind == NK::AnonHash && !n.ival) {
                     Value *hvPv = emitExpr(*n.left);
                     Value *pairs = callRT("perl_hash_pairs_array", {hvPv});
                     callRT("perl_array_extend", {resultArr, pairs});
