@@ -14,6 +14,8 @@
 #   TIMEOUT_SEC=60 ./tests/harness.sh        # per-test perl and binary timeout
 #   RUN_IN_PARALLEL=0 ./tests/harness.sh     # one test at a time
 #   CORE_DIVISOR=2 ./tests/harness.sh        # worker count is nproc/CORE_DIVISOR
+#   PERLC_BWRAP=0 ./tests/harness.sh         # disable per-test bwrap /tmp isolation
+#   PERLC_HARNESS_TMP=/path                  # base dir for harness temp files
 #
 # Exit status: 0 if every compared test matches, nonzero otherwise.
 # Prints PASS/FAIL for each, then a summary.
@@ -139,6 +141,41 @@ PY
     diff -u <(normalize < "$a") <(normalize < "$b") >/dev/null
 }
 
+# Per-test /tmp isolation via bubblewrap.
+#   run_sandboxed <command...>
+# When bwrap is available (and not disabled via PERLC_BWRAP=0), runs the command
+# inside a sandbox with a FRESH, private tmpfs mounted at /tmp, so that tests
+# which write to fixed /tmp paths (e.g. fileio.pl, file_copy_smoke.pl) run
+# concurrently without colliding on the same host file. Host root is otherwise
+# read-only; the project dir is rebound writable so CWD-relative test writes
+# (tests/...) still work, and /dev/shm is a fresh tmpfs so threads::shared has
+# space. When bwrap is unavailable/disabled we fall back to running the command
+# as-is (the pre-bwrap behaviour).
+#
+# Two things the sandbox does that plain execution would get wrong:
+#   * env TMPDIR=/tmp  — the inherited harness TMPDIR points at a path outside
+#     /tmp, which bwrap leaves read-only (host-root bind). perlc's runtime
+#     do-lib compiler uses TMPDIR for its intermediate files, so a read-only
+#     TMPDIR breaks do-lib. Point it at the writable tmpfs /tmp instead.
+#   * fresh tmpfs /tmp — a fresh tmpfs (not a bind mount of a host dir) keeps
+#     perl and perlc on the same kernel readdir ordering, so order-dependent
+#     tests (e.g. File::Find traversal order) match perl, which still runs
+#     against the real /tmp.
+run_sandboxed() {
+    if [[ $USE_BWRAP -eq 1 ]]; then
+        env TMPDIR=/tmp bwrap --ro-bind / / \
+              --bind "$PROJECT_DIR" "$PROJECT_DIR" \
+              --tmpfs /tmp \
+              --tmpfs /dev/shm \
+              --dev /dev \
+              --proc /proc \
+              --chdir "$PROJECT_DIR" \
+              "$@"
+    else
+        "$@"
+    fi
+}
+
 run_one() {
     local testfile="$1"
     local base
@@ -174,7 +211,7 @@ run_one() {
     # status directly (capturing it inside an `if ! cmd; then` block would
     # read the negated status and always see 0).
     perl_rc=0
-    timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1 || perl_rc=$?
+    run_sandboxed timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1 || perl_rc=$?
 
     # Compile with perlc (if binary exists)
     if [[ ! -x "$PERLC_BIN" ]]; then
@@ -216,7 +253,7 @@ run_one() {
         return 0
     fi
 
-    if ! timeout "$test_timeout" "$c_bin" $args >"$c_out" 2>&1; then
+    if ! run_sandboxed timeout "$test_timeout" "$c_bin" $args >"$c_out" 2>&1; then
         :
     fi
 
@@ -248,6 +285,7 @@ main() {
     local total=0 pass=0 fail=0
 
     local t base s skip rfile verdict nworkers running
+    local HARNESS_TMP_BASE USE_BWRAP=0
 
     ncpu=$(nproc)
     nworkers=$(( ncpu / CORE_DIVISOR ))
@@ -260,8 +298,26 @@ main() {
     # file; we aggregate them in sorted order below so the summary is stable
     # regardless of completion order. res_dir is global so the EXIT trap can
     # clean it up after main() returns.
-    res_dir=$(mktemp -d "${TMPDIR:-/tmp}/perlc_harness.XXXXXX")
-    trap 'rm -rf "${res_dir:-}"' EXIT
+
+    # All harness-owned temp files live under HARNESS_TMP_BASE, which is OUTSIDE
+    # the real /tmp. This matters because per-test runs happen inside a bwrap
+    # sandbox where the host /tmp is hidden (fresh tmpfs) — a path under the real
+    # /tmp would then be invisible there. Keep it visible by keeping it off /tmp.
+    mkdir -p "$HOME/.local" 2>/dev/null || true
+    HARNESS_TMP_BASE="$(mktemp -d "${PERLC_HARNESS_TMP:-$HOME/.local/perlc_harness.XXXXXX}")"
+    export TMPDIR="$HARNESS_TMP_BASE"
+    res_dir="$HARNESS_TMP_BASE/results"
+    mkdir -p "$res_dir"
+    trap 'rm -rf "${HARNESS_TMP_BASE:-}"' EXIT
+
+    # Per-test /tmp isolation via bwrap: on by default when bwrap is present,
+    # off when absent or when PERLC_BWRAP=0 is set. run_one/run_sandboxed read
+    # this once per harness run.
+    if [[ "${PERLC_BWRAP:-}" == "0" ]]; then
+        USE_BWRAP=0
+    elif command -v bwrap >/dev/null 2>&1; then
+        USE_BWRAP=1
+    fi
 
     # 1) Print skip notices up-front (original serial ordering).
     for t in "${tests[@]}"; do
