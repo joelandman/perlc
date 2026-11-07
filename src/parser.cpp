@@ -36,6 +36,25 @@ static bool isCmpOpWord(const std::string &w) {
     return false;
 }
 
+/* Any compound-assignment operator token (+=, -=, .=, ||=, //=, &, ...).
+   Used so a freshly-declared `my $x <cmp> EXPR` (e.g. ptar's
+   `my $usage .= <<'=cut';`) parses — the RHS initializes the fresh scalar
+   the same way `my $x = EXPR` would, which is all the compile-only corpus
+   needs. */
+static bool isCompoundAssignOp(TK k) {
+    switch (k) {
+    case TK::PLUS_ASSIGN: case TK::MINUS_ASSIGN: case TK::STAR_ASSIGN:
+    case TK::SLASH_ASSIGN: case TK::DOT_ASSIGN: case TK::PERCENT_ASSIGN:
+    case TK::POW_ASSIGN: case TK::OR_ASSIGN: case TK::AND_ASSIGN:
+    case TK::DEFINED_OR_ASSIGN: case TK::X_ASSIGN:
+    case TK::BITAND_ASSIGN: case TK::BITOR_ASSIGN: case TK::BITXOR_ASSIGN:
+    case TK::LSHIFT_ASSIGN: case TK::RSHIFT_ASSIGN:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* Low-precedence logical xor: both operands are evaluated exactly once,
    left to right, and the result is a real boolean (1 / ""), like perl's
    `A xor B`. There is no xor op in codegen, so desugar to !( !A == !B ). */
@@ -1598,6 +1617,16 @@ NodePtr Parser::parseMy() {
         }
         if (match(TK::ASSIGN)) {
             decl->right = parseLowNot();
+        } else if (isCompoundAssignOp(cur().kind)) {
+            /* `my $x <cmp> EXPR` (+=, .=, ||=, //=, &, ...) on a fresh scalar:
+               the compound op on undef yields the RHS value, so initializing
+               with the RHS matches (a freshly-declared `my $x .= "a"` is "a").
+               Handled here the same way as `my $x = EXPR` — compile-only, and
+               this is what ptar's `my $usage .= <<'=cut'` needs (the heredoc
+               form was previously a hard "unexpected '.='" parse error). */
+            advance();
+            decl->right = parseLowNot();
+            decl->ival |= 4; /* compound-op init on a fresh scalar */
         }
         return finishDeclLowOr(std::move(decl), makeScalar(nm, line), line);
     }
@@ -4817,7 +4846,7 @@ NodePtr Parser::parsePrimary() {
         } else {
             sep = parseExpr();
         }
-        match(TK::COMMA);
+        match(TK::COMMA) || match(TK::FATARROW);
         NodePtr str;
         if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK))
             str = parseExpr();
@@ -4828,7 +4857,7 @@ NodePtr Parser::parsePrimary() {
            0 as the limit sentinel for that case, matching real Perl's
            "omitted or zero" equivalence). */
         NodePtr limitExpr;
-        if (match(TK::COMMA) &&
+        if ((match(TK::COMMA) || match(TK::FATARROW)) &&
             !check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
             limitExpr = parseExpr();
         }
@@ -5096,7 +5125,12 @@ NodePtr Parser::parsePrimary() {
             if (hp && check(TK::RPAREN)) break;
             if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
-            if (!match(TK::COMMA)) break;
+            /* `=>` (fat arrow) is just a quoted comma in a list context, so it
+               is a valid LIST separator here the same way COMMA is —
+               `map {..} split m// => shift @ARGV`. A bare COMMA match alone
+               left the `=>` dangling (parse error "unexpected '=>'"). */
+            if (match(TK::COMMA) || match(TK::FATARROW)) continue;
+            break;
         }
         if (hp) consume(TK::RPAREN, ")");
         return n;
