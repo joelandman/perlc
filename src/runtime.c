@@ -424,6 +424,7 @@ static __thread PerlValue s_dollar_under;
    the definition (perl_mod, div-by-zero, substr) see the correct signature. */
 static char *appendDieLocation(char *msg, const char *filename, int line);
 static PerlValue *flat_elem_box(double d, int intElems);
+static int flat_elem_int_bits(const PerlValue *row, long long idx);
 static int call_sig_handler(const char *name, PerlValue *msg_pv);
 static int perl_parse_signal(PerlValue *v);
 static void perl_sig_install(const char *key, PerlValue *val);
@@ -1392,7 +1393,7 @@ PerlValue *perl_pack_flat_row(PerlValue *refpv) {
     out->blessed_class = NULL;
     out->pval = data;
     out->matchpos = n;         /* element count */
-    out->flags = (unsigned int)bits;
+    out->flags = (unsigned int)bits | PV_FLAG_PK_LAYOUT;
     return out;
 }
 
@@ -1425,10 +1426,9 @@ HOTX PerlValue *perl_cplx_elem(PerlValue *row, long long idx) {
         if (idx < 0) idx += row->matchpos;
         if (idx < 0 || idx >= row->matchpos) return perl_alloc_undef();
         double *d = (double *)row->pval;
-        /* D154 half bits ride on packed rows (the D207 pack hand-out sets
-           them) — the boxed element round trip must reproduce IV-ness. */
-        int ie = (idx % 2 == 0) ? (row->flags & PV_FLAG_INT_ELEMS)
-                                : (row->flags & PV_FLAG_INT_ELEM2);
+        /* D154/D207: boxed element round trip must reproduce IV-ness —
+           per-half bits on packed-layout rows, INT_ELEMS on plain rows. */
+        int ie = flat_elem_int_bits(row, idx);
         return flat_elem_box(d ? d[idx] : 0.0, ie != 0);
     }
     PerlArray *av = perl_deref_array(row);
@@ -2187,33 +2187,18 @@ const char *perl_to_string(const PerlValue *v) {
             return strdup("DBI::db");
         case PERL_DBI_STH:
             return strdup("DBI::st");
-        case PERL_FLAT_ARRAY: {
-            /* format pval as double[] of length matchpos, space-separated */
-            long long n = v->matchpos;
-            double *d = (double *)v->pval;
-            /* worst case: "1.7e308 " is ~10 chars per element, plus NUL */
-            size_t cap = 16 + (size_t)n * 14;
-            char *buf = (char *)malloc(cap);
-            if (!buf) return strdup("");
-            size_t off = 0;
-            for (long long i = 0; i < n; i++) {
-                int w = snprintf(buf + off, cap - off, "%s%g",
-                                 i == 0 ? "" : " ", d ? d[i] : 0.0);
-                if (w < 0 || (size_t)w >= cap - off) break;
-                off += (size_t)w;
-            }
-            if (off < cap) buf[off] = '\0'; else buf[cap - 1] = '\0';
-            return buf;
-        }
-        case PERL_FLOAT_PAIR: {
-            /* fval = re, matchpos holds the bits of im (see perl_alloc_float_pair) */
-            double re = v->fval;
-            double im;
-            memcpy(&im, &v->matchpos, sizeof(double));
-            char buf[80];
-            snprintf(buf, sizeof buf, "%g %g", re, im);
+        case PERL_FLAT_ARRAY:
+        case PERL_FLOAT_PAIR:
+            /* D203: packed row = anon array ref — stringify as the ref
+               form (ARRAY(0x…)), same as the REF_ARRAY/CPLX_ROW arms and
+               the duplicate to_string variant further down. */
+            if (v->blessed_class && v->blessed_class[0])
+                snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class,
+                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
+            else
+                snprintf(buf, sizeof buf, "ARRAY(0x%llx)",
+                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
             return strdup(buf);
-        }
         default:
             return strdup("");
     }
@@ -2379,32 +2364,23 @@ char *perl_to_string_dup(const PerlValue *v) {
             return strdup("DBI::db");
         case PERL_DBI_STH:
             return strdup("DBI::st");
-        case PERL_FLAT_ARRAY: {
-            /* format pval as double[] of length matchpos, space-separated */
-            long long n = v->matchpos;
-            double *d = (double *)v->pval;
-            size_t cap = 16 + (size_t)n * 14;
-            char *buf = (char *)malloc(cap);
-            if (!buf) return strdup("");
-            size_t off = 0;
-            for (long long i = 0; i < n; i++) {
-                int w = snprintf(buf + off, cap - off, "%s%g",
-                                 i == 0 ? "" : " ", d ? d[i] : 0.0);
-                if (w < 0 || (size_t)w >= cap - off) break;
-                off += (size_t)w;
-            }
-            if (off < cap) buf[off] = '\0'; else buf[cap - 1] = '\0';
-            return buf;
-        }
-        case PERL_FLOAT_PAIR: {
-            /* fval = re, matchpos holds the bits of im (see perl_alloc_float_pair) */
-            double re = v->fval;
-            double im;
-            memcpy(&im, &v->matchpos, sizeof(double));
-            char buf[80];
-            snprintf(buf, sizeof buf, "%g %g", re, im);
+        case PERL_FLAT_ARRAY:
+        case PERL_FLOAT_PAIR:
+            /* D203 (2026-11-06): a packed row IS an anonymous-array ref —
+               its stringification is the ref form (ARRAY(0x…)), exactly
+               like the REF_ARRAY/CPLX_ROW arms above. The old element-list
+               format leaked the packed contents through interpolation
+               (my @b = ([9,10,11]); print "@b" printed "9 10 11" where
+               perl prints ARRAY(0x…)) — the core D203 list-position
+               surface. Element views still flatten through @{} / element
+               reads / @row interpolation, which never reach to_string. */
+            if (v->blessed_class && v->blessed_class[0])
+                snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class,
+                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
+            else
+                snprintf(buf, sizeof buf, "ARRAY(0x%llx)",
+                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
             return strdup(buf);
-        }
         default:
             return strdup("");
     }
@@ -4882,6 +4858,19 @@ static PerlValue *flat_elem_box(double d, int intElems) {
     return v;
 }
 
+/* D207/D154: element IV-ness when boxing FLAT elements. Packed-layout rows
+   (the pack hand-out; 2N interleaved re/im) read the per-half D154 bits;
+   plain FLAT rows (Stage-22 literals/fills — any length, one double per
+   slot) mark EVERY element from PV_FLAG_INT_ELEMS alone. Without the
+   layout bit, per-half reads on plain rows wrongly dropped IV-ness at
+   odd indices (Dumper quoted element '6'). */
+static int flat_elem_int_bits(const PerlValue *row, long long idx) {
+    if (row->flags & PV_FLAG_PK_LAYOUT)
+        return (int)((idx % 2 == 0) ? (row->flags & PV_FLAG_INT_ELEMS)
+                                    : (row->flags & PV_FLAG_INT_ELEM2));
+    return (int)(row->flags & PV_FLAG_INT_ELEMS);
+}
+
 PerlArray *perl_deref_array(PerlValue *ref) {
     if (!ref) return perl_array_new();
     if (ref->tag == PERL_FLAT_ARRAY) {
@@ -4889,9 +4878,9 @@ PerlArray *perl_deref_array(PerlValue *ref) {
         long long n = ref->matchpos;
         double *dbl = (double *)ref->pval;
         PerlArray *av = perl_anon_array_new();
-        int ie = (ref->flags & PV_FLAG_INT_ELEMS) != 0;
         for (long long i = 0; i < n; i++) {
-            PerlValue *fv = flat_elem_box(dbl[i], ie);
+            PerlValue *fv = flat_elem_box(dbl[i],
+                flat_elem_int_bits(ref, i));
             perl_array_push(av, fv);
             perl_free(fv);
         }
@@ -7961,8 +7950,33 @@ static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
     perl_promote_ref_array(v); /* FLOAT_PAIR -> real REF_ARRAY (D207: FLAT
                                   rows are kept FLAT through reads and are
                                   boxed right below, exactly like CPLX_ROW) */
-    if (v->tag == PERL_CPLX_ROW || v->tag == PERL_FLAT_ARRAY)
+    if (v->tag == PERL_CPLX_ROW) {
         perl_deref_array(v);
+        json_encode_value(b, v, depth);
+        return;
+    }
+    if (v->tag == PERL_FLAT_ARRAY) {
+        /* D207: box a temp view from the refcounted backing and encode it —
+           never fork-convert a (possibly shared) row PV in place from a
+           read-only walker. The temp is fully freed here. */
+        long long n = v->matchpos;
+        PerlArray *tmp = perl_anon_array_new();
+        if (v->pval) {
+            double *d = (double *)v->pval;
+            for (long long i = 0; i < n; i++) {
+                int ie = flat_elem_int_bits(v, i);
+                PerlValue *b2 = flat_elem_box(d[i], ie != 0);
+                perl_array_push(tmp, b2);
+                perl_free(b2);
+            }
+        } else {
+            for (long long i = 0; i < n; i++)
+                perl_array_push(tmp, perl_alloc_undef());
+        }
+        json_encode_array(b, tmp, depth);
+        perl_array_free(tmp);
+        return;
+    }
     if (depth == 0 && !b->allow_nonref && !json_is_ref_value(v)) {
         perl_die_croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
     }
@@ -13668,7 +13682,29 @@ static void dumper_value(DumperBuf *b, PerlValue *v) {
     perl_promote_ref_array(v); /* FLOAT_PAIR → real REF_ARRAY (D207: FLAT
                                   rows stay FLAT through reads and are
                                   boxed right below, like CPLX_ROW) */
-    if (v->tag == PERL_FLAT_ARRAY) perl_deref_array(v);
+    if (v->tag == PERL_FLAT_ARRAY) {
+        /* D207: box a temp view from the refcounted backing and dump that —
+           never fork-convert a (possibly shared) row PV in place from a
+           read-only walker. Element intness uses the D154 half bits. */
+        long long n = v->matchpos;
+        PerlArray *tmp = perl_anon_array_new();
+        if (v->pval) {
+            double *d = (double *)v->pval;
+            for (long long i = 0; i < n; i++) {
+                int ie = flat_elem_int_bits(v, i);
+                PerlValue *b2 = flat_elem_box(d[i], ie != 0);
+                perl_array_push(tmp, b2);
+                perl_free(b2);
+            }
+        } else {
+            for (long long i = 0; i < n; i++)
+                perl_array_push(tmp, perl_alloc_undef());
+        }
+        dumper_array(b, tmp);
+        perl_array_free(tmp);
+        return;
+    }
+    if (v->tag == PERL_CPLX_ROW) perl_deref_array(v);
     const char *cls = v->blessed_class;
     if (cls) dumper_putstr(b, "bless( ");
     switch (v->tag) {
@@ -16285,9 +16321,7 @@ static void st_enc(StBuf *b, PerlValue *v) {
         if (v->pval && v->matchpos > 0) {
             double *d = (double *)v->pval;
             for (long long i = 0; i < v->matchpos; i++) {
-                /* D154 half bits: re-half vs im-half integer-ness. */
-                int ie = (i % 2 == 0) ? (v->flags & PV_FLAG_INT_ELEMS)
-                                      : (v->flags & PV_FLAG_INT_ELEM2);
+                int ie = flat_elem_int_bits(v, i);
                 double ev = d[i];
                 if (ie && ev == (double)(long long)ev &&
                     ev > -9.2e18 && ev < 9.2e18)
@@ -16753,14 +16787,32 @@ PerlValue *perl_list_moreutils(const char *name, PerlArray *args) {
         /* args are arrayrefs (or we'll treat remaining as one list of refs) */
         long long max = 0, n = args ? args->len : 0;
         PerlArray **avs = calloc((size_t)n, sizeof(PerlArray *));
+        PerlArray **flatTmps = calloc((size_t)n, sizeof(PerlArray *));
         for (long long i = 0; i < n; i++) {
             PerlValue *v = args->elems[i];
             perl_promote_ref_array(v);
             /* D207: FLAT rows stay FLAT through reads (promote is a no-op
-               for tag 10) — box them exactly like the old promote did so
-               mesh/zip still see their element lists. */
-            if (v->tag == PERL_FLAT_ARRAY) perl_deref_array(v);
-            if (v->tag == PERL_REF_ARRAY) avs[i] = (PerlArray *)v->pval;
+               for tag 10) — box a temp view and iterate IT, instead of
+               fork-converting a (possibly shared) row PV in place from a
+               read-only walker. Element intness uses the D154 half bits. */
+            if (v->tag == PERL_FLAT_ARRAY) {
+                long long ne = v->matchpos;
+                PerlArray *tmp = perl_anon_array_new();
+                if (v->pval) {
+                    double *d = (double *)v->pval;
+                    for (long long j = 0; j < ne; j++) {
+                        int ie = flat_elem_int_bits(v, j);
+                        PerlValue *b2 = flat_elem_box(d[j], ie != 0);
+                        perl_array_push(tmp, b2);
+                        perl_free(b2);
+                    }
+                } else {
+                    for (long long j = 0; j < ne; j++)
+                        perl_array_push(tmp, perl_alloc_undef());
+                }
+                avs[i] = tmp;
+                flatTmps[i] = tmp;
+            } else if (v->tag == PERL_REF_ARRAY) avs[i] = (PerlArray *)v->pval;
             if (avs[i] && avs[i]->len > max) max = avs[i]->len;
         }
         PerlArray *out = perl_anon_array_new();
@@ -16770,6 +16822,9 @@ PerlValue *perl_list_moreutils(const char *name, PerlArray *args) {
                 else perl_array_push(out, perl_alloc_undef());
             }
         free(avs);
+        for (long long f = 0; f < n; f++)
+            if (flatTmps[f]) perl_array_free(flatTmps[f]);
+        free(flatTmps);
         if (wa) return perl_array_to_list_return(out);
         return perl_alloc_int(out->len);
     }

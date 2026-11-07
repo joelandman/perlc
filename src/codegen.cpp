@@ -6072,6 +6072,8 @@ bool CodeGen::canEmitF64(const Node &nRaw) {
         if (fileScalarLargeInt_.count(nm)) return false;
         /* D97: file-scope vars that may hold blessed objects can't use F64 */
         if (fileScalarBlessed_.count(nm)) return false;
+        /* D203: vars assigned from call/ref/deref shapes may hold rows */
+        if (fileScalarRowish_.count(nm)) return false;
         /* Only treat file-scope globals as numeric if they have no special runtime accessor */
         static const std::unordered_set<std::string> specialVars =
             {"AUTOLOAD","!","/",".","\\",",","&","0","_"};
@@ -6176,7 +6178,7 @@ Value *CodeGen::emitExprF64(const Node &nRaw) {
         {
             static const std::unordered_set<std::string> noFloat =
                 {"AUTOLOAD","!","/",".","\\",",","&","0","_"};
-            if (!noFloat.count(nm)) {
+            if (!noFloat.count(nm) && !fileScalarRowish_.count(nm)) {
                 auto git = fileScalarGlobals_.find(nm);
                 if (git != fileScalarGlobals_.end()) {
                     Value *pv = builder_.CreateLoad(perlPtrTy_, git->second, nm + ".gpv");
@@ -8989,6 +8991,13 @@ static bool hasDefaultVarUse(const Node &n) {
 static bool hasLocalStmt(const Node &n) {
     if (n.kind == NK::LocalStmt || n.kind == NK::LocalArray || n.kind == NK::LocalHash ||
         n.kind == NK::LocalGlob) return true;
+    /* D2026-11-06: lock() pushes its auto-unlock entry onto the SAME
+       local/lock stack (perl_lock_shared → LOCAL_LOCK_PV; restored by
+       perl_local_restore_to), so any scope that saves/restores that stack
+       must also treat lock-only bodies as local-pushing. Missing this made
+       the sub-level gate skip the depth save for lock-only subs — the
+       block-level gate below relies on the same predicate. */
+    if (n.kind == NK::LockStmt) return true;
     bool r = false;
     if (n.left)  r = r || hasLocalStmt(*n.left);
     if (n.right) r = r || hasLocalStmt(*n.right);
@@ -9240,12 +9249,27 @@ void CodeGen::emitStmt(const Node &n) {
     switch (n.kind) {
     case NK::Block: {
         /* Save local depth so lock() / local() inside bare { } blocks
-           auto-restore when the block exits (Perl scope semantics). */
-        auto *i32Ty = Type::getInt32Ty(ctx_);
-        Value *savedDepth = callRT("perl_local_save_depth", {});
+           auto-restore when the block exits (Perl scope semantics).
+           Perf (2026-11-06, worker-body parity): emitBlock() below already
+           saves/restores exactly when the block contains a local/lock
+           statement (its own needLocal gate) — wrapping every bare block
+           in an unconditional save_depth/restore_to pair made every loop
+           body `{}` (and every if/else block inside counted loops, and the
+           Stage-45 worker bodies) pay an inlined TLS read plus a
+           perl_local_restore_to CALL on every iteration — real ns per
+           element and a call boundary that stopped LLVM's loop vectorizer
+           from treating the enclosing counted loop as closed. Gate on the
+           same predicate hasLocalStmt() applies to sub frames (perf item
+           4); nested pushes are covered by the recursion. */
+        if (hasLocalStmt(n)) {
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *savedDepth = callRT("perl_local_save_depth", {});
+            emitBlock(n);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                callRT("perl_local_restore_to", {savedDepth});
+            break;
+        }
         emitBlock(n);
-        if (!builder_.GetInsertBlock()->getTerminator())
-            callRT("perl_local_restore_to", {savedDepth});
         break;
     }
 
@@ -9553,6 +9577,21 @@ void CodeGen::emitStmt(const Node &n) {
                       ((n.right->kind == NK::LocaltimeFunc || n.right->kind == NK::GmtimeFunc) &&
                        n.right->name == "Time::Piece")))
                      fileScalarBlessed_.insert(nm);
+                 /* D203: track file-scope vars that may hold NON-NUMERIC PVs
+                    (rows/refs): sub-call results, anon/ref arrays, deref
+                    chains. canEmitF64/emitExprF64's file-scope fallback
+                    coerces any PV's fval field — a row PV would silently
+                    become a garbage float (see fileScalarRowish_ note). */
+                 if (n.right &&
+                     (n.right->kind == NK::Call ||
+                      n.right->kind == NK::MethodCall ||
+                      n.right->kind == NK::RefArray ||
+                      n.right->kind == NK::AnonArray ||
+                      n.right->kind == NK::DerefArray ||
+                      n.right->kind == NK::PostfixDeref ||
+                      n.right->kind == NK::ArrowDeref ||
+                      n.right->kind == NK::AnonHash))
+                     fileScalarRowish_.insert(nm);
                  /* D112: always register the package-qualified key (not
                     just when non-main) so lookupVar's qualified-first
                     check (see above) can tell apart two different
@@ -9639,6 +9678,21 @@ void CodeGen::emitStmt(const Node &n) {
                       ((n.right->kind == NK::LocaltimeFunc || n.right->kind == NK::GmtimeFunc) &&
                        n.right->name == "Time::Piece")))
                      fileScalarBlessed_.insert(nm);
+                 /* D203: track file-scope vars that may hold NON-NUMERIC PVs
+                    (rows/refs): sub-call results, anon/ref arrays, deref
+                    chains. canEmitF64/emitExprF64's file-scope fallback
+                    coerces any PV's fval field — a row PV would silently
+                    become a garbage float (see fileScalarRowish_ note). */
+                 if (n.right &&
+                     (n.right->kind == NK::Call ||
+                      n.right->kind == NK::MethodCall ||
+                      n.right->kind == NK::RefArray ||
+                      n.right->kind == NK::AnonArray ||
+                      n.right->kind == NK::DerefArray ||
+                      n.right->kind == NK::PostfixDeref ||
+                      n.right->kind == NK::ArrowDeref ||
+                      n.right->kind == NK::AnonHash))
+                     fileScalarRowish_.insert(nm);
                  /* D112: register both the bare name (last-declared-wins
                     fallback slot, unchanged prior behavior for lookups
                     that don't know which package to prefer) and the

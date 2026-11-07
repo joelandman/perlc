@@ -283,6 +283,13 @@ private:
         arithmetic on blessed objects must go through the overload dispatch
         in perl_add/perl_mul/etc.  Excluded from canEmitF64 for ScalarVar. */
      std::unordered_set<std::string> fileScalarBlessed_;
+     /* D203 (2026-11-07): file-scope variables that may hold NON-NUMERIC PVs
+        (rows/refs) — assigned from a sub call or a ref/deref shape. The
+        file-scope F64 fallback perl_to_float(reads an fval field of a row PV)
+        coerces whatever's there (garbage zero) — e.g. `$arr->[1] = $a` with
+        $a = mk() boxed a float instead of the row. Excluded from canEmitF64
+        and emitExprF64 exactly like fileScalarBlessed_. */
+     std::unordered_set<std::string> fileScalarRowish_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileArrayGlobals_;
     std::unordered_map<std::string, llvm::GlobalVariable *> fileHashGlobals_;
     int fileScopeDepth_ = -1;   /* scopes_.size() that corresponds to file scope */

@@ -490,3 +490,47 @@ value-model decision: **FLAT rows are share-backed REFs, not forks.**
   (`print "@z"`, list-assign element identity for packed literals) and
   the documented deref-while-shared v1 limitation (boxed-view conversion
   through `@$row`-style paths on a shared row still forks views).
+
+### Needs-work round 2 — D207b parity, D203, walker de-fork (2026-11-07, this session)
+
+The D207 round-1 "needs work" list, worked down:
+
+- **D207b — worker-body parity (2× → gone)**: worker chunks paid a
+  per-iteration `perl_local_restore_to` CALL plus an inlined TLS read
+  because `case NK::Block:` wrapped every bare `{}` in an unconditional
+  local save/restore pair (redundant over emitBlock's own gated
+  machinery). The call boundary also stopped the counted-loop
+  vectorizer (fkpar_1 stayed fully scalar `vmulsd`, fkpar_2 lost its
+  tail). Gated the pair on `hasLocalStmt(n)` and taught `hasLocalStmt`
+  about `NK::LockStmt` (lock pushes the same stack — lock-only scopes
+  previously never saved). pcflops: par 0.04 s → **0.013 s (≈3×)**, seq
+  0.05 s → 0.020 s; mbs640 unchanged; regress PASS.
+- **D203 — packed rows in list position**: both `perl_to_string`
+  variants stringified FLAT/FLOAT_PAIR rows as their element lists;
+  now the `ARRAY(0x…)` ref form (row pval = backing, so alias-shared
+  rows print one address exactly like perl's one array). The deep gate
+  then exposed the F64-coercion arm: file-scope scalars were
+  unconditionally eligible for the `perl_to_float(pv)` fallback, so
+  `$arr->[1] = mkrow()` boxed a garbage float instead of the ref —
+  `fileScalarRowish_` (call/ref/deref init shapes) excludes them from
+  both readers, D97-style. Gates `d203_packed_list_position_{smoke,deep}`
+  added (suite now 623/623).
+- **Walker de-fork (deref-while-shared part 1)**: the json/dumper/mesh
+  encode paths D207 round-1 added fork-converted shared row PVs via
+  `perl_deref_array`; they now box temp views from the refcounted
+  backing (per-element, freed in place) and never touch the row PV —
+  an encode before an alias write stays coherent (gated in the deep
+  test). The remaining shared-row fork surface is deliberate and
+  documented: mutation-shaped derefs (`push @$row`, 2D autoviv, OOB
+  growth on shared rows) fork in place because sound write-through
+  views don't exist yet; exclusively-owned rows keep the in-place
+  conversion (byte-faithful incl. OOB undef-gap growth, gated).
+- **Element-IV layout bit**: `PV_FLAG_PK_LAYOUT` (bit 26) marks rows
+  from the pack hand-out (2N interleaved) so `flat_elem_int_bits`
+  applies per-half D154 bits only where they exist — plain Stage-22
+  rows (any length) take INT_ELEMS for every element (Dumper had begun
+  quoting plain-row element '6').
+- **map/grep auto-parallel**: stays deferred, with sharpened blockers —
+  real `map`/`foreach` alias the source list (needs write-back views for
+  `$_`) and a general sound purity walker; the Stage-45 worker/pool
+  machinery is only certified for flat-row bodies.

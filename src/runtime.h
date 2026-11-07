@@ -75,6 +75,15 @@ typedef struct PerlCplxRow {
 #define PV_FLAG_INT_ELEMS         (1u << 27)   /* FLAT_ARRAY: all; FLOAT_PAIR: first */
 #define PV_FLAG_INT_ELEM2         (1u << 28)   /* FLOAT_PAIR: second element */
 #define PV_FLAG_INT_MASK          (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2)
+/* D207: FLAT_ARRAY element-LAYOUT marker. Packed-layout rows (the packflat
+   producer hand-out) hold 2N doubles interleaved re/im and carry PER-HALF
+   D154 intness (INT_ELEMS = re half, INT_ELEM2 = im half). Plain Stage-22
+   rows (literals/fills) hold N doubles, one per array slot, and mark every
+   element from INT_ELEMS alone — per-half reads on those would wrongly
+   drop IV-ness at odd indices (Dumper quoted '6'). Bits 25 (AUTOFLUSH) and
+   26 were both free at read time; 26 is layout-only, never read by
+   capture/shared machinery. */
+#define PV_FLAG_PK_LAYOUT         (1u << 26)
 /* D154: set on a promoted element: still a PERL_FLOAT (the 2D compound-
    assign fast paths rely on promoted rows holding NVs and update fval in
    place), but it came from an integer literal — Data::Dumper prints it as

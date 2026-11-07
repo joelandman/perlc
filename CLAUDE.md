@@ -39,9 +39,28 @@ Findings/method/
 ablations: `docs/optimization_findings_2026-11-04.md`,
 `docs/optimization_findings_2026-11-04_round2.md`,
 `docs/optimization_findings_2026-11-05_landing.md` (the landing
-record). Correctness gates: `make test-all` **621/621 PASS** vs real
+record). Correctness gates: `make test-all` **623/623 PASS** vs real
 perl plus `make bench-regress` PASS (the perlc-vs-perlc runtime
-regression gate). **Closed 2026-11-06 evening — D207 (refcounted FLAT
+regression gate). **Open perf follow-ups:** map/grep parallelism
+(sound `map` needs two mechanisms that don't exist yet: write-back
+aliasing views for `$_` — real map aliases the source list — and a
+general purity walker; Stage-45's machinery is certified only for
+flat-row bodies); deref-while-shared v1 limitation (boxed-view
+conversion via `@$row`-style paths on a refcount-shared row forks
+views; read-side walkers are fork-free after D207's round-2).
+**Closed 2026-11-07 (this round):** D207b worker-body parity —
+`case NK::Block:`'s unconditional save/restore pair paid a TLS read +
+`perl_local_restore_to` call per loop-body block (and blocked the
+counted-loop vectorizer); gated on `hasLocalStmt` + `LockStmt` now
+pushes the local/lock stack — pcflops par 0.04 s → **0.013 s (≈3×)**,
+seq 0.05 s → 0.020 s; AND D203 (packed rows in list position
+stringified as their contents) — both `perl_to_string` variants now
+show the `ARRAY(0x…)` ref form for FLAT/FLOAT_PAIR rows, plus
+`fileScalarRowish_` tracking so `$arr->[1] = mkrow()` stores the ref
+instead of a coerced garbage float (the file-scope F64 fallback read a
+row PV's fval union field). Tests:
+`tests/d203_packed_list_position_{smoke,deep}.pl` added
+(623 tests total). **Closed 2026-11-06 evening — D207 (refcounted FLAT
 backings):** every FLAT row's double[] sits behind an atomic refcount
 header; clones/assigns/local-saves SHARE the backing (the arrayref alias
 contract), so D105's promote lost its FLAT arm — rows stay tag-10
@@ -51,14 +70,9 @@ programs (**mbs640 -O2 1.41 s → 0.22 s, ≈6.4×**, content byte-identical;
 producer hook is default-ON (knob `packflat`) handing out shared-backed
 2N-scalar FLAT rows; nested 2D scalar stores write through the backing
 (`perl_array_set_row`, no autoviv fork); storable/json/dumper/mesh box
-FLAT rows explicitly. Known v1 limitation: boxed-view conversion
-(`@$row`-style paths, non-numeric 2D stores) on a shared row still
-forks views. **Open perf follow-ups:** D203 (packed-literal
-list-position surface: `print "@z"`, list-assign element identity —
-clone-fork half already fixed by D207); map/grep parallelism; worker-
-body codegen parity (worker chunks ≈2× slower per element than the
-inline sequential flat body, which caps end-to-end auto-parallel wins
-at ≈1.2× on small shapes — pool-level 9.3× stands).
+FLAT rows explicitly; `PV_FLAG_PK_LAYOUT` (bit 26) distinguishes the
+2N-interleaved packed hand-out layout from plain N-slot Stage-22 rows so
+D154 intness boxes per-half only for packed rows.
 **Closed 2026-11-06 (earlier):** D199's boxed-path tail (all boxed
 division/modulo paths die catchably with the realPerl location — D204
 `$0` fixed adjacent), Stage 45 auto-parallel counted loops (`autopar`
