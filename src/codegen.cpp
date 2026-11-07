@@ -14765,6 +14765,28 @@ Value *CodeGen::emitExpr(const Node &n) {
     /* ── references ─────────────────────────────────────────────────────── */
 
     case NK::RefScalar: {
+        /* \my %hash / \my @arr — ref to a freshly-declared inline lexical.
+           My's statement codegen (emitStmt) declares the empty container in
+           the current scope; the ref must match its type (a hashref or
+           arrayref). Without this, \my %opt fell through to
+           perl_ref_scalar(perl_hash_size) — a scalar ref to the (empty)
+           hash's element count — printing SCALAR(0x...) where perl prints
+           a HASH(0x...), and passing a stray scalar where a sub expected a
+           real hash (e.g. GetOptions(\my %opt, ...)). \my $var keeps the
+           old scalar-ref path below. */
+        if (n.left && n.left->kind == NK::My &&
+            n.left->name.size() > 1 &&
+            (n.left->name[0] == '%' || n.left->name[0] == '@')) {
+            emitStmt(*n.left);  /* declare the fresh container in this scope */
+            std::string nm = n.left->name.substr(1);
+            if (n.left->name[0] == '%') {
+                if (Value *hv = lookupHash(nm))
+                    return callRT("perl_ref_hash", {hv});
+            } else {
+                if (Value *av = lookupArray(nm))
+                    return callRT("perl_ref_array", {av});
+            }
+        }
         /* \$x — capture the stable PerlValue* */
         Value *pv = emitExpr(*n.left);
         return callRT("perl_ref_scalar", {pv});
