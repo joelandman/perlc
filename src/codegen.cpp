@@ -2155,7 +2155,11 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *lenPv = callRT("perl_array_len", {inputArr});
         Value *len   = callRT("perl_to_int", {lenPv});
 
-        /* $_ alloca (hoisted before loop) */
+        /* $_ alloca (hoisted before loop). D208: like foreach's loop var,
+           $_ now borrows the input's own element cell each iteration
+           (raw pointer store, no clone) — real map/grep alias $_, so
+           `map { $_++ } @a` / `grep { s/x/y/; 1 } @l` write back through
+           the source. The alloca is written before any body read. */
         auto *udAlloca = createEntryAlloca(perlPtrTy_, nullptr, "$_");
         Value *udPv    = perlUndef();
         builder_.CreateStore(udPv, udAlloca);
@@ -2175,7 +2179,7 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
 
         builder_.SetInsertPoint(bodyBB);
         Value *elem = callRT("perl_array_get_ref", {inputArr, i});
-        callRT("perl_assign", {udPv, elem});
+        builder_.CreateStore(elem, udAlloca);   /* D208: $_ = the INPUT SLOT itself */
 
         /* emit block / expr with $_ in scope */
         pushScope();
@@ -8143,8 +8147,19 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
     if (canPar) {
         auto *parBB = BasicBlock::Create(ctx_, "fk.par", fn);
         seqFlatBB = BasicBlock::Create(ctx_, "fk.flatin.seq", fn);
+        /* Move-3 (2026-11-07): the bound threshold is the same
+           PERLC_AUTOPAR_MIN the runtime dispatch honors (default 8192),
+           read once at compile time — mbs640-style programs (bound < 8192)
+           can measure the pool end-to-end with PERLC_AUTOPAR_MIN=512
+           without rebuilding. Below-threshold kernels keep the inline
+           sequential body; the runtime side re-checks its own floor. */
+        long long parMin = 8192;
+        if (const char *e = getenv("PERLC_AUTOPAR_MIN")) {
+            long long v = atoll(e);
+            if (v > 0) parMin = v;
+        }
         auto *enough = builder_.CreateICmpSGE(bound64,
-            ConstantInt::get(i64, 8192), "fkpar.enough");
+            ConstantInt::get(i64, parMin), "fkpar.enough");
         builder_.CreateCondBr(enough, parBB, seqFlatBB);
         builder_.SetInsertPoint(parBB);
         auto *rowsArr = builder_.CreateAlloca(perlPtrTy_,
@@ -14185,7 +14200,7 @@ Value *CodeGen::emitExpr(const Node &n) {
 
         builder_.SetInsertPoint(bodyBB);
         Value *elem = callRT("perl_array_get_ref", {inputArr, i});
-        callRT("perl_assign", {udPv, elem});
+        builder_.CreateStore(elem, udAlloca);   /* D208: $_ = the INPUT SLOT itself */
         pushScope();
         declareVar("_", udAlloca);
         Value *blockResult = n.body ? emitBlockLast(*n.body) : perlUndef();

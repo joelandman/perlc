@@ -39,15 +39,37 @@ Findings/method/
 ablations: `docs/optimization_findings_2026-11-04.md`,
 `docs/optimization_findings_2026-11-04_round2.md`,
 `docs/optimization_findings_2026-11-05_landing.md` (the landing
-record). Correctness gates: `make test-all` **623/623 PASS** vs real
+record). Correctness gates: `make test-all` **625/625 PASS** vs real
 perl plus `make bench-regress` PASS (the perlc-vs-perlc runtime
-regression gate). **Open perf follow-ups:** map/grep parallelism
-(sound `map` needs two mechanisms that don't exist yet: write-back
-aliasing views for `$_` — real map aliases the source list — and a
-general purity walker; Stage-45's machinery is certified only for
-flat-row bodies); deref-while-shared v1 limitation (boxed-view
-conversion via `@$row`-style paths on a refcount-shared row forks
-views; read-side walkers are fork-free after D207's round-2).
+regression gate). **Closed 2026-11-07 (round 3) — D208 (write-back
+aliasing views for shared rows — deref-while-shared closed):** the
+FlatHeader now carries a sharer registry; a mutation-shaped deref on a
+SHARED packed row flips every registered sharer PV onto ONE canonical
+boxed array (exclusive rows keep the legacy fork), closing `push
+@$row`/shared OOB/2D-container divergences; local() saves take a
+registered share (fixes a pre-D207 saved-row UAF); `perl_clone`/
+`perl_assign` keep `INT_ELEM2|PK_LAYOUT` on packed-row copies; storable
+`dclone` of packed rows is INDEPENDENT again (D207 had made it
+share-backing); map/grep/any/all/none `$_` borrows the input's own
+element cell (`map { $_++ } @a` writes back). Gates:
+`tests/d208_shared_row_coherence.pl`,
+`tests/d208_map_grep_alias.pl` (625 tests total). Deliberately open:
+aliased pair/empty-row copies stay value-copies (materialization
+broke mb/nbody — reverted with evidence); element-copy write-back
+(`$z = $row->[$i]; $z->[0] = 9`) needs a row-element alias PV.
+**Move-3 measurements (2026-11-07):** the Stage-45 floor reads
+`PERLC_AUTOPAR_MIN` at COMPILE time (default 8192) — mbs640 with
+AUTOPAR_MIN=512 dispatches 103,680 inner-shape kernels ≈ 99 µs
+wake+join each against 1.7 µs sequential kernel → par 10.1 s vs seq
+0.21 s; pcflops (300k-element kernels, 20 dispatches) par 0.012 s vs
+seq 0.020 s. The 8192 floor is empirically sound for direct shapes;
+mbs-shaped wins need outer-loop dispatch batching (design in the
+landing doc).
+**Open perf follow-ups:** map/grep auto-parallel — `$_`-aliasing +
+canonical-view landing done; remaining: per-chunk result handoff +
+`mapParBodyPurity` walk + per-chunk die slots, and outer-loop batch
+dispatch for the mbs shape (both designed in
+`docs/optimization_findings_2026-11-05_landing.md` round-3 section).
 **Closed 2026-11-07 (this round):** D207b worker-body parity —
 `case NK::Block:`'s unconditional save/restore pair paid a TLS read +
 `perl_local_restore_to` call per loop-body block (and blocked the
@@ -59,8 +81,7 @@ show the `ARRAY(0x…)` ref form for FLAT/FLOAT_PAIR rows, plus
 `fileScalarRowish_` tracking so `$arr->[1] = mkrow()` stores the ref
 instead of a coerced garbage float (the file-scope F64 fallback read a
 row PV's fval union field). Tests:
-`tests/d203_packed_list_position_{smoke,deep}.pl` added
-(623 tests total). **Closed 2026-11-06 evening — D207 (refcounted FLAT
+`tests/d203_packed_list_position_{smoke,deep}.pl` added. **Closed 2026-11-06 evening — D207 (refcounted FLAT
 backings):** every FLAT row's double[] sits behind an atomic refcount
 header; clones/assigns/local-saves SHARE the backing (the arrayref alias
 contract), so D105's promote lost its FLAT arm — rows stay tag-10

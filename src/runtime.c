@@ -110,17 +110,100 @@ static inline void pv_free_track(PerlValue *v)  {}
    arrays. With shares instead of forks, rows stay tag-10 through reads —
    the FK flat-loop certification (tag 10/19 + length) can pass on real
    programs — and the promote keeps FLOAT_PAIR handling only. The header
-   is 8 bytes so data stays 8-aligned; refcount updates are atomic so
+   is 8-ish bytes so data stays 8-aligned; refcount updates are atomic so
    thread-shared rows still refuse certification but plain clones from
-   multiple threads cannot corrupt the count. */
-typedef struct FlatHeader { long long refcount; } FlatHeader;
+   multiple threads cannot corrupt the count.
+
+   D208 (2026-11-07) — write-back aliasing views for SHARED rows: the
+   header additionally keeps a registry of every PerlValue object that
+   shares this backing (each share site registers itself; releases
+   unregister). That makes the sharer set ENUMERABLE, so when a
+   mutation-shaped operation touches a row shared by refcount > 1 the
+   canonical boxing happens ONCE — one PerlArray is created from the
+   backing and EVERY sharer PV is flipped in place to a REF_ARRAY
+   referencing it (exactly what a per-PV fork did, but now all aliases
+   converge instead of diverging). All existing tag==10 dispatches stay
+   sound by construction (after a flip there are no tag-10 sharers left)
+   and EXCLUSIVE rows keep the old in-place fork byte-for-byte (hot FK
+   paths unchanged). Sharer nodes come from a thread-local freelist and
+   the flip validates each node's (pv->tag, pv->pval) against the backing
+   so a recycled PV address can never be flipped. */
+static PerlValue *flat_elem_box(double d, int intElems);
+static int flat_elem_int_bits(const PerlValue *row, long long idx);
+
+typedef struct FlatSharer {
+    struct FlatSharer *next;
+    PerlValue *pv;
+} FlatSharer;
+typedef struct FlatHeader {
+    long long refcount;
+    FlatSharer *sharers;   /* every PerlValue object sharing this backing */
+} FlatHeader;
 
 static double *flat_data_alloc(long long n) {
     FlatHeader *h =
         (FlatHeader *)malloc(sizeof(FlatHeader) + (size_t)n * sizeof(double));
     if (!h) return NULL;
     h->refcount = 1;
+    h->sharers  = NULL;
     return (double *)(h + 1);
+}
+
+/* D208: sharer-node freelist (thread-local like the local/lock stack and
+   the PV freelist — one row can be cloned per inner-loop iteration, and
+   the node malloc/free traffic would show up there). */
+static __thread FlatSharer *s_fs_freelist = NULL;
+
+static void flat_register(PerlValue *v) {
+    if (!v || v->tag != PERL_FLAT_ARRAY || !v->pval) return;
+    FlatHeader *h = (FlatHeader *)v->pval - 1;
+    FlatSharer *n;
+    if (s_fs_freelist) {
+        n = s_fs_freelist;
+        s_fs_freelist = n->next;
+    } else {
+        n = (FlatSharer *)malloc(sizeof(FlatSharer));
+        if (!n) return;   /* out of memory: lose this sharer; flip's stamp
+                             check then simply never sees it (exclusive
+                             fallback keeps everything consistent) */
+    }
+    n->pv   = v;
+    n->next = h->sharers;
+    h->sharers = n;
+}
+
+/* Drop pv's registration WITHOUT touching the refcount (the share itself
+   transfers, e.g. local-restore moves the saved share into the cell). */
+static void flat_unregister_node_only(FlatHeader *h, PerlValue *v) {
+    FlatSharer **pp = &h->sharers;
+    while (*pp) {
+        if ((*pp)->pv == v) {
+            FlatSharer *dead = *pp;
+            *pp = dead->next;
+            dead->next = s_fs_freelist;
+            s_fs_freelist = dead;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* D208: drop pv's registration AND its backing share (refcount--). Called
+   whenever a tag-10 PV object stops referencing this backing: perl_free,
+   perl_assign's dst-release, the exclusive fork, local-restore swaps. */
+static void flat_release_pv(PerlValue *v) {
+    if (!v || !v->pval) return;
+    FlatHeader *h = (FlatHeader *)v->pval - 1;
+    flat_unregister_node_only(h, v);
+    if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) == 0)
+        free(h);
+}
+
+static void flat_share_pv(PerlValue *v) {
+    if (!v || v->tag != PERL_FLAT_ARRAY || !v->pval) return;
+    __atomic_add_fetch(&((FlatHeader *)v->pval - 1)->refcount, 1,
+                       __ATOMIC_ACQ_REL);
+    flat_register(v);
 }
 
 static void flat_release(double *data) {
@@ -134,6 +217,115 @@ static void flat_share(double *data) {
     if (!data) return;
     FlatHeader *h = (FlatHeader *)data - 1;
     __atomic_add_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL);
+}
+
+/* The legacy exclusive-row fork, factored out of perl_deref_array so the
+   shared-row canonical path can share the boxing logic. Boxes the row's
+   doubles into a fresh PerlArray, converts THE CALLER'S PV in place (this
+   PV owns the result array; the backing share is dropped), and leaves any
+   other sharer untouched — that divergence is exactly what flat_flip_all
+   fixes for refcount > 1 rows. */
+static PerlArray *flat_fork_in_place(PerlValue *v) {
+    long long n = v->matchpos;
+    double *dbl = (double *)v->pval;
+    PerlArray *av = perl_anon_array_new();
+    for (long long i = 0; i < n; i++) {
+        PerlValue *fv = flat_elem_box(dbl ? dbl[i] : 0.0,
+            flat_elem_int_bits(v, i));
+        perl_array_push(av, fv);
+        perl_free(fv);
+    }
+    flat_release_pv(v);   /* this PV stops referencing the backing */
+    v->flags &= ~PV_FLAG_INT_MASK;
+    v->tag   = PERL_REF_ARRAY;
+    v->pval  = av;
+    v->matchpos = 0;
+    return av;
+}
+
+/* D208 canonical boxing for a SHARED row (backing refcount > 1): create
+   ONE PerlArray from the backing, then flip EVERY sharer PV in place to a
+   REF_ARRAY referencing it. After this there are no tag-10 PVs left on
+   this backing — every existing tag==10 dispatch (elements, sets, 2D
+   blocks, FK certification) automatically routes through the real array,
+   which is what makes the conversion alias-coherent. The backing share of
+   each flipped PV is dropped as part of its flip, so the header reaches
+   refcount 0 exactly here and dies with its freelist nodes. */
+static PerlArray *flat_flip_all(PerlValue *trigger) {
+    double *data = (double *)trigger->pval;
+    FlatHeader *h = (FlatHeader *)data - 1;
+    long long n = trigger->matchpos;
+    PerlArray *av = perl_anon_array_new();
+    for (long long i = 0; i < n; i++) {
+        PerlValue *fv = flat_elem_box(data ? data[i] : 0.0,
+            flat_elem_int_bits(trigger, i));
+        perl_array_push(av, fv);
+        perl_free(fv);
+    }
+    /* Fold the registry out of the header BEFORE walking it: this flip is
+       the last reader of the list, and each flip drops one backing share
+       (the last one frees the header — the registry must not be reached
+       through the freed header afterwards). */
+    FlatSharer *list = h->sharers;
+    h->sharers = NULL;
+    long long remaining = h->refcount;
+    long long flips = 0;
+    FlatSharer *it = list;
+    while (it) {
+        FlatSharer *next = it->next;
+        PerlValue *pv = it->pv;
+        it->next = s_fs_freelist;
+        s_fs_freelist = it;
+        /* Stamp check: a PV whose (tag, pval) no longer matches this
+           backing was reused/recycled — drop its node but never write to
+           unrelated storage. Each VALID flip is one of the `remaining`
+           live shares. */
+        if (pv && pv->tag == PERL_FLAT_ARRAY && pv->pval == (void *)data &&
+            remaining > 0) {
+            pv->flags &= ~PV_FLAG_INT_MASK;
+            pv->matchpos = 0;
+            pv->pval = av;
+            pv->tag = PERL_REF_ARRAY;
+            __atomic_add_fetch(&av->refcount, 1, __ATOMIC_ACQ_REL);
+            remaining--;
+            flips++;
+        }
+        it = next;
+    }
+    /* The trigger may not have been registered (registration gaps would
+       surface here) — convert it too so the mutation path always returns
+       the canonical array, and account for its live share. */
+    if (trigger->tag == PERL_FLAT_ARRAY && trigger->pval == (void *)data) {
+        trigger->flags &= ~PV_FLAG_INT_MASK;
+        trigger->matchpos = 0;
+        trigger->pval = av;
+        trigger->tag = PERL_REF_ARRAY;
+        __atomic_add_fetch(&av->refcount, 1, __ATOMIC_ACQ_REL);
+        if (remaining > 0) remaining--;
+        flips++;
+    }
+    /* perl_anon_array_new starts with the creator's own ref; from here the
+       array is owned exclusively by the flipped sharer PVs (each carries
+       one ref, released by its perl_free/assign path). */
+    if (flips > 0)
+        av->refcount--;
+    if (remaining == 0)
+        free(h);   /* every share converted: header + doubles die now */
+    return av;
+}
+
+/* D208: deref-time route for a tag-10 row PV. Exclusive rows (refcount 1)
+   keep the legacy in-place fork byte-for-byte; shared rows flip every
+   sharer onto one canonical PerlArray so pushes/OOB stores/views made
+   through ANY alias are visible through all of them — the perl ref
+   aliasing contract. */
+static PerlArray *flat_deref_route(PerlValue *ref) {
+    if (ref->pval) {
+        FlatHeader *h = (FlatHeader *)ref->pval - 1;
+        if (h && __atomic_load_n(&h->refcount, __ATOMIC_ACQUIRE) > 1)
+            return flat_flip_all(ref);
+    }
+    return flat_fork_in_place(ref);
 }
 
 static inline PerlValue *pv_alloc(void) {
@@ -317,9 +509,21 @@ int perl_local_save_depth(void) { return s_local_depth; }
 
 void perl_local_save(PerlValue *pv) {
     if (s_local_depth >= LOCAL_STACK_MAX) return;
+    /* D208 (2026-11-07): rows WITH a backing now register the saved copy as
+       a real share (its own registry node + refcount) — this fixes a
+       pre-D207-era leak/UAF: perl_local_save never shared a FLAT row, so
+       `local $r; $r = $other_row;` could drive the saved row's backing to
+       refcount 0 and free it while the saved copy still pointed at the
+       memory. Empty rows / FLOAT_PAIRs have no backing share to take and
+       stay plain value snapshots (pair-alias divergence predates D208). */
     s_local_stack[s_local_depth].type  = LOCAL_SCALAR;
     s_local_stack[s_local_depth].ptr   = pv;
     s_local_stack[s_local_depth].saved = *pv;
+    if (s_local_stack[s_local_depth].saved.tag == PERL_FLAT_ARRAY &&
+        s_local_stack[s_local_depth].saved.pval) {
+        flat_share((double *)s_local_stack[s_local_depth].saved.pval);
+        flat_register(&s_local_stack[s_local_depth].saved);
+    }
     /* deep-copy string/blessed_class so the saved value is independent */
     if (pv->tag == PERL_STRING && pv->sval) {
         /* D85: length-aware copy — strdup would truncate at an embedded
@@ -370,8 +574,20 @@ void perl_local_restore_to(int depth) {
         } else { /* LOCAL_SCALAR */
             /* free any existing string/blessed_class in the target */
             if ((e->ptr->tag == PERL_STRING) && e->ptr->sval) free(e->ptr->sval);
+            if ((e->ptr->tag == PERL_FLAT_ARRAY) && e->ptr->pval)
+                flat_release_pv(e->ptr);   /* D208: the during-scope value's share dies */
             if (e->ptr->blessed_class) free(e->ptr->blessed_class);
+            /* D208: if the saved copy was flipped (REF now — another sharer
+               boxed the row during the local scope) it holds an av ref and
+               the copy restores a normal REF value. If it is still FLAT its
+               share + registry node transfer to the cell: drop the saved
+               object's node (NOT its count — the share lives on) and
+               re-register the cell as the share's owner. */
+            if (e->saved.tag == PERL_FLAT_ARRAY && e->saved.pval)
+                flat_unregister_node_only((FlatHeader *)e->saved.pval - 1, &e->saved);
             *e->ptr = e->saved;  /* restore saved value */
+            if (e->ptr->tag == PERL_FLAT_ARRAY && e->ptr->pval)
+                flat_register(e->ptr);
         }
     }
     /* If the stack overflowed (s_local_depth was capped at LOCAL_STACK_MAX),
@@ -1394,6 +1610,7 @@ PerlValue *perl_pack_flat_row(PerlValue *refpv) {
     out->pval = data;
     out->matchpos = n;         /* element count */
     out->flags = (unsigned int)bits | PV_FLAG_PK_LAYOUT;
+    flat_register(out);        /* D208: origin PV is the first sharer */
     return out;
 }
 
@@ -1441,6 +1658,7 @@ PerlValue *perl_alloc_flat_array(long long n) {
     v->pval = n > 0 ? flat_data_alloc(n) : NULL;
     v->matchpos = n;
     v->blessed_class = NULL;
+    if (v->pval) flat_register(v);   /* D208 */
     return v;
 }
 
@@ -1454,6 +1672,7 @@ PerlValue *perl_alloc_float_array(long long n) {
     }
     v->matchpos = n;
     v->blessed_class = NULL;
+    if (v->pval) flat_register(v);   /* D208 */
     return v;
 }
 
@@ -1474,6 +1693,7 @@ PerlValue *perl_repeat_flat_array(double value, long long n) {
     }
     v->matchpos = n;
     v->blessed_class = NULL;
+    if (v->pval) flat_register(v);   /* D208 */
     return v;
 }
 
@@ -1500,6 +1720,7 @@ PerlValue *perl_flat_fill_pair(double re_base, double im_base,
     }
     v->matchpos = n * 2;  /* element count for FLAT_ARRAY */
     v->blessed_class = NULL;
+    if (v->pval) flat_register(v);   /* D208 */
     return v;
 }
 
@@ -1565,6 +1786,10 @@ PerlValue *perl_clone(const PerlValue *src) {
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         return v;
     }
+    /* D208 note: FLOAT_PAIR copies stay VALUE copies here (pre-D208
+       semantics; aliased-pair mutation divergence predates this round and
+       is tracked separately). Materializing the source in this arm would
+       convert LIVE pair cells other code still reads as pairs. */
     if (src->tag == PERL_FLAT_ARRAY) {
         /* D207: SHARE the refcounted backing instead of memcpy-forking —
            clones of an arrayref alias the same array in real perl, and
@@ -1577,8 +1802,9 @@ PerlValue *perl_clone(const PerlValue *src) {
         v->matchpos = n;
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         v->pval = src->pval;
-        if (n > 0 && v->pval) flat_share((double *)v->pval);
-        v->flags |= (src->flags & PV_FLAG_INT_ELEMS);   /* D154 */
+        if (v->pval) flat_share((double *)v->pval);
+        if (v->pval) flat_register(v);   /* D208: the clone is a sharer */
+        v->flags |= (src->flags & (PV_FLAG_INT_MASK | PV_FLAG_PK_LAYOUT));  /* D154/D208 */
         return v;
     }
     if (src->tag == PERL_CPLX_ROW && src->pval) {
@@ -1706,7 +1932,7 @@ HOTX void perl_free(PerlValue *v) {
         return;
     }
     if (v->tag == PERL_STRING) free(v->sval);
-    if (v->tag == PERL_FLAT_ARRAY) flat_release((double *)v->pval);
+    if (v->tag == PERL_FLAT_ARRAY) flat_release_pv(v);   /* D208: unlink sharer */
     if (v->tag == PERL_CPLX_ROW && v->pval) {
         cplx_row_release((PerlCplxRow *)v->pval);
         v->pval = NULL;
@@ -2454,6 +2680,9 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (dst == src) return;
     if (dst->flags & PV_FLAG_IMMORTAL)
         perl_die_croak("Modification of a read-only value attempted");
+    /* D208 note: materializing the SOURCE inside perl_assign had the same
+       live-pair hazard; pair copies stay value copies (pre-D208), and
+       empty-row aliasing remains tracked as a follow-up. */
     /* D62: preserve every identity-persistent bit across the reassignment
        below, not just PV_FLAG_SHARED — dst's capture-count/released bits
        belong to the STABLE POINTER's identity (which closures may still
@@ -2461,9 +2690,10 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
        survive any number of perl_assign calls on that same pointer. */
     unsigned int preserved_flags = dst->flags & (PV_FLAG_SHARED | PV_CAPTURE_MASK | PV_FLAG_CAPTURE_RELEASED);
     unsigned int src_utf8 = (src && src->tag == PERL_STRING) ? (src->flags & PV_FLAG_UTF8) : 0;
-    /* D154: FLAT_ARRAY / FLOAT_PAIR "built from ints" is a value bit */
+    /* D154: FLAT_ARRAY / FLOAT_PAIR "built from ints" is a value bit;
+       D208: PK_LAYOUT rides along (packed rows keep per-half IV-ness) */
     if (src && (src->tag == PERL_FLAT_ARRAY || src->tag == PERL_FLOAT_PAIR))
-        src_utf8 |= (src->flags & PV_FLAG_INT_MASK);
+        src_utf8 |= (src->flags & PV_FLAG_INT_MASK) | PV_FLAG_PK_LAYOUT;
     if (src && src->tag == PERL_FLOAT)
         src_utf8 |= (src->flags & PV_FLAG_IV_HINT);
     /* No implicit mutex here — caller must hold lock() for concurrent safety.
@@ -2505,7 +2735,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     }
     /* Release old value */
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
-    if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { flat_release((double *)dst->pval); dst->pval = NULL; }
+    if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { flat_release_pv(dst); dst->pval = NULL; }   /* D208 */
     if (dst->tag == PERL_CPLX_ROW && dst->pval) {
         cplx_row_release((PerlCplxRow *)dst->pval);
         dst->pval = NULL;
@@ -2594,6 +2824,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     if (!src) { dst->tag = PERL_UNDEF; dst->ival = 0; dst->matchpos = 0; return; }
     *dst = *src;
     dst->flags = preserved_flags | src_utf8;  /* identity bits + D90 UTF8 value bit */
+    if (dst->tag == PERL_FLAT_ARRAY && dst->pval)
+        flat_register(dst);   /* D208: dst is now a sharer of src's backing */
     if (src->tag == PERL_STRING) {
         /* D85: strdup(src->sval) would truncate at the first embedded NUL —
            *dst = *src above already copied src->slen correctly (a plain
@@ -4354,6 +4586,12 @@ PerlArray *perl_hash_autoviv_array_sv(PerlHash *h, PerlValue *key) {
 PerlArray *perl_hash_autoviv_array(PerlHash *h, const char *key) {
     PerlHashEntry *e = hash_find(h, key);
     if (e) {
+        /* D208: route rows/pairs through the canonical conversion — a
+           shared row flips ALL sharers onto one array so the autoviv'
+           push lands on the identity every alias reads; an exclusive row
+           forks in place exactly as before. */
+        if (e->val->tag == PERL_FLAT_ARRAY)
+            perl_deref_array(e->val);
         if (e->val->tag == PERL_REF_ARRAY) return (PerlArray *)e->val->pval;
         /* FLAT_ARRAY: extract inline doubles into a proper array */
         if (e->val->tag == PERL_FLAT_ARRAY && e->val->matchpos > 0) {
@@ -4427,6 +4665,9 @@ PerlArray *perl_array_autoviv_array_from_scalar(PerlValue **slot, long long idx)
     long long i = idx < 0 ? idx + 1 : idx;
     /* If slot points to an existing element, use it; otherwise create undef */
     PerlValue *pv = *slot;
+    /* D208: canonical conversion for rows/pairs (see perl_hash_autoviv_array) */
+    if (pv && pv->tag == PERL_FLAT_ARRAY)
+        perl_deref_array(pv);
     if (pv && pv->tag == PERL_REF_ARRAY)
         return (PerlArray *)pv->pval;
     /* FLAT_ARRAY: extract inline doubles into a proper array */
@@ -4874,22 +5115,11 @@ static int flat_elem_int_bits(const PerlValue *row, long long idx) {
 PerlArray *perl_deref_array(PerlValue *ref) {
     if (!ref) return perl_array_new();
     if (ref->tag == PERL_FLAT_ARRAY) {
-        /* Lazy conversion: box flat double[] into a proper PerlArray in-place. */
-        long long n = ref->matchpos;
-        double *dbl = (double *)ref->pval;
-        PerlArray *av = perl_anon_array_new();
-        for (long long i = 0; i < n; i++) {
-            PerlValue *fv = flat_elem_box(dbl[i],
-                flat_elem_int_bits(ref, i));
-            perl_array_push(av, fv);
-            perl_free(fv);
-        }
-        flat_release(dbl);
-        ref->flags &= ~PV_FLAG_INT_MASK;
-        ref->tag   = PERL_REF_ARRAY;
-        ref->pval  = av;
-        ref->matchpos = 0;
-        return av;
+        /* D208: exclusive rows fork in place (legacy); shared rows flip
+           every sharer PV onto one canonical PerlArray so pushes/OOB
+           stores/views through ANY alias stay coherent — the ref aliasing
+           contract. */
+        return flat_deref_route(ref);
     }
     if (ref->tag == PERL_FLOAT_PAIR) {
         /* Lazy conversion: expand inline (re,im) into a 2-element PerlArray. */
@@ -5531,8 +5761,10 @@ static PerlValue *clone_code_ref_for_thread(PerlValue *code_pv) {
                re-shares) — matching the clone contract. */
             ns->matchpos = os->matchpos;
             ns->pval = os->pval;
-            if (os->matchpos > 0 && ns->pval)
+            if (os->matchpos > 0 && ns->pval) {
                 flat_share((double *)ns->pval);
+                flat_register(ns);   /* D208: ns is a real PV sharer */
+            }
         } else if (os->tag == PERL_REF_ARRAY && os->pval) {
             ((PerlArray *)os->pval)->refcount++;  /* shared array */
         } else if (os->tag == PERL_REF_HASH && os->pval) {
@@ -7686,13 +7918,56 @@ static PerlValue *storable_dclone_pv(struct DCloneCtx *ctx, PerlValue *pv,
     if (!pv || pv->tag == PERL_UNDEF) { *owned = 1; return perl_alloc_undef(); }
     if (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR ||
         pv->tag == PERL_CPLX_ROW) {
-        /* Stage 22/23 compact numeric row — D207: clones share the packed
-           backing, so the memo'd copy IS a shared alias (no fork to dodge);
-           keep it packed. */
+        /* Stage 22/23 compact numeric row. D208 (2026-11-07): the clone
+           must be INDEPENDENT of the original (real perl's dclone deep-
+           copies); the D207 share-the-backing shortcut made a packed
+           clone a live alias (writing $c->{b}[1] = 88 leaked into the
+           source hash — the read-only freeze/thaw gates never wrote
+           through a dclone so it went unseen until now). Aliasing WITHIN
+           the source graph is still preserved: rows sharing one backing
+           memo to the ONE clone row (fresh independent backing), so
+           inside the clone graph they stay aliases of each other. */
         void *orig = pv->pval;
         PerlValue *memo = storable_memo_lookup(ctx, orig);
         if (memo) { *owned = 0; return memo; }
-        PerlValue *copy = perl_clone(pv);
+        if (pv->tag == PERL_CPLX_ROW) {
+            PerlCplxRow *r = (PerlCplxRow *)pv->pval;
+            PerlValue *copy = pv_alloc();
+            copy->tag = PERL_CPLX_ROW;
+            copy->matchpos = pv->matchpos;
+            copy->blessed_class = pv->blessed_class ? strdup(pv->blessed_class) : NULL;
+            copy->pval = cplx_row_new(r->n, r->cap ? r->cap : r->n);
+            if (copy->pval && r->n > 0)
+                memcpy(((PerlCplxRow *)copy->pval)->data, r->data,
+                       (size_t)r->n * 2 * sizeof(double));
+            if (copy->pval)
+                ((PerlCplxRow *)copy->pval)->refcount = 1;
+            storable_memo_add(ctx, orig, copy);
+            *owned = 0;
+            return copy;
+        }
+        long long n = pv->tag == PERL_FLAT_ARRAY ? pv->matchpos
+                        : 2;                       /* FLOAT_PAIR → row of 2 */
+        PerlValue *copy = pv_alloc();
+        copy->tag = PERL_FLAT_ARRAY;
+        copy->matchpos = n;
+        copy->blessed_class = pv->blessed_class ? strdup(pv->blessed_class) : NULL;
+        if (n > 0) {
+            double *cd = flat_data_alloc(n);
+            copy->pval = cd;
+            if (cd) {
+                if (pv->tag == PERL_FLAT_ARRAY)
+                    memcpy(cd, pv->pval, (size_t)n * sizeof(double));
+                else {
+                    cd[0] = pv->fval;
+                    memcpy(&cd[1], &pv->matchpos, sizeof(double));
+                }
+            }
+        } else {
+            copy->pval = NULL;
+        }
+        copy->flags = pv->flags & (PV_FLAG_INT_MASK | PV_FLAG_PK_LAYOUT);
+        if (copy->pval) flat_register(copy);
         storable_memo_add(ctx, orig, copy);
         *owned = 0; /* memo'd — freed only with the whole clone graph */
         return copy;
@@ -19312,6 +19587,13 @@ PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
    non-flat rows fall back to the normal converting path.  Mirrors
    perl_array_set's ownership convention (clones v; caller retains v). */
 PerlValue *perl_array_set_row(PerlValue *row_pv, long long idx, PerlValue *v) {
+    /* D208 note: no shared-row flip here. In-bounds numeric stores write
+       the SHARED backing in place (coherent by construction — every
+       sharer reads the same doubles), and the fall-through paths route
+       through perl_deref_array, whose D208 fork/flip split handles the
+       mutation-shaped conversions. Flipping on 2D set_row would also
+       re-represent rows that FK-certified kernels may still be GEP-ing
+       through the backing (mbs/nb), which the pre-D208 code never did. */
     /* REF_* bases alias caller storage and must be dereferenced to the
      * OUTER container before any element store: `my ($z) = @_; $z->[0] =
      * [1,2]` (fill_z in bench/mbs.pl) or `my $ref = \@a; $ref->[0] = [1,2]`.

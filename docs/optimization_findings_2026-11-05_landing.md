@@ -534,3 +534,91 @@ The D207 round-1 "needs work" list, worked down:
   real `map`/`foreach` alias the source list (needs write-back views for
   `$_`) and a general sound purity walker; the Stage-45 worker/pool
   machinery is only certified for flat-row bodies.
+
+### Needs-work round 3 — D208 write-back aliasing views + move-3 measurements (2026-11-07, this session)
+
+**D208 — the deref-while-shared mechanism (next move 2).** `FlatHeader`
+gains a sharer registry (every PV sharing a backing registers itself at
+the share site; releases unregister). A mutation-shaped deref on an
+EXCLUSIVE row keeps the legacy in-place fork; on a SHARED row (refcount
+> 1) `flat_flip_all` boxes the backing ONCE and flips every registered
+sharer PV in place to a REF_ARRAY referencing the one canonical array —
+all existing tag==10 dispatches (element reads, 2D set_row, FK
+certification's sequential fallback, to_string, storable) route through
+the real array by construction, no read-path or FK-emitter changes.
+Every documented divergence from the round-1/2 lists is now
+byte-identical: shared OOB growth (undef gaps visible through aliases),
+`push @$copy` after aliasing, list views taken after mutation,
+container-held rows + 2D numeric stores, hash-cell autoviv push.
+local() saves take a REGISTERED share (fixed a pre-D207 UAF:
+`local $r; $r = $other_row;` could free the saved row's backing) and
+restore transfers the share back while releasing the during-scope
+value's share. En-route fixes: clone/assign dropped
+`INT_ELEM2|PK_LAYOUT` on packed rows (mixed-bits IV-ness), and storable
+`dclone` of packed rows was made share-backing by D207 where real perl
+dclone is independent — clones now get fresh backings (memo by source
+preserves intra-graph aliasing). map/grep/any/all/none now alias `$_`
+to the input's own element cell (foreach's borrow contract), which
+closes `map { $_++ } @a` write-back and short-circuit mutation counts.
+Not done, deliberately (each was attempted and reverted with evidence):
+pair/empty-row materialization at clone/assign (mutating LIVE pair
+sources breaks the mb/nbody pair-read paths — aliased-pair divergence
+predates D208), and element-copy write-back (`$z = $row->[$i];
+$z->[0] = 9`) which needs a row-element alias PV. New gates:
+`tests/d208_shared_row_coherence.pl` (8 shapes) +
+`tests/d208_map_grep_alias.pl` (map-back, grep-back, row write-back,
+any/all/none short-circuit counts). Suite 625/625 twice.
+
+**Move 3 measurements — where the pool pays its way.** The Stage-45
+bound threshold is now the SAME `PERLC_AUTOPAR_MIN` the runtime honors
+(env-tunable at compile time, default 8192) — mbs640-style programs can
+measure without rebuilding. Numbers at nw=16:
+
+- pcflops (bound 300000 per kernel, 20 dispatches): par 0.012 s vs seq
+  0.020 s end-to-end; per-dispatch elapsed 0.2–1.4 ms against
+  chunk_sum 1.6–4.9 ms of worker compute — the pool converts ~8 ms of
+  sequential kernel time into ~2.5 ms of wall per dispatch.
+- mbs640 (bound 640): the certified loops are the INNER i-loops, so the
+  shape dispatches PER OUTER-j ITERATION — 103,680 dispatches at
+  AUTOPAR_MIN=512, mean dispatch wall ≈ 99 µs against ≈ 1.7 µs of
+  sequential kernel each → par 10.1 s vs seq 0.21 s (48× worse). The
+  ~100 µs wake+handoff+join latency at nw=16 swamps small kernels;
+  content stayed byte-identical throughout.
+- mbs1280 (bound 1280): par 22.3 s vs seq 0.86 s — dispatch count grows
+  with N and the same 99 µs floor applies. Conclusion: the 8192-element
+  floor is EMPIRICALLY SOUND for the direct shape (a single big counted
+  loop); no mbs-shaped program should dispatch until the outer-loop
+  batching below exists.
+
+**Map/grep auto-parallel design (post-D208).** With `$_`-aliasing and
+shared-row views landed, the remaining pieces for a sound parallel
+map/grep are:
+
+1. Chunked element aliasing is already sound: `$_` binds the input's
+   own element cell; array realloc moves the PV* slot array but not the
+   PV objects, so borrow-aliases stay valid across pushes (same as
+   foreach). The input must be converged to its canonical array BEFORE
+   chunking (a flip-on-deref; for ArrayVar inputs nothing to do).
+2. Result handoff: map bodies yield 0..k values per element in list
+   context. Workers need per-chunk RESULT arrays + a joiner that
+   concatenates in order. grep is the degenerate case (matched indices
+   only). `perl_autopar_map_run(fn, arr, bound)` returning the first
+   worker's die message covers error semantics (joiner re-dies after
+   draining; perl discards partial results).
+3. `mapParBodyPurity` walk — strict superset of the FK rules: closed
+   body (reads limited to `$_`, the chunk index, and body-`my` locals —
+   the existing Stage-45 closed-body rule), PLUS: writes ONLY through
+   `$_` and body-locals; any element-addressed write to the input or a
+   shared container (ArrowDeref/ArrayElem/base-var stores) keeps the
+   statement sequential; no `local`, no I/O, no locks/threads, no keys/
+   each, no eval/string-eval, no symbolic refs; die-carrying statements
+   make the whole loop sequential unless the pool gets per-chunk error
+   slots (see 2).
+4. Outer-loop dispatch batching (the mbs fix, independent of map): when
+   a counted loop's body is a SINGLE inner counted FK loop whose
+   fkIndexForm uses the OUTER loop's index, certify the OUTER loop and
+   let each worker run the inner inline — 103,680 dispatches collapse
+   to ~160 with ~1 ms compute each (≈8× mbs potential). Needs the
+   worker emitter to nest one loop and the purity walk to cover both
+   levels; the FK row bindings remain per-worker-borrow (rows fetched
+   from the outer array inside the chunk).
