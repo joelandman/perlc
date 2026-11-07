@@ -103,6 +103,8 @@ public:
     bool fkKernelVec_ = false;      /* Stage 42: the FLAT variant's loop carries the enable-only vec hint */
     bool refKernelMode_ = false;    /* rows are proven REF_ARRAY + in-range (boxes) */
     bool fkEmitting_ = false;       /* inside tryEmitFlatKernelFor's own re-emissions */
+    bool fkOuterEmitting_ = false;  /* Stage 45 outerpar: outer loop's own structure is being emitted (bypass cert) */
+    bool fkNoParDispatch_ = false;  /* Stage 45 outerpar: nested inner kernels run their seq flat body, never their pool dispatch */
     std::unordered_set<std::string> knownFlatRows_;
     std::unordered_set<std::string> knownRefRows_;
     /* Stage 42: per-row certified packed-buffer pointer inside the FLAT
@@ -122,7 +124,26 @@ public:
     llvm::Function *emitFkParWorker(const Node &n,
                                     const std::vector<std::string> &rowNames,
                                     const std::string &idxBare);
-    llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
+
+     /* Stage 45 outerpar: certify a counted loop whose body is a single
+        inner counted FK loop + per-outer row binds; parallelise the OUTER
+        loop and run the inner kernel inline inside each worker. */
+     bool tryEmitFlatKernelOuterFor(const Node &n);
+     /* Stage 45 outerpar: emit one outer-counted-loop body -- row binds
+        normally, the single inner counted loop flat/autopar-off. */
+     void emitBatchedBody(const Node &body);
+      /* Stage 45 outerpar: the pool worker for a certified outer loop --
+        loops the outer index over [lo,hi) and emitsBatchedBody per step,
+        registering each captured outer container by name. */
+      llvm::Function *emitFkParWorkerOuter(const Node &n,
+                                           const std::vector<std::string> &containerNames);
+      /* Stage 45 outerpar: emit a certified outer counted loop over [lo,hi)
+        (seq path [0,bound); pool worker [chunk) with lo,hi) -- index as
+        unboxed i64, body runs emitBatchedBody (inner kernel flat). */
+      void emitFkBatchedOuter(const Node &n, const std::string &idxBare,
+                              llvm::Value *lo, llvm::Value *hi,
+                              llvm::BasicBlock *exitAfter);
+     llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
     void emitFlatPairLoad(llvm::Value *dataPtr, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
     void emitRefPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
 

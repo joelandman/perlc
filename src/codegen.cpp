@@ -7839,6 +7839,10 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
     /* the re-emitted copies inside this function's own two variants come
        back through emitStmt→here; they must take the ordinary machinery */
     if (fkEmitting_) return false;
+    /* Stage 45 outerpar: while the OUTER loop's own structure is being
+       emitted, the inner kernel must NOT re-certify (ordinary machinery),
+       and the outer loop must NOT re-enter the outer cert (bypass). */
+    if (fkOuterEmitting_) return false;
     if (!isOptStageEnabled("st41") || !isOptStageEnabled("cplxrow"))
         return false;
     if (!n.init || !n.cond || !n.step || !n.body) return false;
@@ -8144,7 +8148,12 @@ bool CodeGen::tryEmitFlatKernelFor(const Node &n) {
         }
     }
     BasicBlock *seqFlatBB = flatLoopBB;
-    if (canPar) {
+    /* Stage 45 outerpar: a nested inner kernel (the mbs $i loop inside the
+       certified outer $j loop) must never run its own pool dispatch -- that
+       is exactly the per-$j blow-up this feature exists to kill. With the
+       flag set the par block is skipped and the seq flat body emits inline
+       for every $j (structural twin of the seq path, just reached directly). */
+    if (canPar && !fkNoParDispatch_) {
         auto *parBB = BasicBlock::Create(ctx_, "fk.par", fn);
         seqFlatBB = BasicBlock::Create(ctx_, "fk.flatin.seq", fn);
         /* Move-3 (2026-11-07): the bound threshold is the same
@@ -8656,6 +8665,417 @@ llvm::Function *CodeGen::emitFkParWorker(const Node &n,
     inMainBody_ = savedMainBody_;
     fileScopeDepth_ = savedFileDepth_;
     return wfn;
+}
+/* ── Stage 45 (outerpar): outer-loop dispatch batching for the mbs nested ──
+   shape. The inner $i loop already certifies as a flat FK kernel, so the
+   current compiler dispatches that inner kernel once per outer $j
+   iteration (~103k pool calls at PAR_MIN=512 for mbs640, a timeout at
+   N=1280). Certifying the OUTER $j loop instead collapses that to one
+   dispatch per middle (iter) loop: each worker fans the whole $j range over
+   the pool and runs the inner $i kernel inline for its chunk. See
+   docs/optimization_findings_2026-11-07_outerpar.md. */
+
+/* one outer loop's per-$j row bind: the container ScalarVar plus the bare
+   names of the container (registered in the pool worker) and the bind target
+   (the inner kernel's row). */
+struct FkOuterCapture {
+    const Node *container;
+    std::string cname;
+    std::string bvar;
+};
+
+/* join a set of bare names into a comma list for the outerpar debug line. */
+static std::string joinSet(const std::unordered_set<std::string> &s) {
+    std::string out;
+    bool first = true;
+    for (const auto &k : s) {
+        if (!first) out += ", ";
+        out += k;
+        first = false;
+    }
+    return out;
+}
+
+/* Stage 45 (outerpar): one outer-counted-loop body. The body is a list of
+   per-$j row binds (each `my $v = <container>->[$j]` / <container>[$j]) plus
+   exactly one inner counted FK loop. emitBatchedBody re-emits the body so that:
+     - the row binds run normally (fetching a row from the outer container for
+       this $j -- they are O(N) heap fetches, not the hot path), and
+     - the single inner counted loop runs its SEQ FLAT BODY ONLY, never its
+       own pool dispatch. That per-$j dispatch is exactly the mbs pathology;
+       killing it is the whole reason the outer loop dispatches instead of the
+       inner. The cert flags are saved/restored around the emission so the inner
+       loop's tryEmitFlatKernelFor sees the flat hooks live (fkEmitting_/
+       fkOuterEmitting_ false, fkNoParDispatch_ true). */
+void CodeGen::emitBatchedBody(const Node &body) {
+    bool savedFkEmit  = fkEmitting_;
+    bool savedFkOuter = fkOuterEmitting_;
+    bool savedFkNoPar = fkNoParDispatch_;
+    fkEmitting_ = false;
+    fkOuterEmitting_ = false;
+    fkNoParDispatch_ = true;
+    flatDoubleCache_.clear();
+    floatSqrtOf_.clear();
+    lastSqrtInput_ = nullptr;
+    emitBlock(body);
+    fkEmitting_  = savedFkEmit;
+    fkOuterEmitting_ = savedFkOuter;
+    fkNoParDispatch_ = savedFkNoPar;
+}
+
+/* Stage 45 (outerpar): emit a certified outer counted loop over [lo,hi). Both
+   the seq path ([0,bound)) and the pool worker ([chunk)) funnel here. The
+   loop carries the index var idxBare as an unboxed i64 (the per-$j binds read
+   it as their subscript), its body is emitBatchedBody, and the back-branch
+   gets no vectorize hint (the body is a nested kernel, not a numeric body --
+   matching the ordinary counted-loop predicate cforIsCountedNumeric()==false
+   for this shape). Labels and continue blocks are unsupported by the batched
+   shape; when present we simply refuse and keep the ordinary path. */
+void CodeGen::emitFkBatchedOuter(const Node &n, const std::string &idxBare,
+                                 Value *lo, Value *hi, llvm::BasicBlock *exitAfter) {
+    auto *fn  = builder_.GetInsertBlock()->getParent();
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *condBB = BasicBlock::Create(ctx_, "fkouter.cond", fn);
+    auto *bodyBB = BasicBlock::Create(ctx_, "fkouter.body", fn);
+    auto *stepBB = BasicBlock::Create(ctx_, "fkouter.step", fn);
+    auto *exit = BasicBlock::Create(ctx_, "fkouter.end", fn);
+
+    loopExits_.push_back(exit);
+    loopContinues_.push_back(stepBB);
+    loopRedos_.push_back(bodyBB);
+
+    pushScope();
+    emitStmt(*n.init);                 /* my $idxBare = 0  (declares the loop var) */
+    /* worker overrides the start: store lo over the 0 the just-created init set */
+    Value *jslot = lookupIntVar(idxBare);
+    if (!jslot) return;  /* not our shape if the index var isn't unboxed */
+    builder_.CreateStore(lo, jslot, "fkouter.reset");
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    Value *cur = builder_.CreateLoad(i64, lookupIntVar(idxBare), "fkouter.cur");
+    builder_.CreateCondBr(builder_.CreateICmpSLT(cur, hi, "fkouter.more"),
+                          bodyBB, exit);
+
+    builder_.SetInsertPoint(bodyBB);
+    emitBatchedBody(*n.body);
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(stepBB);
+
+    builder_.SetInsertPoint(stepBB);
+    Value *cur2 = builder_.CreateLoad(i64, lookupIntVar(idxBare), "fkouter.cur2");
+    builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1),
+                                            "fkouter.nxt"),
+                         lookupIntVar(idxBare));
+    auto *backBr = builder_.CreateBr(condBB);
+    attachCountedLoopMD(backBr, false, false);
+
+    /* terminate the exit block -- flow into the continuation the caller owns
+       (SEQ path: afterBB in the cert; worker: its `done`/ret block). Leave the
+       insert point inside `exit` so the caller can append nothing more. */
+    builder_.SetInsertPoint(exit);
+    if (exitAfter) builder_.CreateBr(exitAfter);
+
+    loopExits_.pop_back();
+    loopContinues_.pop_back();
+    loopRedos_.pop_back();
+    popScope();
+}
+
+/* Stage 45 (outerpar): the pool worker for a certified outer loop.
+   void (void** rows, i64 lo, i64 hi) -- rows[k] are the outer containers'
+   PerlArray* values captured (at dispatch time) from the calling function, so
+   the worker's per-$j binds `my $v = <container>[$j]` resolve to exactly the
+   same values the sequential body produced. Each container is registered in
+   the (fresh) worker scope pointing at a slot holding rows[k]; the outer loop
+   is then emitted by emitFkBatchedOuter over [lo,hi), whose body runs flat. */
+llvm::Function *CodeGen::emitFkParWorkerOuter(const Node &n,
+        const std::vector<std::string> &containerNames) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
+        {perlPtrTy_, i64, i64}, false);
+    static unsigned parSeqOuter = 0;
+    Function *wfn = Function::Create(fty, Function::InternalLinkage,
+        "__perlc_fkouter_" + std::to_string(++parSeqOuter), mod_.get());
+
+    /* save codegen state -- same discipline as emitFkParWorker */
+    auto      savedFn   = currentFn_;
+    auto      savedBB   = builder_.GetInsertBlock();
+    auto      savedScopes = scopes_;
+    auto      savedArr  = arrayScopes_;
+    auto      savedHash = hashScopes_;
+    auto      savedPv   = pvScopes_;
+    auto      savedFloat = floatScopes_;
+    auto      savedInt  = intScopes_;
+    auto      savedDerefAV = derefAVScopes_;
+    auto      savedRowAV = rowAVScopes_;
+    auto      savedFlatRow = flatRowScopes_;
+    auto      savedPair = pairScopes_;
+    auto     *savedLDep = localDepthAlloca_;
+    auto      savedFkEmit = fkEmitting_;
+    bool      savedFkOuter = fkOuterEmitting_;
+    bool      savedFkNoPar = fkNoParDispatch_;
+    auto      savedFKData = fkKernelData_;
+    auto      savedKnownRows = knownFlatRows_;
+    bool      savedMainBody_ = inMainBody_;
+    int       savedFileDepth_ = fileScopeDepth_;
+
+    scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+    floatScopes_ = {}; intScopes_ = {}; derefAVScopes_ = {};
+    rowAVScopes_ = {}; flatRowScopes_ = {}; pairScopes_ = {};
+    localDepthAlloca_ = nullptr;
+    inMainBody_ = false;
+    fileScopeDepth_ = 0;
+    currentFn_ = wfn;
+    fkEmitting_ = false;
+    fkOuterEmitting_ = false;
+    fkNoParDispatch_ = true;
+    flatDoubleCache_.clear();
+    floatSqrtOf_.clear();
+    lastSqrtInput_ = nullptr;
+
+    pushScope();
+    auto *entry = BasicBlock::Create(ctx_, "entry", wfn);
+    auto *done  = BasicBlock::Create(ctx_, "fkouter.done", wfn);
+    builder_.SetInsertPoint(entry);
+    Value *rowsArg = wfn->getArg(0);
+    Value *lo = wfn->getArg(1);
+    Value *hi = wfn->getArg(2);
+    /* register each outer container: rows[k] -> slot[k]; the worker's per-$j
+       binds look the container up by name and reproduce the sequential emit */
+    for (size_t k = 0; k < containerNames.size(); k++) {
+        Value *cell = builder_.CreateGEP(perlPtrTy_, rowsArg,
+            ConstantInt::get(i64, k), "fkouter.rowp");
+        Value *slot = createEntryAlloca(perlPtrTy_, nullptr,
+                                        "fkouter.c" + std::to_string(k));
+        builder_.CreateStore(builder_.CreateLoad(perlPtrTy_, cell, "fkouter.rowv"), slot);
+        declareVar(containerNames[k], slot);
+    }
+
+    /* find the bare outer index var name (same derivation as the cert) */
+    std::string idxBare;
+    {
+        auto bare = [](const std::string &s) {
+            return (!s.empty() && s[0] == '$') ? s.substr(1) : s;
+        };
+        idxBare = bare(n.cond->left->name);
+    }
+    emitFkBatchedOuter(n, idxBare, lo, hi, done);
+
+    builder_.SetInsertPoint(done);
+    builder_.CreateRetVoid();
+
+    /* restore */
+    fkEmitting_  = savedFkEmit;
+    fkOuterEmitting_ = savedFkOuter;
+    fkNoParDispatch_ = savedFkNoPar;
+    currentFn_ = savedFn;
+    builder_.SetInsertPoint(savedBB);
+    scopes_ = savedScopes; arrayScopes_ = savedArr; hashScopes_ = savedHash;
+    pvScopes_ = savedPv; floatScopes_ = savedFloat; intScopes_ = savedInt;
+    derefAVScopes_ = savedDerefAV; rowAVScopes_ = savedRowAV;
+    flatRowScopes_ = savedFlatRow; pairScopes_ = savedPair;
+    localDepthAlloca_ = savedLDep;
+    fkKernelData_ = savedFKData;
+    knownFlatRows_ = savedKnownRows;
+    inMainBody_ = savedMainBody_;
+    fileScopeDepth_ = savedFileDepth_;
+    return wfn;
+}
+
+/* Stage 45 (outerpar): certify a counted loop whose body is a single inner
+   counted FK loop plus the per-$j row binds that feed it, and parallelise the
+   OUTER loop. Certifying the outer collapses the mbs dispatch from
+   2*Niter*N per-$j pool calls to ~2*Niter. The outer loop writes a disjoint
+   row per $j ($zzzp[$j], $zzz[$j]), so fanning [0,N) over contiguous worker
+   chunks is disjoint-by-construction -- no WAR proof or outer-row runtime
+   cert is needed; the inner kernel's own per-$j runtime certificate re-checks
+   "the fetched rows are FLAT" exactly as the sequential body does, so seq and
+   par stay byte-identical. */
+bool CodeGen::tryEmitFlatKernelOuterFor(const Node &n) {
+    /* inside an inner flat-kernel emission (the seq-flat re-emission of a
+       certified kernel re-emits itself) -- never certify the outer there. */
+    if (fkEmitting_) return false;
+    if (!isOptStageEnabled("autopar")) return false;
+    /* Stage 45 outerpar: the outer-counted-loop dispatch batching. Kept behind
+       its own knob so a regression can be isolated without touching the inner
+       flat-kernel path (which has PERLC_OPT_DISABLE=fk*). */
+    if (!isOptStageEnabled("outerpar")) return false;
+    if (!n.init || !n.cond || !n.step || !n.body) return false;
+    if (!n.sval.empty() || n.contBlock) return false;   /* labels/continue keep the general path */
+
+    auto bare = [](const std::string &s) {
+        return (!s.empty() && s[0] == '$') ? s.substr(1) : s;
+    };
+    /* outer counted shape: my $j = 0; $j < BOUND; $j++ */
+    if (n.init->kind != NK::My || !n.init->right ||
+        n.init->right->kind != NK::IntLit || n.init->right->ival != 0)
+        return false;
+    if (n.cond->kind != NK::BinOp || n.cond->sval != "<" ||
+        !n.cond->left || !n.cond->right ||
+        n.cond->left->kind != NK::ScalarVar || !canEmitI64(*n.cond->right))
+        return false;
+    if (n.step->kind != NK::UnaryOp ||
+        (n.step->sval != "post++" && n.step->sval != "pre++") ||
+        !n.step->left || n.step->left->kind != NK::ScalarVar)
+        return false;
+    std::string idxBare = bare(n.cond->left->name);
+    if (idxBare != bare(n.step->left->name) ||
+        idxBare != bare(n.init->name))
+        return false;
+
+    /* body must be: per-$j row binds + exactly ONE counted inner loop */
+    if (n.body->kind != NK::FlatBlock && n.body->kind != NK::Block)
+        return false;
+    const Node *inner = nullptr;
+    std::vector<const Node *> binds;
+    for (const auto &st : n.body->args) {
+        if (st->kind == NK::For) {
+            if (inner) return false;   /* more than one loop in the body: no */
+            inner = &*st;
+        } else {
+            binds.push_back(&*st);
+        }
+    }
+    if (!inner) return false;            /* no inner loop: not our shape */
+    if (inner->kind != NK::For || !inner->init || !inner->cond ||
+        !inner->step || !inner->body)
+        return false;
+    /* inner counted shape: my $i = 0; $i < BOUND; $i++ */
+    if (inner->init->kind != NK::My || !inner->init->right ||
+        inner->init->right->kind != NK::IntLit || inner->init->right->ival != 0)
+        return false;
+    if (inner->cond->kind != NK::BinOp || inner->cond->sval != "<" ||
+        !inner->cond->left || !inner->cond->right ||
+        inner->cond->left->kind != NK::ScalarVar ||
+        !canEmitI64(*inner->cond->right))
+        return false;
+    if (inner->step->kind != NK::UnaryOp ||
+        (inner->step->sval != "post++" && inner->step->sval != "pre++") ||
+        !inner->step->left || inner->step->left->kind != NK::ScalarVar)
+        return false;
+    std::string innerIdxBare = bare(inner->cond->left->name);
+    if (innerIdxBare != bare(inner->step->left->name) ||
+        innerIdxBare != bare(inner->init->name))
+        return false;
+    if (innerIdxBare == idxBare) return false;   /* same index as the outer: no */
+
+    /* the outer binds: each `my $v = <container>->[$j]` / <container>[$j]`.
+       Collect the bind var names (the inner's rows -- passed to
+       fkParBodyPurity as its rowSet) and the containers (captured per-call for
+       the pool worker). The index of every bind must be the OUTER loop var. */
+    std::unordered_set<std::string> rowSet;      // inner rows (bind var names)
+    std::vector<FkOuterCapture> captures;
+    std::vector<NodePtr> containerNodes;          // owned ScalarVar for ArrayElem containers
+    for (const Node *bn : binds) {
+        const Node *st = bn;
+        if (st->kind == NK::ExprStmt && st->left) st = st->left.get();
+        if (st->kind != NK::My || st->name.empty() || !st->right) return false;
+        const Node *rhs = st->right.get();
+        const Node *container = nullptr;
+        const Node *idxNode = nullptr;
+        if (rhs->kind == NK::ArrowDeref && rhs->sval == "array" &&
+            rhs->left && rhs->left->kind == NK::ScalarVar &&
+            rhs->right && rhs->right->kind == NK::ScalarVar) {
+            container = rhs->left.get();
+            idxNode = rhs->right.get();
+        } else if (rhs->kind == NK::ArrayElem &&
+                   rhs->left && rhs->left->kind == NK::ScalarVar &&
+                   !rhs->name.empty()) {
+            /* $arr[$idx] form: container name lives in rhs->name, index in
+               rhs->left. Build a ScalarVar node for the container so the call
+               site emitExpr / worker scope lookup resolve it identically to
+               the $arr->[$idx] form. */
+            auto sv = std::make_unique<Node>();
+            sv->kind = NK::ScalarVar;
+            sv->name = "$" + rhs->name;
+            containerNodes.push_back(std::move(sv));
+            container = containerNodes.back().get();
+            idxNode = rhs->left.get();
+        } else {
+            return false;   /* a bind we can't reason about: keep the general path */
+        }
+        if (bare(idxNode->name) != idxBare) return false;   /* index must be $j */
+        std::string bvar = bare(st->name);
+        if (bvar == idxBare) return false;       /* bind var can't be the loop var */
+        if (rowSet.count(bvar)) return false;    /* re-binding a row var: no */
+        rowSet.insert(bvar);
+        captures.push_back({container, bare(container->name), bvar});
+    }
+     if (captures.empty()) return false;          /* binds are mandatory */
+
+    /* the inner kernel must be parallel-pure against exactly these rows: each
+       of its pair-read binds / element stores targets a row in rowSet (the
+       outer binds' targets) and its body has no side effects / closed-body
+       reads. That proves chunking over $j is disjoint -- each $j touches only
+       its own fetched rows. */
+    std::unordered_set<std::string> locals;
+     bool _fkok = !fkParBodyPurity(*inner->body, rowSet, innerIdxBare, locals);
+     if (_fkok) return false;
+
+    /* ── certify: emit par vs seq over the bound threshold -- */
+    fkEmitting_ = true;
+    fkOuterEmitting_ = true;    /* while the outer structure is emitted, the
+                                    ordinary counted-loop machinery must emit it
+                                    (its body still runs flat for the inner);
+                                    both certs bail on this flag */
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *fn  = builder_.GetInsertBlock()->getParent();
+    Value *bound64 = emitExprI64(*n.cond->right);
+    if (!bound64) { fkEmitting_ = false; fkOuterEmitting_ = false; return false; }
+
+    auto *afterBB = BasicBlock::Create(ctx_, "fkouter.after", fn);
+    auto *parBB   = BasicBlock::Create(ctx_, "fkouter.par", fn);
+    long long parMin = 8192;
+    if (const char *e = getenv("PERLC_AUTOPAR_MIN")) {
+        long long v = atoll(e);
+        if (v > 0) parMin = v;
+    }
+    /* below the threshold: run the outer loop inline (the body runs the inner
+       kernel flat per $j) */
+    auto *seqBB = BasicBlock::Create(ctx_, "fkouter.seq", fn);
+    Value *enough = builder_.CreateICmpSGE(bound64, ConstantInt::get(i64, parMin),
+                                           "fkouter.enough");
+    /* enough -> parBB (dispatch), else seqBB (inline loop); both merge at
+       afterBB so the two paths never double-execute. */
+    builder_.CreateCondBr(enough, parBB, seqBB);
+    builder_.SetInsertPoint(seqBB);
+    emitFkBatchedOuter(n, idxBare, ConstantInt::get(i64, 0), bound64, afterBB);
+
+    /* at/above the threshold: dispatch the outer range over the pool. The pool
+       worker re-emits the body over its chunk; each $j's fetch of its own rows
+       keeps chunks disjoint. */
+    builder_.SetInsertPoint(parBB);
+    {
+        std::vector<std::string> containerNames;
+        for (auto &c : captures) containerNames.push_back(c.cname);
+        if (getenv("PERLC_DEBUG_AUTOPAR")) {
+            fprintf(stderr, "ST45-outer: loop line %d inner-certified "
+                    "rows=[%s] containers=%zu\n", n.line,
+                    joinSet(rowSet).c_str(), captures.size());
+        }
+        Function *wfn = emitFkParWorkerOuter(n, containerNames);
+        /* rows array = captured container PerlArray* values, resolved at
+           dispatch time in the calling function */
+        auto *rowsArr = builder_.CreateAlloca(perlPtrTy_,
+            ConstantInt::get(i64, captures.size()), "fkouter.rows");
+        for (size_t k = 0; k < captures.size(); k++) {
+            Value *cv = emitExpr(*captures[k].container);
+            builder_.CreateStore(cv, builder_.CreateGEP(perlPtrTy_, rowsArr,
+                ConstantInt::get(i64, k), "fkouter.cell"), "fkouter.store");
+            if (cv) freeIfOwned(cv);
+        }
+        callRT("perl_autopar_run", {wfn, rowsArr, bound64});
+        builder_.CreateBr(afterBB);
+    }
+
+    fkEmitting_ = false;
+    fkOuterEmitting_ = false;
+     /* leave the insert point in the merge block so the next sibling
+        statement (or the sub's return) terminates it -- same discipline
+        the ordinary counted-loop emitter uses for its exit block. */
+     builder_.SetInsertPoint(afterBB);
+    return true;
 }
 
 
@@ -10450,6 +10870,12 @@ void CodeGen::emitStmt(const Node &n) {
            this falls straight through to the ordinary machinery. */
         if (tryEmitFlatKernelFor(n))
             break;
+         /* Stage 45 (outerpar): certify the OUTER counted loop (the mbs
+            nested shape -- body is one inner counted FK loop plus the
+            per-$j row binds) and parallelise over its own index. On any
+            rejection this falls straight through to the ordinary machinery. */
+         if (tryEmitFlatKernelOuterFor(n))
+             break;
         if (!n.sval.empty()) {
             auto *lbb = labelBB(n.sval);
             if (!builder_.GetInsertBlock()->getTerminator())
