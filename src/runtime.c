@@ -7474,21 +7474,26 @@ static FILE *nst_open_dash_mode(const char *spec) {
 
 PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
     char *s = perl_to_string_dup(mode_file_pv);
-    const char *filename = s;
+    /* Perl skips leading blanks (space/tab) before the mode indicator, so a
+       mode such as " < -" or " >-" parses identically to "< -"/">-". */
+    const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
     char mode[4] = "<";
-    if      (s[0]=='>' && s[1]=='>') { strcpy(mode,">>"); filename=s+2; }
-    else if (s[0]=='>')              { strcpy(mode,">");  filename=s+1; }
-    else if (s[0]=='<')              { strcpy(mode,"<");  filename=s+1; }
-    else if (s[0]=='+' && s[1]=='<') { strcpy(mode,"+<"); filename=s+2; }
-    else if (s[0]=='+' && s[1]=='>')  { strcpy(mode,"+>"); filename=s+2; }
-    while (*filename==' '||*filename=='\t') filename++;
+    if      (*p=='>' && p[1]=='>') { strcpy(mode,">>"); p+=2; }
+    else if (*p=='>')              { strcpy(mode,">");  p+=1; }
+    else if (*p=='<')              { strcpy(mode,"<");  p+=1; }
+    else if (*p=='+' && p[1]=='<') { strcpy(mode,"+<"); p+=2; }
+    else if (*p=='+' && p[1]=='>')  { strcpy(mode,"+>"); p+=2; }
+    /* blanks between the mode indicator and the filename are ignored too */
+    while (*p==' ' || *p=='\t') p++;
+    const char *filename = p;
     /* Perl: a bare '-' (optionally with surrounding whitespace, e.g.
        " -" or "- ") with the given IO mode is STDIN/STDOUT. */
     int is_dash = 0;
     if (filename[0] == '-') {
-        const char *p = filename + 1;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0') is_dash = 1;
+        const char *q = filename + 1;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == '\0') is_dash = 1;
     }
     if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
     int utf8 = mode_wants_utf8(s);

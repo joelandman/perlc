@@ -60,6 +60,7 @@ declare -A STDIN_INPUTS=(
     [dash_open_stdin_bare_smoke.pl]="hello world"
     [dash_open_modes_deep.pl]=$'alpha line one\nsecond line here\nthird and final\n'
     [digest_addfile_stdin_smoke.pl]="hello world"
+    [dash_open_leading_ws_deep.pl]="hello world"
 )
 
 # Numeric-heavy tests where we allow FP tolerance instead of exact match.
