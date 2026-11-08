@@ -107,6 +107,23 @@ public:
     bool fkNoParDispatch_ = false;  /* Stage 45 outerpar: nested inner kernels run their seq flat body, never their pool dispatch */
     std::unordered_set<std::string> knownFlatRows_;
     std::unordered_set<std::string> knownRefRows_;
+    /* Inlined (compile-time) user-sub body being emitted (tryEmitInline):
+       maps an inlined sub's param name -> how many nested inlined bodies
+       currently open declare that (same) name. Reads of such a name are
+       forced onto the boxed path (never the i64/float fast path, which
+       resolves via intScopes_/floatScopes_ and would leak to an outer
+       scope's same-named var, e.g. process's $v when inlined
+       doubler/halver both declare `my ($v)`). The depth (not a plain set)
+       is required so a deeper inlined body sharing a param name with a
+       shallower one does not erase the shallower one's shadow on exit. */
+    std::unordered_map<std::string, int> inlinedParams_;
+    /* Scope-depth floor for the current inlined body's OWN intScopes_/
+       floatScopes_ entries. Params are bound into the scope pushed by
+       tryEmitInline at index >= this floor; a fast-path (int/float) read of
+       an inlined param that resolves BELOW the floor is reading an ENCLOSING
+       scope's same-named var (a leak) and must be blocked. 0 = no inlined
+       body active. See the inlinedParamDepth_ shadowing fix. */
+    int inlinedOuterDepth_ = 0;
     /* Stage 42: per-row certified packed-buffer pointer inside the FLAT
        variant (select(tag==FLAT, pv.pval, pv.pval->data)) — consumed by the
        pair-read/store emitters so they index raw doubles for FLAT and CPLX
@@ -468,6 +485,8 @@ private:
     friend class ScopeGuard;
     llvm::Value *lookupVar(const std::string &name);
     bool isGlobName(const std::string &name) const;
+    int inlinedParamDepth_(const std::string &name) const;
+    bool inlinedParamOwnSlot_(const std::string &nm) const;
     void declareVar(const std::string &name, llvm::Value *alloca);
     llvm::Value *lookupArray(const std::string &name);
     void declareArray(const std::string &name, llvm::Value *ptr);

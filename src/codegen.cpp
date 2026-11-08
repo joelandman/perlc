@@ -1346,6 +1346,30 @@ bool CodeGen::isGlobName(const std::string &nm) const {
     return false;
 }
 
+int CodeGen::inlinedParamDepth_(const std::string &nm) const {
+    // How many currently-open inlined (compile-time) user-sub bodies declare
+    // an inlined param of this (bare) name. > 0 means a read of `nm` is inside
+    // an inlined body whose param shadows the enclosing scope -- it must take
+    // the boxed path (its own bound slot), never the i64/float fast path that
+    // resolves via intScopes_/floatScopes_ and would leak to an outer var.
+    auto it = inlinedParams_.find(nm);
+    return it == inlinedParams_.end() ? 0 : it->second;
+}
+
+// During a tryEmitInline body's emission, params are bound into the scope
+// pushed at that call (index == inlinedOuterDepth_). A fast-path (i64/f64)
+// read of an inlined param that resolves BELOW inlinedOuterDepth_ would read an
+// ENCLOSING scope's same-named var (the doubler/halver scope-leak bug), so it
+// must be blocked. Returns true iff `nm` still resolves inside THIS body's own
+// scope subtree in either the float or int scope stack.
+bool CodeGen::inlinedParamOwnSlot_(const std::string &nm) const {
+    for (int i = (int)floatScopes_.size() - 1; i >= inlinedOuterDepth_; i--)
+        if (floatScopes_[i].count(nm)) return true;
+    for (int i = (int)intScopes_.size() - 1; i >= inlinedOuterDepth_; i--)
+        if (intScopes_[i].count(nm)) return true;
+    return false;
+}
+
 void CodeGen::declareVar(const std::string &nm, Value *a) {
     scopes_.back()[nm] = a;
 }
@@ -3430,6 +3454,11 @@ Value *CodeGen::emitExprI64(const Node &nRaw) {
     case NK::ScalarVar: {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        /* An inlined (compile-time) user-sub param is bound to a boxed ptr
+           slot, never an i64 alloca in its own intScope — so the fast path
+           here would resolve via the ENCLOSING scope's same-named i64 var
+           (a scope leak), unless the param holds its own slot in this body (a genuine read). Block only the leak. */
+        if (inlinedParamDepth_(nm) > 0 && !inlinedParamOwnSlot_(nm)) return nullptr;
         if (Value *ia = lookupIntVar(nm))
             return builder_.CreateLoad(i64, ia, nm + ".i");
         return nullptr;
@@ -6173,6 +6202,11 @@ Value *CodeGen::emitExprF64(const Node &nRaw) {
     case NK::ScalarVar: {
         std::string nm = n.name;
         if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+        /* Inlined user-sub param: bound to a boxed ptr slot, not an i64/float
+           alloca in its own scope — so the fast path here could also resolve
+           via an ENCLOSING scope's same-named float var (a scope leak),
+           unless the param holds its own slot in this body (a genuine read). Block */
+        if (inlinedParamDepth_(nm) > 0 && !inlinedParamOwnSlot_(nm)) return nullptr;
         if (Value *fa = lookupFloatVar(nm))
             return builder_.CreateLoad(f64, fa, nm + ".f");
         for (size_t si = (size_t)std::max(fileScopeDepth_, 0); si < scopes_.size(); si++)
@@ -11941,15 +11975,24 @@ Value *CodeGen::emitExpr(const Node &n) {
         {
             std::string nm = n.name;
             if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
-            /* int var: box on demand */
-            if (Value *ia = lookupIntVar(nm)) {
-                Value *iv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia, nm + ".i");
-                return boxI64(iv);
-            }
-            /* float var: box on demand */
-            if (Value *fa = lookupFloatVar(nm)) {
-                Value *dbl = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
-                return boxF64(dbl);
+            /* Inlined (compile-time) user-sub params are bound to boxed ptr
+               slots in their OWN scope - never to an i64/float alloca. The
+               int/float fast paths below resolve via intScopes_/floatScopes_
+               and would leak to an OUTER scope's same-named var (the nested
+               sub scoping bug: doubler(halver($v)) read the caller's $v
+               instead of halver's result). Skip them for an inlined param
+               and fall through to the scope-correct lookupVar path below. */
+            if (inlinedParamDepth_(nm) == 0 || inlinedParamOwnSlot_(nm)) {
+                /* int var: box on demand */
+                if (Value *ia = lookupIntVar(nm)) {
+                    Value *iv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia, nm + ".i");
+                    return boxI64(iv);
+                }
+                /* float var: box on demand */
+                if (Value *fa = lookupFloatVar(nm)) {
+                    Value *dbl = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa, nm + ".f");
+                    return boxF64(dbl);
+                }
             }
         }
         auto *slot = lookupVar(n.name);
@@ -17085,6 +17128,21 @@ Value *CodeGen::emitF64BinOpWithBigIntGuard(const Node &n) {
     bool lVar = n.left->kind == NK::ScalarVar;
     bool rVar = n.right->kind == NK::ScalarVar;
     if (!lVar && !rVar) return nullptr;
+    /* Inlined (compile-time) user-sub params are bound to boxed ptr slots,
+       never to a float alloca in their own floatScope — emitExprF64's ScalarVar
+       fast path returns nullptr for them (the scope-leak guard). The D132
+       wrapper below would strand fastBB (branch target with no terminator) if
+       it reached there, so BAIL OUT here, before any block is created, and let
+       emitBinOp fall through to the generic boxed path (which resolves the
+       param via lookupVar's bound slot — always correct). */
+    for (const Node *op : {n.left.get(), n.right.get()}) {
+        if (!op) continue;
+        if (op->kind == NK::ScalarVar) {
+            std::string onm = op->name;
+            if (!onm.empty() && onm[0] == '$') onm = onm.substr(1);
+            if (inlinedParamDepth_(onm) > 0) return nullptr;
+        }
+    }
     /* Both operands must be F64-representable for the fast path to be in
        play at all — mirror emitExprF64's own gate so the guarded path is
        only ever emitted where the unguarded one would have been. */
@@ -17510,6 +17568,12 @@ Value *CodeGen::emitBinOp(const Node &n) {
        Also add float allocas when the arg is canEmitF64 so the body can use
        the F64 path for params (enables FLOAT_PAIR for cplx(float, float)). */
     pushScope();
+    /* Floor for this inlined body's OWN scope entries: a fast-path (int/
+       float) read of an inlined param that resolves in a scope BELOW this
+       index is reading an ENCLOSING scope's same-named var (a leak) and must
+       be blocked. Params bound here are bound into THIS scope (index ==
+       inlinedOuterDepth_), so genuine reads resolve at >= the floor. */
+    inlinedOuterDepth_ = (int)floatScopes_.size() - 1;
     auto *f64Ty = Type::getDoubleTy(ctx_);
     for (size_t i = 0; i < is.params.size(); i++) {
         auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "$" + is.params[i]);
@@ -17538,7 +17602,14 @@ Value *CodeGen::emitBinOp(const Node &n) {
     }
 
     /* Emit the body expression */
+    /* The inlined sub's params are bound to boxed ptr slots only — their
+       scalar reads must use the boxed path, not the i64/float fast path,
+       which would leak to the enclosing scope's same-named var. Shadow
+       them for the duration of this body's emission. */
+    for (auto &p : is.params) inlinedParams_[p]++;
     Value *result = emitExpr(*is.bodyExpr);
+    for (auto &p : is.params) if (--inlinedParams_[p] == 0) inlinedParams_.erase(p);
+    inlinedOuterDepth_ = 0;
 
     /* Clean up param scope (don't free param slot PVs — we don't own them) */
     popScope();
