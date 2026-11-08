@@ -237,6 +237,17 @@ green as that corpus grows.** Concretely:
    `make test-all`'s 263/263 is tracked today. The 2026-09-09 survey's
    real number (6/36 clean, before D113's silent-failure bug is even
    accounted for) is the actual baseline to move — not vibes.
+    **DONE 2026-11-08 (D214):** the runner is `tests/realworld/run_compare.sh` — it
+    executes both perl and perlc with fixed args+stdin and diffs combined stdout+stderr
+    byte-for-byte. Only pure-compute, non-destructive, deterministic tools are curated/run
+    (gate=1: json_pp/shasum/debconf-escape; gate=0 tracked: pod2text/pod2man/pod2html/piconv);
+    destructive/interactive tools are skip-safe-run and never run to completion. `make
+    test-realworld` now runs the compile-only `run.sh` AND this runtime gate, which FAILS
+    on any gate=1 non-pass or a regression from the versioned `baseline-compare.txt`. The
+    full landscape is reported each run: compile-rate, runtime-correct(among runnable),
+    mvp-pass-rate. The honest starting baseline to move up is runtime-correct 3/7 = 42.9%
+    and mvp-pass-rate 3/29 = 10.3% — the pod2text/pod2man/pod2html/piconv divergences
+    are module-capacity gaps (item 6), not regressions.
 5. **Tier 1 parse gaps fixed** for the specific syntax shown to gate
    real scripts in the corpus (`__PACKAGE__` first — likely highest
    yield — then `qr//`, `map {{}}`, dynamic method dispatch, etc.),
