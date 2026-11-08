@@ -69,7 +69,8 @@ help:
 	@echo "                Diff the 4 assertion programs against real perl"
 	@echo "make test-full  Same as make test-all"
 	@echo "make test-realworld"
-	@echo "                Compile the system-script corpus; do not run the binaries"
+	@echo "                Compile the system-script corpus, then run_compare.sh:"
+	@echo "                byte-for-byte RUNTIME correctness vs perl (the gate)"
 	@echo "make gap"
 	@echo "                Phase-0 runtime gap inventory: build a trace-enabled perlc,"
 	@echo "                run each successfully-compiled real-world script with"
@@ -146,6 +147,7 @@ test-all: $(TARGET)
 # not harness failures. The runner never executes the compiled binaries.
 test-realworld: $(TARGET)
 	@./tests/realworld/run.sh
+	@./tests/realworld/run_compare.sh
 
 # Phase-0 runtime gap inventory: builds a trace-enabled perlc, runs every
 # successfully-compiled real-world script with PERLC_GAPS set to capture its

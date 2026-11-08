@@ -1,7 +1,16 @@
-# Compile-only corpus of real system Perl scripts.
+# System Perl scripts used by the real-world corpus runners.
 # One absolute path per line. Blank lines and # comments are ignored.
 # Host-specific: a missing path is classified missing-file, not a failure.
-# Do not execute these scripts. make test-realworld only compiles them.
+#
+# Two runners consume this manifest:
+#   run.sh           compile-only survey; NEVER executes a binary (several are
+#                    system tools). Tracks Can't locate / parse-error / clean
+#                    compile. Not part of make test-all.
+#   run_compare.sh   byte-for-byte RUNTIME survey; executes a curated subset
+#                    (resolve_invoke in run_compare.sh) with fixed args+stdin
+#                    and diffs perl vs perlc combined stdout+stderr. Destructive
+#                    / interactive / setup-heavy tools stay uncurated and are
+#                    tracked as skip-safe-run (never run to completion).
 #
 # These are the scripts the 2026-09/10 surveys actually hit. The runner
 # separates Can't locate (missing module) from Parse error (compiler gap)
@@ -14,6 +23,7 @@
 /usr/bin/perlbug
 /usr/bin/perlthanks
 /usr/bin/json_pp
+/usr/bin/debconf-escape
 /usr/bin/piconv
 /usr/bin/pod2text
 /usr/bin/pod2man
