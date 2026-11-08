@@ -509,8 +509,15 @@ PerlValue *perl_digest_method(PerlValue *obj, const char *method, PerlArray *arg
         int close_fp = 0;
         if (!fp && args && args->len) {
             char *path = perl_to_string_dup(args->elems[0]);
-            fp = fopen(path ? path : "", "rb");
-            close_fp = 1;
+            /* Perl: addfile('-') reads STDIN (not a file named '-'). Read
+               the live stdin stream directly; do not close it (close_fp
+               stays 0) to match perl, which leaves STDIN open. */
+            if (path && strcmp(path, "-") == 0) {
+                fp = stdin;
+            } else {
+                fp = fopen(path ? path : "", "rb");
+                close_fp = 1;
+            }
             free(path);
         }
         if (!fp) return perl_clone(obj);

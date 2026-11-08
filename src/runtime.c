@@ -7452,6 +7452,26 @@ PerlValue *perl_open_fh(PerlValue *target, PerlValue *mode_pv, PerlValue *filena
     return target->tag == PERL_FILEHANDLE ? perl_alloc_bool(1) : perl_alloc_undef();
 }
 
+/* Perl treats a '-' filename (optionally with a leading IO mode, e.g.
+   "< -", ">", ">>", "+>", "+<") as STDIN when reading and STDOUT when
+   writing. Returns a fresh, independent FILE* via dup() of the process
+   std fd so the returned handle can later be closed safely without
+   closing fd 0/1/2 (unlike handing back the real stdin/stdout FILE*).
+   NULL if the dup/fdopen fails. Write mode is detected by the first
+   non-whitespace char of the spec being '>' (mirroring perl's own leading
+   mode-char parsing); trailing whitespace after '-' is ignored. */
+static FILE *nst_open_dash_mode(const char *spec) {
+    if (!spec) spec = "";
+    const char *p = spec;
+    while (*p == ' ' || *p == '\t') p++;
+    int write = (*p == '>');
+    int fd = write ? dup(fileno(stdout)) : dup(fileno(stdin));
+    if (fd < 0) return NULL;
+    /* On Linux text/binary modes are identical; fdopen() gives an
+       independent buffered stream backed by the dup'd fd. */
+    return fdopen(fd, write ? "wb" : "r");
+}
+
 PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
     char *s = perl_to_string_dup(mode_file_pv);
     const char *filename = s;
@@ -7462,9 +7482,17 @@ PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
     else if (s[0]=='+' && s[1]=='<') { strcpy(mode,"+<"); filename=s+2; }
     else if (s[0]=='+' && s[1]=='>')  { strcpy(mode,"+>"); filename=s+2; }
     while (*filename==' '||*filename=='\t') filename++;
+    /* Perl: a bare '-' (optionally with surrounding whitespace, e.g.
+       " -" or "- ") with the given IO mode is STDIN/STDOUT. */
+    int is_dash = 0;
+    if (filename[0] == '-') {
+        const char *p = filename + 1;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') is_dash = 1;
+    }
     if (target->tag == PERL_FILEHANDLE && target->pval) fclose((FILE*)target->pval);
     int utf8 = mode_wants_utf8(s);
-    FILE *fp = fopen(filename, mode_to_cmode(mode));
+    FILE *fp = is_dash ? nst_open_dash_mode(s) : fopen(filename, mode_to_cmode(mode));
     free(s);
     if (fp) {
         target->tag = PERL_FILEHANDLE; target->pval = fp;

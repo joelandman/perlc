@@ -50,6 +50,18 @@ declare -A ARGV_DEFAULTS=(
     [tree.pl]=""          # tree.pl may accept optional args; start empty
 )
 
+# Tests that receive a fixed string on STDIN. Key: test filename. When a key
+# is present (even with an empty value) the harness pipes that string into the
+# program's STDIN for BOTH the perl and perlc runs, so stdin-consuming
+# behavior — e.g. perl's '-' == STDIN convention — can be tested byte-for-byte.
+# Use ANSI-C quoting ($'...') for values containing newlines.
+declare -A STDIN_INPUTS=(
+    [dash_open_stdin_smoke.pl]="hello world"
+    [dash_open_stdin_bare_smoke.pl]="hello world"
+    [dash_open_modes_deep.pl]=$'alpha line one\nsecond line here\nthird and final\n'
+    [digest_addfile_stdin_smoke.pl]="hello world"
+)
+
 # Numeric-heavy tests where we allow FP tolerance instead of exact match.
 NUMERIC_TESTS=(
     nb.pl nbody.pl mbs.pl fibn.pl arith.pl
@@ -192,6 +204,16 @@ run_one() {
         args="${ARGV_DEFAULTS[$base]}"
     fi
 
+    # Determine STDIN input (if any). When a key exists in STDIN_INPUTS (even
+    # with an empty value) the harness pipes that exact string into STDIN for
+    # both the perl and perlc runs.
+    local stdin_src=""
+    local stdin_set=0
+    if [[ -n "${STDIN_INPUTS[$base]+set}" ]]; then
+        stdin_src="${STDIN_INPUTS[$base]}"
+        stdin_set=1
+    fi
+
     # Determine timeout — heavy benchmarks get a longer window
     local test_timeout="$TIMEOUT_SEC"
     if [[ -n "${LONG_TIMEOUT[$base]:-}" ]]; then
@@ -211,7 +233,11 @@ run_one() {
     # status directly (capturing it inside an `if ! cmd; then` block would
     # read the negated status and always see 0).
     perl_rc=0
-    run_sandboxed timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1 || perl_rc=$?
+    if [[ $stdin_set -eq 1 ]]; then
+        printf '%s' "$stdin_src" | run_sandboxed timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1 || perl_rc=$?
+    else
+        run_sandboxed timeout "$test_timeout" "$PERL_CMD" "$testfile" $args >"$p_out" 2>&1 || perl_rc=$?
+    fi
 
     # Compile with perlc (if binary exists)
     if [[ ! -x "$PERLC_BIN" ]]; then
@@ -253,8 +279,10 @@ run_one() {
         return 0
     fi
 
-    if ! run_sandboxed timeout "$test_timeout" "$c_bin" $args >"$c_out" 2>&1; then
-        :
+    if [[ $stdin_set -eq 1 ]]; then
+        printf '%s' "$stdin_src" | run_sandboxed timeout "$test_timeout" "$c_bin" $args >"$c_out" 2>&1 || true
+    else
+        run_sandboxed timeout "$test_timeout" "$c_bin" $args >"$c_out" 2>&1 || true
     fi
 
     if compare_outputs "$p_out" "$c_out" "$base"; then
