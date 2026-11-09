@@ -701,12 +701,19 @@ std::vector<Token> Lexer::tokenize() {
                that support nesting (the same pairs q/qq use). Without this,
                `qw[a[b]c]` stops at the first `]` and swallows `c]`. */
             int depth = 1;
+            /* D217: a same-character delimiter (qw/.../, qw!...!, qw#...#)
+               does not nest. The old loop incremented depth on every
+               `open` before testing `close`, so when open==close the
+               closer never won and the scan ran to EOF (`expected ) but
+               got ''` on the last line). Bracket pairs still nest
+               (`qw[a[b]c]`, D199). q/qq already do this in readString. */
+            bool nest = (open != close);
             while (pos_ < src_.size() && depth > 0) {
                 char ch = src_[pos_];
                 if (ch == '\\' && pos_+1 < src_.size()) {
                     words += ch; words += src_[pos_+1]; pos_ += 2; continue;
                 }
-                if (ch == open) depth++;
+                if (nest && ch == open) depth++;
                 else if (ch == close) {
                     if (--depth == 0) { pos_++; break; }
                 }

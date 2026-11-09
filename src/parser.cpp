@@ -315,8 +315,13 @@ NodePtr Parser::parseUseNoStmt() {
                 n->kind = NK::OverloadStmt;
                 n->name = currentPackage_; /* the package where overload is declared */
                 n->line = line;
-                /* Parse comma-separated pairs until ; */
-                while (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                /* `use overload(...)` wraps the pairs. Stop before that
+                   `)` so it is not parsed as another operator — otherwise
+                   the following sub (`Pod::Simple::LinkSection::tack_on`)
+                   is swallowed and its `}` is a parse error. */
+                bool hp = match(TK::LPAREN);
+                while (!check(TK::SEMI) && !check(TK::EOF_TOK) &&
+                       !(hp && check(TK::RPAREN))) {
                     /* Parse the op key: could be a STRING, or a bareword
                        like +, -, *, etc. lexed as an operator token. */
                     std::string opKey;
@@ -376,6 +381,7 @@ NodePtr Parser::parseUseNoStmt() {
                     }
                     match(TK::COMMA);
                 }
+                if (hp) match(TK::RPAREN);
                 match(TK::SEMI);
                 stmts.push_back(std::move(n));
                 continue;
@@ -441,9 +447,27 @@ NodePtr Parser::parseUseNoStmt() {
                 match(TK::SEMI);
                 continue;
             }
-            /* skip all other use statements */
-            while (!check(TK::SEMI) && !check(TK::EOF_TOK)) advance();
-            match(TK::SEMI); continue;
+            /* Skip every other `use`. A semicolon inside a balanced
+               brace/paren/bracket is part of the statement (`use if
+               do { no integer; "$]" <= 5.006 }, 'utf8'` — Pod::Simple::
+               BlackBox). Stopping at the first `;` left `, 'utf8'`
+               behind as a parse error. */
+            {
+                int depth = 0;
+                while (!check(TK::EOF_TOK)) {
+                    if (check(TK::LBRACE) || check(TK::LPAREN) || check(TK::LBRACKET)) {
+                        depth++; advance(); continue;
+                    }
+                    if (check(TK::RBRACE) || check(TK::RPAREN) || check(TK::RBRACKET)) {
+                        if (depth > 0) depth--;
+                        advance(); continue;
+                    }
+                    if (check(TK::SEMI) && depth == 0) break;
+                    advance();
+                }
+                match(TK::SEMI);
+            }
+            continue;
         }
         /* D48/D91: `no PRAGMA` (e.g. `no strict;`, `no warnings;`,
             `no warnings 'CATEGORY';`) — silently ignored, matching Perl's
@@ -488,33 +512,35 @@ NodePtr Parser::parseUseNoStmt() {
 
 /* ── statements ──────────────────────────────────────────────────────────── */
 
-/* Token lookahead for map/grep/sort's `{`: real Perl decides between a
-   BLOCK and an anon-hash constructor. Hash-like when the brace's TOP
-   level contains a fat comma (`=>`), or the brace closes immediately
-   (empty anon hash), or starts with a sigil-deref of a hash (e.g.
-   `{%$_, k=>1}` — the bare % sigil can't start a statement). */
+/* Token lookahead for map/grep/sort's `{` and for a `{` in statement
+   position: real Perl decides between a BLOCK and an anon-hash
+   constructor. Hash-like when the brace closes immediately (`{}`), or
+   its top level contains a fat comma (`=>`) before any statement
+   semicolon. A leading `%` is NOT enough: `%h = ()` is an ordinary
+   statement, so `{ %Latin1 = (); my $k; while ... }` (Pod::Escapes) is
+   a block. `{ %$h }` with no semicolon stays a constructor so
+   `map { { %$h } }` still yields one hashref. A depth-1 `;` before any
+   `=>` forces a block. */
 bool Parser::scanBraceHashLike() {
     size_t i = pos_; /* cur() is the LBRACE */
     if (i >= toks_.size() || toks_[i].kind != TK::LBRACE) return false;
     i++; /* past { */
     if (i < toks_.size() && toks_[i].kind == TK::RBRACE) return true; /* {} */
     int depth = 1;
-    /* leading bare %-sigil (hash deref) inside a map/grep block is the
-       anon-hash start: `{ %$h, ... }` */
-    if (i < toks_.size() && toks_[i].kind == TK::HASH) return true;
+    bool leadingHash = i < toks_.size() && toks_[i].kind == TK::HASH;
     while (i < toks_.size()) {
         TK k = toks_[i].kind;
         if (k == TK::LBRACE || k == TK::LBRACKET || k == TK::LPAREN) depth++;
         else if (k == TK::RBRACE) {
             depth--;
-            if (depth == 0) return false; /* no top-level => found */
+            if (depth == 0) return leadingHash; /* `{ %$h }` */
         } else if (k == TK::RBRACKET || k == TK::RPAREN) depth--;
         else if (k == TK::FATARROW && depth == 1) return true;
         else if (k == TK::SEMI && depth == 1) return false;
         if (depth <= 0) return false;
         i++;
     }
-    return false;
+    return leadingHash;
 }
 
 NodePtr Parser::parseBlock() {
@@ -863,45 +889,7 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_SAY))    { return parseModifier(parsePrint(true),  line); }
     if (check(TK::KW_PRINTF)) {
         advance();
-        /* filehandle detection (same heuristic as parsePrint) */
-        std::string fhname;
-        if (check(TK::IDENT) &&
-            (cur().text == "STDOUT" || cur().text == "STDERR" || cur().text == "STDIN" ||
-             knownBareFH_.count(cur().text))) {
-            fhname = cur().text; advance();
-        } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
-            TK t2 = peek(2).kind;
-            bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
-                             t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                             t2 == TK::LPAREN
-                            || t2 == TK::KW_MAP    || t2 == TK::KW_GREP   || t2 == TK::KW_SORT
-                            || t2 == TK::KW_JOIN   || t2 == TK::KW_REVERSE
-                            || t2 == TK::KW_KEYS   || t2 == TK::KW_VALUES);
-            if (!isFhCtx && t2 == TK::IDENT) {
-                isFhCtx = !isCmpOpWord(peek(2).text);
-            }
-            if (isFhCtx) { pos_++; fhname = advance().text; }
-        }
-        bool hasParen = check(TK::LPAREN);
-        if (hasParen) advance();
-        /* D153: printf(FH "fmt", ...) — a bareword directly followed by a
-           term (no comma) inside the parens is the filehandle. */
-        if (hasParen && fhname.empty() && check(TK::IDENT) &&
-            (peek(1).kind == TK::STRING || peek(1).kind == TK::SCALAR)) {
-            fhname = cur().text; advance();
-        }
-        NodePtr fmt = parseLowNot();
-        NodeList args;
-        while (match(TK::COMMA)) {
-            if (!hasParen && isModifier()) break;
-            if (hasParen && check(TK::RPAREN)) break;
-            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            args.push_back(parseLowNot());
-        }
-        if (hasParen) consume(TK::RPAREN, ")");
-        auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
-        n->name = fhname; n->left = std::move(fmt); n->args = std::move(args);
-        return parseModifier(std::move(n), line);
+        return parseModifier(parsePrintfBody(line), line);
     }
     if (check(TK::KW_PUSH))   { return parseModifier(parsePush(),        line); }
     if (check(TK::KW_UNSHIFT)){ return parseModifier(parseUnshift(),     line); }
@@ -943,17 +931,11 @@ NodePtr Parser::parseStmt() {
         match(TK::RPAREN); match(TK::SEMI);
         return n;
     }
-    /* tie($var, CLASS [, args...]) */
+    /* tie VAR, CLASS, LIST — also an expression (`my $o = tie $x, ...`).
+       The statement form is Pod::Simple::TiedOutFH's `tie *$new, $class, $x`. */
     if (check(TK::KW_TIE)) {
-        advance(); match(TK::LPAREN);
-        auto n = std::make_unique<Node>(); n->kind = NK::TieStmt; n->line = line;
-        n->left = parseExpr();  /* $var to tie */
-        match(TK::COMMA);
-        if (check(TK::STRING)) { n->args.push_back(makeStr(cur().text)); advance(); }
-        else if (check(TK::IDENT)) { n->args.push_back(makeStr(cur().text)); advance(); }
-        else { throw std::runtime_error(parseErrPrefix(cur().line) + "tie: expected class name"); }
-        while (check(TK::COMMA)) { advance(); n->args.push_back(parseExpr()); }
-        match(TK::RPAREN); match(TK::SEMI);
+        auto n = parseTie(line);
+        match(TK::SEMI);
         return n;
     }
     /* untie($var) */
@@ -1048,6 +1030,10 @@ NodePtr Parser::parseIf() {
     auto body = parseBlock();
 
     auto n = std::make_unique<Node>(); n->kind = NK::If; n->line = line;
+    /* D215: keep the unless mark. Control flow is still `if (!COND)` via
+       the unary wrap above; the value of a failed unless is COND itself
+       (`unless ("foo") { ... }` yields "foo"), which `!COND` would lose. */
+    if (isUnless) n->sval = "unless";
     n->branches.push_back({std::move(cond), std::move(body)});
 
     while (check(TK::KW_ELSIF)) {
@@ -1923,6 +1909,50 @@ NodePtr Parser::parseUnshift() {
     return n;
 }
 
+/* D225: printf's arguments, after the keyword. Shared by the statement
+   form, `and printf`, and `return printf STDERR "..."`. */
+NodePtr Parser::parsePrintfBody(int line) {
+    std::string fhname;
+    if (check(TK::IDENT) &&
+        (cur().text == "STDOUT" || cur().text == "STDERR" || cur().text == "STDIN" ||
+         knownBareFH_.count(cur().text))) {
+        fhname = cur().text; advance();
+    } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
+        TK t2 = peek(2).kind;
+        bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
+                         t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
+                         t2 == TK::LPAREN
+                        || t2 == TK::KW_MAP    || t2 == TK::KW_GREP   || t2 == TK::KW_SORT
+                        || t2 == TK::KW_JOIN   || t2 == TK::KW_REVERSE
+                        || t2 == TK::KW_KEYS   || t2 == TK::KW_VALUES);
+        if (!isFhCtx && t2 == TK::IDENT) {
+            isFhCtx = !isCmpOpWord(peek(2).text);
+        }
+        if (isFhCtx) { pos_++; fhname = advance().text; }
+    }
+    bool hasParen = check(TK::LPAREN);
+    if (hasParen) advance();
+    /* D153: printf(FH "fmt", ...) — a bareword directly followed by a
+       term (no comma) inside the parens is the filehandle. */
+    if (hasParen && fhname.empty() && check(TK::IDENT) &&
+        (peek(1).kind == TK::STRING || peek(1).kind == TK::SCALAR)) {
+        fhname = cur().text; advance();
+    }
+    NodePtr fmt = parseLowNot();
+    NodeList args;
+    while (match(TK::COMMA) || match(TK::FATARROW)) {
+        if (check(TK::RPAREN)) break;
+        if (!hasParen && isModifier()) break;
+        if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
+        if (!hasParen && check(TK::RBRACE)) break;
+        args.push_back(parseLowNot());
+    }
+    if (hasParen) consume(TK::RPAREN, ")");
+    auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
+    n->name = fhname; n->left = std::move(fmt); n->args = std::move(args);
+    return n;
+}
+
 NodePtr Parser::parseReturn() {
     int line = cur().line;
     consume(TK::KW_RETURN);
@@ -1930,6 +1960,12 @@ NodePtr Parser::parseReturn() {
     /* D155: bare `return` before `}` / `)` (`f() or return }`) */
     if (!check(TK::SEMI) && !isModifier() && !check(TK::RBRACE) &&
         !check(TK::RPAREN) && !check(TK::EOF_TOK) && !check(TK::COLON)) {
+        /* D225: `return printf STDERR "fmt", args` — printf is a term here. */
+        if (check(TK::KW_PRINTF)) {
+            int pline = cur().line;
+            advance();
+            val = parsePrintfBody(pline);
+        } else
         val = parseLowNot();
         /* Unparenthesized multi-value return (`return '', '', 0`):
            collect all comma-separated values into an ArrayLit so the
@@ -2057,8 +2093,30 @@ NodePtr Parser::finishDeclLowOr(NodePtr decl, NodePtr var, int line) {
         /* D191: tolerate a trailing comma after the RHS (e.g. `my $x = 5,`
            or `my $v = pop @a,` before `;`/`}`). */
         consumeTrailingComma();
-        match(TK::SEMI);
-        return decl;
+        /* D224: `our $NL = $/ unless defined $NL` — the declaration is
+           in scope for the whole block; only the initializer is
+           conditional. A bare `my $x if $c` still declares, and the
+           modifier is consumed as a discarded expression. */
+        if (isModifier()) {
+            NodePtr init = std::move(decl->right);
+            auto fb = std::make_unique<Node>();
+            fb->kind = NK::FlatBlock; fb->line = line;
+            fb->args.push_back(std::move(decl));
+            auto es = std::make_unique<Node>();
+            es->kind = NK::ExprStmt; es->line = line;
+            if (init) {
+                auto asgn = std::make_unique<Node>();
+                asgn->kind = NK::Assign; asgn->line = line;
+                asgn->left = std::move(var);
+                asgn->right = std::move(init);
+                es->left = std::move(asgn);
+            } else {
+                es->left = makeInt(0, line);
+            }
+            fb->args.push_back(parseModifier(std::move(es), line));
+            return fb;
+        }
+        return parseModifier(std::move(decl), line);
     }
     auto asgn = std::make_unique<Node>(); asgn->kind = NK::Assign; asgn->line = line;
     asgn->left = std::move(var); asgn->right = std::move(decl->right);
@@ -2066,11 +2124,10 @@ NodePtr Parser::finishDeclLowOr(NodePtr decl, NodePtr var, int line) {
     es->left = consumeLowOrChain(std::move(asgn));
     /* D191: tolerate a trailing comma after the RHS. */
     consumeTrailingComma();
-    match(TK::SEMI);
     auto fb = std::make_unique<Node>(); fb->kind = NK::FlatBlock; fb->line = line;
     fb->args.push_back(std::move(decl));
     fb->args.push_back(std::move(es));
-    return fb;
+    return parseModifier(std::move(fb), line);
 }
 
 NodePtr Parser::consumeLowOrChain(NodePtr init) {
@@ -2150,6 +2207,7 @@ NodePtr Parser::parseModifier(NodePtr stmt, int line) {
         if (neg) cond = makeUnary("!", std::move(cond), line);
         NodeList body; body.push_back(std::move(stmt));
         auto n = std::make_unique<Node>(); n->kind = NK::If; n->line = line;
+        if (neg) n->sval = "unless"; /* D215: see parseIf */
         n->branches.push_back({std::move(cond), makeBlock(std::move(body), line)});
         match(TK::SEMI);
         return n;
@@ -2318,48 +2376,12 @@ NodePtr Parser::parseOrRhs() {
     else if (k == TK::KW_PUSH)   { stmt = parsePush();       }
     else if (k == TK::KW_UNSHIFT){ stmt = parseUnshift();    }
     else if (k == TK::KW_PRINTF) {
-        /* printf: filehandle detection + format + args, same as parseStmt
-           but without parseModifier wrapper (the outer parseStmt handles
-           the trailing modifier, so we leave the ; for the caller). */
-        advance(); /* consume printf */
-        std::string fhname;
-        if (check(TK::IDENT) &&
-            (cur().text == "STDOUT" || cur().text == "STDERR" || cur().text == "STDIN" ||
-             knownBareFH_.count(cur().text))) {
-            fhname = cur().text; advance();
-        } else if (check(TK::SCALAR) && peek(1).kind == TK::IDENT) {
-            TK t2 = peek(2).kind;
-            bool isFhCtx = (t2 == TK::SCALAR || t2 == TK::ARRAY || t2 == TK::HASH ||
-                             t2 == TK::STRING || t2 == TK::INT   || t2 == TK::FLOAT ||
-                             t2 == TK::LPAREN
-                            || t2 == TK::KW_MAP    || t2 == TK::KW_GREP   || t2 == TK::KW_SORT
-                            || t2 == TK::KW_JOIN   || t2 == TK::KW_REVERSE
-                            || t2 == TK::KW_KEYS   || t2 == TK::KW_VALUES);
-            if (!isFhCtx && t2 == TK::IDENT) {
-                isFhCtx = !isCmpOpWord(peek(2).text);
-            }
-            if (isFhCtx) { pos_++; fhname = advance().text; }
-        }
-        bool hasParen = check(TK::LPAREN);
-        if (hasParen) advance();
-        /* D153: printf(FH "fmt", ...) — a bareword directly followed by a
-           term (no comma) inside the parens is the filehandle. */
-        if (hasParen && fhname.empty() && check(TK::IDENT) &&
-            (peek(1).kind == TK::STRING || peek(1).kind == TK::SCALAR)) {
-            fhname = cur().text; advance();
-        }
-        NodePtr fmt = parseLowNot();
-        NodeList args;
-        while (match(TK::COMMA)) {
-            if (!hasParen && isModifier()) break;
-            if (hasParen && check(TK::RPAREN)) break;
-            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
-            args.push_back(parseLowNot());
-        }
-        if (hasParen) consume(TK::RPAREN, ")");
-        auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
-        n->name = fhname; n->left = std::move(fmt); n->args = std::move(args);
-        stmt = std::move(n);
+        /* D225: same body as a statement printf. The `;` stays for the
+           outer statement. The value wrapped below is still 1 for
+           `and printf` (a true print); `return printf` uses the body
+           directly so the character count is the return value. */
+        advance();
+        stmt = parsePrintfBody(line);
     }
     else {
         return parseLowNot();
@@ -3181,8 +3203,43 @@ NodePtr Parser::interpRegexPattern(const std::string &pattern, int line) {
     return nullptr;
 }
 
+/* tie VAR, CLASS, LIST. Parens optional. VAR may be a glob
+   (`tie *$new, $class, $x`). CLASS may be a bareword, a string, or any
+   expression. ival selects the method: 0 TIESCALAR, 1 TIEARRAY,
+   2 TIEHASH, 3 TIEHANDLE. Does not consume a trailing semicolon. */
+NodePtr Parser::parseTie(int line) {
+    advance(); /* tie */
+    bool hp = match(TK::LPAREN);
+    auto n = std::make_unique<Node>(); n->kind = NK::TieStmt; n->line = line;
+    n->left = parseExpr();
+    int kind = 0;
+    if (n->left) {
+        NK k = n->left->kind;
+        if (k == NK::ArrayVar || k == NK::DerefArray) kind = 1;
+        else if (k == NK::HashVar || k == NK::DerefHash) kind = 2;
+        else if (k == NK::Typeglob) kind = 3;
+    }
+    n->ival = kind;
+    match(TK::COMMA);
+    /* A bareword class is a string. A quoted class goes through parseExpr
+       so a double-quoted token's \x01 marker is stripped. */
+    if (check(TK::IDENT) && peek(1).kind != TK::LPAREN && peek(1).kind != TK::ARROW)
+        { n->args.push_back(makeStr(cur().text)); advance(); }
+    else { n->args.push_back(parseExpr()); }
+    while (check(TK::COMMA)) {
+        advance();
+        if (hp && check(TK::RPAREN)) break;
+        n->args.push_back(parseExpr());
+    }
+    if (hp) match(TK::RPAREN);
+    return n;
+}
+
 NodePtr Parser::parsePrimary() {
     int line = cur().line;
+
+    if (!inKeyContext_ && check(TK::KW_TIE))
+        return parseTie(line);
 
     /* D179: `not` nested inside a tighter-binding expression, e.g.
        `$a && not $b` (found via a real /usr/bin/podebconf-report-po
@@ -3438,13 +3495,23 @@ NodePtr Parser::parsePrimary() {
         return r;
     }
 
-    /* qw(word list) — returns ArrayLit of string literals */
+    /* qw(word list) — returns ArrayLit of string literals.
+       The lexer keeps a backslash-escaped character as two bytes so the
+       delimiter and whitespace scan stay balanced. Real qw drops that
+       backslash (`qw/a\/b/` is the word a/b). */
     if (check(TK::QWORDS)) {
         std::string text = cur().text; advance();
         auto n = std::make_unique<Node>(); n->kind = NK::ArrayLit; n->line = line;
         std::istringstream iss(text);
         std::string word;
-        while (iss >> word) n->args.push_back(litStr(word, line));
+        while (iss >> word) {
+            std::string out;
+            for (size_t i = 0; i < word.size(); i++) {
+                if (word[i] == '\\' && i + 1 < word.size()) out += word[++i];
+                else out += word[i];
+            }
+            n->args.push_back(litStr(out, line));
+        }
         return n;
     }
 
@@ -4229,6 +4296,34 @@ NodePtr Parser::parsePrimary() {
             n->left = makeScalar("_", line); n->line = line;
             return n;
         }
+        /* D228: `defined &NAME` / `defined(&NAME)` checks that the sub
+           exists. It must not call it — `defined &DEBUG` in a BEGIN is
+           how Pod::Simple::Transcode installs a missing constant.
+           `defined &NAME()` (parens on the sub) still calls. */
+        if (check(TK::AND) && pos_ + 1 < toks_.size()) {
+            const Token &id = toks_[pos_ + 1];
+            bool identish = id.kind == TK::IDENT ||
+                (!id.text.empty() &&
+                 (std::isalnum((unsigned char)id.text[0]) || id.text[0] == '_'));
+            bool callParen = identish && pos_ + 2 < toks_.size() &&
+                             toks_[pos_ + 2].kind == TK::LPAREN;
+            if (identish && !callParen) {
+                advance(); /* & */
+                std::string nm = cur().text; advance();
+                auto iit = importMap_.find(nm);
+                if (iit != importMap_.end()) nm = iit->second;
+                else if (nm.find("::") == std::string::npos) {
+                    if (currentPackage_.empty() || currentPackage_ == "main")
+                        nm = "main::" + nm;
+                    else
+                        nm = currentPackage_ + "::" + nm;
+                }
+                auto n = std::make_unique<Node>(); n->kind = NK::DefinedFunc;
+                n->sval = "sub"; n->name = nm; n->line = line;
+                if (hasParen) consume(TK::RPAREN, ")");
+                return n;
+            }
+        }
         NodePtr inner = hasParen ? parseExpr() : parseShift();
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::DefinedFunc;
@@ -4598,12 +4693,16 @@ NodePtr Parser::parsePrimary() {
         advance();
         bool hasParen = match(TK::LPAREN);
         NodePtr sep = parseListOpArg(hasParen);
-        match(TK::COMMA);
+        /* `join '' => "a", "b"` — fatarrow is a comma (Pod::Simple::BlackBox). */
+        if (!(match(TK::COMMA) || match(TK::FATARROW))) {
+            /* join with only a separator is legal and yields the empty string */
+        }
         NodeList rest;
         while (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
             if (!hasParen && check(TK::RBRACE)) break; /* D190 */
+            if (check(TK::FATARROW)) break;
             rest.push_back(parseListOpArg(hasParen));
-            if (!match(TK::COMMA)) break;
+            if (!(match(TK::COMMA) || match(TK::FATARROW))) break;
         }
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::JoinFunc;
@@ -4783,9 +4882,12 @@ NodePtr Parser::parsePrimary() {
         bool hasParen = match(TK::LPAREN);
         NodePtr fmt = parseListOpArg(hasParen);
         NodeList args;
-        while (match(TK::COMMA)) {
+        /* A trailing comma before `)` ends the list. Without parens the
+           `)` belongs to an enclosing call (`$o->whine(sprintf "...",
+           $x,)` in Pod::Simple::BlackBox). */
+        while (match(TK::COMMA) || match(TK::FATARROW)) {
+            if (check(TK::RPAREN)) break;
             if (!hasParen && isModifier()) break;
-            if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
             if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             args.push_back(parseListOpArg(hasParen));
@@ -4802,9 +4904,9 @@ NodePtr Parser::parsePrimary() {
         bool hasParen = match(TK::LPAREN);
         NodePtr fmt = parseListOpArg(hasParen);
         NodeList args;
-        while (match(TK::COMMA)) {
+        while (match(TK::COMMA) || match(TK::FATARROW)) {
+            if (check(TK::RPAREN)) break;
             if (!hasParen && isModifier()) break;
-            if (hasParen && check(TK::RPAREN)) break;
             if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
             if (!hasParen && check(TK::RBRACE)) break; /* D190 */
             args.push_back(parseListOpArg(hasParen));
@@ -5208,8 +5310,13 @@ NodePtr Parser::parsePrimary() {
             n->name = cur().text; advance();
         }
         while (!check(TK::SEMI) && !check(TK::EOF_TOK) && !isModifier()) {
-            if (!match(TK::COMMA)) break;
-            if ((hp && check(TK::RPAREN)) || check(TK::SEMI) || check(TK::EOF_TOK)) break;
+            /* D226: `splice(@$t, $i, 1 => splice(...))` — `=>` is a comma.
+               Pod::Simple.pm uses that with a comment between the 1 and
+               the fat arrow. Stop before a closing paren so it stays for
+               the caller. */
+            if (!(match(TK::COMMA) || match(TK::FATARROW))) break;
+            if (check(TK::RPAREN)) break;
+            if (check(TK::SEMI) || check(TK::EOF_TOK)) break;
             if (!hp && check(TK::RBRACE)) break; /* D190 */
             n->args.push_back(parseListOpArg(hp));
         }
@@ -5761,6 +5868,19 @@ NodePtr Parser::parsePrimary() {
                 n->ival = 1; /* bareword call */
                 return n;
             }
+        }
+        /* D228: `DEBUG and print` / `DEBUG or die`. A sub installed by
+           BEGIN (`*DEBUG = sub () {0}`) is a call in real Perl, because
+           BEGIN runs before the rest of the file is compiled. perlc
+           parses the whole file first, so the name is not a known sub
+           yet. Emit a call; codegen calls it only when a sub is
+           actually installed, and otherwise keeps the bare word. */
+        if (cur().kind == TK::KW_AND || cur().kind == TK::KW_OR) {
+            auto n = std::make_unique<Node>(); n->kind = NK::Call;
+            auto iit = importMap_.find(nm);
+            n->name = (iit != importMap_.end()) ? iit->second : nm;
+            n->args = NodeList{}; n->line = line; n->ival = 1;
+            return n;
         }
         /* bareword as string — real Perl may error on unknown barewords,
            but we accept them as strings for flexibility */

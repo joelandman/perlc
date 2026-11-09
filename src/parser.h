@@ -98,6 +98,7 @@ private:
     bool   match(TK k);
 
     NodePtr parseStmt();
+    NodePtr parseTie(int line); /* tie VAR, CLASS, LIST — statement or expression */
     NodePtr parseBlock();
     bool scanBraceHashLike();
     /* D125: the whole `use MODULE`/`use pragma`/`no PRAGMA` statement
@@ -124,6 +125,9 @@ private:
        `or`). Returns nullptr when the next tokens are not my/our + sigil. */
     NodePtr parseDeclExpr();
     NodePtr parsePrint(bool isSay);
+    /* D225: printf after the keyword has been consumed. Does not take
+       the trailing semicolon — callers (statement, `return`, `and`) do. */
+    NodePtr parsePrintfBody(int line);
     NodePtr parsePush();
     NodePtr parseUnshift();
     NodePtr parseReturn();

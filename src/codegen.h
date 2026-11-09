@@ -303,14 +303,15 @@ private:
     std::unordered_set<std::string> sharedScalarNames_;
 
     /* file-scope (top-level my) globals — accessible from subroutines.
-       fileScalarGlobals_'s value is llvm::Value* (not GlobalVariable*)
-       because D58's fix stores an AllocaInst* there instead, in --do-lib
-       builds only (see asDoLib_) — populated at runtime from a process-
-       wide registry (perl_get_or_create_global_scalar) instead of a
-       plain per-compilation-unit GlobalVariable, so a package scalar's
-       storage is actually shared across repeated `do` calls on the same
-       file. All existing consumers only ever load through the pointer
-       generically, so this is a source-compatible widening. */
+       The map holds the pointer slot. In a normal compile that slot is a
+       module-level GlobalVariable. In a --do-lib compile (D58) the
+       PerlValue still comes from the process-wide registry
+       (perl_get_or_create_global_scalar) so repeated `do` shares one
+       cell; D216 keeps the slot itself a GlobalVariable too. An alloca
+       in __perlc_do_run cannot be loaded from a named sub, which is a
+       separate LLVM function ("Referring to an instruction in another
+       function!"). Value* rather than GlobalVariable* so every consumer
+       just loads through the pointer. */
      std::unordered_map<std::string, llvm::Value *> fileScalarGlobals_;
      /* D78: file-scope variables initialized with integer literals > 2^53.
         These cannot safely use the F64 fast path because converting to double
@@ -364,6 +365,13 @@ private:
         emission reuses those placeholders instead of minting a branch-local
         one its scope-cleanup free would then fail to dominate. */
      std::unordered_set<std::string> myHoisitNames_;
+     /* D223: scalar `my` placeholders hoisted to the enclosing block's
+        entry so a `goto` that jumps past the declaration still dominates
+        the scope-exit perl_free. Parallel to myHoisitNames_, but not
+        cleared by short-circuit hoisting. blockEntryMyOrder_ is the
+        nested-block rewind stack (inner names above the mark). */
+     std::unordered_set<std::string> blockEntryMy_;
+     std::vector<std::string> blockEntryMyOrder_;
      /* D56: warnings pragma state (set from parser at compile() entry) */
      bool warningsEnabled_     = false;
      bool warningsUninitialized_ = false;
@@ -501,17 +509,38 @@ private:
         first hoisted decl (or nullptr if none), which the RHS's own my-decl
         emission then reuses instead of minting a fresh, branch-local one. */
      llvm::Value *hoistMyDeclsInRhs(const Node &rhsNode);
+     /* D223: hoist scalar `my` that a goto earlier in this block can skip
+        on the way to a later label. Returns nothing; records names in
+        blockEntryMy_ / blockEntryMyOrder_. */
+     void hoistMysSkippedByGoto(const Node &block);
+     void rewindBlockEntryMy(size_t mark);
     void emitEvalPadFill();   /* dump in-scope my cells into the eval pad */
     void emitEvalPadBind();   /* --eval-lib: load pad cells into file-scope GVs */
     /* returns a PerlArray* Value for things that produce arrays */
     llvm::Value *emitArrayPtr(const Node &n);
 
     void   emitStmt(const Node &n);
+    /* D225: printf's character count (an owned int PV). */
+    llvm::Value *emitPrintf(const Node &n);
     llvm::Value *emitExpr(const Node &n);
     /* W22: symbolic-ref half of ${ EXPR } (shared by read + lvalue paths) */
     llvm::Value *emitSymbolicDeref(const Node &n);
     llvm::Value *emitBlock(const Node &n);
     llvm::Value *emitBlockLast(const Node &n); /* emits block, returns last expr value */
+    /* D215: value of a trailing if/unless. The slot is an entry alloca of
+       PerlValue*; non-null means the If emitter must store the taken arm
+       (or the last false condition) there. realReturnInBlockValue_ makes a
+       trailing `return` inside that value a real return — a do-block or
+       grep body is not the sub's own return slot. swallowBlockReturn_ is
+       the sort-comparator exception: its LLVM function returns i64, so a
+       `return` there is the comparison result, not a PerlValue ret. */
+    void emitIfAsValue(const Node &n);
+    llvm::Value *emitIfArmValue(const Node &body);
+    llvm::Value *captureTrailingIf(const Node &n);
+    void storeOwnedBlockValue(llvm::Value *slot, llvm::Value *v);
+    llvm::Value *ifValueSlot_ = nullptr;
+    bool realReturnInBlockValue_ = false;
+    bool swallowBlockReturn_ = false;
     llvm::Value *emitBinOp(const Node &n);
     llvm::Value *emitI64OverflowCheckedBinOp(const Node &n); /* D103: plus/minus/mul only */
     /* D132: emitBinOp's F64 fast path guard for + - * with a scalar-variable

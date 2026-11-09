@@ -692,7 +692,7 @@ void CodeGen::declareRuntime() {
     RT("perl_pv_flag_utf8",     voidTy, pv);
     RT("perl_print_fh",         voidTy, pv, pv);
     RT("perl_say_fh",           voidTy, pv, pv);
-    RT("perl_printf_fh",        voidTy, pv, pv, av);
+    RT("perl_printf_fh",        pv, pv, pv, av);
     RT("perl_eof_fh",           pv,     pv);
      RT("perl_die",              voidTy, pv, i8p, i32);
     /* perl_die never returns to its caller — it either longjmp's to an eval
@@ -704,7 +704,7 @@ void CodeGen::declareRuntime() {
     RT("perl_get_stdin",        pv);
     /* sprintf / printf */
     RT("perl_sprintf",      pv, pv, av);
-    RT("perl_printf",       voidTy, pv, av);
+    RT("perl_printf",       pv, pv, av);
     /* range */
     RT("perl_range",        av, pv, pv);
     /* math builtins */
@@ -736,6 +736,8 @@ void CodeGen::declareRuntime() {
     RT("perl_str_spaceship",  pv, pv, pv);
     /* new builtins */
     RT("perl_chop",       pv, pv);
+    RT("perl_utf8_encode", voidTy, pv);
+    RT("perl_utf8_decode", pv, pv);
     RT("perl_warn",       voidTy, pv, i8p, i32);
     RT("perl_get_sig_hash", av);
     RT("perl_splice",     av, av, pv, pv, av);
@@ -878,6 +880,8 @@ void CodeGen::declareRuntime() {
     RT("perl_do_file",          pv, pv);
     RT("perl_call_named_sub",   pv, i8p, av, Type::getInt32Ty(ctx_));
     RT("perl_call_named_sub_checked", pv, i8p, av, Type::getInt32Ty(ctx_), i8p, i8p, Type::getInt32Ty(ctx_));
+    RT("perl_sub_defined",      Type::getInt32Ty(ctx_), i8p); /* D228 */
+    RT("perl_bareword_or_call", pv, i8p, i8p, Type::getInt32Ty(ctx_), i8p, Type::getInt32Ty(ctx_)); /* D228 */
     RT("perl_xs_load_library",  pv, pv);
     RT("perl_xs_call_dynamic",  pv, pv, pv, pv, av);
     RT("perl_dl_load_file",     pv, pv, pv);
@@ -1145,6 +1149,8 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_cond_wait",          voidTy, pv);
     RT("perl_cond_signal",        voidTy, pv);
     RT("perl_cond_broadcast",     voidTy, pv);
+    RT("perl_tie",                pv, av, i32);
+    RT("perl_untie",              voidTy, pv);
     /* Phase 3: atomic primitives for shared scalars.  perl_atomic_load
        takes a pv and returns the same pointer (the load is the
        cell-pointer itself; the function is essentially an acquire fence
@@ -1960,7 +1966,12 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             if (!bShadowed) declareVar("b", bAlloca);
 
             currentSubBody_ = n.body.get();
+            /* D215: this function returns i64. A `return` in the comparator,
+               including one inside a trailing if, is the comparison result. */
+            bool savedSwallow = swallowBlockReturn_;
+            swallowBlockReturn_ = true;
             Value *cmpResult = emitBlockLast(*n.body);
+            swallowBlockReturn_ = savedSwallow;
             currentSubBody_ = savedBody;
 
             if (!builder_.GetInsertBlock()->getTerminator()) {
@@ -2223,7 +2234,8 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                 const Node &last = *stmts.back();
                 const Node *e = (last.kind == NK::ExprStmt && last.left)
                                 ? last.left.get() : nullptr;
-                if (e) { mapAv = emitArrayPtr(*e); if (!mapAv) mapPv = emitExpr(*e); }
+                if (last.kind == NK::If) mapPv = captureTrailingIf(last); /* D215 */
+                else if (e) { mapAv = emitArrayPtr(*e); if (!mapAv) mapPv = emitExpr(*e); }
                 else   emitStmt(last);
             } else if (n.left) {
                 /* Bare `{ k => v }` (n.ival unset) yields the key/value
@@ -2362,8 +2374,18 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *len = n.args.size() > 1 ? emitExpr(*n.args[1]) : perlUndef();
         /* build replacement array from remaining args */
         Value *repl = callRT("perl_array_new", {});
-        for (size_t i = 2; i < n.args.size(); i++)
+        /* D226: the replacement list is list context. A nested splice
+           (`splice(@$t, $i, 1 => splice @$row, 2)`) must contribute its
+           removed elements, not the scalar-context count. */
+        for (size_t i = 2; i < n.args.size(); i++) {
+            if (isExplicitListKind(*n.args[i])) {
+                if (Value *sub = emitArrayPtr(*n.args[i])) {
+                    callRT("perl_array_extend", {repl, sub});
+                    continue;
+                }
+            }
             callRT("perl_array_push", {repl, emitExpr(*n.args[i])});
+        }
         return callRT("perl_splice", {av, off, len, repl});
     }
     if (n.kind == NK::ArraySlice) {
@@ -9483,6 +9505,93 @@ static bool hasLocalStmt(const Node &n) {
     return r;
 }
 
+/* D223: labels and label-gotos inside one statement of a block, keyed by
+   that statement's index. Nested subs are their own functions. */
+static void collectGotoLabelsInStmt(const Node &n, int stmt,
+    std::vector<std::pair<int, std::string>> &gotos,
+    std::vector<std::pair<int, std::string>> &labels) {
+    if (n.kind == NK::SubDef || n.kind == NK::AnonSub) return;
+    if (n.kind == NK::Goto) {
+        std::string lab;
+        if (n.sval == "label") lab = n.name;
+        else if (n.sval == "expr" && n.left && n.left->kind == NK::StringLit)
+            lab = n.left->sval;
+        if (!lab.empty()) gotos.emplace_back(stmt, lab);
+    }
+    if (n.kind == NK::LabelStmt && !n.name.empty())
+        labels.emplace_back(stmt, n.name);
+    if (!n.sval.empty() &&
+        (n.kind == NK::While || n.kind == NK::For ||
+         n.kind == NK::Foreach || n.kind == NK::DoWhile))
+        labels.emplace_back(stmt, n.sval);
+    if (n.left)  collectGotoLabelsInStmt(*n.left, stmt, gotos, labels);
+    if (n.right) collectGotoLabelsInStmt(*n.right, stmt, gotos, labels);
+    if (n.cond)  collectGotoLabelsInStmt(*n.cond, stmt, gotos, labels);
+    if (n.body)  collectGotoLabelsInStmt(*n.body, stmt, gotos, labels);
+    if (n.init)  collectGotoLabelsInStmt(*n.init, stmt, gotos, labels);
+    if (n.step)  collectGotoLabelsInStmt(*n.step, stmt, gotos, labels);
+    for (auto &a : n.args)
+        if (a) collectGotoLabelsInStmt(*a, stmt, gotos, labels);
+    for (auto &b : n.branches) {
+        if (b.cond) collectGotoLabelsInStmt(*b.cond, stmt, gotos, labels);
+        if (b.body) collectGotoLabelsInStmt(*b.body, stmt, gotos, labels);
+    }
+}
+
+static void collectDirectScalarMys(const Node &st, std::vector<const Node *> &out) {
+    if (st.kind == NK::My) { out.push_back(&st); return; }
+    /* `my ($a, $b)` is a FlatBlock of per-variable My nodes, same scope. */
+    if (st.kind == NK::FlatBlock) {
+        for (auto &a : st.args)
+            if (a) collectDirectScalarMys(*a, out);
+    }
+}
+
+void CodeGen::rewindBlockEntryMy(size_t mark) {
+    while (blockEntryMyOrder_.size() > mark) {
+        blockEntryMy_.erase(blockEntryMyOrder_.back());
+        blockEntryMyOrder_.pop_back();
+    }
+}
+
+void CodeGen::hoistMysSkippedByGoto(const Node &block) {
+    std::vector<std::pair<int, std::string>> gotos, labels;
+    for (int i = 0; i < (int)block.args.size(); i++)
+        if (block.args[i])
+            collectGotoLabelsInStmt(*block.args[i], i, gotos, labels);
+    if (gotos.empty() || labels.empty()) return;
+    for (int i = 0; i < (int)block.args.size(); i++) {
+        if (!block.args[i]) continue;
+        std::vector<const Node *> mys;
+        collectDirectScalarMys(*block.args[i], mys);
+        for (const Node *st : mys) {
+            std::string nm = st->name;
+            if (nm.empty() || nm[0] == '@' || nm[0] == '%') continue;
+            if (nm[0] == '$') nm = nm.substr(1);
+            if (nm.empty()) continue;
+            if (st->ival & (1 | 2)) continue; /* shared or our */
+            if (prePromotedArgs_.count(nm)) continue;
+            if (blockEntryMy_.count(nm)) continue;
+            if (!scopes_.empty() && scopes_.back().count(nm)) continue;
+            bool skip = false;
+            for (auto &g : gotos) {
+                if (g.first >= i) continue;
+                for (auto &lb : labels)
+                    if (lb.second == g.second && lb.first > i) { skip = true; break; }
+                if (skip) break;
+            }
+            if (!skip) continue;
+            auto *slot = createEntryAlloca(perlPtrTy_, nullptr, st->name);
+            Value *pv = perlUndef();
+            builder_.CreateStore(pv, slot);
+            trackPv(pv);
+            declareVar(nm, slot);
+            blockEntryMy_.insert(nm);
+            blockEntryMyOrder_.push_back(nm);
+        }
+    }
+}
+
 Value *CodeGen::emitBlock(const Node &n) {
     auto *i32Ty = Type::getInt32Ty(ctx_);
     bool needLocal = hasLocalStmt(n);
@@ -9493,6 +9602,8 @@ Value *CodeGen::emitBlock(const Node &n) {
     }
     pushScope();
     ScopeGuard guard{*this};
+    size_t myHoistMark = blockEntryMyOrder_.size();
+    hoistMysSkippedByGoto(n);
     /* Package changes inside a block are block-scoped in real Perl
        (`{ package Foo; ... }` reverts to the enclosing package on exit).
        Without this restore, a `package` inside a bare block at file scope
@@ -9526,7 +9637,177 @@ Value *CodeGen::emitBlock(const Node &n) {
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     currentPackage_ = savedPackage;
+    rewindBlockEntryMy(myHoistMark);
     return nullptr;
+}
+
+/* D215: put an owned PerlValue* into `slot`. A borrowed cell is cloned;
+   null becomes undef. An owned temp is stored as-is (ownership moves). */
+void CodeGen::storeOwnedBlockValue(Value *slot, Value *v) {
+    if (!v || llvm::isa<llvm::ConstantPointerNull>(v))
+        v = perlUndef();
+    /* A hoisted `my` in the condition is perl_alloc_undef (an owned-temp
+       call) AND the scope's tracked cell. Transferring it would free the
+       variable out from under the arms. Clone tracked cells. */
+    else if (isTrackedPv(v) || !isOwnedTemp(v))
+        v = callRT("perl_clone", {v});
+    builder_.CreateStore(v, slot);
+}
+
+/* D215: one arm of a value-if. The parent slot is hidden so a nested
+   non-final if stays a statement; a trailing if inside the arm captures
+   into its own slot via emitBlockLast. A trailing `return` is a real
+   return except inside a sort comparator (swallowBlockReturn_). */
+Value *CodeGen::emitIfArmValue(const Node &body) {
+    auto *savedSlot = ifValueSlot_;
+    ifValueSlot_ = nullptr;
+    bool savedRR = realReturnInBlockValue_;
+    if (!swallowBlockReturn_) realReturnInBlockValue_ = true;
+    Value *arm = emitBlockLast(body);
+    realReturnInBlockValue_ = savedRR;
+    ifValueSlot_ = savedSlot;
+    return arm;
+}
+
+/* D215: if/elsif/else (and unless) in value position. Each path that
+   reaches the merge stores exactly one owned PV. A taken arm stores the
+   arm's value. A final false condition stores that condition — real
+   Perl's value is the last expression evaluated, which is the condition
+   when no branch runs (`do { if (0) { "a" } }` is 0, `do { if ("") { "a" } }`
+   is ""). unless's AST condition is `!COND`; the value is COND. */
+void CodeGen::emitIfAsValue(const Node &n) {
+    Value *slot = ifValueSlot_;
+    auto *fn = builder_.GetInsertBlock()->getParent();
+    auto *merge = BasicBlock::Create(ctx_, "if.end", fn);
+
+    std::vector<Value *>          hoistedCondPv;
+    std::vector<const Node *>     hoistedCondNodes;
+    std::vector<const Node *>     hoistedCondRhs;
+    for (auto &br : n.branches) {
+        if (!br.cond || br.cond->kind != NK::My) continue;
+        if (br.cond->name.empty() || br.cond->name[0] != '$') continue;
+        std::string nm = br.cond->name.substr(1);
+        auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, br.cond->name);
+        Value *pv = perlUndef();
+        builder_.CreateStore(pv, alloca);
+        trackPv(pv);
+        declareVar(nm, alloca);
+        hoistedCondPv.push_back(pv);
+        hoistedCondNodes.push_back(br.cond.get());
+        hoistedCondRhs.push_back(br.cond->right.get());
+    }
+
+    for (size_t i = 0; i < n.branches.size(); i++) {
+        auto &br = n.branches[i];
+        if (!br.body) {
+            storeOwnedBlockValue(slot, nullptr);
+            builder_.CreateBr(merge);
+            break;
+        }
+        if (!br.cond) {
+            Value *arm = emitIfArmValue(*br.body);
+            if (!builder_.GetInsertBlock()->getTerminator()) {
+                storeOwnedBlockValue(slot, arm);
+                builder_.CreateBr(merge);
+            }
+            break;
+        }
+
+        const Node *condN = br.cond.get();
+        bool neg = false;
+        if (i == 0 && n.sval == "unless" &&
+            condN->kind == NK::UnaryOp && condN->sval == "!" && condN->left) {
+            neg = true;
+            condN = condN->left.get();
+        }
+
+        bool hoistedMy = br.cond->kind == NK::My && !br.cond->name.empty()
+                         && br.cond->name[0] == '$';
+        int savedCtx = callCtx_;
+        callCtx_ = 0; /* a condition is scalar context */
+        Value *condPv = nullptr;
+        if (hoistedMy) {
+            Value *pvH = nullptr; const Node *rhs = nullptr;
+            for (size_t k = 0; k < hoistedCondNodes.size(); k++)
+                if (hoistedCondNodes[k] == br.cond.get()) {
+                    pvH = hoistedCondPv[k];
+                    rhs = hoistedCondRhs[k];
+                    break;
+                }
+            if (rhs) {
+                Value *init = emitExpr(*rhs);
+                callRT("perl_assign", {pvH, init});
+                freeIfOwned(init);
+            }
+            condPv = pvH ? pvH : perlUndef();
+        } else {
+            condPv = emitExpr(*condN);
+        }
+        callCtx_ = savedCtx;
+
+        Value *b = callRT("perl_is_true", {condPv});
+        Value *bv = builder_.CreateICmpNE(b, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+        if (neg) bv = builder_.CreateNot(bv, "unless.not");
+
+        auto *thenBB = BasicBlock::Create(ctx_, "if.then", fn);
+        auto *elseBB = BasicBlock::Create(ctx_, "if.else", fn);
+        builder_.CreateCondBr(bv, thenBB, elseBB);
+
+        builder_.SetInsertPoint(thenBB);
+        /* The hoisted `my` cell is freed by its scope, not here. */
+        if (!hoistedMy) freeIfOwned(condPv);
+        Value *arm = emitIfArmValue(*br.body);
+        if (!builder_.GetInsertBlock()->getTerminator()) {
+            storeOwnedBlockValue(slot, arm);
+            builder_.CreateBr(merge);
+        }
+
+        builder_.SetInsertPoint(elseBB);
+        if (i + 1 == n.branches.size()) {
+            storeOwnedBlockValue(slot, condPv);
+            builder_.CreateBr(merge);
+        } else if (!hoistedMy) {
+            freeIfOwned(condPv);
+        }
+    }
+
+    builder_.SetInsertPoint(merge);
+}
+
+/* D215: evaluate `n` (an If) for its value. The phi is an owned temp
+   (perl_clone or perl_alloc_undef) so callers free it once. */
+Value *CodeGen::captureTrailingIf(const Node &n) {
+    auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "if.val");
+    builder_.CreateStore(ConstantPointerNull::get(perlPtrTy_), slot);
+    auto *saved = ifValueSlot_;
+    ifValueSlot_ = slot;
+    emitStmt(n);
+    ifValueSlot_ = saved;
+    if (builder_.GetInsertBlock()->getTerminator())
+        return nullptr;
+    auto *fn = builder_.GetInsertBlock()->getParent();
+    auto *okBB = BasicBlock::Create(ctx_, "if.val.ok", fn);
+    auto *nullBB = BasicBlock::Create(ctx_, "if.val.null", fn);
+    auto *contBB = BasicBlock::Create(ctx_, "if.val.cont", fn);
+    Value *loaded = builder_.CreateLoad(perlPtrTy_, slot, "if.val.load");
+    Value *isNull = builder_.CreateICmpEQ(
+        loaded, ConstantPointerNull::get(perlPtrTy_));
+    builder_.CreateCondBr(isNull, nullBB, okBB);
+
+    builder_.SetInsertPoint(okBB);
+    Value *cloned = callRT("perl_clone", {loaded});
+    callRT("perl_free", {loaded});
+    builder_.CreateBr(contBB);
+
+    builder_.SetInsertPoint(nullBB);
+    Value *und = perlUndef();
+    builder_.CreateBr(contBB);
+
+    builder_.SetInsertPoint(contBB);
+    auto *phi = builder_.CreatePHI(perlPtrTy_, 2, "if.val.phi");
+    phi->addIncoming(cloned, okBB);
+    phi->addIncoming(und, nullBB);
+    return phi;
 }
 
 /* Emit a block and return the PerlValue* of its last expression statement. */
@@ -9540,6 +9821,8 @@ Value *CodeGen::emitBlockLast(const Node &n) {
     }
     pushScope();
     ScopeGuard guard{*this};
+    size_t myHoistMark = blockEntryMyOrder_.size();
+    hoistMysSkippedByGoto(n);
     /* Package changes inside a block are block-scoped in real Perl; restore
        the enclosing package on exit so a `package` inside a bare block can't
        leak and misattribute subs defined afterward (see emitBlock). */
@@ -9595,7 +9878,10 @@ Value *CodeGen::emitBlockLast(const Node &n) {
                 result = emitExpr(le);
                 callCtx_ = savedCtx;
             }
-        } else if (isLast && work->kind == NK::Return) {
+        } else if (isLast && work->kind == NK::If) {
+            /* D215: `do { if ... }`, a sub's implicit return, grep/sort. */
+            result = captureTrailingIf(*work);
+        } else if (isLast && work->kind == NK::Return && !realReturnInBlockValue_) {
             /* Capture the return value without emitting a ret instruction.
                 The caller will handle the actual return. */
             if (work->left && (work->left->kind == NK::ArrayLit || work->left->kind == NK::ArrayVar ||
@@ -9699,9 +9985,61 @@ Value *CodeGen::emitBlockLast(const Node &n) {
     if (needLocal && !builder_.GetInsertBlock()->getTerminator())
         callRT("perl_local_restore_to", {builder_.CreateLoad(i32Ty, bdAlloca)});
     currentPackage_ = savedPackage;
+    rewindBlockEntryMy(myHoistMark);
     if (!result || llvm::isa<llvm::ConstantPointerNull>(result))
         result = llvm::ConstantPointerNull::get(perlPtrTy_);
     return result;
+}
+
+Value *CodeGen::emitPrintf(const Node &n) {
+    /* D12: printf's format and args are all evaluated in list context
+       in real Perl. callCtx_ is a one-shot flag consumed by the first
+       Call node's own codegen, so it must be set fresh before each
+       sub-expression, not once before the whole sequence — and only
+       when that sub-expression is itself call-like, or list context
+       would leak through an enclosing scalar-forcing operator (like
+       `eq`/`==`) into a call nested inside it.
+       D225: the runtime returns an owned int PV of 1 (perl's printf
+       returns true, not the C character count). Statement context frees
+       it; `return printf` hands it back. */
+    if (!n.left) return perlUndef();
+    if (isCallLikeForContext(*n.left)) callCtx_ = 1;
+    Value *fmt = emitExpr(*n.left);
+    callCtx_ = 0;
+    Value *av  = callRT("perl_array_new", {});
+    for (auto &a : n.args) {
+        if (!a) continue;
+        if (isCallLikeForContext(*a)) callCtx_ = 1;
+        Value *sub = isExplicitListKind(*a) ? emitArrayPtr(*a) : nullptr;
+        if (sub) {
+            callCtx_ = 0;
+            callRT("perl_array_extend", {av, sub});
+        } else {
+            Value *v = emitExpr(*a);
+            callCtx_ = 0;
+            callRT("perl_array_push_list_or_scalar", {av, v});
+        }
+    }
+    Value *cnt;
+    if (n.name == "STDERR") {
+        cnt = callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
+    } else if (!n.name.empty() && n.name != "STDOUT") {
+        Value *fh = nullptr;
+        if (auto *slot = lookupVar(n.name)) fh = builder_.CreateLoad(perlPtrTy_, slot);
+        else {
+            globNames_.insert(n.name);
+            Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
+            fh = callRT("perl_glob_get_scalar", {key});
+        }
+        cnt = callRT("perl_printf_fh", {fh, fmt, av});
+    } else {
+        cnt = callRT("perl_printf", {fmt, av});
+    }
+    /* The arg array owns clones from list-extend, but also borrows
+       scalar cells. perl_array_free would perl_free those cells.
+       Leave the array (same as the historical statement printf). */
+    (void)av;
+    return cnt ? cnt : perlUndef();
 }
 
 void CodeGen::emitStmt(const Node &n) {
@@ -10024,7 +10362,24 @@ void CodeGen::emitStmt(const Node &n) {
                     ? ("main::" + nm) : (currentPackage_ + "::" + nm);
                 Value *keyStr = builder_.CreateGlobalStringPtr(qualKey);
                 Value *pv = callRT("perl_get_or_create_global_scalar", {keyStr});
-                auto *slot = createEntryAlloca(perlPtrTy_, nullptr, "g." + nm);
+                /* D216: the slot must be a module-level global. Named subs
+                   are separate LLVM functions, emitted after this do-run
+                   body. An alloca here (`%g.NBSP`) lives in __perlc_do_run;
+                   a load of it from the sub is "Referring to an instruction
+                   in another function!" — Pod::Text / Pod::Man file-scope
+                   `my ($NBSP, $SHY)` used from `s{$NBSP}{...}`. The
+                   PerlValue still comes from the process-wide registry, so
+                   repeated `do` keeps one cell (D58). A later declaration
+                   of the same qualKey reuses the global (D131). */
+                GlobalVariable *slot = nullptr;
+                auto sgit = fileScalarGlobals_.find(qualKey);
+                if (sgit != fileScalarGlobals_.end())
+                    slot = llvm::dyn_cast<GlobalVariable>(sgit->second);
+                if (!slot) {
+                    slot = new GlobalVariable(*mod_, perlPtrTy_, false,
+                        GlobalValue::InternalLinkage,
+                        Constant::getNullValue(perlPtrTy_), "g." + nm);
+                }
                 builder_.CreateStore(pv, slot);
                  if (n.right) {
                      Value *init = emitExpr(*n.right);
@@ -10389,9 +10744,17 @@ void CodeGen::emitStmt(const Node &n) {
                    branch-local one that the scope-cleanup free would then
                    fail to dominate. */
                 Value *pv;
-                if (myHoisitNames_.count(nm)) {
+                /* D223: a block-entry hoist (goto past this my) lives in
+                   the current scope and must be reused. Erase the name so
+                   a second `my` of the same name in this block allocates
+                   its own cell. An inner block's `my` does not see this
+                   scope's slot in scopes_.back() and allocates its own. */
+                bool reuseBlockMy = blockEntryMy_.count(nm) && !scopes_.empty()
+                                    && scopes_.back().count(nm);
+                if (myHoisitNames_.count(nm) || reuseBlockMy) {
                     Value *slot = lookupVar(nm);
                     pv = builder_.CreateLoad(perlPtrTy_, slot, nm);
+                    if (reuseBlockMy) blockEntryMy_.erase(nm);
                 } else {
                     auto *alloca = createEntryAlloca(perlPtrTy_, nullptr, n.name);
                     /* allocate a stable PerlValue* that lives for this variable's lifetime */
@@ -10546,53 +10909,10 @@ void CodeGen::emitStmt(const Node &n) {
         break;
     }
 
-    case NK::PrintfStmt: {
-        /* D12: printf's format and args are all evaluated in list context
-           in real Perl. callCtx_ is a one-shot flag consumed by the first
-           Call node's own codegen, so it must be set fresh before each
-           sub-expression, not once before the whole sequence — and only
-           when that sub-expression is itself call-like, or list context
-           would leak through an enclosing scalar-forcing operator (like
-           `eq`/`==`) into a call nested inside it. */
-        if (isCallLikeForContext(*n.left)) callCtx_ = 1;
-        Value *fmt = emitExpr(*n.left);
-        callCtx_ = 0;
-        Value *av  = callRT("perl_array_new", {});
-        for (auto &a : n.args) {
-            if (isCallLikeForContext(*a)) callCtx_ = 1;
-            /* List-producing arguments expand (D145); with D198, that
-               includes a `?:` whose branch collection is list-shaped —
-               real Perl's printf args are list context, so
-               `printf "%d %d", $c ? (1,2) : (3,4)` prints "1 2". Mirrors
-               the print-filehandle argument loop above. */
-            Value *sub = isExplicitListKind(*a) ? emitArrayPtr(*a) : nullptr;
-            if (sub) {
-                callCtx_ = 0;
-                callRT("perl_array_extend", {av, sub});
-            } else {
-                Value *v = emitExpr(*a);
-                callCtx_ = 0;
-                callRT("perl_array_push_list_or_scalar", {av, v});
-            }
-        }
-        if (n.name == "STDERR") {
-            callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
-        } else if (!n.name.empty() && n.name != "STDOUT") {
-            Value *fh = nullptr;
-            if (auto *slot = lookupVar(n.name)) fh = builder_.CreateLoad(perlPtrTy_, slot);
-            else {
-                /* D153: a bareword handle (`printf LOG ...`) — it used to
-                   fall through to STDOUT; resolve it like print does. */
-                globNames_.insert(n.name);
-                Value *key = builder_.CreateGlobalStringPtr(globBareName(n.name));
-                fh = callRT("perl_glob_get_scalar", {key});
-            }
-            callRT("perl_printf_fh", {fh, fmt, av});
-        } else {
-            callRT("perl_printf", {fmt, av});
-        }
+    case NK::PrintfStmt:
+        /* D225: statement form discards the character count. */
+        freeIfOwned(emitPrintf(n));
         break;
-    }
 
     case NK::FormatDecl: {
         /* Register format for write calls to look up.
@@ -10656,6 +10976,13 @@ void CodeGen::emitStmt(const Node &n) {
     }
 
     case NK::If: {
+        /* D215: value position (do-block, implicit return, grep, map, sort).
+           The statement path below stays the void emitter, including the
+           flat-kernel if-conversion. */
+        if (ifValueSlot_) {
+            emitIfAsValue(n);
+            break;
+        }
         /* FK if-conversion: inside the certified flat-kernel body, a
            uniform if/else that only stores to identical (row, index)
            positions in both arms emits as value selects + unconditional
@@ -11543,21 +11870,22 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.CreateBr(target.endBB);
             break;
         }
-        /* restore any local()s before returning; the retval may point INTO
-           this frame (a tracked my-var PV/cell read or a borrowed pointer
-           whose backing cell local-restore is about to rewrite) — everything
-           that is not already a fresh owned temp gets copied first so the
-           caller's one free is exactly once. Owned temps (boxed arithmetic,
-           freshly cloned results) transfer ownership directly, no extra
-           clone-then-free round trip. */
+        /* Snapshot a non-owned retval before this frame goes away. The
+           value may be a tracked my-var cell (or a pointer into one).
+           emitScopeCleanup frees every such cell, and a sub with local()
+           restores those cells first — either way the caller must not
+           receive the cell itself. Owned temps transfer as-is.
+           D229: the clone used to run only when localDepthAlloca_ was
+           set, so `return $re` from a sub with no local() (BlackBox's
+           my_qr, which returns a qr// held in a lexical) handed the
+           caller the cell emitScopeCleanup had just freed. The next
+           perl_assign aborted with free(): invalid pointer. */
+        if (v && !isOwnedTemp(v))
+            v = callRT("perl_clone", {v});
+        if (currentSubNeedsWantarray_) callRT("perl_pop_wantarray", {});
         if (localDepthAlloca_) {
             auto *i32Ty = Type::getInt32Ty(ctx_);
             Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
-            if (!isOwnedTemp(v)) {
-                Value *cloned = callRT("perl_clone", {v});
-                v = cloned;
-            }
-            if (currentSubNeedsWantarray_) callRT("perl_pop_wantarray", {});
             callRT("perl_local_restore_to", {depth});
         }
         emitScopeCleanup();  /* free tracked my-var pvs in all active scopes */
@@ -12410,6 +12738,24 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
         return ConstantPointerNull::get(perlPtrTy_);
 
+    case NK::PrintfStmt:
+        /* D225: `return printf STDERR "..."` — the value is the count. */
+        return emitPrintf(n);
+    case NK::TieStmt: {
+        /* args array is (var, class, LIST...). ival is the tie kind. */
+        Value *av = callRT("perl_array_new", {});
+        callRT("perl_array_push", {av, n.left ? emitExpr(*n.left) : perlUndef()});
+        for (auto &a : n.args)
+            if (a) callRT("perl_array_push", {av, emitExpr(*a)});
+        Value *kind = ConstantInt::get(Type::getInt32Ty(ctx_), (unsigned)n.ival);
+        return callRT("perl_tie", {av, kind});
+    }
+
+    case NK::UntieStmt: {
+        if (n.left) callRT("perl_untie", {emitExpr(*n.left)});
+        return perlUndef();
+    }
+
     case NK::LockStmt: {
         if (n.sval == "array") {
             Value *av = lookupArray(n.name);
@@ -12640,12 +12986,42 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* *NAME = ... — glob slot assignment */
         if (n.left && n.left->kind == NK::Typeglob) {
             Value *key = builder_.CreateGlobalStringPtr(n.left->name);
+            /* D228: code slots are package-qualified so defined &Pkg::NAME
+               and a later bare call in that package find the same sub.
+               Scalar/array/hash slots stay on the bare glob name. */
+            std::string codeName = n.left->name;
+            if (codeName.find("::") == std::string::npos &&
+                !currentPackage_.empty() && currentPackage_ != "main")
+                codeName = currentPackage_ + "::" + codeName;
             if (n.right && n.right->kind == NK::RefSub) {
-                auto *fn = mod_->getFunction(subLLVMName(n.right->name));
+                auto *fn = n.right->left ? nullptr
+                    : mod_->getFunction(subLLVMName(definedSubName(*mod_, n.right->name)));
+                Value *codeKey = builder_.CreateGlobalStringPtr(codeName);
                 if (fn) {
-                    callRT("perl_register_method", {key, fn});
-                    Value *mainKey = builder_.CreateGlobalStringPtr("main::" + n.left->name);
-                    callRT("perl_register_method", {mainKey, fn});
+                    callRT("perl_register_method", {codeKey, fn});
+                    if (codeName.find("::") == std::string::npos) {
+                        Value *mainKey = builder_.CreateGlobalStringPtr("main::" + codeName);
+                        callRT("perl_register_method", {mainKey, fn});
+                    }
+                } else {
+                    /* \&Pkg::NAME where NAME was installed at runtime
+                       (another compilation unit, or *NAME = sub). */
+                    std::string look = n.right->name;
+                    if (n.right->left) {
+                        Value *ref = emitExpr(*n.right);
+                        callRT("perl_glob_assign", {codeKey, ref});
+                        freeIfOwned(ref);
+                    } else {
+                        if (look.find("::") == std::string::npos &&
+                            !currentPackage_.empty() && currentPackage_ != "main")
+                            look = currentPackage_ + "::" + look;
+                        Value *nm = callRT("perl_alloc_string",
+                            {builder_.CreateGlobalStringPtr(look)});
+                        Value *ref = callRT("perl_code_ref_by_name", {nm});
+                        callRT("perl_glob_assign", {codeKey, ref});
+                        freeIfOwned(nm);
+                        freeIfOwned(ref);
+                    }
                 }
             } else if (n.right && n.right->kind == NK::RefScalar && n.right->left) {
                 Value *slot = emitLValue(*n.right->left);
@@ -12665,7 +13041,10 @@ Value *CodeGen::emitExpr(const Node &n) {
                 callRT("perl_glob_copy", {key, src});
             } else if (n.right) {
                 Value *rhs = emitExpr(*n.right);
-                callRT("perl_glob_assign", {key, rhs});
+                /* D228: `*NAME = sub { }` installs under the package. */
+                Value *slot = (n.right->kind == NK::AnonSub)
+                    ? builder_.CreateGlobalStringPtr(codeName) : key;
+                callRT("perl_glob_assign", {slot, rhs});
                 freeIfOwned(rhs);
             }
             return perlStr("*" + currentPackage_ + "::" + n.left->name);
@@ -14009,6 +14388,29 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::DefinedFunc: {
+        /* D228: defined &NAME — existence, not a call. A body anywhere
+           in this file counts (perl hoists sub declarations). A glob
+           install (`*NAME = sub`) is visible only after it runs. */
+        if (n.sval == "sub") {
+            bool hasBody = false;
+            for (auto *s : subs_) {
+                if (!s || !s->body) continue;
+                if (s->name == n.name) { hasBody = true; break; }
+                if (n.name.rfind("main::", 0) == 0 &&
+                    s->name == n.name.substr(6)) {
+                    hasBody = true; break;
+                }
+            }
+            auto *i64Ty = Type::getInt64Ty(ctx_);
+            if (hasBody)
+                return callRT("perl_alloc_bool", {ConstantInt::get(i64Ty, 1)});
+            Value *nm  = builder_.CreateGlobalStringPtr(n.name);
+            Value *i32 = callRT("perl_sub_defined", {nm});
+            Value *bit = builder_.CreateICmpNE(
+                i32, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+            Value *i64 = builder_.CreateZExt(bit, i64Ty);
+            return callRT("perl_alloc_bool", {i64});
+        }
         Value *v    = emitExpr(*n.left);
         Value *i32  = callRT("perl_defined", {v});
         Value *bit  = builder_.CreateICmpNE(i32, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
@@ -16925,6 +17327,7 @@ bool CodeGen::isExplicitListKind(const Node &n) {
            k == NK::MapFunc        || k == NK::GrepFunc       ||
            k == NK::SortFunc       || k == NK::Range          ||
            k == NK::KeysFunc       || k == NK::ValuesFunc     ||
+           k == NK::SpliceFunc     ||
            k == NK::HashVar        ||
            (k == NK::ReverseFunc   && n.sval != "scalar_ctx");
 }
@@ -17660,6 +18063,28 @@ Value *CodeGen::emitCall(const Node &n) {
     if (n.name == "__auto_bigint_lit")
         return callRT("perl_bigint_from_decstr_unblessed",
                        {builder_.CreateGlobalStringPtr(n.sval)});
+
+    /* utf8::encode / utf8::decode mutate the scalar in place. Pod::Simple's
+       file-scope BOM setup calls encode; decode is the matching check. */
+    if (n.name == "utf8::encode" || n.name == "utf8::decode") {
+        Value *arg = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        if (n.name == "utf8::encode") {
+            callRT("perl_utf8_encode", {arg});
+            freeIfOwned(arg);
+            return perlUndef();
+        }
+        Value *ok = callRT("perl_utf8_decode", {arg});
+        freeIfOwned(arg);
+        return ok;
+    }
+    /* ASCII host: unicode_to_native and native_to_unicode are the identity.
+       Pod::Simple uses them for NBSP / soft hyphen at file scope. */
+    if (n.name == "utf8::unicode_to_native" || n.name == "utf8::native_to_unicode") {
+        Value *arg = n.args.empty() ? perlUndef() : emitExpr(*n.args[0]);
+        Value *r = callRT("perl_alloc_int", {callRT("perl_to_int", {arg})});
+        freeIfOwned(arg);
+        return r;
+    }
 
     /* Try AST-level inline first: eliminates @_ construction for simple subs.
        D192: a computed typeglob can replace that sub at runtime, so the
@@ -19774,7 +20199,30 @@ Value *CodeGen::emitCall(const Node &n) {
        the literal string "NOPE" instead of probing it as a (silently
        unopened) filehandle. */
     if (n.ival == 1 && n.args.empty() && !inBareFhProbe_) {
-        return perlStr(n.name);
+        /* D228: call a glob-installed sub (`DEBUG and print` after
+           BEGIN { *DEBUG = sub () {0} }). No such sub: the bare word. */
+        std::string qualName = (n.name.find("::") != std::string::npos)
+                                   ? n.name
+                                   : (currentPackage_ + "::" + n.name);
+        auto *i32Ty = Type::getInt32Ty(ctx_);
+        Value *ctxVal;
+        if (callCtx_ == 1)
+            ctxVal = ConstantInt::get(i32Ty, 1);
+        else if (callCtx_ == 2)
+            ctxVal = ConstantInt::get(i32Ty, 2);
+        else if (callCtx_ == 0)
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        else if (currentSubNeedsWantarray_)
+            ctxVal = callRT("perl_current_wantarray_ctx", {});
+        else
+            ctxVal = ConstantInt::get(i32Ty, 0);
+        callCtx_ = 0;
+        Value *nameStr = builder_.CreateGlobalStringPtr(n.name);
+        Value *qualStr = builder_.CreateGlobalStringPtr(qualName);
+        Value *fileStr = builder_.CreateGlobalStringPtr(sourceFile_);
+        Value *lineVal = ConstantInt::get(i32Ty, n.line > 0 ? n.line : 1);
+        return callRT("perl_bareword_or_call",
+                      {nameStr, qualStr, ctxVal, fileStr, lineVal});
     }
     if (n.ival == 1) {
         throw std::runtime_error(

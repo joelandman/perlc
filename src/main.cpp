@@ -407,7 +407,7 @@ static std::vector<Token> inlineModules(
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
         "Pod::Usage",
-        "Pod::Text","Pod::Man","Pod::Simple",
+        "Pod::Text","Pod::Man",
         "Archive::Tar",
         "App::Prove","App::Cpan","CPAN::Version",
         "ExtUtils::Packlist","ExtUtils::Installed",
@@ -547,9 +547,21 @@ static std::vector<Token> inlineModules(
            real-script survey — but the underlying bounds bug is real
            and applies to any genuinely malformed/truncated .pl input,
            which perlc should reject gracefully, never crash on. */
+        /* D219: a semicolon inside braces/parens/brackets belongs to
+           the use statement (`use if do { no integer; COND }, 'Mod'`).
+           The first-semi scan split that statement and left the comma
+           and module name for the parser. Depth 0 still stops at `;`,
+           and at EOF_TOK (D170). */
         size_t j = i + 2;
-        while (j < tokens.size() && tokens[j].kind != TK::SEMI &&
-               tokens[j].kind != TK::EOF_TOK) j++;
+        int useDepth = 0;
+        while (j < tokens.size() && tokens[j].kind != TK::EOF_TOK) {
+            TK k = tokens[j].kind;
+            if (k == TK::LBRACE || k == TK::LPAREN || k == TK::LBRACKET) useDepth++;
+            else if (k == TK::RBRACE || k == TK::RPAREN || k == TK::RBRACKET) {
+                if (useDepth > 0) useDepth--;
+            } else if (k == TK::SEMI && useDepth == 0) break;
+            j++;
+        }
         size_t useEnd = j;  /* index of SEMI (or EOF_TOK if unterminated) */
         i = (j < tokens.size() && tokens[j].kind == TK::SEMI) ? j + 1 : j;
 

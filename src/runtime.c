@@ -1226,53 +1226,36 @@ PerlValue *perl_do_file(PerlValue *path_pv) {
     return result ? result : perl_alloc_undef();
 }
 
-/* ── tie/untie (minimal TIESCALAR/TIEARRAY/TIEHASH) ───────────────────────── */
-PerlValue *perl_tie(PerlValue *args_arr) {
-    if (!args_arr || args_arr->tag != PERL_REF_ARRAY) {
-        perl_set_dollar_at_cstr("tie: expected args array ref");
-        return perl_alloc_undef();
-    }
-
-    PerlArray *arr = (PerlArray *)args_arr->pval;
+/* ── tie/untie ──────────────────────────────────────────────────────────────
+   `tie VAR, CLASS, LIST` calls CLASS->TIESCALAR/TIEARRAY/TIEHASH/TIEHANDLE
+   (LIST) and returns that object. kind is chosen by the parser from the
+   variable shape (a glob is TIEHANDLE — Pod::Simple::TiedOutFH's
+   `tie *$new, $class, $x`). The tied variable is not given magic FETCH/
+   STORE here; callers that only need the constructor's return value
+   (and Pod::Simple's tie, which keeps the gensym glob) still run. */
+PerlValue *perl_tie(PerlArray *arr, int kind) {
     if (!arr || arr->len < 2) {
         perl_set_dollar_at_cstr("tie: need at least var and class");
         return perl_alloc_undef();
     }
 
-    PerlValue *var_pv = arr->elems[0];
-    const char *class_name = perl_to_string(arr->elems[1]);
+    PerlValue *class_pv = arr->elems[1];
+    const char *meth = "TIESCALAR";
+    if (kind == 1) meth = "TIEARRAY";
+    else if (kind == 2) meth = "TIEHASH";
+    else if (kind == 3) meth = "TIEHANDLE";
 
-    if (!class_name || !class_name[0]) return perl_alloc_undef();
-
-    /* build extra args (skip var_pv and class_name) */
-    int extra_count = arr->len - 2;
     PerlArray *extra_arr = perl_array_new();
-    for (int i = 2; i < arr->len; i++) {
+    for (int i = 2; i < arr->len; i++)
         perl_array_set(extra_arr, i - 2, arr->elems[i]);
-    }
 
-    /* call CLASS->TIEHASH/TIESCALAR/TIEARRAY(var, extra_args...) */
-    PerlValue *result = perl_dispatch_method(var_pv, class_name, extra_arr);
-
+    PerlValue *result = perl_dispatch_method(class_pv, meth, extra_arr);
     perl_array_free(extra_arr);
 
     if (!result || result->tag == PERL_UNDEF) {
-        perl_set_dollar_at_cstr("tie: class has no TIESCALAR/TIEARRAY/TIEHASH");
-        return perl_alloc_undef();
+        perl_set_dollar_at_cstr("tie: class has no TIESCALAR/TIEARRAY/TIEHASH/TIEHANDLE");
+        return result ? result : perl_alloc_undef();
     }
-
-    /* bless the result */
-    PerlValue *class_pv = perl_alloc_string(class_name);
-    perl_bless(result, class_pv);
-    perl_free(class_pv);
-
-    /* store the blessed reference in the tied variable */
-    if (var_pv && var_pv->tag == PERL_REF_SCALAR) {
-        PerlValue **slot = (PerlValue **)var_pv->pval;
-        if (slot && *slot) perl_free(*slot);
-        *slot = perl_clone(result);
-    }
-
     return result;
 }
 
@@ -2649,6 +2632,7 @@ int perl_is_true(const PerlValue *v) {
         case PERL_REF_ARRAY:
         case PERL_REF_HASH:
         case PERL_CODE_REF:
+        case PERL_QR:          /* a qr// is a reference; always true */
         case PERL_FLAT_ARRAY:
         case PERL_FLOAT_PAIR:
         case PERL_CPLX_ROW:
@@ -6370,6 +6354,101 @@ static void gap_record(const char *sub, const char *qual,
 }
 #endif  /* PERLC_GAP_TRACE */
 
+/* Resolve one name. 1 and *out set on a hit (dyn table, method table,
+   or a native stdlib function). No hit leaves *out alone. */
+static int try_named_sub(const char *name, PerlArray *args, int ctx,
+                         const char *file, int line, PerlValue **out) {
+    PerlValue *dyn = NULL;
+    if (!name || !name[0]) return 0;
+    perl_push_call_frame(file, file, line);
+    if (dyn_call_if(name, args, ctx, &dyn)) {
+        perl_pop_call_frame();
+        *out = dyn;
+        return 1;
+    }
+    perl_pop_call_frame();
+    for (int i = 0; i < s_method_count; i++) {
+        if (s_method_table[i].key && strcmp(s_method_table[i].key, name) == 0) {
+            PerlSubFnCtx fn = s_method_table[i].fn;
+            if (fn) {
+                perl_push_call_frame(file, file, line);
+                PerlValue *result = fn(args, perl_push_wantarray(ctx));
+                perl_pop_wantarray();
+                perl_pop_call_frame();
+                *out = result;
+                return 1;
+            }
+            break;
+        }
+    }
+    /* Native-stdlib functional form: a qualified name Pkg::func that has
+       no compiled sub may still be implemented natively (CGI::escape,
+       MIME::QuotedPrint::encode_qp, Text::Tabs::expand,
+       IO::Seekable::SEEK_SET, ...). Split at the LAST "::" so nested
+       package names (MIME::QuotedPrint) stay intact as the class.
+       perl_stdlib_method returns NULL for any class/method it does not
+       handle. */
+    {
+        const char *sc = NULL;
+        const char *colon = strstr(name, "::");
+        while (colon) { sc = colon; colon = strstr(sc + 1, "::"); }
+        if (sc) {
+            size_t clen = (size_t)(sc - name);
+            PerlValue *cls_pv = perl_alloc_string_len(name, (long long)clen);
+            perl_push_call_frame(file, file, line);
+            (void)perl_push_wantarray(ctx);
+            PerlValue *r = perl_stdlib_method(cls_pv, sc + 2, args);
+            (void)perl_pop_wantarray();
+            perl_pop_call_frame();
+            perl_free(cls_pv);
+            if (r) { *out = r; return 1; }
+        }
+    }
+    return 0;
+}
+
+/* D228: exact key, plus the main:: / bare alias the glob assign writes. */
+int perl_sub_defined(const char *name) {
+    char buf[512];
+    if (!name || !name[0]) return 0;
+    if (dyn_sub_lookup(name)) return 1;
+    for (int i = 0; i < s_method_count; i++) {
+        if (s_method_table[i].key && s_method_table[i].fn &&
+            strcmp(s_method_table[i].key, name) == 0)
+            return 1;
+    }
+    if (!strstr(name, "::")) {
+        snprintf(buf, sizeof buf, "main::%s", name);
+        return perl_sub_defined(buf);
+    }
+    if (strncmp(name, "main::", 6) == 0) {
+        const char *bare = name + 6;
+        if (dyn_sub_lookup(bare)) return 1;
+        for (int i = 0; i < s_method_count; i++) {
+            if (s_method_table[i].key && s_method_table[i].fn &&
+                strcmp(s_method_table[i].key, bare) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* D228: bareword with no arguments. A sub installed under the qualified
+   name (typically by `*NAME = sub` in a BEGIN) is called. Otherwise the
+   word is the string real Perl uses when no sub was declared. */
+PerlValue *perl_bareword_or_call(const char *name, const char *qual,
+                                  int ctx, const char *file, int line) {
+    const char *key = (qual && qual[0]) ? qual : name;
+    PerlArray *args;
+    PerlValue *r;
+    if (!perl_sub_defined(key))
+        return perl_alloc_string(name ? name : "");
+    args = perl_array_new();
+    r = perl_call_named_sub_checked(key, args, ctx, key, file, line);
+    perl_array_free(args);
+    return r;
+}
+
 /* D113: real Perl dies with "Undefined subroutine &Pkg::name called at
    FILE line N." (exit 255) rather than silently returning undef. Used
    at codegen call sites that dispatch a genuine sub call (bareword /
@@ -6379,54 +6458,14 @@ static void gap_record(const char *sub, const char *qual,
    the unchecked perl_call_named_sub above. */
 PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ctx,
                                          const char *qualname, const char *file, int line) {
-    if (name) {
-        PerlValue *dyn = NULL;
-        perl_push_call_frame(file, file, line);
-        if (dyn_call_if(name, args, ctx, &dyn)) {
-            perl_pop_call_frame();
-            return dyn;
-        }
-        perl_pop_call_frame();
-        for (int i = 0; i < s_method_count; i++) {
-            if (strcmp(s_method_table[i].key, name) == 0) {
-                PerlSubFnCtx fn = s_method_table[i].fn;
-                if (fn) {
-                    /* push the caller frame for this call so a die/croak
-                       inside the callee reports the caller's location */
-                    perl_push_call_frame(file, file, line);
-                    PerlValue *result = fn(args, perl_push_wantarray(ctx));
-                    perl_pop_wantarray();
-                    perl_pop_call_frame();
-                    return result;
-                }
-                break;
-            }
-        }
-        /* Native-stdlib functional form: a qualified name Pkg::func that has
-           no compiled sub may still be implemented natively (CGI::escape,
-           MIME::QuotedPrint::encode_qp, Text::Tabs::expand,
-           IO::Seekable::SEEK_SET, ...). Split at the LAST "::" so nested
-           package names (MIME::QuotedPrint) stay intact as the class.
-           perl_stdlib_method returns NULL for any class/method it does not
-           handle, in which case the D113 undefined-subroutine error below
-           still applies. */
-        {
-            const char *sc = NULL;
-            const char *colon = strstr(name, "::");
-            while (colon) { sc = colon; colon = strstr(sc + 1, "::"); }
-            if (sc) {
-                size_t clen = (size_t)(sc - name);
-                PerlValue *cls_pv = perl_alloc_string_len(name, (long long)clen);
-                perl_push_call_frame(file, file, line);
-                (void)perl_push_wantarray(ctx);
-                PerlValue *r = perl_stdlib_method(cls_pv, sc + 2, args);
-                (void)perl_pop_wantarray();
-                perl_pop_call_frame();
-                perl_free(cls_pv);
-                if (r) return r;
-            }
-        }
-    }
+    PerlValue *hit = NULL;
+    if (try_named_sub(name, args, ctx, file, line, &hit))
+        return hit;
+    /* D228: a bare call in package Pkg looks up "Pkg::name" when the
+       compile-time function is not in this module (glob-installed). */
+    if (qualname && name && strcmp(qualname, name) != 0 &&
+        try_named_sub(qualname, args, ctx, file, line, &hit))
+        return hit;
     /* Phase-0 gap detector: when PERLC_GAPS collection is active, record the
        unresolved call and return undef so execution can continue and surface
        further gaps instead of dying at the first.  With collection inactive
@@ -6477,23 +6516,29 @@ typedef struct PerlGlob {
 static PerlGlob s_glob_table[GLOB_TABLE_MAX];
 static int s_glob_count = 0;
 
+/* bare "foo" and "main::foo" are one glob. Any other package is exact
+   only — stripping at the first "::" made Widget::VERSION and
+   Child::VERSION the same slot (D231). */
+static int glob_names_match(const char *a, const char *b) {
+    const char *ab, *bb;
+    if (!a) a = "";
+    if (!b) b = "";
+    if (strcmp(a, b) == 0) return 1;
+    ab = a;
+    bb = b;
+    if (strncmp(a, "main::", 6) == 0) ab = a + 6;
+    else if (strstr(a, "::")) return 0;
+    if (strncmp(b, "main::", 6) == 0) bb = b + 6;
+    else if (strstr(b, "::")) return 0;
+    if (strchr(ab, ':') || strchr(bb, ':')) return 0;
+    return strcmp(ab, bb) == 0;
+}
+
 static PerlGlob *glob_get_or_create(const char *name) {
     if (!name) name = "";
     for (int i = 0; i < s_glob_count; i++)
-        if (strcmp(s_glob_table[i].name, name) == 0)
+        if (s_glob_table[i].name && glob_names_match(s_glob_table[i].name, name))
             return &s_glob_table[i];
-    /* also match bare vs main::bare */
-    const char *bare = name;
-    const char *p = strstr(name, "::");
-    if (p) bare = p + 2;
-    for (int i = 0; i < s_glob_count; i++) {
-        const char *g = s_glob_table[i].name;
-        const char *gb = g;
-        const char *gp = strstr(g, "::");
-        if (gp) gb = gp + 2;
-        if (strcmp(gb, bare) == 0)
-            return &s_glob_table[i];
-    }
     if (s_glob_count >= GLOB_TABLE_MAX) {
         static PerlGlob dummy;
         return &dummy;
@@ -6647,12 +6692,20 @@ void perl_glob_assign(const char *name, PerlValue *rhs) {
         glob_get_or_create(name)->scalar = rhs;
     }
     else if (rhs->tag == PERL_CODE_REF && rhs->pval) {
+        /* D228: latest-wins, and under the name we were given. A
+           package assign registers "Pkg::NAME" (the caller qualifies).
+           A bare main-package name also lands under main::NAME so
+           defined &NAME finds it. Captures stay on the code ref. */
+        dyn_sub_install_one(name, rhs);
         PerlClosure *cl = (PerlClosure *)rhs->pval;
-        if (cl->fn) {
+        if (cl->fn)
             perl_register_method(name, cl->fn);
+        if (!strstr(name, "::")) {
             char buf[512];
             snprintf(buf, sizeof buf, "main::%s", name);
-            perl_register_method(buf, cl->fn);
+            dyn_sub_install_one(buf, rhs);
+            if (cl->fn)
+                perl_register_method(buf, cl->fn);
         }
     }
 }
@@ -6802,6 +6855,29 @@ static PerlArray *build_dispatch_args(PerlValue *obj, PerlArray *args) {
         for (long long i = 0; i < args->len; i++)
             perl_array_push(full, args->elems[i]);
     return full;
+}
+
+/* D231: *{EXPR} = sub installs a closure in the dyn-sub table only
+   (perl_glob_assign_sv). The method table holds a bare function pointer,
+   which would drop the closure's captures — Pod::Simple's _accessorize
+   accessors close over the attribute name. Walk the class and @ISA,
+   latest-wins, and call the code ref. A runtime glob therefore replaces
+   a compile-time sub of the same name. */
+static PerlValue *dyn_find_method(const char *class_name, const char *method, int depth) {
+    char key[512];
+    PerlValue *code;
+    const char *parents[ISA_MAX_DIRECT_PARENTS];
+    int np, i;
+    if (!class_name || !method || !method[0] || depth > 32) return NULL;
+    snprintf(key, sizeof key, "%s::%s", class_name, method);
+    code = dyn_sub_lookup(key);
+    if (code) return code;
+    np = perl_isa_direct_parents(class_name, parents, ISA_MAX_DIRECT_PARENTS);
+    for (i = 0; i < np; i++) {
+        code = dyn_find_method(parents[i], method, depth + 1);
+        if (code) return code;
+    }
+    return NULL;
 }
 
 /* ── $AUTOLOAD global ───────────────────────────────────────────────────── */
@@ -7121,7 +7197,45 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
         fprintf(stderr, "Can't call method \"%s\" on unblessed reference\n", method);
         exit(255);
     }
+    /* D231: dyn closure before the static table (latest wins). */
+    {
+        PerlValue *code = dyn_find_method(class_name, method, 0);
+        if (code) {
+            /* Same leak as the static fn() call below. perl_array_free
+               would free a callee that returns $_[0]. */
+            return perl_call_code_ref(code, build_dispatch_args(obj, args));
+        }
+    }
     PerlSubFnCtx fn = perl_find_method(class_name, method);
+    if (!fn && method && strcmp(method, "VERSION") == 0) {
+        /* UNIVERSAL::VERSION, no-arg: the invocant package's $VERSION.
+           `our $VERSION` lives in the glob scalar slot (exact name).
+           A --do-lib compile puts the same cell in the global-scalar
+           registry instead. Missing is undef, and this does not fall
+           through to AUTOLOAD. Exact match only — glob_get_or_create's
+           bare-name fallback would hand back some other package's
+           VERSION. */
+        char key[512];
+        PerlValue *cell = NULL;
+        int i;
+        snprintf(key, sizeof key, "%s::VERSION", class_name);
+        for (i = 0; i < s_glob_count; i++) {
+            if (s_glob_table[i].name && strcmp(s_glob_table[i].name, key) == 0) {
+                cell = s_glob_table[i].scalar;
+                break;
+            }
+        }
+        if (!cell) {
+            for (i = 0; i < s_global_scalar_count; i++) {
+                if (s_global_scalar_table[i].key &&
+                    strcmp(s_global_scalar_table[i].key, key) == 0) {
+                    cell = s_global_scalar_table[i].pv;
+                    break;
+                }
+            }
+        }
+        return cell ? perl_clone(cell) : perl_alloc_undef();
+    }
     if (!fn) {
         /* Try AUTOLOAD in the package's ISA chain */
         fn = perl_find_method(class_name, "AUTOLOAD");
@@ -7714,6 +7828,60 @@ void perl_pv_flag_utf8(PerlValue *v) {
     if (v) v->flags |= PV_FLAG_UTF8;
 }
 
+/* utf8::encode($s): a flagged string is already stored as UTF-8 octets.
+   Clearing the flag makes length() count bytes. An unflagged string is
+   already octets. The return is undef, matching perl 5.44. */
+void perl_utf8_encode(PerlValue *v) {
+    if (v && v->tag == PERL_STRING)
+        v->flags &= ~PV_FLAG_UTF8;
+}
+
+/* Strict one-character check. Rejects overlongs and truncated tails.
+   *nlen is the byte width on success. */
+static int utf8_seq_ok(const unsigned char *p, const unsigned char *end, int *nlen) {
+    if (p >= end) return 0;
+    unsigned char c = *p;
+    int need;
+    if (c < 0x80) { *nlen = 1; return 1; }
+    if ((c & 0xE0) == 0xC0) {
+        need = 2;
+        if (c < 0xC2) return 0;
+    } else if ((c & 0xF0) == 0xE0) {
+        need = 3;
+    } else if ((c & 0xF8) == 0xF0) {
+        need = 4;
+        if (c > 0xF4) return 0;
+    } else {
+        return 0;
+    }
+    if (p + need > end) return 0;
+    for (int i = 1; i < need; i++)
+        if ((p[i] & 0xC0) != 0x80) return 0;
+    *nlen = need;
+    return 1;
+}
+
+/* utf8::decode($s): if every byte is well-formed UTF-8, turn the flag on
+   and return true. A failure leaves the string as octets and returns false.
+   An already-flagged string stays flagged and returns true. */
+PerlValue *perl_utf8_decode(PerlValue *v) {
+    const unsigned char *p, *end;
+    int nlen;
+    if (!v || v->tag != PERL_STRING || !v->sval)
+        return perl_alloc_bool(0);
+    if (v->flags & PV_FLAG_UTF8)
+        return perl_alloc_bool(1);
+    p = (const unsigned char *)v->sval;
+    end = p + (v->slen < 0 ? 0 : v->slen);
+    while (p < end) {
+        if (!utf8_seq_ok(p, end, &nlen))
+            return perl_alloc_bool(0);
+        p += nlen;
+    }
+    v->flags |= PV_FLAG_UTF8;
+    return perl_alloc_bool(1);
+}
+
 static void fwrite_fh_bytes(PerlValue *fh, const PerlValue *v, FILE *fp) {
     long long n;
     char *s = perl_to_string_dup_len(v, &n);
@@ -7744,10 +7912,13 @@ void perl_say_fh(PerlValue *fh, PerlValue *v) {
     fputc('\n', fp);
 }
 
-void perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
+PerlValue *perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
     PerlValue *s = perl_sprintf(fmt, args);
+    if (!s) return perl_alloc_undef();
     perl_print_fh(fh, s);
     perl_free(s);
+    /* perl's printf returns true (1), not the C character count. */
+    return perl_alloc_int(1);
 }
 
 PerlValue *perl_eof_fh(PerlValue *fh) {
@@ -9786,10 +9957,13 @@ PerlValue *perl_sprintf(PerlValue *fmt_pv, PerlArray *args) {
     return result;
 }
 
-void perl_printf(PerlValue *fmt, PerlArray *args) {
+PerlValue *perl_printf(PerlValue *fmt, PerlArray *args) {
     PerlValue *s = perl_sprintf(fmt, args);
+    if (!s) return perl_alloc_undef();
     perl_print(s);
     perl_free(s);
+    /* perl's printf returns true (1), not the C character count. */
+    return perl_alloc_int(1);
 }
 
 /* ── pack / unpack ───────────────────────────────────────────────────────── */

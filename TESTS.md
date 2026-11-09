@@ -148,6 +148,154 @@ non-atomic `@{shared} += $check`, or regression_bugs.pl's racy sub) — perlc
 is deterministic and byte-identical to perl in isolation, so those single
 contention fails are perl's, not a perlc regression.
 
+**D215 (2026-11-08): block-value `if`/`unless`.** A block whose last
+statement is `if`/`elsif`/`else` or `unless` (including a statement
+modifier, a sub's implicit return, `grep`/`map`, and a `sort` comparator)
+now yields the taken arm. A failed `if` with no `else` yields the
+condition (`do { if (0) { "a" } }` is `0`). A failed `unless` yields the
+original condition, not the `!` boolean. `return` inside such an arm
+still returns; inside a `sort` comparator it stays the comparison result.
+Tests: `tests/d215_block_if_value_{smoke,deep}.pl`. `make test-all`:
+642 compared, 642 PASS, 0 FAIL.
+
+**D216 (2026-11-08): file-scope `my` across a `do`/`require` function boundary.**
+A `--do-lib` compile (what `do FILE` and runtime `require` use) stored the
+file-scope scalar slot in an alloca inside `__perlc_do_run` (`%g.NBSP`).
+Named subs are separate LLVM functions, so a load of that alloca — including
+the `s{$NBSP}{...}` / `s{ \s }{$NBSP}` interpolation Pod::Text and Pod::Man
+use — failed LLVM verify with `Referring to an instruction in another
+function!`. The PerlValue still comes from the process-wide registry (D58);
+the slot is a module-level global again, reused when the same qualified
+name is declared twice. An ordinary (non-`do`) compile already used a
+global and was unaffected. Tests:
+`tests/d216_file_my_capture_{smoke,deep}.pl`. `make test-all`:
+644 compared, 644 PASS, 0 FAIL.
+
+**D217 (2026-11-09): symmetric `qw` delimiters.** `qw/.../` (and `qw|...|`,
+`qw#...#`) no longer treats the delimiter as a nesting bracket, so
+`qw/a b/` is two words. `qw[...]`, `qw(...)`, and `qw<...>` still nest.
+`qw/a\/b/` is the word `a/b`. Tests:
+`tests/d217_qw_symdelim_{smoke,deep}.pl`.
+
+**D218 (2026-11-09): block versus hash after `{`.** A leading `%` is not
+enough to decide. `{ %h = (); ...}` is a block. `{ k => v }` and `{}`
+are hashes. `{ %$h }` with no semicolon stays a hash constructor.
+Tests: `tests/d218_block_hash_assign_{smoke,deep}.pl`.
+
+**D219 (2026-11-09): `use if` condition with braces.** The use-scan and
+the module inliner stop at the depth-0 semicolon, so
+`use if do { ... }, 'utf8';` parses. A non-constant condition does not
+inline the module. Tests: `tests/d219_use_if_block_{smoke,deep}.pl`.
+
+**D220 (2026-11-09): `tie` on a typeglob.** `tie *$g, $class, $x` reaches
+`perl_tie` and calls `TIESCALAR` / `TIEARRAY` / `TIEHASH` / `TIEHANDLE`.
+The tie does not install FETCH/STORE/PRINT magic. Tests:
+`tests/d220_tie_glob_{smoke,deep}.pl`.
+
+**D221 (2026-11-09): `=>` in `join`, and a trailing comma before `)`
+in an unparenthesized `sprintf` argument list.** The same `=>` break
+is in `pack`'s argument loop. Tests:
+`tests/d221_join_fatarrow_{smoke,deep}.pl`.
+
+**D222 (2026-11-09): parenthesized `use overload(...)`.** Tests:
+`tests/d222_overload_paren_{smoke,deep}.pl`.
+
+**D223 (2026-11-09): `my` skipped by `goto` in the same block.** The
+declaration is hoisted to the block entry so LLVM dominance holds.
+`our`, shared, arrays, and hashes are not hoisted. Tests:
+`tests/d223_goto_my_{smoke,deep}.pl`.
+
+**D224 (2026-11-09): `our`/`my VAR = INIT if COND`.** The declaration is
+unconditional and the assignment is the statement modifier. Tests:
+`tests/d224_decl_modifier_{smoke,deep}.pl`.
+
+**D225 (2026-11-09): `return printf`.** `printf` is an expression and
+returns true (1), matching perl 5.44. Tests:
+`tests/d225_return_printf_{smoke,deep}.pl`.
+
+**D226 (2026-11-09): `=>` inside `splice`, and a list-context replacement
+list.** Scalar-context `splice` still returns the removed-element count.
+Tests: `tests/d226_splice_fatarrow_{smoke,deep}.pl`.
+
+**D227 (2026-11-09): `use Pod::Simple`.** Removed from the pragma skip
+list once the use-chain compiled. `tests/d227_pod_simple.sh` (not a
+harness `.pl`; it needs the host privlib) constructs a parser and
+compares stdout and stderr with perl. `Pod::Text` and `Pod::Man` stay
+skipped. `perl_tie` still has no PRINT magic, so a parse that writes
+through `Pod::Simple::TiedOutFH` is outside this check.
+
+**D228 (2026-11-09): `defined &NAME` and `NAME and` / `NAME or`.**
+`defined &NAME` is an existence check. `defined &NAME()` still calls.
+A bareword before `and` or `or` calls the sub when one is installed and
+stays a string otherwise. A glob assign of a sub registers the code
+ref, captures included. Tests:
+`tests/d228_defined_sub_{smoke,deep}.pl`.
+
+**D229 (2026-11-09): explicit `return` of a lexical.** The return value
+is cloned before scope cleanup frees the cell, including in a sub with
+no `local`. A `qr//` value is true. Tests:
+`tests/d229_return_lexical_qr_{smoke,deep}.pl`.
+
+**D230 (2026-11-09): `utf8::encode` / `utf8::decode`.** Encode clears the
+UTF-8 flag in place and returns undef. Decode sets the flag and returns
+true when every sequence is well-formed, and leaves the octets alone
+when one is not. `utf8::unicode_to_native` and `utf8::native_to_unicode`
+are the identity on this ASCII host. Tests:
+`tests/d230_utf8_encode_{smoke,deep}.pl`.
+
+**D231 (2026-11-09): method dispatch of a dyn closure, and `VERSION`.**
+`*{EXPR} = sub` lands in the dyn-sub table. Method lookup calls that
+code ref (captures kept) before the static method table, and walks
+`@ISA`. No-arg `->VERSION` clones the invocant package's `$VERSION`
+glob scalar (exact name; a `--do-lib` cell in the global-scalar
+registry is the fallback). A bare name and `main::name` still share one
+glob; two other packages no longer do. Tests:
+`tests/d231_dyn_method_{smoke,deep}.pl`. `make test-all`:
+672 compared, 671 PASS, 1 FAIL. The FAIL is `tree.pl` under the parallel
+runner: `$checks[$depth] += $check` on a shared array is not atomic, so
+the depth-4 and depth-6 check totals differed (1984 vs perl's 1891,
+2032 vs 1905) while the stretch and long-lived lines matched.
+`./tests/harness.sh tests/tree.pl` in isolation is PASS.
+
+**Open after D231 (2026-11-09).** `Pod::Simple->new` matches perl. These
+are the gaps that still block the rest of the Pod toolchain and the
+real-world runtime corpus:
+
+- `Pod::Text` and `Pod::Man` stay on the pragma skip list in
+  `src/main.cpp`. `use Pod::Text` does not inline the real module.
+- `delete $$ref{key}` and `delete $$ref[idx]` do not parse. Pod::Text
+  uses `delete $$self{key}`.
+- `push` and `unshift` argument lists do not accept `=>` as a comma.
+  `join`, `pack`, and `sprintf` do (D221). Pod::Text uses the
+  `push` form.
+- Pod::Man, compiled with only the `qw` fix, still stops near line 767.
+- `perl_tie` calls `TIESCALAR` / `TIEARRAY` / `TIEHASH` / `TIEHANDLE`
+  and does not install FETCH, STORE, PRINT, or PRINTF magic.
+  `tests/d227_pod_simple.sh` stops at construction
+  (`expand_verbatim_tabs` is 8). A parse that writes through
+  `Pod::Simple::TiedOutFH` (`$$$it .= $x`) still diverges.
+- No-arg `$obj->VERSION` reads `$Class::VERSION`. The requirement form
+  `$obj->VERSION($v)` is unimplemented.
+- `can` consults the static method table only, so a closure installed
+  with `*{EXPR} = sub` is invisible to it.
+- The dyn-sub table holds 256 entries (`DYN_SUB_MAX`). A later install
+  is dropped with no diagnostic. Pod::Simple's accessor list fits.
+- Scalar-context `splice` returns the removed-element count. Perl
+  returns the last removed element.
+- `Encode` stays a native pragma. `piconv` still fails at runtime on
+  `Encode->getEncoding` (gate=0 in `tests/realworld/`).
+- Deliberately left from D215: a file-scope `do { return 5 }` whose
+  `return` is not inside a value-`if` is swallowed; a file-scope
+  list-context `do` yields the last element; `do { print }` is empty;
+  `unless (my $y)` can leak at file scope; a non-last `return` inside
+  a `sort` comparator's `if` still fails LLVM verify (i64 vs pointer
+  return).
+- `./perlc -g` fails verify with `DISubprogram attached to more than
+  one function` on `main`. Debug backtraces into the compiler are
+  unavailable until that is fixed.
+
+Handoff detail: `docs/realworld_runtime_gap_resumption.md`.
+
 Skipped by default: `dbi_sqlite.pl`, `xs_ffi.pl`.
 
 New (2026-09-09/10): `Getopt::Long`, `Data::Dumper`, `File::Basename` —

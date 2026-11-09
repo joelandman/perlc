@@ -175,8 +175,7 @@ PerlValue *perl_atomic_dec(PerlValue *pv);
 PerlValue *perl_atomic_add(PerlValue *pv, PerlValue *delta);
 PerlValue *perl_atomic_rmw(PerlValue *pv, PerlValue *rhs, int op);  /* *, /, % */
 
- /* tie/untie */
- PerlValue *perl_tie(PerlValue *args_arr);
+ /* tie/untie — perl_tie is declared after PerlArray. */
  void perl_untie(PerlValue *var_pv);
 
  /* coercions */
@@ -257,6 +256,10 @@ typedef struct PerlArray {
     int              refcount; /* 0 = scope-managed (named @arr), >0 = anonymous refcounted ([]) */
     pthread_mutex_t *mu;       /* non-NULL when declared : shared */
 } PerlArray;
+
+/* kind: 0 TIESCALAR, 1 TIEARRAY, 2 TIEHASH, 3 TIEHANDLE.
+   args is (var, class, LIST...). Returns CLASS->TIExxx(LIST). */
+PerlValue *perl_tie(PerlArray *args, int kind);
 
 /* list-context return helpers for wantarray */
 PerlValue *perl_array_to_list_return(PerlArray *av); /* list ctx→LIST_RESULT; scalar→last elem */
@@ -618,9 +621,11 @@ PerlValue *perl_get_dollar_argv(void);
 void       perl_set_data_section(const char *s, long long n);
 PerlValue *perl_get_data_fh(void);
 void       perl_pv_flag_utf8(PerlValue *v);
+void       perl_utf8_encode(PerlValue *v);
+PerlValue *perl_utf8_decode(PerlValue *v);
 void       perl_print_fh(PerlValue *fh, PerlValue *v);
 void       perl_say_fh(PerlValue *fh, PerlValue *v);
-void       perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args);
+PerlValue *perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args);
 PerlValue *perl_eof_fh(PerlValue *fh);
 void       perl_die(PerlValue *msg, const char *filename, int line);
 PerlValue *perl_unlink_files(PerlArray *files);
@@ -630,7 +635,7 @@ PerlValue *perl_get_stdout(void);   /* returns stable STDOUT PerlValue* */
 
 /* ── sprintf / printf ────────────────────────────────────────────────────── */
 PerlValue *perl_sprintf(PerlValue *fmt, PerlArray *args);
-void       perl_printf(PerlValue *fmt, PerlArray *args);
+PerlValue *perl_printf(PerlValue *fmt, PerlArray *args);
 
 /* ── pack / unpack ───────────────────────────────────────────────────────── */
 PerlValue *perl_pack(PerlValue *fmt, PerlArray *args);
@@ -752,6 +757,13 @@ PerlValue *perl_call_named_sub(const char *name, PerlArray *args, int ctx);
    name to use in the error message (may equal name). */
 PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ctx,
                                         const char *qualname, const char *file, int line);
+/* D228: defined &NAME — true when a sub body is installed under that
+   qualified name. Does not call it. */
+int        perl_sub_defined(const char *name);
+/* D228: argument-less bareword. Calls the sub when one is installed
+   under qual (BEGIN *NAME = sub), otherwise the bare word as a string. */
+PerlValue *perl_bareword_or_call(const char *name, const char *qual,
+                                  int ctx, const char *file, int line);
 PerlValue *perl_get_or_create_global_scalar(const char *key); /* D58: process-wide package-scalar registry for --do-lib builds */
 /* ── threads ─────────────────────────────────────────────────────────────── */
 #include <pthread.h>
