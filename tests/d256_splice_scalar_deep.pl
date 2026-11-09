@@ -1,0 +1,14 @@
+use strict;
+use warnings;
+my @e = (7, 8, 9);
+my @got = splice @e, 0, 2, 10, 11;
+print "got=", join(",", @got), " e=", join(",", @e), "\n";
+my @fv = (1, 2, 3, 4);
+my @mid = splice @fv, -2;
+print "mid=", join(",", @mid), " fv=", join(",", @fv), "\n";
+my @r = (10, 20, 30);
+my $ref = \@r;
+my $one = splice @$ref, 0, 1;
+print "one=$one rest=", join(",", @$ref), "\n";
+splice @$ref;
+print "cleared=", scalar(@$ref), "\n";

@@ -1,0 +1,11 @@
+use strict;
+use warnings;
+my $f = "/tmp/pt_d252_$$.pm";
+open my $fh, ">", $f or die "open: $!\n";
+print $fh "1;\n";
+close $fh;
+my $r = eval { require $f };
+print "r=", defined($r) ? $r : "U", "\n";
+unlink $f;
+my $miss = eval { require "/tmp/pt_d252_missing_$$.pm" };
+print "miss=", defined($miss) ? "D" : "U", "\n";

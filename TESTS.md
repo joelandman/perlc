@@ -257,33 +257,82 @@ the depth-4 and depth-6 check totals differed (1984 vs perl's 1891,
 2032 vs 1905) while the stretch and long-lived lines matched.
 `./tests/harness.sh tests/tree.pl` in isolation is PASS.
 
-**Open after D231 (2026-11-09).** `Pod::Simple->new` matches perl. These
-are the gaps that still block the rest of the Pod toolchain and the
-real-world runtime corpus:
+**D232–D256 (2026-11-09): Pod::Text and Pod::Man samples match perl.**
+`Pod::Text` and `Pod::Man` are off the inline skip list. With host
+privlib on `-I`, `tests/d247_pod_text.sh` prints a NAME section that
+matches perl, and the same shape for Pod::Man (roff page, coding line,
+empty stderr besides the constructor trace) matches under
+`SOURCE_DATE_EPOCH=0`. The shell compares are outside the `.pl` harness
+because they need `-I`.
 
-- `Pod::Text` and `Pod::Man` stay on the pragma skip list in
-  `src/main.cpp`. `use Pod::Text` does not inline the real module.
-- `delete $$ref{key}` and `delete $$ref[idx]` do not parse. Pod::Text
-  uses `delete $$self{key}`.
-- `push` and `unshift` argument lists do not accept `=>` as a comma.
-  `join`, `pack`, and `sprintf` do (D221). Pod::Text uses the
-  `push` form.
-- Pod::Man, compiled with only the `qw` fix, still stops near line 767.
+- **D232** `delete $$ref{key}` / `delete $$ref[idx]` is one deref.
+  `tests/d232_delete_deref_{smoke,deep}.pl`.
+- **D233** `=>` is a comma in `push` and `unshift` argument lists.
+  `tests/d233_push_fatarrow_{smoke,deep}.pl`.
+- **D234** `require EXPR` resolves a computed path. A missing file is
+  false inside `eval`. `tests/d234_require_expr_{smoke,deep}.pl`.
+- **D235** `s///r` returns the copy and leaves the original alone.
+  `tests/d235_subst_r_{smoke,deep}.pl`.
+- **D237** `can` sees a dyn-sub closure, including through `@ISA`.
+  `tests/d237_can_dyn_{smoke,deep}.pl`.
+- **D238** a `/g` match that can be zero-width advances one character.
+  `tests/d238_gmatch_zerowidth_{smoke,deep}.pl`.
+- **D239** `package NAME VERSION` sets the package `$VERSION`.
+  `tests/d239_package_version_{smoke,deep}.pl`.
+- **D240** `print` / `say` accept a glob reference as the handle.
+  `tests/d240_print_globref_{smoke,deep}.pl`.
+- **D241** scalar `@$ref` / `%$ref` is the count, including in boolean
+  context. `tests/d241_deref_bool_{smoke,deep}.pl`.
+- **D242** a second `my $name` initializer sees the new binding, not
+  the outer one. `tests/d242_my_init_outer_{smoke,deep}.pl`.
+- **D243** an undefined subroutine dies inside `eval` instead of
+  exiting the process. `tests/d243_undef_sub_eval_{smoke,deep}.pl`.
+- **D244** an interpolated pattern with `/g` advances.
+  `tests/d244_interp_gmatch_{smoke,deep}.pl`.
+- **D245** method arguments are list context (`$obj->m(@$row)`).
+  `tests/d245_method_list_args_{smoke,deep}.pl`.
+- **D246** a `use` inside a module file is spliced at that `use`, so
+  a `BEGIN` in the used file runs before the caller's next statement.
+  `tests/d246_begin_use_{smoke,deep}.pl`.
+- **D248** `split` inside `map` / `grep` stops at the block's `}`.
+  `tests/d248_split_block_{smoke,deep}.pl`.
+- **D249** `(LIST)[i,j]` is a slice evaluated once. `$r->[3,1]` stays
+  the comma operator (last index only). `tests/d249_list_slice_{smoke,deep}.pl`.
+- **D250** `$obj->$coderef` calls the code ref with the invocant, with
+  or without parentheses. `tests/d250_coderef_method_{smoke,deep}.pl`.
+- **D251** runtime `require Name` searches compiler `-I`, then
+  `PERL5LIB`, then `.` and `lib/`. The file is found and the require
+  is true. It is not executed. `tests/d251_require_inc.sh`.
+- **D252** `eval { require ... }` yields the require's value.
+  `tests/d252_eval_require_{smoke,deep}.pl`.
+- **D253** `%$ref = LIST` snapshots the right-hand side, then replaces
+  the hash. `tests/d253_hashref_assign_{smoke,deep}.pl`.
+- **D254** after `-I` and `PERL5LIB`, `require` searches the host
+  default `@INC` (site, vendor, arch, priv). `Encode.pm` lives in
+  archlib. `tests/d254_require_default_inc_{smoke,deep}.pl`.
+- **D255** a method call passes the caller's wantarray into the
+  method. `return()` in list context is empty.
+  `tests/d255_method_wantarray_{smoke,deep}.pl`.
+- **D256** scalar `splice` returns the last removed element.
+  `tests/d256_splice_scalar_{smoke,deep}.pl`.
+
+`make test-all` after D256: 716 compared, 716 PASS, 0 FAIL.
+
+**Open after D256 (2026-11-09).** The small Pod::Text and Pod::Man
+samples match. These still block a full pod2man / piconv run:
+
 - `perl_tie` calls `TIESCALAR` / `TIEARRAY` / `TIEHASH` / `TIEHANDLE`
-  and does not install FETCH, STORE, PRINT, or PRINTF magic.
-  `tests/d227_pod_simple.sh` stops at construction
-  (`expand_verbatim_tabs` is 8). A parse that writes through
-  `Pod::Simple::TiedOutFH` (`$$$it .= $x`) still diverges.
-- No-arg `$obj->VERSION` reads `$Class::VERSION`. The requirement form
-  `$obj->VERSION($v)` is unimplemented.
-- `can` consults the static method table only, so a closure installed
-  with `*{EXPR} = sub` is invisible to it.
+  and does not install FETCH, STORE, PRINT, or PRINTF magic. A parse
+  that writes through `Pod::Simple::TiedOutFH` (`$$$it .= $x`) still
+  diverges. The samples above do not take that path.
+- Runtime `require` returns true when the file exists and does not
+  run it. `Encode::encode` is the native function. `Encode->getEncoding`
+  and loading Encode's own subs are still the piconv gap. `Encode`
+  stays on the pragma skip list.
+- `$obj->VERSION($v)` (the requirement form) is unimplemented.
 - The dyn-sub table holds 256 entries (`DYN_SUB_MAX`). A later install
-  is dropped with no diagnostic. Pod::Simple's accessor list fits.
-- Scalar-context `splice` returns the removed-element count. Perl
-  returns the last removed element.
-- `Encode` stays a native pragma. `piconv` still fails at runtime on
-  `Encode->getEncoding` (gate=0 in `tests/realworld/`).
+  is dropped with no diagnostic.
+- A missing `require` returns undef and sets `$@`. It does not die.
 - Deliberately left from D215: a file-scope `do { return 5 }` whose
   `return` is not inside a value-`if` is swallowed; a file-scope
   list-context `do` yields the last element; `do { print }` is empty;

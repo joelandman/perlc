@@ -1,0 +1,17 @@
+use strict;
+use warnings;
+my $a = ["x"];
+print((@$a ? "Y" : "N"), "\n");
+print "n=", scalar(@$a), "\n";
+my $e = [];
+print((@$e ? "Y" : "N"), "\n");
+my $h = { a => 1 };
+print((%$h ? "Y" : "N"), "\n");
+print "hn=", scalar(%$h), "\n";
+my $he = {};
+print((%$he ? "Y" : "N"), "\n");
+my $paras;
+print((@{$paras = $a} ? "Y" : "N"), "\n");
+print "p=", $paras->[0], "\n";
+my $z = ["0"];
+print((@$z ? "Y" : "N"), "\n");

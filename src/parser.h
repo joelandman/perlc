@@ -130,6 +130,8 @@ private:
     NodePtr parsePrintfBody(int line);
     NodePtr parsePush();
     NodePtr parseUnshift();
+    /* D234: require Module / "file" / VERSION / EXPR. Does not consume `;`. */
+    NodePtr parseRequire(int line);
     NodePtr parseReturn();
     NodePtr parseFormat();
     NodePtr parseWrite();

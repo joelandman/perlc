@@ -90,6 +90,13 @@ typedef struct PerlCplxRow {
    an IV. Any perl_assign to the slot clears it. (Bit 25 is native_stdlib's
    PV_FLAG_AUTOFLUSH.) */
 #define PV_FLAG_IV_HINT           (1u << 29)
+/* D238: last /g match on this scalar was zero-width. matchpos is the
+   reported pos() (the match end, which may be 0). The next /g starts
+   one past that. Without the bit, a zero-width match at EOS stored
+   length+1 and the following call treated "past the end" as "start
+   over", so `while (/( [^\n\r]* )( \r?\n? )/g)` never finished
+   (Pod::Simple::parse_string_document). */
+#define PV_FLAG_G_BUMP            (1u << 30)
 
 typedef struct PerlValue {
     PerlTag      tag;
@@ -683,6 +690,8 @@ PerlArray *perl_regex_match_all(PerlValue *str, const char *pattern, const char 
 /* OR-in: amp=1 if this unit reads $&/`/', caps=1 if it reads $1.. or %+. */
 void       perl_set_match_globals_needed(int amp, int caps);
 long long  perl_regex_subst(PerlValue *str, const char *pattern, const char *repl, const char *flags);
+/* D235: /r — non-destructive. Returns the new string. Does not modify str. */
+PerlValue *perl_regex_subst_r(PerlValue *str, const char *pattern, const char *repl, const char *flags);
 /* D38c: s///e — eval_fn is called once per match with $1/$& already set;
    returns a PerlValue* whose stringification becomes the replacement.
    captures may be NULL (no outer lexical capture). */
@@ -1037,6 +1046,9 @@ PerlValue *perl_get_autoload_name(void);   /* returns stable $AUTOLOAD PV* */
 void perl_set_pos_str(PerlValue *pv, PerlValue *pos);
 
 /* ── runtime require ─────────────────────────────────────────────────────── */
+void       perl_inc_push(const char *dir);
+void       perl_inc_load_env(void);
+void       perl_inc_load_defaults(void);
 PerlValue *perl_runtime_require(const char *modname);
 PerlValue *perl_do_file(PerlValue *path_pv);
 void       perl_do_lib_cleanup(void);  /* D24: dlclose() do'd shared libraries */

@@ -604,13 +604,34 @@ NodePtr Parser::parseStmt() {
         return parseModifier(std::make_unique<Node>(), line); /* unreachable */
     }
 
-    /* package Foo; — changes current package context for sub naming */
+    /* package Foo; — changes current package context for sub naming.
+       D239: `package Foo v6.0.2;` / `package Foo 1.23;` also sets
+       $Foo::VERSION. A v-string lexes as IDENT "v6" DOT number
+       (DOT number)*; a plain number is one FLOAT or INT token.
+       The block form `package Foo { }` is unchanged (next token is `{`). */
     if (check(TK::KW_PACKAGE)) {
         advance();
         currentPackage_ = cur().text; advance();
+        std::string ver;
+        if (check(TK::IDENT) && cur().text.size() >= 2 && cur().text[0] == 'v' &&
+            std::isdigit(static_cast<unsigned char>(cur().text[1]))) {
+            ver = cur().text;
+            advance();
+            while (check(TK::DOT) && pos_ + 1 < toks_.size() &&
+                   (toks_[pos_ + 1].kind == TK::INT ||
+                    toks_[pos_ + 1].kind == TK::FLOAT)) {
+                advance(); /* dot */
+                ver += ".";
+                ver += cur().text;
+                advance();
+            }
+        } else if (check(TK::FLOAT) || check(TK::INT)) {
+            ver = cur().text;
+            advance();
+        }
         match(TK::SEMI);
         auto n = std::make_unique<Node>(); n->kind = NK::PackageStmt;
-        n->sval = currentPackage_; n->line = line;
+        n->sval = currentPackage_; n->name = ver; n->line = line;
         return n;
     }
 
@@ -947,31 +968,7 @@ NodePtr Parser::parseStmt() {
         return n;
     }
     if (check(TK::KW_REQUIRE)) {
-        advance();
-        std::string modname;
-        /* require Module::Name  or  require "file.pm"  or  require VERSION
-           (require 5.008;)  or  require vVERSION (require v5.8.1;) — the
-           latter lexes as IDENT "v5" DOT INT "8" DOT INT "1". No-op like
-           the numeric VERSION form (host is new enough); consume any
-           trailing .NUMBER components. */
-        if (check(TK::IDENT) && cur().text.size() >= 2 &&
-            cur().text[0] == 'v' && isdigit((unsigned char)cur().text[1])) {
-            advance(); /* vN */
-            while (match(TK::DOT) && (check(TK::INT) || check(TK::FLOAT))) advance();
-            auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
-            n->sval = ""; n->line = line;
-            return parseModifier(std::move(n), line);
-        }
-        if (check(TK::IDENT)) { modname = cur().text; advance(); }
-        else if (check(TK::STRING)) { modname = cur().text; advance(); }
-        else if (check(TK::FLOAT) || check(TK::INT)) {
-            advance(); /* version check — no-op (host is new enough) */
-            auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
-            n->sval = ""; n->line = line;
-            return parseModifier(std::move(n), line);
-        }
-        auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt; n->sval = modname; n->line = line;
-        return parseModifier(std::move(n), line);
+        return parseModifier(parseRequire(line), line);
     }
     if (check(TK::LBRACE)) {
         /* `{ key => val, ... }` in STATEMENT position (inside a
@@ -1831,6 +1828,46 @@ NodePtr Parser::parsePrint(bool isSay) {
     return n;
 }
 
+/* D234: require Module::Name / "file.pm" / VERSION / EXPR.
+   Does not consume a trailing semicolon. EXPR uses named-unary
+   precedence (concat and =~ are inside the operand; a comparison or
+   comma is not). name "expr" distinguishes a runtime filename from
+   the empty-sval VERSION no-op. */
+NodePtr Parser::parseRequire(int line) {
+    advance(); /* require */
+    std::string modname;
+    /* require v5.8.1 lexes as IDENT "v5" DOT INT "8" DOT INT "1". */
+    if (check(TK::IDENT) && cur().text.size() >= 2 &&
+        cur().text[0] == 'v' && isdigit((unsigned char)cur().text[1])) {
+        advance();
+        while (match(TK::DOT) && (check(TK::INT) || check(TK::FLOAT))) advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
+        n->sval = ""; n->line = line;
+        return n;
+    }
+    if (check(TK::IDENT)) { modname = cur().text; advance(); }
+    else if (check(TK::STRING)) { modname = cur().text; advance(); }
+    else if (check(TK::FLOAT) || check(TK::INT)) {
+        advance();
+        auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
+        n->sval = ""; n->line = line;
+        return n;
+    } else {
+        auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
+        n->line = line; n->name = "expr";
+        if (match(TK::LPAREN)) {
+            n->left = parseExpr();
+            consume(TK::RPAREN, ")");
+        } else {
+            n->left = parseNamedUnaryArg(false, line);
+        }
+        return n;
+    }
+    auto n = std::make_unique<Node>(); n->kind = NK::RequireStmt;
+    n->sval = modname; n->line = line;
+    return n;
+}
+
 NodePtr Parser::parsePush() {
     int line = cur().line;
     consume(TK::KW_PUSH);
@@ -1861,7 +1898,8 @@ NodePtr Parser::parsePush() {
         if (hasParen && check(TK::RPAREN)) break;
         if (!hasParen && check(TK::RBRACE)) break;
         vals.push_back(parseLowNot());
-        if (!match(TK::COMMA)) break;
+        /* D233: `push (@args, alt => 1)` — `=>` is a comma, same as join. */
+        if (!(match(TK::COMMA) || match(TK::FATARROW))) break;
         /* D191: a trailing comma before `}`/`)`/`]` (the last argument of a
            list with no following element) is legal Perl — stop here rather
            than trying to parse the delimiter as another element. */
@@ -1898,7 +1936,8 @@ NodePtr Parser::parseUnshift() {
         if (hasParen && check(TK::RPAREN)) break;
         if (!hasParen && check(TK::RBRACE)) break; /* D190 */
         vals.push_back(parseLowNot());
-        if (!match(TK::COMMA)) break;
+        /* D233: `unshift` takes the same `=>`-as-comma list as push. */
+        if (!(match(TK::COMMA) || match(TK::FATARROW))) break;
         /* D191: trailing comma before `}`/`)`/`]` (see parsePush). */
         if (atTrailingDelim()) break;
     }
@@ -2301,7 +2340,10 @@ NodePtr Parser::parseNamedUnaryArg(bool parens, int line) {
                  k == TK::SPACESHIP || (k == TK::IDENT && isCmpOpWord(cur().text)) ||
                  isModifier());
     if (none) return makeScalar("_", line);
-    return parens ? parseExpr() : parseBinding();
+    /* D236: =~ binds tighter than + . * <<, so the operand is parseShift
+       (the outermost arithmetic level), not parseBinding. `uc $a . $b`
+       stays uc($a . $b); `length $x > 3` stays (length $x) > 3. */
+    return parens ? parseExpr() : parseShift();
 }
 
 /* D152: the filehandle argument of close/eof/tell/binmode/fileno. A bareword
@@ -2608,7 +2650,9 @@ NodePtr Parser::parseShift() {
 }
 
 NodePtr Parser::parseBinding() {
-    auto lhs = parseShift();
+    /* D236: =~ !~ bind tighter than * / + . << and looser than unary and **.
+       The LHS is a unary/pow term, not the arithmetic expression. */
+    auto lhs = parseUnary();
     while (check(TK::BIND) || check(TK::NBIND)) {
         bool negated = check(TK::NBIND);
         int line = cur().line; advance();
@@ -2686,7 +2730,8 @@ NodePtr Parser::parseBinding() {
 }
 
 NodePtr Parser::parseCmp() {
-    auto lhs = parseBinding();
+    /* D236: comparisons sit outside << + . * =~. */
+    auto lhs = parseShift();
     int line = cur().line;
     TK k = cur().kind;
     std::string ident = (k == TK::IDENT) ? cur().text : "";
@@ -2717,7 +2762,7 @@ NodePtr Parser::parseCmp() {
             }
         }
         advance();
-        auto rhs = parseBinding();
+        auto rhs = parseShift();
         lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
         line = cur().line; k = cur().kind;
         ident = (k == TK::IDENT) ? cur().text : "";
@@ -2738,7 +2783,7 @@ NodePtr Parser::parseAdd() {
 }
 
 NodePtr Parser::parseMul() {
-    auto lhs = parseUnary();
+    auto lhs = parseBinding();
     while (check(TK::STAR) || check(TK::SLASH) || check(TK::PERCENT) ||
            (cur().kind == TK::IDENT && cur().text == "x" && peek(1).kind != TK::ASSIGN)) {
         int line = cur().line;
@@ -2748,7 +2793,7 @@ NodePtr Parser::parseMul() {
         else if (check(TK::PERCENT)) op = "%";
         else op = "x"; /* IDENT "x" */
         advance();
-        auto rhs = parseUnary();
+        auto rhs = parseBinding();
         lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
     }
     return lhs;
@@ -2853,13 +2898,42 @@ NodePtr Parser::parseHashKeySingle() {
 NodePtr Parser::parseSubscript(NodePtr base, int line) {
     /* consume -> then [ or { */
     /* also handles adjacent [] {} (no -> needed after first subscript) */
+    /* D249: (LIST)[i,j,k] is a slice. $ref->[i,j] is the comma
+       operator (one index, the last value). */
+    auto parseBracketIndices = [&](NodeList &idxs) -> bool {
+        bool slice = false;
+        if (check(TK::RBRACKET) || check(TK::EOF_TOK)) return false;
+        idxs.push_back(parseExpr());
+        while (match(TK::COMMA) || match(TK::FATARROW)) {
+            slice = true;
+            if (check(TK::RBRACKET) || check(TK::EOF_TOK)) break;
+            idxs.push_back(parseExpr());
+        }
+        return slice;
+    };
+    auto isListSliceBase = [](NK k) {
+        return k == NK::ArrayLit || k == NK::Call || k == NK::MethodCall ||
+               k == NK::CallCodeRef || k == NK::MapFunc || k == NK::GrepFunc ||
+               k == NK::SortFunc || k == NK::ReverseFunc || k == NK::CallerFunc ||
+               k == NK::GmtimeFunc || k == NK::LocaltimeFunc ||
+               k == NK::StatFunc || k == NK::LstatFunc;
+    };
     for (;;) {
         if (check(TK::ARROW)) {
             advance();
             if (check(TK::LBRACKET)) {
                 advance();
-                auto idx = parseExpr();
+                NodeList idxs;
+                parseBracketIndices(idxs);
                 consume(TK::RBRACKET, "]");
+                /* $ref->[3,1] is one index: the comma operator, last
+                   value wins. A real slice is @$ref[3,1] or (LIST)[3,1]. */
+                NodePtr idx;
+                if (!idxs.empty()) {
+                    idx = std::move(idxs[0]);
+                    for (size_t i = 1; i < idxs.size(); i++)
+                        idx = makeBin(",", std::move(idx), std::move(idxs[i]), line);
+                }
                 auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
                 n->sval = "array"; n->left = std::move(base);
                 n->right = std::move(idx); n->line = line;
@@ -2967,11 +3041,13 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
                 } else if (varName.size() > 1 && varName[0] == '$')
                     varName = varName.substr(1);
                 /* `->$_` is the implicit-$_ glob — only a dynamic METHOD
-                   call when followed by '(' */
+                   call when followed by '('. `$obj->$name` is a method
+                   call with or without parentheses (Pod::Man
+                   `$self->$coderef`). */
                 TK after = peek(methodConsume).kind;
-                if (varName != "$" && (after == TK::LPAREN ||
-                                       after == TK::LBRACKET ||
-                                       after == TK::LBRACE)) {
+                bool dynCall = varName != "$" || after == TK::LPAREN ||
+                               after == TK::LBRACKET || after == TK::LBRACE;
+                if (dynCall) {
                     for (size_t ci = 0; ci < methodConsume; ci++) advance();
                     auto n = std::make_unique<Node>(); n->kind = NK::MethodCall;
                     n->sval = ""; /* dynamic: name from n.right */
@@ -3112,12 +3188,29 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         }
         if (isSubscriptableK(base->kind) && check(TK::LBRACKET)) {
             advance();
-            auto idx = parseExpr();
+            NodeList idxs;
+            bool slice = parseBracketIndices(idxs);
             consume(TK::RBRACKET, "]");
-            auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
-            n->sval = "array"; n->left = std::move(base);
-            n->right = std::move(idx); n->line = line;
-            base = std::move(n);
+            /* (gmtime($t))[5,4,3] is a list slice. $x[3,1] is the
+               comma operator (multidimensional subscript), last index. */
+            if (slice && isListSliceBase(base->kind)) {
+                auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice;
+                n->line = line; n->sval = "list";
+                n->args = std::move(idxs);
+                n->left = std::move(base);
+                base = std::move(n);
+            } else {
+                NodePtr idx;
+                if (!idxs.empty()) {
+                    idx = std::move(idxs[0]);
+                    for (size_t i = 1; i < idxs.size(); i++)
+                        idx = makeBin(",", std::move(idx), std::move(idxs[i]), line);
+                }
+                auto n = std::make_unique<Node>(); n->kind = NK::ArrowDeref;
+                n->sval = "array"; n->left = std::move(base);
+                n->right = std::move(idx); n->line = line;
+                base = std::move(n);
+            }
             continue;
         }
         if (isSubscriptableK(base->kind) && check(TK::LBRACE)) {
@@ -3240,6 +3333,12 @@ NodePtr Parser::parsePrimary() {
 
     if (!inKeyContext_ && check(TK::KW_TIE))
         return parseTie(line);
+
+    /* D234: `my $r = require $file` — require is a term, not only a
+       statement. `require => 1` stays a bareword key. */
+    if (!inKeyContext_ && check(TK::KW_REQUIRE) &&
+        !(pos_ + 1 < toks_.size() && toks_[pos_ + 1].kind == TK::FATARROW))
+        return parseRequire(line);
 
     /* D179: `not` nested inside a tighter-binding expression, e.g.
        `$a && not $b` (found via a real /usr/bin/podebconf-report-po
@@ -4431,6 +4530,50 @@ NodePtr Parser::parsePrimary() {
             return n;
         }
         consume(TK::SCALAR, "$");
+        /* D232: delete $$ref{key} / delete $$ref[idx]. Real Perl treats
+           the adjacent subscript as one deref of the scalar
+           (`$ref->{key}`), the same shape as D63's `$$name{key}` read.
+           `delete $$ref->{key}` keeps the extra scalar deref: the base
+           is `$$ref`, then `->`. Pod::Text uses `delete $$self{opt_stderr}`. */
+        if (check(TK::SCALAR)) {
+            advance();
+            const std::string &nxt = cur().text;
+            bool isIdent = !nxt.empty() &&
+                (std::isalpha(static_cast<unsigned char>(nxt[0])) || nxt[0] == '_');
+            if (!isIdent)
+                throw std::runtime_error(parseErrPrefix(line) +
+                    "expected name after $$ in delete");
+            std::string dnm = cur().text; advance();
+            auto n = std::make_unique<Node>(); n->kind = NK::DeleteFunc;
+            n->line = line; n->sval = "expr"; n->name = "";
+            if (check(TK::ARROW)) {
+                auto inner = std::make_unique<Node>();
+                inner->kind = NK::DerefScalar;
+                inner->left = makeScalar(dnm, line);
+                inner->line = line;
+                n->left = parseSubscript(std::move(inner), line);
+            } else if (check(TK::LBRACKET) || check(TK::LBRACE)) {
+                auto ad = std::make_unique<Node>();
+                ad->kind = NK::ArrowDeref; ad->line = line;
+                ad->left = makeScalar(dnm, line);
+                if (match(TK::LBRACKET)) {
+                    ad->sval = "array";
+                    ad->right = parseExpr();
+                    consume(TK::RBRACKET, "]");
+                } else {
+                    advance();
+                    ad->sval = "hash";
+                    ad->right = parseHashKeySingle();
+                    consume(TK::RBRACE, "}");
+                }
+                n->left = std::move(ad);
+            } else {
+                throw std::runtime_error(parseErrPrefix(line) +
+                    "delete argument is not a HASH or ARRAY element");
+            }
+            if (hasParen) consume(TK::RPAREN, ")");
+            return n;
+        }
         std::string nm = cur().text; advance();
         auto n = std::make_unique<Node>(); n->kind = NK::DeleteFunc;
         n->name = nm; n->line = line;
@@ -4949,8 +5092,15 @@ NodePtr Parser::parsePrimary() {
             sep = parseExpr();
         }
         match(TK::COMMA) || match(TK::FATARROW);
+        /* D248: map { split /pat/ } LIST (Pod::Man outindex). The
+           pattern is the whole call. A block-ending brace is not the
+           string being split. A closing bracket is not either. */
+        auto splitArgEnd = [&]() {
+            return check(TK::RPAREN) || check(TK::SEMI) || check(TK::EOF_TOK)
+                || check(TK::RBRACE) || check(TK::RBRACKET) || isModifier();
+        };
         NodePtr str;
-        if (!check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK))
+        if (!splitArgEnd())
             str = parseExpr();
         /* D118: optional 3rd LIMIT argument — split(/:/, $line, 2) — was a
            hard parse error before (only 2 args were ever consumed). Stored
@@ -4959,8 +5109,7 @@ NodePtr Parser::parsePrimary() {
            0 as the limit sentinel for that case, matching real Perl's
            "omitted or zero" equivalence). */
         NodePtr limitExpr;
-        if ((match(TK::COMMA) || match(TK::FATARROW)) &&
-            !check(TK::RPAREN) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
+        if ((match(TK::COMMA) || match(TK::FATARROW)) && !splitArgEnd()) {
             limitExpr = parseExpr();
         }
         if (hasParen) consume(TK::RPAREN, ")");

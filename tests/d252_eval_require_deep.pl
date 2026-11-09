@@ -1,0 +1,12 @@
+use strict;
+use warnings;
+my $f = "/tmp/pt_d252d_$$.pm";
+open my $fh, ">", $f or die "open: $!\n";
+print $fh "1;\n";
+close $fh;
+my $x = 0;
+my $r = eval { $x = 4; require $f };
+print "r=", defined($r) ? $r : "U", " x=$x\n";
+unlink $f;
+my $n = eval { 2 + 3 };
+print "n=$n\n";

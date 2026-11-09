@@ -16,13 +16,15 @@ regression baseline).
 
 ## State at handoff
 
-Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D231 landed
-2026-11-09 on top of it: block-value `if`, do-lib file-scope `my`,
-symmetric `qw`, and a `Pod::Simple->new` that matches perl. The open
-list is in TESTS.md ("Open after D231") and under "Recommended next
-move" at the bottom of this file. `Pod::Text` and `Pod::Man` are still
-skipped. `delete $$ref{key}`, `push`/`unshift` fat-comma, tie
-PRINT/FETCH/STORE magic, and `Encode->getEncoding` are still open.
+Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D256 landed
+on top of it. `Pod::Text` and `Pod::Man` are off the skip list. A
+small `parse_string_document` of each matches perl
+(`tests/d247_pod_text.sh`; the Man program is the same shape, with
+`SOURCE_DATE_EPOCH=0`). The open list is in TESTS.md ("Open after
+D256") and under "Recommended next move" at the bottom of this file.
+Tie PRINT/FETCH/STORE magic and `Encode->getEncoding` are still open.
+Runtime `require` finds the file (including host archlib, where
+`Encode.pm` lives) and returns true. It does not execute the file.
 
 - 2026-11-08 tree was clean at `7df4f3b` (D214: the runner + gate). The fixes described as reverted in the sections below were the pre-D215 attempts. D217 re-landed symmetric `qw`. The other three (`delete $$`, `push` fat-comma, `Encode->getEncoding`) stayed reverted.
 - Gate: **HOLD** (no gate=1 failure, no regression vs baseline).
@@ -145,13 +147,19 @@ is fixed on the `--do-lib` path (`do`/`require`): the slot is a
 module-level global again, and the PerlValue still comes from the D58
 registry. The inlined (non-`do`) compile already used a global.
 
-**D217–D231 landed (2026-11-09).** Symmetric `qw`, the Pod::Simple
-use-chain, and `Pod::Simple->new` / `$p->VERSION` /
-`$p->expand_verbatim_tabs` match perl (`tests/d227_pod_simple.sh`).
-Next for the Pod trio: take `Pod::Text` off the skip list after
-`delete $$ref{key}` and the `push`/`unshift` fat-comma parse, then
-whatever the next compile of Text.pm reports. `Pod::Man` stays skipped
-until its own parse error (around line 767) is done. A parse that
-PRINTs through `TiedOutFH` still diverges because `perl_tie` does not
-install PRINT magic. piconv's remaining failure is
-`Encode->getEncoding`, not the block-value gap.
+**D217–D256 landed (2026-11-09).** `make test-all` is 716/716. Symmetric `qw`, the Pod::Simple
+use-chain, and `Pod::Simple->new` match perl
+(`tests/d227_pod_simple.sh`). `Pod::Text` and `Pod::Man` compile and
+are inlined. The small NAME-section samples match perl, including
+Pod::Man's UTF-8 coding line. That line depends on `require Encode`
+being true: Encode.pm is in archlib, which D254 adds to the runtime
+search after `-I` and `PERL5LIB`. The require does not run the file.
+`Encode::encode` for the ASCII sample is the existing native function,
+reached because STDOUT has no UTF-8 PerlIO layer, so Pod::Man's
+`ENCODE` flag stays on.
+
+Next: install PRINT magic in `perl_tie` if a real pod2text/pod2man run
+writes through `TiedOutFH`, and `Encode->getEncoding` for piconv.
+`parent` stays on the skip list (ISA injection is already native).
+Do not refresh `tests/realworld/baseline-compare.txt` unless
+`COMPARE_BASELINE_UPDATE=1`.

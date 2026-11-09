@@ -760,8 +760,10 @@ void perl_print_array_fh(PerlValue *fh, PerlArray *a) {
     }
 }
 /* filehandle variant of perl_print_string (which targets the selected fh). */
+static PerlValue *fh_as_handle(PerlValue *fh);
 void perl_print_string_fh(PerlValue *fh, const char *s) {
-    if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
+    fh = fh_as_handle(fh);
+    if (!fh || !s || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     fputs(s, (FILE *)fh->pval);
 }
 
@@ -993,12 +995,54 @@ static void perl_set_dollar_at_cstr(const char *msg) {
     perl_assign(&s_dollar_at, &pv);
 }
 
+/* D251/D254: compile-time -I / use lib, then PERL5LIB, then the host
+   perl default @INC (site, vendor, arch, priv). require EXPR searches
+   these before lib/. Encode.pm lives in archlib, so -I privlib alone
+   is not enough for `require Encode` to match perl. */
+static char **s_inc_dirs = NULL;
+static int s_inc_count = 0;
+static int s_inc_cap = 0;
+
+void perl_inc_push(const char *dir) {
+    if (!dir || !*dir) return;
+    if (s_inc_count >= s_inc_cap) {
+        int ncap = s_inc_cap ? s_inc_cap * 2 : 8;
+        char **n = (char **)realloc(s_inc_dirs, (size_t)ncap * sizeof(char *));
+        if (!n) return;
+        s_inc_dirs = n;
+        s_inc_cap = ncap;
+    }
+    s_inc_dirs[s_inc_count++] = strdup(dir);
+}
+
+void perl_inc_load_env(void) {
+    const char *env = getenv("PERL5LIB");
+    if (!env || !*env) return;
+    char *copy = strdup(env);
+    if (!copy) return;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save))
+        perl_inc_push(tok);
+    free(copy);
+}
+
+static int perl_try_inc_file(const char *path, char *resolved, size_t resolved_sz) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    fclose(f);
+    snprintf(resolved, resolved_sz, "%s", path);
+    return 1;
+}
+
 static int perl_resolve_runtime_path(const char *name, int module_semantics,
                                      char *resolved, size_t resolved_sz) {
     char candidate[1024];
     if (!name || !*name) return 0;
 
-    if (module_semantics && strstr(name, "::")) {
+    /* A slash means a path (require "/tmp/x.pm", require "Foo/Bar.pm").
+       A bare module name, including one with no "::" (require Encode),
+       is NAME.pm with "::" turned into "/". */
+    if (module_semantics && !strchr(name, '/')) {
         size_t n = strlen(name);
         if (n >= sizeof(candidate) - 4) return 0;
         size_t j = 0;
@@ -1020,21 +1064,17 @@ static int perl_resolve_runtime_path(const char *name, int module_semantics,
         snprintf(candidate, sizeof(candidate), "%s", name);
     }
 
-    FILE *f = fopen(candidate, "r");
-    if (f) {
-        fclose(f);
-        snprintf(resolved, resolved_sz, "%s", candidate);
-        return 1;
+    if (perl_try_inc_file(candidate, resolved, resolved_sz)) return 1;
+
+    for (int ii = 0; ii < s_inc_count; ii++) {
+        char libpath[1024];
+        snprintf(libpath, sizeof(libpath), "%s/%s", s_inc_dirs[ii], candidate);
+        if (perl_try_inc_file(libpath, resolved, resolved_sz)) return 1;
     }
 
     char libpath[1024];
     snprintf(libpath, sizeof(libpath), "lib/%s", candidate);
-    f = fopen(libpath, "r");
-    if (f) {
-        fclose(f);
-        snprintf(resolved, resolved_sz, "%s", libpath);
-        return 1;
-    }
+    if (perl_try_inc_file(libpath, resolved, resolved_sz)) return 1;
 
     if (module_semantics) {
         char errmsg[1200];
@@ -6477,10 +6517,19 @@ PerlValue *perl_call_named_sub_checked(const char *name, PerlArray *args, int ct
         return perl_alloc_undef();
     }
 #endif
-    fprintf(stderr, "Undefined subroutine &%s called at %s line %d.\n",
-            qualname ? qualname : (name ? name : "(unknown)"),
-            file ? file : "-", line);
-    exit(255);
+    /* D243: this used to fprintf+exit(255), which an `eval` cannot
+       catch. Pod::Text::start_document does `eval { require PerlIO;
+       PerlIO::get_layers(...) }` and must survive a missing builtin
+       the same way a missing user sub dies into $@. */
+    {
+        const char *nm = qualname ? qualname : (name ? name : "(unknown)");
+        char buf[512];
+        snprintf(buf, sizeof buf, "Undefined subroutine &%s called", nm);
+        PerlValue *msg = perl_alloc_string(buf);
+        perl_die(msg, file, line);
+        perl_free(msg);
+        return perl_alloc_undef();
+    }
 }
 
 /* ── global (package) scalar registry (D58) ──────────────────────────────────
@@ -7259,7 +7308,11 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
             return NULL;
         }
     }
-    PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
+    /* D255: the caller already pushed the real wantarray (list for
+       `my @x = $obj->m`, scalar for `$obj->m`). Forcing 0 made
+       `return()` inside a method a one-element (undef) list. */
+    int ctx = perl_current_wantarray_ctx();
+    PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(ctx));
     perl_pop_wantarray();
     return result;
 }
@@ -7289,6 +7342,11 @@ PerlArray *perl_hash_pairs_array(PerlValue *pv) {
    name resolution). */
 PerlValue *perl_dispatch_method_sv(PerlValue *obj, PerlValue *method_pv,
                                    PerlArray *args) {
+    /* D250: $obj->$coderef(@args) invokes the code ref with the
+       invocant in front. Stringifying a code ref is "" and looks up
+       a method with an empty name. A string still names a method. */
+    if (method_pv && method_pv->tag == PERL_CODE_REF && method_pv->pval)
+        return perl_call_code_ref(method_pv, build_dispatch_args(obj, args));
     char *name = perl_to_string_dup(method_pv);
     PerlValue *r = perl_dispatch_method(obj, name ? name : "", args);
     free(name);
@@ -7318,7 +7376,8 @@ PerlValue *perl_dispatch_method_super(PerlValue *obj, const char *caller_pkg,
                 method, caller_pkg);
         exit(255);
     }
-    PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(0));
+    int ctx = perl_current_wantarray_ctx();
+    PerlValue *result = fn(build_dispatch_args(obj, args), perl_push_wantarray(ctx));
     perl_pop_wantarray();
     return result;
 }
@@ -7900,12 +7959,27 @@ static void fwrite_fh_bytes(PerlValue *fh, const PerlValue *v, FILE *fp) {
     free(s);
 }
 
+/* D240: `print { \*STDOUT }` stores a scalar ref whose target is the
+   FILEHANDLE (`\*STDOUT` is perl_ref_scalar of the stdout cell). Real
+   perl's print accepts that glob reference. A hash-stored copy
+   (Pod::Text's output_fh) is the same shape after perl_clone. */
+static PerlValue *fh_as_handle(PerlValue *fh) {
+    int depth = 0;
+    while (fh && fh->tag == PERL_REF_SCALAR && fh->pval && depth < 4) {
+        fh = (PerlValue *)fh->pval;
+        depth++;
+    }
+    return fh;
+}
+
 void perl_print_fh(PerlValue *fh, PerlValue *v) {
+    fh = fh_as_handle(fh);
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     fwrite_fh_bytes(fh, v, (FILE*)fh->pval);
 }
 
 void perl_say_fh(PerlValue *fh, PerlValue *v) {
+    fh = fh_as_handle(fh);
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     FILE *fp = (FILE*)fh->pval;
     fwrite_fh_bytes(fh, v, fp);
@@ -7922,6 +7996,7 @@ PerlValue *perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
 }
 
 PerlValue *perl_eof_fh(PerlValue *fh) {
+     fh = fh_as_handle(fh);
      if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return perl_alloc_int(1);
      /* D152: like perl, peek one char — feof() alone stays false right after
         the last line was read, so `while (!eof($fh))` ran one extra time. */
@@ -11193,6 +11268,24 @@ long long perl_regex_subst(PerlValue *str, const char *pattern, const char *repl
     return count;
 }
 
+/* D235: s///r. Clone, substitute the clone, return that string (not the
+   match count). A failed compile leaves the clone equal to the original,
+   which is what /r returns when nothing is rewritten. */
+PerlValue *perl_regex_subst_r(PerlValue *str, const char *pattern,
+                              const char *repl, const char *flags) {
+    char clean[64];
+    int ci = 0;
+    if (!flags) flags = "";
+    for (const char *fp = flags; *fp && ci < 63; fp++) {
+        if (*fp == 'r') continue;
+        clean[ci++] = *fp;
+    }
+    clean[ci] = '\0';
+    PerlValue *copy = perl_clone(str);
+    (void)perl_regex_subst(copy, pattern, repl, clean);
+    return copy;
+}
+
 /* D38c: s///e — call eval_fn once per match with $1/$& installed. */
 long long perl_regex_subst_e(PerlValue *str, const char *pattern, const char *flags,
                              PerlSubstEvalFn eval_fn, PerlArray *captures) {
@@ -11486,12 +11579,26 @@ void perl_clear_named_captures(void) {
 int perl_regex_match_g_bool(PerlValue *str, const char *pattern, const char *flags) {
     pcre2_code *re = regex_compile_cached(pattern, flags);
     if (!re) {
-        if (str) str->matchpos = 0;
+        if (str) { str->matchpos = 0; str->flags &= ~PV_FLAG_G_BUMP; }
         return 0;
     }
     ReSubj s = re_subject(str);
-    size_t startpos = (str && str->matchpos > 0 && (PCRE2_SIZE)str->matchpos <= s.len)
-                      ? (size_t)str->matchpos : 0;
+    /* D238: pos() is the end of the last successful match. A zero-width
+       match keeps that end (including 0) and bumps the NEXT start by one,
+       so a pattern that can match empty (`([^\n\r]*)(\r?\n?)` in
+       Pod::Simple::parse_string_document) does not rematch forever.
+       A start past the subject fails and clears pos, same as perl. */
+    size_t startpos = 0;
+    if (str && (str->flags & PV_FLAG_G_BUMP)) {
+        startpos = (size_t)(str->matchpos < 0 ? 0 : str->matchpos) + 1;
+    } else if (str && str->matchpos > 0) {
+        startpos = (size_t)str->matchpos;
+    }
+    if (startpos > s.len) {
+        if (str) { str->matchpos = 0; str->flags &= ~PV_FLAG_G_BUMP; }
+        if (s.owned) free(s.owned);
+        return 0;
+    }
     pcre2_match_data *md = re_match_data(re);
     int rc = pcre2_match(re, s.ptr, s.len, startpos, 0, md, NULL);
     if (rc > 0) {
@@ -11499,11 +11606,17 @@ int perl_regex_match_g_bool(PerlValue *str, const char *pattern, const char *fla
             install_match_captures(md, (const char *)s.ptr, rc, re);
         PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
         size_t mend = ov[1];
-        if (str) str->matchpos = (long long)(mend > startpos ? mend : mend + 1);
+        if (str) {
+            str->matchpos = (long long)mend;
+            if (mend == startpos)
+                str->flags |= PV_FLAG_G_BUMP;
+            else
+                str->flags &= ~PV_FLAG_G_BUMP;
+        }
         if (s.owned) free(s.owned);
         return 1;
     }
-    if (str) str->matchpos = 0;
+    if (str) { str->matchpos = 0; str->flags &= ~PV_FLAG_G_BUMP; }
     if (s.owned) free(s.owned);
     return 0;
 }
@@ -14826,6 +14939,25 @@ PerlValue *perl_uri_unescape(PerlValue *textPV) {
  * file is never inlined and the typeglob trick never runs. The 4 real
  * functions print/return the same bytes real Config does on this host. */
 #include "config_data.h"
+
+/* D254: stock perl @INC after -I and PERL5LIB. Empty vendor* values
+   (this host leaves them blank) are skipped. */
+void perl_inc_load_defaults(void) {
+    static const char *keys[] = {
+        "sitearch", "sitelib", "vendorarch", "vendorlib", "archlib", "privlib", NULL
+    };
+    for (int i = 0; keys[i]; i++) {
+        const char *v = NULL;
+        for (int j = 0; j < perlc_config_pairs_n; j++) {
+            if (strcmp(perlc_config_pairs[j].key, keys[i]) == 0) {
+                v = perlc_config_pairs[j].value;
+                break;
+            }
+        }
+        if (v && v[0] && v[0] != ' ')
+            perl_inc_push(v);
+    }
+}
 
 PerlValue *perl_config_get(PerlValue *keyPV) {
     char *key = keyPV ? perl_to_string_dup(keyPV) : NULL;
@@ -18226,7 +18358,15 @@ PerlValue *perl_can_check(PerlValue *obj, PerlValue *method_pv) {
     if (!obj || !method_pv) return perl_alloc_undef();
     char *method = perl_to_string_dup(method_pv);
     const char *cls = obj->blessed_class;
-    if (!cls) { free(method); return perl_alloc_undef(); }
+    if (!cls || !method) { free(method); return perl_alloc_undef(); }
+    /* D237: Pod::Simple accessors are dyn closures. can() has to see
+       them, including through @ISA, or Pod::Text->new takes the
+       legacy fullstop_space_harden branch. */
+    PerlValue *dyn = dyn_find_method(cls, method, 0);
+    if (dyn) {
+        free(method);
+        return perl_clone(dyn);
+    }
     PerlSubFnCtx fn = perl_find_method(cls, method);
     free(method);
     if (!fn) return perl_alloc_undef();
@@ -18344,12 +18484,16 @@ PerlArray *perl_each_hash(PerlHash *h) {
 
 PerlValue *perl_pos_str(PerlValue *pv) {
     if (!pv) return perl_alloc_undef();
+    /* D238: a zero-width match at offset 0 still has a defined pos of 0. */
+    if (pv->flags & PV_FLAG_G_BUMP)
+        return perl_alloc_int(pv->matchpos < 0 ? 0 : pv->matchpos);
     if (pv->matchpos <= 0) return perl_alloc_undef();
     return perl_alloc_int(pv->matchpos);
 }
 
 void perl_set_pos_str(PerlValue *pv, PerlValue *pos) {
     if (!pv) return;
+    pv->flags &= ~PV_FLAG_G_BUMP;
     if (!pos || pos->tag == PERL_UNDEF) { pv->matchpos = 0; return; }
     long long n = perl_to_int(pos);
     pv->matchpos = (n < 0) ? 0 : n;

@@ -372,7 +372,7 @@ scanExports(const std::vector<Token> &toks)
    Pragmas (strict/warnings/feature/parent/base/Exporter/Carp/POSIX/Scalar::Util etc)
    are handled or skipped.  Returns combined token list. */
 static std::vector<Token> inlineModules(
-         const std::vector<Token> &tokens,
+         std::vector<Token> tokens,
          const std::string &baseDir,
          std::set<std::string> &loaded,
          std::map<std::string,std::string> &importMap,
@@ -407,7 +407,6 @@ static std::vector<Token> inlineModules(
         "Text::CSV","Text::CSV_PP","Text::CSV_XS","Hash::Util",
         "Try::Tiny","List::MoreUtils","Term::ANSIColor","Encode",
         "Pod::Usage",
-        "Pod::Text","Pod::Man",
         "Archive::Tar",
         "App::Prove","App::Cpan","CPAN::Version",
         "ExtUtils::Packlist","ExtUtils::Installed",
@@ -450,7 +449,47 @@ static std::vector<Token> inlineModules(
         visibleUnqualified.insert(ownExports["EXPORT"].begin(), ownExports["EXPORT"].end());
     std::string currentPackage = "main";
 
-    for (size_t i = 0; i < tokens.size(); ) {
+    /* D246: a module's `BEGIN` before `use Other` must run before Other.
+       Real perl runs that BEGIN at compile time, then loads Other.
+       Hoisting every dependency to the front of the module runs Other
+       first, so `*FLAG = \&Parent::FLAG` copies nothing and a later
+       bareword stays the true string "FLAG". File-scope uses inside a
+       module are spliced at the use site, then the caller's package is
+       restored. The main script still hoists (a runtime statement
+       before `use` runs after the module). A require nested in a sub
+       stays hoisted so the module body is not pasted into the sub. */
+    size_t i = 0;
+    auto depthAt = [&](size_t pos) -> int {
+        int d = 0;
+        size_t n = pos < tokens.size() ? pos : tokens.size();
+        for (size_t k = 0; k < n; k++) {
+            TK tk = tokens[k].kind;
+            if (tk == TK::LBRACE || tk == TK::LPAREN || tk == TK::LBRACKET)
+                d++;
+            else if (tk == TK::RBRACE || tk == TK::RPAREN || tk == TK::RBRACKET) {
+                if (d > 0) d--;
+            }
+        }
+        return d;
+    };
+    auto placeExpanded = [&](std::vector<Token> expanded) {
+        if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK)
+            expanded.pop_back();
+        if (!isMainScript && depthAt(i) == 0) {
+            expanded.push_back({TK::KW_PACKAGE, "package", 0});
+            expanded.push_back({TK::IDENT,
+                currentPackage.empty() ? std::string("main") : currentPackage, 0});
+            expanded.push_back({TK::SEMI, ";", 0});
+            size_t n = expanded.size();
+            tokens.insert(tokens.begin() + static_cast<std::ptrdiff_t>(i),
+                          expanded.begin(), expanded.end());
+            i += n;
+        } else {
+            modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
+        }
+    };
+
+    for (; i < tokens.size(); ) {
         if (tokens[i].kind == TK::KW_PACKAGE && i + 1 < tokens.size() &&
             tokens[i+1].kind == TK::IDENT) {
             currentPackage = tokens[i+1].text;
@@ -510,7 +549,7 @@ static std::vector<Token> inlineModules(
                    resolve free variables by name through the global
                    registry, not through genuine lexical closure capture
                    over enclosing blocks. See TESTS.md D112. */
-                modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
+                placeExpanded(std::move(expanded));
                 return true;
             };
             /* absolute path: use directly */
@@ -1248,6 +1287,78 @@ static std::vector<Token> inlineModules(
             continue;
         }
 
+        /* D237: `use parent qw(Pod::Simple)` is a pragma, so the real
+           parent.pm never runs. That import both loads each base class
+           and pushes it onto the caller's @ISA. Do both here: inline a
+           base whose .pm is on disk (unless -norequire), then splice
+           `our @ISA = (...);` after this use so the existing ISA wiring
+           runs in the caller's package. Pod::Text's only link to
+           Pod::Simple is this statement. */
+        if (modName == "parent") {
+            bool norequire = false;
+            std::vector<std::string> bases;
+            for (auto &raw : explicitImports) {
+                std::string t = raw;
+                if (!t.empty() && t[0] == '\x01') t = t.substr(1);
+                if (t == "-norequire") { norequire = true; continue; }
+                if (t.empty() || t[0] == '-' || t[0] == ':') continue;
+                bases.push_back(t);
+            }
+            if (!norequire) {
+                std::vector<std::string> searchDirs = {
+                    baseDir, baseDir + "/lib", "lib", "lib/lib/perl5", "."
+                };
+                searchDirs.insert(searchDirs.begin(),
+                                  g_extraLibDirs.begin(), g_extraLibDirs.end());
+                for (auto &base : bases) {
+                    if (PRAGMAS.count(base) || loaded.count(base)) continue;
+                    std::string basePath = base;
+                    for (char &c : basePath) if (c == ':') c = '/';
+                    while (basePath.find("//") != std::string::npos)
+                        basePath.replace(basePath.find("//"), 2, "/");
+                    basePath += ".pm";
+                    for (auto &dir : searchDirs) {
+                        std::string fullPath = dir + "/" + basePath;
+                        if (access(fullPath.c_str(), R_OK) != 0) continue;
+                        loaded.insert(base);
+                        std::string src = readFile(fullPath);
+                        Lexer modLexer(src, fullPath);
+                        auto modToks = modLexer.tokenize();
+                        if (!modToks.empty() && modToks.back().kind == TK::EOF_TOK)
+                            modToks.pop_back();
+                        auto expanded = inlineModules(modToks, dirOf(fullPath), loaded,
+                                                      importMap, constMap, parser,
+                                                      /*isMainScript=*/false, {});
+                        if (!expanded.empty() && expanded.back().kind == TK::EOF_TOK)
+                            expanded.pop_back();
+                        placeExpanded(std::move(expanded));
+                        break;
+                    }
+                }
+            }
+            if (!bases.empty()) {
+                /* `tokens` is const, so the our @ISA cannot be spliced
+                   into the use site. Prepend it in the caller's package.
+                   The parser records that package on the decl, and the
+                   statement runs before the caller's body. */
+                modTokens.push_back({TK::KW_PACKAGE, "package", 0});
+                modTokens.push_back({TK::IDENT, currentPackage, 0});
+                modTokens.push_back({TK::SEMI, ";", 0});
+                modTokens.push_back({TK::KW_OUR, "our", 0});
+                modTokens.push_back({TK::ARRAY, "@", 0});
+                modTokens.push_back({TK::IDENT, "ISA", 0});
+                modTokens.push_back({TK::ASSIGN, "=", 0});
+                modTokens.push_back({TK::LPAREN, "(", 0});
+                for (size_t bi = 0; bi < bases.size(); bi++) {
+                    if (bi) modTokens.push_back({TK::COMMA, ",", 0});
+                    modTokens.push_back({TK::STRING, bases[bi], 0});
+                }
+                modTokens.push_back({TK::RPAREN, ")", 0});
+                modTokens.push_back({TK::SEMI, ";", 0});
+            }
+            continue;
+        }
+
         if (PRAGMAS.count(modName)) continue;
 
         /* convert Foo::Bar → Foo/Bar.pm */
@@ -1328,7 +1439,7 @@ static std::vector<Token> inlineModules(
             /* D112 is fixed in codegen.cpp (package-qualified global
                storage keys) — see the note in the `require` handler
                above for why a token-level block wrap was rejected. */
-            modTokens.insert(modTokens.end(), expanded.begin(), expanded.end());
+            placeExpanded(std::move(expanded));
 
             /* build import map from @EXPORT / explicit list */
             auto exports = scanExports(modToks);
@@ -1708,6 +1819,7 @@ int main(int argc, char **argv) {
         cg.setEnglishEnabled(parser.getEnglishEnabled());
         cg.setAutodieEnabled(parser.getAutodieEnabled());
         cg.setOpenStdUtf8(parser.getOpenStdUtf8());
+        cg.setIncDirs(g_extraLibDirs);
         cg.compile(*ast, inputFile, doLib, evalLib);
 
         if (emitIR) {

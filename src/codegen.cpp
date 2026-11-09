@@ -794,6 +794,9 @@ void CodeGen::declareRuntime() {
     RT("perl_dup2_fd",           pv, pv, pv);
     RT("perl_backtick",   pv, pv);
     RT("perl_init_argv",   av, Type::getInt32Ty(ctx_), i8p);
+    RT("perl_inc_push",    voidTy, i8p);
+    RT("perl_inc_load_env", voidTy);
+    RT("perl_inc_load_defaults", voidTy);
     RT("perl_get_dollar0", pv);
     RT("perl_set_dollar0", voidTy, i8p);
     /* Stage 45 (autopar): persistent-pool fan-out for FK counted loops */
@@ -841,6 +844,7 @@ void CodeGen::declareRuntime() {
     RT("perl_regex_match_all", av,  pv, i8p, i8p);
     RT("perl_set_match_globals_needed", voidTy, Type::getInt32Ty(ctx_), Type::getInt32Ty(ctx_));
     RT("perl_regex_subst",     i64, pv, i8p, i8p, i8p);
+    RT("perl_regex_subst_r",   pv,  pv, i8p, i8p, i8p);
     RT("perl_regex_subst_e",   i64, pv, i8p, i8p, i8p, av);
     RT("perl_capture",         pv,  i64);
     RT("perl_split_regex",     av,  i8p, i8p, pv, i64);
@@ -2390,7 +2394,17 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     }
     if (n.kind == NK::ArraySlice) {
         Value *av;
-        if (n.left) {              /* @{$aref}[...] or @$aref[...] */
+        if (n.sval == "list" && n.left) {
+            /* D249: (LIST)[i,j,k]. Evaluate the list once. Do not
+               treat the value as an array reference. */
+            av = emitArrayPtr(*n.left);
+            if (!av) {
+                av = callRT("perl_array_new", {});
+                Value *v = emitExpr(*n.left);
+                callRT("perl_array_push_list_or_scalar", {av, v});
+                freeIfOwned(v);
+            }
+        } else if (n.left) {              /* @{$aref}[...] or @$aref[...] */
             Value *ref = emitExpr(*n.left);
             av = callRT("perl_deref_array", {ref});
             freeIfOwned(ref);
@@ -3628,7 +3642,14 @@ Value *CodeGen::emitRegexMatchBool(const Node &n) {
                 Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
         Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "rmi_flg");
-        Value *hit = callRT("perl_regex_match_bool", {str, patC, flg});
+        /* D244: /g on an interpolated pattern (`m/\G.../xgo` in
+           Pod::Simple's formatter) must use the pos() iterator. The
+           non-global matcher always restarts at 0, so a successful
+           match makes `while ($s =~ m/.../g)` run forever. */
+        bool isG = n.name.find('g') != std::string::npos;
+        Value *hit = callRT(isG ? "perl_regex_match_g_bool"
+                                 : "perl_regex_match_bool",
+                            {str, patC, flg});
         Function *freeFn = rtFuncs_.count("free")
             ? rtFuncs_["free"]
             : (rtFuncs_["free"] = Function::Create(
@@ -6982,6 +7003,12 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         auto *initEntry = BasicBlock::Create(ctx_, "entry", initFn);
         builder_.SetInsertPoint(initEntry);
 
+        /* D251/D254: -I and use lib, then PERL5LIB, then host @INC. */
+        for (const auto &dir : incDirs_)
+            callRT("perl_inc_push", {builder_.CreateGlobalStringPtr(dir)});
+        callRT("perl_inc_load_env", {});
+        callRT("perl_inc_load_defaults", {});
+
         if (debug_) {
             initFn->setSubprogram(currentSP_);
             builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
@@ -9881,6 +9908,14 @@ Value *CodeGen::emitBlockLast(const Node &n) {
         } else if (isLast && work->kind == NK::If) {
             /* D215: `do { if ... }`, a sub's implicit return, grep/sort. */
             result = captureTrailingIf(*work);
+        } else if (isLast && (work->kind == NK::RequireStmt || work->kind == NK::DoFile)) {
+            /* D252: `eval { require Encode }` is the block's value.
+               A bare RequireStmt is not an ExprStmt, so the old path
+               ran it and then returned undef. */
+            int savedCtx = callCtx_;
+            callCtx_ = -1;
+            result = emitExpr(*work);
+            callCtx_ = savedCtx;
         } else if (isLast && work->kind == NK::Return && !realReturnInBlockValue_) {
             /* Capture the return value without emitting a ret instruction.
                 The caller will handle the actual return. */
@@ -10744,6 +10779,31 @@ void CodeGen::emitStmt(const Node &n) {
                    branch-local one that the scope-cleanup free would then
                    fail to dominate. */
                 Value *pv;
+                /* D242: evaluate the initializer BEFORE this `my` is
+                   declared. `my $method = 'start_' . $method` must read
+                   the outer `$method` (Pod::Text::_handle_element_start).
+                   Declaring the new undef cell first made the RHS see
+                   that cell, so the call name collapsed to "start_".
+                   A block-entry hoist has already declared the new name;
+                   hide that slot for the duration of the initializer so
+                   the same outer binding is visible. */
+                Value *init = nullptr;
+                Value *hiddenSlot = nullptr;
+                bool hidName = false;
+                if (n.right) {
+                    /* Hide only a hoist of THIS declaration. A previous
+                       `my` of the same name in this block must stay
+                       visible to the initializer (`my $x = 1; my $x = $x`). */
+                    bool hoisted = myHoisitNames_.count(nm) || blockEntryMy_.count(nm);
+                    if (hoisted && !scopes_.empty() && scopes_.back().count(nm)) {
+                        hiddenSlot = scopes_.back()[nm];
+                        scopes_.back().erase(nm);
+                        hidName = true;
+                    }
+                    init = emitExpr(*n.right);
+                    if (hidName)
+                        scopes_.back()[nm] = hiddenSlot;
+                }
                 /* D223: a block-entry hoist (goto past this my) lives in
                    the current scope and must be reused. Erase the name so
                    a second `my` of the same name in this block allocates
@@ -10764,7 +10824,6 @@ void CodeGen::emitStmt(const Node &n) {
                     declareVar(nm, alloca);
                 }
                 if (n.right) {
-                    Value *init = emitExpr(*n.right);
                     callRT("perl_assign", {pv, init});
                     freeIfOwned(init);
                 }
@@ -12201,6 +12260,17 @@ void CodeGen::emitStmt(const Node &n) {
 
     case NK::PackageStmt:
         currentPackage_ = n.sval;
+        /* D239: package NAME VERSION stores the version text in the
+           package scalar. Real perl wraps a version object; the string
+           form ("v6.0.2", "1.23") is what print and eq see. */
+        if (!n.name.empty()) {
+            std::string key = n.sval + "::VERSION";
+            Value *k = builder_.CreateGlobalStringPtr(key, "pkg.ver.key");
+            Value *cell = callRT("perl_glob_get_scalar", {k});
+            Value *ver = perlStr(n.name);
+            callRT("perl_assign", {cell, ver});
+            freeIfOwned(ver);
+        }
         break;
 
     default:
@@ -12689,6 +12759,17 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RequireStmt: {
+        /* D234: require EXPR. The string value is the filename (or a
+           module name). perl_runtime_require does not take ownership of
+           the buffer. */
+        if (n.name == "expr" && n.left) {
+            Value *pv = emitExpr(*n.left);
+            Value *cs = callRT("perl_to_string_dup", {pv});
+            freeIfOwned(pv);
+            Value *r = callRT("perl_runtime_require", {cs});
+            builder_.CreateCall(getRTFunc("free"), {cs});
+            return r;
+        }
         if (n.sval.empty()) return perlInt(1); /* require VERSION */
         Value *modStr = builder_.CreateGlobalStringPtr(n.sval);
         return callRT("perl_runtime_require", {modStr});
@@ -12839,7 +12920,14 @@ Value *CodeGen::emitExpr(const Node &n) {
         return perlUndef();
     }
 
-    case NK::BinOp:     return emitBinOp(n);
+    case NK::BinOp:
+        /* D249: comma operator inside $ref->[3,1]. Left runs, right is
+           the value. List slices use ArraySlice, not this operator. */
+        if (n.sval == ",") {
+            if (n.left) freeIfOwned(emitExpr(*n.left));
+            return n.right ? emitExpr(*n.right) : perlUndef();
+        }
+        return emitBinOp(n);
 
     case NK::UnaryOp: {
         if (n.sval == "-") {
@@ -13328,6 +13416,34 @@ Value *CodeGen::emitExpr(const Node &n) {
             callRT("perl_hash_from_list", {hv, listArr});
             /* D150: scalar value is the RHS element count (pairs * 2,
                duplicates included), as in perl. */
+            return callRT("perl_array_len", {listArr});
+        }
+        /* D253: %$ref = LIST. Pod::Man does `%$self = (%$self, @opts)`.
+           Snapshot the RHS before clearing, and flatten hashes and
+           arrays in that list (a scalar emitExpr of %$ref is the
+           key count). */
+        if (n.left->kind == NK::DerefHash && n.left->left) {
+            Value *ref = emitExpr(*n.left->left);
+            Value *hv = callRT("perl_deref_hash", {ref});
+            freeIfOwned(ref);
+            Value *listArr = callRT("perl_array_new", {});
+            if (n.right && n.right->kind == NK::ArrayLit) {
+                for (auto &elem : n.right->args) {
+                    if (Value *sub = emitArrayPtr(*elem))
+                        callRT("perl_array_extend", {listArr, sub});
+                    else
+                        callRT("perl_array_push", {listArr, emitExpr(*elem)});
+                }
+            } else if (n.right) {
+                if (Value *src = emitArrayPtr(*n.right))
+                    callRT("perl_array_extend", {listArr, src});
+                else
+                    callRT("perl_array_push", {listArr, emitExpr(*n.right)});
+            }
+            if (hv) {
+                callRT("perl_hash_clear", {hv});
+                callRT("perl_hash_from_list", {hv, listArr});
+            }
             return callRT("perl_array_len", {listArr});
         }
         /* $$ref = val */
@@ -15424,13 +15540,25 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::DerefArray: {
+        /* Scalar/boolean context: the element count, same as `@arr` and
+           `$r->@*`. Returning the raw PerlArray* made `perl_is_true` read
+           the array header as a PerlValue (tag looked like undef), so
+           `return unless @{$self->{'paras'}}` was always taken
+           (Pod::Simple::_ponder_paragraph_buffer). List context still
+           goes through emitArrayPtr. */
         Value *ref = emitExpr(*n.left);
-        return callRT("perl_deref_array", {ref});
+        Value *av = callRT("perl_deref_array", {ref});
+        freeIfOwned(ref);
+        return callRT("perl_array_len", {av});
     }
 
     case NK::DerefHash: {
+        /* Scalar/boolean context is the key count (perl 5.26+). The raw
+           PerlHash* has the same boolean-context misread as DerefArray. */
         Value *ref = emitExpr(*n.left);
-        return callRT("perl_deref_hash", {ref});
+        Value *hv = callRT("perl_deref_hash", {ref});
+        freeIfOwned(ref);
+        return callRT("perl_hash_size", {hv});
     }
 
     case NK::PostfixDeref: {
@@ -15568,7 +15696,10 @@ Value *CodeGen::emitExpr(const Node &n) {
                 Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
         Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "rmi_flg");
-        Value *res = callRT("perl_regex_match", {str, patC, flg});
+        /* D244: same /g iterator as the condition path above. */
+        bool isG = n.name.find('g') != std::string::npos;
+        Value *res = callRT(isG ? "perl_regex_match_g" : "perl_regex_match",
+                            {str, patC, flg});
         freeIfOwned(patPv);
         freeIfOwned(str);
         return n.ival ? callRT("perl_not", {res}) : res;
@@ -15795,6 +15926,15 @@ Value *CodeGen::emitExpr(const Node &n) {
         }
 
         Value *rep  = builder_.CreateGlobalStringPtr(repl,   "rs_rep");
+        /* D235: s///r returns the substituted copy and leaves the
+           original alone. PerlIO builds a filename this way
+           (`$layer =~ s{::}{/}gr . '.pm'`). */
+        if (flags.find('r') != std::string::npos) {
+            std::string fl2;
+            for (char c : flags) if (c != 'r') fl2.push_back(c);
+            Value *flg2 = builder_.CreateGlobalStringPtr(fl2, "rs_flgr");
+            return callRT("perl_regex_subst_r", {str, pat, rep, flg2});
+        }
         Value *cnt  = callRT("perl_regex_subst", {str, pat, rep, flg});
         /* Real Perl's s/// returns "" (not 0) when nothing matched — the
            zero case stringifies empty. Branch on the count. */
@@ -15877,10 +16017,19 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::ArraySlice: {
-        /* Two forms:
+        /* Scalar context of a slice is the last selected element.
            (a) @arr[i,j,...]  — n.name non-empty, n.left null
            (b) $r->@[i,j,...] — n.name empty, n.left is a ref expr
-           Resolve the source array accordingly. */
+           (c) D249 (LIST)[i,j] — sval "list": the list, evaluated once.
+           List assignment uses emitArrayPtr. */
+        if (n.sval == "list") {
+            Value *av = emitArrayPtr(n);
+            if (!av) return perlUndef();
+            Value *len = callRT("perl_array_len_i64", {av});
+            auto *i64Ty = Type::getInt64Ty(ctx_);
+            Value *last = builder_.CreateSub(len, ConstantInt::get(i64Ty, 1), "lslice.last");
+            return callRT("perl_array_get", {av, last});
+        }
         Value *av  = nullptr;
         if (!n.name.empty()) {
             av = lookupArray(n.name);
@@ -15939,10 +16088,14 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::SpliceFunc: {
-        /* scalar context: return count of removed elements */
+        /* D256: scalar splice is the last removed element, or undef
+           when nothing was removed. emitArrayPtr already splices. */
         Value *av = emitArrayPtr(n);
         if (!av) return perlUndef();
-        return callRT("perl_array_len", {av});
+        Value *len = callRT("perl_array_len_i64", {av});
+        auto *i64Ty = Type::getInt64Ty(ctx_);
+        Value *last = builder_.CreateSub(len, ConstantInt::get(i64Ty, 1), "splice.last");
+        return callRT("perl_array_get", {av, last});
     }
 
     case NK::DollarAt:
@@ -16591,23 +16744,21 @@ Value *CodeGen::emitExpr(const Node &n) {
         Value *obj = emitExpr(*n.left);
         Value *argsArr = callRT("perl_array_new", {});
         for (auto &arg : n.args) {
-            if (arg->kind == NK::ArrayVar) {
-                Value *av = lookupArray(arg->name);
-                if (av) { callRT("perl_array_extend", {argsArr, av}); continue; }
-            }
-            /* D198: method args are list context like sub-call args — a
-               ternary argument must flatten through the same list branch
-               collection (emitExpr would scalar-collapse the branch). */
-            if (arg->kind == NK::BinOp && arg->sval == "?:") {
-                Value *sub = emitArrayPtr(*arg);
-                if (sub) { callRT("perl_array_extend", {argsArr, sub}); continue; }
-            }
-            Value *v = emitExpr(*arg);
-            /* read/sysread mutate the buffer scalar in place. */
-            if ((n.sval == "read" || n.sval == "sysread") && arg == n.args[0])
+            /* read/sysread mutate the buffer scalar in place. A list
+               in that slot is not a buffer, so it still flattens. */
+            if ((n.sval == "read" || n.sval == "sysread") && arg == n.args[0]
+                && arg->kind != NK::ArrayVar && arg->kind != NK::HashVar
+                && arg->kind != NK::DerefArray && arg->kind != NK::DerefHash
+                && arg->kind != NK::ArrayLit) {
+                Value *v = emitExpr(*arg);
                 callRT("perl_array_push_nc", {argsArr, v});
-            else
-                callRT("perl_array_push", {argsArr, v});
+                continue;
+            }
+            /* D245: method arguments are list context, same as sub
+               calls. emitExpr(@$ref) is the element count (D241);
+               flattenArgInto spreads the elements. Pod::Simple walks
+               a paragraph with `$self->_traverse_treelet_bit(@$para)`. */
+            flattenArgInto(argsArr, *arg);
         }
         /* isa / can — UNIVERSAL methods */
         if (n.sval == "isa") {
