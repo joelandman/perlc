@@ -328,12 +328,29 @@ because they need `-I`.
   in place. `tests/d257_tie_print_{smoke,deep}.pl`.
   `tests/d257_pod_text_string.sh` (needs `-I`) matches perl for
   `Pod::Text`'s `output_string` NAME-section sample.
+- **D258** (2026-11-10) the rest of that print path. `ref` is a named
+  unary: `!ref $a and !ref $b` is two calls, and a bare `ref` before
+  `and` / `or` / `?` is `ref $_`. A non-`/r` `s///` writes through an
+  lvalue, so `$para->[0] =~ s/^[~=]//` updates the element. An
+  expression-level bare `s///` interpolates `$width` in the pattern
+  (`Pod::Text::wrap`). A one-element `foreach` of an lvalue aliases
+  that cell. `(LIST)[i]` is a list slice for one index as well
+  (`(grep { ... } @a)[-1]`, `(10,20,30)[1]`). `(LIST)->[i]` stays a
+  scalar subscript of the last element (`(pop @$a)->[1]{'~type'}`).
+  `@$ref = LIST` and `$ref->@* = LIST` collect the right-hand side,
+  then replace the array (`@$ell = (@$ell[0,1], @$link_text)`).
+  `tests/d258_ref_subst_{smoke,deep}.pl`.
+  `tests/d258_pod_text_fmt.sh` (needs `-I`) matches perl for a
+  Pod::Text page with `L<>` / `C<>` / `B<>` / `I<>`, `=over` /
+  `=item` / `=back`, and a verbatim block (width 40, `quotes => '"'`,
+  `sentence => 1`).
 
 `make test-all` after D257: 718 compared, 718 PASS, 0 FAIL.
+`make test-all` after D258: 720 compared, 720 PASS, 0 FAIL.
 
-**Open after D257 (2026-11-09).** Tied `PRINT` / `PRINTF` match perl,
-including the Pod::Text `output_string` sample. These still block a
-full pod2man / piconv run:
+**Open after D258 (2026-11-10).** Pod::Text's formatted
+`output_string` page matches perl. These still block a full pod2man /
+piconv run:
 
 - Scalar `FETCH` / `STORE` are not installed. `TiedOutFH` does not
   need them (`$$$it` is an ordinary deref). `$hash{key}++` still

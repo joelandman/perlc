@@ -16,14 +16,16 @@ regression baseline).
 
 ## State at handoff
 
-Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D257 landed
+Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D258 landed
 on top of it. `Pod::Text` and `Pod::Man` are off the skip list. A
 small `parse_string_document` of each matches perl
 (`tests/d247_pod_text.sh`; the Man program is the same shape, with
 `SOURCE_DATE_EPOCH=0`). `Pod::Text`'s `output_string` path matches
 too (`tests/d257_pod_text_string.sh`): tied `PRINT`/`PRINTF` write
-through `$$$it`. The open list is in TESTS.md ("Open after D257")
-and under "Recommended next move" at the bottom of this file.
+through `$$$it`. A formatted page (links, wrap, items, verbatim)
+matches in `tests/d258_pod_text_fmt.sh`. The open list is in TESTS.md
+("Open after D258") and under "Recommended next move" at the bottom
+of this file.
 Scalar FETCH/STORE and `Encode->getEncoding` are still open.
 Runtime `require` finds the file (including host archlib, where
 `Encode.pm` lives) and returns true. It does not execute the file.
@@ -165,6 +167,16 @@ Tied handles call `PRINT` / `PRINTF` / `CLOSE` / `UNTIE`. `$$$name`
 is a nested scalar deref, so `TiedOutFH`'s `$$$it .= $x` updates the
 caller's scalar. Scalar `FETCH` / `STORE` are still absent.
 `$hash{key}++` still does not stick.
+
+**D258 (2026-11-10).** `make test-all` is 720/720. The formatted Pod::Text page matches
+perl (`tests/d258_pod_text_fmt.sh`): `L<Widget|Widget>` prints
+`Widget`, the width-40 wrap breaks where perl breaks, `=item` text
+is indented, and `=back` restores the margin so the following
+verbatim block and paragraph match. The pieces are named-unary
+`ref`, in-place `s///` on an element lvalue, pattern interpolation
+in an expression-level bare `s///`, a one-element `foreach` that
+aliases the cell, `(LIST)[i]` as a one-index list slice, scalar
+context for `(LIST)->[i]`, and `@$ref = LIST`.
 
 Next: `Encode->getEncoding` for piconv.
 `parent` stays on the skip list (ISA injection is already native).

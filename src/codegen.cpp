@@ -11711,6 +11711,28 @@ void CodeGen::emitStmt(const Node &n) {
             NK k = n.args[0]->kind;
             ownsTmpArr = tmpArr && (k != NK::ArrayVar && k != NK::DerefArray);
         }
+
+        /* One lvalue (`foreach my $line ($para->[$i])`) aliases that
+           cell. Pushing a clone made `s///` on the loop var a no-op
+           on the source, which is how Pod::Simple strips verbatim
+           indent. The temp array borrows the cell and is freed with
+           perl_array_free_nc. */
+        bool ncTmp = false;
+        if (!tmpArr && n.args.size() == 1) {
+            NK k = n.args[0]->kind;
+            bool oneLv = k == NK::ArrayElem || k == NK::ArrowDeref ||
+                         k == NK::DerefScalar || k == NK::ScalarVar ||
+                         k == NK::HashElem;
+            if (oneLv) {
+                if (Value *slot = emitLValue(*n.args[0])) {
+                    tmpArr = callRT("perl_array_new", {});
+                    ownsTmpArr = true;
+                    ncTmp = true;
+                    Value *cell = builder_.CreateLoad(perlPtrTy_, slot, "fe.cell");
+                    callRT("perl_array_push_nc", {tmpArr, cell});
+                }
+            }
+        }
         if (!tmpArr) {
             tmpArr = callRT("perl_array_new", {});
             ownsTmpArr = true;
@@ -11782,7 +11804,8 @@ void CodeGen::emitStmt(const Node &n) {
         loopRedos_.pop_back();
         if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
-        if (ownsTmpArr) callRT("perl_array_free", {tmpArr});
+        if (ownsTmpArr)
+            callRT(ncTmp ? "perl_array_free_nc" : "perl_array_free", {tmpArr});
         break;
     }
 
@@ -13465,6 +13488,39 @@ Value *CodeGen::emitExpr(const Node &n) {
                 callRT("perl_hash_from_list", {hv, listArr});
             }
             return callRT("perl_array_len", {listArr});
+        }
+        /* D258: @$ref = LIST and $ref->@* = LIST. Pod::Simple replaces an
+           L-node's children with `@$ell = (@$ell[0,1], splice @$link_text)`.
+           emitLValue has no DerefArray arm, so the write was a no-op and
+           the original `Widget|Widget` text stayed. Collect the RHS first
+           (it may slice this same array) then perl_array_replace. */
+        if (n.left && n.left->left &&
+            (n.left->kind == NK::DerefArray ||
+             (n.left->kind == NK::PostfixDeref && n.left->sval == "all_array"))) {
+            Value *ref = emitExpr(*n.left->left);
+            Value *av = callRT("perl_deref_array", {ref});
+            freeIfOwned(ref);
+            int savedCtx = callCtx_;
+            callCtx_ = 1;
+            Value *rhsArr = n.right ? emitArrayPtr(*n.right) : nullptr;
+            callCtx_ = savedCtx;
+            bool ownRhs = false;
+            if (!rhsArr) {
+                rhsArr = callRT("perl_array_new", {});
+                ownRhs = true;
+                if (n.right &&
+                    !(n.right->kind == NK::ArrayLit && n.right->args.empty())) {
+                    callCtx_ = 1;
+                    Value *v = emitExpr(*n.right);
+                    callCtx_ = savedCtx;
+                    callRT("perl_array_push_list_or_scalar", {rhsArr, v});
+                    freeIfOwned(v);
+                }
+            }
+            if (av) callRT("perl_array_replace", {av, rhsArr});
+            Value *len = callRT("perl_array_len", {av ? av : rhsArr});
+            if (ownRhs) callRT("perl_array_free", {rhsArr});
+            return len;
         }
         /* $$ref = val */
         if (n.left->kind == NK::DerefScalar) {
@@ -15614,11 +15670,17 @@ Value *CodeGen::emitExpr(const Node &n) {
                 return callRT("perl_array_get_ref", {av, emitIdx(*n.right)});
             }
         }
-        /* (LIST)[i] — list-producing expression used directly as array source */
+        /* List-producing expression used directly as the array source.
+           D258: a parenthesized list (ArrayLit, including one-element
+           `(pop @$a)`) is scalar context here — the last element, then
+           the subscript. Indexing the list made `(pop @$curr)->[1]`
+           read past a 1-element temporary, so Pod::Simple's `=back`
+           built the end name `over-` and never restored MARGIN.
+           `(LIST)[i]` without the arrow is NK::ArraySlice, not this. */
         if (n.sval == "array" && n.left) {
             static auto isListNode = [](NK k) {
                 return k == NK::SortFunc || k == NK::MapFunc || k == NK::GrepFunc ||
-                       k == NK::ReverseFunc || k == NK::ArrayLit || k == NK::CallerFunc ||
+                       k == NK::ReverseFunc || k == NK::CallerFunc ||
                        k == NK::Call || k == NK::PostfixDeref;
             };
             if (isListNode(n.left->kind)) {
@@ -15758,20 +15820,31 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RegexSubst: {
-        /* Statement-level `s///` on `$_` has n.left == nullptr. */
-        Value *str;
-        if (n.left) {
-            str = emitExpr(*n.left);
-        } else {
-            /* Default to $_ */
-            if (auto *slot = lookupVar("_"))
-                str = builder_.CreateLoad(perlPtrTy_, slot, "subst_default");
-            else
-                str = perlUndef();
-        }
+        /* Statement-level `s///` on `$_` has n.left == nullptr.
+           D258: a non-/r target that is an lvalue is mutated in place.
+           emitExpr of `$para->[0]` goes through perl_cplx_elem, a copy,
+           so `s///` never reached the element. Pod::Simple strips a
+           leading `=` from the directive name this way. */
         size_t sep = n.name.find('\x01');
         std::string repl  = n.name.substr(0, sep);
         std::string flags = n.name.substr(sep + 1);
+        bool isR = flags.find('r') != std::string::npos;
+        Value *str = nullptr;
+        if (n.left && !isR) {
+            if (Value *lv = emitLValue(*n.left))
+                str = builder_.CreateLoad(perlPtrTy_, lv, "subst.lv");
+        }
+        if (!str) {
+            if (n.left) {
+                str = emitExpr(*n.left);
+            } else {
+                /* Default to $_ */
+                if (auto *slot = lookupVar("_"))
+                    str = builder_.CreateLoad(perlPtrTy_, slot, "subst_default");
+                else
+                    str = perlUndef();
+            }
+        }
         /* s/$var.../ pattern interpolation: when n.right is set (the
            pattern was parsed as an InterpolatedStr AST), build the pattern
            at runtime; otherwise it's the compile-time literal. */

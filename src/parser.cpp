@@ -3198,11 +3198,13 @@ NodePtr Parser::parseSubscript(NodePtr base, int line) {
         if (isSubscriptableK(base->kind) && check(TK::LBRACKET)) {
             advance();
             NodeList idxs;
-            bool slice = parseBracketIndices(idxs);
+            (void)parseBracketIndices(idxs);
             consume(TK::RBRACKET, "]");
-            /* (gmtime($t))[5,4,3] is a list slice. $x[3,1] is the
-               comma operator (multidimensional subscript), last index. */
-            if (slice && isListSliceBase(base->kind)) {
+            /* (gmtime($t))[5,4,3] and (grep)[-1] are list slices,
+               one index included. The arrow form (LIST)->[i] is the
+               branch above and stays a scalar subscript. $x[3,1] is
+               the comma operator (multidimensional subscript). */
+            if (isListSliceBase(base->kind)) {
                 auto n = std::make_unique<Node>(); n->kind = NK::ArraySlice;
                 n->line = line; n->sval = "list";
                 n->args = std::move(idxs);
@@ -4383,18 +4385,26 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* ref($x) */
+    /* ref($x). Named unary, same bound as defined: the no-paren
+       argument stops at comparisons, so `!ref $a and !ref $b` is two
+       calls and `ref $x ? 1 : 0` tests the result. parseExpr() here
+       swallowed the `and` (Pod::Simple's `_wrap_up` then stringified
+       formatting-code nodes). A bare `ref` before and/or/? is `ref $_`. */
     if (check(TK::KW_REF)) {
         advance();
         bool hasParen = match(TK::LPAREN);
         TK rnx = cur().kind;
         if (rnx == TK::RBRACE || rnx == TK::SEMI || rnx == TK::RPAREN ||
-            rnx == TK::COMMA || rnx == TK::EOF_TOK) {
+            rnx == TK::COMMA || rnx == TK::EOF_TOK ||
+            rnx == TK::KW_AND || rnx == TK::KW_OR ||
+            rnx == TK::AND || rnx == TK::OR || rnx == TK::DEFINED_OR ||
+            rnx == TK::QUESTION) {
             auto n = std::make_unique<Node>(); n->kind = NK::RefFunc;
             n->left = makeScalar("_", line); n->line = line;
+            if (hasParen) consume(TK::RPAREN, ")");
             return n;
         }
-        auto inner = parseExpr();
+        NodePtr inner = hasParen ? parseExpr() : parseShift();
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::RefFunc;
         n->left = std::move(inner); n->line = line;
@@ -5461,6 +5471,11 @@ NodePtr Parser::parsePrimary() {
         n->left = makeScalar("_", line);
         n->sval = txt.substr(0, s1);
         n->name = txt.substr(s1 + 1, s2 - s1 - 1) + "\x01" + txt.substr(s2 + 1);
+        /* D258: expression-level bare s/// (Pod::Text::wrap's
+           `s/^(.{0,$width})//`) must interpolate like `$x =~ s///`.
+           The statement form already did. */
+        if (NodePtr interp = interpRegexPattern(n->sval, line))
+            n->right = std::move(interp);
         return n;
     }
     /* Bare tr/// — translate on $_ */
