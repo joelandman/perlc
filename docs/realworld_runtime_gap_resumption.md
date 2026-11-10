@@ -16,13 +16,15 @@ regression baseline).
 
 ## State at handoff
 
-Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D256 landed
+Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D257 landed
 on top of it. `Pod::Text` and `Pod::Man` are off the skip list. A
 small `parse_string_document` of each matches perl
 (`tests/d247_pod_text.sh`; the Man program is the same shape, with
-`SOURCE_DATE_EPOCH=0`). The open list is in TESTS.md ("Open after
-D256") and under "Recommended next move" at the bottom of this file.
-Tie PRINT/FETCH/STORE magic and `Encode->getEncoding` are still open.
+`SOURCE_DATE_EPOCH=0`). `Pod::Text`'s `output_string` path matches
+too (`tests/d257_pod_text_string.sh`): tied `PRINT`/`PRINTF` write
+through `$$$it`. The open list is in TESTS.md ("Open after D257")
+and under "Recommended next move" at the bottom of this file.
+Scalar FETCH/STORE and `Encode->getEncoding` are still open.
 Runtime `require` finds the file (including host archlib, where
 `Encode.pm` lives) and returns true. It does not execute the file.
 
@@ -147,19 +149,24 @@ is fixed on the `--do-lib` path (`do`/`require`): the slot is a
 module-level global again, and the PerlValue still comes from the D58
 registry. The inlined (non-`do`) compile already used a global.
 
-**D217–D256 landed (2026-11-09).** `make test-all` is 716/716. Symmetric `qw`, the Pod::Simple
+**D217–D257 landed (2026-11-09).** `make test-all` is 718/718. Symmetric `qw`, the Pod::Simple
 use-chain, and `Pod::Simple->new` match perl
 (`tests/d227_pod_simple.sh`). `Pod::Text` and `Pod::Man` compile and
 are inlined. The small NAME-section samples match perl, including
-Pod::Man's UTF-8 coding line. That line depends on `require Encode`
-being true: Encode.pm is in archlib, which D254 adds to the runtime
-search after `-I` and `PERL5LIB`. The require does not run the file.
-`Encode::encode` for the ASCII sample is the existing native function,
-reached because STDOUT has no UTF-8 PerlIO layer, so Pod::Man's
-`ENCODE` flag stays on.
+Pod::Man's UTF-8 coding line and Pod::Text `output_string`
+(`tests/d257_pod_text_string.sh`). The coding line depends on
+`require Encode` being true: Encode.pm is in archlib, which D254 adds
+to the runtime search after `-I` and `PERL5LIB`. The require does not
+run the file. `Encode::encode` for the ASCII sample is the existing
+native function, reached because STDOUT has no UTF-8 PerlIO layer, so
+Pod::Man's `ENCODE` flag stays on.
 
-Next: install PRINT magic in `perl_tie` if a real pod2text/pod2man run
-writes through `TiedOutFH`, and `Encode->getEncoding` for piconv.
+Tied handles call `PRINT` / `PRINTF` / `CLOSE` / `UNTIE`. `$$$name`
+is a nested scalar deref, so `TiedOutFH`'s `$$$it .= $x` updates the
+caller's scalar. Scalar `FETCH` / `STORE` are still absent.
+`$hash{key}++` still does not stick.
+
+Next: `Encode->getEncoding` for piconv.
 `parent` stays on the skip list (ISA injection is already native).
 Do not refresh `tests/realworld/baseline-compare.txt` unless
 `COMPARE_BASELINE_UPDATE=1`.

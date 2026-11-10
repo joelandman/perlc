@@ -121,11 +121,14 @@ typedef struct PerlValue {
        (meaningless for other tags); `sval[slen]` is still always a NUL
        terminator for backward compatibility with any remaining
        strlen()-based consumer, but bytes *before* that position may
-       legitimately include 0x00. `_pad_reserved` exists solely to keep
-       sizeof(PerlValue) a multiple of 16 — the lock-free 16-byte CAS
-       (cmpxchg16b/ldxp+stxp, see perl_atomic_* and PerlValueAtomic16)
-       requires every slab-allocated PerlValue to stay 16-byte aligned,
-       which only holds if the struct's own size is a 16-byte multiple. */
+       legitimately include 0x00. `_pad_reserved` keeps sizeof(PerlValue)
+       a multiple of 16 — the lock-free 16-byte CAS (cmpxchg16b/ldxp+stxp,
+       see perl_atomic_* and PerlValueAtomic16) requires every
+       slab-allocated PerlValue to stay 16-byte aligned, which only holds
+       if the struct's own size is a 16-byte multiple. D257: on a
+       PERL_FILEHANDLE this field is the TIEHANDLE object (0 if untied).
+       Clones copy it, so a stored copy of the handle still prints
+       through PRINT. */
     long long slen;
     long long _pad_reserved;
 } PerlValue;

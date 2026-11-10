@@ -315,16 +315,29 @@ because they need `-I`.
   `tests/d255_method_wantarray_{smoke,deep}.pl`.
 - **D256** scalar `splice` returns the last removed element.
   `tests/d256_splice_scalar_{smoke,deep}.pl`.
+- **D257** a tied handle's `print` / `say` / `printf` call `PRINT` /
+  `PRINTF` once, with the raw arguments (`$,` and `$\` are not extra
+  arguments, and `say` does not add a newline argument). `printf`'s
+  return value is the method's return. `printf {$fh}` is the brace
+  filehandle form. `tie *$gensym` ties that handle. `$$$name` is two
+  scalar derefs (expressions and interpolated strings); bare `$$` is
+  still the pid. `bless \$lexical` keeps the lexical alive after the
+  constructor returns, so `Pod::Simple::TiedOutFH`'s `$$$it .= $x`
+  updates the caller's scalar. `untie` calls `UNTIE` when the method
+  exists. `close` on a tied handle calls `CLOSE` and leaves the tie
+  in place. `tests/d257_tie_print_{smoke,deep}.pl`.
+  `tests/d257_pod_text_string.sh` (needs `-I`) matches perl for
+  `Pod::Text`'s `output_string` NAME-section sample.
 
-`make test-all` after D256: 716 compared, 716 PASS, 0 FAIL.
+`make test-all` after D257: 718 compared, 718 PASS, 0 FAIL.
 
-**Open after D256 (2026-11-09).** The small Pod::Text and Pod::Man
-samples match. These still block a full pod2man / piconv run:
+**Open after D257 (2026-11-09).** Tied `PRINT` / `PRINTF` match perl,
+including the Pod::Text `output_string` sample. These still block a
+full pod2man / piconv run:
 
-- `perl_tie` calls `TIESCALAR` / `TIEARRAY` / `TIEHASH` / `TIEHANDLE`
-  and does not install FETCH, STORE, PRINT, or PRINTF magic. A parse
-  that writes through `Pod::Simple::TiedOutFH` (`$$$it .= $x`) still
-  diverges. The samples above do not take that path.
+- Scalar `FETCH` / `STORE` are not installed. `TiedOutFH` does not
+  need them (`$$$it` is an ordinary deref). `$hash{key}++` still
+  leaves the element unchanged; `$hash{key} .=` does update it.
 - Runtime `require` returns true when the file exists and does not
   run it. `Encode::encode` is the native function. `Encode->getEncoding`
   and loading Encode's own subs are still the piconv gap. `Encode`

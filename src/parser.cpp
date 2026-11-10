@@ -1952,7 +1952,15 @@ NodePtr Parser::parseUnshift() {
    form, `and printf`, and `return printf STDERR "..."`. */
 NodePtr Parser::parsePrintfBody(int line) {
     std::string fhname;
-    if (check(TK::IDENT) &&
+    NodePtr fhExpr;
+    /* D257: `printf {$fh} FMT, LIST` — same brace filehandle as print.
+       Pod::Simple and the tie tests write through a gensym this way.
+       The expression lives in n->right; the format stays in n->left. */
+    if (check(TK::LBRACE)) {
+        advance();
+        fhExpr = parseExpr();
+        consume(TK::RBRACE, "}");
+    } else if (check(TK::IDENT) &&
         (cur().text == "STDOUT" || cur().text == "STDERR" || cur().text == "STDIN" ||
          knownBareFH_.count(cur().text))) {
         fhname = cur().text; advance();
@@ -1989,6 +1997,7 @@ NodePtr Parser::parsePrintfBody(int line) {
     if (hasParen) consume(TK::RPAREN, ")");
     auto n = std::make_unique<Node>(); n->kind = NK::PrintfStmt; n->line = line;
     n->name = fhname; n->left = std::move(fmt); n->args = std::move(args);
+    if (fhExpr) n->right = std::move(fhExpr);
     return n;
 }
 
@@ -3313,6 +3322,11 @@ NodePtr Parser::parseTie(int line) {
         else if (k == NK::Typeglob) kind = 3;
     }
     n->ival = kind;
+    /* D257: `tie *OUT, ...` makes OUT a bare filehandle for later
+       `print OUT`. */
+    if (n->left && n->left->kind == NK::Typeglob && !n->left->left &&
+        !n->left->name.empty())
+        knownBareFH_.insert(n->left->name);
     match(TK::COMMA);
     /* A bareword class is a string. A quoted class goes through parseExpr
        so a double-quoted token's \x01 marker is stripped. */
@@ -4059,21 +4073,38 @@ NodePtr Parser::parsePrimary() {
             n->left = std::move(inner); n->line = line;
             return n;
         }
-        /* $$ — process ID or $$ref deref */
-        if (check(TK::SCALAR)) {
-            advance(); /* skip second $ */
-            /* check if next token is identifier-like (any token whose text is alphanumeric) */
+        /* $$ — process ID, or one or more scalar derefs.
+           Each '$' is its own SCALAR token, then the name. `$$it` is
+           one deref. `$$$it` is two (`${${$it}}`) — Pod::Simple::TiedOutFH
+           writes through `$$$it .= $x`. A run of '$' with no name is
+           the pid (`$$`); extra '$' tokens stay for the next term. */
+        if (check(TK::SCALAR) && cur().text == "$") {
+            size_t mark = pos_;
+            int extra = 0;
+            while (check(TK::SCALAR) && cur().text == "$") {
+                advance();
+                extra++;
+            }
             const std::string &nxt = cur().text;
-            bool isIdent = !nxt.empty() && (isalpha((unsigned char)nxt[0]) || nxt[0] == '_');
+            bool isIdent = !nxt.empty() &&
+                (isalpha((unsigned char)nxt[0]) || nxt[0] == '_');
             if (!isIdent) {
-                /* standalone $$ = process ID */
-                auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc; n->line = line;
+                pos_ = mark;
+                advance(); /* the one '$' that makes $$ */
+                auto n = std::make_unique<Node>();
+                n->kind = NK::GetpidFunc; n->line = line;
                 return n;
             }
             std::string nm = cur().text; advance();
-            auto n = std::make_unique<Node>(); n->kind = NK::DerefScalar;
-            n->left = makeScalar(nm, line); n->line = line;
-            return n;
+            NodePtr base = makeScalar(nm, line);
+            for (int i = 0; i < extra; i++) {
+                auto d = std::make_unique<Node>();
+                d->kind = NK::DerefScalar;
+                d->left = std::move(base);
+                d->line = line;
+                base = std::move(d);
+            }
+            return base;
         }
         std::string nm = cur().text; advance();
         auto sv = makeScalar(nm, line);
@@ -6413,30 +6444,38 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
            not fixed here, see TESTS.md. */
         if (raw[i] == '$' && i + 1 < raw.size() && raw[i+1] == '$') {
             flush();
-            bool isIdent = i + 2 < raw.size() &&
-                           (isalpha((unsigned char)raw[i+2]) || raw[i+2] == '_');
+            /* D257: `$$$name` is two derefs, same as the token parser.
+               A non-name after the dollars stays the pid (`$$`), and
+               any further '$' is rescanned. */
+            int extra = 0;
+            size_t j = i + 1;
+            while (j < raw.size() && raw[j] == '$') { extra++; j++; }
+            bool isIdent = j < raw.size() &&
+                           (isalpha((unsigned char)raw[j]) || raw[j] == '_');
             if (isIdent) {
-                i += 2;
+                i = j;
                 std::string vname;
                 while (i < raw.size() && (isalnum((unsigned char)raw[i]) || raw[i] == '_'))
                     vname += raw[i++];
-                auto n = std::make_unique<Node>(); n->kind = NK::DerefScalar;
-                n->left = makeScalar(vname, line); n->line = line;
+                NodePtr base = makeScalar(vname, line);
+                for (int k = 0; k < extra; k++) {
+                    auto d = std::make_unique<Node>();
+                    d->kind = NK::DerefScalar;
+                    d->left = std::move(base);
+                    d->line = line;
+                    base = std::move(d);
+                }
                 /* D120: $$name[i] / $$name{k} — a subscript immediately
-                   after a bare deref means ${name}[i] / ${name}{k}, i.e.
-                   the inner scalar is the ref being indexed (exactly one
-                   deref level). The token-level parser models this (D63)
-                   by unwrapping the DerefScalar to its inner scalar and
-                   emitting ArrowDeref("array"/"hash"); mirror that node
-                   shape here. Without this, "[0]"/"{k}" stayed literal
-                   text after the deref. */
-                if (i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
+                   after a single deref means ${name}[i] / ${name}{k}.
+                   Deeper `$$$name[i]` keeps the nested deref and leaves
+                   the brackets as following text. */
+                if (extra == 1 && i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
                     bool isArr = raw[i] == '[';
                     auto e = parseSubscriptGroup(raw, i, line, vname.c_str(), isArr);
                     parts.push_back(std::move(e));
                     continue;
                 }
-                parts.push_back(std::move(n));
+                parts.push_back(std::move(base));
             } else {
                 i += 2;
                 auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc; n->line = line;

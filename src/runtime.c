@@ -726,26 +726,82 @@ static void perl_set_dollar_question(int status) {
     s_dollar_question.ival = status;
 }
 
+/* D257: tied filehandles. The TIEHANDLE object lives in the handle's
+   _pad_reserved. print/say/printf call PRINT/PRINTF with the raw
+   argument list. $, $\ and say's newline are not extra arguments
+   (probed on 5.44: say OUT "c" is PRINT("c"), and $\ is not appended). */
+static PerlValue *fh_unwrap_handle(PerlValue *fh) {
+    int depth = 0;
+    while (fh && fh->tag == PERL_REF_SCALAR && fh->pval && depth < 4) {
+        fh = (PerlValue *)fh->pval;
+        depth++;
+    }
+    return fh;
+}
+
+static PerlValue *fh_tie_object(PerlValue *fh) {
+    fh = fh_unwrap_handle(fh);
+    if (!fh || fh->tag != PERL_FILEHANDLE || fh->_pad_reserved == 0)
+        return NULL;
+    return (PerlValue *)(uintptr_t)fh->_pad_reserved;
+}
+
+static PerlValue *selected_handle_pv(void);
+
+static PerlValue *tie_handle_cell(PerlValue *var) {
+    const char *name, *col;
+    PerlValue *cell;
+    if (!var) return NULL;
+    if (var->tag == PERL_STRING && var->sval && var->sval[0] == '*') {
+        name = var->sval + 1;
+        while ((col = strstr(name, "::")) != NULL)
+            name = col + 2;
+        if (!name[0]) return NULL;
+        if (strcmp(name, "STDOUT") == 0) return perl_get_stdout();
+        if (strcmp(name, "STDERR") == 0) return perl_get_stderr();
+        if (strcmp(name, "STDIN") == 0) return perl_get_stdin();
+        cell = perl_glob_get_scalar(name);
+        if (cell->tag != PERL_FILEHANDLE) {
+            cell->tag = PERL_FILEHANDLE;
+            cell->pval = NULL;
+        }
+        perl_glob_set_io(name, cell);
+        return cell;
+    }
+    cell = fh_unwrap_handle(var);
+    if (cell && cell->tag == PERL_FILEHANDLE) return cell;
+    return NULL;
+}
+
 void perl_print_sep(void) {
     if (s_dollar_comma.tag == PERL_UNDEF) return;
+    if (fh_tie_object(selected_handle_pv())) return;
     perl_print(&s_dollar_comma);
 }
 void perl_print_sep_fh(PerlValue *fh) {
     if (s_dollar_comma.tag == PERL_UNDEF) return;
+    if (fh_tie_object(fh)) return;
     perl_print_fh(fh, &s_dollar_comma);
 }
 void perl_print_ors(void) {
     if (s_dollar_bsl.tag == PERL_UNDEF) return;
+    if (fh_tie_object(selected_handle_pv())) return;
     perl_print(&s_dollar_bsl);
 }
 void perl_print_ors_fh(PerlValue *fh) {
     if (s_dollar_bsl.tag == PERL_UNDEF) return;
+    if (fh_tie_object(fh)) return;
     perl_print_fh(fh, &s_dollar_bsl);
 }
 
 /* forward decl — PerlArray defined later in this file */
 typedef struct PerlArray PerlArray;
 void perl_print_array(PerlArray *a) {
+    /* D257: one PRINT for the whole list when the selected handle is tied. */
+    if (a && fh_tie_object(selected_handle_pv())) {
+        perl_print_array_fh(selected_handle_pv(), a);
+        return;
+    }
     for (long long i = 0; i < a->len; i++) {
         if (i > 0) perl_print_sep();
         perl_print(a->elems[i]);
@@ -754,6 +810,11 @@ void perl_print_array(PerlArray *a) {
 /* filehandle variant of perl_print_array — used by print/say FH LIST, which
    evaluates the whole list before writing anything. */
 void perl_print_array_fh(PerlValue *fh, PerlArray *a) {
+    PerlValue *tied = fh_tie_object(fh);
+    if (tied) {
+        perl_dispatch_method(tied, "PRINT", a);
+        return;
+    }
     for (long long i = 0; i < a->len; i++) {
         if (i > 0) perl_print_sep_fh(fh);
         perl_print_fh(fh, a->elems[i]);
@@ -762,6 +823,10 @@ void perl_print_array_fh(PerlValue *fh, PerlArray *a) {
 /* filehandle variant of perl_print_string (which targets the selected fh). */
 static PerlValue *fh_as_handle(PerlValue *fh);
 void perl_print_string_fh(PerlValue *fh, const char *s) {
+    /* D257: say's trailing newline is a separate string write. A tied
+       handle's PRINT already received the arguments and does not get
+       that newline as another PRINT. */
+    if (fh_tie_object(fh)) return;
     fh = fh_as_handle(fh);
     if (!fh || !s || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     fputs(s, (FILE *)fh->pval);
@@ -1270,9 +1335,11 @@ PerlValue *perl_do_file(PerlValue *path_pv) {
    `tie VAR, CLASS, LIST` calls CLASS->TIESCALAR/TIEARRAY/TIEHASH/TIEHANDLE
    (LIST) and returns that object. kind is chosen by the parser from the
    variable shape (a glob is TIEHANDLE — Pod::Simple::TiedOutFH's
-   `tie *$new, $class, $x`). The tied variable is not given magic FETCH/
-   STORE here; callers that only need the constructor's return value
-   (and Pod::Simple's tie, which keeps the gensym glob) still run. */
+   `tie *$new, $class, $x`). D257: a handle remembers the object and
+   print/say/printf dispatch to PRINT/PRINTF. Scalar FETCH/STORE is
+   still not installed. */
+static PerlSubFnCtx perl_find_method(const char *class_name, const char *method);
+
 PerlValue *perl_tie(PerlArray *arr, int kind) {
     if (!arr || arr->len < 2) {
         perl_set_dollar_at_cstr("tie: need at least var and class");
@@ -1296,10 +1363,35 @@ PerlValue *perl_tie(PerlArray *arr, int kind) {
         perl_set_dollar_at_cstr("tie: class has no TIESCALAR/TIEARRAY/TIEHASH/TIEHANDLE");
         return result ? result : perl_alloc_undef();
     }
+    /* D257: keep a clone on the handle. The caller's return value can
+       be freed; the clone shares a blessed hash/scalar referent, so
+       PRINT and `$o->{log}` see the same object. */
+    if (kind == 3) {
+        PerlValue *cell = tie_handle_cell(arr->elems[0]);
+        /* A fresh glob scalar is still UNDEF. It is the handle. */
+        if (!cell && arr->elems[0] && arr->elems[0]->tag == PERL_UNDEF) {
+            cell = arr->elems[0];
+            cell->tag = PERL_FILEHANDLE;
+            cell->pval = NULL;
+        }
+        if (cell)
+            cell->_pad_reserved = (long long)(uintptr_t)perl_clone(result);
+    }
     return result;
 }
 
 void perl_untie(PerlValue *var_pv) {
+    PerlValue *cell = tie_handle_cell(var_pv);
+    if (cell && cell->_pad_reserved) {
+        PerlValue *obj = (PerlValue *)(uintptr_t)cell->_pad_reserved;
+        cell->_pad_reserved = 0;
+        if (obj && obj->blessed_class &&
+            perl_find_method(obj->blessed_class, "UNTIE")) {
+            PerlValue *r = perl_dispatch_method(obj, "UNTIE", NULL);
+            perl_free(r);
+        }
+        return;
+    }
     if (!var_pv || var_pv->tag == PERL_UNDEF) return;
 
     PerlValue *obj = var_pv;
@@ -1793,6 +1885,9 @@ PerlValue *perl_alloc_string(const char *s) {
     return perl_alloc_string_len(s, s ? (long long)strlen(s) : 0);
 }
 
+static void epad_bump_scalar(PerlValue *v);
+static void perl_release_capture(PerlValue *v);
+
 PerlValue *perl_clone(const PerlValue *src) {
     if (!src) return perl_alloc_undef();
     /* Sanity: if tag is bogus, fall back to undef instead of corrupting memory
@@ -1855,7 +1950,9 @@ PerlValue *perl_clone(const PerlValue *src) {
     else v->flags |= (src->flags & PV_FLAG_INT_MASK);   /* D154 */
     if (src->tag == PERL_FLOAT) v->flags |= (src->flags & PV_FLAG_IV_HINT);   /* D154 */
     v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
-    if (src->tag == PERL_REF_ARRAY && src->pval) {
+    if (src->tag == PERL_REF_SCALAR && src->pval) {
+        epad_bump_scalar((PerlValue *)src->pval);
+    } else if (src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
         if (av->refcount > 0) av->refcount++;
     } else if (src->tag == PERL_REF_HASH && src->pval) {
@@ -1891,6 +1988,7 @@ static PerlDBIStatement *perl_dbi_get_sth(PerlValue *pv);
 static void perl_dbi_handle_release(PerlDBIHandle *dbh);
 static void perl_dbi_statement_release(PerlDBIStatement *sth);
 static void perl_release_capture(PerlValue *v);   /* D62 */
+static void epad_bump_scalar(PerlValue *v);
 static void perl_closure_release(PerlClosure *cl); /* D62 */
 
 static inline unsigned pv_capture_count(const PerlValue *v) {
@@ -1983,6 +2081,8 @@ HOTX void perl_free(PerlValue *v) {
             free(qr);
         }
     }
+    if (v->tag == PERL_REF_SCALAR && v->pval)
+        perl_release_capture((PerlValue *)v->pval);
     if (v->tag == PERL_REF_ARRAY && v->pval) {
         PerlArray *av = (PerlArray *)v->pval;
         /* call DESTROY on blessed array objects */
@@ -2729,6 +2829,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
        mediate writes (e.g. array push, hash set) is not visibility-safe
        on its own — those callers must hold the cell's SharedMutex. */
     /* Acquire new reference first (handles self-assignment safely) */
+    if (src && src->tag == PERL_REF_SCALAR && src->pval)
+        epad_bump_scalar((PerlValue *)src->pval);
     if (src && src->tag == PERL_REF_ARRAY && src->pval) {
         PerlArray *av = (PerlArray *)src->pval;
         if (av->refcount > 0) av->refcount++;
@@ -2758,6 +2860,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         perl_digest_retain((PerlValue *)src);
     }
     /* Release old value */
+    if (dst->tag == PERL_REF_SCALAR && dst->pval)
+        perl_release_capture((PerlValue *)dst->pval);
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
     if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { flat_release_pv(dst); dst->pval = NULL; }   /* D208 */
     if (dst->tag == PERL_CPLX_ROW && dst->pval) {
@@ -3583,12 +3687,22 @@ static FILE *perl_selected_fp(void) {
     return stdout;
 }
 
+static PerlValue *selected_handle_pv(void) {
+    if (s_selected_inited && s_selected_fh.tag == PERL_FILEHANDLE)
+        return &s_selected_fh;
+    return perl_get_stdout();
+}
+
 void perl_print(const PerlValue *v) {
     /* D85: fwrite the true byte length instead of fputs — fputs stops at
        the first embedded NUL, silently truncating output for e.g. a
        pack()'d value being printed/written out (the direct binary-
        protocol use case that motivated this fix). */
     perl_sig_poll();
+    if (fh_tie_object(selected_handle_pv())) {
+        perl_print_fh(selected_handle_pv(), (PerlValue *)v);
+        return;
+    }
     long long n;
     char *s = perl_to_string_dup_len(v, &n);
     fwrite(s, 1, (size_t)n, perl_selected_fp());
@@ -3597,10 +3711,14 @@ void perl_print(const PerlValue *v) {
 
 void perl_say(const PerlValue *v) {
     perl_print(v);
-    fputc('\n', stdout);
+    /* D257: say on a tied handle is one PRINT of the arguments. The
+       newline is not a second write. */
+    if (!fh_tie_object(selected_handle_pv()))
+        fputc('\n', stdout);
 }
 
 void perl_print_string(const char *s) {
+    if (fh_tie_object(selected_handle_pv())) return;
     fputs(s, perl_selected_fp());
 }
 
@@ -5083,6 +5201,9 @@ PerlValue *perl_ref_scalar(PerlValue *v) {
     r->pval = v;
     r->matchpos = 0;
     r->blessed_class = NULL;
+    /* D257: \$lexical stays valid after the lexical's scope returns.
+       bless \$scalar_ref in a tie constructor is this shape. */
+    epad_bump_scalar(v);
     return r;
 }
 
@@ -7688,6 +7809,18 @@ PerlValue *perl_open2_fh(PerlValue *target, PerlValue *mode_file_pv) {
    that is not open (never opened, failed open, already closed) or a failed
    fclose — perl's close returns false ("") in all of those cases. */
 int perl_close_fh(PerlValue *fh) {
+    PerlValue *tied = fh_tie_object(fh);
+    if (tied) {
+        PerlValue *r = NULL;
+        int ok = 1;
+        if (tied->blessed_class && perl_find_method(tied->blessed_class, "CLOSE"))
+            r = perl_dispatch_method(tied, "CLOSE", NULL);
+        if (r) {
+            ok = perl_is_true(r);
+            perl_free(r);
+        }
+        return ok;
+    }
     if (fh && fh->tag == PERL_FILEHANDLE && fh->pval) {
         int r = fclose((FILE*)fh->pval);
         fh->pval = NULL;
@@ -7973,12 +8106,25 @@ static PerlValue *fh_as_handle(PerlValue *fh) {
 }
 
 void perl_print_fh(PerlValue *fh, PerlValue *v) {
+    PerlValue *tied = fh_tie_object(fh);
+    if (tied) {
+        PerlArray *one = perl_array_new();
+        perl_array_push(one, v ? v : perl_alloc_undef());
+        perl_dispatch_method(tied, "PRINT", one);
+        perl_array_free(one);
+        return;
+    }
     fh = fh_as_handle(fh);
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     fwrite_fh_bytes(fh, v, (FILE*)fh->pval);
 }
 
 void perl_say_fh(PerlValue *fh, PerlValue *v) {
+    /* D257: tied say is PRINT of the value alone. */
+    if (fh_tie_object(fh)) {
+        perl_print_fh(fh, v);
+        return;
+    }
     fh = fh_as_handle(fh);
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval) return;
     FILE *fp = (FILE*)fh->pval;
@@ -7987,6 +8133,20 @@ void perl_say_fh(PerlValue *fh, PerlValue *v) {
 }
 
 PerlValue *perl_printf_fh(PerlValue *fh, PerlValue *fmt, PerlArray *args) {
+    PerlValue *tied = fh_tie_object(fh);
+    if (tied) {
+        /* PRINTF(format, LIST). The method's return value is printf's. */
+        PerlArray *call = perl_array_new();
+        long long i;
+        perl_array_push(call, fmt);
+        if (args) {
+            for (i = 0; i < args->len; i++)
+                perl_array_push(call, args->elems[i]);
+        }
+        PerlValue *r = perl_dispatch_method(tied, "PRINTF", call);
+        perl_array_free(call);
+        return r ? r : perl_alloc_undef();
+    }
     PerlValue *s = perl_sprintf(fmt, args);
     if (!s) return perl_alloc_undef();
     perl_print_fh(fh, s);
@@ -12922,9 +13082,11 @@ PerlValue *perl_select_fh(PerlValue *newfh) {
     PerlValue *old = perl_alloc_undef();
     old->tag = PERL_FILEHANDLE;
     old->pval = s_selected_fh.pval;
-    if (newfh && newfh->tag == PERL_FILEHANDLE && newfh->pval) {
+    old->_pad_reserved = s_selected_fh._pad_reserved;
+    if (newfh && newfh->tag == PERL_FILEHANDLE) {
         s_selected_fh.tag = PERL_FILEHANDLE;
         s_selected_fh.pval = newfh->pval;
+        s_selected_fh._pad_reserved = newfh->_pad_reserved;
     }
     return old;
 }

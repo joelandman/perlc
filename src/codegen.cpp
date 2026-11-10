@@ -10056,7 +10056,11 @@ Value *CodeGen::emitPrintf(const Node &n) {
         }
     }
     Value *cnt;
-    if (n.name == "STDERR") {
+    if (n.right) {
+        /* D257: printf {$fh} — the brace expression is the handle. */
+        Value *fh = emitExpr(*n.right);
+        cnt = callRT("perl_printf_fh", {fh, fmt, av});
+    } else if (n.name == "STDERR") {
         cnt = callRT("perl_printf_fh", {callRT("perl_get_stderr", {}), fmt, av});
     } else if (!n.name.empty() && n.name != "STDOUT") {
         Value *fh = nullptr;
@@ -12823,9 +12827,25 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* D225: `return printf STDERR "..."` — the value is the count. */
         return emitPrintf(n);
     case NK::TieStmt: {
-        /* args array is (var, class, LIST...). ival is the tie kind. */
+        /* args array is (var, class, LIST...). ival is the tie kind.
+           D257: register the bare glob before emitting it so *OUT is
+           the handle cell, the same cell print OUT writes. */
+        if (n.left && n.left->kind == NK::Typeglob && !n.left->name.empty())
+            globNames_.insert(globBareName(n.left->name));
         Value *av = callRT("perl_array_new", {});
-        callRT("perl_array_push", {av, n.left ? emitExpr(*n.left) : perlUndef()});
+        /* The variable is the live cell. A clone would take the tie
+           object and leave print writing to the original handle.
+           *$new is a dyn typeglob: its normal emit stringifies the
+           name. Tie needs the handle that value already is (gensym). */
+        Value *var = perlUndef();
+        if (n.left && n.left->kind == NK::Typeglob &&
+            n.left->sval == "dyn" && n.left->left) {
+            Value *inner = emitExpr(*n.left->left);
+            var = callRT("perl_resolve_glob_io", {inner});
+        } else if (n.left) {
+            var = emitExpr(*n.left);
+        }
+        callRT("perl_array_push_nc", {av, var});
         for (auto &a : n.args)
             if (a) callRT("perl_array_push", {av, emitExpr(*a)});
         Value *kind = ConstantInt::get(Type::getInt32Ty(ctx_), (unsigned)n.ival);
