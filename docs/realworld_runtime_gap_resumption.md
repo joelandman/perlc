@@ -200,9 +200,15 @@ is numified, so `build_index` nests the second heading.
 perl's buffering, including under `stdbuf`. `make test-all` is
 746/746, then `D271_OK` and `D259_OK`.
 
-Next: scalar `FETCH`/`STORE`, or whatever the next runtime-survey
-failure is after `baseline-compare.txt` is refreshed on purpose.
-`parent` and `Encode` stay on the skip list. Do not refresh
-`tests/realworld/baseline-compare.txt` unless
+**D272–D276 (2026-11-11).** Arrow `++`/`--` mutates the element, and a
+numeric string numifies (`"3"++` is 4). A runtime `require` runs the
+file once via `--do-lib` and dies when the file is missing or false.
+`$obj->VERSION($need)` checks `$VERSION`. The dyn-sub table grows past
+256. `./perlc -g` verifies. `make test-all` is 754/754, then
+`D271_OK`, `D276_OK`, and `D259_OK`.
+
+Next: scalar `FETCH`/`STORE`. The D215 file-scope `do`/`sort` leftovers
+stay as they were. `parent` and `Encode` stay on the skip list. Do not
+refresh `tests/realworld/baseline-compare.txt` unless
 `COMPARE_BASELINE_UPDATE=1`. Do not stage
 `tests/realworld/last-compare-report.txt`.

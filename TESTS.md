@@ -426,6 +426,27 @@ because they need `-I`.
   merged capture matches perl. `tests/d271_stdio_buffer_{smoke,deep}.pl`.
   `tests/d271_stdio_buffer.sh` (part of `make test-all`) repeats the
   compare under `stdbuf -oL` and `stdbuf -o0`, and on a tty.
+- **D272** (2026-11-11) `++`/`--` on `$obj->{n}`, `$h->{a}`, `$row->[0]`,
+  and `$$r` load the element cell and mutate it. A numeric string
+  (`"3"++` is 4, `"3.5"++` is 4.5) is numified; a magical identifier
+  string (`"z"++` is `"aa"`) is unchanged. `tests/d272_arrow_inc_{smoke,deep}.pl`.
+- **D273** (2026-11-11) a runtime `require` compiles the file with
+  `--do-lib` and runs it in this process. A second require returns 1.
+  A missing file dies with `Can't locate ... in @INC`. A false return
+  dies with `did not return a true value`. Modules inlined at compile
+  time are marked loaded first, so the leftover `require` does not run
+  them again. `Encode` stays on the pragma list and is not executed.
+  `tests/d273_runtime_require_{smoke,deep}.pl` and `tests/lib/D273*.pm`.
+- **D274** (2026-11-11) `$obj->VERSION($need)` compares `$VERSION` as a
+  number and dies with perl's `version N required--this is only version`
+  text, or `does not define $Pkg::VERSION`. No-arg `->VERSION` is unchanged.
+  `tests/d274_version_req_{smoke,deep}.pl`.
+- **D275** (2026-11-11) the computed-glob sub table grows. Installing
+  300 closures keeps `d1` and `d300`. `tests/d275_dyn_sub_grow_{smoke,deep}.pl`.
+- **D276** (2026-11-11) `./perlc -g` gives `__perlc_init_globals` its own
+  `DISubprogram`, so verify no longer reports that `main`'s subprogram
+  is attached to two functions. `tests/d276_debug_subprogram.sh`
+  (part of `make test-all`).
 - **Config snapshot** (2026-11-11) `tools/gen_config_data.pl` regenerated
   `src/config_data.h` from this host. `perladmin` is `joe@marvin.(none)`.
   The curated `pod2html` page's mailto matches perl because of that.
@@ -435,33 +456,25 @@ because they need `-I`.
 `make test-all` after D259: 720 compared, 720 PASS, 0 FAIL, then `D259_OK`.
 `make test-all` after D260: 722 compared, 722 PASS, 0 FAIL, then `D259_OK`.
 `make test-all` after D271: 746 compared, 746 PASS, 0 FAIL, then `D271_OK` and `D259_OK`.
+`make test-all` after D276: 754 compared, 754 PASS, 0 FAIL, then `D271_OK`, `D276_OK`, and `D259_OK`.
 
-**Open after D271 (2026-11-11).** Curated stdin samples of `pod2text`,
+**Open after D276 (2026-11-11).** Curated stdin samples of `pod2text`,
 `pod2man` (`--name=Foo`, no `SOURCE_DATE_EPOCH`), and `pod2html` match
 perl, including `pod2html`'s 3-byte `pod2htmd.tmp`. These remain open:
 
 - Scalar `FETCH` / `STORE` are not installed. `TiedOutFH` does not
-  need them (`$$$it` is an ordinary deref). `$hash{key}++` still
-  leaves the element unchanged; `$hash{key} .=` does update it.
-- A direct runtime `require` returns true when the file exists and
-  does not run it. A constant `eval` that contains `require`, `use`,
-  or `do` does run the file (D268). `Encode::encode` and
-  `Encode->getEncoding` are native. Loading Encode's own subs is
-  still open. `Encode` stays on the pragma skip list.
-- `$obj->VERSION($v)` (the requirement form) is unimplemented.
-- The dyn-sub table holds 256 entries (`DYN_SUB_MAX`). A later install
-  is dropped with no diagnostic.
-- `eval "require No::Such; 1"` is `1` with an empty `$@`. Perl returns
-  undef and sets `$@`. A bare missing `require` does not die.
+  need them (`$$$it` is an ordinary deref). A tied hash element's
+  `++` does not call `FETCH`/`STORE`.
+- A constant `eval` that contains `require`, `use`, or `do` runs the
+  file (D268). `Encode::encode` and `Encode->getEncoding` are native.
+  Loading Encode's own subs is still open. `Encode` stays on the
+  pragma skip list.
 - Deliberately left from D215: a file-scope `do { return 5 }` whose
   `return` is not inside a value-`if` is swallowed; a file-scope
   list-context `do` yields the last element; `do { print }` is empty;
   `unless (my $y)` can leak at file scope; a non-last `return` inside
   a `sort` comparator's `if` still fails LLVM verify (i64 vs pointer
   return).
-- `./perlc -g` fails verify with `DISubprogram attached to more than
-  one function` on `main`. Debug backtraces into the compiler are
-  unavailable until that is fixed.
 
 Handoff detail: `docs/realworld_runtime_gap_resumption.md`.
 

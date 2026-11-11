@@ -603,7 +603,15 @@ static std::vector<Token> inlineModules(
                 /* strip .pm and convert / to :: for the loaded key */
                 if (modPath.size() > 3 && modPath.substr(modPath.size()-3) == ".pm")
                     modName = modPath.substr(0, modPath.size()-3);
-                for (char &c : modName) if (c == '/') c = ':';
+                /* "Foo/Bar.pm" and Foo::Bar are one loaded key. */
+                {
+                    std::string key;
+                    for (char c : modName) {
+                        if (c == '/') key += "::";
+                        else key += c;
+                    }
+                    modName = std::move(key);
+                }
             } else {
                 /* module name form: Foo::Bar */
                 modPath = rawName;
@@ -1910,6 +1918,7 @@ int main(int argc, char **argv) {
         cg.setAutodieEnabled(parser.getAutodieEnabled());
         cg.setOpenStdUtf8(parser.getOpenStdUtf8());
         cg.setIncDirs(g_extraLibDirs);
+        cg.setRequiredModules(std::vector<std::string>(loaded.begin(), loaded.end()));
         cg.compile(*ast, inputFile, doLib, evalLib);
 
         if (emitIR) {

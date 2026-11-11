@@ -884,6 +884,7 @@ void CodeGen::declareRuntime() {
     RT("perl_get_autoload_name", pv);
     RT("perl_set_pos_str",      voidTy, pv, pv);
     RT("perl_runtime_require",  pv, i8p);
+    RT("perl_req_mark",         voidTy, i8p);
     RT("perl_do_file",          pv, pv);
     RT("perl_call_named_sub",   pv, i8p, av, Type::getInt32Ty(ctx_));
     RT("perl_call_named_sub_checked", pv, i8p, av, Type::getInt32Ty(ctx_), i8p, i8p, Type::getInt32Ty(ctx_));
@@ -7060,10 +7061,22 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             callRT("perl_inc_push", {builder_.CreateGlobalStringPtr(dir)});
         callRT("perl_inc_load_env", {});
         callRT("perl_inc_load_defaults", {});
+        /* Inlined modules already ran as part of this program. A later
+           `require Name` must return true and not compile them again. */
+        for (const auto &name : requiredModules_)
+            callRT("perl_req_mark", {builder_.CreateGlobalStringPtr(name)});
 
         if (debug_) {
-            initFn->setSubprogram(currentSP_);
-            builder_.SetCurrentDebugLocation(getDebugLoc(1, currentSP_));
+            /* currentSP_ is main's subprogram. Attaching it here too
+               makes verify fail: one DISubprogram, two functions. */
+            auto *intTy = dib_->createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+            auto *subTy = dib_->createSubroutineType(dib_->getOrCreateTypeArray(intTy));
+            auto *initSP = dib_->createFunction(
+                cu_, "__perlc_init_globals", "__perlc_init_globals", file_, 1,
+                subTy, 1, llvm::DINode::FlagZero,
+                llvm::DISubprogram::SPFlagDefinition);
+            initFn->setSubprogram(initSP);
+            builder_.SetCurrentDebugLocation(getDebugLoc(1, initSP));
         }
 
         /* Save CodeGen state -- init function uses its own scope stack and
@@ -7362,6 +7375,12 @@ void CodeGen::compile(const Node &program, const std::string &modName,
         entryFn->getArg(1)->setName("ctx");
         auto *entry = BasicBlock::Create(ctx_, "entry", entryFn);
         builder_.SetInsertPoint(entry);
+
+        /* Same record as __perlc_init_globals: modules this .so already
+           inlined must not be compiled again when their leftover
+           `require` runs in the parent. */
+        for (const auto &name : requiredModules_)
+            callRT("perl_req_mark", {builder_.CreateGlobalStringPtr(name)});
 
         if (debug_) {
             entryFn->setSubprogram(currentSP_);
@@ -13107,12 +13126,16 @@ Value *CodeGen::emitExpr(const Node &n) {
                 }
             }
         }
-        /* For hash-element targets, use lvalue accessor so missing keys get a
-           writable slot instead of mutating the shared read-only undef sentinel. */
+        /* ++/-- must mutate the element cell. emitExpr of an arrow
+           (`$obj->{n}++`, `$row->[0]++`) returns a copy, so the increment
+           was discarded. A named hash element already went through the
+           lvalue helper; the same cell is what emitLValue loads. */
         auto emitIncTarget = [&](bool wantLValue) -> Value * {
-            if (wantLValue && n.left && n.left->kind == NK::HashElem) {
-                Value *hv = lookupHash(n.left->name);
-                if (hv) return emitHashLValueRef(hv, *n.left->left);
+            if (wantLValue && n.left &&
+                (n.left->kind == NK::HashElem || n.left->kind == NK::ArrayElem ||
+                 n.left->kind == NK::ArrowDeref || n.left->kind == NK::DerefScalar)) {
+                if (Value *slot = emitLValue(*n.left))
+                    return builder_.CreateLoad(perlPtrTy_, slot, "inc.cell");
             }
             return n.left ? emitExpr(*n.left) : perlUndef();
         };

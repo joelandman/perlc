@@ -1060,6 +1060,7 @@ void       perl_inc_push(const char *dir);
 void       perl_inc_load_env(void);
 void       perl_inc_load_defaults(void);
 PerlValue *perl_runtime_require(const char *modname);
+void       perl_req_mark(const char *name); /* compile-time %INC, state 2 */
 PerlValue *perl_do_file(PerlValue *path_pv);
 void       perl_do_lib_cleanup(void);  /* D24: dlclose() do'd shared libraries */
 

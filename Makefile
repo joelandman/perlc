@@ -148,6 +148,7 @@ test: $(TARGET)
 test-all: $(TARGET)
 	@./tests/harness.sh
 	@./tests/d271_stdio_buffer.sh
+	@./tests/d276_debug_subprogram.sh
 	@./tests/d259_asset_sync.sh
 
 # Compile-only survey of real system scripts. Not part of test-all:

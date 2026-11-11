@@ -53,6 +53,11 @@ public:
     void setAutodieEnabled(bool v) { autodieEnabled_ = v; }
     void setOpenStdUtf8(bool v) { openStdUtf8_ = v; }
     void setIncDirs(std::vector<std::string> dirs) { incDirs_ = std::move(dirs); }
+    /* Modules inlined at compile time. Runtime require of one of these
+       returns true without compiling the file again. */
+    void setRequiredModules(std::vector<std::string> names) {
+        requiredModules_ = std::move(names);
+    }
     void writeIR(const std::string &path);
     void writeBC(const std::string &path);
     void dumpIR();
@@ -339,6 +344,7 @@ private:
     bool autodieEnabled_ = false;
     bool openStdUtf8_ = false;
     std::vector<std::string> incDirs_;
+    std::vector<std::string> requiredModules_;
     bool asEvalPad_ = false;    /* --eval-lib: bind outer `my` cells from the eval pad */
     bool hasDataSection_ = false;
     std::string dataSection_;   /* text after __DATA__/__END__ */

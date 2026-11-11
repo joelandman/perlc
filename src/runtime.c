@@ -1173,14 +1173,58 @@ static char *perl_read_runtime_file(const char *path) {
     return code;
 }
 
-static PerlValue *perl_eval_loaded_code(const char *code) {
-    if (!code) return perl_alloc_undef();
-    /* runtime source eval (require/do of dynamic files) not available after JIT removal.
-       Static compile-time require/use via driver inlining still works.
-       The caller (perl_do_file / perl_runtime_require) already validated
-       that the file exists and is readable.  We return 1 to indicate success.
-       The file is NOT actually parsed/executed — that requires JIT. */
-    return perl_alloc_int(1);
+/* Defined with the %INC table, below perl_runtime_require. */
+static int perl_req_lookup(const char *name);
+static void perl_req_set(const char *name, int state);
+static void perl_req_clear(const char *name);
+static PerlValue *perl_exec_compiled_file(const char *resolved);
+
+/* @INC-relative name used in "Can't locate" / "did not return a true
+   value". A bare module becomes Name.pm with "::" turned into "/". */
+static void perl_require_candidate(const char *name, char *candidate, size_t sz) {
+    size_t n, j = 0;
+    if (!candidate || sz == 0) return;
+    candidate[0] = '\0';
+    if (!name || !*name) return;
+    if ((unsigned char)name[0] == 1) name++;
+    if (strchr(name, '/')) {
+        snprintf(candidate, sz, "%s", name);
+        return;
+    }
+    n = strlen(name);
+    for (size_t i = 0; i < n && j + 1 < sz; i++) {
+        if (name[i] == ':' && i + 1 < n && name[i + 1] == ':') {
+            candidate[j++] = '/';
+            i++;
+        } else {
+            candidate[j++] = name[i];
+        }
+    }
+    candidate[j] = '\0';
+    if (j < 3 || memcmp(candidate + j - 3, ".pm", 3) != 0) {
+        if (j + 4 < sz) memcpy(candidate + j, ".pm", 4);
+    }
+}
+
+/* Same key the compiler's `loaded` set uses: strip a leading \x01 and
+   a trailing .pm, and turn "/" into "::". */
+static void perl_req_key_from_name(const char *name, char *out, size_t outsz) {
+    size_t n, j = 0;
+    if (!out || outsz == 0) return;
+    out[0] = '\0';
+    if (!name || !*name) return;
+    if ((unsigned char)name[0] == 1) name++;
+    n = strlen(name);
+    if (n >= 3 && strcmp(name + n - 3, ".pm") == 0) n -= 3;
+    for (size_t i = 0; i < n && j + 2 < outsz; i++) {
+        if (name[i] == '/') {
+            out[j++] = ':';
+            out[j++] = ':';
+        } else {
+            out[j++] = name[i];
+        }
+    }
+    out[j] = '\0';
 }
 
 /* ── runtime require ─────────────────────────────────────────────────────── */
@@ -1224,30 +1268,48 @@ static int perl_native_module(const char *name) {
 
 PerlValue *perl_runtime_require(const char *modname) {
     char path[1024];
-    char *code;
+    char key[512];
+    char candidate[1024];
+    const char *name = modname;
     PerlValue *result;
+    int st;
 
     if (!modname || !*modname) return perl_alloc_int(1);
-    if (perl_native_module(modname)) return perl_alloc_int(1);
-    if (!perl_resolve_runtime_path(modname, 1, path, sizeof(path)))
-        return perl_alloc_undef();
-
-    code = perl_read_runtime_file(path);
-    if (!code) {
-        perl_set_dollar_at_cstr("require: failed to read file");
-        return perl_alloc_undef();
+    if ((unsigned char)name[0] == 1) name++;
+    perl_req_key_from_name(name, key, sizeof key);
+    /* Native modules (Encode included) succeed without reading the
+       on-disk .pm. */
+    if (key[0] && perl_native_module(key)) {
+        perl_req_set(key, 2);
+        return perl_alloc_int(1);
     }
+    st = key[0] ? perl_req_lookup(key) : 0;
+    /* 1 = a require of this module is already on the stack.
+       2 = compiled in, or a previous require succeeded.
+       Either way perl returns 1 and does not run the file again. */
+    if (st == 1 || st == 2) return perl_alloc_int(1);
 
-    result = perl_eval_loaded_code(code);
-    free(code);
-    if (!result) return perl_alloc_undef();
+    perl_require_candidate(name, candidate, sizeof candidate);
+    if (!perl_resolve_runtime_path(name, 1, path, sizeof path))
+        perl_die_croak("Can't locate %s in @INC",
+                       candidate[0] ? candidate : name);
+
+    if (key[0]) perl_req_set(key, 1);
+    result = perl_exec_compiled_file(path);
+    /* A die or a compile failure inside the file left $@. Re-die so
+       eval catches it. The message already has its location. */
     if (s_dollar_at.tag != PERL_UNDEF && s_dollar_at.sval && s_dollar_at.sval[0]) {
-        perl_free(result);
-        return perl_alloc_undef();
+        if (key[0]) perl_req_clear(key);
+        perl_die(&s_dollar_at, NULL, 0);
     }
-
-    perl_free(result);
-    return perl_alloc_int(1);
+    if (!result || !perl_is_true(result)) {
+        if (key[0]) perl_req_clear(key);
+        if (result) perl_free(result);
+        perl_die_croak("%s did not return a true value",
+                       candidate[0] ? candidate : name);
+    }
+    if (key[0]) perl_req_set(key, 2);
+    return result;
 }
 
 /* ── do FILE (D24) ────────────────────────────────────────────────────────
@@ -1295,7 +1357,13 @@ PerlValue *perl_do_file(PerlValue *path_pv) {
         return perl_alloc_undef();
     }
     free(path);
+    return perl_exec_compiled_file(resolved);
+}
 
+/* Compile `resolved` with --do-lib and run it in this process. A
+   compile error or a die inside the file sets $@ and returns undef;
+   the caller decides whether that is fatal (require) or a false do. */
+static PerlValue *perl_exec_compiled_file(const char *resolved) {
     static long long s_do_counter = 0;
     long long id = __atomic_fetch_add(&s_do_counter, 1, __ATOMIC_RELAXED);
     char soPath[256], errPath[256];
@@ -1451,40 +1519,58 @@ void perl_untie(PerlValue *var_pv) {
    in, which evals the same require. Perl records the module in %INC
    before the body runs, so the nested require returns true and does
    not compile again. This table is that record for the eval path. */
-#define PERL_REQ_MAX 64
-static __thread char s_req_names[PERL_REQ_MAX][160];
-static __thread int s_req_state[PERL_REQ_MAX]; /* 1 loading, 2 loaded */
+typedef struct PerlReqSlot {
+    char *name;
+    int state; /* 1 loading, 2 loaded */
+} PerlReqSlot;
+static __thread PerlReqSlot *s_req_tab;
 static __thread int s_req_n;
+static __thread int s_req_cap;
 
 static int perl_req_lookup(const char *name) {
+    if (!name) return 0;
     for (int i = 0; i < s_req_n; i++)
-        if (strcmp(s_req_names[i], name) == 0) return s_req_state[i];
+        if (s_req_tab[i].name && strcmp(s_req_tab[i].name, name) == 0)
+            return s_req_tab[i].state;
     return 0;
 }
 
 static void perl_req_set(const char *name, int state) {
+    if (!name || !*name) return;
     for (int i = 0; i < s_req_n; i++) {
-        if (strcmp(s_req_names[i], name) == 0) {
-            s_req_state[i] = state;
+        if (s_req_tab[i].name && strcmp(s_req_tab[i].name, name) == 0) {
+            s_req_tab[i].state = state;
             return;
         }
     }
-    if (s_req_n >= PERL_REQ_MAX) return;
-    snprintf(s_req_names[s_req_n], sizeof(s_req_names[0]), "%s", name);
-    s_req_state[s_req_n++] = state;
+    if (s_req_n >= s_req_cap) {
+        int ncap = s_req_cap ? s_req_cap * 2 : 64;
+        PerlReqSlot *n = realloc(s_req_tab, (size_t)ncap * sizeof(*n));
+        if (!n) return;
+        s_req_tab = n;
+        s_req_cap = ncap;
+    }
+    s_req_tab[s_req_n].name = strdup(name);
+    if (!s_req_tab[s_req_n].name) return;
+    s_req_tab[s_req_n].state = state;
+    s_req_n++;
 }
 
 static void perl_req_clear(const char *name) {
+    if (!name) return;
     for (int i = 0; i < s_req_n; i++) {
-        if (strcmp(s_req_names[i], name) == 0) {
+        if (s_req_tab[i].name && strcmp(s_req_tab[i].name, name) == 0) {
+            free(s_req_tab[i].name);
             s_req_n--;
-            if (i != s_req_n) {
-                memcpy(s_req_names[i], s_req_names[s_req_n], sizeof(s_req_names[0]));
-                s_req_state[i] = s_req_state[s_req_n];
-            }
+            if (i != s_req_n) s_req_tab[i] = s_req_tab[s_req_n];
             return;
         }
     }
+}
+
+/* Compiler init: this module's body is already part of the program. */
+void perl_req_mark(const char *name) {
+    if (name && *name) perl_req_set(name, 2);
 }
 
 /* `require Name;` or `require "Path.pm";` with only surrounding
@@ -3942,17 +4028,36 @@ PerlValue *perl_inc(PerlValue *v) {
             return v;
         }
     }
-    /* non-magic: convert to int 0 and increment */
-    if (v->tag == PERL_STRING) { free(v->sval); v->sval = NULL; }
-    v->tag = PERL_INT; v->ival = 1;
+    /* Non-magic: numify, then add 1. "3"++ is 4 and "3.5"++ is 4.5.
+       A string with no number ("" , "a" was already handled as magic)
+       numifies to 0, so the result is 1. */
+    {
+        int as_float = (v->tag == PERL_STRING && v->sval &&
+                        (strchr(v->sval, '.') || strchr(v->sval, 'e') ||
+                         strchr(v->sval, 'E')));
+        double d = (v->tag == PERL_STRING) ? perl_to_float(v) : 0.0;
+        if (v->tag == PERL_STRING) { free(v->sval); v->sval = NULL; }
+        if (as_float) { v->tag = PERL_FLOAT; v->fval = d + 1.0; }
+        else { v->tag = PERL_INT; v->ival = (long long)d + 1; }
+    }
     return v;
 }
 
 PerlValue *perl_dec(PerlValue *v) {
     if (v && (v->flags & PV_FLAG_IMMORTAL))
         perl_die_croak("Modification of a read-only value attempted");
-    if (v->tag == PERL_FLOAT) { v->fval -= 1.0; }
-    else { if (v->tag != PERL_INT) { v->tag = PERL_INT; v->ival = 0; } v->ival--; }
+    if (v->tag == PERL_FLOAT) { v->fval -= 1.0; return v; }
+    if (v->tag == PERL_INT) { v->ival--; return v; }
+    /* "--" always numifies. There is no magical string decrement. */
+    {
+        int as_float = (v->tag == PERL_STRING && v->sval &&
+                        (strchr(v->sval, '.') || strchr(v->sval, 'e') ||
+                         strchr(v->sval, 'E')));
+        double d = (v->tag == PERL_STRING) ? perl_to_float(v) : 0.0;
+        if (v->tag == PERL_STRING) { free(v->sval); v->sval = NULL; }
+        if (as_float) { v->tag = PERL_FLOAT; v->fval = d - 1.0; }
+        else { v->tag = PERL_INT; v->ival = (long long)d - 1; }
+    }
     return v;
 }
 
@@ -6492,9 +6597,9 @@ void perl_register_method(const char *key, PerlSubFnCtx fn) {
    later perl_register_method cannot replace a compile-time sub. This
    table stores the CODE PerlValue itself (cloned) so a closure's
    captures stay alive after the assignment temporary is freed. */
-#define DYN_SUB_MAX 256
-static struct { char *key; PerlValue *code; } s_dyn_subs[DYN_SUB_MAX];
+static struct { char *key; PerlValue *code; } *s_dyn_subs;
 static int s_dyn_sub_count = 0;
+static int s_dyn_sub_cap = 0;
 
 static PerlValue *dyn_sub_lookup(const char *name) {
     if (!name) return NULL;
@@ -6514,7 +6619,13 @@ static void dyn_sub_install_one(const char *key, PerlValue *code) {
             return;
         }
     }
-    if (s_dyn_sub_count >= DYN_SUB_MAX) return;
+    if (s_dyn_sub_count >= s_dyn_sub_cap) {
+        int ncap = s_dyn_sub_cap ? s_dyn_sub_cap * 2 : 64;
+        void *grown = realloc(s_dyn_subs, (size_t)ncap * sizeof(*s_dyn_subs));
+        if (!grown) return;
+        s_dyn_subs = grown;
+        s_dyn_sub_cap = ncap;
+    }
     s_dyn_subs[s_dyn_sub_count].key = strdup(key);
     s_dyn_subs[s_dyn_sub_count].code = perl_clone(code);
     s_dyn_sub_count++;
@@ -7650,6 +7761,27 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
                     cell = s_global_scalar_table[i].pv;
                     break;
                 }
+            }
+        }
+        /* `$obj->VERSION($need)` dies when the package has no $VERSION
+           or the need is greater. No-arg still returns the cell.
+           Compare as numbers (perl_to_float). The decimal-version
+           helper treats "1.10" as greater than "1.2". */
+        if (args && args->len > 0) {
+            PerlValue *need = args->elems[0];
+            if (!cell || cell->tag == PERL_UNDEF)
+                perl_die_croak("%s does not define $%s::VERSION--version check failed",
+                               class_name, class_name);
+            if (perl_to_float(cell) < perl_to_float(need)) {
+                char have_buf[128], need_buf[128];
+                char *have_s = perl_to_string_dup(cell);
+                char *need_s = perl_to_string_dup(need);
+                snprintf(have_buf, sizeof have_buf, "%s", have_s ? have_s : "");
+                snprintf(need_buf, sizeof need_buf, "%s", need_s ? need_s : "");
+                free(have_s);
+                free(need_s);
+                perl_die_croak("%s version %s required--this is only version %s",
+                               class_name, need_buf, have_buf);
             }
         }
         return cell ? perl_clone(cell) : perl_alloc_undef();
