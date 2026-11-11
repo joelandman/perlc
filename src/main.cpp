@@ -70,6 +70,22 @@ static std::string readFile(const std::string &path) {
    added `use lib` / earliest -I wins). */
 static std::vector<std::string> g_extraLibDirs;
 
+/* D261: compile-time use/require searches the same host @INC tail as
+   runtime require (D254). -I, PERL5LIB, script dir, and lib/ stay in
+   front. Empty vendor* values are skipped. */
+static void appendHostIncDirs(std::vector<std::string> &dirs) {
+    static const char *keys[] = {
+        "sitearch", "sitelib", "vendorarch", "vendorlib", "archlib", "privlib", nullptr
+    };
+    for (const char *k : keys) {
+        const char *v = perl_config_lookup(k);
+        if (!v || !v[0] || v[0] == ' ') continue;
+        bool already = false;
+        for (auto &d : dirs) if (d == v) { already = true; break; }
+        if (!already) dirs.emplace_back(v);
+    }
+}
+
 static std::string dirOf(const std::string &path) {
     auto p = path.rfind('/');
     return p == std::string::npos ? "." : path.substr(0, p);
@@ -192,7 +208,8 @@ static bool installMissingModules(const std::vector<Token> &tokens,
                                   const std::string &baseDir)
 {
     static const std::set<std::string> PRAGMAS = {
-        "strict","warnings","feature","parent","base",
+        "strict","warnings","feature","parent","base","locale",
+        "Config",
         "Exporter","Carp","POSIX","Scalar::Util",
         "List::Util","Data::Dumper","overload",
         "constant",
@@ -207,7 +224,7 @@ static bool installMissingModules(const std::vector<Token> &tokens,
         "IO::Handle","IO::File","IO::Socket","IO::Socket::INET","IO::Socket::IP",
         "Socket","MIME::Base64","Digest::MD5","Digest::SHA",
         "Getopt::Std","Text::ParseWords","File::Compare","File::stat",
-        "English","if","experimental","PerlIO::scalar",
+        "English","if","experimental","PerlIO","PerlIO::scalar",
         "HTTP::Tiny","version","autodie",
         "Term::ReadLine","CGI","MIME::QuotedPrint","Digest","Text::Tabs",
         "FileHandle","IO::Seekable","IO::Pipe","IO::Select","IO::Socket::UNIX",
@@ -218,6 +235,9 @@ static bool installMissingModules(const std::vector<Token> &tokens,
     std::vector<std::string> searchDirs = {
         baseDir, baseDir + "/lib", "lib", "lib/lib/perl5", "."
     };
+    searchDirs.insert(searchDirs.begin(),
+                      g_extraLibDirs.begin(), g_extraLibDirs.end());
+    appendHostIncDirs(searchDirs);
 
     /* Scan for use statements */
     for (size_t i = 0; i + 1 < tokens.size(); ++i) {
@@ -459,7 +479,7 @@ static std::vector<Token> inlineModules(
        Perl-semantics pragma engine). */
     static const std::set<std::string> PRAGMAS = {
         "strict","warnings","feature","parent","base","integer","utf8",
-        "vars",
+        "vars","locale","Config",
         "Exporter","Carp","POSIX","Scalar::Util",
         "List::Util","Data::Dumper","overload",
         "Math::BigInt","Math::BigInt::GMP","Math::BigFloat",
@@ -482,7 +502,7 @@ static std::vector<Token> inlineModules(
         "IO::Handle","IO::File","IO::Socket","IO::Socket::INET","IO::Socket::IP",
         "Socket","MIME::Base64","Digest::MD5","Digest::SHA",
         "Getopt::Std","Text::ParseWords","File::Compare","File::stat",
-        "English","if","experimental","PerlIO::scalar",
+        "English","if","experimental","PerlIO","PerlIO::scalar",
         "HTTP::Tiny","version","autodie",
         "Term::ReadLine","CGI","MIME::QuotedPrint","Digest","Text::Tabs",
         "FileHandle","IO::Seekable","IO::Pipe","IO::Select","IO::Socket::UNIX",
@@ -497,6 +517,7 @@ static std::vector<Token> inlineModules(
     };
     searchDirsBase.insert(searchDirsBase.begin(),
                            g_extraLibDirs.begin(), g_extraLibDirs.end());
+    appendHostIncDirs(searchDirsBase);
 
     /* D26: `use constant` declared inside an inlined module must not leak
        as a bareword-global sub the way it does for the main script's own
@@ -1377,6 +1398,7 @@ static std::vector<Token> inlineModules(
                 };
                 searchDirs.insert(searchDirs.begin(),
                                   g_extraLibDirs.begin(), g_extraLibDirs.end());
+                appendHostIncDirs(searchDirs);
                 for (auto &base : bases) {
                     if (PRAGMAS.count(base) || loaded.count(base)) continue;
                     std::string basePath = base;
@@ -1443,6 +1465,7 @@ static std::vector<Token> inlineModules(
             "."
         };
         searchDirs.insert(searchDirs.begin(), g_extraLibDirs.begin(), g_extraLibDirs.end());
+        appendHostIncDirs(searchDirs);
 
         /* if module already loaded, only process explicit import list —
            still needs D26-follow-up validation (a second `use Module

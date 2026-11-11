@@ -16,19 +16,23 @@ regression baseline).
 
 ## State at handoff
 
-Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D258 landed
+Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D260 landed
 on top of it. `Pod::Text` and `Pod::Man` are off the skip list. A
 small `parse_string_document` of each matches perl
 (`tests/d247_pod_text.sh`; the Man program is the same shape, with
 `SOURCE_DATE_EPOCH=0`). `Pod::Text`'s `output_string` path matches
 too (`tests/d257_pod_text_string.sh`): tied `PRINT`/`PRINTF` write
 through `$$$it`. A formatted page (links, wrap, items, verbatim)
-matches in `tests/d258_pod_text_fmt.sh`. The open list is in TESTS.md
-("Open after D258") and under "Recommended next move" at the bottom
+matches in `tests/d258_pod_text_fmt.sh`. `Encode->getEncoding` is
+native (D260): the curated `piconv -f ascii -t ascii` run matches
+perl. D261–D271 land the three remaining runtime-survey scripts:
+curated `pod2text`, `pod2man`, and `pod2html` match perl (stdout,
+stderr, and `pod2html`'s `pod2htmd.tmp`). The open list is in TESTS.md
+("Open after D271") and under "Recommended next move" at the bottom
 of this file.
-Scalar FETCH/STORE and `Encode->getEncoding` are still open.
-Runtime `require` finds the file (including host archlib, where
-`Encode.pm` lives) and returns true. It does not execute the file.
+Scalar FETCH/STORE is still open. Runtime `require` finds the file
+(including host archlib, where `Encode.pm` lives) and returns true.
+It does not execute the file. `Encode` stays on the pragma skip list.
 
 - 2026-11-08 tree was clean at `7df4f3b` (D214: the runner + gate). The fixes described as reverted in the sections below were the pre-D215 attempts. D217 re-landed symmetric `qw`. The other three (`delete $$`, `push` fat-comma, `Encode->getEncoding`) stayed reverted.
 - Gate: **HOLD** (no gate=1 failure, no regression vs baseline).
@@ -178,7 +182,27 @@ in an expression-level bare `s///`, a one-element `foreach` that
 aliases the cell, `(LIST)[i]` as a one-index list slice, scalar
 context for `(LIST)->[i]`, and `@$ref = LIST`.
 
-Next: `Encode->getEncoding` for piconv.
-`parent` stays on the skip list (ISA injection is already native).
-Do not refresh `tests/realworld/baseline-compare.txt` unless
-`COMPARE_BASELINE_UPDATE=1`.
+**D260 (2026-11-11).** `Encode->getEncoding` is native. The curated
+`piconv -f ascii -t ascii` run (stdin `abc`) matches perl
+(`tests/d260_piconv.sh`). An unknown name is undef. `\*STDIN` is
+readable through `<>`. `Encode` stays on the pragma skip list.
+
+**D261–D271 (2026-11-11).** The Pod survey scripts match perl.
+`Getopt::Long::config` returns 1. Host `@INC` is searched after `-I`.
+`"${name}"` interpolation ends at the brace. A constant
+`eval "require HTML::Entities; 1"` loads the module in the parent.
+`for my $h (@{ $rows }, [0])` flattens in list context, a
+still-negative store dies catchably, and a non-float pair-slot read
+is numified, so `build_index` nests the second heading.
+`\$self->{output}` aliases the element, which is the page body.
+`src/config_data.h` was regenerated on this host (`perladmin`
+`joe@marvin.(none)`), so the mailto line matches. STDOUT follows
+perl's buffering, including under `stdbuf`. `make test-all` is
+746/746, then `D271_OK` and `D259_OK`.
+
+Next: scalar `FETCH`/`STORE`, or whatever the next runtime-survey
+failure is after `baseline-compare.txt` is refreshed on purpose.
+`parent` and `Encode` stay on the skip list. Do not refresh
+`tests/realworld/baseline-compare.txt` unless
+`COMPARE_BASELINE_UPDATE=1`. Do not stage
+`tests/realworld/last-compare-report.txt`.

@@ -520,6 +520,10 @@ private:
     void emitEvalPadBind();   /* --eval-lib: load pad cells into file-scope GVs */
     /* returns a PerlArray* Value for things that produce arrays */
     llvm::Value *emitArrayPtr(const Node &n);
+    /* Store with the source location so a still-negative index dies as
+       "Modification of non-creatable array value attempted". */
+    void emitArrayCheckStore(llvm::Value *av, llvm::Value *idx, int line);
+    void emitArraySet(llvm::Value *av, llvm::Value *idx, llvm::Value *val, int line);
 
     void   emitStmt(const Node &n);
     /* D225: printf's character count (an owned int PV). */

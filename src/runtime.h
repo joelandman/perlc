@@ -291,6 +291,12 @@ PerlValue *perl_array_pop(PerlArray *a);
 PerlValue *perl_array_get(PerlArray *a, long long idx);
 PerlValue *perl_array_get_ref(PerlArray *a, long long idx); /* borrow: no clone, never free result */
 void       perl_array_set(PerlArray *a, long long idx, PerlValue *v);
+void       perl_array_set_loc(PerlArray *a, long long idx, PerlValue *v,
+                              const char *file, int line);
+/* Die before a store when idx is still negative after counting from the
+   end. A read of that index is undef; a write is a catchable die. */
+void       perl_array_check_store(PerlArray *a, long long idx,
+                                  const char *file, int line);
 /* D81: delete $a[i] / element of delete @a[...] — returns prior value,
    sets slot to undef, then trims trailing undefs (Perl's delete-on-array). */
 PerlValue *perl_array_delete(PerlArray *a, long long idx);
@@ -304,6 +310,7 @@ void perl_array_replace(PerlArray *dst, PerlArray *src);
 PerlArray *perl_repeat_list(PerlArray *src, PerlValue *n);
 void       perl_array_sort_str(PerlArray *a);
 void       perl_array_extend(PerlArray *dst, PerlArray *src);
+void       perl_array_extend_nc(PerlArray *dst, PerlArray *src); /* borrow elems */
 void       perl_array_extend_from(PerlArray *dst, PerlArray *src, long long start); /* dst += src[start..] */
 PerlValue *perl_array_shift(PerlArray *a);
 void       perl_array_unshift(PerlArray *a, PerlValue *v);
@@ -1207,6 +1214,9 @@ PerlValue *perl_native_constant(const char *qualifiedName);
 
 /* ── Config (native module) ──────────────────────────────────────────────── */
 PerlValue *perl_config_get(PerlValue *keyPV);
+/* C-string lookup of one Config key. NULL when the key is absent.
+   Used by the compiler driver to append the host @INC dirs. */
+const char *perl_config_lookup(const char *key);
 int        perl_config_exists(PerlValue *keyPV);
 PerlArray *perl_config_keys(void);
 PerlValue *perl_config_myconfig(void);

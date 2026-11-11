@@ -4637,6 +4637,27 @@ NodePtr Parser::parsePrimary() {
             n->left = parseHashKeySingle();
             consume(TK::RBRACE, "}");
         }
+        /* D267: `delete $_[0]{htext}` / `delete $a[i]{k}` / `delete $h{k}[i]`.
+           The first subscript names the container element (a ref). A
+           following `[` / `{` / `->` is another subscript of that
+           element, and delete removes the last one. Without this, the
+           `{key}` was left for the next statement — a bare block after
+           `my $h = delete $_[0]`, or `expected ) but got '{'` inside
+           `$_[0]->idify(delete $_[0]{htext})` (Pod::Simple::XHTML). */
+        if (check(TK::LBRACKET) || check(TK::LBRACE) || check(TK::ARROW)) {
+            auto elem = std::make_unique<Node>();
+            elem->kind = (n->sval == "array") ? NK::ArrayElem : NK::HashElem;
+            elem->name = nm;
+            elem->left = std::move(n->left);
+            elem->line = line;
+            NodePtr full = parseSubscript(std::move(elem), line);
+            if (!full || full->kind != NK::ArrowDeref)
+                throw std::runtime_error(parseErrPrefix(line) +
+                    "delete argument is not a HASH or ARRAY element");
+            n->left = std::move(full);
+            n->sval = "expr";
+            n->name = "";
+        }
         if (hasParen) consume(TK::RPAREN, ")");
         return n;
     }
@@ -5602,7 +5623,16 @@ NodePtr Parser::parsePrimary() {
         advance(); bool hp = match(TK::LPAREN);
         /* opendir(my $dh, path) or opendir(DH, path) */
         std::string dhVar;
-        if (check(TK::KW_MY)) { advance(); consume(TK::SCALAR, "$"); dhVar = cur().text; advance(); }
+        /* `opendir my ($dh), $dir` — the parens are the my-list form.
+           Pod::Simple::Search uses it. */
+        if (check(TK::KW_MY)) {
+            advance();
+            bool parenDh = match(TK::LPAREN);
+            consume(TK::SCALAR, "$");
+            dhVar = cur().text;
+            advance();
+            if (parenDh) consume(TK::RPAREN, ")");
+        }
         else if (check(TK::SCALAR)) { advance(); dhVar = cur().text; advance(); }
         else { dhVar = cur().text; advance(); } /* bare DH ident */
         match(TK::COMMA);
@@ -6584,17 +6614,9 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                 std::string vname;
                 while (i < raw.size() && raw[i] != '}') vname += raw[i++];
                 if (i < raw.size()) i++; /* skip } */
-                /* D120: ${name}[idx] / ${name}{key} — subscripted scalar
-                   deref: the inner scalar is the ref being indexed. Same
-                   ArrowDeref shape the token-level parser's D63 path
-                   emits. A trailing group whose opener is '[' / '{' is
-                   the subscript; anything else (e.g. "${a}b") stays a
-                   plain scalar. */
-                if (!vname.empty() && i < raw.size() && (raw[i] == '[' || raw[i] == '{')) {
-                    bool isArr = raw[i] == '[';
-                    parts.push_back(parseSubscriptGroup(raw, i, line, vname.c_str(), isArr));
-                    continue;
-                }
+                /* ${name} ends the scalar. A following [idx] or {key} is
+                   literal text ("${termpat}[:|]"), unlike $name[idx] and
+                   ${name[idx]}. */
                 parts.push_back(makeScalar(vname, line));
             }
             continue;

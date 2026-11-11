@@ -1,0 +1,14 @@
+use strict;
+use warnings;
+my $termpat = "foo";
+my $s = "pre ${termpat}[:|] post";
+print "[$s]\n";
+my @termpat = ("A", "B");
+print "unbraced=$termpat[1]\n";
+my $name = "zz";
+print "braceword=${name}x\n";
+my $foo = "ab";
+my $hit = "x|foo|y";
+my $m = ($foo =~ m/(^|\|)${termpat}[:|]/s) ? 1 : 0;
+my $h = ($hit =~ m/(^|\|)${termpat}[:|]/s) ? 1 : 0;
+print "m=$m hit=$h\n";

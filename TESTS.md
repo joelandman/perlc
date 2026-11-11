@@ -354,26 +354,105 @@ because they need `-I`.
   timestamp, and checks that the linked asset path and the `die`
   location text both follow the edit. A comment appended to
   `runtime.h` alone must select a new asset too.
+- **D260** (2026-11-11) `Encode->getEncoding($name)`. Whitespace is
+  stripped, the name is matched case-insensitively, and an unknown
+  name is undef (`|| die "Unknown encoding"`). Known aliases return
+  an object whose `ref` and `->name` match perl (`ascii` →
+  `Encode::XS` / `ascii`, `utf8` → `Encode::utf8` / `utf8`, `UTF-8`
+  → `Encode::utf8` / `utf-8-strict`, `latin1` → `Encode::XS` /
+  `iso-8859-1`, `UTF-16` / `UTF-32` → `Encode::Unicode`). The
+  function form `Encode::getEncoding($class, $name)` uses the second
+  argument; one argument is undef. `Encode::find_encoding` uses the
+  same table. A scalar ref to a glob (`\*STDIN`, `\*IN`) is a
+  readable handle for `<>` and `binmode`, which is the path piconv
+  takes after `push @ARGV, \*STDIN`. `Encode` stays on the pragma
+  skip list: the method is native, and `Encode.pm` is not executed.
+  `tests/d260_get_encoding_{smoke,deep}.pl`.
+  `tests/d260_piconv.sh` matches perl for `piconv -f ascii -t ascii`
+  with stdin `abc`.
+- **D261** (2026-11-11) `Getopt::Long::config` is the deprecated alias
+  of `Configure` and returns 1, same as `Getopt::Long::Configure`.
+  Bundling stays a no-op. Compile-time and runtime module search append
+  the host `sitearch`, `sitelib`, `vendorarch`, `vendorlib`, `archlib`,
+  and `privlib` after `-I`, `use lib`, and `PERL5LIB`, so
+  `use Pod::Escapes` resolves with no `-I`. `PerlIO` is a native pragma.
+  `tests/d261_getopt_config_{smoke,deep}.pl`,
+  `tests/d261_host_inc_{smoke,deep}.pl`.
+- **D262** (2026-11-11) `.5` is a float only when a term is expected.
+  After a value, `1 .5` is concatenation. `1..5` stays the range and
+  `$.` stays the special variable.
+  `tests/d262_leading_dot_{smoke,deep}.pl`.
+- **D263** (2026-11-11) `"${name}[:|]"` is the scalar plus the literal
+  text after the closing brace. `$name[idx]` and `${name[idx]}` stay
+  subscripts. `tests/d262_brace_interp_{smoke,deep}.pl`.
+- **D264** (2026-11-11) a string `eval` whose text is only
+  `require Name` (optional semicolon) loads that module once. A second
+  `require` of the same name, including a self-require from inside the
+  module, does not re-enter. `tests/d264_require_reentry_{smoke,deep}.pl`.
+- **D265** (2026-11-11) `$obj->Pkg::method` starts the search at `Pkg`
+  and keeps `$obj` as the invocant. The split is the last `::`.
+  `SUPER::` is unchanged. `tests/d265_qual_method_{smoke,deep}.pl`.
+- **D266** (2026-11-11) `opendir my ($dh), $dir` and
+  `opendir(my ($dh), $dir)` declare the handle.
+  `tests/d266_opendir_my_paren_{smoke,deep}.pl`. `Config` and `locale`
+  are compile-time pragmas: real `Config.pm` dies on
+  `$^V eq 5.44.0` because `$^V` stringifies as `v5.44.0`, so `use Config`
+  stays on the native table. `locale` is native beside `experimental`.
+- **D267** (2026-11-11) `delete $_[0]{key}`, `delete $a[i]{k}`,
+  `delete $h{k}[i]`, and `delete $a[i]->{k}` parse. The delete removes
+  the outermost element. `tests/d267_delete_elem_subscript_{smoke,deep}.pl`.
+- **D268** (2026-11-11) a constant-string `eval` whose body contains
+  `require`, `use`, or `do` is compiled through `perl_eval_string`, so
+  the loaded file's subs are registered in the parent process.
+  `eval "require HTML::Entities; 1"` defines `encode_entities` and the
+  encoded text matches perl. A constant `eval` with none of those is
+  still inlined. `tests/d268_eval_require_{smoke,deep}.pl`.
+- **D269** (2026-11-11) `for my $h (@{ $to }, [0])` flattens each
+  list-producing item and keeps a trailing anon array as one element.
+  A still-negative array store dies with
+  `Modification of non-creatable array value attempted, subscript N`,
+  quoting the original index, and the die is catchable. A non-float
+  element read through the complex-pair fast path is numified, so
+  `Pod::Simple::XHTML::build_index` nests a second heading level.
+  `tests/d269_foreach_list_{smoke,deep}.pl`.
+- **D270** (2026-11-11) `\$h{k}`, `\$a[i]`, `\$obj->{k}`, and
+  `\$obj->[i]` alias the element cell. `\$self->{output}` is the scalar
+  `Pod::Html` ties for the page body. `tests/d270_elem_ref_{smoke,deep}.pl`.
+- **D271** (2026-11-11) at startup, STDOUT is line-buffered on a
+  terminal and fully buffered otherwise, and STDERR is unbuffered.
+  An explicit buffer is required: glibc ignores `setvbuf` with a null
+  buffer once `stdbuf -o0` has made the stream unbuffered. A newline
+  on a pipe no longer flushes before a later `warn` or `die`, so a
+  merged capture matches perl. `tests/d271_stdio_buffer_{smoke,deep}.pl`.
+  `tests/d271_stdio_buffer.sh` (part of `make test-all`) repeats the
+  compare under `stdbuf -oL` and `stdbuf -o0`, and on a tty.
+- **Config snapshot** (2026-11-11) `tools/gen_config_data.pl` regenerated
+  `src/config_data.h` from this host. `perladmin` is `joe@marvin.(none)`.
+  The curated `pod2html` page's mailto matches perl because of that.
 
 `make test-all` after D257: 718 compared, 718 PASS, 0 FAIL.
 `make test-all` after D258: 720 compared, 720 PASS, 0 FAIL.
 `make test-all` after D259: 720 compared, 720 PASS, 0 FAIL, then `D259_OK`.
+`make test-all` after D260: 722 compared, 722 PASS, 0 FAIL, then `D259_OK`.
+`make test-all` after D271: 746 compared, 746 PASS, 0 FAIL, then `D271_OK` and `D259_OK`.
 
-**Open after D258 (2026-11-10).** Pod::Text's formatted
-`output_string` page matches perl. These still block a full pod2man /
-piconv run:
+**Open after D271 (2026-11-11).** Curated stdin samples of `pod2text`,
+`pod2man` (`--name=Foo`, no `SOURCE_DATE_EPOCH`), and `pod2html` match
+perl, including `pod2html`'s 3-byte `pod2htmd.tmp`. These remain open:
 
 - Scalar `FETCH` / `STORE` are not installed. `TiedOutFH` does not
   need them (`$$$it` is an ordinary deref). `$hash{key}++` still
   leaves the element unchanged; `$hash{key} .=` does update it.
-- Runtime `require` returns true when the file exists and does not
-  run it. `Encode::encode` is the native function. `Encode->getEncoding`
-  and loading Encode's own subs are still the piconv gap. `Encode`
-  stays on the pragma skip list.
+- A direct runtime `require` returns true when the file exists and
+  does not run it. A constant `eval` that contains `require`, `use`,
+  or `do` does run the file (D268). `Encode::encode` and
+  `Encode->getEncoding` are native. Loading Encode's own subs is
+  still open. `Encode` stays on the pragma skip list.
 - `$obj->VERSION($v)` (the requirement form) is unimplemented.
 - The dyn-sub table holds 256 entries (`DYN_SUB_MAX`). A later install
   is dropped with no diagnostic.
-- A missing `require` returns undef and sets `$@`. It does not die.
+- `eval "require No::Such; 1"` is `1` with an empty `$@`. Perl returns
+  undef and sets `$@`. A bare missing `require` does not die.
 - Deliberately left from D215: a file-scope `do { return 5 }` whose
   `return` is not inside a value-`if` is swallowed; a file-scope
   list-context `do` yields the last element; `do { print }` is empty;

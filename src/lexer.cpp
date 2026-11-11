@@ -1265,6 +1265,78 @@ std::vector<Token> Lexer::tokenize() {
             case '.':
                 if (peek() == '.') { pos_++; toks.push_back({TK::DOTDOT, "..", line_}); }
                 else if (peek() == '=') { pos_++; toks.push_back({TK::DOT_ASSIGN, ".=", line_}); }
+                else if (isdigit((unsigned char)peek())) {
+                    /* A leading-dot number (.5, .2) is a term. After a
+                       value (`1 .5`, `time.5`, `f.5`) the dot stays
+                       concatenation and the digits are the next term.
+                       Comma, operators, and `return`/`print` expect a
+                       term, which is the Term::Cap pad-table shape. */
+                    bool expectTerm = toks.empty();
+                    if (!expectTerm) {
+                        switch (toks.back().kind) {
+                            case TK::SEMI: case TK::COMMA:
+                            case TK::LPAREN: case TK::LBRACE: case TK::LBRACKET:
+                            case TK::FATARROW: case TK::COLON:
+                            case TK::PLUS: case TK::MINUS: case TK::STAR:
+                            case TK::SLASH: case TK::PERCENT: case TK::STAR_STAR:
+                            case TK::EQ: case TK::NE: case TK::LT: case TK::GT:
+                            case TK::LE: case TK::GE:
+                            case TK::STR_EQ: case TK::STR_NE: case TK::STR_LT:
+                            case TK::STR_GT: case TK::STR_LE: case TK::STR_GE:
+                            case TK::AND: case TK::OR: case TK::NOT:
+                            case TK::AND2: case TK::OR2: case TK::DEFINED_OR:
+                            case TK::TILDE: case TK::CARET:
+                            case TK::LSHIFT: case TK::RSHIFT:
+                            case TK::ASSIGN:
+                            case TK::PLUS_ASSIGN: case TK::MINUS_ASSIGN:
+                            case TK::STAR_ASSIGN: case TK::SLASH_ASSIGN:
+                            case TK::DOT_ASSIGN: case TK::PERCENT_ASSIGN:
+                            case TK::POW_ASSIGN: case TK::OR_ASSIGN:
+                            case TK::AND_ASSIGN: case TK::DEFINED_OR_ASSIGN:
+                            case TK::X_ASSIGN: case TK::BITAND_ASSIGN:
+                            case TK::BITOR_ASSIGN: case TK::BITXOR_ASSIGN:
+                            case TK::LSHIFT_ASSIGN: case TK::RSHIFT_ASSIGN:
+                            case TK::QUESTION: case TK::BACKSLASH:
+                            case TK::KW_RETURN: case TK::KW_PRINT:
+                            case TK::KW_SAY: case TK::KW_PRINTF:
+                            case TK::KW_SPRINTF: case TK::KW_DIE:
+                            case TK::KW_WARN: case TK::KW_NOT:
+                            case TK::KW_AND: case TK::KW_OR:
+                            case TK::KW_IF: case TK::KW_ELSIF:
+                            case TK::KW_UNLESS: case TK::KW_WHILE:
+                            case TK::KW_UNTIL: case TK::KW_FOR:
+                            case TK::KW_FOREACH:
+                                expectTerm = true;
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+                    if (expectTerm) {
+                        std::string num = ".";
+                        while (isdigit((unsigned char)peek()) || peek() == '_') {
+                            num += peek();
+                            pos_++;
+                        }
+                        if (peek() == 'e' || peek() == 'E') {
+                            num += peek();
+                            pos_++;
+                            if (peek() == '+' || peek() == '-') {
+                                num += peek();
+                                pos_++;
+                            }
+                            while (isdigit((unsigned char)peek())) {
+                                num += peek();
+                                pos_++;
+                            }
+                        }
+                        std::string clean;
+                        for (char ch : num) if (ch != '_') clean += ch;
+                        toks.push_back({TK::FLOAT, clean, line_});
+                        break;
+                    }
+                    toks.push_back({TK::DOT, ".", line_});
+                }
                 else toks.push_back({TK::DOT, ".", line_});
                 break;
             case '=':

@@ -568,6 +568,8 @@ void CodeGen::declareRuntime() {
     RT("perl_array_get",     pv,  av, i64);
     RT("perl_array_get_ref",      pv,     av, i64);
     RT("perl_array_set",          voidTy, av, i64, pv);
+    RT("perl_array_set_loc",      voidTy, av, i64, pv, i8p, i32);
+    RT("perl_array_check_store",  voidTy, av, i64, i8p, i32);
     RT("perl_flat_row_op_assign", pv,     pv, i64, pv, Type::getInt32Ty(ctx_), i8p, i32);
     RT("perl_array_set_row",      pv,     pv, i64, pv);
     RT("perl_array_ensure_slot",  voidTy, av, i64);
@@ -640,6 +642,7 @@ void CodeGen::declareRuntime() {
     RT("perl_array_assign_slice",   voidTy, av, av, av);
     RT("perl_array_sort_str",   voidTy, av);
     RT("perl_array_extend",     voidTy, av, av);
+    RT("perl_array_extend_nc",  voidTy, av, av);
     RT("perl_array_extend_from",voidTy, av, av, i64);
     RT("perl_array_extend_hash",voidTy, av, av);
     RT("perl_array_push_list_or_scalar", voidTy, av, pv);
@@ -1603,6 +1606,20 @@ Value *CodeGen::collectTernListBranch(const Node &branch, llvm::BasicBlock *endB
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateBr(endBB);
     return res;
+}
+
+void CodeGen::emitArrayCheckStore(Value *av, Value *idx, int line) {
+    callRT("perl_array_check_store",
+           {av, idx, builder_.CreateGlobalStringPtr(sourceFile_),
+            ConstantInt::get(Type::getInt32Ty(ctx_), line)});
+}
+
+void CodeGen::emitArraySet(Value *av, Value *idx, Value *val, int line) {
+    auto *i32 = Type::getInt32Ty(ctx_);
+    Value *file = builder_.CreateGlobalStringPtr(sourceFile_);
+    Value *lineV = ConstantInt::get(i32, line);
+    callRT("perl_array_check_store", {av, idx, file, lineV});
+    callRT("perl_array_set_loc", {av, idx, val, file, lineV});
 }
 
 Value *CodeGen::emitArrayPtr(const Node &n) {
@@ -3873,12 +3890,47 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     auto *rok2BBp = builder_.GetInsertBlock();
 
     builder_.SetInsertPoint(fBB);
+    /* perl_cplx_elem on a packed row returns FLOAT or FLOAT_PAIR, and the
+       scalar half is fval (im lives in matchpos for a pair). A normal
+       array element is whatever was stored: an INT's ival shares that
+       offset, so loading it as a double made `$level == $h->[0]` compare
+       against a denormal and Pod::Simple::XHTML::build_index closed a
+       nested heading. Numify every other tag; the packed fast paths
+       above never reach here. */
     Value *elem = callRT("perl_cplx_elem", {rowPv, idx});
+    Value *etag = builder_.CreateLoad(i32, elem, "cplx.etag");
+    setTBAA(etag, tbaaPvTagTag_);
+    Value *isFloatish = builder_.CreateOr(
+        builder_.CreateICmpEQ(etag, ConstantInt::get(i32, 2), "cplx.etf"),
+        builder_.CreateICmpEQ(etag, ConstantInt::get(i32, 13), "cplx.etp"),
+        "cplx.fsh");
+    auto *fboxBB = BasicBlock::Create(ctx_, "cplx.fbox", curFn);
+    auto *fnumBB = BasicBlock::Create(ctx_, "cplx.fnum", curFn);
+    auto *fjoinBB = BasicBlock::Create(ctx_, "cplx.fjoin", curFn);
+    builder_.CreateCondBr(isFloatish, fboxBB, fnumBB);
+
+    builder_.SetInsertPoint(fboxBB);
     Value *reF2 = builder_.CreateLoad(f64,
         builder_.CreateGEP(i8, elem, ConstantInt::get(Type::getInt64Ty(ctx_), 8), "cplx.repv"), "cplx.ref");
     Value *mpPtr = builder_.CreateGEP(i8, elem, ConstantInt::get(Type::getInt64Ty(ctx_), 16), "cplx.mp");
     Value *mpBits = builder_.CreateLoad(i64, mpPtr, "cplx.imb");
     Value *imF = builder_.CreateBitCast(mpBits, f64, "cplx.imf");
+    builder_.CreateBr(fjoinBB);
+    auto *fboxBBp = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(fnumBB);
+    Value *reNum = callRT("perl_to_float", {elem});
+    Value *imZero = ConstantFP::get(f64, 0.0);
+    builder_.CreateBr(fjoinBB);
+    auto *fnumBBp = builder_.GetInsertBlock();
+
+    builder_.SetInsertPoint(fjoinBB);
+    auto *reFJ = builder_.CreatePHI(f64, 2, "cplx.refj");
+    auto *imFJ = builder_.CreatePHI(f64, 2, "cplx.imfj");
+    reFJ->addIncoming(reF2, fboxBBp);
+    imFJ->addIncoming(imF, fboxBBp);
+    reFJ->addIncoming(reNum, fnumBBp);
+    imFJ->addIncoming(imZero, fnumBBp);
     freeIfOwned(elem);
     builder_.CreateBr(mBB);
     auto *fBBp = builder_.GetInsertBlock();
@@ -3892,8 +3944,8 @@ bool CodeGen::tryLoadCplxPairF64(Value *rowPv, Value *idx, Value *&re, Value *&i
     imPhi->addIncoming(imFlat, fokBBp);
     rePhi->addIncoming(f0, rok2BBp);
     imPhi->addIncoming(f1, rok2BBp);
-    rePhi->addIncoming(reF2, fBBp);
-    imPhi->addIncoming(imF, fBBp);
+    rePhi->addIncoming(reFJ, fBBp);
+    imPhi->addIncoming(imFJ, fBBp);
     re = rePhi;
     im = imPhi;
     return true;
@@ -11733,12 +11785,36 @@ void CodeGen::emitStmt(const Node &n) {
                 }
             }
         }
+        /* D269: a multi-item foreach list is list context. `@{ $to }, [0]`
+           must flatten the deref and then append the anon array as one
+           element. emitExpr() on `@{ $to }` is the element count, which
+           made Pod::Simple::XHTML::build_index take the `$out[-1] .=`
+           branch on an empty @out. Borrow elements of a real array so
+           `$x = 1` inside `for $x (@a, @b)` writes back. Fresh lists and
+           scalars are owned and freed after the loop. */
+        Value *ownedForeach = nullptr;
         if (!tmpArr) {
             tmpArr = callRT("perl_array_new", {});
             ownsTmpArr = true;
+            ncTmp = true;
+            ownedForeach = callRT("perl_array_new", {});
             for (auto &elem : n.args) {
-                Value *v = emitExpr(*elem);
-                callRT("perl_array_push", {tmpArr, v});
+                NK k = elem->kind;
+                bool borrowed = k == NK::ArrayVar || k == NK::DerefArray ||
+                    (k == NK::PostfixDeref && elem->sval == "all_array");
+                Value *sub = emitArrayPtr(*elem);
+                if (sub && borrowed) {
+                    callRT("perl_array_extend_nc", {tmpArr, sub});
+                } else if (sub) {
+                    callRT("perl_array_extend_nc", {tmpArr, sub});
+                    callRT("perl_array_extend_nc", {ownedForeach, sub});
+                    callRT("perl_array_free_nc", {sub});
+                } else {
+                    Value *v = emitExpr(*elem);
+                    callRT("perl_array_push_nc", {tmpArr, v});
+                    if (isOwnedTemp(v))
+                        callRT("perl_array_push_nc", {ownedForeach, v});
+                }
             }
         }
 
@@ -11804,6 +11880,8 @@ void CodeGen::emitStmt(const Node &n) {
         loopRedos_.pop_back();
         if (!n.sval.empty()) loopLabels_.pop_back();
         builder_.SetInsertPoint(exit);
+        if (ownedForeach)
+            callRT("perl_array_free", {ownedForeach});
         if (ownsTmpArr)
             callRT(ncTmp ? "perl_array_free_nc" : "perl_array_free", {tmpArr});
         break;
@@ -13633,7 +13711,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                         innerAvH = callRT("perl_hash_autoviv_array_sv", {outerHv, key2});
                         freeIfOwned(key2);
                     }
-                    callRT("perl_array_set", {innerAvH, idx, rhs});
+                    emitArraySet(innerAvH, idx, rhs, n.line);
                     builder_.CreateBr(h2dM);
                     auto *h2dNp = builder_.GetInsertBlock();
                     builder_.SetInsertPoint(h2dM);
@@ -13668,7 +13746,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     auto *r2dFp = builder_.GetInsertBlock();
                     builder_.SetInsertPoint(r2dN);
                     Value *innerAv = callRT("perl_array_autoviv_array", {outerAv, outerIdx});
-                    callRT("perl_array_set", {innerAv, idx, rhs});
+                    emitArraySet(innerAv, idx, rhs, n.line);
                     builder_.CreateBr(r2dM);
                     auto *r2dNp = builder_.GetInsertBlock();
                     builder_.SetInsertPoint(r2dM);
@@ -13690,7 +13768,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                      isScalarRootedAllHashChain(*n.left->left))) {
                     Value *innerAv = emitAutovivContainer(*n.left->left, false);
                     if (!innerAv) return perlUndef();
-                    callRT("perl_array_set", {innerAv, idx, rhs});
+                    emitArraySet(innerAv, idx, rhs, n.line);
                     return rhs;
                 }
                 /* D50: chains with array-index levels that need special handling.
@@ -13769,7 +13847,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     av32 = callRT("perl_deref_array", {base});
                     freeIfOwned(base);
                 }
-                callRT("perl_array_set", {av32, idx, rhs});
+                emitArraySet(av32, idx, rhs, n.line);
                 builder_.CreateBr(mBB32);
                 builder_.SetInsertPoint(mBB32);
                 return rhs;
@@ -13828,7 +13906,7 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *av = lookupArray(n.left->name);
             if (!av) return perlUndef();
             Value *rhs = emitExpr(*n.right);
-            callRT("perl_array_set", {av, emitIdx(*n.left->left), rhs});
+            emitArraySet(av, emitIdx(*n.left->left), rhs, n.line);
             return rhs;
         }
         /* @arr[i,j,...] = list  (lvalue array slice) */
@@ -14221,12 +14299,16 @@ Value *CodeGen::emitExpr(const Node &n) {
             Value *av = lookupArray(n.left->name);
             if (!av) return perlUndef();
             Value *idx    = emitIdx(*n.left->left);
+            /* Die before the read so `$a[-1] .= "x"` on an empty @a does
+               not warn about an uninitialized value. Real Perl rejects the
+               lvalue first. */
+            emitArrayCheckStore(av, idx, n.line);
             Value *lhsVal = callRT("perl_array_get_ref", {av, idx});
             Value *rhsVal = emitExpr(*n.right);
             Value *result = applyOp(lhsVal, rhsVal);
             freeIfOwned(lhsVal);
             freeIfOwned(rhsVal);
-            callRT("perl_array_set", {av, idx, result});
+            emitArraySet(av, idx, result, n.line);
             return result;
         }
         /* $hash{key} op= rhs */
@@ -14420,6 +14502,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                     freeIfOwned(base);
                 }
                 Value *idx = emitIdx(*n.left->right);
+                emitArrayCheckStore(av, idx, n.line);
                 /* Stage 18 PV* fast path: RHS is F64 and op is arithmetic */
                 if (canEmitF64(*n.right)) {
                     auto applyF64op = [&](Value *lv, Value *rv) -> Value * {
@@ -14457,7 +14540,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                 result = applyOp(lhsVal, rhsVal);
                 freeIfOwned(lhsVal);
                 freeIfOwned(rhsVal);
-                callRT("perl_array_set", {av, idx, result});
+                emitArraySet(av, idx, result, n.line);
             } else {
                 Value *hashBase = emitExpr(*n.left->left);
                 Value *hv = callRT("perl_deref_hash", {hashBase});
@@ -15422,6 +15505,18 @@ Value *CodeGen::emitExpr(const Node &n) {
             } else {
                 if (Value *av = lookupArray(nm))
                     return callRT("perl_ref_array", {av});
+            }
+        }
+        /* \$h{k} / \$a[i] / \$obj->{k} / \$obj->[i] alias the element
+           cell. emitExpr returns a copy, so `\$self->{output}` wrote a
+           temporary and Pod::Html printed an empty page. */
+        if (n.left && (n.left->kind == NK::HashElem ||
+                       n.left->kind == NK::ArrayElem ||
+                       n.left->kind == NK::ArrowDeref ||
+                       n.left->kind == NK::DerefScalar)) {
+            if (Value *slot = emitLValue(*n.left)) {
+                Value *cell = builder_.CreateLoad(perlPtrTy_, slot, "ref.cell");
+                return callRT("perl_ref_scalar", {cell});
             }
         }
         /* \$x — capture the stable PerlValue* */
@@ -18345,9 +18440,19 @@ Value *CodeGen::emitCall(const Node &n) {
         callCtx_ = 0;
         auto nodeHasSub = [&](auto &&self, const Node *nd) -> bool {
             if (!nd) return false;
+            /* D268: `require Module` (and `use`) inside a constant
+               eval loads a file whose subs are not in this string.
+               Inlining the eval would run perl_runtime_require, which
+               returns true without defining them. Pod::Simple::XHTML
+               does `eval "require HTML::Entities; 1"` and then calls
+               HTML::Entities::encode_entities. Send any require/use/do
+               through perl_eval_string so the loaded file's subs are
+               registered in this process. */
             if (nd->kind == NK::SubDef || nd->kind == NK::AnonSub ||
                 nd->kind == NK::PackageStmt || nd->kind == NK::BeginBlock ||
-                nd->kind == NK::EndBlock)
+                nd->kind == NK::EndBlock ||
+                nd->kind == NK::RequireStmt || nd->kind == NK::UseStmt ||
+                nd->kind == NK::DoFile)
                 return true;
             if (self(self, nd->left.get()) || self(self, nd->right.get()) ||
                 self(self, nd->cond.get()) || self(self, nd->body.get()) ||
@@ -18710,7 +18815,13 @@ Value *CodeGen::emitCall(const Node &n) {
     if (n.name == "pod2usage" || n.name == "Pod::Usage::pod2usage") {
         return callRT("perl_pod2usage", {buildArgArray()});
     }
-    if (n.name == "Configure" || n.name == "Getopt::Long::Configure") {
+    if (n.name == "Configure" || n.name == "Getopt::Long::Configure" ||
+        n.name == "Getopt::Long::config") {
+        /* config is the deprecated name of Configure. The curated
+           pod2text/pod2man runs pass 'bundling' / 'bundling_override'
+           and then only long options (--name=Foo) or no options at all,
+           which perl_getopt_long already parses. The return value is
+           ignored by those scripts. */
         return perlInt(1);
     }
     if (n.name == "GetOptions" || n.name == "Getopt::Long::GetOptions") {
@@ -19073,7 +19184,7 @@ Value *CodeGen::emitCall(const Node &n) {
         if (sc != std::string::npos) bare = bare.substr(sc + 2);
         static const std::unordered_set<std::string> encNames = {
             "encode","decode","encode_utf8","decode_utf8","from_to","encodings",
-            "find_encoding","find_mime_encoding","is_utf8","_utf8_on","_utf8_off",
+            "find_encoding","find_mime_encoding","getEncoding","is_utf8","_utf8_on","_utf8_off",
             "FB_CROAK","FB_WARN","FB_PERLQQ","FB_HTMLCREF","FB_XMLCREF","FB_DEFAULT",
             "FB_QUIET","DIE_ON_ERR","WARN_ON_ERR","PERLQQ","HTMLCREF","XMLCREF",
             "LEAVE_SRC","RETURN_ON_ERR","STOP_AT_PARTIAL",

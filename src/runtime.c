@@ -1184,12 +1184,51 @@ static PerlValue *perl_eval_loaded_code(const char *code) {
 }
 
 /* ── runtime require ─────────────────────────────────────────────────────── */
+/* Modules the compiler provides itself. A runtime `require` of one of
+   these must succeed without compiling the on-disk .pm (Encode.pm in
+   particular must not be executed). Same set the driver skips at
+   compile time. */
+static int perl_native_module(const char *name) {
+    static const char *names[] = {
+        "Archive::Tar", "App::Cpan", "App::Prove", "CGI", "CPAN::Version",
+        "Carp", "Config", "Cpanel::JSON::XS", "Cwd", "Data::Dumper",
+        "Digest", "Digest::MD5", "Digest::SHA", "Encode", "Encode::Alias",
+        "English", "Errno", "Exporter", "ExtUtils::Installed",
+        "ExtUtils::Packlist", "Fatal", "Fcntl", "File::Basename",
+        "File::Compare", "File::Copy", "File::Find", "File::Glob",
+        "File::Path", "File::Spec", "File::Spec::Functions",
+        "File::Spec::Unix", "File::Temp", "File::Which", "File::stat",
+        "FileHandle", "FindBin", "Getopt::Long", "Getopt::Std",
+        "HTTP::Tiny", "Hash::Util", "IO::File", "IO::Handle", "IO::Pipe",
+        "IO::Seekable", "IO::Select", "IO::Socket", "IO::Socket::INET",
+        "IO::Socket::IP", "IO::Socket::UNIX", "IPC::Open2", "IPC::Open3",
+        "JSON", "JSON::PP", "List::MoreUtils", "List::Util",
+        "MIME::Base64", "MIME::QuotedPrint", "Math::BigFloat",
+        "Math::BigInt", "Math::BigInt::Calc", "Math::BigInt::GMP",
+        "Math::BigRat", "POSIX", "PerlIO", "PerlIO::scalar", "Pod::Usage",
+        "Scalar::Util", "SelectSaver", "Socket", "Storable", "Symbol",
+        "Sys::Hostname", "Term::ANSIColor", "Term::ReadLine", "Test::More",
+        "Text::CSV", "Text::CSV_PP", "Text::CSV_XS", "Text::ParseWords",
+        "Text::Tabs", "Text::Wrap", "Time::HiRes", "Time::Local",
+        "Time::Piece", "Time::Seconds", "Try::Tiny", "URI::Escape",
+        "autodie", "base", "bigint", "bignum", "constant", "experimental",
+        "locale",
+        "feature", "if", "integer", "open", "overload", "parent", "strict",
+        "vars", "version", "warnings",
+        NULL
+    };
+    for (int i = 0; names[i]; i++)
+        if (strcmp(names[i], name) == 0) return 1;
+    return 0;
+}
+
 PerlValue *perl_runtime_require(const char *modname) {
     char path[1024];
     char *code;
     PerlValue *result;
 
     if (!modname || !*modname) return perl_alloc_int(1);
+    if (perl_native_module(modname)) return perl_alloc_int(1);
     if (!perl_resolve_runtime_path(modname, 1, path, sizeof(path)))
         return perl_alloc_undef();
 
@@ -1406,6 +1445,119 @@ void perl_untie(PerlValue *var_pv) {
     perl_dispatch_method(obj, "UNTIE", NULL);
 }
 
+/* D264: a string-eval `require Module` compiles and runs that module
+   (the driver inlines it). Pod::Simple::Transcode does
+   `eval "require $class;"` and the loaded class pulls Transcode back
+   in, which evals the same require. Perl records the module in %INC
+   before the body runs, so the nested require returns true and does
+   not compile again. This table is that record for the eval path. */
+#define PERL_REQ_MAX 64
+static __thread char s_req_names[PERL_REQ_MAX][160];
+static __thread int s_req_state[PERL_REQ_MAX]; /* 1 loading, 2 loaded */
+static __thread int s_req_n;
+
+static int perl_req_lookup(const char *name) {
+    for (int i = 0; i < s_req_n; i++)
+        if (strcmp(s_req_names[i], name) == 0) return s_req_state[i];
+    return 0;
+}
+
+static void perl_req_set(const char *name, int state) {
+    for (int i = 0; i < s_req_n; i++) {
+        if (strcmp(s_req_names[i], name) == 0) {
+            s_req_state[i] = state;
+            return;
+        }
+    }
+    if (s_req_n >= PERL_REQ_MAX) return;
+    snprintf(s_req_names[s_req_n], sizeof(s_req_names[0]), "%s", name);
+    s_req_state[s_req_n++] = state;
+}
+
+static void perl_req_clear(const char *name) {
+    for (int i = 0; i < s_req_n; i++) {
+        if (strcmp(s_req_names[i], name) == 0) {
+            s_req_n--;
+            if (i != s_req_n) {
+                memcpy(s_req_names[i], s_req_names[s_req_n], sizeof(s_req_names[0]));
+                s_req_state[i] = s_req_state[s_req_n];
+            }
+            return;
+        }
+    }
+}
+
+/* `require Name;` or `require "Path.pm";` with only surrounding
+   whitespace. A version require (`require 5.012`) is left alone.
+   The stored key is the module name (`Foo::Bar`). */
+static int perl_eval_require_name(const char *code, char *out, size_t outsz) {
+    const char *p = code;
+    size_t n;
+    if (!code || outsz < 2) return 0;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (strncmp(p, "require", 7) != 0) return 0;
+    p += 7;
+    if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') return 0;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '\0' || (*p >= '0' && *p <= '9') || *p == 'v') return 0;
+    if (*p == '"' || *p == '\'') {
+        char q = *p++;
+        const char *s = p;
+        while (*p && *p != q) p++;
+        if (*p != q) return 0;
+        n = (size_t)(p - s);
+        if (n == 0 || n >= outsz) return 0;
+        memcpy(out, s, n);
+        out[n] = '\0';
+        p++;
+    } else {
+        const char *s = p;
+        while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+               (*p >= '0' && *p <= '9') || *p == '_' || *p == ':')
+            p++;
+        n = (size_t)(p - s);
+        if (n == 0 || n >= outsz) return 0;
+        memcpy(out, s, n);
+        out[n] = '\0';
+    }
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == ';') {
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    }
+    if (*p != '\0') return 0;
+    /* Foo/Bar.pm and Foo::Bar are the same module. */
+    {
+        size_t len = strlen(out);
+        if (len > 3 && strcmp(out + len - 3, ".pm") == 0) {
+            out[len - 3] = '\0';
+            len -= 3;
+        }
+        if (strchr(out, '/')) {
+            char tmp[160];
+            size_t j = 0;
+            for (size_t i = 0; i < len && j + 2 < sizeof(tmp); i++) {
+                if (out[i] == '/') {
+                    tmp[j++] = ':';
+                    tmp[j++] = ':';
+                } else {
+                    tmp[j++] = out[i];
+                }
+            }
+            tmp[j] = '\0';
+            if (j == 0 || j >= outsz) return 0;
+            memcpy(out, tmp, j + 1);
+        }
+    }
+    return out[0] ? 1 : 0;
+}
+
+static PerlValue *perl_eval_require_hit(void) {
+    PerlValue empty = { .tag = PERL_STRING, .sval = "", .slen = 0 };
+    perl_assign(&s_dollar_at, &empty);
+    return perl_alloc_int(1);
+}
+
 /* ── string eval EXPR ─────────────────────────────────────────────────────
    Dynamic strings (and constant strings that define subs) are compiled the
    same way as `do FILE`, but with `--eval-lib` so the eval pad of outer
@@ -1421,6 +1573,15 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
         return perl_alloc_undef();
     }
 
+    /* D264: nested `require` of a module already loading or loaded. */
+    char reqname[160];
+    int is_req = perl_eval_require_name(code, reqname, sizeof(reqname));
+    if (is_req && (perl_native_module(reqname) || perl_req_lookup(reqname))) {
+        free(code);
+        return perl_eval_require_hit();
+    }
+    if (is_req) perl_req_set(reqname, 1);
+
     static long long s_eval_counter = 0;
     long long id = __atomic_fetch_add(&s_eval_counter, 1, __ATOMIC_RELAXED);
     char plPath[256], soPath[256], errPath[256];
@@ -1432,6 +1593,7 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
     FILE *fp = fopen(plPath, "wb");
     if (!fp) {
         free(code);
+        if (is_req) perl_req_clear(reqname);
         perl_set_dollar_at_cstr("eval: cannot write temp file");
         return perl_alloc_undef();
     }
@@ -1461,6 +1623,7 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
         free(errtext);
         unlink(soPath);
         unlink(errPath);
+        if (is_req) perl_req_clear(reqname);
         return perl_alloc_undef();
     }
     unlink(errPath);
@@ -1471,6 +1634,7 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
         char msg[1200];
         snprintf(msg, sizeof(msg), "eval failed to load: %s", dlerror());
         perl_set_dollar_at_cstr(msg);
+        if (is_req) perl_req_clear(reqname);
         return perl_alloc_undef();
     }
 
@@ -1480,6 +1644,7 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
         snprintf(msg, sizeof(msg), "eval: internal error (%s)", dlerror());
         perl_set_dollar_at_cstr(msg);
         dlclose(handle);
+        if (is_req) perl_req_clear(reqname);
         return perl_alloc_undef();
     }
 
@@ -1503,6 +1668,13 @@ PerlValue *perl_eval_string(PerlValue *code_pv) {
         result = perl_alloc_undef();
     }
     perl_array_free(emptyArgs);
+    if (is_req) {
+        /* A true return is %INC. A false or thrown body can be retried. */
+        if (result && perl_is_true(result))
+            perl_req_set(reqname, 2);
+        else
+            perl_req_clear(reqname);
+    }
     return result ? result : perl_alloc_undef();
 }
 
@@ -3905,8 +4077,38 @@ __attribute__((pure)) HOTX PerlValue *perl_array_get_ref(PerlArray *a, long long
     return a->elems[idx] ? a->elems[idx] : &pv_undef_sentinel_;
 }
 
-void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
-    if (idx < 0) idx += a->len;
+/* Real Perl dies (catchable) on a store whose index is still negative
+   after counting from the end: `$a[-1] = 1` on an empty @a. The subscript
+   in the message is the original index, not the adjusted one
+   (`$a[-3] = 1` on a 1-element array says subscript -3). A read stays
+   undef. Falling through used to index elems[] with a negative subscript
+   and free whatever word lived there (pod2html's `$out[-1] .=` SIGSEGV). */
+static void die_noncreatable_array(long long idx, const char *file, int line) {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "Modification of non-creatable array value attempted, subscript %lld",
+             idx);
+    PerlValue died = { .tag = PERL_STRING, .sval = msg, .slen = (long long)strlen(msg) };
+    if (!file || line <= 0)
+        perl_current_call_frame(&file, &line);
+    perl_die(&died, file, line);
+}
+
+void perl_array_check_store(PerlArray *a, long long idx,
+                            const char *file, int line) {
+    if (!a) return;
+    if (idx < 0 && idx + a->len < 0)
+        die_noncreatable_array(idx, file, line);
+}
+
+static void perl_array_set_impl(PerlArray *a, long long idx, PerlValue *v,
+                                const char *file, int line) {
+    if (!a) return;
+    if (idx < 0) {
+        if (idx + a->len < 0)
+            die_noncreatable_array(idx, file, line);
+        idx += a->len;
+    }
     {
         static int dbg = -1;
         if (dbg < 0) dbg = getenv("PERLC_DEBUG_FKRT") ? 1 : 0;
@@ -3933,6 +4135,15 @@ void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
         perl_free(a->elems[idx]);
         a->elems[idx] = perl_clone(v);
     }
+}
+
+void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
+    perl_array_set_impl(a, idx, v, NULL, 0);
+}
+
+void perl_array_set_loc(PerlArray *a, long long idx, PerlValue *v,
+                        const char *file, int line) {
+    perl_array_set_impl(a, idx, v, file, line);
 }
 
 /* D81: array-element delete. Returns a clone of the prior value (undef if
@@ -4006,6 +4217,14 @@ long long perl_array_len_i64(PerlArray *a) {
 void perl_array_extend(PerlArray *dst, PerlArray *src) {
     for (long long i = 0; i < src->len; i++)
         perl_array_push(dst, src->elems[i]);
+}
+
+/* Borrow src's element pointers. dst must be released with
+   perl_array_free_nc unless the caller owns every slot itself. */
+void perl_array_extend_nc(PerlArray *dst, PerlArray *src) {
+    if (!dst || !src) return;
+    for (long long i = 0; i < src->len; i++)
+        perl_array_push_nc(dst, src->elems[i]);
 }
 
 /* Like perl_array_extend, but starting at src[start] — used for the
@@ -7055,6 +7274,9 @@ static PerlValue s_autoload_pv = { .tag = PERL_UNDEF };
 
 PerlValue *perl_get_autoload_name(void) { return &s_autoload_pv; }
 
+static int enc_is_encoding_obj(const PerlValue *obj);
+static PerlValue *enc_get_encoding(PerlValue *namev);
+
 PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *args) {
     {
         PerlValue *io = perl_io_method(obj, method, args);
@@ -7299,11 +7521,16 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
         }
     }
 
-    if (obj && obj->tag == PERL_REF_HASH && obj->blessed_class &&
-        strcmp(obj->blessed_class, "Encode::Encoding") == 0)
+    if (enc_is_encoding_obj(obj))
         return perl_encode_method(obj, method, args);
     if (obj && obj->tag == PERL_STRING && obj->sval &&
         (strcmp(obj->sval, "Encode") == 0)) {
+        /* getEncoding's real signature is ($class, $name). The method
+           call has already dropped the invocant, so the name is args[0].
+           Encode::getEncoding($class, $name) as a function is the other
+           path inside perl_encode_call. */
+        if (strcmp(method, "getEncoding") == 0)
+            return enc_get_encoding(args && args->len > 0 ? args->elems[0] : NULL);
         if (strcmp(method, "find_encoding") == 0 || strcmp(method, "encode") == 0 ||
             strcmp(method, "decode") == 0 || strcmp(method, "encodings") == 0)
             return perl_encode_call(method, args);
@@ -7357,8 +7584,29 @@ PerlValue *perl_dispatch_method(PerlValue *obj, const char *method, PerlArray *a
          strcmp(obj->blessed_class, "Text::CSV_XS") == 0))
         return perl_csv_method(obj, method, args);
 
+    /* D265: `$obj->Pkg::method` starts lookup at Pkg, not at the
+       object's class, and still passes the object as the invocant.
+       Pod::Text::parse_from_file calls `$self->Pod::Simple::parse_from_file`
+       so the override does not recurse. The package in a missing-method
+       error is the named class. */
     const char *class_name = NULL;
-    if (obj && obj->tag == PERL_STRING && obj->sval)
+    char forced_class[512];
+    forced_class[0] = '\0';
+    if (method) {
+        const char *last = NULL;
+        for (const char *p = method; p[0] && p[1]; p++)
+            if (p[0] == ':' && p[1] == ':') last = p;
+        if (last && last != method && last[2]) {
+            size_t n = (size_t)(last - method);
+            if (n >= sizeof(forced_class)) n = sizeof(forced_class) - 1;
+            memcpy(forced_class, method, n);
+            forced_class[n] = '\0';
+            method = last + 2;
+        }
+    }
+    if (forced_class[0])
+        class_name = forced_class;
+    else if (obj && obj->tag == PERL_STRING && obj->sval)
         class_name = obj->sval;
     else if (obj && obj->blessed_class)
         class_name = obj->blessed_class;
@@ -7831,7 +8079,19 @@ int perl_close_fh(PerlValue *fh) {
     return 0;
 }
 
+/* `\*STDIN` is a scalar ref whose referent is the handle cell.
+   readline and binmode on that ref use the handle, which is what
+   piconv does after `push @ARGV, \*STDIN`. */
+static PerlValue *fh_from_glob_ref(PerlValue *fh) {
+    if (fh && fh->tag == PERL_REF_SCALAR && fh->pval) {
+        PerlValue *inner = (PerlValue *)fh->pval;
+        if (inner->tag == PERL_FILEHANDLE) return inner;
+    }
+    return fh;
+}
+
 PerlValue *perl_readline(PerlValue *fh) {
+    fh = fh_from_glob_ref(fh);
     if (!fh || fh->tag != PERL_FILEHANDLE || !fh->pval)
         return perl_alloc_undef();
     FILE *fp = (FILE*)fh->pval;
@@ -13288,7 +13548,30 @@ long long perl_tr(PerlValue *str, const char *search, const char *replace, const
 
 static PerlValue  perl_dollar0_val = { .tag = PERL_STRING };
 
+/* D271: perl forces STDOUT to line buffering on a terminal and full
+   buffering otherwise, and leaves STDERR unbuffered. glibc already
+   does that at startup. A parent stdbuf, or any LD_PRELOAD that calls
+   setvbuf before main, does not: STDOUT stays line-buffered on a pipe,
+   a newline flushes before a later warn/die, and a merged capture
+   disagrees with perl. Reset once, from the real program entry
+   (perl_init_argv). A do/eval .so does not call this. */
+static void perl_stdio_match_perl(void) {
+    static int done = 0;
+    /* glibc ignores setvbuf(..., NULL, ...) once the stream is already
+       unbuffered (stdbuf -o0). An explicit buffer is what actually
+       switches it. It has to outlive the process. */
+    static char outbuf[8192];
+    if (done) return;
+    done = 1;
+    if (isatty(fileno(stdout)))
+        setvbuf(stdout, outbuf, _IOLBF, sizeof outbuf);
+    else
+        setvbuf(stdout, outbuf, _IOFBF, sizeof outbuf);
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
 PerlArray *perl_init_argv(int argc, char **argv) {
+    perl_stdio_match_perl();
     /* Prevent glibc from returning heap pages to OS between frees (reduces page
        faults from re-allocation in tight loops with many short-lived objects). */
     mallopt(M_TRIM_THRESHOLD, -1);
@@ -15104,18 +15387,21 @@ PerlValue *perl_uri_unescape(PerlValue *textPV) {
 
 /* D254: stock perl @INC after -I and PERL5LIB. Empty vendor* values
    (this host leaves them blank) are skipped. */
+const char *perl_config_lookup(const char *key) {
+    if (!key) return NULL;
+    for (int i = 0; i < perlc_config_pairs_n; i++) {
+        if (strcmp(perlc_config_pairs[i].key, key) == 0)
+            return perlc_config_pairs[i].value;
+    }
+    return NULL;
+}
+
 void perl_inc_load_defaults(void) {
     static const char *keys[] = {
         "sitearch", "sitelib", "vendorarch", "vendorlib", "archlib", "privlib", NULL
     };
     for (int i = 0; keys[i]; i++) {
-        const char *v = NULL;
-        for (int j = 0; j < perlc_config_pairs_n; j++) {
-            if (strcmp(perlc_config_pairs[j].key, keys[i]) == 0) {
-                v = perlc_config_pairs[j].value;
-                break;
-            }
-        }
+        const char *v = perl_config_lookup(keys[i]);
         if (v && v[0] && v[0] != ' ')
             perl_inc_push(v);
     }
@@ -18160,7 +18446,8 @@ static PerlValue *enc_iconv(const char *tocode, const char *fromcode,
 }
 static const char *enc_canon(const char *n) {
     if (!n) return "UTF-8";
-    if (!strcasecmp(n, "utf8") || !strcasecmp(n, "utf-8")) return "UTF-8";
+    if (!strcasecmp(n, "utf8") || !strcasecmp(n, "utf-8") ||
+        !strcasecmp(n, "utf-8-strict")) return "UTF-8";
     if (!strcasecmp(n, "latin1") || !strcasecmp(n, "iso-8859-1") ||
         !strcasecmp(n, "iso8859-1")) return "ISO-8859-1";
     if (!strcasecmp(n, "ascii") || !strcasecmp(n, "us-ascii")) return "ASCII";
@@ -18168,6 +18455,90 @@ static const char *enc_canon(const char *n) {
     if (!strcasecmp(n, "utf16le") || !strcasecmp(n, "utf-16le")) return "UTF-16LE";
     if (!strcasecmp(n, "utf16be") || !strcasecmp(n, "utf-16be")) return "UTF-16BE";
     return n;
+}
+
+/* Encode->getEncoding($name). Whitespace is removed (Encode's s/\s+//g)
+   and the rest is matched case-insensitively. An unknown name is undef,
+   which is what piconv's `|| die "Unknown encoding"` tests. The object's
+   ->name and ref() match perl for the aliases this runtime converts. */
+struct EncAlias {
+    const char *key;
+    const char *name;
+    const char *cls;
+};
+
+static const struct EncAlias *enc_find(const char *raw) {
+    char key[96];
+    size_t j = 0;
+    static const struct EncAlias table[] = {
+        {"ascii", "ascii", "Encode::XS"},
+        {"us-ascii", "ascii", "Encode::XS"},
+        {"ansi_x3.4-1968", "ascii", "Encode::XS"},
+        {"iso-646-us", "ascii", "Encode::XS"},
+        {"utf8", "utf8", "Encode::utf8"},
+        {"utf-8", "utf-8-strict", "Encode::utf8"},
+        {"utf-8-strict", "utf-8-strict", "Encode::utf8"},
+        {"latin1", "iso-8859-1", "Encode::XS"},
+        {"iso-8859-1", "iso-8859-1", "Encode::XS"},
+        {"iso8859-1", "iso-8859-1", "Encode::XS"},
+        {"utf-16", "UTF-16", "Encode::Unicode"},
+        {"utf16", "UTF-16", "Encode::Unicode"},
+        {"utf-16le", "UTF-16LE", "Encode::Unicode"},
+        {"utf16le", "UTF-16LE", "Encode::Unicode"},
+        {"utf-16be", "UTF-16BE", "Encode::Unicode"},
+        {"utf16be", "UTF-16BE", "Encode::Unicode"},
+        {"utf-32", "UTF-32", "Encode::Unicode"},
+        {"utf32", "UTF-32", "Encode::Unicode"},
+        {"utf-32le", "UTF-32LE", "Encode::Unicode"},
+        {"utf32le", "UTF-32LE", "Encode::Unicode"},
+        {"utf-32be", "UTF-32BE", "Encode::Unicode"},
+        {"utf32be", "UTF-32BE", "Encode::Unicode"},
+        {NULL, NULL, NULL}
+    };
+    int i;
+    if (!raw) return NULL;
+    for (const unsigned char *p = (const unsigned char *)raw; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
+            *p == '\f' || *p == '\v')
+            continue;
+        if (j + 1 >= sizeof key) return NULL;
+        key[j++] = (char)tolower(*p);
+    }
+    if (j == 0) return NULL;
+    key[j] = 0;
+    for (i = 0; table[i].key; i++)
+        if (strcmp(table[i].key, key) == 0) return &table[i];
+    return NULL;
+}
+
+static int enc_is_encoding_obj(const PerlValue *obj) {
+    const char *c;
+    if (!obj || obj->tag != PERL_REF_HASH || !obj->blessed_class) return 0;
+    c = obj->blessed_class;
+    return strcmp(c, "Encode::Encoding") == 0
+        || strcmp(c, "Encode::XS") == 0
+        || strcmp(c, "Encode::utf8") == 0
+        || strcmp(c, "Encode::Unicode") == 0;
+}
+
+static PerlValue *enc_make(const struct EncAlias *a) {
+    PerlHash *h = perl_anon_hash_new();
+    PerlValue *r;
+    perl_hash_set_str(h, "Name", perl_alloc_string(a->name));
+    r = perl_ref_hash(h);
+    r->blessed_class = strdup(a->cls);
+    return r;
+}
+
+static PerlValue *enc_get_encoding(PerlValue *namev) {
+    char *dup;
+    const struct EncAlias *a;
+    if (!namev || namev->tag == PERL_UNDEF) return perl_alloc_undef();
+    dup = perl_to_string_dup(namev);
+    a = enc_find(dup);
+    free(dup);
+    if (!a) return perl_alloc_undef();
+    return enc_make(a);
 }
 PerlValue *perl_encode_call(const char *name, PerlArray *args) {
     const char *bare = name;
@@ -18233,7 +18604,16 @@ PerlValue *perl_encode_call(const char *name, PerlArray *args) {
         if (s && s->tag == PERL_STRING) s->flags &= ~(unsigned)PV_FLAG_UTF8;
         return s ? perl_clone(s) : perl_alloc_undef();
     }
-    if (!strcmp(bare, "find_encoding") || !strcmp(bare, "find_mime_encoding")) {
+    if (!strcmp(bare, "getEncoding")) {
+        /* Function form is ($class, $name). One argument is the class
+           alone, so the name is missing and the result is undef. */
+        if (!args || args->len < 2) return perl_alloc_undef();
+        return enc_get_encoding(args->elems[1]);
+    }
+    if (!strcmp(bare, "find_encoding")) {
+        return enc_get_encoding(args && args->len > 0 ? args->elems[0] : NULL);
+    }
+    if (!strcmp(bare, "find_mime_encoding")) {
         const char *enc = (args && args->len > 0) ? perl_to_string(args->elems[0]) : "";
         PerlHash *h = perl_anon_hash_new();
         perl_hash_set_str(h, "Name", perl_alloc_string(enc && enc[0] ? enc : "utf8"));
@@ -18297,6 +18677,7 @@ PerlValue *perl_tell_fh(PerlValue *fh) {
 }
 
 PerlValue *perl_binmode_fh(PerlValue *fh, PerlValue *layer) {
+    fh = fh_from_glob_ref(fh);
     if (!fh || fh->tag != PERL_FILEHANDLE) return perl_alloc_undef();  /* perl: undef when not open */
     if (!layer || layer->tag == PERL_UNDEF) {
         fh->flags &= ~PV_FLAG_UTF8;
