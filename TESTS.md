@@ -344,9 +344,20 @@ because they need `-I`.
   Pod::Text page with `L<>` / `C<>` / `B<>` / `I<>`, `=over` /
   `=item` / `=back`, and a verbatim block (width 40, `quotes => '"'`,
   `sentence => 1`).
+- **D259** (2026-11-10) the prebuilt runtime asset cache follows the
+  sources. The key is a content hash of the `.c` file and every quoted
+  header reachable from it, plus the clang flags, `PERLC_SELF_PATH`,
+  and `clang-22 --version`. Size and mtime are not part of the key.
+  `make` records header dependencies with `-MMD` for the same reason.
+  `tests/d259_asset_sync.sh` (part of `make test-all`) copies the
+  compiler and its runtime sources aside, restores a same-size edit's
+  timestamp, and checks that the linked asset path and the `die`
+  location text both follow the edit. A comment appended to
+  `runtime.h` alone must select a new asset too.
 
 `make test-all` after D257: 718 compared, 718 PASS, 0 FAIL.
 `make test-all` after D258: 720 compared, 720 PASS, 0 FAIL.
+`make test-all` after D259: 720 compared, 720 PASS, 0 FAIL, then `D259_OK`.
 
 **Open after D258 (2026-11-10).** Pod::Text's formatted
 `output_string` page matches perl. These still block a full pod2man /

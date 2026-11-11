@@ -12,6 +12,7 @@ src/native_stdlib.bc
 pod2htmd.tmp
 a.out
 src/*.o
+src/*.d
 src/*.a
 *.ll
 *.bc

@@ -95,29 +95,33 @@ $(TARGET): $(OBJS) $(RT_OBJ)
 $(TSAN_TARGET): $(TSAN_OBJS) $(TSAN_RT_OBJ)
 	$(CXX) $(TSAN_CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h $(TRACE_FLAG)
-	$(CC) $(CFLAGS) -c -o $@ $<
+# -MMD writes a .d next to each object so a new #include rebuilds that
+# TU. The asset cache (D259) has the same rule for the prebuilt runtime.
+DEPFLAGS = -MMD -MP -MF $(@:.o=.d)
+
+$(SRCDIR)/runtime.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h $(SRCDIR)/config_data.h $(SRCDIR)/native_constants.h $(TRACE_FLAG)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/runtime_tsan.o: $(SRCDIR)/runtime.c $(SRCDIR)/runtime.h $(SRCDIR)/mini-gmp.h
-	$(CC) $(TSAN_CFLAGS) -c -o $@ $<
+	$(CC) $(TSAN_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/mini-gmp.o: $(SRCDIR)/mini-gmp.c $(SRCDIR)/mini-gmp.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/mini-gmp_tsan.o: $(SRCDIR)/mini-gmp.c $(SRCDIR)/mini-gmp.h
-	$(CC) $(TSAN_CFLAGS) -c -o $@ $<
+	$(CC) $(TSAN_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/native_stdlib.o: $(SRCDIR)/native_stdlib.c $(SRCDIR)/runtime.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/native_stdlib_tsan.o: $(SRCDIR)/native_stdlib.c $(SRCDIR)/runtime.h
-	$(CC) $(TSAN_CFLAGS) -c -o $@ $<
+	$(CC) $(TSAN_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/%_tsan.o: $(SRCDIR)/%.cpp
-	$(CXX) $(TSAN_CXXFLAGS) -c -o $@ $<
+	$(CXX) $(TSAN_CXXFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(SRCDIR)/main.o: $(SRCDIR)/main.cpp $(SRCDIR)/lexer.h $(SRCDIR)/ast.h $(SRCDIR)/parser.h $(SRCDIR)/codegen.h $(SRCDIR)/llvm_early_init.h src/force_complete_std.h $(TRACE_FLAG)
 $(SRCDIR)/lexer.o: $(SRCDIR)/lexer.cpp $(SRCDIR)/lexer.h
@@ -126,8 +130,10 @@ $(SRCDIR)/codegen.o: $(SRCDIR)/codegen.cpp $(SRCDIR)/codegen.h $(SRCDIR)/ast.h $
 $(SRCDIR)/ast.o: $(SRCDIR)/ast.cpp $(SRCDIR)/ast.h
 $(SRCDIR)/llvm_early_init.o: $(SRCDIR)/llvm_early_init.cpp $(SRCDIR)/llvm_early_init.h
 
+-include $(OBJS:.o=.d) $(RT_OBJ:.o=.d) $(TSAN_OBJS:.o=.d) $(TSAN_RT_OBJ:.o=.d)
+
 clean:
-	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.a $(TARGET) $(TSAN_TARGET) $(TRACE_FLAG)
+	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.d $(SRCDIR)/*.a $(TARGET) $(TSAN_TARGET) $(TRACE_FLAG)
 	rm -rf $(SRCDIR)/.perlc_lto_cache
 
 test: $(TARGET)
@@ -141,6 +147,7 @@ test: $(TARGET)
 
 test-all: $(TARGET)
 	@./tests/harness.sh
+	@./tests/d259_asset_sync.sh
 
 # Compile-only survey of real system scripts. Not part of test-all:
 # missing Debian modules and known non-goals (format/write) are reports,

@@ -75,6 +75,73 @@ static std::string dirOf(const std::string &path) {
     return p == std::string::npos ? "." : path.substr(0, p);
 }
 
+static void fnvMix(uint64_t &h, const char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)p[i];
+        h *= 0x100000001b3ULL;
+    }
+}
+
+static void fnvMixStr(uint64_t &h, const std::string &s) {
+    fnvMix(h, s.data(), s.size());
+    unsigned char sep = 0x1f;
+    fnvMix(h, (const char *)&sep, 1);
+}
+
+/* Content of `path` plus every quoted #include reachable from it.
+   Angle-bracket headers are the system toolchain; clang's own version
+   string is mixed into the asset recipe instead. A new quoted include
+   is picked up from the source text, so the key tracks the TU without
+   a hand-maintained file list. */
+static void hashTranslationUnit(const std::string &path, uint64_t &h,
+                                std::unordered_set<std::string> &seen) {
+    if (!seen.insert(path).second) return;
+    std::string text = readFile(path);
+    fnvMixStr(h, path);
+    fnvMixStr(h, text);
+    std::string dir = dirOf(path);
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t eol = text.find('\n', i);
+        if (eol == std::string::npos) eol = text.size();
+        std::string line = text.substr(i, eol - i);
+        i = (eol < text.size()) ? eol + 1 : text.size();
+        size_t p = 0;
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+        if (p >= line.size() || line[p] != '#') continue;
+        ++p;
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+        if (line.compare(p, 7, "include") != 0) continue;
+        p += 7;
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) p++;
+        if (p >= line.size() || line[p] != '"') continue;
+        ++p;
+        size_t q = line.find('"', p);
+        if (q == std::string::npos) continue;
+        std::string inc = line.substr(p, q - p);
+        if (inc.empty()) continue;
+        std::string resolved = (!inc.empty() && inc[0] == '/') ? inc : dir + "/" + inc;
+        hashTranslationUnit(resolved, h, seen);
+    }
+}
+
+static const std::string &clang22VersionStamp() {
+    static std::string v;
+    static bool done = false;
+    if (done) return v;
+    done = true;
+    FILE *fp = popen("clang-22 --version 2>/dev/null", "r");
+    if (!fp) {
+        v = "clang-22";
+        return v;
+    }
+    char buf[512];
+    while (fgets(buf, sizeof buf, fp)) v += buf;
+    pclose(fp);
+    if (v.empty()) v = "clang-22";
+    return v;
+}
+
 /* Extract qw(...) word list from token stream starting after current position.
    Advances *pos past the closing ')'.  Returns list of words. */
 /* D127: a qw()/list export or import name may carry a leading & (or *)
@@ -1938,7 +2005,14 @@ int main(int argc, char **argv) {
              runtime ships pre-optimized — measured ~2x faster -O0 runtimes
              with unchanged compile time. PERLC_NO_PREBUILT_RT=1 links the
              runtime from source at -O0 (full -O0 binary for
-             debug-into-the-runtime / miscompile-repro workflows). */
+             debug-into-the-runtime / miscompile-repro workflows).
+           D259: the cache key is a content hash of that translation unit
+           (the .c file and every quoted header reachable from it) plus a
+           hash of the clang recipe (flags, PERLC_SELF_PATH, clang-22's
+           version string). Size and mtime are not part of the key: a
+           same-size rewrite, a restored timestamp, or an edit to
+           runtime.h / config_data.h / native_constants.h selects a new
+           asset. tests/d259_asset_sync.sh. */
         /* Compiler builds carrying the Phase-0 gap detector (`make TRACE=1`)
            skip the cache entirely: the runtime objects must be compiled with
            -DPERLC_GAP_TRACE, which describes the compiler build, not the
@@ -1984,9 +2058,29 @@ int main(int argc, char **argv) {
             std::string cacheDir = dir + "/.perlc_lto_cache";
             ::mkdir(cacheDir.c_str(), 0755);
             bool isLto = !strcmp(flavor, "lto-bc");
+            /* Flags are the asset recipe. The same string is hashed into
+               the key and passed to clang, so a flag edit cannot reuse an
+               object built with the previous recipe. */
+            std::ostringstream flags;
+            flags << "clang-22 -O2";
+            if (isLto)
+                flags << " -flto";
+            else
+                flags << (withG ? " -g" : "") << " -march=native -Wno-atomic-alignment";
+            flags << selfDefine;
+            std::string flagStr = flags.str();
+            uint64_t recipeHash = 1469598103934665603ULL;
+            fnvMixStr(recipeHash, flagStr);
+            fnvMixStr(recipeHash, clang22VersionStamp());
+            uint64_t tuHash = 1469598103934665603ULL;
+            std::unordered_set<std::string> seen;
+            hashTranslationUnit(src, tuHash, seen);
+            char tuHex[17], recipeHex[17];
+            snprintf(tuHex, sizeof(tuHex), "%016llx", (unsigned long long)tuHash);
+            snprintf(recipeHex, sizeof(recipeHex), "%016llx",
+                     (unsigned long long)recipeHash);
             std::ostringstream key;
-            key << base << "." << (long long)st.st_size << "."
-                << (long long)st.st_mtime << "." << spHex << ".v2";
+            key << base << "." << tuHex << "." << recipeHex << "." << spHex << ".v3";
             /* Distinct tails per (flavor, -g) so a stale asset of one flavor
                is never pruned by a rebuild of the other: ".o2.o" is not a
                suffix of ".o2.g.o" nor vice versa. */
@@ -2001,12 +2095,7 @@ int main(int argc, char **argv) {
             std::string tmp = cacheDir + "/._" + key.str() + ".tmp" + suffix +
                               "." + std::to_string(getpid());
             std::ostringstream c;
-            c << "clang-22 -O2";
-            if (isLto)
-                c << " -flto";
-            else
-                c << (withG ? " -g" : "") << " -march=native -Wno-atomic-alignment";
-            c << selfDefine << " -c " << src << " -o " << tmp << " 2>/dev/null";
+            c << flagStr << " -c " << src << " -o " << tmp << " 2>/dev/null";
             if (system(c.str().c_str()) != 0 || rename(tmp.c_str(), cached.c_str()) != 0) {
                 unlink(tmp.c_str());
                 return src;   /* fall back to from-source linking */

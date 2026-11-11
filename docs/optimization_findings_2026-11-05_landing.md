@@ -185,6 +185,11 @@ Completes the last two small items of the round-2 queue (§5 items 1 and
   (basename, size, mtime, self-path-hash, `.v2` schema), pruning never
   crosses flavors, and concurrent perlc processes share the cache via
   atomic renames (the LTO cache's existing discipline).
+  D259 replaced that key: size and mtime are no longer consulted.
+  The key is a content hash of the translation unit (the `.c` file and
+  every quoted header it reaches) plus the clang recipe and
+  `clang-22 --version` (`.v3`). `tests/d259_asset_sync.sh` is part of
+  `make test-all`.
 - **Default-on `-flto` at `-O2+`**: every `-O2`+ build LTO-links unless
   `-noflto` / `PERLC_NO_LTO=1` / `PERLC_LTO=0|off`; explicit `-flto`
   still forces it at `-O1`; `PERLC_LTO=thin` selects the summary-based
