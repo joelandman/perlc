@@ -1,5 +1,5 @@
 # perlc real-world RUNTIME correctness corpus (byte-for-byte vs perl)
-# host: Linux 7.0.0-42-generic x86_64  date: 2026-11-08T20:07:08Z
+# host: Linux 7.0.0-42-generic x86_64  date: 2026-11-08T23:27:16Z
 # perlc: /home/joe/work/pc/perlc/perlc  perl: perl  timeout: 30s
 # total=31 pass=3 fail-compile=0 fail-runtime=4 skip-safe=22 skip-missing=2
 # compile-rate=100.0%  runtime-correct(among runnable)=42.9%  mvp-pass-rate=10.3%

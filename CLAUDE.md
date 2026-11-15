@@ -11,6 +11,22 @@ AOT compiler for a large Perl 5 subset. C++17 + LLVM 22 (`clang-22` /
                                        runtime.c
 ```
 
+## Open after `904ba0b` (2026-11-11)
+
+`make test-all` is 754/754, then `D271_OK`, `D276_OK`, and `D259_OK`.
+The full list is TESTS.md, "Open after D276". Still open:
+
+- Scalar `FETCH`/`STORE`. `perl_tie` does not attach the object to a
+  scalar. Tied handles already call `PRINT`/`PRINTF`/`CLOSE`/`UNTIE`.
+  Flag bits 24–30 are taken. Hook boxed reads and `perl_assign` only.
+- D215 leftovers: file-scope `do { return }`, list-context `do`,
+  `do { print }`, an `unless (my)` leak, and a non-last `return`
+  inside a `sort` comparator `if` (LLVM verify). Do not regress D215.
+- `Encode` and `parent` stay on the pragma skip list. Do not execute
+  `Encode.pm`. Encode's own subs and `find_mime_encoding` are open.
+- Survey-only divergences and the perf follow-ups are listed in
+  TESTS.md. Do not start them unless a survey script prints them.
+
 ## Current state (2026-11-06)
 
 **The generated-code performance program, stages 34–42 (landed

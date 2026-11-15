@@ -16,23 +16,18 @@ regression baseline).
 
 ## State at handoff
 
-Snapshot below is 2026-11-08 (HEAD `7df4f3b`). D215–D260 landed
-on top of it. `Pod::Text` and `Pod::Man` are off the skip list. A
-small `parse_string_document` of each matches perl
-(`tests/d247_pod_text.sh`; the Man program is the same shape, with
-`SOURCE_DATE_EPOCH=0`). `Pod::Text`'s `output_string` path matches
-too (`tests/d257_pod_text_string.sh`): tied `PRINT`/`PRINTF` write
-through `$$$it`. A formatted page (links, wrap, items, verbatim)
-matches in `tests/d258_pod_text_fmt.sh`. `Encode->getEncoding` is
-native (D260): the curated `piconv -f ascii -t ascii` run matches
-perl. D261–D271 land the three remaining runtime-survey scripts:
-curated `pod2text`, `pod2man`, and `pod2html` match perl (stdout,
-stderr, and `pod2html`'s `pod2htmd.tmp`). The open list is in TESTS.md
-("Open after D271") and under "Recommended next move" at the bottom
-of this file.
-Scalar FETCH/STORE is still open. Runtime `require` finds the file
-(including host archlib, where `Encode.pm` lives) and returns true.
-It does not execute the file. `Encode` stays on the pragma skip list.
+The current open list is TESTS.md, "Open after D276", HEAD `904ba0b`
+(2026-11-11). `make test-all` is 754/754, then `D271_OK`, `D276_OK`,
+and `D259_OK`. Curated `pod2text`, `pod2man`, and `pod2html` match
+perl. Runtime `require` runs the file (D273). Scalar `FETCH`/`STORE`
+is still open. `Encode` and `parent` stay on the pragma skip list.
+Do not execute `Encode.pm`.
+
+The paragraphs below this one are the 2026-11-08 snapshot (HEAD
+`7df4f3b`) and the root-cause notes from that handoff. D215–D276
+landed on top of it. Where those paragraphs still say a gap is open
+(`require` does not execute, `pod2html` fails, `delete $$` and
+`push =>` are open, `./perlc -g` fails verify), trust TESTS.md.
 
 - 2026-11-08 tree was clean at `7df4f3b` (D214: the runner + gate). The fixes described as reverted in the sections below were the pre-D215 attempts. D217 re-landed symmetric `qw`. The other three (`delete $$`, `push` fat-comma, `Encode->getEncoding`) stayed reverted.
 - Gate: **HOLD** (no gate=1 failure, no regression vs baseline).
@@ -207,8 +202,21 @@ file once via `--do-lib` and dies when the file is missing or false.
 256. `./perlc -g` verifies. `make test-all` is 754/754, then
 `D271_OK`, `D276_OK`, and `D259_OK`.
 
-Next: scalar `FETCH`/`STORE`. The D215 file-scope `do`/`sort` leftovers
-stay as they were. `parent` and `Encode` stay on the skip list. Do not
-refresh `tests/realworld/baseline-compare.txt` unless
+Next: scalar `FETCH`/`STORE`. `perl_tie` returns the object and does
+not attach it to a scalar. Tied handles already store the object in
+`_pad_reserved` and call `PRINT`/`PRINTF`/`CLOSE`/`UNTIE` (D257).
+Flag bits 24–30 are taken. Hook the boxed scalar read and
+`perl_assign`; leave the unboxed i64/f64 paths alone.
+
+Still open beside that, and written out in TESTS.md ("Open after
+D276"): the D215 file-scope `do`/`sort` leftovers; Encode's own subs
+and `find_mime_encoding` (`Encode` stays a pragma; do not execute
+`Encode.pm`); `parent` stays skipped. Do not start the logged survey
+divergences (hash-slice `delete`, Getopt bundling, unqualified
+`$VERSION`, failed-`opendir` `defined`, 3-level `exists`, Stage 36
+string pair-bind, `\$a[-1]` on an empty array) unless a survey script
+prints them. Perf follow-ups stay in the 2026-11-05 landing doc.
+
+Do not refresh `tests/realworld/baseline-compare.txt` unless
 `COMPARE_BASELINE_UPDATE=1`. Do not stage
 `tests/realworld/last-compare-report.txt`.

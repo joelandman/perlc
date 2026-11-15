@@ -458,23 +458,62 @@ because they need `-I`.
 `make test-all` after D271: 746 compared, 746 PASS, 0 FAIL, then `D271_OK` and `D259_OK`.
 `make test-all` after D276: 754 compared, 754 PASS, 0 FAIL, then `D271_OK`, `D276_OK`, and `D259_OK`.
 
-**Open after D276 (2026-11-11).** Curated stdin samples of `pod2text`,
-`pod2man` (`--name=Foo`, no `SOURCE_DATE_EPOCH`), and `pod2html` match
-perl, including `pod2html`'s 3-byte `pod2htmd.tmp`. These remain open:
+**Open after D276 (2026-11-11), HEAD `904ba0b`.** Curated stdin samples
+of `pod2text`, `pod2man` (`--name=Foo`, no `SOURCE_DATE_EPOCH`), and
+`pod2html` match perl, including `pod2html`'s 3-byte `pod2htmd.tmp`.
+`make test-all` is 754/754, then `D271_OK`, `D276_OK`, and `D259_OK`.
+Closed in that commit, so they are not open: arrow `++`/`--` (D272),
+runtime `require` that runs the file (D273; the D251 note that require
+returns true without executing is the pre-D273 behavior),
+`$obj->VERSION($need)` (D274), a dyn-sub table past 256 (D275), and
+`./perlc -g` (D276).
 
-- Scalar `FETCH` / `STORE` are not installed. `TiedOutFH` does not
-  need them (`$$$it` is an ordinary deref). A tied hash element's
-  `++` does not call `FETCH`/`STORE`.
-- A constant `eval` that contains `require`, `use`, or `do` runs the
-  file (D268). `Encode::encode` and `Encode->getEncoding` are native.
-  Loading Encode's own subs is still open. `Encode` stays on the
-  pragma skip list.
-- Deliberately left from D215: a file-scope `do { return 5 }` whose
-  `return` is not inside a value-`if` is swallowed; a file-scope
-  list-context `do` yields the last element; `do { print }` is empty;
-  `unless (my $y)` can leak at file scope; a non-last `return` inside
-  a `sort` comparator's `if` still fails LLVM verify (i64 vs pointer
-  return).
+Still open:
+
+- Scalar `FETCH` / `STORE` are not installed. `perl_tie` returns the
+  `TIE*` object and does not attach it to a scalar. A tied handle is
+  different: D257 stores the `TIEHANDLE` object in `_pad_reserved` and
+  `PRINT` / `PRINTF` / `CLOSE` / `UNTIE` run. `TiedOutFH` does not need
+  scalar `FETCH`/`STORE` (`$$$it` is an ordinary deref). A tied hash
+  or array element's `++` does not call `FETCH`/`STORE`. Flag bits
+  24–30 are taken (`IMMORTAL`, `AUTOFLUSH`, `PK_LAYOUT`, `INT_ELEMS`,
+  `INT_ELEM2`, `IV_HINT`, `G_BUMP`). A scalar hook belongs on the boxed
+  read (`emitExpr` of a scalar) and on `perl_assign`. The unboxed i64
+  and f64 paths stay as they are.
+- `Encode` stays on the pragma skip list in both `src/main.cpp` sets.
+  Do not execute `Encode.pm`. `Encode::encode` and `Encode->getEncoding`
+  are native (D260). Loading Encode's own subs, and a MIME-correct
+  `find_mime_encoding`, are still open. `parent` stays on that skip
+  list too.
+- Deliberately left from D215. Do not regress D215's block-value
+  ownership or the flat-kernel statement path. A file-scope
+  `do { return 5 }` whose `return` is not inside a value-`if` is
+  swallowed. A file-scope list-context `do` yields the last element.
+  `do { print }` is empty. `unless (my $y)` can leak at file scope. A
+  non-last `return` inside a `sort` comparator's `if` still fails LLVM
+  verify (an i64 return against a pointer return).
+- Logged, and left until a survey script prints them: hash-slice
+  `delete @options{...}`; `Getopt::Long` bundling (Configure state is
+  still a no-op); an unqualified `$VERSION = '1.07'` is not visible as
+  `$Pkg::VERSION` (a qualified `$Foo::OTHER`, `our $VERSION`, and
+  `package NAME vX` do write the glob); `defined $dh` after a failed
+  `opendir` is 1 in perl and 0 in perlc (D266 tests the false return
+  only); a 3-level `exists` after a nested `delete`; a Stage 36
+  pair-bind of a non-numeric string (`my $s = $a->[0]` becomes 0.0);
+  `\$a[-1]` on an empty array returns a fresh undef; aliases outside
+  the D260 table.
+- Perf follow-ups, separate from this correctness list: map/grep
+  auto-parallel (per-chunk result handoff, purity walk, per-chunk die
+  slots) and outer-loop batch dispatch for the mbs shape. Aliased
+  pair and empty-row copies stay value-copies. Element-copy write-back
+  (`$z = $row->[$i]; $z->[0] = 9`) needs a row-element alias.
+  `docs/optimization_findings_2026-11-05_landing.md`.
+
+Do not refresh `tests/realworld/baseline-compare.txt` unless
+`COMPARE_BASELINE_UPDATE=1`. Do not stage
+`tests/realworld/last-compare-report.txt` (a survey run rewrites only
+its timestamp). `tests/lib/` is gitignored; a new fixture `.pm` needs
+`git add -f`.
 
 Handoff detail: `docs/realworld_runtime_gap_resumption.md`.
 
