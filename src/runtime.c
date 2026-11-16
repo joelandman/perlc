@@ -1232,6 +1232,39 @@ static void perl_req_key_from_name(const char *name, char *out, size_t outsz) {
    these must succeed without compiling the on-disk .pm (Encode.pm in
    particular must not be executed). Same set the driver skips at
    compile time. */
+static int perl_native_override_enabled(void) {
+    /* MVP #1 (do-eval-options, task A): opt-in override of the hard-coded
+       native-module short-circuit. When PERLC_NATIVE_OVERRIDE is set to a
+       falsey token ("0"/"false"/"off"/"no"/"none"/"disable"/"disabled",
+       case-insensitive), perl_runtime_require() stops treating that
+       module as a forced internal load and falls through to the normal
+       @INC search, so a user-supplied <lib>/<Module>.pm takes precedence.
+       Unset or any other value keeps the self-contained "native wins" default.
+       Cached once per process.
+
+       Scope: `require` only. The `eval "require …"` path
+       (perl_eval_string) spawns a separate perlc --eval-lib subprocess
+       with its OWN @INC (not the parent's -I), so it cannot load the
+       user's module and instead hits the host-perl copy (parse error
+       on advanced syntax). That path is left as the clean native stub:
+       eval "require NativeMod" always uses the stub, no spawn,
+       regardless of the flag. See docs/do-eval-options.md. */
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PERLC_NATIVE_OVERRIDE");
+        cached = 0;
+        if (v && *v) {
+            static const char *toks[] = {
+                "0", "false", "off", "no", "none", "disable", "disabled",
+                NULL
+            };
+            for (int t = 0; toks[t]; t++)
+                if (!strncasecmp(v, toks[t], strlen(toks[t]))) { cached = 1; break; }
+        }
+    }
+    return cached;
+}
+
 static int perl_native_module(const char *name) {
     static const char *names[] = {
         "Archive::Tar", "App::Cpan", "App::Prove", "CGI", "CPAN::Version",
@@ -1279,7 +1312,7 @@ PerlValue *perl_runtime_require(const char *modname) {
     perl_req_key_from_name(name, key, sizeof key);
     /* Native modules (Encode included) succeed without reading the
        on-disk .pm. */
-    if (key[0] && perl_native_module(key)) {
+    if (key[0] && perl_native_module(key) && !perl_native_override_enabled()) {
         perl_req_set(key, 2);
         return perl_alloc_int(1);
     }

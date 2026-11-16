@@ -171,3 +171,29 @@ blocker table and current gate state.
     coverage today — would need a test with a static `do` of a file present
     at compile time, plus compile-time file read + recursive `cg.compile`);
     constant `require "NonNative.pm"` (overlaps blocker #3).
+- 2026-11-16: **#3 native-module override hook (task A) — DONE and verified.**
+  - `PERLC_NATIVE_OVERRIDE=0` (falsey token: `0`/`false`/`off`/`no`/`none`/
+    `disable`/`disabled`, case-insensitive) opts out of the hard-coded
+    native-module short-circuit so a user-supplied `<lib>/<Module>.pm` in
+    @INC loads instead. Unset or any other value keeps "native wins"
+    (self-contained default). Env is read once, cached.
+  - **Implementation** (`src/runtime.c`): new `perl_native_override_enabled()`
+    helper before `perl_native_module()`; the `require` short-circuit in
+    `perl_runtime_require()` (line 1308) gated with
+    `&& !perl_native_override_enabled()`.
+  - **Scope decision — `require` only.** The `eval "require …"` path
+    (`perl_eval_string`) spawns a *separate* `perlc --eval-lib` subprocess
+    that has its **own** @INC (not the parent's `-I`), so it cannot load the
+    user's module there and instead hits the host-perl copy (parse error on
+    advanced syntax). Gating that path was net-negative, so it was left as the
+    clean native stub: `eval "require NativeMod"` always uses the stub, no
+    spawn, regardless of the flag. The override is the well-defined `require`
+    surface.
+  - **Verification** (compile to `-o` then run the binary — in-process runs
+    have a stdio-flush quirk): `require "File::Copy"` → default `copied=-1
+    detected=-1` (stub); `PERLC_NATIVE_OVERRIDE=0` with `-I<projlib>` →
+    `copied=999 detected=42` (user module); a second `-I` dir yields
+    `copied=777 detected=7` (proves the chosen `-I` wins, native stub
+    bypassed). `eval "require"` stays `copied=-1` (clean stub) in both modes.
+    Full gate **751/0** — no regression (default native short-circuit
+    unchanged when the env var is unset).
