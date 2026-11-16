@@ -15340,12 +15340,13 @@ Value *CodeGen::emitExpr(const Node &n) {
             }
         }
 
-        /* result slot — heap PV so perl_assign works.
-           W1: `any`/`all`/`none`/`notall`/`one` must return "" for false
-           (not IV 0), matching real Perl's boolean-in-string-context. */
+        /* result slot — heap PV so perl_assign works. any/all/none/
+           notall/one return numeric 0/1 (stringifies "0"/"1") on
+           false/true — matching real Perl's List::MoreUtils behaviour:
+           all/none start at 1; any/one start at 0. */
         Value *resultPv = isFirst  ? perlUndef()
                         : (isAll || isNone) ? perlInt(1)
-                        :                     perlUndef(); /* any/one starts undef→"" */
+                        :                     perlInt(0); /* any/one starts at 0 (perl returns "0"/"1") */
 
         Value *lenPv = callRT("perl_array_len", {inputArr});
         Value *len   = callRT("perl_to_int", {lenPv});

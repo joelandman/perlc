@@ -18240,7 +18240,7 @@ PerlValue *perl_list_moreutils(const char *name, PerlArray *args) {
         else if (!strcmp(bare, "none")) ok = ntrue == 0;
         else if (!strcmp(bare, "notall")) ok = ntrue < n;
         else ok = ntrue == 1;
-        return perl_alloc_bool(ok);
+        return perl_alloc_int(ok); /* numeric 0/1 (stringifies "0"/"1"), matching perl's List::MoreUtils any/all/none/notall/one — not the "" used by boolean-in-string ops */
     }
     if (!strcmp(bare, "pairwise")) {
         /* block, then two lists already flattened is wrong; treat remaining as two halves if even? */

@@ -1514,6 +1514,7 @@ plus `__WARN__`/`__DIE__`); `$?`; Math::BigInt; threads + threads::shared.
 | `MVP_ROADMAP.md` | 2026-09-10 multi-agent MVP assessment + CPAN-module plan |
 | `THREADS_SHARED_ATOMIC.md` | Shared-scalar atomic memory model (landed) |
 | `SHARED_ARRAY_HASH_ATOMIC_DESIGN.md` | Lock-free shared array/hash ops — design draft, not implemented (MVP blocker #14) |
+| `docs/mvp_blockers.md` | **Authoritative MVP blockers list (#1–#10)** — the work to complete before MVP. Re-verified against the live tree. |
 | `docs/optimization_findings_2026-11-04.md` | Perf round 1: methodology, O-matrix, profiles, item 1/3/4 landings |
 | `docs/optimization_findings_2026-11-04_round2.md` | Perf round 2: root causes E1–E6, measured experiments, landing queue |
 | `docs/optimization_findings_2026-11-05_landing.md` | The landing record: stages 38–42, E3/-flto, current headline numbers, open follow-ups |
@@ -1524,6 +1525,10 @@ Historical defect write-ups (D1–D98) live in git, not in-tree.
 
 ## Agent workflow
 
+- **Session startup — reconcile with the remote first.** Every session must start from a known-consistent state: `git fetch`, then compare with `git log --oneline origin/main..main` and `git status`.
+  - **Local behind remote** (remote has commits you lack): fast-forward `git merge --ff-only origin/main` (or `git reset --hard origin/main` if you have nothing uncommitted), so you build against the real HEAD.
+  - **Local ahead / diverged** (you have commits the remote lacks that aren't a fast-forward): **do not** overwrite the remote. Raise a GitHub issue to track the divergence, keep your work local, and only merge/reconcile before pushing.
+  - Never start compiler work on a tree that isn't in sync with `origin/main`, and re-read `docs/mvp_blockers.md` + this file against the reconciled state — a stale tree makes the blockers table point at the wrong line numbers.
 - Do not commit unless asked.
 - Gate: `make test-all` before any commit that touches the compiler.
 - `make clean && make` after pulling — object files have been left stale before.

@@ -1653,13 +1653,13 @@ PerlValue *perl_wave45_method(PerlValue *obj, const char *method, PerlArray *arg
         if (obj->tag == PERL_STRING && strcmp(method, "new") == 0)
             return perl_http_tiny_new(args);
         if (strcmp(method, "can_ssl") == 0)
-            return perl_alloc_bool(1); /* perlc: assume SSL available */
+            return perl_alloc_bool(0); /* perlc: HTTP::Tiny stub has no SSL (no IO::Socket::SSL) → can_ssl is 0 */
         if (obj->tag != PERL_STRING) {
             PerlHash *self = nst_href(obj);
             const char *mth = method;
             char *url;
             PerlValue *content = NULL;
-            if (strcmp(method, "can_ssl") == 0) return perl_alloc_bool(1);
+            if (strcmp(method, "can_ssl") == 0) return perl_alloc_bool(0); /* no SSL in perlc's HTTP::Tiny stub */
             if (strcmp(method, "get") == 0 || strcmp(method, "head") == 0 ||
                 strcmp(method, "post") == 0 || strcmp(method, "put") == 0 ||
                 strcmp(method, "delete") == 0) {
@@ -2310,13 +2310,13 @@ static PerlValue *nst_readline_new(PerlArray *args) {
     PerlValue *obj, *v, *hist;
     const char *nm = args && args->len ? perl_to_string(args->elems[0]) : "perl";
     v = perl_alloc_string(nm); perl_hash_set_str(h, "name", v); perl_free(v);
-    v = perl_alloc_string("Term::ReadLine::Gnu");
+    v = perl_alloc_string("Term::ReadLine::Stub");
     perl_hash_set_str(h, "impl", v); perl_free(v);
     hist = perl_ref_array(perl_anon_array_new());
     perl_hash_set_str(h, "hist", hist); perl_free(hist);
     obj = perl_ref_hash(h);
     if (obj->blessed_class) free(obj->blessed_class);
-    obj->blessed_class = strdup("Term::ReadLine");
+    obj->blessed_class = strdup("Term::ReadLine::Stub");
     return obj;
 }
 
@@ -2448,34 +2448,40 @@ PerlValue *perl_stdlib_method(PerlValue *obj, const char *method, PerlArray *arg
         if (obj && obj->tag == PERL_STRING && strcmp(method, "new") == 0)
             return nst_readline_new(args);
         if (strcmp(method, "ReadLine") == 0)
-            return perl_alloc_string("Term::ReadLine::Gnu");
+            return perl_alloc_string("Term::ReadLine::Stub");
         if (strcmp(method, "readline") == 0) {
             {
                 PerlValue *pr = args && args->len ? args->elems[0] : NULL;
                 char *ps = pr ? perl_to_string_dup(pr) : strdup("");
-                /* Term::ReadLine::Stub::ornaments loads Term::Cap. With a
-                   usable TERM (xterm, linux, screen) the prompt on stderr is
-                   "\e[4m<ps>\e[24m" (italic underline). TERM=dumb (and an
-                   unset TERM) leaves the capability strings empty, so real
-                   perl prints the prompt alone. */
+                /* Term::ReadLine::Stub::ornaments(1) resolves the termcap
+                   capabilities us,ue,md,me and perl prints, on STDERR:
+                       us <prompt> ue md  ... (read) ... me
+                   i.e. underline-start <prompt> underline-end bold-on, then
+                   a bold-off after the read.  With TERM=dumb or an unset
+                   TERM these capability strings are empty, so real perl
+                   emits only the prompt.  We mirror perl for the xterm-family
+                   defaults (us=\e[4m ue=\e[24m md=\e[1m me=\e[0m\e[0m) -- the
+                   sequences perl's terminfo resolves for xterm, screen and
+                   xterm-256color. */
                 const char *term = getenv("TERM");
                 int fancy = term && term[0] && strcmp(term, "dumb") != 0;
+                const char *us = "\033[4m";          /* smul */
+                const char *ue = "\033[24m";         /* rmul */
+                const char *md = "\033[1m";          /* bold on (md) */
+                const char *me = "\033[0m\033[0m";   /* bold off (me) */
                 char buf[4200];
-                int bp = fancy
-                    ? snprintf(buf, sizeof buf, "\033[4m%s\033[24m", ps)
-                    : snprintf(buf, sizeof buf, "%s", ps);
-                if (bp < 0) { free(ps); return perl_alloc_undef(); }
-                if (bp >= (int)sizeof buf) bp = (int)sizeof buf - 1;
-                buf[bp] = '\0';
-                fputs(buf, stderr);
+                if (fancy) fprintf(stderr, "%s%s%s%s", us, ps, ue, md);
+                else       fputs(ps, stderr);
                 fflush(stderr);
                 free(ps);
-                if (!isatty(0)) return perl_alloc_undef();
-                if (!fgets(buf, sizeof buf, stdin)) return perl_alloc_undef();
+                if (!isatty(0)) { if (fancy) fputs(me, stderr); fflush(stderr); return perl_alloc_undef(); }
+                if (!fgets(buf, sizeof buf, stdin)) { if (fancy) fputs(me, stderr); fflush(stderr); return perl_alloc_undef(); }
                 {
                     size_t n = strlen(buf);
                     if (n && buf[n-1] == '\n') buf[--n] = 0;
                     if (n && buf[n-1] == '\r') buf[--n] = 0;
+                    if (fancy) fputs(me, stderr);
+                    fflush(stderr);
                     return perl_alloc_string_len(buf, (long long)n);
                 }
             }
