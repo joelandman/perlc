@@ -455,6 +455,12 @@ private:
        emission in `emitSub()` reads `subCaptures_[name]` to know
        which captures to load with `perl_get_capture(i)`. */
     std::vector<const Node *> subs_;
+    /* MVP #1 (do-eval-options (a)): parsed bodies of constant-string evals
+    whose subs we reclaim at compile time (see the eval handler). Stored
+    here so their AST nodes stay alive — collectSubDefs pushes raw
+    &node pointers into subs_, and those must outlive the emitSub loop
+    at compile() end. Cleared at the top of compile(). */
+    std::vector<NodePtr> pendingEvalBodies_;
     std::unordered_map<std::string, std::vector<std::string>> subCaptures_;
     /* names that appear as *NAME = ... in this compilation — package
        $NAME/@NAME/%NAME (when not a lexical) route through the glob table */

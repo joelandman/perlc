@@ -61,6 +61,39 @@ static void collectAllScalarNames(const Node &n, std::set<std::string> &names) {
     for (auto &a : n.args) collectAllScalarNames(*a, names);
 }
 
+/* Collect every name declared by a my/our declaration anywhere in a subtree.
+   Handles both `my $x`/`my @a` (n.name set) and list form `my ($a,$b)`
+   (lvalue is an ArrayLit pulled from .args[0] or .left). Used by the MVP #1
+   eval-sub reclaim: a sub that references only its own local lexicals (plus
+   @_ ) is self-contained and can be compiled into this binary. */
+static void collectLocalDecls(const Node &n, std::set<std::string> &decls) {
+    if (n.kind == NK::My || n.kind == NK::Our) {
+        if (!n.name.empty()) {
+            char c = n.name[0];
+            if (c == '$' || c == '@' || c == '%')
+                decls.insert(n.name.substr(1));
+        }
+        for (const Node *lv : {n.left.get(), n.args.empty() ? nullptr : n.args[0].get()}) {
+            if (lv && lv->kind == NK::ArrayLit)
+                for (auto &e : lv->args)
+                    if (e->kind == NK::ScalarVar) {
+                        std::string nm = e->name;
+                        if (!nm.empty() && nm[0] == '$') nm = nm.substr(1);
+                        decls.insert(nm);
+                    }
+        }
+    }
+    if (n.left)  collectLocalDecls(*n.left,  decls);
+    if (n.body)  collectLocalDecls(*n.body,  decls);
+    if (n.init)  collectLocalDecls(*n.init,  decls);
+    if (n.step)  collectLocalDecls(*n.step,  decls);
+    for (auto &a : n.args) collectLocalDecls(*a, decls);
+    for (auto &b : n.branches) {
+        if (b.cond) collectLocalDecls(*b.cond, decls);
+        if (b.body) collectLocalDecls(*b.body, decls);
+    }
+}
+
 /* D109: s/PATTERN/REPLACEMENT/'s REPLACEMENT text is captured 100% raw by
    the lexer (readSubst/readSection do no escape processing at all, unlike
    readString for ordinary "..." literals) — so before it can be handed to
@@ -6929,6 +6962,7 @@ void CodeGen::compile(const Node &program, const std::string &modName,
        children (D45: a sub nested in a bare block is still global). */
     subs_.clear();
     subCaptures_.clear();
+    pendingEvalBodies_.clear();
     globNames_.clear();
     dynamicGlobAssign_ = false;
     dynamicCodeRef_ = false;
@@ -18497,6 +18531,66 @@ Value *CodeGen::emitCall(const Node &n) {
                 auto toks = lex.tokenize();
                 Parser p(std::move(toks));
                 NodePtr body = p.parseProgram();
+                /* (MVP #1 / do-eval-options (a)): a constant eval that defines
+                   ONLY self-contained subs compiles those subs into this
+                   binary instead of spawning perl+clang at runtime.
+                   "Self-contained" = the sub references only its own local
+                   lexicals and @_ (an outer-lexical closure can't cross the
+                   compile boundary, and the runtime spawn path exists for
+                   exactly those). "Pure-subdef" = every top-level statement
+                   is a sub definition — the common "define a sub via eval"
+                   idiom (eval 'sub evaled_add { ... }'). Pure-subdef evals
+                   yield undef in void context. */
+                auto subIsSelfContained = [&](const Node &sd) -> bool {
+                    if (sd.kind != NK::SubDef || !sd.body) return false;
+                    std::set<std::string> refs, decls;
+                    collectAllScalarNames(*sd.body, refs);
+                    collectLocalDecls(*sd.body, decls);
+                    for (const auto &nm : refs)
+                        if (nm != "_" && !decls.count(nm)) return false;
+                    return true;
+                };
+                auto noNameCollision = [&](const Node *b) -> bool {
+                    for (auto &stmt : b->args)
+                        if (stmt->kind == NK::SubDef &&
+                            mod_->getFunction(subLLVMName(stmt->name)))
+                            return false;
+                    return true;
+                };
+                auto isPureSelfContainedSubDefs = [&](const Node *b) -> bool {
+                    if (!b || b->args.empty()) return false;
+                    for (auto &stmt : b->args)
+                        if (stmt->kind != NK::SubDef) return false;
+                    for (auto &stmt : b->args)
+                        if (!subIsSelfContained(*stmt)) return false;
+                    return true;
+                };
+                if (body && isPureSelfContainedSubDefs(body.get()) &&
+                    noNameCollision(body.get())) {
+                    const size_t subsBefore = subs_.size();
+                    collectSubDefs(*body, subs_);
+                    pendingEvalBodies_.push_back(std::move(body));
+                    /* The pre-declare loop in compile() already ran before the
+                       main body was emitted, so declare the freshly registered
+                       subs as Functions here (matching the pre-declare loop),
+                       or emitSub's getFunction() (~7630) returns null and the
+                       sub body would never be emitted. */
+                    for (size_t i = subsBefore; i < subs_.size(); i++) {
+                        const Node *s = subs_[i];
+                        if (!mod_->getFunction(subLLVMName(s->name))) {
+                            auto *ft = FunctionType::get(perlPtrTy_,
+                                {arrayPtrTy_, Type::getInt32Ty(ctx_)}, false);
+                            auto *fn = Function::Create(ft,
+                                Function::ExternalLinkage,
+                                subLLVMName(s->name), mod_.get());
+                            fn->addFnAttr(Attribute::AlwaysInline);
+                        }
+                    }
+                    /* eval of a pure sub-def yields undef (void context). No
+                       setjmp frame needed — no body ran, so $@ is untouched and
+                       nothing can longjmp. */
+                    return perlUndef();
+                }
                 if (body && !nodeHasSub(nodeHasSub, body.get())) {
                     Node ev;
                     ev.kind = NK::EvalBlock;
