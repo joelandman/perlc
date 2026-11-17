@@ -187,14 +187,27 @@ static std::vector<std::string> extractQw(
         if (toks[pos].kind == TK::LPAREN) {
             pos++;
             while (pos < end && toks[pos].kind != TK::RPAREN) {
-                if (toks[pos].kind == TK::IDENT || toks[pos].kind == TK::STRING)
-                    words.push_back(stripExportSigil(toks[pos].text));
+                if (toks[pos].kind == TK::IDENT || toks[pos].kind == TK::STRING) {
+                    std::string w = stripExportSigil(toks[pos].text);
+                    if (!w.empty() && w[0] == '\x01') w = w.substr(1);
+                    if (w.size() >= 2 &&
+                        ((w.front() == '\'' && w.back() == '\'') ||
+                         (w.front() == '"' && w.back() == '"')))
+                        w = w.substr(1, w.size() - 2);
+                    words.push_back(w);
+                }
                 pos++;
             }
             return words;
         }
         if (toks[pos].kind == TK::IDENT || toks[pos].kind == TK::STRING) {
-            words.push_back(stripExportSigil(toks[pos].text));
+            std::string w = stripExportSigil(toks[pos].text);
+            if (!w.empty() && w[0] == '\x01') w = w.substr(1);
+            if (w.size() >= 2 &&
+                ((w.front() == '\'' && w.back() == '\'') ||
+                 (w.front() == '"' && w.back() == '"')))
+                w = w.substr(1, w.size() - 2);
+            words.push_back(w);
             return words;  /* single unparenthesised name */
         }
         pos++;
@@ -659,6 +672,7 @@ static std::vector<Token> inlineModules(
         if (tokens[i].kind != TK::KW_USE ||
             i + 1 >= tokens.size() ||
             (tokens[i+1].kind != TK::IDENT && tokens[i+1].kind != TK::KW_IF &&
+             tokens[i+1].kind != TK::KW_UNLESS &&
              tokens[i+1].kind != TK::KW_OPEN)) {
             i++;
             continue;
@@ -700,8 +714,17 @@ static std::vector<Token> inlineModules(
         size_t useEnd = j;  /* index of SEMI (or EOF_TOK if unterminated) */
         i = (j < tokens.size() && tokens[j].kind == TK::SEMI) ? j + 1 : j;
 
-        /* use if COND, MODULE, ARGS — compile-time conditional use */
-        if (modName == "if") {
+        /* use if / use unless COND, MODULE, ARGS — compile-time
+            conditional use. `if` loads MODULE when COND is true;
+            `unless` when COND is false (real Perl defers to the if /
+            unless pragma's import/unimport, which runs at compile
+            time). perlc constant-folds the condition here so the whole
+            `use` becomes a no-op when it doesn't apply. The module
+            name is usually a quoted string (a ::-bareword is illegal
+            under `strict subs`), so strip the surrounding quotes and
+            any interpolating `\x01` prefix before resolving it. */
+        bool isUnless = (modName == "unless");
+        if (modName == "if" || isUnless) {
             size_t ui = useEnd;
             while (ui > 0 && tokens[ui].kind != TK::KW_USE) ui--;
             size_t p = ui + 2;
@@ -716,9 +739,16 @@ static std::vector<Token> inlineModules(
                 p++;
                 if (p < useEnd && tokens[p].kind == TK::COMMA) p++;
             }
-            if (!truth || p >= useEnd) continue;
-            modName = tokens[p].text;
-            if (!modName.empty() && modName[0] == '\x01') modName = modName.substr(1);
+            bool apply = isUnless ? !truth : (truth != 0);
+            if (!apply || p >= useEnd) continue;
+            std::string m = tokens[p].text;
+            if (!m.empty() && m[0] == '\x01') m = m.substr(1);
+            if (m.size() >= 2 &&
+                ((m.front() == '"' && m.back() == '"') ||
+                 (m.front() == '\'' && m.back() == '\'')))
+                m = m.substr(1, m.size() - 2);
+            if (m.empty()) continue;
+            modName = std::move(m);
         }
 
         /* ── use constant NAME => VALUE  or  use constant { NAME => V, ... } */
@@ -917,9 +947,25 @@ static std::vector<Token> inlineModules(
             size_t p = /* skip 'use' and modName, both already consumed */ 0;
             /* find the IDENT token for modName in the original stream — it's at useEnd-? */
             /* we need position of first token after modName in this use stmt */
-            /* walk back from useEnd to find modName */
+            /* walk back from useEnd to find modName. The module-name
+               token may be a STRING rather than an IDENT — e.g. a quoted
+               module name in `use if 1, "My::Flag"` — whose text still
+               carries the lexer's leading `\x01` interpolating marker and
+               possibly surrounding quotes. Compare the de-prefixed,
+               unquoted form so the walk-back lands on the real module
+               token instead of collapsing to index 0 (which would make
+               explicitImports garbage and skip default export). */
             size_t mnIdx = useEnd;
-            while (mnIdx > 0 && tokens[mnIdx].text != modName) mnIdx--;
+            while (mnIdx > 0) {
+                std::string t = tokens[mnIdx].text;
+                if (!t.empty() && t[0] == '\x01') t = t.substr(1);
+                if (t.size() >= 2 &&
+                    ((t.front() == '\'' && t.back() == '\'') ||
+                     (t.front() == '"' && t.back() == '"')))
+                    t = t.substr(1, t.size() - 2);
+                if (t == modName) break;
+                mnIdx--;
+            }
             size_t afterMod = mnIdx + 1;
             if (afterMod < useEnd)
                 explicitImports = extractQw(tokens, afterMod, useEnd);

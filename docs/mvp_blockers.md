@@ -108,17 +108,55 @@ regression fixtures in `tests/` / `tests/lib/`:
    (`src/main.cpp` `seedProto`). Fixtures:
    `tests/lib/E/NamedOne.pm`, `tests/import_named_{smoke,deep}.pl`.
 
-`make test-all` green at **755 PASS / 0 FAIL** (was 751; +4 new tests),
+`make test-all` green at **757 PASS / 0 FAIL** (was 751; +4 new tests),
 including `list_moreutils_*` (builtin arity preserved). `#4` is now a
 narrower, well-understood surface: remaining work is the rest of the
-`import()` lifecycle (`no Module` un-import, conditional `use if` import
-lists, caller-namespace injection) — see next set below.
+`import()` lifecycle (`no Module` un-import, caller-namespace injection) —
+see next set below.
+
+### Conditional `use if` / `use unless` fixed (2026-11-17)
+
+`use if COND, Module` / `use unless COND, Module` are compile-time
+conditional imports. Verified byte-for-byte against real perl: `use if`
+imports when `COND` is true, `use unless` imports when `COND` is false
+(the `if`/`unless` pragmas' `work()` differs only in `return unless shift`
+vs `return if shift`).
+
+The defect: the conditional handler only recognized `"if"` (no `unless`),
+and, more importantly, it resolved the module name by a backwards scan that
+compared the raw token text to `modName`. A **quoted** module name — the
+normal form, since a `::`-bareword is illegal under `strict subs` — is a
+`TK::STRING` whose text keeps the lexer's leading `\x01` interpolating
+marker (and for `q{}`/`qq{}` its surrounding quotes). The scan therefore
+never matched, `mnIdx` collapsed to 0, `explicitImports` became garbage,
+and the module's default `@EXPORT` was silently skipped → the bareword
+resolved to `UNDEF`.
+
+Fix (`src/main.cpp` `inlineModules`):
+- Route both `KW_IF` and `KW_UNLESS` into the handler (the use-gate at
+  ~line 672 and the `isUnless` branch at ~line 718).
+- Strip the `\x01` prefix and any surrounding `'`/`"` quotes from the
+  resolved module name.
+- De-prefix / de-quote the module-name token *before* the import-list
+  walk-back compares it to `modName` (the STRING-vs-IDENT mismatch is the
+  root cause), and in `extractQw` so a quoted name used as an explicit
+  import-list item is also de-quoted.
+
+Condition is still constant-folded from literal INT/FLOAT/STRING tokens; a
+runtime expression condition (`$^O eq 'linux'`, `do {...}`) is left for the
+general `use` handler as before. Fixtures: `tests/lib/E/IfFlag.pm`,
+`tests/lib/E/UnlessFlag.pm`, `tests/use_if_cond_smoke.pl` (imports),
+`tests/use_if_noop_smoke.pl` (no-op). `make test-all` now **759 PASS / 0
+FAIL** (+2 over the previous run).
 
 ### Prioritized next set for #4
 - `no Module` (un-import): reverse a prior `use`, removing the imported
   names from the caller namespace.
-- Conditional `use if COND, Module qw(...)` / `use unless`: import-list
-  resolution behind a compile-time condition.
+- Conditional `use if COND, Module qw(...)` / `use unless`: **import-list
+  resolution behind a literal INT/FLOAT/STRING condition is done** — quoted
+  and unquoted module names resolve and honor the condition; runtime
+  expression conditions (`$^O eq 'linux'`, `do {...}`) are still folded by
+  the general `use` handler, not the conditional path.
 - Caller-namespace injection: imported names should land in the *caller's*
   package, not leak into `main` unconditionally (covers multi-package
   callers where the current importMap is applied globally).
