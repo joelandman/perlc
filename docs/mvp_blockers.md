@@ -61,6 +61,50 @@ supersedes the a2985bb stamp in the Verification section below.
 Non-blockers: #7 (XSUB non-goal), #8 (perf, deferred), #9 (SQLite-only),
 #10 (host env).
 
+## Resolution and next set (2026-11-16, HEAD 4299888)
+
+### #4 Exporter / import() — first two gaps closed
+Audit of `import()` in `src/main.cpp` (`inlineModules`, the `:tag`
+expansion block and `seedProto`). Two concrete defects found and fixed;
+both verified byte-for-byte against real perl and covered by new
+regression fixtures in `tests/` / `tests/lib/`:
+
+1. **`:DEFAULT` treated as a literal tag.** `use Foo qw(:DEFAULT)` threw
+   "not defined in %EXPORT_TAGS". Real Exporter's `:DEFAULT` is a special
+   keyword (exact uppercase) that always expands to `@EXPORT`, regardless
+   of whether the module declares its own `:DEFAULT` tag. Fixed by
+   expanding `:DEFAULT` to `@EXPORT` before the generic tag lookup
+   (`src/main.cpp` `inlineModules`, right before the `TAG:` lookup).
+   Lowercase `:default` is NOT special in real perl either (literal lookup
+   that dies when absent) — perlc matches. Fixtures:
+   `tests/lib/E/DefaultTag.pm`, `tests/exporter_default_tag_{smoke,deep}.pl`.
+2. **Imported sub sharing a builtin name got the builtin arity.** perlc
+   emulates subs like `List::MoreUtils::one` / `Try::Tiny::try` as builtins
+   and seeded their arity prototype ("&@", a required list arg) onto ANY
+   imported sub with that short name — so `use Foo qw(one)` died "Not
+   enough arguments for Foo::one" even when the user sub took zero args.
+   Real Perl aliases the user's own sub into the caller, shadowing the
+   builtin. Fixed by gating the builtin prototype on the imported sub's
+   qualified name actually living in the native module's namespace
+   (`Try::Tiny::` for try/catch/finally, else `List::MoreUtils::`)
+   (`src/main.cpp` `seedProto`). Fixtures:
+   `tests/lib/E/NamedOne.pm`, `tests/import_named_{smoke,deep}.pl`.
+
+`make test-all` green at **755 PASS / 0 FAIL** (was 751; +4 new tests),
+including `list_moreutils_*` (builtin arity preserved). `#4` is now a
+narrower, well-understood surface: remaining work is the rest of the
+`import()` lifecycle (`no Module` un-import, conditional `use if` import
+lists, caller-namespace injection) — see next set below.
+
+### Prioritized next set for #4
+- `no Module` (un-import): reverse a prior `use`, removing the imported
+  names from the caller namespace.
+- Conditional `use if COND, Module qw(...)` / `use unless`: import-list
+  resolution behind a compile-time condition.
+- Caller-namespace injection: imported names should land in the *caller's*
+  package, not leak into `main` unconditionally (covers multi-package
+  callers where the current importMap is applied globally).
+
 ## Verification (2026-11-15)
 
 Re-checked against the live tree at HEAD `a2985bb`. The line numbers in the
@@ -102,8 +146,10 @@ current locations are noted so the blockers stay actionable.
   `PERLC_BWRAP=0`, or you'll see 2 spurious failures.
 - **#3** — `tests/realworld/baseline.txt` / `make test-realworld` remain the
   source of truth for missing-module coverage.
-- **#4** — `%EXPORT_TAGS` / `:tag` / `:all` / `:OK` exist; full `import()`
-  lifecycle is partial. See `MVP_ROADMAP.md`.
+- **#4** — `:DEFAULT` now expands to `@EXPORT` and same-named imported
+  subs no longer inherit builtin arity (both fixed 2026-11-16; fixtures in
+  `tests/` / `tests/lib/E/`). Remaining lifecycle gaps: `no Module`
+  un-import, conditional `use if` import lists, caller-namespace injection.
 - **#5** — documented in `docs/format_write_design.md`; needs a runtime
   byte-for-byte check (currently compile-only).
 - **#7** — DynaLoader-compatible FFI present; genuine perlguts XSUB is a

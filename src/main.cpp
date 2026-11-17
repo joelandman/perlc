@@ -1604,6 +1604,24 @@ static std::vector<Token> inlineModules(
                                     "\" is not defined in %EXPORT_TAGS of the " +
                                     modName + " module");
                             }
+                        } else if (tag == "DEFAULT") {
+                            /* Real Exporter: :DEFAULT is a special keyword
+                               (exact uppercase, per Exporter.pm's export_tags),
+                               NOT a literal %EXPORT_TAGS key — it always
+                               expands to the module's current @EXPORT,
+                               regardless of whether the module declares
+                               %EXPORT_TAGS or a :DEFAULT key of its own
+                               (verified against real perl: `use Foo qw(:DEFAULT)`
+                               imports exactly @EXPORT, and lowercase :default is
+                               special-less and falls through to the literal-tag
+                               lookup below, which dies "not defined" when the
+                               module has no lowercase :default key). perlc's
+                               generic lookup treated :DEFAULT as a literal key
+                               and wrongly threw "not defined in %EXPORT_TAGS". */
+                            auto def = exports.find("EXPORT");
+                            if (def != exports.end())
+                                for (auto &n : def->second)
+                                    expandedImports.push_back(n);
                         } else {
                             auto it = exports.find("TAG:" + tag);
                             if (it == exports.end())
@@ -1870,6 +1888,16 @@ int main(int argc, char **argv) {
         parser = Parser(std::move(expanded));
         {
             std::map<std::string,std::string> protoMap;
+            /* perlc emulates several subs as BUILTINS under their own native
+               module namespace (List::MoreUtils::one, Try::Tiny::try, ...).
+               The arity prototype seeded here (e.g. "&@", a required list
+               arg) is only valid for those native-module subs — it must NOT
+               leak onto an unrelated user sub that merely SHARES the short
+               name via `use Other::Module qw(one)`, where real Perl aliases
+               the user's own sub into the caller (shadowing any builtin)
+               and the arity is the user sub's, not a required list. Gate the
+               prototype on the imported sub's qualified name living in the
+               expected module namespace. */
             auto seedProto = [&](const std::string &shortN, const std::string &qual) {
                 auto amp = [](const std::string &b) {
                     static const std::set<std::string> a = {
@@ -1885,10 +1913,19 @@ int main(int argc, char **argv) {
                     return a.count(b);
                 };
                 std::string bare = shortN;
-                if (amp(bare)) {
-                    protoMap[shortN] = (bare == "try" || bare == "catch" || bare == "finally") ? "&;@" : "&@";
-                    protoMap[qual] = protoMap[shortN];
-                }
+                if (!amp(bare)) return;
+                /* arity prototype applies only to the native-module builtin
+                   (Try::Tiny for try/catch/finally, List::MoreUtils for the
+                   rest); a same-named sub imported from any other module
+                   shadows the builtin and must keep its own (unknown-at-
+                   compile-time) arity, so assign no builtin proto. */
+                std::string ns =
+                    (bare == "try" || bare == "catch" || bare == "finally")
+                        ? "Try::Tiny::" : "List::MoreUtils::";
+                if (qual.rfind(ns, 0) != 0) return;
+                protoMap[shortN] = (bare == "try" || bare == "catch" ||
+                                    bare == "finally") ? "&;@" : "&@";
+                protoMap[qual] = protoMap[shortN];
             };
             for (auto &kv : importMap) seedProto(kv.first, kv.second);
             static const char *ansiConsts[] = {
