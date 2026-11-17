@@ -25,7 +25,12 @@ my %want = (
                  S_IRWXG S_IROTH S_IWOTH S_IXOTH S_IRWXO
                  S_IFMT S_IFDIR S_IFREG S_IFCHR S_IFBLK S_IFIFO S_IFLNK
                  S_IFSOCK IFTODT DT_DIR DT_REG DT_UNKNOWN DT_FIFO DT_SOCK
-                 DT_CHR DT_BLK DT_LNK)],
+                 DT_CHR DT_BLK DT_LNK
+                 /* :mode — real Fcntl S_IS* stat-test macros
+                    referenced by IO::Compress/Zip.pm use Fcntl qw :mode */
+                 S_ISUID S_ISGID S_ISVTX S_ISTXT S_IFWHT S_ENFMT
+                 S_IREAD S_IWRITE S_IEXEC S_ISREG S_ISDIR S_ISLNK
+                 S_ISSOCK S_ISBLK S_ISCHR S_ISFIFO S_IMODE)],
     posix => [qw(LC_ALL LC_COLLATE LC_CTYPE LC_NUMERIC LC_MONETARY
                  LC_MESSAGES S_IRUSR S_IWUSR S_IXUSR S_IRWXU S_IRGRP S_IWGRP
                  S_IXGRP S_IRWXG S_IROTH S_IWOTH S_IXOTH S_IRWXG S_IRWXO

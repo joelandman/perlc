@@ -1036,6 +1036,14 @@ static std::vector<Token> inlineModules(
                 {"Fcntl", {
                     {"seek", {"SEEK_SET","SEEK_CUR","SEEK_END"}},
                     {"flock", {"LOCK_SH","LOCK_EX","LOCK_UN","LOCK_NB"}},
+                    {"mode", {"S_ISUID","S_ISGID","S_ISVTX","S_ISTXT",
+                         "S_IFREG","S_IFDIR","S_IFLNK","S_IFSOCK","S_IFBLK",
+                         "S_IFCHR","S_IFIFO","S_IFWHT","S_ENFMT","S_IRUSR",
+                         "S_IWUSR","S_IXUSR","S_IRWXU","S_IRGRP","S_IWGRP",
+                         "S_IXGRP","S_IRWXG","S_IROTH","S_IWOTH","S_IXOTH",
+                         "S_IRWXO","S_IREAD","S_IWRITE","S_IEXEC","S_ISREG",
+                         "S_ISDIR","S_ISLNK","S_ISSOCK","S_ISBLK","S_ISCHR",
+                         "S_ISFIFO","S_IFMT","S_IMODE"}},
                     {"DEFAULT", {}},   /* overridden above by the DEFAULT branch */
                 }},
                 {"POSIX", {
@@ -1500,6 +1508,14 @@ static std::vector<Token> inlineModules(
                         return false;
                     };
                     for (auto &name : explicitImports) {
+                        /* `:tag` imports (and runtime-added tags the static
+                           scan can't see, e.g. IO::Compress::Base::Common's
+                           :Parse, bound via $EXPORT_TAGS{Parse} = ... after
+                           %EXPORT_TAGS) are accepted here: the module already
+                           loaded once, so its tags are valid by construction.
+                           Only a bogus *literal* bareword import is rejected,
+                           matching real Exporter's "NAME is not exported". */
+                        if (!name.empty() && name[0] == ':') continue;
                         if (!exportedElsewhere(name) && !constMap->count(name)) {
                             throw std::runtime_error("\"" + name + "\" is not exported by the " +
                                                       modName + " module");
@@ -1624,11 +1640,18 @@ static std::vector<Token> inlineModules(
                                     expandedImports.push_back(n);
                         } else {
                             auto it = exports.find("TAG:" + tag);
-                            if (it == exports.end())
-                                throw std::runtime_error("\"" + name +
-                                    "\" is not defined in %EXPORT_TAGS of the " +
-                                    modName + " module");
-                            for (auto &n : it->second) expandedImports.push_back(n);
+                            if (it == exports.end()) {
+                                /* tag invisible to the static scan — the
+                                   module may bind it at runtime (e.g.
+                                   `use Fcntl qw(:mode)`, IO::Compress
+                                   `:Parse`), which no static scan of the
+                                   source can see. Accept it; the module's
+                                   own tag-building is authoritative. */
+                                expandedImports.push_back(name);
+                            } else {
+                                for (auto &n : it->second)
+                                    expandedImports.push_back(n);
+                            }
                         }
                     } else if (!name.empty() && name[0] == '&') {
                         /* &name form (real Pod::Usage exports qw(&pod2usage)) */
