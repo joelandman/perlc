@@ -10,12 +10,12 @@ bottom of this file._
 
 | # | Blocker | Category | Impact | Severity | Evidence | Recommended |
 |---|---------|----------|--------|----------|----------|-------------|
-| 1 | Generated binary is not self-contained | Portability | A perlc binary re-invokes the compiler at runtime for `do FILE`, string `eval EXPR`, and dynamic XS: it bakes `PERLC_SELF_PATH` into the linked binary (`main.cpp:1769`) and calls `system("$PERLC --do-lib …")` then `dlopen`s (`runtime.c:909`). Requires perlc + clang-18 + `/bin/sh` + writable `/tmp` on the target. | Critical | Central to "stand alone MVP" — the output is not a standalone native binary. | Decide scope: (a) restrict runtime do/eval to compile-time-only, (b) bundle a static eval path, or (c) document "needs toolchain at runtime." Until decided, any do/eval script is not deployable. |
+| 1 | Generated binary is not self-contained | Portability | A perlc binary re-invokes the compiler at runtime for `do FILE`, string `eval EXPR`, and dynamic XS: it bakes `PERLC_SELF_PATH` into the linked binary (`main.cpp:1769`) and calls `system("$PERLC --do-lib …")` then `dlopen`s (`runtime.c:909`). Requires perlc + clang-18 + `/bin/sh` + writable `/tmp` on the target. | Critical | Central to "stand alone MVP" — the output is not a standalone native binary. | Decide scope. **Recommended (a): restrict runtime do/eval to compile-time-only** (error if not statically resolvable) — the only low-risk way to ship a self-contained binary (see #1/#6 decision note). (b) bundle a static eval path (embeds a compiler; biggest lift). (c) document "needs toolchain at runtime" + content-addressed `.so` cache — stopgap. Until decided, any do/eval script is not deployable. |
 | 2 | 4 active correctness-gate failures | Defect | `test-all` is the mandatory pre-commit gate and must read 0 FAIL for MVP. Currently 605/609. | High | See table above. `any` and `can_ssl` are genuine divergences; Term::ReadLine is Stub-vs-host. | Fix `any` and `can_ssl` (real bugs); align `term_readline` test with the documented Stub behavior (or implement Gnu) so the gate is green. |
 | 3 | Module availability for offline/standalone use | Ecosystem | **Resolved (2026-11-16).** 0/31 real scripts fail on missing modules now — the high-frequency core modules are natively implemented and functional at runtime (see writeup below). Standalone MVP no longer needs host Pod::/Archive::/Encode:: modules present. | High | `tests/realworld/` live survey (compile-only) + dedicated runtime tests (`d227`/`d247`/`d257`/`d258`/`d260`/`d251`). | Native path adds opt-in override via `PERLC_NATIVE_OVERRIDE=0` — a user `.pm` in @INC then beats the built-in stub for `require` (see `docs/do-eval-options.md`). Remaining realworld failures are *parser-exporter fidelity* in a few complex host modules, not module availability. |
 | 4 | Exporter / `import()` full semantics | Missing feature | `%EXPORT_TAGS` / `:tag` / `:all` / `:OK` are implemented, but full `import()` lifecycle, default `@EXPORT`, and conditional imports are only partially there — the documented ceiling on "arbitrary pure-Perl modules just work." | High | README/CLAUDE.md "Known Limitations"; `MVP_ROADMAP.md` historically flagged as the real ceiling. | Audit `import()` in `main.cpp`; cover `@EXPORT` + caller-namespace injection end-to-end before claiming general-CPAN support. |
 | 5 | `format`/`write` runtime fidelity | Unverified | Now compiles (was an explicit non-goal), but the corpus is compile-only, so runtime output is unverified. | Med | `docs/format_write_design.md`; `perlbug`/`ucfq` now compile. | Run byte-for-byte vs perl before marking resolved; confirm it isn't a compile-only win with empty runtime output (the prior root cause was passing a raw LLVM string ptr to `perl_sprintf`). |
-| 6 | Runtime do/eval compiler-spawn cost | Perf/Portability | Even once #1 is scoped, every runtime `do`/`eval` currently launches a full perlc+clang compile (seconds each) into `/tmp`. | Med | `runtime.c` `perl_do_file`/`perl_eval_string` use `system()`. | Prefer compile-time resolution / static lib where possible; cache built `.sos`; document the cold-start cost. |
+| 6 | Runtime do/eval compiler-spawn cost | Perf/Portability | Even once #1 is scoped, every runtime `do`/`eval` currently launches a full perlc+clang compile (seconds each) into `/tmp`. | Med | `runtime.c` `perl_do_file`/`perl_eval_string` use `system()`. | Compile-time resolution / static lib (option (a) above). A content-addressed `.so` cache reduces cold start but still needs the toolchain — keep as a documented stopgap, not the MVP answer. |
 | 7 | Full XS/XSUB (SV\* ABI) loading | Non-goal/limitation | DynaLoader-compatible FFI works for perlc's own `.so` and hand-built C libs; genuine perlguts XSUB `.so`s cannot load. Explicit non-goal. | Low | `docs/xs_ffi_design.md`. | Leave as documented non-goal for MVP (sysadmin/CLI scope). |
 | 8 | Auto-parallel `map`/`foreach` | Deferred (perf) | No dependence analyzer; only pure-`$_` `map` is safely parallelizable. | Low (perf) | CLAUDE.md "Known remaining gaps." | Defer; not a correctness MVP gate. |
 | 9 | DBI beyond SQLite | Scope | Only the SQLite subset is implemented; non-SQLite drivers out of scope. | Low | README. | Keep SQLite-only for MVP. |
@@ -34,10 +34,14 @@ supersedes the earlier a2985bb stamp in the Verification section below.
   in `tests/` / `tests/lib/E/`. See the #4 writeup in this section below.
   Remaining lifecycle gaps: `no Module` un-import, conditional
   `use if` import lists, caller-namespace injection.
-- **#1 / #6 — runtime do/eval spawns (not closed).** `(a.1)` reclaim
-  (commit `75a0fe9`) cut runtime spawns **19 → 16** (constant eval'd-sub
-  strings compile in-process). `do FILE`, dynamic `eval EXPR`, and dynamic
-  XS still spawn perlc+clang at runtime.
+- **#1 / #6 — runtime do/eval spawns (not closed; scope decision pending).**
+  `(a.1)` reclaim (commit `75a0fe9`) cut runtime spawns **19 → 16** (constant
+  eval'd-sub strings compile in-process). `do FILE`, dynamic `eval EXPR`, and
+  dynamic XS still spawn perlc+clang at runtime → binary not self-contained.
+  **Recommended: option (a) compile-time-only for MVP** (see the #1/#6
+  decision note below). (b) keeps runtime eval but is the biggest lift;
+  (c) documents the toolchain dependency and caches the built `.so` — a
+  stopgap only if runtime eval must be preserved.
 - **#3 — module availability. Resolved (2026-11-16).** All high-frequency
   core modules are now natively implemented and verified functional at
   runtime (no host Pod::/Archive::/Encode:: needed). The 2026-11-15
@@ -165,6 +169,42 @@ high-frequency core ones run correctly at runtime:
 | `perlbug`, `perlthanks` | `Module/CoreList.pm:82 expected ) but got '$'` | host-module parse |
 | `streamzip` | `Compress/Raw/Bzip2.pm:53 unexpected token '}'` | `*{$AUTOLOAD} = sub {$val}` computed-typeglob RHS (D192 model present, this form not emitted) |
 | `zipdetails` | `encoding.pm:48 unexpected token '&'` | host-module parse |
+
+## #1/#6 — do/eval scope decision (pending; recommended: (a))
+
+**Status: open.** Not resolved by the #3 work this session. `perl_do_file()`
+and `perl_eval_string()` (`src/runtime.c:1380`, `:1685`) still `system()` a
+perlc `--do-lib`/`--eval-lib` compile at runtime and `dlopen` the `.so`, so
+the binary is not self-contained (needs perlc + clang + `/bin/sh`).
+`(a.1)` (commit `75a0fe9`) already reclaiming the common case: constant
+eval'd-sub strings now compile in-process (19 → 16 runtime spawns).
+
+**The decision to make:** keep runtime `do`/`eval`, or resolve it at compile
+time (error if not statically resolvable)? **Recommended: (a)
+compile-time-only for MVP.**
+
+| Option | Self-contained? | Keeps runtime do/eval? | Effort |
+|--------|-----------------|------------------------|--------|
+| (a) compile-time-only | Yes | No (statically resolvable only) | Low |
+| (b) static eval path (embed compiler) | Yes | Yes | High / uncertain |
+| (c) keep + content-addressed `.so` cache | No (still needs toolchain) | Yes | Low–med |
+
+Why **(a)**: **#1 is Critical and "central to the standalone MVP."** Only
+(a)/(b) yield a self-contained binary; (c) only reduces the spawn cost and
+still needs the toolchain, so (c) cannot close #1. (a) is low-risk and
+consistent with (a.1); (b) embeds a compiler at runtime (biggest, most
+uncertain lift) → defer as post-MVP. (c) is a stopgap only if runtime eval is
+a hard requirement.
+
+**Is `do`/`eval` worth preserving?** Mostly `do FILE` is a **benign inclusion
+idiom** (like `require`/`#include` for config, helper, or library `.pl`
+files) — a standard, common Perl pattern, not self-modifying code. The
+genuinely "self-modifying" one is **string `eval`** (compile a string at
+runtime: codegen, runtime-generated code). `eval { }` **block** form is the
+idiomatic try/catch and is compile-time — already handled by perlc, not the
+runtime-spawn path. So the runtime-spawn concern is the *dynamic* cases
+(non-static `do` paths, runtime `eval` strings); (a) covers the common
+(statically resolvable) part and errors cleanly on the rest.
 
 ## Verification (2026-11-15)
 
