@@ -21,49 +21,50 @@ bottom of this file._
 | 9 | DBI beyond SQLite | Scope | Only the SQLite subset is implemented; non-SQLite drivers out of scope. | Low | README. | Keep SQLite-only for MVP. |
 | 10 | valgrind SIGILL on perlc binaries | Env issue | `make test-valgrind` can't run on this host (SIGILL, environmental, noted as D151). | Non-blocker | README/TESTS.md notes. | Track as host-specific, not a code defect. |
 
-## Resolution and next set (2026-11-16, HEAD `4299888`)
+## Resolution and next set (2026-11-16, HEAD `45c3dca`)
 
-Re-verified 2026-11-16: `./tests/harness.sh` = **751 PASS / 0 FAIL**. This
-supersedes the a2985bb stamp in the Verification section below.
+Re-verified 2026-11-16: `make test-all` = **755 PASS / 0 FAIL** (755
+compared) vs real perl — the mandatory pre-commit gate is green. This
+supersedes the earlier a2985bb stamp in the Verification section below.
 
-### Resolved since the last stamp
-- **#2 — correctness gate.** `make test-all` is green (751/0). This was the
-  mandatory pre-commit gate.
-
-### Shifted since the last stamp
-- **#1 / #6 — runtime do/eval spawns.** `(a.1)` reclaim (commit `75a0fe9`) cut
-  runtime spawns **19 → 16** (constant eval'd-sub strings now compile in
-  process). The blocker is **not closed**: `do FILE`, dynamic `eval EXPR`, and
-  dynamic XS still spawn perlc+clang at runtime.
-- **#3 — module availability.** Native-path groundwork done: `PERLC_NATIVE_OVERRIDE=0`
-  (commit `4299888`) lets a user `.pm` in @INC beat the built-in stub for
-  `require`; it defaults off, so `make test-realworld` is still 10/30
-  failing. Core high-frequency module impl is pending.
+- **#2 — correctness gate.** Resolved. Was 605/609; now fully green
+  (`any`/`can_ssl` fixed, `term_readline` aligned to Stub).
+- **#4 Exporter / `import()` — first two gaps closed.** Audit + two fixes,
+  both byte-for-byte verified against real perl, with regression fixtures
+  in `tests/` / `tests/lib/E/`. See the #4 writeup in this section below.
+  Remaining lifecycle gaps: `no Module` un-import, conditional
+  `use if` import lists, caller-namespace injection.
+- **#1 / #6 — runtime do/eval spawns (not closed).** `(a.1)` reclaim
+  (commit `75a0fe9`) cut runtime spawns **19 → 16** (constant eval'd-sub
+  strings compile in-process). `do FILE`, dynamic `eval EXPR`, and dynamic
+  XS still spawn perlc+clang at runtime.
+- **#3 — module availability (not closed).** Native-path groundwork done:
+  `PERLC_NATIVE_OVERRIDE=0` (commit `4299888`) lets a user `.pm` in @INC beat
+  the built-in stub for `require`; it defaults off, so `make test-realworld`
+  is still 10/30 failing. Core high-frequency module impl is pending.
 
 ### Prioritized next set (by severity × blast radius × can-start-now)
-1. **#4 Exporter / `import()` full semantics** *(High)* — `%EXPORT_TAGS` / `:tag`
-   / `:all` / `:OK` exist; full `import()` lifecycle, default `@EXPORT`, and
-   conditional imports are partial. The documented ceiling on "arbitrary
-   pure-Perl modules just work." Well-scoped audit of `import()` in
-   `main.cpp`; pairs with the #3 native path (most modules `use Exporter`).
-2. **#3 Module availability** *(High)* — 10/30 real scripts fail on missing
+1. **#3 Module availability** *(High)* — 10/30 real scripts fail on missing
    modules (Pod::Text/Man/Html, Archive::Tar, IO::Compress::Zip,
    ExtUtils::Packlist, App::Cpan, App::Prove, Encode::Alias). Needs the
    native-vs-cpanm decision first, then implement the high-frequency modules.
-3. **#1 / #6 runtime do/eval + spawn cost** *(Critical / Med)* — after (a.1),
+2. **#1 / #6 runtime do/eval + spawn cost** *(Critical / Med)* — after (a.1),
    `do FILE`, dynamic `eval EXPR`, and dynamic XS still spawn. Needs the scope
    call: (a) compile-time-only, (b) bundle a static eval path, or (c) document
    "needs toolchain" + a content-addressed `.so` cache.
-4. **#5 `format`/`write` runtime fidelity** *(Med)* — compiles but the corpus
-   is compile-only; needs byte-for-byte vs perl to rule out an empty-runtime
+3. **#4 Exporter / `import()` lifecycle remaining** *(High)* — after the
+   `:DEFAULT` + builtin-arity fixes above, remaining: `no Module` un-import,
+   conditional `use if`/`use unless` import lists, caller-namespace injection.
+   The "arbitrary pure-Perl modules just work" ceiling; pairs with #3
+   (most modules `use Exporter`).
+4. **#5 `format`/`write` runtime fidelity** *(Med)* — compiles but corpus is
+   compile-only; needs byte-for-byte vs perl to rule out an empty-runtime
    compile-only win.
 
 Non-blockers: #7 (XSUB non-goal), #8 (perf, deferred), #9 (SQLite-only),
 #10 (host env).
 
-## Resolution and next set (2026-11-16, HEAD 4299888)
-
-### #4 Exporter / import() — first two gaps closed
+## #4 Exporter / import() — first two gaps closed (2026-11-16, HEAD `45c3dca`)
 Audit of `import()` in `src/main.cpp` (`inlineModules`, the `:tag`
 expansion block and `seedProto`). Two concrete defects found and fixed;
 both verified byte-for-byte against real perl and covered by new
