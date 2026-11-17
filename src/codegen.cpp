@@ -16,6 +16,8 @@
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <stdexcept>
 #include <sstream>
+#include <fstream>
+#include <unistd.h>
 #include <set>
 #include <unordered_set>
 
@@ -302,6 +304,33 @@ static std::string definedSubName(llvm::Module &mod, const std::string &name) {
             return bare;
     }
     return name;
+}
+
+/* #1 / do-eval-options (a): static `do "literal"` expansion — a `do` whose
+   target is a path known at COMPILE time and whose top-level is PURE,
+   self-contained sub definitions compiles those subs into the current
+   binary instead of spawning perlc+clang at runtime. `subIsSelfContained`
+   mirrors the constant-eval reclaim (codegen.cpp ~18544): a sub is
+   self-contained only if every scalar it references is declared locally
+   (an outer-lexical closure can't cross the compile boundary, which is
+   exactly why the runtime `perl_do_file` spawn exists for those). */
+static bool doSubSelfContained(const Node &sd) {
+    if (sd.kind != NK::SubDef || !sd.body) return false;
+    std::set<std::string> refs, decls;
+    collectAllScalarNames(*sd.body, refs);
+    collectLocalDecls(*sd.body, decls);
+    for (const auto &nm : refs)
+        if (nm != "_" && !decls.count(nm)) return false;
+    return true;
+}
+
+static bool doPureSelfContained(const Node &b) {
+    if (b.args.empty()) return false;
+    for (auto &stmt : b.args)
+        if (stmt->kind != NK::SubDef) return false;
+    for (auto &stmt : b.args)
+        if (!doSubSelfContained(*stmt)) return false;
+    return true;
 }
 
 /* ── format / write helpers ─────────────────────────────────────────────── */
@@ -12933,8 +12962,96 @@ Value *CodeGen::emitExpr(const Node &n) {
         return callRT("perl_runtime_require", {modStr});
     }
 
-    case NK::DoFile:
+    case NK::DoFile: {
+        /* #1 / do-eval-options (a): static `do "literal.pl"` expansion. A
+          `do` whose target is a literal path WITH a directory component (so
+          perl treats it as a direct cwd-relative/absolute path rather than
+          an @INC lookup) whose body is PURE, self-contained sub definitions
+          compiles those subs into this binary at build time instead of
+          spawning perlc+clang at runtime (keeps the binary self-contained).
+          Mirrors the constant-eval reclaim: the sub is only reclaimed if it
+          references only its own local lexicals (an outer-lexical closure
+          can't cross the compile boundary). A missing path, a non-subdef
+          body, a bare filename (deferred to perl's @INC lookup), or a
+          dynamic path (`do $x`) falls through to the runtime spawn, which
+          is deferred. `do` of a pure-subdef file yields undef in void
+          context, matching real Perl. */
+        if (n.left && n.left->kind == NK::StringLit) {
+            const std::string &raw = n.left->sval;
+            std::string resolved;
+            {
+                /* real perl treats a path prefixed with ./ or ../ (or an
+                   absolute path) as a direct cwd-relative/absolute path; a
+                   bare filename or bare a/b is looked up in @INC and
+                   deferred. Match that so the compile-time read resolves
+                   to the same file perl's runtime would. */
+                char buf[4096];
+                std::string cwd = getcwd(buf, sizeof(buf))
+                                         ? std::string(buf) : std::string(".");
+                const bool isDirect = (raw.rfind("./", 0) == 0 ||
+                                       raw.rfind("../", 0) == 0 ||
+                                       !raw.empty() && raw[0] == '/');
+                if (isDirect) {
+                    std::string target = (raw[0] == '/') ? raw
+                                         : (cwd + "/" + raw);
+                    std::ifstream probe(target);
+                    if (probe.good()) resolved = target;
+                    if (resolved.empty()) {
+                        for (const auto &d : incDirs_) {
+                            probe.open(d + "/" + raw);
+                            if (probe.good()) { resolved = d + "/" + raw; break; }
+                        }
+                    }
+                }
+            }
+            if (!resolved.empty()) {
+                std::ifstream in(resolved, std::ios::binary);
+                std::stringstream ss; ss << in.rdbuf();
+                std::string src = ss.str();
+                try {
+                    Lexer lex(src);
+                    auto toks = lex.tokenize();
+                    Parser p(std::move(toks));
+                    NodePtr body = p.parseProgram();
+                    if (body && doPureSelfContained(*body)) {
+                        bool collide = false;
+                        for (auto &stmt : body->args)
+                            if (stmt->kind == NK::SubDef &&
+                                mod_->getFunction(subLLVMName(stmt->name))) {
+                                collide = true; break;
+                            }
+                        if (!collide) {
+                            const size_t subsBefore = subs_.size();
+                            collectSubDefs(*body, subs_);
+                            pendingEvalBodies_.push_back(std::move(body));
+                            /* The pre-declare loop in compile() already ran
+                               before the main body was emitted, so declare
+                               the freshly registered subs as Functions here
+                               (matching the constant-eval reclaim) or
+                               emitSub's getFunction() returns null and the
+                               sub body is never emitted. */
+                            for (size_t i = subsBefore; i < subs_.size(); i++) {
+                                const Node *s = subs_[i];
+                                if (!mod_->getFunction(subLLVMName(s->name))) {
+                                    auto *ft = FunctionType::get(perlPtrTy_,
+                                        {arrayPtrTy_, Type::getInt32Ty(ctx_)},
+                                        false);
+                                    auto *fn = Function::Create(ft,
+                                        Function::ExternalLinkage,
+                                        subLLVMName(s->name), mod_.get());
+                                    fn->addFnAttr(Attribute::AlwaysInline);
+                                }
+                            }
+                            return perlUndef();
+                        }
+                    }
+                } catch (const std::exception &) {
+                    /* parse error: fall through to the runtime spawn */
+                }
+            }
+        }
         return callRT("perl_do_file", {emitExpr(*n.left)});
+    }
 
     case NK::Redo: {
         if (!loopRedos_.empty()) {
