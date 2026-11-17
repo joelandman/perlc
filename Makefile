@@ -146,6 +146,7 @@ test: $(TARGET)
 	done
 
 test-all: $(TARGET)
+	@./tests/eval_inline_nospawn.sh
 	@./tests/harness.sh
 	@./tests/d271_stdio_buffer.sh
 	@./tests/d276_debug_subprogram.sh

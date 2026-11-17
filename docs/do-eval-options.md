@@ -170,7 +170,24 @@ blocker table and current gate state.
   - **Next (a) slices**: `do "literal"` of a *pre-existing* file (no corpus
     coverage today — would need a test with a static `do` of a file present
     at compile time, plus compile-time file read + recursive `cg.compile`);
-    constant `require "NonNative.pm"` (overlaps blocker #3).
+  - **Slice 1 (a.2) — DONE and verified** (`tests/eval_inline_nospawn.sh`, 2026-11-17):
+     constant **arithmetic / list / multi-statement / conditional / literal /
+     constant-qr / eval-block** string evals compile in-process as an
+     `EvalBlock` — no `perl_eval_string`, no spawn, no `/tmp`. The `eval` Call
+     handler (`codegen.cpp`, ~18617) already narrows `eval("str")` to its one
+     element and, for a StringLit arg with a parsed body that has no subs /
+     require / use / do, emits the EvalBlock directly (`codegen.cpp`, ~18649).
+     Output byte-matches perl.
+    - **Only** StringLit args are reclaimable; with no new subs they compile
+    inline unconditionally. Genuinely **dynamic** cases (a string built by
+       runtime interpolation — `eval "qr/$pat/"`, `eval "sub $nm()"`,
+       `eval "10 + $x"`) parse to a concatenation BinOp (not a StringLit) and
+       correctly **remain deferred** to `perl_eval_string`: recompiling that
+       source in-process is exactly what the spawn exists for.
+     - Regression check is *structural* (no `perl_eval_string`/`perl_do_file`
+       call site in the const program, exactly one in the dynamic program),
+      because a pure output compare cannot catch a constant eval that
+       regressed back through `perl_eval_string` (perl still runs it right).
 - 2026-11-16: **#3 native-module override hook (task A) — DONE and verified.**
   - `PERLC_NATIVE_OVERRIDE=0` (falsey token: `0`/`false`/`off`/`no`/`none`/
     `disable`/`disabled`, case-insensitive) opts out of the hard-coded

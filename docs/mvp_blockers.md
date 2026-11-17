@@ -172,12 +172,21 @@ high-frequency core ones run correctly at runtime:
 
 ## #1/#6 — do/eval scope decision (pending; recommended: (a))
 
-**Status: open.** Not resolved by the #3 work this session. `perl_do_file()`
-and `perl_eval_string()` (`src/runtime.c:1380`, `:1685`) still `system()` a
-perlc `--do-lib`/`--eval-lib` compile at runtime and `dlopen` the `.so`, so
-the binary is not self-contained (needs perlc + clang + `/bin/sh`).
-`(a.1)` (commit `75a0fe9`) already reclaiming the common case: constant
-eval'd-sub strings now compile in-process (19 → 16 runtime spawns).
+**Status: open (partially closed).** Not resolved by the #3 work this session.
+`perl_do_file()` and `perl_eval_string()` (`src/runtime.c:1347`, `:1692`) still
+`system()` a perlc `--do-lib`/`--eval-lib` compile at runtime and `dlopen` the
+`.so`, so a *dynamic* `do`/`eval` is not self-contained (needs perlc + clang +
+`/bin/sh`). Two slices of (a) are now in, both verified by
+`make test-all` (757 PASS / 0 FAIL):
+
+- `(a.1)` (commit `75a0fe9`) — constant eval'd-**sub** strings compile
+  in-process (`19 → 16` runtime spawns).
+- `(a.2)` slice 1 — **constant arithmetic / list / multi-statement /
+  conditional / literal / constant-qr string evals** already compile
+  in-process as an `EvalBlock` (no `perl_eval_string`, no spawn, no `/tmp`);
+  covered by `tests/eval_inline_nospawn.sh` (a *structural* regression check:
+  the harness's output compare can't catch a constant eval falling back to a
+  runtime spawn).
 
 **The decision to make:** keep runtime `do`/`eval`, or resolve it at compile
 time (error if not statically resolvable)? **Recommended: (a)
