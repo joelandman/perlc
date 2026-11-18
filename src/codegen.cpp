@@ -1831,10 +1831,18 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
     if (n.kind == NK::EachFunc) {
         Value *hv;
         if (n.sval == "deref") {
-            Value *sv = lookupVar(n.name);
-            if (!sv) return callRT("perl_array_new", {});
-            Value *refVal = builder_.CreateLoad(perlPtrTy_, sv, "each_ref");
-            hv = callRT("perl_deref_hash", {refVal});
+            Value *ref;
+            if (n.left) {
+                /* each %{expr} — hash-block deref (CoreList.pm's
+                   `each %{$version{$_}}`). expr form has no name. */
+                ref = emitExpr(*n.left);
+            } else {
+                /* each %$ref — named scalar holding a hash ref. */
+                Value *sv = lookupVar(n.name);
+                if (!sv) return callRT("perl_array_new", {});
+                ref = builder_.CreateLoad(perlPtrTy_, sv, "each_ref");
+            }
+            hv = callRT("perl_deref_hash", {ref});
         } else {
             hv = lookupHash(n.name);
         }
@@ -12014,6 +12022,32 @@ void CodeGen::emitStmt(const Node &n) {
             builder_.SetInsertPoint(dead);
             break;
         }
+        if (n.sval == "coderedir" && n.left) {
+            /* goto &{EXPR} — replace current frame by calling a code
+               reference computed at runtime (Compress::Raw::Bzip2's
+               `goto &{$AUTOLOAD}` after `*{$AUTOLOAD} = sub { $val }`).
+               Mirrors `goto &NAME` above, but resolves the callee via
+               perl_call_code_ref instead of a named sub. */
+            Value *argsArr = lookupArray("_");
+            if (!argsArr) argsArr = callRT("perl_array_new", {});
+            Value *ref = emitExpr(*n.left);
+            freeIfOwned(ref);
+            auto *i32Ty = Type::getInt32Ty(ctx_);
+            Value *ctxVal = currentSubNeedsWantarray_
+                ? callRT("perl_current_wantarray_ctx", {})
+                : ConstantInt::get(i32Ty, 0);
+            Value *retVal = callRT("perl_call_code_ref", {ref, argsArr});
+            if (currentSubNeedsWantarray_) callRT("perl_pop_wantarray", {});
+            if (localDepthAlloca_) {
+                Value *depth = builder_.CreateLoad(i32Ty, localDepthAlloca_);
+                callRT("perl_local_restore_to", {depth});
+            }
+            builder_.CreateRet(retVal);
+            auto *dead = BasicBlock::Create(ctx_, "goto.coderedir.dead",
+                                            builder_.GetInsertBlock()->getParent());
+            builder_.SetInsertPoint(dead);
+            break;
+        }
         if (n.sval == "expr" && n.left) {
             /* computed label: only string literals handled above; runtime
                string → look up is not wired; jump to undef path. */
@@ -12875,10 +12909,19 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* D198: `each %$ref` — hash deref form. */
         Value *hv;
         if (n.sval == "deref") {
-            Value *sv = lookupVar(n.name);
-            if (!sv) return perlUndef();
-            Value *refVal = builder_.CreateLoad(perlPtrTy_, sv, "each_ref");
-            hv = callRT("perl_deref_hash", {refVal});
+            Value *ref;
+            if (n.left) {
+                /* each %{expr} — hash-block deref: the block evaluated to a
+                   scalar holding a hash ref (CoreList.pm's
+                   `each %{$version{$_}}`). expr form has no name. */
+                ref = emitExpr(*n.left);
+            } else {
+                /* each %$ref — named scalar holding a hash ref. */
+                Value *sv = lookupVar(n.name);
+                if (!sv) return perlUndef();
+                ref = builder_.CreateLoad(perlPtrTy_, sv, "each_ref");
+            }
+            hv = callRT("perl_deref_hash", {ref});
         } else {
             hv = lookupHash(n.name);
             if (!hv) return perlUndef();
@@ -20823,11 +20866,26 @@ Value *CodeGen::emitCall(const Node &n) {
         return callRT("perl_bareword_or_call",
                       {nameStr, qualStr, ctxVal, fileStr, lineVal});
     }
-    if (n.ival == 1) {
+    /* A bareword call whose FIRST argument is a bare literal (string/int/float) —
+       `foo "s"`, `foo 5` — is a compile error in real Perl (unparenthesized
+       bareword can't take a bare literal; needs parens). A bareword call with a
+       non-literal first arg (scalar, hash, arrayref, expr — e.g. `readonly $x`)
+       is a valid call to a possibly-undefined sub, deferred to runtime (D113).
+       Perl 5.44 has no readonly feature, so `readonly $$value` in IO::Compress
+       must COMPILE, not error. Args after the first are always fine, so only the
+       first arg decides. The empty-args and probe arms must keep throwing:
+       `print WORD;` (D155) and the bareword-fh probe rely on THIS throw to fall
+       back to the bareword filehandle form. */
+    bool literalFirstArg =
+        !n.args.empty() && n.args[0] &&
+        (n.args[0]->kind == NK::StringLit ||
+         n.args[0]->kind == NK::IntLit ||
+         n.args[0]->kind == NK::FloatLit);
+    if (n.ival == 1 && (n.args.empty() || literalFirstArg || inBareFhProbe_)) {
         throw std::runtime_error(
-            "String found where operator expected (Do you need to predeclare \"" +
-            n.name + "\"?) at " + sourceFile_ + " line " +
-            std::to_string(n.line > 0 ? n.line : 1));
+             "String found where operator expected (Do you need to predeclare \"" +
+                 n.name + "\"?) at " + sourceFile_ + " line " +
+                 std::to_string(n.line > 0 ? n.line : 1));
     }
     /* Parenthesized call to a name not known at compile time — e.g. a sub
        defined later via eval STRING, or a genuinely undefined sub (real

@@ -1119,7 +1119,32 @@ std::vector<Token> Lexer::tokenize() {
       toks.back().text = "]";
       continue;
     }
-            /* $^X control variables: encode as "^X" in the SCALAR token text */
+             /* ${^NAME} special lexical "control" scalar (encoding.pm's
+                ${^ENCODING}, ${^E_NCODING}, ${^GLOBAL_PERIOD}). Multi-char
+                caret-form control vars must use the brace form because
+                $^ENCODING would read as $^E followed by NCODING. Encode as a
+                single SCALAR token holding "^NAME" (dots kept, as in
+                ${^GLOBAL_PERIOD}) so the parser's existing $^X scalar path
+                handles it uniformly. */
+             if (c == '$' && pos_ < src_.size() && src_[pos_] == '{'
+                     && pos_ + 1 < src_.size() && src_[pos_ + 1] == '^') {
+                 pos_++;    /* skip '{' */
+                 pos_++;    /* skip the '^' */
+                 std::string special = "^";
+                 while (pos_ < src_.size() && src_[pos_] != '}') {
+                     char ch = src_[pos_];
+                     if (isalnum((unsigned char)ch) || ch == '_' || ch == '.') {
+                         special += ch;
+                     } else {
+                         break;
+                     }
+                     pos_++;
+                 }
+                 if (pos_ < src_.size() && src_[pos_] == '}') pos_++; /* skip } */
+                 toks.back().text = special;
+                 continue;
+             }
+             /* $^X control variables: encode as "^X" in the SCALAR token text */
             if (c == '$' && pos_ < src_.size() && src_[pos_] == '^'
                     && pos_+1 < src_.size() && isupper((unsigned char)src_[pos_+1])) {
                 char ctrl = src_[pos_+1];

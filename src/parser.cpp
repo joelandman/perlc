@@ -696,10 +696,24 @@ NodePtr Parser::parseStmt() {
             struct LocalVarDecl { std::string sigil; std::string name; };
             std::vector<LocalVarDecl> allVars;
             while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
-                if (check(TK::ARRAY)) { advance(); allVars.push_back({"@", cur().text}); advance(); }
-                else if (check(TK::HASH)) { advance(); allVars.push_back({"%", cur().text}); advance(); }
-                else if (check(TK::SCALAR)) { advance(); allVars.push_back({"$", cur().text}); advance(); }
-                else { advance(); continue; }
+                if (check(TK::ARRAY)) {
+                    advance(); allVars.push_back({"@", cur().text}); advance();
+                } else if (check(TK::HASH)) {
+                    advance(); allVars.push_back({"%", cur().text}); advance();
+                } else if (check(TK::SCALAR)) {
+                    /* A fused control/special scalar ($^E, $#arr, $], $&, $1,
+                       ${^GLOBAL_PERIOD}, ...) carries its name *inside* the one
+                       SCALAR token, so the sigil and name are consumed by a
+                       single advance. Only a bare `$` sigil is followed by a
+                       separate IDENT/INT/`&` token carrying the name ($foo,
+                       $::name, $1, $&). Consuming that extra token for a fused
+                       scalar would swallow the list closer — the cause of the
+                       `local ($^E)` / `my ($^E)` "expected )" error. */
+                    std::string saved = cur().text;
+                    advance();
+                    if (saved == "$") { allVars.push_back({"$", cur().text}); advance(); }
+                    else allVars.push_back({"$", saved});
+                } else { advance(); continue; }
                 if (!match(TK::COMMA)) break;
             }
             consume(TK::RPAREN, ")");
@@ -860,7 +874,19 @@ NodePtr Parser::parseStmt() {
     if (check(TK::KW_GOTO)) {
         advance();
         auto n = std::make_unique<Node>(); n->kind = NK::Goto; n->line = line;
-        if (check(TK::AND)) {
+        if (check(TK::AND) && pos_ + 1 < toks_.size() &&
+            toks_[pos_ + 1].kind == TK::LBRACE) {
+            /* goto &{EXPR} — redirect to a code reference computed at runtime
+               (Compress::Raw::Bzip2's AUTOLOAD: `goto &{$AUTOLOAD}` right
+               after `*{$AUTOLOAD} = sub { $val };`). Same frame-replacement
+               as `goto &NAME`, but the callee is a runtime code ref. */
+            advance(); /* & */
+            advance(); /* { */
+            auto inner = parseExpr();
+            consume(TK::RBRACE, "}");
+            n->sval = "coderedir";
+            n->left = std::move(inner);
+        } else if (check(TK::AND)) {
             advance();
             n->sval = "sub";
             n->name = cur().text; advance();
@@ -975,16 +1001,17 @@ NodePtr Parser::parseStmt() {
        The statement form is Pod::Simple::TiedOutFH's `tie *$new, $class, $x`. */
     if (check(TK::KW_TIE)) {
         auto n = parseTie(line);
-        match(TK::SEMI);
-        return n;
+        return parseModifier(std::move(n), line);
     }
-    /* untie($var) */
+    /* untie($var) / untie *$glob — optional parens, postfix modifier
+       allowed (`untie *$self if $] >= 5.008`, IO::Compress::Base.pm
+       close()). */
     if (check(TK::KW_UNTIE)) {
         advance(); match(TK::LPAREN);
         auto n = std::make_unique<Node>(); n->kind = NK::UntieStmt; n->line = line;
         n->left = parseExpr();
         match(TK::RPAREN); match(TK::SEMI);
-        return n;
+        return parseModifier(std::move(n), line);
     }
     if (check(TK::KW_REQUIRE)) {
         return parseModifier(parseRequire(line), line);
@@ -1324,6 +1351,26 @@ bool Parser::looksLikeSignature() const {
     size_t i = pos_ + 1;
     auto k = [&](size_t j) { return j < toks_.size() ? toks_[j].kind : TK::EOF_TOK; };
     if (k(i) == TK::RPAREN) return signaturesEnabled_; /* sub f() */
+    /* Scan the parenthesised list. Real Perl forbids two things inside a
+       subroutine signature: a top-level `;` (that's a prototype's
+       required/optional separator) and adjacent nameless sigils such as
+       `$$` or `$@` (each nameless sigil must be followed by an IDENT, or
+       by a `,`/`;`/`)`). Either marks a legacy prototype. */
+    int depth = 0;
+    for (size_t j = i; j < toks_.size(); ++j) {
+        TK kj = toks_[j].kind;
+        if (kj == TK::RPAREN) break;
+        if (kj == TK::LPAREN || kj == TK::LBRACE) { depth++; continue; }
+        if ((depth > 0) && (kj == TK::RBRACKET || kj == TK::RBRACE)) { depth--; continue; }
+        if (depth != 0) continue;
+        if (kj == TK::SEMI) return false;                 /* prototype */
+        // Adjacent nameless sigils: illegal in a signature.
+        if (kj == TK::SCALAR || kj == TK::ARRAY || kj == TK::HASH) {
+            TK nxt = (j + 1 < toks_.size()) ? toks_[j + 1].kind : TK::EOF_TOK;
+            if (nxt == TK::SCALAR || nxt == TK::ARRAY || nxt == TK::HASH)
+                return false;
+        }
+    }
     if (k(i) == TK::SCALAR) {
         if (k(i + 1) == TK::IDENT) return true;          /* $x */
         if (signaturesEnabled_) return true;              /* nameless $ */
@@ -1475,6 +1522,33 @@ NodePtr Parser::parseSub() {
             rememberProto(name, proto);
         }
     }
+    /* sub NAME :ATTR(...) :ATTR2 — subroutine attributes. Real Perl
+       supports several (:lvalue, :method, :prototype, :locked, :ref,
+       :persistent, :warnifunused, ...); only :prototype changes how the
+       prototype is seen, and the argumented form :prototype(...)
+        carries the prototype itself. We ignore attributes for codegen
+       but must consume them — the earlier parser stopped at the first
+       attribute and threw "expected { but got ':'". Found via a real
+       /usr/bin/bytes.pm: `sub chr :prototype(_) { &CORE::chr }`. */
+    while (check(TK::COLON)) {
+        advance(); /* : */
+        /* attribute name (IDENT, or any leading-alnum bareword) */
+        if (check(TK::IDENT) ||
+            (!cur().text.empty() &&
+             (isalnum((unsigned char)cur().text[0]) || cur().text[0] == '_'))) {
+            advance();
+        }
+        /* argumented form: :name(ARGS) — skip balanced parens */
+        if (check(TK::LPAREN)) {
+            int d = 1; advance();
+            while (d > 0 && !check(TK::EOF_TOK)) {
+                if (check(TK::LPAREN)) d++;
+                else if (check(TK::RPAREN)) d--;
+                advance();
+            }
+            match(TK::RPAREN);
+        }
+    }
 
     /* forward declaration: sub name; or sub name(PROTOTYPE); */
     if (check(TK::SEMI)) {
@@ -1537,7 +1611,12 @@ NodePtr Parser::parseMy() {
         while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
             if (check(TK::ARRAY)) { advance(); allVars.push_back({"@", cur().text}); advance(); }
             else if (check(TK::HASH)) { advance(); allVars.push_back({"%", cur().text}); advance(); }
-            else if (check(TK::SCALAR)) { advance(); allVars.push_back({"$", cur().text}); advance(); }
+            else if (check(TK::SCALAR)) {
+                std::string saved = cur().text;
+                advance();
+                if (saved == "$") { allVars.push_back({"$", cur().text}); advance(); }
+                else allVars.push_back({"$", saved});
+            }
             else { advance(); continue; }
             if (getenv("PERLC_DBG")) fprintf(stderr, "DBG mylist tok='%s'\n", cur().text.c_str());
             if (!match(TK::COMMA)) break;
@@ -2666,9 +2745,9 @@ NodePtr Parser::parseNot() {
 NodePtr Parser::parseShift() {
     auto lhs = parseAdd();
     while (check(TK::LSHIFT) || check(TK::RSHIFT)) {
-        int line = cur().line;
         std::string op = check(TK::LSHIFT) ? "<<" : ">>";
         advance();
+        int line = cur().line;
         auto rhs = parseAdd();
         lhs = makeBin(op, std::move(lhs), std::move(rhs), line);
     }
@@ -2856,6 +2935,27 @@ NodePtr Parser::parseUnary() {
         n->left = makeScalar(varName, line);
         n->line = line;
         /* Optional parenthesized args: `&$scalar(args)` */
+        if (check(TK::LPAREN)) {
+            advance();
+            while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
+                n->args.push_back(parseExpr());
+                if (!match(TK::COMMA)) break;
+            }
+            consume(TK::RPAREN, ")");
+        }
+        return n;
+    }
+    /* `&{EXPR}` / `&{EXPR}(args)` — call a code reference obtained from
+       a runtime expression (encoding.pm: `&{$tries[1]}()`). Same
+       desugaring as `&$scalar` (CallCodeRef), but the ref is a computed
+       expression rather than a bare scalar name. */
+    if (check(TK::AND) && peek(1).kind == TK::LBRACE) {
+        advance(); /* & */
+        advance(); /* { */
+        auto inner = parseExpr();
+        consume(TK::RBRACE, "}");
+        auto n = std::make_unique<Node>(); n->kind = NK::CallCodeRef;
+        n->left = std::move(inner); n->line = line;
         if (check(TK::LPAREN)) {
             advance();
             while (!check(TK::RPAREN) && !check(TK::EOF_TOK)) {
@@ -3367,6 +3467,19 @@ NodePtr Parser::parsePrimary() {
     if (!inKeyContext_ && check(TK::KW_TIE))
         return parseTie(line);
 
+    /* `strict` / `warnings` are pragma keywords but are also usable as
+       bareword/package identifiers in expression position — the classic
+       case is `strict->unimport('hashpairs')` (encoding.pm line 137, inside
+       a BEGIN block). In term position treat them as their package-name
+       string, exactly like the IDENT handler (line ~6022), leaving any
+       following ARROW for parsePostfix/parseSubscript to build the method
+       call. `use strict` / `no strict` are handled at statement level
+       (parseUseNoStmt) and are not affected here. */
+    if (check(TK::KW_STRICT) || check(TK::KW_WARNINGS)) {
+        std::string nm = cur().text; advance();
+        return makeStr(nm, line);
+    }
+
     /* D234: `my $r = require $file` — require is a term, not only a
        statement. `require => 1` stays a bareword key. */
     if (!inKeyContext_ && check(TK::KW_REQUIRE) &&
@@ -3733,8 +3846,17 @@ NodePtr Parser::parsePrimary() {
         return n;
     }
 
-    /* typeglob: *NAME at expression start */
-    if (check(TK::STAR) && pos_ + 1 < toks_.size() && toks_[pos_+1].kind == TK::IDENT) {
+    /* typeglob: *NAME at expression start. NAME may be any bareword,
+        including a builtin that the lexer tokenizes as a keyword — e.g.
+        `*read = _notAvailable("read")` in IO::Compress::Base.pm, where
+        `read` is KW_READ. A leading `*` is unambiguously the typeglob
+        operator in Perl (no other prefix meaning), so treating the
+        following token as a glob name is always correct here; accept
+        IDENT or any KW_* builtin keyword. */
+    if (check(TK::STAR) && pos_ + 1 < toks_.size() &&
+        (toks_[pos_ + 1].kind == TK::IDENT ||
+         (toks_[pos_ + 1].kind >= TK::KW_MY &&
+          toks_[pos_ + 1].kind <= TK::KW_WRITE))) {
         advance();
         auto n = std::make_unique<Node>(); n->kind = NK::Typeglob;
         n->name = cur().text; n->line = line; advance();
@@ -3982,19 +4104,28 @@ NodePtr Parser::parsePrimary() {
             scNode->kind = NK::ScalarFunc; scNode->name = arrname; scNode->line = line;
             return makeBin("-", std::move(scNode), makeInt(1, line), line);
         }
-        /* $^O and similar control variables — text encodes "^X" */
-        if (cur().text.size() == 2 && cur().text[0] == '^') {
-            char ctrl = cur().text[1];
+        /* $^O and similar control variables — text encodes "^...". The lexer
+           folds the brace-form control scalars (${^ENCODING}, ${^E_NCODING},
+           ${^GLOBAL_PERIOD}) into a single SCALAR token whose text is the
+           full "^NAME" (size > 2); $^O/$^V are size 2. Handle both: the O/V
+           spellings stay numeric (GetpidFunc), everything else is a plain
+           ScalarVar with the full caret-name (codegen reads it as undef, which
+           is exactly what these deprecated/lexical scalars are in modern Perl). */
+        if (cur().text.size() >= 2 && cur().text[0] == '^') {
+            std::string full = cur().text;
             advance();
-            if (ctrl == 'O') {
-                auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc;
-                n->sval = "osname"; n->line = line; return n;
+            if (full.size() == 2) {
+                char ctrl = full[1];
+                if (ctrl == 'O') {
+                    auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc;
+                    n->sval = "osname"; n->line = line; return n;
+                }
+                if (ctrl == 'V') {
+                    auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc;
+                    n->sval = "perl_version"; n->line = line; return n;
+                }
             }
-            if (ctrl == 'V') {
-                auto n = std::make_unique<Node>(); n->kind = NK::GetpidFunc;
-                n->sval = "perl_version"; n->line = line; return n;
-            }
-            return makeScalar(std::string("^") + ctrl, line);
+            return makeScalar(full, line);
         }
         /* $+ — named-capture hash (single-token: SCALAR text="+") */
         if (cur().text == "+") {
@@ -4480,6 +4611,7 @@ NodePtr Parser::parsePrimary() {
             }
         }
         NodePtr inner = hasParen ? parseExpr() : parseShift();
+        
         if (hasParen) consume(TK::RPAREN, ")");
         auto n = std::make_unique<Node>(); n->kind = NK::DefinedFunc;
         n->left = std::move(inner); n->line = line;
@@ -4582,6 +4714,23 @@ NodePtr Parser::parsePrimary() {
                 inKeyContext_ = false;
                 consume(TK::RBRACE, "}");
             }
+            if (hasParen) consume(TK::RPAREN, ")");
+            return n;
+        }
+        /* `delete *$glob->{key}` / `delete *$arr[i]` / `delete *$scalar`:
+           the argument is a typeglob-deref (`*$name`), not a bare scalar.
+           Real Perl removes a slot from that glob's symbol table. perlc
+           models every symbol-table element delete in scalar context as
+           undef (see DeleteFunc sval="glob_del"), which is exactly the
+           correct result here — so parse the argument as a general
+           expression and flag it as a glob-symbol delete. Found via
+           /usr/bin/streamzip's IO::Compress::Base.pm close():
+           `delete *$self->{FH}`. */
+        if (check(TK::STAR)) {
+            auto e = parseExpr();
+            auto n = std::make_unique<Node>(); n->kind = NK::DeleteFunc;
+            n->line = line; n->sval = "glob_del";
+            n->left = std::move(e);
             if (hasParen) consume(TK::RPAREN, ")");
             return n;
         }
@@ -5826,6 +5975,19 @@ NodePtr Parser::parsePrimary() {
            `each %hash` — named hash. */
         std::string nm;
         bool isDeref = false;
+        if (check(TK::LBRACE)) {
+            /* each %{expr} — hash-block deref: the block evaluated to a scalar
+               holding a hash ref (CoreList.pm's `each %{$version{$_}}`).
+               Parsed standalone into an EachFunc whose codegen emits the
+               expr via emitExpr. */
+            advance(); /* { */
+            auto n2 = std::make_unique<Node>();
+            n2->kind = NK::EachFunc; n2->line = line; n2->sval = "deref";
+            n2->left = parseExpr();
+            consume(TK::RBRACE, "}");
+            if (hp) consume(TK::RPAREN, ")");
+            return n2;
+        }
         if (check(TK::SCALAR)) {
             advance(); /* $ */
             nm = cur().text; advance();
@@ -6219,7 +6381,7 @@ bool Parser::inKeyBuiltinFollowedByArg() const {
     case TK::KW_LENGTH: case TK::KW_SUBSTR: case TK::KW_JOIN:
     case TK::KW_SPLIT: case TK::KW_INDEX: case TK::KW_RINDEX:
     case TK::KW_UC: case TK::KW_LC: case TK::KW_UCFIRST: case TK::KW_LCFIRST:
-    case TK::KW_REVERSE: case TK::KW_REF:
+    case TK::KW_REVERSE: case TK::KW_REF: case TK::KW_SPRINTF:
     case TK::KW_ABS: case TK::KW_INT: case TK::KW_SQRT:
     case TK::KW_CHR: case TK::KW_ORD: case TK::KW_HEX: case TK::KW_OCT:
     case TK::KW_MAP: case TK::KW_GREP: case TK::KW_SORT:
@@ -6447,6 +6609,22 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
     std::string cur_s;
 
     auto flush = [&]{ if (!cur_s.empty()) { parts.push_back(litStr(cur_s, line)); cur_s.clear(); } };
+
+    /* A bracketed subscript is genuine only when the index between the
+       brackets is a number (after trimming surrounding whitespace) or a
+       sigil/`-`-prefixed expression (parsed below). Anything else — a
+       glob/regex `[...]` bracket such as `\(\)` — is literal text, not an
+       array subscript. Treating it as literal keeps interpolation of
+       regex/glob patterns (e.g. File::GlobMapper) from crashing. */
+    auto looksNumericSubscript = [](const std::string &s) {
+        size_t b = 0, e = s.size();
+        while (b < e && isspace((unsigned char)s[b])) b++;
+        while (e > b && isspace((unsigned char)s[e-1])) e--;
+        if (b == e) return true;              /* empty => index 0 */
+        for (size_t k = b; k < e; k++)
+            if (!isdigit((unsigned char)s[k])) return false;
+        return true;
+    };
 
     size_t i = 0;
     while (i < raw.size()) {
@@ -6727,10 +6905,26 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                          i += 2; arrowSeenQ = true;
                      }
                      if (i < raw.size() && raw[i] == '[') {
+                         size_t saveBr = i;
                          i++;
                          std::string idx_s;
                          while (i < raw.size() && raw[i] != ']') idx_s += raw[i++];
-                         if (i < raw.size()) i++;
+                         bool closed = (i < raw.size());
+                         if (closed) i++;
+                         /* A bracket whose index is neither a number nor a
+                            sigil/`-` expression isn't a subscript — it's a
+                            literal regex/glob `[...]` bracket. Emit it as
+                         text so interpolation of patterns doesn't crash.
+                         A sigil/`-`-prefixed index ($i, @a, -1) IS a real subscript,
+                         not a literal bracket. */
+                         if (!idx_s.empty() &&
+                             !looksNumericSubscript(idx_s) &&
+                             !(idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
+                             cur_s += raw[saveBr];
+                             cur_s += idx_s;
+                             if (closed) cur_s += ']';
+                             continue;
+                         }
                          NodePtr idxExpr;
                          if (!idx_s.empty() && (idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
                              Lexer il(idx_s); auto itoks = il.tokenize();
@@ -6899,10 +7093,26 @@ NodePtr Parser::parseStringInterp(const std::string &raw, int line) {
                     }
                 }
                 if (i < raw.size() && raw[i] == '[') {
+                    size_t saveBr = i;
                     i++;
                     std::string idx_s;
                     while (i < raw.size() && raw[i] != ']') idx_s += raw[i++];
-                    if (i < raw.size()) i++;
+                    bool closed = (i < raw.size());
+                    if (closed) i++;
+                    /* A bracket whose index is neither a number nor a
+                       sigil/`-` expression isn't a subscript — it's a
+                       literal regex/glob `[...]` bracket. Emit it as text
+                    text so interpolation of patterns doesn't crash.
+                    A sigil/`-`-prefixed index ($i, @a, -1) IS a real subscript,
+                    not a literal bracket. */
+                    if (!idx_s.empty() &&
+                        !looksNumericSubscript(idx_s) &&
+                        !(idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
+                        cur_s += raw[saveBr];
+                        cur_s += idx_s;
+                        if (closed) cur_s += ']';
+                        continue;
+                    }
                     NodePtr idxExpr;
                     if (!idx_s.empty() && (idx_s[0] == '$' || idx_s[0] == '@' || idx_s[0] == '-')) {
                         Lexer il(idx_s); auto itoks = il.tokenize();
