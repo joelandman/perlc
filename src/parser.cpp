@@ -495,11 +495,30 @@ NodePtr Parser::parseUseNoStmt() {
                 utf8Enabled_ = false;
                 match(TK::SEMI);
                 continue;
-            } else if (!check(TK::STRING) && !check(TK::SEMI) && !check(TK::EOF_TOK)) {
-                advance(); /* pragma name (strict, etc.) */
+            } else if (!check(TK::SEMI) && !check(TK::EOF_TOK)) {
+                /* `no MODULE` (or a pragma such as strict/integer/feature that has
+                   no importMap entry, so this is a no-op). Perl calls
+                   `MODULE->unimport(LIST)` at compile time, removing the imported
+                   names from the caller's namespace for the rest of the enclosing
+                   block. perlc models import() as a package-scoped compile-time
+                   map (importMap_), so unimport() erases LIST from the current
+                   package's bucket; because the parser resolves bareword calls
+                   eagerly in source order, a name parsed after the `no` no longer
+                   resolves unqualified (matching Perl's "symbol removed"), while
+                   earlier calls keep resolving. Bare `no MODULE` (no LIST) erases
+                   nothing, matching Perl's default-Exporter unimport. */
+                advance(); /* module (or pragma) name */
+                if (check(TK::QWORDS)) {
+                    std::istringstream iss(cur().text);
+                    std::string w;
+                    while (iss >> w) unimportName(w);
+                    advance();
+                }
+                /* Skip optional argument string, e.g. `no Module 'arg'` */
+                if (check(TK::STRING)) advance();
+                match(TK::SEMI);
+                continue;
             }
-            /* Skip optional argument string, e.g. `no warnings 'misc'` */
-            if (check(TK::STRING)) advance();
             match(TK::SEMI); continue;
         }
         break;
@@ -1243,9 +1262,8 @@ void Parser::rememberProto(const std::string &name, const std::string &proto) {
 const std::string *Parser::lookupProto(const std::string &name) const {
     auto it = protoMap_.find(name);
     if (it != protoMap_.end()) return &it->second;
-    auto iit = importMap_.find(name);
-    if (iit != importMap_.end()) {
-        it = protoMap_.find(iit->second);
+    if (const std::string *q = resolveImport(name)) {
+        it = protoMap_.find(*q);
         if (it != protoMap_.end()) return &it->second;
     }
     return nullptr;
@@ -1402,8 +1420,7 @@ NodePtr Parser::parseSignaturePrefix(int line) {
 }
 
 NodePtr Parser::parseAmpBlockCall(std::string name, const std::string &proto, int line) {
-    auto iit = importMap_.find(name);
-    if (iit != importMap_.end()) name = iit->second;
+    if (const std::string *q = resolveImport(name)) name = *q;
     NodeList args;
     args.push_back(parseAnonSubBody(line, ""));
     match(TK::COMMA);
@@ -1783,7 +1800,7 @@ NodePtr Parser::parsePrint(bool isSay) {
        bareword call and let the D153 probe (emitBareFhPrintProbe) decide.
        Imports, constants and known handles are resolved here as before. */
     if (!hasParen && fhname.empty() && check(TK::IDENT) &&
-        !importMap_.count(cur().text) && !constMap_.count(cur().text) &&
+        !resolveImport(cur().text) && !constMap_.count(cur().text) &&
         !knownBareFH_.count(cur().text) && !isCmpOpWord(cur().text) &&
         cur().text.find("::") == std::string::npos) {
         TK k1 = peek(1).kind;
@@ -3759,8 +3776,7 @@ NodePtr Parser::parsePrimary() {
            toks_[pos_+1].text[0] == '_')))) {
         advance();
         std::string nm = cur().text; advance();
-        auto it = importMap_.find(nm);
-        if (it != importMap_.end()) nm = it->second;
+        if (const std::string *q = resolveImport(nm)) nm = *q;
         auto n = std::make_unique<Node>(); n->kind = NK::Call;
         n->name = nm; n->line = line; n->ival = 2; /* bypass prototype */
         if (check(TK::LPAREN)) {
@@ -4450,8 +4466,7 @@ NodePtr Parser::parsePrimary() {
             if (identish && !callParen) {
                 advance(); /* & */
                 std::string nm = cur().text; advance();
-                auto iit = importMap_.find(nm);
-                if (iit != importMap_.end()) nm = iit->second;
+                if (const std::string *q = resolveImport(nm)) nm = *q;
                 else if (nm.find("::") == std::string::npos) {
                     if (currentPackage_.empty() || currentPackage_ == "main")
                         nm = "main::" + nm;
@@ -4571,6 +4586,39 @@ NodePtr Parser::parsePrimary() {
             return n;
         }
         consume(TK::SCALAR, "$");
+        /* delete ${ EXPR } { KEY } — symbolic package-symbol-table delete.
+           This is the canonical `no Module` un-import idiom
+           (delete ${"$pkg\::"}{name} removes `name` from the caller's
+           package glob). ${ EXPR } is a SymbolicDeref; the following
+           { KEY } is the element to delete. perlc never executes a
+           module's unimport (the import is reversed at parse time via
+           importMap_, see parseUseNoStmt), so this only needs to *parse* —
+           the delete is never in the executed path. */
+        if (check(TK::LBRACE)) {
+            advance(); /* { */
+            auto base = std::make_unique<Node>();
+            base->kind = NK::SymbolicDeref;
+            base->line = line;
+            base->left = parseHashKeySingle();
+            if (!match(TK::RBRACE))
+                throw std::runtime_error(parseErrPrefix(line) + "expected }");
+            auto n = std::make_unique<Node>();
+            n->kind = NK::DeleteFunc;
+            n->line = line; n->sval = "glob_del";
+            n->left = std::move(base);
+            if (check(TK::LBRACE)) {
+                advance(); /* { */
+                n->right = parseHashKeySingle();
+                if (!match(TK::RBRACE))
+                    throw std::runtime_error(parseErrPrefix(line) + "expected }");
+            } else {
+                throw std::runtime_error(parseErrPrefix(line) +
+                    "delete ${...} needs a subscript");
+            }
+            if (hasParen) consume(TK::RPAREN, ")");
+            return n;
+        }
+
         /* D232: delete $$ref{key} / delete $$ref[idx]. Real Perl treats
            the adjacent subscript as one deref of the scalar
            (`$ref->{key}`), the same shape as D63's `$$name{key}` read.
@@ -5257,10 +5305,10 @@ NodePtr Parser::parsePrimary() {
            importMap_, populated in main.cpp's inlineModules()). A bare
            `use Time::HiRes;` with no import list must NOT change time()'s
            behavior — confirmed against real Perl. */
-        auto it = importMap_.find("time");
-        if (it != importMap_.end() && it->second == "Time::HiRes::time") {
+        const std::string *it = resolveImport("time");
+        if (it && *it == "Time::HiRes::time") {
             auto n = std::make_unique<Node>(); n->kind = NK::Call;
-            n->name = it->second; n->line = line;
+            n->name = *it; n->line = line;
             return n;
         }
         auto n = std::make_unique<Node>(); n->kind = NK::TimeFunc; n->line = line;
@@ -5285,9 +5333,8 @@ NodePtr Parser::parsePrimary() {
            any `use Time::Piece;`, so this checks the map the same way
            Time::HiRes does but doesn't require it to come from an
            explicit qw(...) list. */
-        auto itLt = importMap_.find(isGm ? "gmtime" : "localtime");
-        if (itLt != importMap_.end() &&
-            itLt->second == (isGm ? "Time::Piece::gmtime" : "Time::Piece::localtime"))
+        const std::string *itLt = resolveImport(isGm ? "gmtime" : "localtime");
+        if (itLt && *itLt == (isGm ? "Time::Piece::gmtime" : "Time::Piece::localtime"))
             n->name = "Time::Piece";
         return n;
     }
@@ -5304,10 +5351,10 @@ NodePtr Parser::parsePrimary() {
            builtin behavior — see the `time` case above for why the
            Time::HiRes override must be opt-in via importMap_. */
         if (isSleep) {
-            auto it = importMap_.find("sleep");
-            if (it != importMap_.end() && it->second == "Time::HiRes::sleep") {
+            const std::string *it = resolveImport("sleep");
+            if (it && *it == "Time::HiRes::sleep") {
                 auto n = std::make_unique<Node>(); n->kind = NK::Call;
-                n->name = it->second; n->line = line;
+                n->name = *it; n->line = line;
                 if (arg) n->args.push_back(std::move(arg));
                 return n;
             }
@@ -5698,8 +5745,8 @@ NodePtr Parser::parsePrimary() {
         advance(); bool hp = match(TK::LPAREN);
         auto path = parseExpr();
         if (hp) consume(TK::RPAREN, ")");
-        auto itSt = importMap_.find("stat");
-        if (itSt != importMap_.end() && itSt->second == "File::stat::stat") {
+        const std::string *itSt = resolveImport("stat");
+        if (itSt && *itSt == "File::stat::stat") {
             auto n = std::make_unique<Node>(); n->kind = NK::Call; n->line = line;
             n->name = "File::stat::stat";
             n->args.push_back(std::move(path));
@@ -5714,8 +5761,8 @@ NodePtr Parser::parsePrimary() {
         advance(); bool hp = match(TK::LPAREN);
         auto path = parseExpr();
         if (hp) consume(TK::RPAREN, ")");
-        auto itLs = importMap_.find("lstat");
-        if (itLs != importMap_.end() && itLs->second == "File::stat::lstat") {
+        const std::string *itLs = resolveImport("lstat");
+        if (itLs && *itLs == "File::stat::lstat") {
             auto n = std::make_unique<Node>(); n->kind = NK::Call; n->line = line;
             n->name = "File::stat::lstat";
             n->args.push_back(std::move(path));
@@ -5906,8 +5953,8 @@ NodePtr Parser::parsePrimary() {
                 /* sub foo () — bare foo is a call, foo() too. */
                 if (match(TK::LPAREN)) consume(TK::RPAREN, ")");
                 auto n = std::make_unique<Node>(); n->kind = NK::Call;
-                auto iit = importMap_.find(nm);
-                n->name = (iit != importMap_.end()) ? iit->second : nm;
+                const std::string *iit = resolveImport(nm);
+                n->name = (iit != nullptr) ? *iit : nm;
                 n->line = line; n->sval = *pr; n->ival = 0;
                 return n;
             }
@@ -5952,13 +5999,13 @@ NodePtr Parser::parsePrimary() {
            string: `BOLD RED "x"` nests (BOLD(RED("x"))) and `BOLD . "x"` is
            BOLD() . "x". `NAME => v` stays a string key. */
         {
-            auto imp = importMap_.find(nm);
-            if (imp != importMap_.end() && !check(TK::FATARROW)) {
+            const std::string *imp = resolveImport(nm);
+            if (imp && !check(TK::FATARROW)) {
                 if (check(TK::IDENT) && !isCmpOpWord(cur().text) &&
                     peek(1).kind != TK::FATARROW)
                     return parseBareCall(nm, line);
                 auto n = std::make_unique<Node>(); n->kind = NK::Call;
-                n->name = imp->second; n->line = line; n->ival = 0;
+                n->name = *imp; n->line = line; n->ival = 0;
                 return n;
             }
         }
@@ -6026,10 +6073,10 @@ NodePtr Parser::parsePrimary() {
                    prints the string; only `foo "arg"`-shaped calls with an
                    actual argument die "String found where operator
                    expected"). */
-                auto iit = importMap_.find(nm);
-                if (iit != importMap_.end()) {
+                const std::string *iit = resolveImport(nm);
+                if (iit) {
                     auto n = std::make_unique<Node>(); n->kind = NK::Call;
-                    n->name = iit->second; n->args = NodeList{};
+                    n->name = *iit; n->args = NodeList{};
                     n->line = line;
                     n->ival = 1; /* bareword call */
                     return n;
@@ -6102,8 +6149,8 @@ NodePtr Parser::parsePrimary() {
            actually installed, and otherwise keeps the bare word. */
         if (cur().kind == TK::KW_AND || cur().kind == TK::KW_OR) {
             auto n = std::make_unique<Node>(); n->kind = NK::Call;
-            auto iit = importMap_.find(nm);
-            n->name = (iit != importMap_.end()) ? iit->second : nm;
+            const std::string *iit = resolveImport(nm);
+            n->name = (iit ? *iit : nm);
             n->args = NodeList{}; n->line = line; n->ival = 1;
             return n;
         }
@@ -6211,8 +6258,8 @@ NodePtr Parser::parseBareCall(std::string name, int line) {
        ival=1 marks bareword-style call (unknown name → compile error). */
     if (getenv("PERLC_DEBUG_BARE"))
         fprintf(stderr, "BARECALL: '%s' line %d\n", name.c_str(), line);
-    auto it = importMap_.find(name);
-    if (it != importMap_.end()) name = it->second;
+    const std::string *it = resolveImport(name);
+    if (it) name = *it;
     const std::string *pr = lookupProto(name);
     NodeList args;
     args.push_back(parseLowNot());
@@ -6231,8 +6278,8 @@ NodePtr Parser::parseBareCall(std::string name, int line) {
 
 NodePtr Parser::parseCall(std::string name, int line) {
     /* remap imported short names to their qualified Module::name */
-    auto it = importMap_.find(name);
-    if (it != importMap_.end()) name = it->second;
+    const std::string *it = resolveImport(name);
+    if (it) name = *it;
     const std::string *pr = lookupProto(name);
     consume(TK::LPAREN, "(");
     NodeList args;

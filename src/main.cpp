@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
@@ -467,6 +468,292 @@ scanExports(const std::vector<Token> &toks)
     return result;
 }
 
+/* ── use if / use unless condition folding ───────────────────────────
+   perlc constant-folds a `use if`/`use unless` condition so the whole
+   statement can be dropped at compile time when the module is not
+   needed. Only a pragmatic subset of Perl's expression language is
+   folded — numeric / float / string literals, the special scalars
+   `$]` (perl version) and `$^O` (platform name, → "linux"), numeric
+   arithmetic (+ - * /), string/number comparisons, boolean && / || /
+   !, `do { ... }` blocks (whose trailing expression is the value), and
+   `defined &Sub`. Anything else is left unfolded.
+
+   This intentionally lives here (not in codegen) because the `use`
+   import decision must be made during the token pass, before the
+   module body is inlined.  The version ("5.044000") mirrors the value
+   runtime.c hardcodes for perl_get_perl_version(), so a folded `"$]"`
+   comparison agrees with the runtime value perlc would otherwise emit. */
+struct FoldScalar {
+    bool ok = false;        // could fold to a concrete value
+    bool isUndef = false;   // folded to undef (e.g. unknown scalar)
+    bool numeric = false;   // value is numeric
+    double num = 0.0;       // numeric value (valid when numeric)
+    std::string str;        // string value
+    bool isTruthy() const {
+        if (isUndef) return false;
+        if (numeric) return num != 0.0;
+        return !str.empty() && str != "0";
+    }
+};
+
+struct CondFolder {
+    const std::vector<Token> *T = nullptr;
+    size_t p = 0;
+    size_t end = 0;
+    std::function<bool(const std::string &)> isDefined = nullptr;
+
+    FoldScalar eval() { return evalOr(); }
+
+    void skipWs() {
+        while (p < end && (*T)[p].kind == TK::NEWLINE) p++;
+    }
+    bool accept(TK k) { skipWs(); if (p < end && (*T)[p].kind == k) { p++; return true; } return false; }
+
+    FoldScalar num(double v) { FoldScalar f; f.ok = true; f.numeric = true; f.num = v; return f; }
+    FoldScalar sstr(const std::string &s) { FoldScalar f; f.ok = true; f.str = s; return f; }
+
+    static double toDouble(const std::string &s) {
+        return s.empty() ? 0.0 : strtod(s.c_str(), nullptr);
+    }
+
+    /* || */ FoldScalar evalOr() {
+        FoldScalar l = evalAnd(); skipWs();
+        while (p < end && (*T)[p].kind == TK::OR2) {
+            p++; FoldScalar r = evalAnd(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            l.num = (l.isTruthy() || r.isTruthy()) ? 1.0 : 0.0;
+            l.numeric = true; l.str.clear();
+        }
+        return l;
+    }
+    /* && */ FoldScalar evalAnd() {
+        FoldScalar l = evalBitOr(); skipWs();
+        while (p < end && (*T)[p].kind == TK::AND2) {
+            p++; FoldScalar r = evalBitOr(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            l.num = (l.isTruthy() && r.isTruthy()) ? 1.0 : 0.0;
+            l.numeric = true; l.str.clear();
+        }
+        return l;
+    }
+    /* | */ FoldScalar evalBitOr() {
+        FoldScalar l = evalBitXor(); skipWs();
+        while (p < end && (*T)[p].kind == TK::OR) {
+            p++; FoldScalar r = evalBitXor(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            long long a = (long long)l.num, b = (long long)r.num;
+            return num((double)(a | b));
+        }
+        return l;
+    }
+    /* ^ */ FoldScalar evalBitXor() {
+        FoldScalar l = evalBitAnd(); skipWs();
+        while (p < end && (*T)[p].kind == TK::CARET) {
+            p++; FoldScalar r = evalBitAnd(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            long long a = (long long)l.num, b = (long long)r.num;
+            return num((double)(a ^ b));
+        }
+        return l;
+    }
+    /* & (bitwise) */ FoldScalar evalBitAnd() {
+        FoldScalar l = evalEquality(); skipWs();
+        while (p < end && (*T)[p].kind == TK::AND) {
+            p++; FoldScalar r = evalEquality(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            long long a = (long long)l.num, b = (long long)r.num;
+            return num((double)(a & b));
+        }
+        return l;
+    }
+    /* == != */ FoldScalar evalEquality() {
+        FoldScalar l = evalRelational(); skipWs();
+        while (p < end && ((*T)[p].kind == TK::EQ || (*T)[p].kind == TK::NE)) {
+            p++; FoldScalar r = evalRelational(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            bool t = l.num == r.num;
+            if ((*T)[p - 1].kind == TK::NE) t = !t;
+            return num(t ? 1.0 : 0.0);
+        }
+        return l;
+    }
+    /* < > <= >= <=> eq ne lt gt le ge */ FoldScalar evalRelational() {
+        FoldScalar l = evalShift(); skipWs();
+        while (p < end) {
+            TK k = (*T)[p].kind;
+            if (k < TK::LT || k > TK::STR_GE) break; /* not a relational op */
+            p++; FoldScalar r = evalShift(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            bool less = false, eq = false;
+            bool numericCmp = false;
+            switch (k) {
+                case TK::EQ:  case TK::NE:
+                    numericCmp = true; eq = (l.num == r.num); break;
+                case TK::SPACESHIP:
+                    return num(l.num < r.num ? -1.0 : (l.num == r.num ? 0.0 : 1.0));
+                case TK::LT: case TK::GT: case TK::LE: case TK::GE:
+                    numericCmp = l.numeric && r.numeric;
+                    if (numericCmp) { less = l.num < r.num; eq = (l.num == r.num); }
+                    else { std::string a = l.numeric ? std::to_string(l.num) : l.str;
+                           std::string b = r.numeric ? std::to_string(r.num) : r.str;
+                           less = a < b; eq = (a == b); }
+                    break;
+                case TK::STR_EQ: case TK::STR_NE:
+                    { std::string a = l.numeric ? std::to_string(l.num) : l.str;
+                      std::string b = r.numeric ? std::to_string(r.num) : r.str;
+                      less = a < b; eq = (a == b); break; }
+                case TK::STR_LT: case TK::STR_GT: case TK::STR_LE: case TK::STR_GE:
+                    { std::string a = l.numeric ? std::to_string(l.num) : l.str;
+                      std::string b = r.numeric ? std::to_string(r.num) : r.str;
+                      less = a < b; eq = (a == b); break; }
+                default: return {};
+            }
+            if (k == TK::LT || k == TK::LE || k == TK::STR_LT || k == TK::STR_LE)
+                return num(less ? 1.0 : 0.0);
+            if (k == TK::GT || k == TK::GE || k == TK::STR_GT || k == TK::STR_GE)
+                return num((!less && !eq) ? 1.0 : 0.0);
+            bool t = numericCmp ? (l.num == r.num) : eq;
+            if (k == TK::NE || k == TK::STR_NE) t = !t;
+            return num(t ? 1.0 : 0.0);
+        }
+        return l;
+    }
+    /* << >> */ FoldScalar evalShift() {
+        FoldScalar l = evalAdditive(); skipWs();
+        while (p < end) {
+            TK k = (*T)[p].kind;
+            if (k != TK::LSHIFT && k != TK::RSHIFT) break;
+            p++; FoldScalar r = evalAdditive(); skipWs();
+            if (!l.ok || !r.ok || !l.numeric || !r.numeric) return {};
+            long long a = (long long)l.num, b = (long long)r.num;
+            l.num = k == TK::LSHIFT ? (double)(a << b) : (double)(a >> b);
+            l.numeric = true; l.str.clear();
+        }
+        return l;
+    }
+    /* + - . */ FoldScalar evalAdditive() {
+        FoldScalar l = evalMultiplicative(); skipWs();
+        while (p < end) {
+            TK k = (*T)[p].kind;
+            if (k != TK::PLUS && k != TK::MINUS && k != TK::DOT) break;
+            p++; FoldScalar r = evalMultiplicative(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            if (k == TK::DOT) {
+                std::string a = l.numeric ? std::to_string(l.num) : l.str;
+                std::string b = r.numeric ? std::to_string(r.num) : r.str;
+                return sstr(a + b);
+            }
+            l.numeric = true; l.str.clear();
+            if (k == TK::PLUS) l.num = l.num + r.num;
+            else l.num = l.num - r.num;
+        }
+        return l;
+    }
+    /* * / % */ FoldScalar evalMultiplicative() {
+        FoldScalar l = evalPower(); skipWs();
+        while (p < end) {
+            TK k = (*T)[p].kind;
+            if (k != TK::STAR && k != TK::SLASH && k != TK::PERCENT) break;
+            p++; FoldScalar r = evalPower(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            if (k == TK::STAR) l.num = l.num * r.num;
+            else if (k == TK::SLASH) l.num = r.num != 0.0 ? l.num / r.num : 0.0;
+            else l.num = std::fmod(l.num, r.num);
+            l.numeric = true; l.str.clear();
+        }
+        return l;
+    }
+    /* ** */ FoldScalar evalPower() {
+        FoldScalar l = evalUnary(); skipWs();
+        while (p < end && (*T)[p].kind == TK::STAR_STAR) {
+            p++; FoldScalar r = evalUnary(); skipWs();
+            if (!l.ok || !r.ok) return {};
+            return num(std::pow(l.num, r.num));
+        }
+        return l;
+    }
+    /* ! unary- ~ */ FoldScalar evalUnary() {
+        skipWs();
+        if (p < end) {
+            TK k = (*T)[p].kind;
+            if (k == TK::NOT || k == TK::MINUS || k == TK::TILDE) {
+                p++; FoldScalar r = evalUnary(); skipWs();
+                if (!r.ok) return {};
+                if (k == TK::MINUS) return num(-r.num);
+                if (k == TK::TILDE) { long long a = (long long)r.num; return num((long long)~a); }
+                return num(!r.isTruthy() ? 1.0 : 0.0);
+            }
+        }
+        return evalPrimary();
+    }
+    /* primary: literal / $^O / $] / ( ) / do { } / defined &Sub */
+    FoldScalar evalPrimary() {
+        skipWs();
+        if (p >= end) return {};
+        const Token &t = (*T)[p];
+        TK k = t.kind;
+        if (k == TK::LPAREN) {
+            p++; FoldScalar v = evalOr(); skipWs();
+            if (p < end && (*T)[p].kind == TK::RPAREN) p++;
+            return v;
+        }
+        if (k == TK::KW_DO) { p++; return evalDoBlock(); }
+        if (k == TK::KW_DEFINED) {
+            p++; /* defined */
+            if (p < end && (*T)[p].kind == TK::AND) { /* & */
+                p++;
+                if (p < end && (*T)[p].kind == TK::IDENT) {
+                    std::string name = (*T)[p].text; p++;
+                    bool exists = isDefined && isDefined(name);
+                    return num(exists ? 1.0 : 0.0);
+                }
+            }
+            return {}; /* cannot determine definition */
+        }
+        if (k == TK::INT || k == TK::FLOAT) { p++; return num(toDouble(t.text)); }
+        if (k == TK::STRING) {
+            p++;
+            std::string s = t.text;
+            if (!s.empty() && s[0] == '\x01') s = s.substr(1);
+            /* "$]" interpolation → perl version; the lexer leaves it as the
+               literal `$]` (sometimes doubled) inside the string. */
+            if (s.find("$]") != std::string::npos || s.find("]") == 0)
+                return num(5.044); /* == perl_get_perl_version() "5.044000" */
+            return sstr(s);
+        }
+        if (k == TK::SCALAR) {
+            p++;
+            if (t.text == "^O") return sstr("linux"); /* $^O on this platform */
+            if (t.text == "]") return num(5.044);      /* bare $] */
+            return {}; /* other scalar: cannot fold */
+        }
+        if (k == TK::IDENT && isDefined) return {}; /* bareword constant: not foldable */
+        return {};
+    }
+    /* do { ... } : skip leading statement pragmas, return last expr value */
+    FoldScalar evalDoBlock() {
+        FoldScalar last;
+        while (p < end && (*T)[p].kind != TK::RBRACE) {
+            TK k = (*T)[p].kind;
+            if (k == TK::SEMI) { p++; continue; }
+            if (k == TK::IDENT && p + 1 < end && (*T)[p + 1].kind == TK::IDENT) {
+                std::string a = (*T)[p].text, b = (*T)[p + 1].text;
+                if (a == "no" || a == "use" || a == "strict" || a == "warnings" ||
+                    a == "feature" || a == "integer") {
+                    p += 2;
+                    if (p < end && (*T)[p].kind == TK::SEMI) p++;
+                    continue;
+                }
+            }
+            FoldScalar v = evalOr();
+            if (v.ok) last = v;
+            else return last; /* stop folding if the tail can't be folded */
+        }
+        if (p < end && (*T)[p].kind == TK::RBRACE) p++;
+        return last;
+    }
+};
+
 /* Inline `use Module` by prepending module tokens.
    Also builds importMap (short → qualified) from @EXPORT and explicit import lists.
    Pragmas (strict/warnings/feature/parent/base/Exporter/Carp/POSIX/Scalar::Util etc)
@@ -475,7 +762,7 @@ static std::vector<Token> inlineModules(
          std::vector<Token> tokens,
          const std::string &baseDir,
          std::set<std::string> &loaded,
-         std::map<std::string,std::string> &importMap,
+         std::map<std::string, std::map<std::string,std::string>> &importMap,
          std::map<std::string,NodePtr> *constMap = nullptr,
          Parser *parser = nullptr,
          bool isMainScript = true,
@@ -725,23 +1012,46 @@ static std::vector<Token> inlineModules(
             any interpolating `\x01` prefix before resolving it. */
         bool isUnless = (modName == "unless");
         if (modName == "if" || isUnless) {
+            /* find the 'use' keyword (token stream already had `i` advanced
+               past the statement at line ~1007) and the top-level COMMA that
+               separates the condition from the module name. The comma may be
+               nested inside the condition (e.g. `use if @a, "M"` would be
+               rare, but a do-block like `use if do { ... }, "M"` must not
+               stop at the ';' inside the block — that one is at depth>0 and
+               already excluded; here we only skip COMMAs inside () {} []). */
             size_t ui = useEnd;
             while (ui > 0 && tokens[ui].kind != TK::KW_USE) ui--;
-            size_t p = ui + 2;
-            int truth = 0;
-            if (p < useEnd) {
-                if (tokens[p].kind == TK::INT)
-                    truth = strtoll(tokens[p].text.c_str(), nullptr, 10) != 0;
-                else if (tokens[p].kind == TK::FLOAT)
-                    truth = strtod(tokens[p].text.c_str(), nullptr) != 0.0;
-                else if (tokens[p].kind == TK::STRING)
-                    truth = !tokens[p].text.empty();
-                p++;
-                if (p < useEnd && tokens[p].kind == TK::COMMA) p++;
+            size_t condStart = ui + 2;  /* first token after if/unless */
+            size_t commaPos = std::string::npos;
+            int depth = 0;
+            for (size_t c = condStart; c < useEnd; c++) {
+                TK k = tokens[c].kind;
+                if (k == TK::LPAREN || k == TK::LBRACE || k == TK::LBRACKET) depth++;
+                else if (k == TK::RPAREN || k == TK::RBRACE || k == TK::RBRACKET) {
+                    if (depth > 0) depth--;
+                } else if (k == TK::COMMA && depth == 0) {
+                    commaPos = c; break;
+                }
             }
-            bool apply = isUnless ? !truth : (truth != 0);
-            if (!apply || p >= useEnd) continue;
-            std::string m = tokens[p].text;
+            if (commaPos == std::string::npos) continue;
+            /* Fold the condition; treat any un-foldable condition as a
+               no-op (module not loaded), matching the pre-existing
+               literal-only behaviour for conditions perlc can't evaluate. */
+            CondFolder folder;
+            folder.T = &tokens;
+            folder.p = condStart;
+            folder.end = commaPos;
+            folder.isDefined = [&](const std::string &n) { return constMap->count(n) != 0; };
+            FoldScalar v = folder.eval();
+            if (!v.ok) continue;
+            bool apply = isUnless ? !v.isTruthy() : v.isTruthy();
+            if (!apply) continue;
+            /* module name: first token after the (top-level) comma, with the
+               leading \x01 marker and surrounding quotes stripped. */
+            size_t mStart = commaPos + 1;
+            while (mStart < useEnd && tokens[mStart].kind == TK::COMMA) mStart++;
+            if (mStart >= useEnd) continue;
+            std::string m = tokens[mStart].text;
             if (!m.empty() && m[0] == '\x01') m = m.substr(1);
             if (m.size() >= 2 &&
                 ((m.front() == '"' && m.back() == '"') ||
@@ -917,7 +1227,7 @@ static std::vector<Token> inlineModules(
                 "diag","note","done_testing","subtest", nullptr
             };
             for (int ti = 0; tmNames[ti]; ti++)
-                importMap[tmNames[ti]] = std::string("Test::More::") + tmNames[ti];
+                importMap[""][tmNames[ti]] = std::string("Test::More::") + tmNames[ti];
 
             size_t mnIdx = useEnd;
             while (mnIdx > 0 && tokens[mnIdx].text != modName) mnIdx--;
@@ -986,7 +1296,7 @@ static std::vector<Token> inlineModules(
            same always-available bareword dispatch POSIX::floor uses). */
         if (modName == "Time::HiRes") {
             for (auto &name : explicitImports)
-                importMap[name] = "Time::HiRes::" + name;
+                importMap[""][name] = "Time::HiRes::" + name;
             continue;
         }
 
@@ -1002,11 +1312,11 @@ static std::vector<Token> inlineModules(
            ONE_* constants are @EXPORT too (real module has no
            @EXPORT_OK gate on them). */
         if (modName == "Time::Piece") {
-            importMap["localtime"] = "Time::Piece::localtime";
-            importMap["gmtime"] = "Time::Piece::gmtime";
+            importMap[""]["localtime"] = "Time::Piece::localtime";
+            importMap[""]["gmtime"] = "Time::Piece::gmtime";
             for (auto &name : explicitImports) {
                 if (name == "localtime" || name == "gmtime") continue;
-                importMap[name] = "Time::Piece::" + name;
+                importMap[""][name] = "Time::Piece::" + name;
             }
             continue;
         }
@@ -1017,7 +1327,7 @@ static std::vector<Token> inlineModules(
                 "ONE_MINUTE","ONE_HOUR","ONE_DAY","ONE_WEEK","ONE_MONTH",
                 "ONE_YEAR","ONE_FINANCIAL_MONTH","LEAP_YEAR","NON_LEAP_YEAR",
             };
-            for (const char *c : oneConsts) importMap[c] = std::string("Time::Seconds::") + c;
+            for (const char *c : oneConsts) importMap[""][c] = std::string("Time::Seconds::") + c;
             continue;
         }
 
@@ -1223,7 +1533,7 @@ static std::vector<Token> inlineModules(
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
-                importMap[name] = modName + "::" + name;
+                importMap[currentPackage][name] = modName + "::" + name;
             }
             if (getenv("PERLC_DEBUG_IMPORTS")) {
                 fprintf(stderr, "FcntlImport: %s -> %zu names\n", modName.c_str(), names.size());
@@ -1237,7 +1547,7 @@ static std::vector<Token> inlineModules(
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
-                importMap[name] = "Try::Tiny::" + name;
+                importMap[""][name] = "Try::Tiny::" + name;
             }
             continue;
         }
@@ -1248,7 +1558,7 @@ static std::vector<Token> inlineModules(
                 if (!name.empty() && name[0] == '&') name = name.substr(1);
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
-                importMap[name] = "Pod::Usage::" + name;
+                importMap[""][name] = "Pod::Usage::" + name;
             }
             continue;
         }
@@ -1285,7 +1595,7 @@ static std::vector<Token> inlineModules(
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
-                importMap[name] = modName + "::" + name;
+                importMap[currentPackage][name] = modName + "::" + name;
             }
             continue;
         }
@@ -1324,7 +1634,7 @@ static std::vector<Token> inlineModules(
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
-                importMap[name] = modName + "::" + name;
+                importMap[currentPackage][name] = modName + "::" + name;
             }
             continue;
         }
@@ -1365,7 +1675,7 @@ static std::vector<Token> inlineModules(
             for (auto &name : names) {
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
-                importMap[name] = modName + "::" + name;
+                importMap[currentPackage][name] = modName + "::" + name;
             }
             continue;
         }
@@ -1416,7 +1726,7 @@ static std::vector<Token> inlineModules(
                 if (!name.empty() && name[0] == '\x01') name = name.substr(1);
                 if (!name.empty() && name[0] == '$') name = name.substr(1);
                 if (name.empty() || name[0] == ':') continue;
-                importMap[name] = modName + "::" + name;
+                importMap[currentPackage][name] = modName + "::" + name;
             }
             continue;
         }
@@ -1570,7 +1880,7 @@ static std::vector<Token> inlineModules(
                     break;
                 }
                 for (auto &name : explicitImports)
-                    importMap[name] = modName + "::" + name;
+                    importMap[currentPackage][name] = modName + "::" + name;
             }
             continue;
         }
@@ -1752,7 +2062,7 @@ static std::vector<Token> inlineModules(
                 if (it != exports.end()) importList = it->second;
             }
             for (auto &name : importList)
-                importMap[name] = modName + "::" + name;
+                importMap[currentPackage][name] = modName + "::" + name;
 
             break;
         }
@@ -1946,7 +2256,7 @@ int main(int argc, char **argv) {
 
         /* inline any 'use Module' files before parsing; build import map */
         std::set<std::string> loaded;
-        std::map<std::string,std::string> importMap;
+        std::map<std::string, std::map<std::string,std::string>> importMap;
         std::map<std::string,NodePtr> constMap;
         /* create a dummy parser first (will be rebuilt after inlining) */
         std::vector<Token> dummyTokens;
@@ -1996,7 +2306,11 @@ int main(int argc, char **argv) {
                                     bare == "finally") ? "&;@" : "&@";
                 protoMap[qual] = protoMap[shortN];
             };
-            for (auto &kv : importMap) seedProto(kv.first, kv.second);
+            /* nested importMap: a package's entries hold only that
+               package's own imports, so walk every package's names
+               to seed native-module arity prototypes once each. */
+            for (auto &pkg : importMap)
+                for (auto &kv : pkg.second) seedProto(kv.first, kv.second);
             static const char *ansiConsts[] = {
                 "CLEAR","RESET","BOLD","DARK","FAINT","ITALIC","UNDERLINE",
                 "BLACK","RED","GREEN","YELLOW","BLUE","MAGENTA","CYAN","WHITE",

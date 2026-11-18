@@ -15296,6 +15296,15 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::DeleteFunc: {
+        /* Symbolic package-symbol-table delete — `delete ${"$pkg\::"}{name}`, the canonical `no Module` un-import idiom. perlc never executes a
+        module's unimport (the import is reversed at parse time via
+        importMap_ in parseUseNoStmt), so a node parsed in this shape is
+        never in the executed path; return undef (a delete of an absent
+        element yields undef anyway). The un-import itself is modeled at
+        parse time, not here. */
+        if (n.sval == "glob_del") {
+            return perlUndef();
+        }
         /* D81: slice forms return the last deleted value in scalar context
            (list form goes through emitArrayPtr). */
         if (n.sval == "array_slice" || n.sval == "hash_slice") {

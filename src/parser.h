@@ -9,8 +9,44 @@
 class Parser {
 public:
     explicit Parser(std::vector<Token> tokens);
-    /* importMap: short_name → qualified Module::name for re-exported symbols */
-    void setImportMap(std::map<std::string, std::string> m) { importMap_ = std::move(m); }
+    /* importMap: short_name → qualified Module::name for re-exported
+       symbols. It is PACKAGE-SCOPED: keyed by the caller's package so a
+       module's import() only makes its names available unqualified in the
+       package that imported them (real Perl semantics) instead of leaking
+       into every package. The empty-string "" bucket holds builtin
+       overrides (Time::HiRes::time, ...) that apply in all packages.
+       resolveImport() checks the current package first, then "" for the
+       builtin fallback. */
+    const std::string *resolveImport(const std::string &name) const {
+        auto byPkg = importMap_.find(currentPackage_);
+        if (byPkg != importMap_.end()) {
+            auto it = byPkg->second.find(name);
+            if (it != byPkg->second.end()) return &it->second;
+        }
+        auto glob = importMap_.find("");
+        if (glob != importMap_.end()) {
+            auto it = glob->second.find(name);
+            if (it != glob->second.end()) return &it->second;
+        }
+        return nullptr;
+    }
+    /* unimport(): `no MODULE qw(names)` calls `MODULE->unimport(names)` at
+       compile time, removing those names from the caller's namespace for the
+       rest of the enclosing block. perlc models import() as a package-scoped
+       compile-time map (importMap_), so unimport() simply ERASES each name
+       from the current package's bucket. Because the parser walks statements
+       in source order and resolveImport() is consulted eagerly while building
+       each node, erasing here takes effect for every name parsed AFTER the
+       `no` (matching Perl's lexical scoping) while earlier calls keep
+       resolving unqualified. Bare `no MODULE` (no list) erases nothing,
+       matching Perl's default-Exporter unimport. */
+    void unimportName(const std::string &name) {
+        auto byPkg = importMap_.find(currentPackage_);
+        if (byPkg == importMap_.end()) return;
+        auto it = byPkg->second.find(name);
+        if (it != byPkg->second.end()) byPkg->second.erase(it);
+    }
+    void setImportMap(std::map<std::string, std::map<std::string,std::string>> m) { importMap_ = std::move(m); }
     void setConstMap(std::map<std::string, NodePtr> m)      { constMap_  = std::move(m); }
     /* Native modules with `&` prototypes (Try::Tiny, List::MoreUtils)
        seed protoMap_ so `try { } catch { }` / `firstidx { } @list`
@@ -63,7 +99,7 @@ private:
     std::string                     currentPackage_ = "main";
     int                             subDepth_        = 0;
     int                             anonCount_       = 0; /* D10: per-parse anon sub ids */
-    std::map<std::string,std::string> importMap_;  /* short → qualified call names */
+    std::map<std::string,std::map<std::string,std::string>> importMap_;  /* pkg → (short → qualified call names) */
     std::map<std::string,NodePtr>     constMap_;   /* constant name → parsed AST */
     std::map<std::string,std::string> protoMap_;   /* sub name → prototype string */
     bool inKeyContext_ = false;  /* true when parsing hash keys — barewords are strings */

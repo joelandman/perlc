@@ -29,11 +29,11 @@ supersedes the earlier a2985bb stamp in the Verification section below.
 
 - **#2 — correctness gate.** Resolved. Was 605/609; now fully green
   (`any`/`can_ssl` fixed, `term_readline` aligned to Stub).
-- **#4 Exporter / `import()` — first two gaps closed.** Audit + two fixes,
-  both byte-for-byte verified against real perl, with regression fixtures
-  in `tests/` / `tests/lib/E/`. See the #4 writeup in this section below.
-  Remaining lifecycle gaps: `no Module` un-import, conditional
-  `use if` import lists, caller-namespace injection.
+- **#4 Exporter / `import()` — full lifecycle now closed.** Audit + fixes,
+  every change byte-for-byte verified against real perl, with regression
+  fixtures in `tests/` / `tests/lib/E/`. See the #4 writeup in this section
+  below. Gaps (`no Module` un-import, conditional `use if` import lists,
+  caller-namespace injection) are all done.
 - **#1 / #6 — runtime do/eval spawns (not closed; scope decision pending).**
   `(a.1)` reclaim (commit `75a0fe9`) cut runtime spawns **19 → 16** (constant
   eval'd-sub strings compile in-process). `do FILE`, dynamic `eval EXPR`, and
@@ -69,11 +69,14 @@ supersedes the earlier a2985bb stamp in the Verification section below.
    `do FILE`, dynamic `eval EXPR`, and dynamic XS still spawn. Needs the scope
    call: (a) compile-time-only, (b) bundle a static eval path, or (c) document
    "needs toolchain" + a content-addressed `.so` cache.
-3. **#4 Exporter / `import()` lifecycle remaining** *(High)* — after the
-   `:DEFAULT` + builtin-arity fixes above, remaining: `no Module` un-import,
-   conditional `use if`/`use unless` import lists, caller-namespace injection.
-   The "arbitrary pure-Perl modules just work" ceiling; pairs with #3
-   (most modules `use Exporter`).
+3. **#4 Exporter / `import()` lifecycle** *(High — largely resolved)* — after
+    the `:DEFAULT` + builtin-arity fixes, the remaining `import()` lifecycle
+    (`no Module` un-import, conditional `use if`/`use unless` import lists,
+    caller-namespace injection) is **now closed** (see writeups below). The
+    "arbitrary pure-Perl modules just work" ceiling is largely crossed;
+    remaining realworld failures are parser-fidelity on deep host modules
+    (see #3), not the import() surface. Pairs with #3 (most modules
+    `use Exporter`).
 4. **#5 `format`/`write` runtime fidelity** *(Med)* — compiles but corpus is
    compile-only; needs byte-for-byte vs perl to rule out an empty-runtime
    compile-only win.
@@ -110,9 +113,9 @@ regression fixtures in `tests/` / `tests/lib/`:
 
 `make test-all` green at **757 PASS / 0 FAIL** (was 751; +4 new tests),
 including `list_moreutils_*` (builtin arity preserved). `#4` is now a
-narrower, well-understood surface: remaining work is the rest of the
-`import()` lifecycle (`no Module` un-import, caller-namespace injection) —
-see next set below.
+narrower, well-understood surface: the remaining `import()` lifecycle items
+(`no Module` un-import, caller-namespace injection) are now closed — see
+the conditional-use and `no Module` writeups below.
 
 ### Conditional `use if` / `use unless` fixed (2026-11-17)
 
@@ -149,17 +152,60 @@ general `use` handler as before. Fixtures: `tests/lib/E/IfFlag.pm`,
 `tests/use_if_noop_smoke.pl` (no-op). `make test-all` now **759 PASS / 0
 FAIL** (+2 over the previous run).
 
+### `no Module` un-import fixed (2026-11-17)
+
+`no MODULE qw(name ...)` reverses a prior `use`, removing the imported names
+from the caller's namespace for the rest of the enclosing block. Verified
+byte-for-byte against real perl: a name imported by `use MODULE`, then
+un-imported by `no MODULE qw(name)`, resolves unqualified **before** the
+`no` and **not** after (the symbol is gone).
+
+Implementation, modelled entirely at **parse time** — perlc never executes a
+module's `unimport`:
+
+- The parser walks statements in source order and consults `resolveImport()`
+  eagerly while building each node. `import()` is a package-scoped compile-time
+  map (`importMap_`, keyed by caller package). So `unimport()` just **erases**
+  each `qw` name from the current package's bucket. A name parsed after the
+  `no` no longer resolves unqualified (matching Perl's "symbol removed"),
+  while earlier calls keep resolving. Bare `no MODULE` (no list) erases
+  nothing.
+- `src/parser.h` `unimportName(name)` (next to `resolveImport()`): erases the
+  name from `importMap_[currentPackage_]` (a no-op if the bucket/entry is
+  absent — matching Perl's default-Exporter `unimport`, which warns rather
+  than removes).
+- `src/parser.cpp` `parseUseNoStmt()`: `no` is now handled as `no MODULE [LIST]`
+  — consume the module (or pragma) name, and if a `qw(...)` list follows,
+  split it and `unimportName` each word. `no strict`/`no warnings`/`no utf8`
+  keep their existing handling; this branch is `no` of anything else.
+- The canonical Perl idiom `delete ${"$pkg\::"}{$n}` in a module's
+  `unimport` (the only form that actually removes the symbol in perl) needed
+  parser support. Added a `delete ${EXPR}{KEY}` branch in
+  `src/parser.cpp` (after `consume(TK::SCALAR, "$")`): `EXPR` becomes a
+  `SymbolicDeref`, `KEY` the subscript, the node is `NK::DeleteFunc` with
+  `sval="glob_del"`. `src/codegen.cpp` stubs it (`return perlUndef()`) since
+  the delete is never in perlc's executed path.
+
+**Fidelity note:** perl's default Exporter `unimport` is a **no-op that
+warns** ("Attempt to call missing unimport method") — it does not remove the
+symbol. Only a *custom* `unimport` removes it, and the canonical symbol-table
+`delete` is the only reliably-removing shape perlc can match in output. So the
+regression fixtures use a custom-unimport module (`tests/lib/E/NixFoo.pm`,
+whose `unimport` uses `delete ${"$pkg\::"}{$n}`), not the default-Exporter
+warning form (which perlc can't reproduce in the binary). Fixtures:
+`tests/lib/E/NixFoo.pm`, `tests/caller_ns_unimport.pl` (top-level),
+`tests/caller_ns_unimport_nested.pl` (inside `package Sub`).
+`make test-all` now **763 PASS / 0 FAIL** (+4 over the conditional-use run).
+
 ### Prioritized next set for #4
-- `no Module` (un-import): reverse a prior `use`, removing the imported
-  names from the caller namespace.
 - Conditional `use if COND, Module qw(...)` / `use unless`: **import-list
   resolution behind a literal INT/FLOAT/STRING condition is done** — quoted
   and unquoted module names resolve and honor the condition; runtime
   expression conditions (`$^O eq 'linux'`, `do {...}`) are still folded by
   the general `use` handler, not the conditional path.
-- Caller-namespace injection: imported names should land in the *caller's*
-  package, not leak into `main` unconditionally (covers multi-package
-  callers where the current importMap is applied globally).
+- Caller-namespace injection: done. Imported names land in the *caller's*
+  package (package-scoped `importMap_`); `no MODULE` un-imports from that same
+  package bucket. Verified by `tests/caller_ns_unimport_nested.pl`.
 
 ## #3 Module availability — resolved (2026-11-16, HEAD `45c3dca`)
 
@@ -299,8 +345,10 @@ current locations are noted so the blockers stay actionable.
   failures are parser-exporter fidelity, not availability.
 - **#4** — `:DEFAULT` now expands to `@EXPORT` and same-named imported
   subs no longer inherit builtin arity (both fixed 2026-11-16; fixtures in
-  `tests/` / `tests/lib/E/`). Remaining lifecycle gaps: `no Module`
-  un-import, conditional `use if` import lists, caller-namespace injection.
+  builtin arity (both fixed 2026-11-16; fixtures in
+  `tests/` / `tests/lib/E/`). The full `import()` lifecycle is now closed —
+  `no Module` un-import, conditional `use if`/`use unless` import lists, and
+  caller-namespace injection all work (see writeups below).
 - **#5** — documented in `docs/format_write_design.md`; needs a runtime
   byte-for-byte check (currently compile-only).
 - **#7** — DynaLoader-compatible FFI present; genuine perlguts XSUB is a
