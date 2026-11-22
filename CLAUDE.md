@@ -50,7 +50,7 @@ certified-body raw-store routing + kernel if-conversion (`fkifconv`)
 make the certified flat loops genuinely vectorize (and remove the
 `-Wpass-failed` stderr noise on FK-listing `-O2` compiles). Every
 stage has a `PERLC_OPT_DISABLE=` knob
-(`st41`/`st39`/`cplxrow`/`packflat`/`fkifconv`/`autopar`/`outerpar`/`mappar`/…).
+(`st41`/`st39`/`cplxrow`/`packflat`/`fkifconv`/`autopar`/`outerpar`/`mappar`/`sortpar`/…).
 Findings/method/
 ablations: `docs/optimization_findings_2026-11-04.md`,
 `docs/optimization_findings_2026-11-04_round2.md`,
@@ -102,6 +102,16 @@ on an unboxed int; float stays sequential). Tests:
 **Closed 2026-11-22 — opt_strat 4 perlc leftovers:** match-subject
 D105 promote skip and void boxed `$count++` (`tests/regex_residual_{smoke,deep}.pl`).
 pcre2 match strategy and parallel `grep { /pat/ }` stay open.
+**Closed 2026-11-22 — opt_strat 5 (sortpar):** stable mergesort (perl
+contract; qsort was not stable). Closed `$a`/`$b` comparators and
+builtin num/str sorts parallel-merge on the Stage-45 pool; impure
+comparators and `sort SUBNAME` stay sequential. Knob
+`PERLC_OPT_DISABLE=sortpar` (also off with `autopar`). Tests:
+`tests/sortpar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 6 (cforpar):** boxed closed C-style
+`for (my $i = LO; $i < HI; $i++)` with disjoint `$a[$i]` reuses the
+rangepar worker (`PERLC_OPT_DISABLE=mappar`). Tests:
+`tests/cforpar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

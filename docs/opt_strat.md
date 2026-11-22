@@ -58,17 +58,28 @@ Still open: a different match strategy (the pcre2 cliff). Parallel
 `grep { /pat/ }` is a separate, smaller slice: capture globals (`$1`,
 `$&`) are why regex is refused in `mapParBodyPurity` today.
 
-### 5. Closed `sort` with a pure comparator
+### 5. Closed `sort` with a pure comparator — closed this session
 
-Block comparators that only read `$a`/`$b` can merge in parallel and stay
-stable. Effort is higher than (1)/(2): comparator purity, list vs
-`$a cmp $b`, and ties.
+Perl’s sort is a stable mergesort. perlc now uses the same contract
+(replacing C `qsort`, which is not stable). Closed comparators that only
+read `$a`/`$b`, captures, and body-`my` fan out on the Stage-45 pool at
+bound `>= PERLC_AUTOPAR_MIN`, then a stable merge of the sorted runs.
+Default `$a cmp $b` / `<=>` / list-form use the builtin num/str paths
+(also stable + parallel). Impure comparators (`push @observed, $a`) and
+`sort SUBNAME` stay sequential. Ties keep original order. Knob:
+`PERLC_OPT_DISABLE=sortpar` (also off with `autopar`). Tests:
+`tests/sortpar_{smoke,deep}.pl`.
 
-### 6. More counted loops that are closed but not FK
+### 6. More counted loops that are closed but not FK — closed this session
 
-Stage 45 workers are pure f64 FK. Stage 46 covers map/grep/foreach. A
-boxed but closed C-style `for` (`$a[$i] = …` without flat rows) can reuse
-the rangepar worker. Smaller unique gain than (1)–(2).
+Stage 45 workers are pure f64 FK. Stage 46 already covered map/grep/
+foreach-range. A boxed but closed C-style `for (my $i = LO; $i < HI; $i++)`
+with disjoint `$a[$i]` stores (no flat rows) now reuses the rangepar
+worker. `$i <= HI`, `++$i`, and `$i += 1` are the same counted shape.
+`$i` is read-only in the par body (a body `$i++` stays sequential, matching
+C-style semantics). Live bounds (`$i < foo()`, `$i < $n` while `$n +=`)
+stay sequential. Knob: `PERLC_OPT_DISABLE=mappar` (also off with
+`autopar`). Tests: `tests/cforpar_{smoke,deep}.pl`.
 
 ## Non-goals (do not review next)
 
@@ -93,6 +104,5 @@ the rangepar worker. Smaller unique gain than (1)–(2).
 
 ## Practical order
 
-(1)–(3) and the perlc-side of (4) landed this session. Remaining of
-(4) is the pcre2 match strategy (parallelism will not move it). Then
-(5) closed sort, (6) boxed closed counted `for`.
+(1)–(6) and the perlc-side of (4) landed this session. Remaining of
+(4) is the pcre2 match strategy (parallelism will not move it).

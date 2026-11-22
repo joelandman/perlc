@@ -11460,10 +11460,188 @@ static int cmp_str_asc(const void *a, const void *b) {
 }
 static int cmp_str_desc(const void *a, const void *b) { return cmp_str_asc(b, a); }
 
+/* Stable mergesort (perl's sort is a stable mergesort). qsort is not.
+   Pure comparators at bound >= PERLC_AUTOPAR_MIN fan out on the Stage-45
+   pool, then a stable merge of the sorted runs. Knob: PERLC_OPT_DISABLE
+   token sortpar (also off with autopar). */
+#define SORT_INSERTION 16
+#define SORTPAR_MAX_RUNS 16
+
+static __thread PerlSortCmpFn sort_custom_cmp_ = NULL;
+static int sort_qsort_wrap_(const void *pa, const void *pb);
+
+static int sortpar_wanted(void) {
+    const char *e = getenv("PERLC_OPT_DISABLE");
+    if (!e || !*e) return 1;
+    const char *p = e;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == ';') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != ',' && *p != ' ' && *p != ';') p++;
+        size_t n = (size_t)(p - s);
+        if (n == 7 && strncasecmp(s, "sortpar", 7) == 0) return 0;
+        if (n == 7 && strncasecmp(s, "autopar", 7) == 0) return 0;
+    }
+    return 1;
+}
+
+static void sort_insertion(PerlValue **a, long long lo, long long hi,
+                           int (*cmp)(const void *, const void *)) {
+    for (long long i = lo + 1; i < hi; i++) {
+        PerlValue *x = a[i];
+        long long j = i;
+        while (j > lo) {
+            PerlValue *y = a[j - 1];
+            if (cmp(&x, &y) >= 0) break;
+            a[j] = y;
+            j--;
+        }
+        a[j] = x;
+    }
+}
+
+static void sort_merge(PerlValue **a, PerlValue **tmp, long long lo,
+                       long long mid, long long hi,
+                       int (*cmp)(const void *, const void *)) {
+    long long i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) {
+        if (cmp(&a[i], &a[j]) <= 0) tmp[k++] = a[i++];
+        else tmp[k++] = a[j++];
+    }
+    while (i < mid) tmp[k++] = a[i++];
+    while (j < hi) tmp[k++] = a[j++];
+    memcpy(a + lo, tmp + lo, (size_t)(hi - lo) * sizeof(PerlValue *));
+}
+
+static void sort_ms_rec(PerlValue **a, PerlValue **tmp, long long lo, long long hi,
+                        int (*cmp)(const void *, const void *)) {
+    long long n = hi - lo;
+    if (n <= 1) return;
+    if (n <= SORT_INSERTION) {
+        sort_insertion(a, lo, hi, cmp);
+        return;
+    }
+    long long mid = lo + n / 2;
+    sort_ms_rec(a, tmp, lo, mid, cmp);
+    sort_ms_rec(a, tmp, mid, hi, cmp);
+    sort_merge(a, tmp, lo, mid, hi, cmp);
+}
+
+typedef struct {
+    PerlValue **elems;
+    PerlValue **tmp;
+    int (*cmp)(const void *, const void *);
+    PerlSortCmpFn custom;
+    PerlValue **caps;
+    int ncaps;
+    long long run_lo[SORTPAR_MAX_RUNS];
+    long long run_hi[SORTPAR_MAX_RUNS];
+    int nruns;
+} SortPar;
+
+static void sort_par_chunk(void **rows, long long lo, long long hi) {
+    SortPar *s = (SortPar *)rows[0];
+    if (s->custom) {
+        sort_custom_cmp_ = s->custom;
+        s_current_captures = s->caps;
+        s_ncaptures = s->ncaps;
+    }
+    if (lo < hi)
+        sort_ms_rec(s->elems, s->tmp, lo, hi, s->cmp);
+    int i = (int)__atomic_fetch_add(&s->nruns, 1, __ATOMIC_RELAXED);
+    if (i >= 0 && i < SORTPAR_MAX_RUNS) {
+        s->run_lo[i] = lo;
+        s->run_hi[i] = hi;
+    }
+}
+
+static void sort_stable_elems(PerlValue **elems, long long n,
+                              int (*cmp)(const void *, const void *),
+                              int allow_par,
+                              PerlSortCmpFn custom,
+                              PerlArray *captures) {
+    if (n <= 1) return;
+    PerlValue **tmp = (PerlValue **)malloc((size_t)n * sizeof(PerlValue *));
+    if (!tmp) {
+        sort_insertion(elems, 0, n, cmp);
+        return;
+    }
+    long long minb = 8192;
+    {
+        const char *e = getenv("PERLC_AUTOPAR_MIN");
+        if (e) {
+            long long v = atoll(e);
+            if (v > 0) minb = v;
+        }
+    }
+    if (allow_par && sortpar_wanted() && n >= minb) {
+        SortPar s;
+        memset(&s, 0, sizeof(s));
+        s.elems = elems;
+        s.tmp = tmp;
+        s.cmp = cmp;
+        s.custom = custom;
+        if (captures && captures->len > 0) {
+            s.caps = captures->elems;
+            s.ncaps = (int)captures->len;
+        }
+        void *rows[1] = { &s };
+        perl_autopar_run(sort_par_chunk, rows, n);
+        int nr = s.nruns;
+        if (nr > SORTPAR_MAX_RUNS) nr = SORTPAR_MAX_RUNS;
+        for (int i = 1; i < nr; i++) {
+            long long lo = s.run_lo[i], hi = s.run_hi[i];
+            int j = i;
+            while (j > 0 && s.run_lo[j - 1] > lo) {
+                s.run_lo[j] = s.run_lo[j - 1];
+                s.run_hi[j] = s.run_hi[j - 1];
+                j--;
+            }
+            s.run_lo[j] = lo;
+            s.run_hi[j] = hi;
+        }
+        int w = 0;
+        for (int i = 0; i < nr; i++) {
+            if (s.run_lo[i] < s.run_hi[i]) {
+                s.run_lo[w] = s.run_lo[i];
+                s.run_hi[w] = s.run_hi[i];
+                w++;
+            }
+        }
+        nr = w;
+        while (nr > 1) {
+            int out = 0, i = 0, merged = 0;
+            while (i < nr) {
+                if (i + 1 < nr && s.run_hi[i] == s.run_lo[i + 1]) {
+                    sort_merge(elems, tmp, s.run_lo[i], s.run_hi[i],
+                               s.run_hi[i + 1], cmp);
+                    s.run_lo[out] = s.run_lo[i];
+                    s.run_hi[out] = s.run_hi[i + 1];
+                    out++;
+                    i += 2;
+                    merged = 1;
+                } else {
+                    s.run_lo[out] = s.run_lo[i];
+                    s.run_hi[out] = s.run_hi[i];
+                    out++;
+                    i++;
+                }
+            }
+            nr = out;
+            if (!merged) break;
+        }
+    } else {
+        sort_ms_rec(elems, tmp, 0, n, cmp);
+    }
+    free(tmp);
+}
+
 static PerlArray *sort_copy_with(PerlArray *a, int(*cmp)(const void*, const void*)) {
     PerlArray *r = perl_array_new();
+    if (!a) return r;
     for (long long i = 0; i < a->len; i++) perl_array_push(r, perl_clone(a->elems[i]));
-    qsort(r->elems, (size_t)r->len, sizeof(PerlValue*), cmp);
+    sort_stable_elems(r->elems, r->len, cmp, 1, NULL, NULL);
     return r;
 }
 
@@ -14482,8 +14660,6 @@ PerlArray *perl_uniq_list(PerlArray *a) {
 
 /* ── sort with custom comparator ─────────────────────────────────────────── */
 
-static PerlSortCmpFn sort_custom_cmp_ = NULL;
-
 static int sort_qsort_wrap_(const void *pa, const void *pb) {
     PerlValue *a = *(PerlValue **)pa;
     PerlValue *b = *(PerlValue **)pb;
@@ -14506,7 +14682,8 @@ static void perl_sort_release_captures(PerlArray *captures) {
                                        untouched either way */
 }
 
-PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures) {
+static PerlArray *sort_custom_impl(PerlArray *a, PerlSortCmpFn cmp,
+                                   PerlArray *captures, int allow_par) {
     PerlArray *res = perl_array_new();
     if (!a) { perl_sort_release_captures(captures); return res; }
     /* copy element pointers (shallow) */
@@ -14524,12 +14701,21 @@ PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures
     sort_custom_cmp_    = cmp;
     s_current_captures  = (captures && captures->len > 0) ? captures->elems : NULL;
     s_ncaptures         = captures ? (int)captures->len : 0;
-    qsort(res->elems, (size_t)res->len, sizeof(PerlValue *), sort_qsort_wrap_);
+    sort_stable_elems(res->elems, res->len, sort_qsort_wrap_,
+                      allow_par, cmp, captures);
     sort_custom_cmp_    = saved_cmp;
     s_current_captures  = saved_caps;
     s_ncaptures         = saved_n;
     perl_sort_release_captures(captures);  /* D62 */
     return res;
+}
+
+PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures) {
+    return sort_custom_impl(a, cmp, captures, 0);
+}
+
+PerlArray *perl_sort_custom_par(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures) {
+    return sort_custom_impl(a, cmp, captures, 1);
 }
 
 /* ── POSIX ────────────────────────────────────────────────────────────────── */

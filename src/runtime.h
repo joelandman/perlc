@@ -1031,6 +1031,11 @@ typedef long long (*PerlSortCmpFn)(PerlValue *, PerlValue *);
    closure's body already uses — may be NULL/empty for a comparator that
    captures nothing. */
 PerlArray *perl_sort_custom(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures); /* sort copy of a */
+/* Closed (pure $a/$b) comparator: same copy+stable-merge as perl_sort_custom,
+   and at bound >= PERLC_AUTOPAR_MIN fans out on the Stage-45 pool. Impure
+   comparators (push, I/O, writes) stay on perl_sort_custom. Knob:
+   PERLC_OPT_DISABLE=sortpar (also off with autopar). */
+PerlArray *perl_sort_custom_par(PerlArray *a, PerlSortCmpFn cmp, PerlArray *captures);
 
 /* ── directory I/O ───────────────────────────────────────────────────────── */
 PerlValue *perl_opendir_fh(PerlValue *target, PerlValue *path);

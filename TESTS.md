@@ -4147,12 +4147,27 @@ arbitrary blocks.
   another same-named `$s += $a[$i]` is not int-shaped; tests use unique
   accumulator names. `$s += $a[$i]` itself stays sequential unless `$s`
   is already int-unboxed.
+- **Closed sort (sortpar):** perl’s sort is a stable mergesort; perlc
+  matches that (C `qsort` was not stable). Builtin num/str sorts and
+  closed block comparators (reads of `$a`/`$b`, captures, body-`my`;
+  `$a->[0]`, `$a->{k}`, `lc`/`length`/…) fan out on the Stage-45 pool
+  at bound `>= PERLC_AUTOPAR_MIN`, then a stable merge of the recorded
+  runs. Impure comparators (`push`, I/O, outer writes, regex, die) and
+  `sort SUBNAME` stay sequential. Ties keep original order. Knob:
+  `PERLC_OPT_DISABLE=sortpar` (also off with `autopar`; independent of
+  `mappar`). Tests: `tests/sortpar_{smoke,deep}.pl`.
+- **Boxed C-style for (cforpar):** `for (my $i = LO; $i < HI; $i++)`
+  with disjoint `$a[$i]` (also `<=`, `++$i`, `$i += 1`) reuses the
+  rangepar worker. The index is read-only in the par body. Live bounds
+  and `$i++` then `$a[$i]` stay sequential. Knob `mappar`. Tests:
+  `tests/cforpar_{smoke,deep}.pl`.
 - **Still sequential:** live-length foreach that `push`es the iterated
-  array; `$a[$i+1]` / `$i++` then `$a[$i]` range bodies; float
-  reductions; arbitrary blocks. Regex residual perlc leftovers
-  (subject promote skip, void `$count++`) landed; the pcre2 match
-  strategy and parallel `grep { /pat/ }` remain. Next candidates:
-  `docs/opt_strat.md`.
+  array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
+  reductions; arbitrary blocks; impure / named-sub sort; C-style
+  `for ($i = LO; …)` without `my` (post-loop `$i`). Regex residual
+  perlc leftovers (subject promote skip, void `$count++`) landed; the
+  pcre2 match strategy and parallel `grep { /pat/ }` remain. Next
+  candidates: `docs/opt_strat.md`.
 
 ### Native stdlib waves 1–3 (2026-09-22)
 

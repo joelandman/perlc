@@ -1035,6 +1035,7 @@ RT("perl_clear_named_captures", voidTy);
        third arg is the comparator's closure captures array (D61), may be
        an empty PerlArray*. */
     RT("perl_sort_custom",  av,  av, i8p, av);
+    RT("perl_sort_custom_par", av, av, i8p, av);
     /* special globals (Tier 2) */
     RT("perl_get_dollar_dot",   pv);
     RT("perl_get_dollar_comma", pv);
@@ -1950,7 +1951,9 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
                the comparator silently no-opped when @observed was merely
                block-scoped. $a/$b themselves are excluded here since
                they're bound separately below (as the function's own
-               parameters, or via the D28 file-scope-shadow check). */
+               parameters, or via the D28 file-scope-shadow check). The
+               comparator is a real C function pointer so the runtime
+               stable mergesort (and its parallel run-merge) can call it. */
             std::set<std::string> sortUsedNames;
             collectAllScalarNames(*n.body, sortUsedNames);
             std::vector<std::string> sortCaptureNames;
@@ -2105,15 +2108,24 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
             localDepthAlloca_ = savedLDep;
             currentSubBody_   = savedBody;
 
-            /* call perl_sort_custom(av, cmpFn, capsAv) — capsAv built from
-               the sortCaptureVals collected in the caller's own scope
-               above (D61), now that we're back in that scope. */
+            /* call perl_sort_custom[_par](av, cmpFn, capsAv) — capsAv built
+               from the sortCaptureVals collected in the caller's own scope
+               above (D61), now that we're back in that scope. A closed
+               comparator (reads of $a/$b and captures only) takes the
+               parallel stable-merge path; impure bodies stay sequential. */
             Value *fnPtr = builder_.CreateBitCast(cmpFn,
                               PointerType::getUnqual(ctx_));
             Value *capsAv = callRT("perl_array_new", {});
             for (auto *cv : sortCaptureVals)
                 callRT("perl_array_push_capture", {capsAv, cv});
-            return callRT("perl_sort_custom", {av, fnPtr, capsAv});
+            bool sortPar = isOptStageEnabled("sortpar") &&
+                           isOptStageEnabled("autopar") &&
+                           sortCmpIsPure(*n.body);
+            if (getenv("PERLC_DEBUG_AUTOPAR"))
+                fprintf(stderr, "ST46: sort par=%s line=%d\n",
+                        sortPar ? "YES" : "no", n.line);
+            return callRT(sortPar ? "perl_sort_custom_par" : "perl_sort_custom",
+                          {av, fnPtr, capsAv});
         }
         else if (mode == "subname" && !n.name.empty()) {
             /* sort SUBNAME LIST — named comparator sub, no braces. Unlike
@@ -9813,6 +9825,128 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
     return stmtOk(s);
 }
 
+bool CodeGen::sortCmpIsPure(const Node &s) {
+    std::unordered_set<std::string> locals;
+    std::function<bool(const Node &, bool)> exprOk;
+    std::function<bool(const Node &)> stmtOk;
+
+    exprOk = [&](const Node &e, bool asWrite) -> bool {
+        switch (e.kind) {
+        case NK::IntLit: case NK::FloatLit: case NK::StringLit: case NK::UndefLit:
+            return !asWrite;
+        case NK::ArrayLit:
+            if (asWrite) return false;
+            for (auto &a : e.args)
+                if (!a || !exprOk(*a, false)) return false;
+            return true;
+        case NK::ScalarVar: {
+            if (asWrite) return locals.count(bareVarName(e.name)) != 0;
+            return true;
+        }
+        case NK::BinOp: {
+            if (asWrite) return false;
+            if (e.cond && !exprOk(*e.cond, false)) return false;
+            if (e.left && !exprOk(*e.left, false)) return false;
+            if (e.right && !exprOk(*e.right, false)) return false;
+            return true;
+        }
+        case NK::UnaryOp: {
+            if (e.sval == "pre++" || e.sval == "pre--" ||
+                e.sval == "post++" || e.sval == "post--") {
+                return e.left && exprOk(*e.left, true);
+            }
+            return !asWrite && e.left && exprOk(*e.left, false);
+        }
+        case NK::Assign:
+            return e.left && e.right &&
+                   exprOk(*e.left, true) && exprOk(*e.right, false);
+        case NK::CompoundAssign:
+            return e.left && e.right &&
+                   exprOk(*e.left, true) && exprOk(*e.right, false);
+        case NK::HashElem:
+        case NK::ArrayElem:
+        case NK::ArrowDeref:
+            if (asWrite) return false;
+            if (e.left && !exprOk(*e.left, false)) return false;
+            if (e.right && !exprOk(*e.right, false)) return false;
+            for (auto &a : e.args)
+                if (a && !exprOk(*a, false)) return false;
+            return true;
+        case NK::DerefArray:
+        case NK::DerefHash:
+        case NK::DerefScalar:
+        case NK::PostfixDeref:
+            if (asWrite) return false;
+            return !e.left || exprOk(*e.left, false);
+        case NK::DefinedFunc: case NK::ScalarFunc:
+        case NK::AbsFunc: case NK::IntFunc: case NK::SqrtFunc:
+        case NK::LengthFunc: case NK::UcFunc: case NK::LcFunc:
+        case NK::UcfirstFunc: case NK::LcfirstFunc:
+        case NK::ChrFunc: case NK::OrdFunc: case NK::RefFunc:
+        case NK::IndexFunc: case NK::RindexFunc: case NK::SubstrFunc:
+            if (asWrite) return false;
+            if (e.left && !exprOk(*e.left, false)) return false;
+            if (e.right && !exprOk(*e.right, false)) return false;
+            for (auto &a : e.args)
+                if (!exprOk(*a, false)) return false;
+            return true;
+        case NK::InterpolatedStr:
+            if (asWrite) return false;
+            for (auto &a : e.args)
+                if (!exprOk(*a, false)) return false;
+            return true;
+        case NK::If: {
+            if (asWrite) return false;
+            for (auto &br : e.branches) {
+                if (br.cond && !exprOk(*br.cond, false)) return false;
+                if (br.body && !stmtOk(*br.body)) return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+        }
+    };
+
+    stmtOk = [&](const Node &st) -> bool {
+        if (st.kind == NK::FlatBlock || st.kind == NK::Block) {
+            for (auto &sub : st.args)
+                if (!stmtOk(*sub)) return false;
+            return true;
+        }
+        if (st.kind == NK::Return)
+            return !st.left || exprOk(*st.left, false);
+        if (st.kind == NK::My) {
+            if (!st.name.empty() && (st.name[0] == '@' || st.name[0] == '%'))
+                return false;
+            std::string bn = bareVarName(st.name);
+            if (bn.empty()) return false;
+            if (st.right && !exprOk(*st.right, false)) return false;
+            locals.insert(bn);
+            return true;
+        }
+        if (st.kind == NK::If) return exprOk(st, false);
+        if (st.kind == NK::PushStmt || st.kind == NK::PopExpr ||
+            st.kind == NK::ShiftExpr || st.kind == NK::UnshiftStmt ||
+            st.kind == NK::UnshiftStmt2 || st.kind == NK::Call ||
+            st.kind == NK::MethodCall || st.kind == NK::CallCodeRef ||
+            st.kind == NK::PrintStmt || st.kind == NK::SayStmt ||
+            st.kind == NK::WarnStmt || st.kind == NK::PrintfStmt ||
+            st.kind == NK::DieStmt || st.kind == NK::RegexMatch ||
+            st.kind == NK::RegexMatchExpr || st.kind == NK::RegexSubst ||
+            st.kind == NK::CaptureVar || st.kind == NK::SortFunc ||
+            st.kind == NK::MapFunc || st.kind == NK::GrepFunc ||
+            st.kind == NK::KeysFunc || st.kind == NK::ValuesFunc ||
+            st.kind == NK::EachFunc || st.kind == NK::EvalBlock)
+            return false;
+        const Node *e = &st;
+        if (e->kind == NK::ExprStmt && e->left) e = e->left.get();
+        return exprOk(*e, false);
+    };
+
+    return stmtOk(s);
+}
+
 bool CodeGen::mapParListYield(const Node &n) const {
     const Node *e = nullptr;
     if (n.body && !n.body->args.empty()) {
@@ -10553,6 +10687,103 @@ bool CodeGen::tryEmitForeachRangePar(const Node &n, const std::string &idxBare,
     (void)bodyBB;
     (void)stepBB;
     return true;
+}
+
+bool CodeGen::tryEmitCForRangePar(const Node &n, Function *fn,
+                                  BasicBlock *exit, BasicBlock *bodyBB,
+                                  BasicBlock *stepBB) {
+    /* FK re-emission of the same counted loop must stay on the certified
+       sequential / autopar-flat path, not this boxed rangepar reuse. */
+    if (fkEmitting_ || flatKernelMode_) return false;
+    if (!isOptStageEnabled("mappar") || !isOptStageEnabled("autopar"))
+        return false;
+    if (!n.init || !n.cond || !n.step || !n.body) return false;
+    if (!n.sval.empty() || n.contBlock) return false;
+
+    auto bare = [](const std::string &s) {
+        return pkBareName(s);
+    };
+
+    /* `my $i = LO` only. A bare `$i = LO` would need the post-loop
+       value of $i (HI or HI+1) written back; that is a separate slice. */
+    if (n.init->kind != NK::My || !n.init->right) return false;
+    std::string idxBare = bare(n.init->name);
+    const Node *initRhs = n.init->right.get();
+    if (idxBare.empty() || !initRhs) return false;
+
+    if (n.cond->kind != NK::BinOp || !n.cond->left || !n.cond->right)
+        return false;
+    bool inclusive = false;
+    if (n.cond->sval == "<") inclusive = false;
+    else if (n.cond->sval == "<=") inclusive = true;
+    else return false;
+    if (n.cond->left->kind != NK::ScalarVar ||
+        bare(n.cond->left->name) != idxBare)
+        return false;
+
+    const Node *st = n.step.get();
+    bool stepOk = false;
+    if (st->kind == NK::UnaryOp &&
+        (st->sval == "post++" || st->sval == "pre++") &&
+        st->left && st->left->kind == NK::ScalarVar &&
+        bare(st->left->name) == idxBare)
+        stepOk = true;
+    else if (st->kind == NK::CompoundAssign && st->sval == "+" &&
+             st->left && st->left->kind == NK::ScalarVar &&
+             bare(st->left->name) == idxBare &&
+             st->right && st->right->kind == NK::IntLit &&
+             st->right->ival == 1)
+        stepOk = true;
+    if (!stepOk) return false;
+
+    /* Bound must be a snapshot-safe expression: C-style re-evaluates the
+       cond every iteration, so a call or a live write of the bound would
+       disagree with a one-shot rangepar snapshot. */
+    const Node *hiN = n.cond->right.get();
+    if (hiN->kind == NK::Call || hiN->kind == NK::MethodCall ||
+        hiN->kind == NK::CallCodeRef)
+        return false;
+    if (hiN->kind != NK::IntLit && hiN->kind != NK::ScalarVar &&
+        hiN->kind != NK::ArrayVar && !canEmitI64(*hiN))
+        return false;
+    if (initRhs->kind != NK::IntLit && initRhs->kind != NK::ScalarVar &&
+        !canEmitI64(*initRhs))
+        return false;
+
+    std::unordered_set<std::string> locals;
+    locals.insert(idxBare);
+    std::vector<std::string> arrNames, dests, reduces;
+    bool hadStore = false;
+    if (!mapParBodyPurity(*n.body, idxBare, locals, true, &arrNames, &hadStore,
+                          nullptr, &dests, &reduces))
+        return false;
+    if (hiN->kind == NK::ScalarVar) {
+        std::string hn = bare(hiN->name);
+        for (auto &r : reduces)
+            if (r == hn) return false;
+    }
+    if (hiN->kind == NK::ArrayVar) {
+        std::string hn = pkBareName(hiN->name);
+        for (auto &d : dests)
+            if (pkBareName(d) == hn) return false;
+    }
+
+    auto emitBound = [&](const Node &bound) -> Value * {
+        if (Value *iv = emitExprI64(bound)) return iv;
+        Value *pv = emitExpr(bound);
+        Value *i  = callRT("perl_to_int", {pv});
+        freeIfOwned(pv);
+        return i;
+    };
+    Value *lo = emitBound(*initRhs);
+    Value *hiRaw = emitBound(*hiN);
+    auto *i64 = Type::getInt64Ty(ctx_);
+    Value *hi = inclusive ? hiRaw
+        : builder_.CreateSub(hiRaw, ConstantInt::get(i64, 1), "cforpar.hi");
+    if (getenv("PERLC_DEBUG_AUTOPAR"))
+        fprintf(stderr, "ST46: cfor-range idx=%s incl=%d line=%d\n",
+                idxBare.c_str(), (int)inclusive, n.line);
+    return tryEmitForeachRangePar(n, idxBare, lo, hi, fn, exit, bodyBB, stepBB);
 }
 
 /* Stage 42 (packflat): at a sub's `return \@r;` site — when the scan above
@@ -12654,6 +12885,11 @@ void CodeGen::emitStmt(const Node &n) {
 
         pushScope();
         if (n.init) emitStmt(*n.init);
+        /* Stage 46: boxed closed counted C-style for reuses rangepar.
+           Init ran on this block so exit's popScope is valid on the par
+           path (`my $i` dies with the loop; the worker has its own index).
+           parBB jumps to exit; seqBB continues the sequential loop. */
+        tryEmitCForRangePar(n, fn, exit, bodyBB, stepBB);
 
         /* Stage 26c: if the loop body is a single call to a named sub with
            all loop-invariant args (literals + array refs), build the args

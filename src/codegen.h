@@ -179,6 +179,9 @@ public:
                           const std::string *iterArrayName = nullptr,
                           std::vector<std::string> *appendDests = nullptr,
                           std::vector<std::string> *reduceVars = nullptr);
+    /* Closed sort comparator: reads of $a/$b, captures, and body-`my`;
+       no outer writes, calls, I/O, regex, or die. Knob sortpar. */
+    bool sortCmpIsPure(const Node &s);
     bool mapParScalarYield(const Node &n) const;
     bool mapParListYield(const Node &n) const;
     void emitParDiePrologue(llvm::Value *dieSlot, llvm::Value *iSlot);
@@ -212,6 +215,12 @@ public:
                                 llvm::Function *fn, llvm::BasicBlock *exit,
                                 llvm::BasicBlock *bodyBB,
                                 llvm::BasicBlock *stepBB);
+    /* Boxed closed C-style for (my $i = LO; $i < HI; $i++) with disjoint
+       $a[$i] stores / append / i64 reduce. Same worker as range foreach.
+       Knob mappar (also off with autopar). */
+    bool tryEmitCForRangePar(const Node &n, llvm::Function *fn,
+                             llvm::BasicBlock *exit, llvm::BasicBlock *bodyBB,
+                             llvm::BasicBlock *stepBB);
      llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
     void emitFlatPairLoad(llvm::Value *dataPtr, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
     void emitRefPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
