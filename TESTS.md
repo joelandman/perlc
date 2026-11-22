@@ -502,11 +502,12 @@ Still open:
   pair-bind of a non-numeric string (`my $s = $a->[0]` becomes 0.0);
   `\$a[-1]` on an empty array returns a fresh undef; aliases outside
   the D260 table.
-- Perf follow-ups, separate from this correctness list: map/grep
-  auto-parallel (per-chunk result handoff, purity walk, per-chunk die
-  slots) and outer-loop batch dispatch for the mbs shape. Aliased
-  pair and empty-row copies stay value-copies. Element-copy write-back
-  (`$z = $row->[$i]; $z->[0] = 9`) needs a row-element alias.
+- Perf follow-ups: map/grep auto-parallel, outerpar, range `$a[$i]`,
+  concat, die slots, append-only foreach, i64 reductions, and the
+  row-element alias PV (`PERL_PAIR_ELEM`) have landed (see Stage 46 and
+  `docs/opt_strat.md`). Remaining: regex residual, closed sort, boxed
+  closed counted `for`. Aliased pair and empty-row copies stay
+  value-copies. Tests: `tests/pairelem_{smoke,deep}.pl`.
   `docs/optimization_findings_2026-11-05_landing.md`.
 
 Do not refresh `tests/realworld/baseline-compare.txt` unless
@@ -3865,7 +3866,7 @@ A failing `try` with no `catch` returns undef without rethrowing
 - **Regex match hot path**: boolean `=~` in `if`/`while`/`for`/`?:` calls `perl_regex_match_bool` (no bool PV); `PERL_STRING` subjects are matched in place; `pcre2_match_data` is thread-local and reused; compiled patterns are JIT'd; `%+` is rebuilt only when the pattern has named groups; `$&`/`$1` are installed only if the unit reads them; `foreach @arr` uses a live `i64` length. Tests: `tests/regex_hotpath_{smoke,deep}.pl`.
 - **Interned bool PVs**: `perl_alloc_bool` returns process-lifetime 1 / `""` cells (`PV_FLAG_IMMORTAL`), never pooled. `perl_free` is a no-op; writes croak like perl's `PL_sv_yes`/`PL_sv_no`. JSON::PP::Boolean clones first. Tests: `tests/intern_bool_{smoke,deep}.pl`.
 - **Stage 34 loop vectorize**: counted C-style `for` and integer-range `foreach` whose body is unboxed i64/f64 get a `llvm.loop.vectorize.width=4` hint. Statement-context `+=`/`++`/assign on int/float allocas store only (no `perl_alloc_int` box, which blocked LV). Mixed `$i * 1.0` SIToFPs the int; `$i + 1` stays i64 (D78). Inner foreach still gets Stage 28 unroll. Disable with `PERLC_OPT_DISABLE=loopvec`. Tests: `tests/loop_vec_{smoke,deep}.pl`.
-- **Stage 35 packed complex rows**: `$row->[$i] = [re,im]` (or `cplx`/`cadd`/`cmul` results) packs the row as `PERL_CPLX_ROW` — a refcounted interleaved `double[2N]` still observed as an ARRAY of 2-element arrayrefs. Codegen loads `$z->[0]`/`$z->[1]` and `$row->[$i][0|1]` from that buffer and stores pairs without `perl_alloc_float_pair` when the index is in bounds. A non-pair store, `@$row`, or `perl_promote_ref_array` unpacks to a real `REF_ARRAY` of `FLOAT_PAIR`s (D105). Disable IR fast paths with `PERLC_OPT_DISABLE=cplxrow` (runtime packing still happens). Tests: `tests/cplx_row_{smoke,deep}.pl`.
+- **Stage 35 packed complex rows**: `$row->[$i] = [re,im]` (or `cplx`/`cadd`/`cmul` results) packs the row as `PERL_CPLX_ROW` — a refcounted interleaved `double[2N]` still observed as an ARRAY of 2-element arrayrefs. Codegen loads `$z->[0]`/`$z->[1]` and `$row->[$i][0|1]` from that buffer and stores pairs without `perl_alloc_float_pair` when the index is in bounds. A non-pair store unpacks to a real `REF_ARRAY`. `@$row` / `perl_deref_array` on CPLX_ROW boxes `PAIR_ELEM` views (parent buffer stays alive). `perl_promote_ref_array` still only converts FLOAT_PAIR (D105). `$z = $row->[$i]` is a `PERL_PAIR_ELEM` view so `$z->[0] = 9` writes the packed pair; FLOAT_PAIR / empty-row copies stay value-copies. Disable IR fast paths with `PERLC_OPT_DISABLE=cplxrow` (runtime packing still happens). Tests: `tests/cplx_row_{smoke,deep}.pl`, `tests/pairelem_{smoke,deep}.pl`.
 - **Stage 36 flat-row scalar-half binding** (2026-11-04, perf item 3):
   `my $v = $row->[expr]` where the enclosing body never observes `$v` as a
   PV (floatVarUseSafe, no deref-chain base per isRowishUse, not
@@ -4131,13 +4132,24 @@ arbitrary blocks.
   /foreach-range par=YES|no`.
 - **Tests:** `tests/mappar_{smoke,deep}.pl`,
   `tests/foreachpar_{smoke,deep}.pl`, `tests/rangepar_{smoke,deep}.pl`,
-  `tests/mapconcat_{smoke,deep}.pl`, `tests/mapdie_{smoke,deep}.pl`.
+  `tests/mapconcat_{smoke,deep}.pl`, `tests/mapdie_{smoke,deep}.pl`,
+  `tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
+- **Append / reduce (opt_strat 1–2):** `foreach (@a) { push @b, … }`
+  snapshots `@a` and concatenates per-chunk dest arrays in order.
+  Same-array `push @a` stays sequential (live length). `$s +=` / `$s -=`
+  on an unboxed i64 accumulator uses per-chunk partials and an ordered
+  sum; `lookupIntVar` must succeed at dispatch. Float `+=` stays
+  sequential. Die in an append/reduce body stays sequential (prefix
+  side effects). D135's file-scope scan can box a block-local `$s` when
+  another same-named `$s += $a[$i]` is not int-shaped; tests use unique
+  accumulator names. `$s += $a[$i]` itself stays sequential unless `$s`
+  is already int-unboxed.
 - **Still sequential:** live-length foreach that `push`es the iterated
-  array; `$a[$i+1]` / `$i++` then `$a[$i]` range bodies; arbitrary
-  blocks.
+  array; `$a[$i+1]` / `$i++` then `$a[$i]` range bodies; float
+  reductions; arbitrary blocks. Next candidates: `docs/opt_strat.md`.
 
 ### Native stdlib waves 1–3 (2026-09-22)
 

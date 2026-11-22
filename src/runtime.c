@@ -1906,6 +1906,57 @@ PerlValue *perl_alloc_cplx_row(long long n) {
     return v;
 }
 
+static int pair_elem_xy(const PerlValue *v, double *re, double *im) {
+    if (!v || v->tag != PERL_PAIR_ELEM || !v->pval) return 0;
+    PerlCplxRow *r = (PerlCplxRow *)v->pval;
+    long long i = v->matchpos;
+    if (!r || i < 0 || i >= r->n) return 0;
+    *re = r->data[2 * i];
+    *im = r->data[2 * i + 1];
+    return 1;
+}
+
+static const void *pair_elem_ident(const PerlValue *v) {
+    if (!v || v->tag != PERL_PAIR_ELEM || !v->pval) return v;
+    PerlCplxRow *r = (PerlCplxRow *)v->pval;
+    long long i = v->matchpos;
+    if (!r || !r->data || i < 0 || i >= r->n) return v;
+    return (const void *)(r->data + 2 * i);
+}
+
+static PerlValue *perl_alloc_pair_elem(PerlCplxRow *r, long long idx, unsigned int flags) {
+    PerlValue *pv = pv_alloc();
+    pv->tag = PERL_PAIR_ELEM;
+    pv->pval = r;
+    pv->matchpos = idx;
+    pv->blessed_class = NULL;
+    if (r) r->refcount++;
+    pv->flags |= (flags & PV_FLAG_INT_MASK);
+    return pv;
+}
+
+static PerlArray *pair_elem_snapshot_av(PerlValue *pv) {
+    double re = 0, im = 0;
+    pair_elem_xy(pv, &re, &im);
+    int ie1 = (pv->flags & PV_FLAG_INT_ELEMS) != 0;
+    int ie2 = (pv->flags & PV_FLAG_INT_ELEM2) != 0;
+    PerlArray *av = perl_anon_array_new();
+    PerlValue *a = flat_elem_box(re, ie1);
+    PerlValue *b = flat_elem_box(im, ie2);
+    perl_array_push(av, a); perl_free(a);
+    perl_array_push(av, b); perl_free(b);
+    return av;
+}
+
+static void pair_elem_convert_in_place(PerlValue *pv) {
+    PerlArray *av = pair_elem_snapshot_av(pv);
+    if (pv->pval) cplx_row_release((PerlCplxRow *)pv->pval);
+    pv->tag = PERL_REF_ARRAY;
+    pv->pval = av;
+    pv->matchpos = 0;
+    pv->flags &= ~PV_FLAG_INT_MASK;
+}
+
 static int perl_value_pair_xy(PerlValue *v, double *re, double *im) {
     if (!v) return 0;
     if (v->tag == PERL_FLOAT_PAIR) {
@@ -1913,6 +1964,7 @@ static int perl_value_pair_xy(PerlValue *v, double *re, double *im) {
         memcpy(im, &v->matchpos, sizeof(double));
         return 1;
     }
+    if (pair_elem_xy(v, re, im)) return 1;
     if (v->tag == PERL_FLAT_ARRAY && v->matchpos >= 2 && v->pval) {
         double *d = (double *)v->pval;
         *re = d[0];
@@ -2032,13 +2084,18 @@ HOTX PerlValue *perl_cplx_elem(PerlValue *row, long long idx) {
         if (!r) return perl_alloc_undef();
         if (idx < 0) idx += r->n;
         if (idx < 0 || idx >= r->n) return perl_alloc_undef();
-        PerlValue *pv = perl_alloc_float_pair(r->data[2 * idx], r->data[2 * idx + 1]);
-        /* Stage 42: a packed row's re/im halves remember IV-ness (D154
-           bits) — re-boxed elements must present the same int-ness the
-           original boxes did. */
-        if (row->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2))
-            pv->flags |= (row->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2));
-        return pv;
+        /* PAIR_ELEM: $z = $row->[$i] aliases the packed pair so
+           $z->[0] = 9 writes data[2*i]. FLOAT_PAIR clones stay value
+           copies (mb/nbody). */
+        return perl_alloc_pair_elem(r, idx, row->flags);
+    }
+    if (row->tag == PERL_PAIR_ELEM) {
+        PerlCplxRow *r = (PerlCplxRow *)row->pval;
+        long long pidx = row->matchpos;
+        if (idx < 0) idx += 2;
+        if (!r || pidx < 0 || pidx >= r->n || idx < 0 || idx > 1)
+            return perl_alloc_undef();
+        return perl_alloc_float(r->data[2 * pidx + idx]);
     }
     if (row->tag == PERL_FLOAT_PAIR) {
         if (idx < 0) idx += 2;
@@ -2187,12 +2244,13 @@ static void perl_release_capture(PerlValue *v);
 PerlValue *perl_clone(const PerlValue *src) {
     if (!src) return perl_alloc_undef();
     /* Sanity: if tag is bogus, fall back to undef instead of corrupting memory
-       The highest valid PerlTag is PERL_CPLX_ROW (19); PERL_XS_PTR is only 16,
+       The highest valid PerlTag is PERL_PAIR_ELEM (20); PERL_XS_PTR is only 16,
        so this must not use PERL_XS_PTR as the bound, or BigInt (17), QR (18),
-       and complex (19) clones are rejected here as "undef" even though they
-       each have a dedicated case below (which broke Math::BigInt arithmetic,
-       since perl_clone(oprand) returned undef for blessed BigInt operands). */
-    if ((int)src->tag < PERL_UNDEF || (int)src->tag > PERL_CPLX_ROW)
+       complex (19), and pair-elem (20) clones are rejected here as "undef"
+       even though they each have a dedicated case below (which broke
+       Math::BigInt arithmetic, since perl_clone(oprand) returned undef for
+       blessed BigInt operands). */
+    if ((int)src->tag < PERL_UNDEF || (int)src->tag > PERL_PAIR_ELEM)
         return perl_alloc_undef();
     if (src->tag == PERL_STRING) {
         PerlValue *v = perl_alloc_string_len(src->sval, src->slen);
@@ -2225,6 +2283,15 @@ PerlValue *perl_clone(const PerlValue *src) {
         PerlValue *v = pv_alloc();
         *v = *src;
         v->flags = 0;
+        v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
+        ((PerlCplxRow *)src->pval)->refcount++;
+        return v;
+    }
+    if (src->tag == PERL_PAIR_ELEM && src->pval) {
+        /* Share the parent row + pair index so $w = $z aliases $z. */
+        PerlValue *v = pv_alloc();
+        *v = *src;
+        v->flags = src->flags & PV_FLAG_INT_MASK;
         v->blessed_class = src->blessed_class ? strdup(src->blessed_class) : NULL;
         ((PerlCplxRow *)src->pval)->refcount++;
         return v;
@@ -2350,7 +2417,7 @@ HOTX void perl_free(PerlValue *v) {
     }
     if (v->tag == PERL_STRING) free(v->sval);
     if (v->tag == PERL_FLAT_ARRAY) flat_release_pv(v);   /* D208: unlink sharer */
-    if (v->tag == PERL_CPLX_ROW && v->pval) {
+    if ((v->tag == PERL_CPLX_ROW || v->tag == PERL_PAIR_ELEM) && v->pval) {
         cplx_row_release((PerlCplxRow *)v->pval);
         v->pval = NULL;
     }
@@ -2834,16 +2901,23 @@ const char *perl_to_string(const PerlValue *v) {
             return strdup("DBI::st");
         case PERL_FLAT_ARRAY:
         case PERL_FLOAT_PAIR:
+        case PERL_PAIR_ELEM:
             /* D203: packed row = anon array ref — stringify as the ref
                form (ARRAY(0x…)), same as the REF_ARRAY/CPLX_ROW arms and
-               the duplicate to_string variant further down. */
-            if (v->blessed_class && v->blessed_class[0])
-                snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class,
-                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
-            else
-                snprintf(buf, sizeof buf, "ARRAY(0x%llx)",
-                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
-            return strdup(buf);
+               the duplicate to_string variant further down. PAIR_ELEM
+               identity is the pair's slot in the parent buffer. */
+            {
+                const void *id = (v->tag == PERL_PAIR_ELEM)
+                    ? pair_elem_ident(v)
+                    : (v->pval ? v->pval : (const void *)v);
+                if (v->blessed_class && v->blessed_class[0])
+                    snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class,
+                             (unsigned long long)(uintptr_t)id);
+                else
+                    snprintf(buf, sizeof buf, "ARRAY(0x%llx)",
+                             (unsigned long long)(uintptr_t)id);
+                return strdup(buf);
+            }
         default:
             return strdup("");
     }
@@ -2860,7 +2934,7 @@ char *perl_to_string_dup(const PerlValue *v) {
         /* Also skip if tag is bogus — a corrupted PV would have a garbage tag
            that passes the above check but isn't a real blessed object. */
         int t = (int)v->tag;
-        if (t >= 0 && t <= 19) {
+        if (t >= 0 && t <= (int)PERL_PAIR_ELEM) {
             const char *method = perl_find_overload(v, "\"\"");
             if (method) {
                 /* D97: built-in C function overload (Math::BigInt) */
@@ -3011,6 +3085,7 @@ char *perl_to_string_dup(const PerlValue *v) {
             return strdup("DBI::st");
         case PERL_FLAT_ARRAY:
         case PERL_FLOAT_PAIR:
+        case PERL_PAIR_ELEM:
             /* D203 (2026-11-06): a packed row IS an anonymous-array ref —
                its stringification is the ref form (ARRAY(0x…)), exactly
                like the REF_ARRAY/CPLX_ROW arms above. The old element-list
@@ -3019,13 +3094,18 @@ char *perl_to_string_dup(const PerlValue *v) {
                perl prints ARRAY(0x…)) — the core D203 list-position
                surface. Element views still flatten through @{} / element
                reads / @row interpolation, which never reach to_string. */
-            if (v->blessed_class && v->blessed_class[0])
-                snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class,
-                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
-            else
-                snprintf(buf, sizeof buf, "ARRAY(0x%llx)",
-                         (unsigned long long)(uintptr_t)(v->pval ? v->pval : (const void *)v));
-            return strdup(buf);
+            {
+                const void *id = (v->tag == PERL_PAIR_ELEM)
+                    ? pair_elem_ident(v)
+                    : (v->pval ? v->pval : (const void *)v);
+                if (v->blessed_class && v->blessed_class[0])
+                    snprintf(buf, sizeof buf, "%s=ARRAY(0x%llx)", v->blessed_class,
+                             (unsigned long long)(uintptr_t)id);
+                else
+                    snprintf(buf, sizeof buf, "ARRAY(0x%llx)",
+                             (unsigned long long)(uintptr_t)id);
+                return strdup(buf);
+            }
         default:
             return strdup("");
     }
@@ -3072,6 +3152,7 @@ int perl_is_true(const PerlValue *v) {
         case PERL_FLAT_ARRAY:
         case PERL_FLOAT_PAIR:
         case PERL_CPLX_ROW:
+        case PERL_PAIR_ELEM:
             return 1;
         case PERL_FILEHANDLE:
         case PERL_XS_PTR:
@@ -3112,8 +3193,10 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
     unsigned int src_utf8 = (src && src->tag == PERL_STRING) ? (src->flags & PV_FLAG_UTF8) : 0;
     /* D154: FLAT_ARRAY / FLOAT_PAIR "built from ints" is a value bit;
        D208: PK_LAYOUT rides along (packed rows keep per-half IV-ness) */
-    if (src && (src->tag == PERL_FLAT_ARRAY || src->tag == PERL_FLOAT_PAIR))
-        src_utf8 |= (src->flags & PV_FLAG_INT_MASK) | PV_FLAG_PK_LAYOUT;
+    if (src && (src->tag == PERL_FLAT_ARRAY || src->tag == PERL_FLOAT_PAIR ||
+                src->tag == PERL_PAIR_ELEM))
+        src_utf8 |= (src->flags & PV_FLAG_INT_MASK) |
+                    (src->tag == PERL_PAIR_ELEM ? 0 : PV_FLAG_PK_LAYOUT);
     if (src && src->tag == PERL_FLOAT)
         src_utf8 |= (src->flags & PV_FLAG_IV_HINT);
     /* No implicit mutex here — caller must hold lock() for concurrent safety.
@@ -3152,6 +3235,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         ((PerlQrRegex *)src->pval)->refcount++;
     } else if (src && src->tag == PERL_CPLX_ROW && src->pval) {
         ((PerlCplxRow *)src->pval)->refcount++;
+    } else if (src && src->tag == PERL_PAIR_ELEM && src->pval) {
+        ((PerlCplxRow *)src->pval)->refcount++;
     } else if (src && src->tag == PERL_XS_PTR) {
         perl_digest_retain((PerlValue *)src);
     }
@@ -3160,7 +3245,7 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         perl_release_capture((PerlValue *)dst->pval);
     if (dst->tag == PERL_STRING) { free(dst->sval); dst->sval = NULL; }
     if (dst->tag == PERL_FLAT_ARRAY && dst->pval) { flat_release_pv(dst); dst->pval = NULL; }   /* D208 */
-    if (dst->tag == PERL_CPLX_ROW && dst->pval) {
+    if ((dst->tag == PERL_CPLX_ROW || dst->tag == PERL_PAIR_ELEM) && dst->pval) {
         cplx_row_release((PerlCplxRow *)dst->pval);
         dst->pval = NULL;
     }
@@ -3269,6 +3354,8 @@ HOTX void perl_assign(PerlValue *dst, const PerlValue *src) {
         /* matchpos holds the imaginary part as double bits — must NOT be zeroed. */
     } else if (src->tag == PERL_CPLX_ROW) {
         /* pval is a shared PerlCplxRow; refcount already bumped above. */
+    } else if (src->tag == PERL_PAIR_ELEM) {
+        /* pval is the parent PerlCplxRow; matchpos is the pair index. */
     } else if (src->tag == PERL_BIGINT && src->pval) {
         /* D97: deep-copy the mpz_t so src and dst each own their own. */
         dst->pval = malloc(sizeof(mpz_t));
@@ -5134,6 +5221,10 @@ PerlArray *perl_hash_autoviv_array(PerlHash *h, const char *key) {
             e->val = ref;
             return inner;
         }
+        if (e->val->tag == PERL_PAIR_ELEM) {
+            pair_elem_convert_in_place(e->val);
+            return (PerlArray *)e->val->pval;
+        }
         PerlArray *inner = perl_anon_array_new();
         PerlValue *ref   = perl_ref_array(inner);
         perl_free(e->val);
@@ -5209,6 +5300,10 @@ PerlArray *perl_array_autoviv_array_from_scalar(PerlValue **slot, long long idx)
         *slot = ref;
         return inner;
     }
+    if (pv && pv->tag == PERL_PAIR_ELEM) {
+        pair_elem_convert_in_place(pv);
+        return (PerlArray *)pv->pval;
+    }
     /* undef or other: create new array */
     PerlArray *inner = perl_anon_array_new();
     PerlValue *ref   = perl_ref_array(inner);
@@ -5246,6 +5341,10 @@ PerlArray *perl_hash_autoviv_array_idx(PerlHash *parent, const char *key) {
             PerlValue *ref = perl_ref_array(inner);
             *slot = ref;
             return inner;
+        }
+        if (pv && pv->tag == PERL_PAIR_ELEM) {
+            pair_elem_convert_in_place(pv);
+            return (PerlArray *)pv->pval;
         }
     }
     PerlArray *inner = perl_anon_array_new();
@@ -5304,6 +5403,10 @@ PerlHash *perl_array_autoviv_hash_idx(PerlArray *parent, long long idx) {
         *elem = ref;
         pv = ref;
     }
+    if (pv && pv->tag == PERL_PAIR_ELEM) {
+        pair_elem_convert_in_place(pv);
+        pv = *elem;
+    }
     if (pv && pv->tag == PERL_REF_HASH)
         return (PerlHash *)pv->pval;
     PerlHash *inner = perl_anon_hash_new();
@@ -5356,6 +5459,10 @@ PerlHash *perl_hash_autoviv_hash_idx(PerlHash *parent, const char *key) {
             *slot = ref;
             pv = ref;
         }
+        if (pv && pv->tag == PERL_PAIR_ELEM) {
+            pair_elem_convert_in_place(pv);
+            pv = *slot;
+        }
         if (pv && pv->tag == PERL_REF_HASH)
             return (PerlHash *)pv->pval;
     }
@@ -5400,6 +5507,10 @@ PerlHash *perl_array_autoviv_hash_from_scalar(PerlValue **slot, long long idx) {
         PerlValue *ref = perl_ref_array(tmp);
         *slot = ref;
         pv = ref;
+    }
+    if (pv && pv->tag == PERL_PAIR_ELEM) {
+        pair_elem_convert_in_place(pv);
+        pv = *slot;
     }
     if (pv && pv->tag == PERL_REF_HASH)
         return (PerlHash *)pv->pval;
@@ -5662,12 +5773,11 @@ PerlArray *perl_deref_array(PerlValue *ref) {
         PerlCplxRow *r = (PerlCplxRow *)ref->pval;
         PerlArray *av = perl_anon_array_new();
         long long n = r ? r->n : 0;
+        unsigned int bits = ref->flags;
         for (long long i = 0; i < n; i++) {
-            PerlValue *p = perl_alloc_float_pair(r->data[2 * i], r->data[2 * i + 1]);
-            /* Stage 42: carry the packed row's D154 int-half bits onto the
-               re-boxed pairs so promotion reproduces the original elements. */
-            if (ref->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2))
-                p->flags |= (ref->flags & (PV_FLAG_INT_ELEMS | PV_FLAG_INT_ELEM2));
+            /* PAIR_ELEM views keep the packed buffer alive so
+               $z = $row->[$i] after @$row / chained stores still writes back. */
+            PerlValue *p = perl_alloc_pair_elem(r, i, bits);
             perl_array_push(av, p);
             perl_free(p);
         }
@@ -5677,13 +5787,20 @@ PerlArray *perl_deref_array(PerlValue *ref) {
         ref->matchpos = 0;
         return av;
     }
+    if (ref->tag == PERL_PAIR_ELEM) {
+        /* Snapshot this view PV only — the parent row stays packed.
+           $z->[0] = 9 uses perl_array_set_row, not deref. */
+        pair_elem_convert_in_place(ref);
+        return (PerlArray *)ref->pval;
+    }
     if (ref->tag != PERL_REF_ARRAY) return perl_array_new();
     return (PerlArray *)ref->pval;
 }
 
 /* Fast read-only deref — caller typically has a REF_ARRAY. CPLX_ROW
-   promotes; FLAT_ARRAY / FLOAT_PAIR must NOT (the 2D F64 path relies
-   on those tags staying packed). */
+   promotes; FLAT_ARRAY / FLOAT_PAIR / PAIR_ELEM must NOT (the 2D F64
+   path relies on those tags staying packed; converting PAIR_ELEM would
+   snapshot the view and drop write-back). */
 HOTX PerlArray *perl_deref_array_ro(PerlValue *ref) {
     if (ref && ref->tag == PERL_CPLX_ROW)
         return perl_deref_array(ref);
@@ -5752,6 +5869,8 @@ PerlValue *perl_ref_type(PerlValue *ref) {
                     case PERL_REF_SCALAR:
                     case PERL_FLAT_ARRAY:
                     case PERL_FLOAT_PAIR:
+                    case PERL_CPLX_ROW:
+                    case PERL_PAIR_ELEM:
                     case PERL_XS_PTR:
                         return perl_alloc_string("REF");
                     default:               return perl_alloc_string("SCALAR");
@@ -5763,6 +5882,7 @@ PerlValue *perl_ref_type(PerlValue *ref) {
         case PERL_FLAT_ARRAY:  return perl_alloc_string("ARRAY");
         case PERL_FLOAT_PAIR:  return perl_alloc_string("ARRAY");
         case PERL_CPLX_ROW:    return perl_alloc_string("ARRAY");
+        case PERL_PAIR_ELEM:   return perl_alloc_string("ARRAY");
         case PERL_REF_HASH:    return perl_alloc_string("HASH");
         case PERL_CODE_REF:    return perl_alloc_string("CODE");
         case PERL_QR:          return perl_alloc_string("Regexp");
@@ -8799,6 +8919,12 @@ static PerlValue *storable_clone_container(struct DCloneCtx *ctx,
 static PerlValue *storable_dclone_pv(struct DCloneCtx *ctx, PerlValue *pv,
                                      int *owned) {
     if (!pv || pv->tag == PERL_UNDEF) { *owned = 1; return perl_alloc_undef(); }
+    if (pv->tag == PERL_PAIR_ELEM) {
+        double re = 0, im = 0;
+        pair_elem_xy(pv, &re, &im);
+        *owned = 1;
+        return perl_alloc_float_pair(re, im);
+    }
     if (pv->tag == PERL_FLAT_ARRAY || pv->tag == PERL_FLOAT_PAIR ||
         pv->tag == PERL_CPLX_ROW) {
         /* Stage 22/23 compact numeric row. D208 (2026-11-07): the clone
@@ -9092,7 +9218,8 @@ static int json_is_ref_value(PerlValue *v) {
     perl_promote_ref_array(v);
     return v->tag == PERL_REF_ARRAY || v->tag == PERL_REF_HASH ||
            v->tag == PERL_REF_SCALAR || v->tag == PERL_FLAT_ARRAY ||
-           v->tag == PERL_FLOAT_PAIR || v->tag == PERL_CPLX_ROW;
+           v->tag == PERL_FLOAT_PAIR || v->tag == PERL_CPLX_ROW ||
+           v->tag == PERL_PAIR_ELEM;
 }
 
 static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
@@ -9111,6 +9238,12 @@ static void json_encode_value(JsonBuf *b, PerlValue *v, int depth) {
     if (v->tag == PERL_CPLX_ROW) {
         perl_deref_array(v);
         json_encode_value(b, v, depth);
+        return;
+    }
+    if (v->tag == PERL_PAIR_ELEM) {
+        PerlArray *tmp = pair_elem_snapshot_av(v);
+        json_encode_array(b, tmp, depth);
+        perl_array_free(tmp);
         return;
     }
     if (v->tag == PERL_FLAT_ARRAY) {
@@ -14044,6 +14177,23 @@ void perl_mappar_die_free(void *slot) {
     free(d);
 }
 
+long long *perl_mappar_i64slots_new(long long n) {
+    if (n <= 0) return NULL;
+    return (long long *)calloc((size_t)n, sizeof(long long));
+}
+void perl_mappar_i64slots_put(long long *s, long long lo, long long v) {
+    if (s && lo >= 0) s[lo] = v;
+}
+long long perl_mappar_i64slots_sum(long long *s, long long n) {
+    long long t = 0;
+    if (!s || n <= 0) return 0;
+    for (long long i = 0; i < n; i++) t += s[i];
+    return t;
+}
+void perl_mappar_i64slots_free(long long *s) {
+    free(s);
+}
+
 /* D199-tail session: $0 must read as the SCRIPT path byte-identically to
    real perl (perl runs `perl prog.pl` → $0="prog.pl"; perlc's compiled
    binary's argv[0] is the binary path, which would diverge every script
@@ -15017,6 +15167,12 @@ static void dumper_value(DumperBuf *b, PerlValue *v) {
         return;
     }
     if (v->tag == PERL_CPLX_ROW) perl_deref_array(v);
+    if (v->tag == PERL_PAIR_ELEM) {
+        PerlArray *tmp = pair_elem_snapshot_av(v);
+        dumper_array(b, tmp);
+        perl_array_free(tmp);
+        return;
+    }
     const char *cls = v->blessed_class;
     if (cls) dumper_putstr(b, "bless( ");
     switch (v->tag) {
@@ -17704,6 +17860,16 @@ static void st_enc(StBuf *b, PerlValue *v) {
         if (b->nseen < 512) b->seen[b->nseen++] = v->pval;
         st_u8(b, SX_REF);
         st_enc(b, (PerlValue *)v->pval);
+        break;
+    }
+    case PERL_PAIR_ELEM: {
+        PerlArray *tmp = pair_elem_snapshot_av(v);
+        PerlValue fake;
+        memset(&fake, 0, sizeof fake);
+        fake.tag = PERL_REF_ARRAY;
+        fake.pval = tmp;
+        st_enc(b, &fake);
+        perl_array_free(tmp);
         break;
     }
     default: {
@@ -20723,6 +20889,25 @@ PerlValue *perl_flat_row_op_assign(PerlValue *row_pv, long long idx,
             default: r = lhs;
         }
         flat[idx] = r;
+    } else if (row_pv && row_pv->tag == PERL_PAIR_ELEM) {
+        PerlCplxRow *pr = (PerlCplxRow *)row_pv->pval;
+        long long pidx = row_pv->matchpos;
+        long long half = idx;
+        if (half < 0) half += 2;
+        double lhs = 0.0;
+        if (pr && pidx >= 0 && pidx < pr->n && half >= 0 && half < 2)
+            lhs = pr->data[2 * pidx + half];
+        switch (op) {
+            case 0: r = lhs + rhs; break;
+            case 1: r = lhs - rhs; break;
+            case 2: r = lhs * rhs; break;
+            case 3:
+                if (rhs == 0.0) { PerlValue *e = perl_alloc_string("Illegal division by zero"); perl_die(e, dfile, dline); }
+                r = lhs / rhs; break;
+            default: r = lhs;
+        }
+        if (pr && pidx >= 0 && pidx < pr->n && half >= 0 && half < 2)
+            pr->data[2 * pidx + half] = r;
     } else {
         PerlArray *av = perl_deref_array(row_pv);
         PerlValue *lhs_pv = perl_array_get_ref(av, idx);
@@ -20781,6 +20966,18 @@ PerlValue *perl_array_set_row(PerlValue *row_pv, long long idx, PerlValue *v) {
         double *flat = (double *)row_pv->pval;
         flat[idx] = perl_to_float(v);
         return v;
+    }
+    /* PAIR_ELEM: $z->[0] = 9 writes the parent packed pair in place. */
+    if (row_pv && row_pv->tag == PERL_PAIR_ELEM) {
+        PerlCplxRow *r = (PerlCplxRow *)row_pv->pval;
+        long long pidx = row_pv->matchpos;
+        long long half = idx;
+        if (half < 0) half += 2;
+        if (r && pidx >= 0 && pidx < r->n && half >= 0 && half < 2) {
+            r->data[2 * pidx + half] = perl_to_float(v);
+            return v;
+        }
+        pair_elem_convert_in_place(row_pv);
     }
     /* Stage 35: storing a 2-float pair into an empty/all-pair row packs it
        as CPLX_ROW (contiguous re,im). Non-pair stores promote. */

@@ -71,8 +71,9 @@ element cell (`map { $_++ } @a` writes back). Gates:
 `tests/d208_shared_row_coherence.pl`,
 `tests/d208_map_grep_alias.pl` (625 tests total). Deliberately open:
 aliased pair/empty-row copies stay value-copies (materialization
-broke mb/nbody — reverted with evidence); element-copy write-back
-(`$z = $row->[$i]; $z->[0] = 9`) needs a row-element alias PV.
+broke mb/nbody — reverted with evidence). Element-copy write-back
+(`$z = $row->[$i]; $z->[0] = 9`) is `PERL_PAIR_ELEM` (closed 2026-11-22;
+`tests/pairelem_{smoke,deep}.pl`).
 **Move-3 measurements (2026-11-07):** the Stage-45 floor reads
 `PERLC_AUTOPAR_MIN` at COMPILE time (default 8192) — mbs640 with
 AUTOPAR_MIN=512 dispatches 103,680 inner-shape kernels ≈ 99 µs
@@ -93,8 +94,12 @@ body; arrays pre-sized with `perl_array_fill_undef`); list-yielding map
 concat (per-chunk arrays + ordered `extend_nc`); per-chunk die slots
 (worker setjmp, lowest-index `$@`, rethrow after join). Tests:
 `tests/rangepar_{smoke,deep}.pl`, `tests/mapconcat_{smoke,deep}.pl`,
-`tests/mapdie_{smoke,deep}.pl`. Live-length foreach that `push`es the
-iterated array stays sequential. Outer-loop batch dispatch for the mbs
+`tests/mapdie_{smoke,deep}.pl`. **Closed 2026-11-22 — opt_strat 1–2:**
+append-only foreach `push @b` (dest ≠ iterated array; live-length
+`push @a` stays sequential) and ordered i64 reductions (`$s +=`/`-=`
+on an unboxed int; float stays sequential). Tests:
+`tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`.
+Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.
 **Closed 2026-11-07 (this round):** D207b worker-body parity —

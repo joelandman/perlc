@@ -175,7 +175,10 @@ public:
                           std::unordered_set<std::string> &locals,
                           bool rangeElem = false,
                           std::vector<std::string> *rangeArrays = nullptr,
-                          bool *hadRangeStore = nullptr);
+                          bool *hadRangeStore = nullptr,
+                          const std::string *iterArrayName = nullptr,
+                          std::vector<std::string> *appendDests = nullptr,
+                          std::vector<std::string> *reduceVars = nullptr);
     bool mapParScalarYield(const Node &n) const;
     bool mapParListYield(const Node &n) const;
     void emitParDiePrologue(llvm::Value *dieSlot, llvm::Value *iSlot);
@@ -190,7 +193,9 @@ public:
                                 llvm::Value *inputArr, llvm::Value *resultArr,
                                 llvm::Value *len);
     llvm::Function *emitForeachParWorker(const Node &n,
-                                         const std::string &aliasBare);
+                                         const std::string &aliasBare,
+                                         const std::string &appendDest,
+                                         const std::string &reduceName);
     bool tryEmitForeachArrPar(const Node &n, llvm::Value *tmpArr,
                               bool ownsTmpArr, bool ncTmp,
                               llvm::Value *ownedForeach,
@@ -199,7 +204,9 @@ public:
                               llvm::BasicBlock *stepBB);
     llvm::Function *emitForeachRangeParWorker(const Node &n,
                                               const std::string &idxBare,
-                                              const std::vector<std::string> &arrNames);
+                                              const std::vector<std::string> &arrNames,
+                                              const std::string &appendDest,
+                                              const std::string &reduceName);
     bool tryEmitForeachRangePar(const Node &n, const std::string &idxBare,
                                 llvm::Value *lo, llvm::Value *hi,
                                 llvm::Function *fn, llvm::BasicBlock *exit,

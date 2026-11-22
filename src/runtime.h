@@ -27,6 +27,7 @@ typedef enum {
     PERL_BIGINT       = 17, /* Math::BigInt — pval=mpz_t* (GMP or mini-gmp), blessed_class="Math::BigInt" */
     PERL_QR           = 18, /* compiled regex — pval=PerlQrRegex* */
     PERL_CPLX_ROW     = 19, /* packed complexes: pval=PerlCplxRow* (interleaved re,im) */
+    PERL_PAIR_ELEM    = 20, /* alias of one pair in a CPLX_ROW: pval=PerlCplxRow*, matchpos=idx */
 } PerlTag;
 
 /* Stage 35: a row of N complex pairs as contiguous doubles, observed as
@@ -160,7 +161,7 @@ PerlValue *perl_alloc_flat_array(long long n); /* alloc PV with pval=double[n] *
 PerlValue *perl_alloc_float_array(long long n); /* alloc FLAT_ARRAY with n zero doubles */
 PerlValue *perl_alloc_float_pair(double re, double im); /* PERL_FLOAT_PAIR: inline 2-float */
 PerlValue *perl_alloc_cplx_row(long long n); /* PERL_CPLX_ROW of n zero pairs */
-PerlValue *perl_cplx_elem(PerlValue *row, long long idx); /* $row->[$i] as FLOAT_PAIR (clone) */
+PerlValue *perl_cplx_elem(PerlValue *row, long long idx); /* $row->[$i]: PAIR_ELEM view on CPLX_ROW, FLOAT_PAIR clone otherwise */
 PerlValue *perl_pack_flat_row(PerlValue *refpv); /* Stage 42: REF'd interleaved numeric row -> CPLX_ROW (NULL = refuse, untouched) */
 PerlValue *perl_alloc_xs_ptr(void *p);
 PerlValue *perl_clone(const PerlValue *v);
@@ -636,6 +637,13 @@ void perl_mappar_die_record(void *slot, long long i);
 int  perl_mappar_die_pending(void *slot);
 void perl_mappar_die_raise(void *slot);
 void perl_mappar_die_free(void *slot);
+
+/* Stage 46: ordered i64 reduction — one partial per chunk at slots[lo];
+   gather is the sum of those partials (zeros in unused slots). */
+long long *perl_mappar_i64slots_new(long long n);
+void perl_mappar_i64slots_put(long long *s, long long lo, long long v);
+long long perl_mappar_i64slots_sum(long long *s, long long n);
+void perl_mappar_i64slots_free(long long *s);
 
 /* Stage 45 debug: per-row FK prelude certification inputs */
 void perl_fk_cert_dbg(long long tag, long long flags, long long len,

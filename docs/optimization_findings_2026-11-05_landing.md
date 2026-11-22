@@ -565,11 +565,12 @@ dclone is independent — clones now get fresh backings (memo by source
 preserves intra-graph aliasing). map/grep/any/all/none now alias `$_`
 to the input's own element cell (foreach's borrow contract), which
 closes `map { $_++ } @a` write-back and short-circuit mutation counts.
-Not done, deliberately (each was attempted and reverted with evidence):
+Not done, deliberately (attempted and reverted with evidence):
 pair/empty-row materialization at clone/assign (mutating LIVE pair
 sources breaks the mb/nbody pair-read paths — aliased-pair divergence
-predates D208), and element-copy write-back (`$z = $row->[$i];
-$z->[0] = 9`) which needs a row-element alias PV. New gates:
+predates D208). Element-copy write-back (`$z = $row->[$i];
+$z->[0] = 9`) closed 2026-11-22 as `PERL_PAIR_ELEM` (a view of one
+packed pair; FLOAT_PAIR copies stay value-copies). New gates:
 `tests/d208_shared_row_coherence.pl` (8 shapes) +
 `tests/d208_map_grep_alias.pl` (map-back, grep-back, row write-back,
 any/all/none short-circuit counts). Suite 625/625 twice.
