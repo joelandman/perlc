@@ -140,6 +140,16 @@ those slots. A `$1` anywhere, `/g`, and `pack("C*", @outer)` stay
 sequential. Knob: `mappar`. Tests: `tests/splitpar_{smoke,deep}.pl`
 — those files must not mention `$1`/`$&`.
 
+### 12. Closed `unpack` in mappar — closed this session
+
+`unpack` is a list-yield (map-concat of fields) or a scalar first field
+(grep). It was still default-false after pack landed in (11).
+`map { unpack("C*", $_) }` and `map { unpack("C", pack("C", length($_))) }`
+now fan out with Stage 46. An outer format scalar (`unpack($fmt, $_)`)
+stays sequential. Knob: `mappar`. Tests:
+`tests/unpackpar_{smoke,deep}.pl` — print numeric fields, not packed
+binary.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -163,7 +173,7 @@ sequential. Knob: `mappar`. Tests: `tests/splitpar_{smoke,deep}.pl`
 
 ## Practical order
 
-(1)–(7) and (9)–(11) landed this session. (8) is the pcre2 leftover of
+(1)–(7) and (9)–(12) landed this session. (8) is the pcre2 leftover of
 (4): a C concatenation scanner was measured slower than JIT and was
 not landed. Remaining of (4) is a different match engine. Parallelism
 will not move it.

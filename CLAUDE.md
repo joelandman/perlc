@@ -132,6 +132,10 @@ regex) and `pack` in closed map/grep. Regex split uses the per-thread
 pcre2 LRU and skips `$1`/`%+` install unless the unit reads them.
 `pack("C*", @outer)` stays sequential. Tests:
 `tests/splitpar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 12 (unpackpar):** `unpack` in closed
+map/grep. Map unpack is list-concat; grep unpack is the first field.
+`unpack($fmt, $_)` with an outer format stays sequential. Tests:
+`tests/unpackpar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

@@ -9535,6 +9535,7 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
      - no calls, I/O, last/next/redo, local, eval, hashes, pop
      - boolean literal /pat/ (no /g) when the unit does not read $1/$&
      - closed split (string or regex) and pack; regex split refuses $1/$& /g
+     - closed unpack (list-concat in map; scalar first field in grep)
      - append-only `push @b` (dest != iterated array) reuses concat slots
      - ordered i64 `$s +=` / `$s -=` uses per-chunk partials; die in an
        append/reduce body stays sequential (prefix side effects)
@@ -9585,10 +9586,10 @@ bool CodeGen::mapParScalarYield(const Node &n) const {
     case NK::Range: case NK::MapFunc: case NK::GrepFunc: case NK::SortFunc:
     case NK::RepeatArray:
     case NK::RegexMatch: case NK::RegexMatchExpr: case NK::RegexMatchInterp:
-    case NK::SplitFunc:
+    case NK::SplitFunc: case NK::UnpackFunc:
         /* List-context match yields the capture list (empty on failure),
            not a 1:1 boolean. Grep uses scalar /pat/ via perl_is_true.
-           split yields fields (concat). */
+           split/unpack yield fields (concat). */
         return false;
     case NK::PostfixDeref:
         if (e->sval == "all_array" || e->sval == "slice_array" ||
@@ -9766,7 +9767,7 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
         case NK::IndexFunc: case NK::RindexFunc: case NK::SubstrFunc:
         case NK::JoinFunc: case NK::SprintfFunc:
         case NK::HexFunc: case NK::OctFunc:
-        case NK::PackFunc: case NK::SplitFunc:
+        case NK::PackFunc: case NK::SplitFunc: case NK::UnpackFunc:
             /* 4-arg substr($s,off,len,$repl) writes $s in place; lvalue
                substr(...) = is asWrite. Both stay sequential. */
             if (asWrite) return false;
@@ -10000,7 +10001,7 @@ bool CodeGen::mapParListYield(const Node &n) const {
     if (e->kind == NK::PostfixDeref &&
         (e->sval == "all_array" || e->sval == "slice_array"))
         return true;
-    if (e->kind == NK::SplitFunc) return true;
+    if (e->kind == NK::SplitFunc || e->kind == NK::UnpackFunc) return true;
     return false;
 }
 
