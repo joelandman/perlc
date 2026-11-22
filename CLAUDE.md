@@ -120,6 +120,10 @@ sequential (list-context capture list). Tests:
 `tests/greppar_{smoke,deep}.pl`.
 **Measured 2026-11-22 — opt_strat 8:** a C `/lit\d+_lit/` scanner
 matched perl but was slower than pcre2 JIT on regex_heavy; not landed.
+**Closed 2026-11-22 — opt_strat 9 (idxpar):** `index` / `rindex` /
+read-only 2/3-arg `substr` in closed map/grep (`PERLC_OPT_DISABLE=mappar`).
+4-arg and lvalue `substr` stay sequential. Tests:
+`tests/idxpar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

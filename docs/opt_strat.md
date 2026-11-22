@@ -112,6 +112,15 @@ memo path and gated vs perl. It is **not landed**: at `-O2` LTO,
 subjects does not beat JIT. Remaining of (4): a different engine
 (SIMD/batch/hyperscan), not another per-call NFA.
 
+### 9. Closed `index` / `rindex` / `substr` in mappar — closed this session
+
+`length` / `lc` / `uc` were already eligible; `index`, `rindex`, and
+read-only 2/3-arg `substr` were still default-false in `mapParBodyPurity`.
+`grep { index($_, "x") >= 0 }` and `map { substr($_, 0, 2) }` now fan
+out with the rest of Stage 46. 4-arg `substr($s, off, len, $repl)` and
+lvalue `substr(...) =` stay sequential (in-place write of `$s`). Knob:
+`mappar`. Tests: `tests/idxpar_{smoke,deep}.pl`.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -135,7 +144,7 @@ subjects does not beat JIT. Remaining of (4): a different engine
 
 ## Practical order
 
-(1)–(7) landed this session. (8) is the pcre2 leftover of (4): a C
-concatenation scanner was measured slower than JIT and was not landed.
-Remaining of (4) is a different match engine. Parallelism will not
-move it.
+(1)–(7) and (9) landed this session. (8) is the pcre2 leftover of (4):
+a C concatenation scanner was measured slower than JIT and was not
+landed. Remaining of (4) is a different match engine. Parallelism will
+not move it.

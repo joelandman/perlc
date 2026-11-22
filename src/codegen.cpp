@@ -9760,7 +9760,11 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
         case NK::UcfirstFunc: case NK::LcfirstFunc:
         case NK::ChrFunc: case NK::OrdFunc: case NK::RefFunc:
         case NK::ChompFunc:
+        case NK::IndexFunc: case NK::RindexFunc: case NK::SubstrFunc:
+            /* 4-arg substr($s,off,len,$repl) writes $s in place; lvalue
+               substr(...) = is asWrite. Both stay sequential. */
             if (asWrite) return false;
+            if (e.kind == NK::SubstrFunc && e.args.size() >= 4) return false;
             if (e.left && !exprOk(*e.left, false)) return false;
             if (e.right && !exprOk(*e.right, false)) return false;
             for (auto &a : e.args)
