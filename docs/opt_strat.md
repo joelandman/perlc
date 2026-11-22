@@ -46,10 +46,17 @@ view PV only. Tests: `tests/pairelem_{smoke,deep}.pl`.
 ### 4. Regex residual (slowest of the four benches)
 
 Memo slots and promote-inline already landed. regex3m is ~90% libpcre2
-(~2.9× vs perl). Remaining perlc cost: match-subject promote skip, void
-`$count++` without clone/free, and only then a different match strategy.
-Parallel `grep { /pat/ }` is a separate, smaller slice: capture globals
-(`$1`, `$&`) are why regex is refused in `mapParBodyPurity` today.
+(~2.9× vs perl). **Closed this session (perlc leftover, not pcre2):**
+match-subject D105 promote skip (`emitMatchSubject` on ScalarVar /
+ArrayElem / HashElem — stringify does not create a second array-ref
+alias) and statement-context `$count++` / `$count--` on a boxed PV
+(`perl_inc` in place; post++ clone only when the value is consumed).
+File-scope `my $count = 0` is not int-promoted, which is the regex3m
+shape. Tests: `tests/regex_residual_{smoke,deep}.pl`.
+
+Still open: a different match strategy (the pcre2 cliff). Parallel
+`grep { /pat/ }` is a separate, smaller slice: capture globals (`$1`,
+`$&`) are why regex is refused in `mapParBodyPurity` today.
 
 ### 5. Closed `sort` with a pure comparator
 
@@ -70,9 +77,22 @@ the rangepar worker. Smaller unique gain than (1)–(2).
 - Hash `keys`/`each` (order)
 - `while` with a live bound
 - `$i++` then `$a[$i]` (overlapping stores)
+- **Parallel f64 reductions / `--fast` / a reassoc pragma.** IEEE add is
+  not associative, so a chunked join is a different program than perl’s
+  left-to-right `+=`. Default sequential f64 `+=` stays the contract.
+  A file-wide `--fast` is too coarse (it would also become a bucket for
+  other unsound flags). A per-loop annotation is the only honest shape,
+  and even that is not worth the product cost: none of the four landing
+  benches is gated on a large f64 sum (nbody’s `$e +=` is 5 bodies;
+  mbs is already FK/autopar of independent iterations),
+  `PERLC_AUTOPAR_MIN=8192` means an unboxed sequential add is already
+  microseconds, and `make test-all` must never compile with reassoc.
+  If this is ever revisited: measure a 1e6/1e7-element sum first; name
+  the opt-in after the permission (`reduce(par)` / `--assoc-fp-reduce`),
+  not `--fast`.
 
 ## Practical order
 
-(1)–(3) landed this session. Next review: (4) is the remaining bench
-cliff that parallelism will not move. Then (5) closed sort, (6) boxed
-closed counted `for`.
+(1)–(3) and the perlc-side of (4) landed this session. Remaining of
+(4) is the pcre2 match strategy (parallelism will not move it). Then
+(5) closed sort, (6) boxed closed counted `for`.

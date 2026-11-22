@@ -99,6 +99,9 @@ append-only foreach `push @b` (dest ≠ iterated array; live-length
 `push @a` stays sequential) and ordered i64 reductions (`$s +=`/`-=`
 on an unboxed int; float stays sequential). Tests:
 `tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 4 perlc leftovers:** match-subject
+D105 promote skip and void boxed `$count++` (`tests/regex_residual_{smoke,deep}.pl`).
+pcre2 match strategy and parallel `grep { /pat/ }` stay open.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

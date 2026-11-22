@@ -3759,10 +3759,26 @@ Value *CodeGen::emitExprI64(const Node &nRaw) {
 }
 
 /* Returns an i1 for integer comparisons, nullptr if not applicable. */
+Value *CodeGen::emitMatchSubject(const Node &n) {
+    /* Scalar / element / hash-elem cells are stringified for the match
+       and not handed to a second alias, so D105 promote is skippable.
+       Computed subjects (calls, concats) keep the normal promote on
+       nested reads — those can create aliases. */
+    if (n.kind == NK::ScalarVar || n.kind == NK::ArrayElem ||
+        n.kind == NK::HashElem) {
+        bool saved = skipPromoteOnRead_;
+        skipPromoteOnRead_ = true;
+        Value *v = emitExpr(n);
+        skipPromoteOnRead_ = saved;
+        return v;
+    }
+    return emitExpr(n);
+}
+
 Value *CodeGen::emitRegexMatchBool(const Node &n) {
     auto *i32 = Type::getInt32Ty(ctx_);
     if (n.kind == NK::RegexMatch) {
-        Value *str = emitExpr(*n.left);
+        Value *str = emitMatchSubject(*n.left);
         Value *pat = builder_.CreateGlobalStringPtr(n.sval, "re_pat");
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
         bool isG = n.name.find('g') != std::string::npos;
@@ -3781,12 +3797,13 @@ Value *CodeGen::emitRegexMatchBool(const Node &n) {
         } else {
             hit = callRT("perl_regex_match_g_bool", {str, pat, flg});
         }
+        freeIfOwned(str);
         if (n.ival)
             hit = builder_.CreateXor(hit, ConstantInt::get(i32, 1), "re_not");
         return hit;
     }
     if (n.kind == NK::RegexMatchInterp) {
-        Value *str = emitExpr(*n.left);
+        Value *str = emitMatchSubject(*n.left);
         Value *patPv = emitExpr(*n.right);
         if (!rtFuncs_.count("perl_to_string_dup"))
             rtFuncs_["perl_to_string_dup"] = Function::Create(
@@ -3816,7 +3833,7 @@ Value *CodeGen::emitRegexMatchBool(const Node &n) {
         return hit;
     }
     if (n.kind == NK::RegexMatchExpr) {
-        Value *str = emitExpr(*n.left);
+        Value *str = emitMatchSubject(*n.left);
         int savedCtx = callCtx_;
         callCtx_ = -1;
         Value *patPv = emitExpr(*n.right);
@@ -4436,6 +4453,7 @@ static std::string loopScalarNm(const Node &n) {
    well-predicted branch. */
 void CodeGen::emitPromoteInline(Value *pv) {
     if (!pv) return;
+    if (skipPromoteOnRead_) return;
     auto *curFn = builder_.GetInsertBlock()->getParent();
     Value *tag = builder_.CreateLoad(Type::getInt32Ty(ctx_), pv, "prom.tag");
     setTBAA(tag, tbaaPvTagTag_);
@@ -4723,6 +4741,18 @@ bool CodeGen::emitUnboxedNumericVoid(const Node &n) {
             Value *next = isInc ? builder_.CreateFAdd(cur, ConstantFP::get(f64, 1.0))
                                 : builder_.CreateFSub(cur, ConstantFP::get(f64, 1.0));
             builder_.CreateStore(next, fa);
+            return true;
+        }
+        /* Boxed PV (file-scope `my $count = 0` is not int-promoted).
+           Statement-context ++/-- mutates in place; post++'s clone is
+           only required when the old value is consumed. */
+        if (Value *slot = lookupVar(nm)) {
+            Value *pv = builder_.CreateLoad(perlPtrTy_, slot, nm + ".incpv");
+            if (sharedScalarNames_.count(nm)) {
+                callRT(isInc ? "perl_atomic_inc" : "perl_atomic_dec", {pv});
+                return true;
+            }
+            callRT(isInc ? "perl_inc" : "perl_dec", {pv});
             return true;
         }
     }
@@ -7088,6 +7118,7 @@ void CodeGen::compile(const Node &program, const std::string &modName,
     endSeq_ = 0;
     globIterSeq_ = 0;
     regexMemoSeq_ = 0;
+    skipPromoteOnRead_ = false;
     lastSqrtInput_ = nullptr;
     floatSqrtOf_.clear();
 
@@ -17195,7 +17226,7 @@ Value *CodeGen::emitExpr(const Node &n) {
     }
 
     case NK::RegexMatch: {
-        Value *str = emitExpr(*n.left);
+        Value *str = emitMatchSubject(*n.left);
         Value *pat = builder_.CreateGlobalStringPtr(n.sval, "re_pat");
         Value *flg = builder_.CreateGlobalStringPtr(n.name, "re_flg");
         bool isG   = n.name.find('g') != std::string::npos;
@@ -17211,6 +17242,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         } else {
             res = callRT("perl_regex_match_g", {str, pat, flg});
         }
+        freeIfOwned(str);
         return n.ival ? callRT("perl_not", {res}) : res;
     }
 
@@ -17254,7 +17286,7 @@ Value *CodeGen::emitExpr(const Node &n) {
         /* $s =~ /pat-with-$vars/ — the pattern is an InterpolatedStr AST
            (parseStringInterp output): evaluate it to its runtime string
            and match with the node's flags. !~ via ival. */
-        Value *str = emitExpr(*n.left);
+        Value *str = emitMatchSubject(*n.left);
         Value *patPv = emitExpr(*n.right);
         if (!rtFuncs_.count("perl_to_string_dup"))
             rtFuncs_["perl_to_string_dup"] = Function::Create(
@@ -17288,7 +17320,7 @@ Value *CodeGen::emitExpr(const Node &n) {
                           {PointerType::getUnqual(ctx_)}),
                    Function::ExternalLinkage, "free", mod_.get()));
 
-        Value *str = emitExpr(*n.left);
+        Value *str = emitMatchSubject(*n.left);
         int savedCtx = callCtx_;
         callCtx_ = -1;              /* pattern expr inherits caller context */
         Value *patPv = emitExpr(*n.right);

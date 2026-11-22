@@ -303,6 +303,10 @@ private:
        (allocated as file-static globals; the runtime pins the compiled
        pattern — never LRU-evicted, freed by perl_cleanup). */
     int regexMemoSeq_ = 0;
+    /* Match-subject reads stringify in place and do not create a second
+       array-ref alias, so D105 promote (FLAT/FLOAT_PAIR → REF_ARRAY) is
+       a no-op for the match and only adds a CFG diamond per element. */
+    bool skipPromoteOnRead_ = false;
     /* D10: per-compilation counters (reset in compile()) */
     int sortCmpCounter_ = 0;
     int substEvalCounter_ = 0; /* D38c: unique names for s///e eval fns */
@@ -708,6 +712,7 @@ private:
     bool emitPackedPairComponents(const Node &n, llvm::Value *&re, llvm::Value *&im);
     bool tryEmitPackedPairAssign(const Node &n);
     llvm::Value *emitRegexMatchBool(const Node &n); /* i32 0/1; installs $&/$1 if needed */
+    llvm::Value *emitMatchSubject(const Node &n);   /* emitExpr, skip D105 promote on the cell */
     llvm::Value *emitIdx(const Node &n);        /* i64 array index without boxing */
 
     /* D56: emit a warn call for use of an undef value at this location */
