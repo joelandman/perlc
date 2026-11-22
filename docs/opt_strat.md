@@ -121,6 +121,14 @@ out with the rest of Stage 46. 4-arg `substr($s, off, len, $repl)` and
 lvalue `substr(...) =` stay sequential (in-place write of `$s`). Knob:
 `mappar`. Tests: `tests/idxpar_{smoke,deep}.pl`.
 
+### 10. Closed `join` / `sprintf` / `hex` / `oct` in mappar — closed this session
+
+`join`, `sprintf`, `hex`, and `oct` are scalar, side-effect-free on a
+closed body. `map { join(":", $_, "x") }` and `map { sprintf("%04d", $_) }`
+now fan out with Stage 46. `join(",", @outer)` still refuses (named
+array reads stay sequential). Knob: `mappar`. Tests:
+`tests/joinpar_{smoke,deep}.pl`.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -144,7 +152,7 @@ lvalue `substr(...) =` stay sequential (in-place write of `$s`). Knob:
 
 ## Practical order
 
-(1)–(7) and (9) landed this session. (8) is the pcre2 leftover of (4):
-a C concatenation scanner was measured slower than JIT and was not
-landed. Remaining of (4) is a different match engine. Parallelism will
-not move it.
+(1)–(7) and (9)–(10) landed this session. (8) is the pcre2 leftover of
+(4): a C concatenation scanner was measured slower than JIT and was
+not landed. Remaining of (4) is a different match engine. Parallelism
+will not move it.

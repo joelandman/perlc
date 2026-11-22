@@ -4137,7 +4137,8 @@ arbitrary blocks.
   `tests/mapconcat_{smoke,deep}.pl`, `tests/mapdie_{smoke,deep}.pl`,
   `tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`,
   `tests/greppar_{smoke,deep}.pl`,
-  `tests/idxpar_{smoke,deep}.pl`.
+  `tests/idxpar_{smoke,deep}.pl`,
+  `tests/joinpar_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
@@ -4176,6 +4177,10 @@ arbitrary blocks.
   2/3-arg `substr` in a closed map/grep body fan out with mappar.
   4-arg `substr` and lvalue `substr(...) =` stay sequential. Knob
   `mappar`. Tests: `tests/idxpar_{smoke,deep}.pl`.
+- **join / sprintf (opt_strat 10):** `join`, `sprintf`, `hex`, and
+  `oct` in a closed map/grep body fan out with mappar. `join(",", @outer)`
+  stays sequential (named array read). Knob `mappar`. Tests:
+  `tests/joinpar_{smoke,deep}.pl`.
 - **Still sequential:** live-length foreach that `push`es the iterated
   array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
   reductions; arbitrary blocks; impure / named-sub sort; C-style
