@@ -166,6 +166,45 @@ public:
       void emitFkBatchedOuter(const Node &n, const std::string &idxBare,
                               llvm::Value *lo, llvm::Value *hi,
                               llvm::BasicBlock *exitAfter);
+
+    /* Stage 46 (mappar): auto-parallel map/grep/foreach-@arr, integer-range
+       foreach with disjoint $a[$i] stores, list-yielding map concat, and
+       per-chunk die slots. Knob PERLC_OPT_DISABLE=mappar (also off with
+       autopar). */
+    bool mapParBodyPurity(const Node &s, const std::string &aliasBare,
+                          std::unordered_set<std::string> &locals,
+                          bool rangeElem = false,
+                          std::vector<std::string> *rangeArrays = nullptr,
+                          bool *hadRangeStore = nullptr);
+    bool mapParScalarYield(const Node &n) const;
+    bool mapParListYield(const Node &n) const;
+    void emitParDiePrologue(llvm::Value *dieSlot, llvm::Value *iSlot);
+    void emitParDieEpilogue();
+    llvm::Function *emitMapGrepParWorker(const Node &n, bool isMap,
+                                         const std::string &aliasBare,
+                                         bool concat);
+    void emitMapGrepParIter(const Node &n, bool isMap, bool concat,
+                            llvm::Value *elem, llvm::Value *udAlloca,
+                            llvm::Value *outOrMask, llvm::Value *i);
+    void emitMapGrepParDispatch(const Node &n, bool isMap, bool concat,
+                                llvm::Value *inputArr, llvm::Value *resultArr,
+                                llvm::Value *len);
+    llvm::Function *emitForeachParWorker(const Node &n,
+                                         const std::string &aliasBare);
+    bool tryEmitForeachArrPar(const Node &n, llvm::Value *tmpArr,
+                              bool ownsTmpArr, bool ncTmp,
+                              llvm::Value *ownedForeach,
+                              llvm::BasicBlock *exit,
+                              llvm::BasicBlock *bodyBB,
+                              llvm::BasicBlock *stepBB);
+    llvm::Function *emitForeachRangeParWorker(const Node &n,
+                                              const std::string &idxBare,
+                                              const std::vector<std::string> &arrNames);
+    bool tryEmitForeachRangePar(const Node &n, const std::string &idxBare,
+                                llvm::Value *lo, llvm::Value *hi,
+                                llvm::Function *fn, llvm::BasicBlock *exit,
+                                llvm::BasicBlock *bodyBB,
+                                llvm::BasicBlock *stepBB);
      llvm::Value *scalarVarRawPv(const std::string &rawNm); /* scopes_ load, no D105 promote */
     void emitFlatPairLoad(llvm::Value *dataPtr, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);
     void emitRefPairLoad(llvm::Value *rowPv, llvm::Value *idx, llvm::Value *&re, llvm::Value *&im);

@@ -337,11 +337,16 @@ static inline PerlValue *pv_alloc(void) {
         memset(v, 0, sizeof(*v));
         return v;
     }
-    /* Cold miss: allocate a contiguous slab, return first entry, link rest. */
+    /* Cold miss: allocate a contiguous slab, return first entry, link rest.
+       Stage 46: two pool workers can miss at once. Claim the registry slot
+       with an atomic; a process-wide mutex here lives in BSS and has
+       shifted other runtime globals. The per-thread freelist stays lock-free. */
     PerlValue *slab = calloc(PV_SLAB, sizeof(PerlValue));
-    if (pv_slab_count_ < PV_SLAB_CAP) {
-        pv_slabs_[pv_slab_count_++] = slab;
-    }
+    int slot = __atomic_fetch_add(&pv_slab_count_, 1, __ATOMIC_RELAXED);
+    if (slot < PV_SLAB_CAP)
+        pv_slabs_[slot] = slab;
+    else
+        __atomic_fetch_sub(&pv_slab_count_, 1, __ATOMIC_RELAXED);
     for (int i = PV_SLAB - 1; i >= 1; i--) {
         slab[i].pval  = (void *)pv_freelist_;
         pv_freelist_  = &slab[i];
@@ -4282,6 +4287,20 @@ void perl_array_set(PerlArray *a, long long idx, PerlValue *v) {
 void perl_array_set_loc(PerlArray *a, long long idx, PerlValue *v,
                         const char *file, int line) {
     perl_array_set_impl(a, idx, v, file, line);
+}
+
+/* Stage 46 (mappar): pre-size a result array with undef slots so parallel
+   workers can perl_array_set disjoint indices without realloc/len races. */
+void perl_array_fill_undef(PerlArray *a, long long n) {
+    if (!a || n <= 0) return;
+    if (n <= a->len) return;
+    if (a->cap <= 0) a->cap = 8;
+    while (a->cap < n) {
+        a->cap *= 2;
+        a->elems = realloc(a->elems, (size_t)a->cap * sizeof(PerlValue *));
+    }
+    while (a->len < n)
+        a->elems[a->len++] = perl_alloc_undef();
 }
 
 /* D81: array-element delete. Returns a clone of the prior value (undef if
@@ -13935,6 +13954,94 @@ void perl_autopar_run(perlc_autopar_fn fn, void **rows, long long bound) {
         s_ap_chunk_sum = 0;
     }
     pthread_mutex_unlock(&s_ap_mu);
+}
+
+/* Stage 46 (mappar): per-index match mask for parallel grep. Workers write
+   disjoint bytes; the caller gathers in order on the main thread. */
+unsigned char *perl_mappar_mask_new(long long n) {
+    if (n <= 0) return NULL;
+    return (unsigned char *)calloc((size_t)n, 1);
+}
+void perl_mappar_mask_free(unsigned char *m) {
+    free(m);
+}
+void perl_mappar_mask_set(unsigned char *m, long long i) {
+    if (m && i >= 0) m[i] = 1;
+}
+void perl_mappar_grep_gather(PerlArray *out, PerlArray *in,
+                             unsigned char *m, long long n) {
+    if (!out || !in || !m || n <= 0) return;
+    for (long long i = 0; i < n; i++) {
+        if (m[i])
+            perl_array_push(out, perl_array_get_ref(in, i));
+    }
+}
+
+void **perl_mappar_slots_new(long long n) {
+    if (n <= 0) return NULL;
+    return (void **)calloc((size_t)n, sizeof(void *));
+}
+void perl_mappar_chunk_put(void **slots, long long lo, PerlArray *a) {
+    if (slots && lo >= 0) slots[lo] = a;
+}
+void perl_mappar_concat_gather(PerlArray *out, void **slots, long long n) {
+    if (!out || !slots || n <= 0) return;
+    for (long long i = 0; i < n; i++) {
+        PerlArray *ch = (PerlArray *)slots[i];
+        if (!ch) continue;
+        perl_array_extend_nc(out, ch);
+        perl_array_free_nc(ch);
+        slots[i] = NULL;
+    }
+}
+void perl_mappar_slots_free(void **slots) {
+    free(slots);
+}
+
+typedef struct {
+    pthread_mutex_t mu;
+    long long idx;
+    char *msg;
+} MapparDie;
+
+void *perl_mappar_die_new(void) {
+    MapparDie *d = (MapparDie *)calloc(1, sizeof(MapparDie));
+    if (!d) return NULL;
+    pthread_mutex_init(&d->mu, NULL);
+    d->idx = -1;
+    return d;
+}
+void perl_mappar_die_record(void *slot, long long i) {
+    MapparDie *d = (MapparDie *)slot;
+    if (!d) return;
+    char *msg = perl_to_string_dup(perl_get_dollar_at());
+    pthread_mutex_lock(&d->mu);
+    if (d->idx < 0 || i < d->idx) {
+        free(d->msg);
+        d->msg = msg;
+        d->idx = i;
+        msg = NULL;
+    }
+    pthread_mutex_unlock(&d->mu);
+    free(msg);
+}
+int perl_mappar_die_pending(void *slot) {
+    MapparDie *d = (MapparDie *)slot;
+    return d && d->idx >= 0;
+}
+void perl_mappar_die_raise(void *slot) {
+    MapparDie *d = (MapparDie *)slot;
+    if (!d || d->idx < 0 || !d->msg) return;
+    PerlValue pv = { .tag = PERL_STRING, .sval = d->msg,
+                     .slen = (long long)strlen(d->msg) };
+    perl_die(&pv, NULL, 0);
+}
+void perl_mappar_die_free(void *slot) {
+    MapparDie *d = (MapparDie *)slot;
+    if (!d) return;
+    pthread_mutex_destroy(&d->mu);
+    free(d->msg);
+    free(d);
 }
 
 /* D199-tail session: $0 must read as the SCRIPT path byte-identically to

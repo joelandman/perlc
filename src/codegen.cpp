@@ -866,6 +866,21 @@ void CodeGen::declareRuntime() {
     RT("perl_set_dollar0", voidTy, i8p);
     /* Stage 45 (autopar): persistent-pool fan-out for FK counted loops */
     RT("perl_autopar_run", voidTy, pv, pv, i64);
+    /* Stage 46 (mappar) */
+    RT("perl_array_fill_undef",    voidTy, av, i64);
+    RT("perl_mappar_mask_new",     i8p, i64);
+    RT("perl_mappar_mask_free",    voidTy, i8p);
+    RT("perl_mappar_mask_set",     voidTy, i8p, i64);
+    RT("perl_mappar_grep_gather",  voidTy, av, av, i8p, i64);
+    RT("perl_mappar_slots_new",    i8p, i64);
+    RT("perl_mappar_chunk_put",    voidTy, i8p, i64, av);
+    RT("perl_mappar_concat_gather",voidTy, av, i8p, i64);
+    RT("perl_mappar_slots_free",   voidTy, i8p);
+    RT("perl_mappar_die_new",      i8p);
+    RT("perl_mappar_die_record",   voidTy, i8p, i64);
+    RT("perl_mappar_die_pending",  Type::getInt32Ty(ctx_), i8p);
+    RT("perl_mappar_die_raise",    voidTy, i8p);
+    RT("perl_mappar_die_free",     voidTy, i8p);
     RT("perl_fk_cert_dbg", voidTy, i64, i64, i64, i64, i8p);
     RT("perl_pv_dbg", voidTy, pv, i8p);
     RT("perl_make_code_ref",  pv, i8p);
@@ -2282,6 +2297,47 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         Value *lenPv = callRT("perl_array_len", {inputArr});
         Value *len   = callRT("perl_to_int", {lenPv});
 
+        /* Stage 46 (mappar): certified closed 1:1 map / grep fans out
+           through the Stage-45 pool when bound >= PERLC_AUTOPAR_MIN.
+           The sequential loop below is the fallback (small N, or the
+           body failed the purity walk). */
+        BasicBlock *mapJoinBB = nullptr;
+        bool mapCanPar = isOptStageEnabled("mappar") &&
+                         isOptStageEnabled("autopar");
+        bool mapConcat = false;
+        if (mapCanPar) {
+            const Node *bodyN = n.body ? n.body.get() : n.left.get();
+            std::unordered_set<std::string> mapLocals;
+            mapLocals.insert("_");
+            mapCanPar = bodyN && mapParBodyPurity(*bodyN, "_", mapLocals);
+            if (mapCanPar && isMap) {
+                if (mapParListYield(n)) mapConcat = true;
+                else if (!mapParScalarYield(n)) mapCanPar = false;
+            }
+            if (getenv("PERLC_DEBUG_AUTOPAR"))
+                fprintf(stderr, "ST46: %s par=%s concat=%d line=%d\n",
+                        isMap ? "map" : "grep",
+                        mapCanPar ? "YES" : "no", (int)mapConcat, n.line);
+        }
+        if (mapCanPar) {
+            auto *parBB = BasicBlock::Create(ctx_, isMap ? "map.par" : "grep.par", fn);
+            auto *seqBB = BasicBlock::Create(ctx_, isMap ? "map.seq" : "grep.seq", fn);
+            mapJoinBB   = BasicBlock::Create(ctx_, isMap ? "map.join" : "grep.join", fn);
+            long long parMin = 8192;
+            if (const char *e = getenv("PERLC_AUTOPAR_MIN")) {
+                long long v = atoll(e);
+                if (v > 0) parMin = v;
+            }
+            auto *enough = builder_.CreateICmpSGE(len,
+                ConstantInt::get(Type::getInt64Ty(ctx_), parMin),
+                isMap ? "mappar.enough" : "greppar.enough");
+            builder_.CreateCondBr(enough, parBB, seqBB);
+            builder_.SetInsertPoint(parBB);
+            emitMapGrepParDispatch(n, isMap, mapConcat, inputArr, resultArr, len);
+            builder_.CreateBr(mapJoinBB);
+            builder_.SetInsertPoint(seqBB);
+        }
+
         /* $_ alloca (hoisted before loop). D208: like foreach's loop var,
            $_ now borrows the input's own element cell each iteration
            (raw pointer store, no clone) — real map/grep alias $_, so
@@ -2380,6 +2436,10 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(exitBB);
+        if (mapJoinBB) {
+            builder_.CreateBr(mapJoinBB);
+            builder_.SetInsertPoint(mapJoinBB);
+        }
         return resultArr;
     }
     if (n.kind == NK::RegexMatch && n.name.find('g') != std::string::npos) {
@@ -9372,6 +9432,831 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
     return true;
 }
 
+/* ── Stage 46 (mappar): auto-parallel map / grep / foreach @arr ───────────
+   Reuses the Stage-45 persistent pool. Workers touch PVs (clone/set/true),
+   so pv_alloc's process-wide slab registry is an atomic slot claim;
+   per-thread freelists stay lock-free. Safety is a closed-body walk, not
+   dependence analysis:
+
+     - reads: $_ / the foreach alias, body-`my` locals, literals, pure
+       arithmetic, ArrowDeref/element reads of those
+     - writes: the alias cell and body-local scalars (no nested
+       `$x->[i] =` — two list elements may share a referent)
+     - integer-range foreach may write `$a[$i]` when the index is the
+       loop var (disjoint slots)
+     - list-yielding map uses per-chunk arrays + ordered concat
+     - workers setjmp; `/` `%` / die record per-chunk and rethrow after join
+     - no calls, I/O, last/next/redo, local, eval, regex, hashes, push/pop
+
+   Dispatch shape matches Stage 45: bound >= PERLC_AUTOPAR_MIN fans out;
+   smaller lists keep the sequential body so the harness and small-N
+   programs do not change. Knob: PERLC_OPT_DISABLE=mappar (also off when
+   autopar is disabled). */
+
+static bool mapParIsAliasName(const std::string &nm, const std::string &aliasBare) {
+    std::string b = bareVarName(nm);
+    return b == aliasBare || (aliasBare == "_" && (b == "_" || nm == "$_"));
+}
+
+bool CodeGen::mapParScalarYield(const Node &n) const {
+    const Node *e = nullptr;
+    if (n.body && !n.body->args.empty()) {
+        const Node &last = *n.body->args.back();
+        if (last.kind == NK::ExprStmt && last.left) e = last.left.get();
+        else e = &last;
+    } else {
+        e = n.left.get();
+    }
+    if (!e) return false;
+    /* 1-element ArrayLit is a paren group `(expr)`, not a list. */
+    while (e->kind == NK::ArrayLit && e->args.size() == 1 && e->args[0])
+        e = e->args[0].get();
+    switch (e->kind) {
+    case NK::ArrayVar: case NK::DerefArray: case NK::ArrayLit:
+    case NK::Range: case NK::MapFunc: case NK::GrepFunc: case NK::SortFunc:
+    case NK::RepeatArray:
+        return false;
+    case NK::PostfixDeref:
+        if (e->sval == "all_array" || e->sval == "slice_array" ||
+            e->sval == "all_hash"  || e->sval == "slice_hash")
+            return false;
+        return true;
+    case NK::AnonHash:
+        /* bare `{ k => v }` yields pairs (2N); `map +{...}` is one hashref. */
+        return n.ival != 0;
+    default:
+        return true;
+    }
+}
+
+bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
+                              std::unordered_set<std::string> &locals,
+                              bool rangeElem,
+                              std::vector<std::string> *rangeArrays,
+                              bool *hadRangeStore) {
+    std::function<bool(const Node &, bool)> exprOk;
+    std::function<bool(const Node &)> stmtOk;
+
+    auto writableScalar = [&](const Node &t) -> bool {
+        if (t.kind != NK::ScalarVar) return false;
+        std::string b = bareVarName(t.name);
+        if (rangeElem && mapParIsAliasName(t.name, aliasBare)) return false;
+        return locals.count(b) || mapParIsAliasName(t.name, aliasBare);
+    };
+    auto readableScalar = [&](const Node &t) -> bool {
+        if (t.kind != NK::ScalarVar) return false;
+        std::string b = bareVarName(t.name);
+        return locals.count(b) || mapParIsAliasName(t.name, aliasBare);
+    };
+    auto isLoopIndex = [&](const Node *idx) -> bool {
+        if (!idx) return false;
+        while (idx->kind == NK::ArrayLit && idx->args.size() == 1 && idx->args[0])
+            idx = idx->args[0].get();
+        return idx->kind == NK::ScalarVar &&
+               mapParIsAliasName(idx->name, aliasBare);
+    };
+    auto noteArray = [&](const std::string &nm) {
+        if (!rangeArrays) return;
+        for (auto &e : *rangeArrays)
+            if (e == nm) return;
+        rangeArrays->push_back(nm);
+    };
+    auto writableRangeElem = [&](const Node &t) -> bool {
+        if (!rangeElem || t.kind != NK::ArrayElem || t.name.empty())
+            return false;
+        if (!isLoopIndex(t.left.get())) return false;
+        noteArray(t.name);
+        return true;
+    };
+
+    exprOk = [&](const Node &e, bool asWrite) -> bool {
+        switch (e.kind) {
+        case NK::IntLit: case NK::FloatLit: case NK::StringLit: case NK::UndefLit:
+            return !asWrite;
+        case NK::ArrayLit:
+            if (asWrite) return false;
+            if (e.args.empty()) return true;
+            for (auto &a : e.args)
+                if (!a || !exprOk(*a, false)) return false;
+            return true;
+        case NK::ScalarVar:
+            return asWrite ? writableScalar(e) : readableScalar(e);
+        case NK::BinOp: {
+            if (asWrite) return false;
+            return e.left && e.right && exprOk(*e.left, false) && exprOk(*e.right, false);
+        }
+        case NK::UnaryOp: {
+            if (e.sval == "pre++" || e.sval == "pre--" ||
+                e.sval == "post++" || e.sval == "post--") {
+                if (e.left && writableScalar(*e.left)) return true;
+                if (e.left && writableRangeElem(*e.left)) {
+                    if (hadRangeStore) *hadRangeStore = true;
+                    return true;
+                }
+                return false;
+            }
+            return !asWrite && e.left && exprOk(*e.left, false);
+        }
+        case NK::Assign:
+            return e.left && e.right && exprOk(*e.left, true) && exprOk(*e.right, false);
+        case NK::CompoundAssign:
+            return e.left && e.right && exprOk(*e.left, true) && exprOk(*e.right, false);
+        case NK::HashElem:
+            return false;
+        case NK::ArrayElem:
+            if (!e.name.empty()) {
+                if (!rangeElem || !isLoopIndex(e.left.get())) return false;
+                noteArray(e.name);
+                if (asWrite && hadRangeStore) *hadRangeStore = true;
+                return true;
+            }
+            if (asWrite) return false;
+            if (e.left && !exprOk(*e.left, false)) return false;
+            if (e.right && !exprOk(*e.right, false)) return false;
+            return true;
+        case NK::ArrowDeref:
+            if (asWrite) return false;
+            if (e.left && !exprOk(*e.left, false)) return false;
+            if (e.right && !exprOk(*e.right, false)) return false;
+            return true;
+        case NK::DerefArray:
+            if (asWrite) return false;
+            return e.left && exprOk(*e.left, false);
+        case NK::PostfixDeref:
+            if (asWrite) return false;
+            if (e.sval == "all_array" || e.sval == "slice_array")
+                return e.left && exprOk(*e.left, false);
+            return e.left && exprOk(*e.left, false);
+        case NK::DefinedFunc: case NK::ScalarFunc:
+        case NK::AbsFunc: case NK::IntFunc: case NK::SqrtFunc:
+        case NK::LengthFunc: case NK::UcFunc: case NK::LcFunc:
+        case NK::UcfirstFunc: case NK::LcfirstFunc:
+        case NK::ChrFunc: case NK::OrdFunc: case NK::RefFunc:
+        case NK::ChompFunc:
+            if (asWrite) return false;
+            if (e.left && !exprOk(*e.left, false)) return false;
+            if (e.right && !exprOk(*e.right, false)) return false;
+            for (auto &a : e.args)
+                if (!exprOk(*a, false)) return false;
+            return true;
+        case NK::InterpolatedStr:
+            if (asWrite) return false;
+            for (auto &a : e.args)
+                if (!exprOk(*a, false)) return false;
+            return true;
+        case NK::If: {
+            if (asWrite) return false;
+            for (auto &br : e.branches) {
+                if (br.cond && !exprOk(*br.cond, false)) return false;
+                if (br.body && !stmtOk(*br.body)) return false;
+            }
+            return true;
+        }
+        case NK::DieStmt:
+            if (asWrite) return false;
+            return !e.left || exprOk(*e.left, false);
+        default:
+            return false;
+        }
+    };
+
+    stmtOk = [&](const Node &st) -> bool {
+        if (st.kind == NK::FlatBlock || st.kind == NK::Block) {
+            for (auto &sub : st.args)
+                if (!stmtOk(*sub)) return false;
+            return true;
+        }
+        if (st.kind == NK::Last || st.kind == NK::Next || st.kind == NK::Redo ||
+            st.kind == NK::Return || st.kind == NK::Goto ||
+            st.kind == NK::PrintStmt || st.kind == NK::SayStmt || st.kind == NK::WarnStmt ||
+            st.kind == NK::PrintfStmt || st.kind == NK::LockStmt ||
+            st.kind == NK::LocalStmt || st.kind == NK::LocalArray || st.kind == NK::LocalHash ||
+            st.kind == NK::EvalBlock || st.kind == NK::Call || st.kind == NK::MethodCall ||
+            st.kind == NK::CallCodeRef || st.kind == NK::PushStmt || st.kind == NK::PopExpr ||
+            st.kind == NK::ShiftExpr || st.kind == NK::UnshiftStmt || st.kind == NK::UnshiftStmt2 ||
+            st.kind == NK::SpliceFunc || st.kind == NK::KeysFunc || st.kind == NK::ValuesFunc ||
+            st.kind == NK::EachFunc || st.kind == NK::MapFunc || st.kind == NK::GrepFunc ||
+            st.kind == NK::SortFunc || st.kind == NK::RegexMatch || st.kind == NK::RegexMatchExpr ||
+            st.kind == NK::RegexSubst || st.kind == NK::CaptureVar || st.kind == NK::DollarAt)
+            return false;
+        if (st.kind == NK::DieStmt)
+            return !st.left || exprOk(*st.left, false);
+        if (st.kind == NK::My) {
+            if (!st.name.empty() && (st.name[0] == '@' || st.name[0] == '%'))
+                return false;
+            std::string bn = bareVarName(st.name);
+            if (bn.empty() || bn == aliasBare) return false;
+            if (st.right && !exprOk(*st.right, false)) return false;
+            locals.insert(bn);
+            return true;
+        }
+        if (st.kind == NK::If) return exprOk(st, false);
+        const Node *e = &st;
+        if (e->kind == NK::ExprStmt && e->left) e = e->left.get();
+        return exprOk(*e, false);
+    };
+
+    return stmtOk(s);
+}
+
+bool CodeGen::mapParListYield(const Node &n) const {
+    const Node *e = nullptr;
+    if (n.body && !n.body->args.empty()) {
+        const Node &last = *n.body->args.back();
+        if (last.kind == NK::ExprStmt && last.left) e = last.left.get();
+        else e = &last;
+    } else {
+        e = n.left.get();
+    }
+    if (!e) return false;
+    while (e->kind == NK::ArrayLit && e->args.size() == 1 && e->args[0])
+        e = e->args[0].get();
+    if (e->kind == NK::ArrayLit && e->args.size() != 1) return true;
+    if (e->kind == NK::DerefArray) return true;
+    if (e->kind == NK::PostfixDeref &&
+        (e->sval == "all_array" || e->sval == "slice_array"))
+        return true;
+    return false;
+}
+
+void CodeGen::emitParDiePrologue(Value *dieSlot, Value *iSlot) {
+    auto *i8Arr = ArrayType::get(Type::getInt8Ty(ctx_), 256);
+    auto *jbAlloca = createEntryAlloca(i8Arr, nullptr, "mappar.jb");
+    Value *jbPtr = builder_.CreateBitCast(jbAlloca, PointerType::getUnqual(ctx_));
+    callRT("perl_eval_push", {jbPtr});
+    Value *caught = callRT("setjmp", {jbPtr});
+    auto *fn = builder_.GetInsertBlock()->getParent();
+    auto *i32 = Type::getInt32Ty(ctx_);
+    Value *isCaught = builder_.CreateICmpNE(caught, ConstantInt::get(i32, 0));
+    auto *okBB = BasicBlock::Create(ctx_, "mappar.dieok", fn);
+    auto *catchBB = BasicBlock::Create(ctx_, "mappar.diecatch", fn);
+    builder_.CreateCondBr(isCaught, catchBB, okBB);
+    builder_.SetInsertPoint(catchBB);
+    Value *idx = builder_.CreateLoad(Type::getInt64Ty(ctx_), iSlot, "mappar.diei");
+    callRT("perl_mappar_die_record", {dieSlot, idx});
+    callRT("perl_eval_pop", {});
+    builder_.CreateRetVoid();
+    builder_.SetInsertPoint(okBB);
+}
+
+void CodeGen::emitParDieEpilogue() {
+    callRT("perl_eval_pop", {});
+    builder_.CreateRetVoid();
+}
+
+void CodeGen::emitMapGrepParIter(const Node &n, bool isMap, bool concat,
+                                Value *elem, Value *udAlloca,
+                                Value *outOrMask, Value *i) {
+    builder_.CreateStore(elem, udAlloca);
+    pushScope();
+    declareVar("_", udAlloca);
+    if (isMap) {
+        Value *mapAv = nullptr;
+        Value *mapPv = nullptr;
+        if (n.body && !n.body->args.empty()) {
+            const auto &stmts = n.body->args;
+            for (size_t si = 0; si + 1 < stmts.size(); si++)
+                emitStmt(*stmts[si]);
+            const Node &last = *stmts.back();
+            const Node *e = (last.kind == NK::ExprStmt && last.left)
+                            ? last.left.get() : nullptr;
+            if (last.kind == NK::If) mapPv = captureTrailingIf(last);
+            else if (e) { mapAv = emitArrayPtr(*e); if (!mapAv) mapPv = emitExpr(*e); }
+            else emitStmt(last);
+        } else if (n.left) {
+            mapAv = emitArrayPtr(*n.left);
+            if (!mapAv) mapPv = emitExpr(*n.left);
+        }
+        if (mapPv && !llvm::isa<llvm::ConstantPointerNull>(mapPv)) {
+            Value *orig = mapPv;
+            mapPv = callRT("perl_clone", {mapPv});
+            freeIfOwned(orig);
+        }
+        popScope();
+        if (concat) {
+            if (mapAv) callRT("perl_array_extend", {outOrMask, mapAv});
+            else if (mapPv) callRT("perl_array_push", {outOrMask, mapPv});
+        } else {
+            if (!mapPv && mapAv)
+                mapPv = callRT("perl_array_get",
+                    {mapAv, ConstantInt::get(Type::getInt64Ty(ctx_), 0)});
+            if (mapPv) callRT("perl_array_set", {outOrMask, i, mapPv});
+        }
+    } else {
+        Value *blockResult;
+        if (n.body)       blockResult = emitBlockLast(*n.body);
+        else if (n.left)  blockResult = emitExpr(*n.left);
+        else              blockResult = perlUndef();
+        popScope();
+        Value *tv = callRT("perl_is_true", {blockResult});
+        Value *cond = builder_.CreateICmpNE(
+            tv, ConstantInt::get(Type::getInt32Ty(ctx_), 0));
+        auto *fn = builder_.GetInsertBlock()->getParent();
+        auto *setBB  = BasicBlock::Create(ctx_, "mappar.gset", fn);
+        auto *nextBB = BasicBlock::Create(ctx_, "mappar.gnext", fn);
+        builder_.CreateCondBr(cond, setBB, nextBB);
+        builder_.SetInsertPoint(setBB);
+        callRT("perl_mappar_mask_set", {outOrMask, i});
+        builder_.CreateBr(nextBB);
+        builder_.SetInsertPoint(nextBB);
+    }
+}
+
+llvm::Function *CodeGen::emitMapGrepParWorker(const Node &n, bool isMap,
+                                              const std::string &aliasBare,
+                                              bool concat) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
+        {perlPtrTy_, i64, i64}, false);
+    static unsigned mapParSeq = 0;
+    Function *wfn = Function::Create(fty, Function::InternalLinkage,
+        std::string(isMap ? "__perlc_mappar_" : "__perlc_greppar_") +
+        std::to_string(++mapParSeq), mod_.get());
+
+    auto *savedFn   = currentFn_;
+    auto *savedBB   = builder_.GetInsertBlock();
+    auto  savedScopes = scopes_;
+    auto  savedArr  = arrayScopes_;
+    auto  savedHash = hashScopes_;
+    auto  savedPv   = pvScopes_;
+    auto  savedFloat = floatScopes_;
+    auto  savedInt  = intScopes_;
+    auto  savedDerefAV = derefAVScopes_;
+    auto  savedRowAV = rowAVScopes_;
+    auto  savedFlatRow = flatRowScopes_;
+    auto  savedPair = pairScopes_;
+    auto *savedLDep = localDepthAlloca_;
+    auto *savedBody = currentSubBody_;
+    bool  savedMainBody_ = inMainBody_;
+    int   savedFileDepth_ = fileScopeDepth_;
+    auto  savedExits = loopExits_;
+    auto  savedConts = loopContinues_;
+    auto  savedRedos = loopRedos_;
+
+    scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+    floatScopes_ = {}; intScopes_ = {}; derefAVScopes_ = {};
+    rowAVScopes_ = {}; flatRowScopes_ = {}; pairScopes_ = {};
+    localDepthAlloca_ = nullptr;
+    inMainBody_ = false;
+    fileScopeDepth_ = 0;
+    currentFn_ = wfn;
+    loopExits_.clear(); loopContinues_.clear(); loopRedos_.clear();
+    flatDoubleCache_.clear();
+    floatSqrtOf_.clear();
+    lastSqrtInput_ = nullptr;
+
+    pushScope();
+
+    auto *entry = BasicBlock::Create(ctx_, "entry", wfn);
+    auto *cond  = BasicBlock::Create(ctx_, "mappar.cond", wfn);
+    auto *body  = BasicBlock::Create(ctx_, "mappar.body", wfn);
+    auto *step  = BasicBlock::Create(ctx_, "mappar.step", wfn);
+    auto *done  = BasicBlock::Create(ctx_, "mappar.done", wfn);
+
+    builder_.SetInsertPoint(entry);
+    Value *ctxArg = wfn->getArg(0);
+    Value *lo = wfn->getArg(1);
+    Value *hi = wfn->getArg(2);
+    Value *inCell = builder_.CreateGEP(perlPtrTy_, ctxArg,
+        ConstantInt::get(i64, 0), "mappar.inp");
+    Value *outCell = builder_.CreateGEP(perlPtrTy_, ctxArg,
+        ConstantInt::get(i64, 1), "mappar.outp");
+    Value *dieCell = builder_.CreateGEP(perlPtrTy_, ctxArg,
+        ConstantInt::get(i64, 2), "mappar.diep");
+    Value *inputArr = builder_.CreateLoad(perlPtrTy_, inCell, "mappar.in");
+    Value *outOrMask = builder_.CreateLoad(perlPtrTy_, outCell, "mappar.out");
+    Value *dieSlot = builder_.CreateLoad(perlPtrTy_, dieCell, "mappar.die");
+    auto *iSlot = createEntryAlloca(i64, nullptr, "mappar.i");
+    auto *udAlloca = createEntryAlloca(perlPtrTy_, nullptr, "$_");
+    builder_.CreateStore(lo, iSlot);
+    builder_.CreateStore(perlUndef(), udAlloca);
+    (void)aliasBare;
+    if (concat) {
+        Value *chunk = callRT("perl_array_new", {});
+        callRT("perl_mappar_chunk_put", {outOrMask, lo, chunk});
+        outOrMask = chunk;
+    }
+    emitParDiePrologue(dieSlot, iSlot);
+    builder_.CreateBr(cond);
+
+    builder_.SetInsertPoint(cond);
+    Value *cur = builder_.CreateLoad(i64, iSlot, "mappar.cur");
+    builder_.CreateCondBr(builder_.CreateICmpSLT(cur, hi, "mappar.more"),
+                          body, done);
+
+    builder_.SetInsertPoint(body);
+    Value *elem = callRT("perl_array_get_ref", {inputArr, cur});
+    emitMapGrepParIter(n, isMap, concat, elem, udAlloca, outOrMask, cur);
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(step);
+
+    builder_.SetInsertPoint(step);
+    Value *cur2 = builder_.CreateLoad(i64, iSlot, "mappar.cur2");
+    builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1),
+                                            "mappar.nxt"), iSlot);
+    builder_.CreateBr(cond);
+
+    builder_.SetInsertPoint(done);
+    emitParDieEpilogue();
+
+    currentFn_ = savedFn;
+    builder_.SetInsertPoint(savedBB);
+    scopes_ = savedScopes; arrayScopes_ = savedArr; hashScopes_ = savedHash;
+    pvScopes_ = savedPv; floatScopes_ = savedFloat; intScopes_ = savedInt;
+    derefAVScopes_ = savedDerefAV; rowAVScopes_ = savedRowAV;
+    flatRowScopes_ = savedFlatRow; pairScopes_ = savedPair;
+    localDepthAlloca_ = savedLDep;
+    currentSubBody_ = savedBody;
+    inMainBody_ = savedMainBody_;
+    fileScopeDepth_ = savedFileDepth_;
+    loopExits_ = savedExits;
+    loopContinues_ = savedConts;
+    loopRedos_ = savedRedos;
+    return wfn;
+}
+
+void CodeGen::emitMapGrepParDispatch(const Node &n, bool isMap, bool concat,
+                                    Value *inputArr, Value *resultArr,
+                                    Value *len) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    auto *ctxArr = builder_.CreateAlloca(perlPtrTy_,
+        ConstantInt::get(i64, 3), "mappar.ctx");
+    builder_.CreateStore(inputArr,
+        builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 0)));
+    Value *outOrMask = resultArr;
+    if (!isMap)
+        outOrMask = callRT("perl_mappar_mask_new", {len});
+    else if (concat)
+        outOrMask = callRT("perl_mappar_slots_new", {len});
+    else
+        callRT("perl_array_fill_undef", {resultArr, len});
+    builder_.CreateStore(outOrMask,
+        builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 1)));
+    Value *dieSlot = callRT("perl_mappar_die_new", {});
+    builder_.CreateStore(dieSlot,
+        builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 2)));
+    Function *wfn = emitMapGrepParWorker(n, isMap, "_", concat);
+    callRT("perl_autopar_run", {wfn, ctxArr, len});
+    callRT("perl_mappar_die_raise", {dieSlot});
+    callRT("perl_mappar_die_free", {dieSlot});
+    if (!isMap) {
+        callRT("perl_mappar_grep_gather", {resultArr, inputArr, outOrMask, len});
+        callRT("perl_mappar_mask_free", {outOrMask});
+    } else if (concat) {
+        callRT("perl_mappar_concat_gather", {resultArr, outOrMask, len});
+        callRT("perl_mappar_slots_free", {outOrMask});
+    }
+}
+
+llvm::Function *CodeGen::emitForeachParWorker(const Node &n,
+                                              const std::string &aliasBare) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
+        {perlPtrTy_, i64, i64}, false);
+    static unsigned feParSeq = 0;
+    Function *wfn = Function::Create(fty, Function::InternalLinkage,
+        "__perlc_fepar_" + std::to_string(++feParSeq), mod_.get());
+
+    auto *savedFn   = currentFn_;
+    auto *savedBB   = builder_.GetInsertBlock();
+    auto  savedScopes = scopes_;
+    auto  savedArr  = arrayScopes_;
+    auto  savedHash = hashScopes_;
+    auto  savedPv   = pvScopes_;
+    auto  savedFloat = floatScopes_;
+    auto  savedInt  = intScopes_;
+    auto  savedDerefAV = derefAVScopes_;
+    auto  savedRowAV = rowAVScopes_;
+    auto  savedFlatRow = flatRowScopes_;
+    auto  savedPair = pairScopes_;
+    auto *savedLDep = localDepthAlloca_;
+    auto *savedBody = currentSubBody_;
+    bool  savedMainBody_ = inMainBody_;
+    int   savedFileDepth_ = fileScopeDepth_;
+    auto  savedExits = loopExits_;
+    auto  savedConts = loopContinues_;
+    auto  savedRedos = loopRedos_;
+
+    scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+    floatScopes_ = {}; intScopes_ = {}; derefAVScopes_ = {};
+    rowAVScopes_ = {}; flatRowScopes_ = {}; pairScopes_ = {};
+    localDepthAlloca_ = nullptr;
+    inMainBody_ = false;
+    fileScopeDepth_ = 0;
+    currentFn_ = wfn;
+    loopExits_.clear(); loopContinues_.clear(); loopRedos_.clear();
+    flatDoubleCache_.clear();
+    floatSqrtOf_.clear();
+    lastSqrtInput_ = nullptr;
+
+    pushScope();
+
+    auto *entry = BasicBlock::Create(ctx_, "entry", wfn);
+    auto *cond  = BasicBlock::Create(ctx_, "fepar.cond", wfn);
+    auto *body  = BasicBlock::Create(ctx_, "fepar.body", wfn);
+    auto *step  = BasicBlock::Create(ctx_, "fepar.step", wfn);
+    auto *done  = BasicBlock::Create(ctx_, "fepar.done", wfn);
+
+    builder_.SetInsertPoint(entry);
+    Value *ctxArg = wfn->getArg(0);
+    Value *lo = wfn->getArg(1);
+    Value *hi = wfn->getArg(2);
+    Value *inCell = builder_.CreateGEP(perlPtrTy_, ctxArg,
+        ConstantInt::get(i64, 0), "fepar.in.p");
+    Value *dieCell = builder_.CreateGEP(perlPtrTy_, ctxArg,
+        ConstantInt::get(i64, 1), "fepar.die.p");
+    Value *inputArr = builder_.CreateLoad(perlPtrTy_, inCell, "fepar.in");
+    Value *dieSlot = builder_.CreateLoad(perlPtrTy_, dieCell, "fepar.die");
+    auto *iSlot = createEntryAlloca(i64, nullptr, "fepar.i");
+    auto *loopVar = createEntryAlloca(perlPtrTy_, nullptr, aliasBare);
+    builder_.CreateStore(lo, iSlot);
+    builder_.CreateStore(perlUndef(), loopVar);
+    emitParDiePrologue(dieSlot, iSlot);
+    builder_.CreateBr(cond);
+
+    builder_.SetInsertPoint(cond);
+    Value *cur = builder_.CreateLoad(i64, iSlot, "fepar.cur");
+    builder_.CreateCondBr(builder_.CreateICmpSLT(cur, hi, "fepar.more"),
+                          body, done);
+
+    builder_.SetInsertPoint(body);
+    Value *elem = callRT("perl_array_get_ref", {inputArr, cur});
+    builder_.CreateStore(elem, loopVar);
+    pushScope();
+    std::string declName = n.name.empty() ? "_" : n.name;
+    declareVar(declName, loopVar);
+    if (n.body) emitBlock(*n.body);
+    popScope();
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(step);
+
+    builder_.SetInsertPoint(step);
+    Value *cur2 = builder_.CreateLoad(i64, iSlot, "fepar.cur2");
+    builder_.CreateStore(builder_.CreateAdd(cur2, ConstantInt::get(i64, 1),
+                                            "fepar.nxt"), iSlot);
+    builder_.CreateBr(cond);
+
+    builder_.SetInsertPoint(done);
+    emitParDieEpilogue();
+
+    currentFn_ = savedFn;
+    builder_.SetInsertPoint(savedBB);
+    scopes_ = savedScopes; arrayScopes_ = savedArr; hashScopes_ = savedHash;
+    pvScopes_ = savedPv; floatScopes_ = savedFloat; intScopes_ = savedInt;
+    derefAVScopes_ = savedDerefAV; rowAVScopes_ = savedRowAV;
+    flatRowScopes_ = savedFlatRow; pairScopes_ = savedPair;
+    localDepthAlloca_ = savedLDep;
+    currentSubBody_ = savedBody;
+    inMainBody_ = savedMainBody_;
+    fileScopeDepth_ = savedFileDepth_;
+    loopExits_ = savedExits;
+    loopContinues_ = savedConts;
+    loopRedos_ = savedRedos;
+    return wfn;
+}
+
+bool CodeGen::tryEmitForeachArrPar(const Node &n, Value *tmpArr,
+                                   bool ownsTmpArr, bool ncTmp,
+                                   Value *ownedForeach,
+                                   BasicBlock *exit,
+                                   BasicBlock *bodyBB,
+                                   BasicBlock *stepBB) {
+    if (!isOptStageEnabled("mappar") || !isOptStageEnabled("autopar"))
+        return false;
+    if (!n.body || n.contBlock) return false;
+    if (!n.sval.empty()) return false;   /* labeled loops keep seq last/next */
+    std::string alias = n.name.empty() ? "_" : bareVarName(n.name);
+    std::unordered_set<std::string> locals;
+    locals.insert(alias);
+    if (!mapParBodyPurity(*n.body, alias, locals)) return false;
+    if (getenv("PERLC_DEBUG_AUTOPAR"))
+        fprintf(stderr, "ST46: foreach-arr par=YES alias=%s line=%d\n",
+                alias.c_str(), n.line);
+
+    auto *i64 = Type::getInt64Ty(ctx_);
+    Value *len = callRT("perl_array_len_i64", {tmpArr});
+    long long parMin = 8192;
+    if (const char *e = getenv("PERLC_AUTOPAR_MIN")) {
+        long long v = atoll(e);
+        if (v > 0) parMin = v;
+    }
+    auto *fn = builder_.GetInsertBlock()->getParent();
+    auto *parBB = BasicBlock::Create(ctx_, "fepar.par", fn);
+    auto *seqBB = BasicBlock::Create(ctx_, "fepar.seq", fn);
+    auto *enough = builder_.CreateICmpSGE(len,
+        ConstantInt::get(i64, parMin), "fepar.enough");
+    builder_.CreateCondBr(enough, parBB, seqBB);
+
+    builder_.SetInsertPoint(parBB);
+    auto *ctxArr = builder_.CreateAlloca(perlPtrTy_,
+        ConstantInt::get(i64, 2), "fepar.ctx");
+    builder_.CreateStore(tmpArr,
+        builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 0)));
+    Value *dieSlot = callRT("perl_mappar_die_new", {});
+    builder_.CreateStore(dieSlot,
+        builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 1)));
+    Function *wfn = emitForeachParWorker(n, alias);
+    callRT("perl_autopar_run", {wfn, ctxArr, len});
+    callRT("perl_mappar_die_raise", {dieSlot});
+    callRT("perl_mappar_die_free", {dieSlot});
+    if (ownedForeach)
+        callRT("perl_array_free", {ownedForeach});
+    if (ownsTmpArr)
+        callRT(ncTmp ? "perl_array_free_nc" : "perl_array_free", {tmpArr});
+    builder_.CreateBr(exit);
+
+    builder_.SetInsertPoint(seqBB);
+    (void)bodyBB;
+    (void)stepBB;
+    return true;   /* caller emits the sequential loop from seqBB */
+}
+
+llvm::Function *CodeGen::emitForeachRangeParWorker(const Node &n,
+        const std::string &idxBare, const std::vector<std::string> &arrNames) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
+        {perlPtrTy_, i64, i64}, false);
+    static unsigned rangeParSeq = 0;
+    Function *wfn = Function::Create(fty, Function::InternalLinkage,
+        "__perlc_rangepar_" + std::to_string(++rangeParSeq), mod_.get());
+
+    auto *savedFn   = currentFn_;
+    auto *savedBB   = builder_.GetInsertBlock();
+    auto  savedScopes = scopes_;
+    auto  savedArr  = arrayScopes_;
+    auto  savedHash = hashScopes_;
+    auto  savedPv   = pvScopes_;
+    auto  savedFloat = floatScopes_;
+    auto  savedInt  = intScopes_;
+    auto  savedDerefAV = derefAVScopes_;
+    auto  savedRowAV = rowAVScopes_;
+    auto  savedFlatRow = flatRowScopes_;
+    auto  savedPair = pairScopes_;
+    auto *savedLDep = localDepthAlloca_;
+    auto *savedBody = currentSubBody_;
+    bool  savedMainBody_ = inMainBody_;
+    int   savedFileDepth_ = fileScopeDepth_;
+    auto  savedExits = loopExits_;
+    auto  savedConts = loopContinues_;
+    auto  savedRedos = loopRedos_;
+
+    scopes_ = {}; arrayScopes_ = {}; hashScopes_ = {}; pvScopes_ = {};
+    floatScopes_ = {}; intScopes_ = {}; derefAVScopes_ = {};
+    rowAVScopes_ = {}; flatRowScopes_ = {}; pairScopes_ = {};
+    localDepthAlloca_ = nullptr;
+    inMainBody_ = false;
+    fileScopeDepth_ = 0;
+    currentFn_ = wfn;
+    loopExits_.clear(); loopContinues_.clear(); loopRedos_.clear();
+    flatDoubleCache_.clear();
+    floatSqrtOf_.clear();
+    lastSqrtInput_ = nullptr;
+
+    pushScope();
+
+    auto *entry = BasicBlock::Create(ctx_, "entry", wfn);
+    auto *cond  = BasicBlock::Create(ctx_, "rangepar.cond", wfn);
+    auto *body  = BasicBlock::Create(ctx_, "rangepar.body", wfn);
+    auto *step  = BasicBlock::Create(ctx_, "rangepar.step", wfn);
+    auto *done  = BasicBlock::Create(ctx_, "rangepar.done", wfn);
+
+    builder_.SetInsertPoint(entry);
+    Value *ctxArg = wfn->getArg(0);
+    Value *lo = wfn->getArg(1);
+    Value *hi = wfn->getArg(2);
+    Value *origLo = builder_.CreatePtrToInt(
+        builder_.CreateLoad(perlPtrTy_,
+            builder_.CreateGEP(perlPtrTy_, ctxArg, ConstantInt::get(i64, 0)),
+            "rangepar.lop"),
+        i64, "rangepar.origlo");
+    Value *dieSlot = builder_.CreateLoad(perlPtrTy_,
+        builder_.CreateGEP(perlPtrTy_, ctxArg, ConstantInt::get(i64, 1)),
+        "rangepar.die");
+    for (size_t k = 0; k < arrNames.size(); k++) {
+        Value *cell = builder_.CreateGEP(perlPtrTy_, ctxArg,
+            ConstantInt::get(i64, (int64_t)(k + 2)), "rangepar.avp");
+        declareArray(arrNames[k],
+            builder_.CreateLoad(perlPtrTy_, cell, "rangepar.av"));
+    }
+    auto *offSlot = createEntryAlloca(i64, nullptr, "rangepar.off");
+    auto *iterAlloca = createEntryAlloca(i64, nullptr, idxBare + ".i");
+    builder_.CreateStore(lo, offSlot);
+    builder_.CreateStore(builder_.CreateAdd(origLo, lo, "rangepar.i0"),
+                         iterAlloca);
+    declareIntVar(idxBare, iterAlloca);
+    emitParDiePrologue(dieSlot, iterAlloca);
+    builder_.CreateBr(cond);
+
+    builder_.SetInsertPoint(cond);
+    Value *curOff = builder_.CreateLoad(i64, offSlot, "rangepar.cur");
+    builder_.CreateCondBr(builder_.CreateICmpSLT(curOff, hi, "rangepar.more"),
+                          body, done);
+
+    builder_.SetInsertPoint(body);
+    builder_.CreateStore(builder_.CreateAdd(origLo, curOff, "rangepar.i"),
+                         iterAlloca);
+    if (n.body) emitBlock(*n.body);
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(step);
+
+    builder_.SetInsertPoint(step);
+    Value *off2 = builder_.CreateLoad(i64, offSlot, "rangepar.off2");
+    builder_.CreateStore(builder_.CreateAdd(off2, ConstantInt::get(i64, 1),
+                                            "rangepar.nxt"), offSlot);
+    builder_.CreateBr(cond);
+
+    builder_.SetInsertPoint(done);
+    emitParDieEpilogue();
+
+    currentFn_ = savedFn;
+    builder_.SetInsertPoint(savedBB);
+    scopes_ = savedScopes; arrayScopes_ = savedArr; hashScopes_ = savedHash;
+    pvScopes_ = savedPv; floatScopes_ = savedFloat; intScopes_ = savedInt;
+    derefAVScopes_ = savedDerefAV; rowAVScopes_ = savedRowAV;
+    flatRowScopes_ = savedFlatRow; pairScopes_ = savedPair;
+    localDepthAlloca_ = savedLDep;
+    currentSubBody_ = savedBody;
+    inMainBody_ = savedMainBody_;
+    fileScopeDepth_ = savedFileDepth_;
+    loopExits_ = savedExits;
+    loopContinues_ = savedConts;
+    loopRedos_ = savedRedos;
+    return wfn;
+}
+
+bool CodeGen::tryEmitForeachRangePar(const Node &n, const std::string &idxBare,
+                                    Value *lo, Value *hi,
+                                    Function *fn, BasicBlock *exit,
+                                    BasicBlock *bodyBB, BasicBlock *stepBB) {
+    if (!isOptStageEnabled("mappar") || !isOptStageEnabled("autopar"))
+        return false;
+    if (!n.body || n.contBlock) return false;
+    if (!n.sval.empty()) return false;
+    if (idxBare.empty()) return false;
+    std::unordered_set<std::string> locals;
+    locals.insert(idxBare);
+    std::vector<std::string> arrNames;
+    bool hadStore = false;
+    if (!mapParBodyPurity(*n.body, idxBare, locals, true, &arrNames, &hadStore))
+        return false;
+    if (!hadStore || arrNames.empty()) return false;
+    std::vector<Value *> arrPtrs;
+    arrPtrs.reserve(arrNames.size());
+    for (auto &nm : arrNames) {
+        Value *av = lookupArray(nm);
+        if (!av) return false;
+        arrPtrs.push_back(av);
+    }
+    if (getenv("PERLC_DEBUG_AUTOPAR"))
+        fprintf(stderr, "ST46: foreach-range par=YES idx=%s narr=%zu line=%d\n",
+                idxBare.c_str(), arrNames.size(), n.line);
+
+    auto *i64 = Type::getInt64Ty(ctx_);
+    Value *span = builder_.CreateSub(hi, lo, "rangepar.span");
+    Value *bound = builder_.CreateAdd(span, ConstantInt::get(i64, 1),
+                                      "rangepar.bound");
+    long long parMin = 8192;
+    if (const char *e = getenv("PERLC_AUTOPAR_MIN")) {
+        long long v = atoll(e);
+        if (v > 0) parMin = v;
+    }
+    auto *parBB = BasicBlock::Create(ctx_, "rangepar.par", fn);
+    auto *seqBB = BasicBlock::Create(ctx_, "rangepar.seq", fn);
+    Value *enoughN = builder_.CreateICmpSGE(bound,
+        ConstantInt::get(i64, parMin), "rangepar.enoughN");
+    Value *loOk = builder_.CreateICmpSGE(lo, ConstantInt::get(i64, 0),
+                                         "rangepar.loOk");
+    builder_.CreateCondBr(builder_.CreateAnd(enoughN, loOk, "rangepar.enough"),
+                          parBB, seqBB);
+
+    builder_.SetInsertPoint(parBB);
+    Value *need = builder_.CreateAdd(hi, ConstantInt::get(i64, 1),
+                                     "rangepar.need");
+    for (Value *av : arrPtrs)
+        callRT("perl_array_fill_undef", {av, need});
+    auto *ctxArr = builder_.CreateAlloca(perlPtrTy_,
+        ConstantInt::get(i64, (int64_t)(arrNames.size() + 2)), "rangepar.ctx");
+    builder_.CreateStore(builder_.CreateIntToPtr(lo, perlPtrTy_),
+        builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 0)));
+    Value *dieSlot = callRT("perl_mappar_die_new", {});
+    builder_.CreateStore(dieSlot,
+        builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 1)));
+    for (size_t k = 0; k < arrPtrs.size(); k++)
+        builder_.CreateStore(arrPtrs[k],
+            builder_.CreateGEP(perlPtrTy_, ctxArr,
+                ConstantInt::get(i64, (int64_t)(k + 2))));
+    Function *wfn = emitForeachRangeParWorker(n, idxBare, arrNames);
+    callRT("perl_autopar_run", {wfn, ctxArr, bound});
+    callRT("perl_mappar_die_raise", {dieSlot});
+    callRT("perl_mappar_die_free", {dieSlot});
+    builder_.CreateBr(exit);
+
+    builder_.SetInsertPoint(seqBB);
+    (void)bodyBB;
+    (void)stepBB;
+    return true;
+}
+
 /* Stage 42 (packflat): at a sub's `return \@r;` site — when the scan above
    proves @r is a sub-local row-fill array with no alias escapes outside
    return positions — pack the boxed interleaved numeric row into a
@@ -11642,6 +12527,10 @@ void CodeGen::emitStmt(const Node &n) {
 
             std::string loopNm = n.name;
             if (!loopNm.empty() && loopNm[0] == '$') loopNm = loopNm.substr(1);
+            /* Stage 46: closed integer-range foreach with disjoint `$a[$i]`
+               stores fans out over [lo,hi] as a half-open pool bound
+               (hi-lo+1). Sequential fallback keeps the counted i64 loop. */
+            tryEmitForeachRangePar(n, loopNm, lo, hi, fn, exit, bodyBB, stepBB);
             /* counterAlloca: hidden loop counter — never exposed to user code.
                iterAlloca: user-visible $VAR — refreshed from counter at each body entry.
                This mirrors Perl semantics: $i++ inside foreach body does not advance
@@ -11907,6 +12796,12 @@ void CodeGen::emitStmt(const Node &n) {
                 }
             }
         }
+
+        /* Stage 46: closed foreach @arr bodies fan out over the snapshot
+           length (live-length push in the body fails the purity walk).
+           On success the insert point is the sequential fallback block. */
+        tryEmitForeachArrPar(n, tmpArr, ownsTmpArr, ncTmp, ownedForeach,
+                             exit, bodyBB, stepBB);
 
         /* loop variable — Perl foreach aliases $_/the loop var to each element
            in turn, so mutating it (or $_) writes back to the source array.

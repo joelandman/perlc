@@ -1570,11 +1570,11 @@ String `eval EXPR` sees outer `my`. Runtime `eval`/`do` still needs
 clang+perlc
 on the target.
 
-**Auto-parallel `map` / counted loops** (2026-09-22): explored, deferred.
-Pthreads + a fixed `map`/`grep` length exist; there is no loop-carried
-dependence analyzer. A gated pure-`$_` map (especially on `FLAT_ARRAY`)
-is the only subset that looks safe. Full write-up: "Future: auto-parallel
-`map` / counted loops" under Language leftovers above.
+**Auto-parallel `map` / counted loops:** counted `for` is Stage 45
+(`autopar` / `outerpar`). Closed-body `map`/`grep`/`foreach @arr` is
+Stage 46 (`mappar`). There is still no loop-carried dependence analyzer;
+integer-range `foreach (LO..HI)` with disjoint `$a[$i]` stores, and
+variable-length `map` concat, stay sequential.
 
 **2026-09-09 note:** `src/runtime.c` (commit `706b478`, "updates") added
 `perl_glob_set_io`/`perl_glob_get_io`/`perl_glob_slot` — runtime support
@@ -4033,7 +4033,7 @@ A failing `try` with no `catch` returns undef without rethrowing
 ### Stage 45: auto-parallel counted loops (2026-11-06, landed)
 
 The 2026-09-22 exploration above is now implemented for the counted-loop
-half (map/grep parallelism remains future work). `tryEmitFlatKernelFor`'s
+half. Map/grep/`foreach @arr` is Stage 46. `tryEmitFlatKernelFor`'s
 certification gains a parallel variant (`PERLC_OPT_DISABLE=autopar`):
 
 - **Safety is structural, not analysis:** the FK walk already proves every
@@ -4087,27 +4087,57 @@ certification gains a parallel variant (`PERLC_OPT_DISABLE=autopar`):
   (pack-pair store corruption on flat-scalar index forms) and D206
   (fkNoRowTouch paren-group blindness) — see their rows.
 
-### Future: auto-parallel `map` phase (2026-09-22 exploration, deferred)
+### Stage 46: auto-parallel map / grep / foreach-@arr (2026-11-21)
 
-Explored, **not implemented**. A pthread pool over a list whose length is known before the loop is feasible for a **narrow pure subset**; general `for`/`foreach`/`map` auto-parallel from dependence analysis is not something the compiler can do today.
+The post-D208 map/grep design in the landing docs is implemented for a
+**closed-body** subset. Safety is the same structural purity walk used
+by Stage 45, not loop-carried dependence analysis. Do not auto-parallel
+arbitrary blocks.
 
-**Already in place**
-
-- `map`/`grep` snapshot `perl_array_len` once, then a counted `i` loop (`src/codegen.cpp`). Integer-range `foreach (LO..HI)` is a counted i64 loop (Stage 28/34).
-- `threads->create` is a **pthread** calling a compiled code-ref on the **same heap** (OpenMP-shaped, not Perl ithreads clone). `threads::shared` has acquire/release + CAS.
-- TLS: PV freelist, `wantarray`, `eval`/`$@`, `local`, regex JIT cache, `pcre2_match_data`.
-- AST walks (`hasVar`, D135 write scan, Stage 34 `stmtIsUnboxedNumeric`) are **purity** checks, not loop-carried dependence (`$a[$i]` vs `$a[$i+1]`).
-
-**What blocks a general transform**
-
-- `foreach (@a)` aliases the element (`perl_array_get_ref`); `$x++` writes the source array.
-- `map`/`grep` sequential `push`/`extend`; parallel needs per-chunk buffers then **ordered** concat. `map { @$_ }` has data-dependent output length. `foreach @arr` uses **live** `perl_array_len_i64` (`push` in the body is visible).
-- `last`/`next`/`redo`, outer-`my` writes, `print`, hashes, `die`.
-- `$&`/`$1` are process-wide (not TLS); parallel `=~` would race.
-- LLVM LoopParallel will not fire: bodies are full of `perl_*` calls.
-- `pv_slabs_` / `pv_slab_count_` is process-wide with no lock; a parallel map that cold-misses many TLS pools would race (small runtime fix if this ships).
-
-**If revisited:** conservative predicate on `map { EXPR } @list` (EXPR Stage-34-pure in `$_`, no stores/calls/regex/outer `my`), plus a packed `FLAT_ARRAY`/`CPLX_ROW` C worker over `double[]`. `grep` via per-thread vectors + prefix-sum concat. A small index-range pool (`nproc` workers), not `perl_threads_create` per element. Off by default (`PERLC_OPT_DISABLE` twin or `use perlc::parallel`) so the harness stays byte-for-byte. Do not auto-parallel arbitrary blocks.
+- **Eligible:** `map { EXPR } LIST` that yields one scalar per input, or
+  a list (`($_, $_+1)`, `@$_`) gathered by per-chunk concat; `grep { EXPR
+  } LIST`; `foreach my $x (@arr) { ... }` / `$_++ for @arr`; integer-range
+  `foreach my $i (LO..HI)` with disjoint named `$a[$i]` stores (index is
+  the loop var; `$i` is read-only in the par body). The body may read the
+  alias, body-`my` scalars, and literals; it may write the alias cell
+  (map/grep/foreach-@arr) and those locals; `/` `%` and `die` are allowed
+  (worker setjmp). Nested `$x->[i] =` is refused (shared referents).
+  Calls, I/O, last/next/redo, `local`, eval, regex, hashes, and push/pop
+  stay sequential. Bare `{ k => v }` pairs stay sequential. A 1-element
+  `ArrayLit` is a paren group `(expr)`, same as Stage 41 `fkNoRowTouch`.
+- **Emission:** snapshot `perl_array_len` (foreach: `perl_array_len_i64`)
+  once. Bound `>= PERLC_AUTOPAR_MIN` (default 8192) fans out through
+  Stage 45's `perl_autopar_run`; smaller N keeps the sequential body.
+  Map workers `perl_array_set` disjoint pre-filled slots, or put a
+  per-chunk array at `slots[lo]` for list yield (main thread
+  `perl_mappar_concat_gather` with `extend_nc`). Grep workers write a
+  per-index mask; the main thread gathers in order
+  (`perl_mappar_grep_gather`). Foreach-@arr aliases `perl_array_get_ref`
+  like D208. Range foreach maps pool offset `i` to `origLo+i` (bound
+  `hi-lo+1`), pre-sizes each target with `perl_array_fill_undef(hi+1)`,
+  and refuses `lo < 0`. Workers are `__perlc_mappar_N` /
+  `__perlc_greppar_N` / `__perlc_fepar_N` / `__perlc_rangepar_N` with
+  `inMainBody_=false` so worker `my` is not file-scope. Every worker
+  setjmps; the lowest-index `$@` is rethrown on the main thread after
+  join (`perl_mappar_die_raise`) before gather.
+- **Runtime:** mappar workers allocate PVs, so `pv_alloc`'s process-wide
+  slab registry claims slots with an atomic. TLS PV/array freelists stay
+  lock-free. A BSS mutex on that registry shifted other runtime globals
+  and crashed `perl_set_isa` on small programs that also emit 4-byte
+  UTF-8 (`tests/d68_substr_utf8.pl`, `chr(0x1F600)`); the atomic path
+  does not. Die slots use a heap `pthread_mutex_t` (not BSS).
+- **Knob:** `PERLC_OPT_DISABLE=mappar` (also off when `autopar` is
+  disabled). `PERLC_DEBUG_AUTOPAR=1` prints `ST46: map/grep/foreach-arr
+  /foreach-range par=YES|no`.
+- **Tests:** `tests/mappar_{smoke,deep}.pl`,
+  `tests/foreachpar_{smoke,deep}.pl`, `tests/rangepar_{smoke,deep}.pl`,
+  `tests/mapconcat_{smoke,deep}.pl`, `tests/mapdie_{smoke,deep}.pl`.
+  Deep uses bound 13005 so the pool path runs. Smoke covers refused
+  outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
+  shapes on the sequential fallback.
+- **Still sequential:** live-length foreach that `push`es the iterated
+  array; `$a[$i+1]` / `$i++` then `$a[$i]` range bodies; arbitrary
+  blocks.
 
 ### Native stdlib waves 1–3 (2026-09-22)
 

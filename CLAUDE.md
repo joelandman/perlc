@@ -50,7 +50,7 @@ certified-body raw-store routing + kernel if-conversion (`fkifconv`)
 make the certified flat loops genuinely vectorize (and remove the
 `-Wpass-failed` stderr noise on FK-listing `-O2` compiles). Every
 stage has a `PERLC_OPT_DISABLE=` knob
-(`st41`/`st39`/`cplxrow`/`packflat`/`fkifconv`/`autopar`/…).
+(`st41`/`st39`/`cplxrow`/`packflat`/`fkifconv`/`autopar`/`outerpar`/`mappar`/…).
 Findings/method/
 ablations: `docs/optimization_findings_2026-11-04.md`,
 `docs/optimization_findings_2026-11-04_round2.md`,
@@ -81,11 +81,22 @@ wake+join each against 1.7 µs sequential kernel → par 10.1 s vs seq
 seq 0.020 s. The 8192 floor is empirically sound for direct shapes;
 mbs-shaped wins need outer-loop dispatch batching (design in the
 landing doc).
-**Open perf follow-ups:** map/grep auto-parallel — `$_`-aliasing +
-canonical-view landing done; remaining: per-chunk result handoff +
-`mapParBodyPurity` walk + per-chunk die slots, and outer-loop batch
-dispatch for the mbs shape (both designed in
-`docs/optimization_findings_2026-11-05_landing.md` round-3 section).
+**Closed 2026-11-21 — Stage 46 (mappar):** closed-body auto-parallel
+`map`/`grep`/`foreach @arr` on the Stage-45 pool (`PERLC_OPT_DISABLE=mappar`,
+also off with `autopar`). 1:1 scalar map, grep mask+ordered gather,
+foreach-@arr D208 alias write-back. `pv_alloc` slab registry is atomic
+(a BSS mutex shifted `perl_set_isa` globals). Tests:
+`tests/mappar_{smoke,deep}.pl`, `tests/foreachpar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — Stage 46 follow-ups:** integer-range
+`foreach (LO..HI)` disjoint `$a[$i]` (loop var read-only in the par
+body; arrays pre-sized with `perl_array_fill_undef`); list-yielding map
+concat (per-chunk arrays + ordered `extend_nc`); per-chunk die slots
+(worker setjmp, lowest-index `$@`, rethrow after join). Tests:
+`tests/rangepar_{smoke,deep}.pl`, `tests/mapconcat_{smoke,deep}.pl`,
+`tests/mapdie_{smoke,deep}.pl`. Live-length foreach that `push`es the
+iterated array stays sequential. Outer-loop batch dispatch for the mbs
+shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
+blocks.
 **Closed 2026-11-07 (this round):** D207b worker-body parity —
 `case NK::Block:`'s unconditional save/restore pair paid a TLS read +
 `perl_local_restore_to` call per loop-body block (and blocked the

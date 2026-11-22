@@ -293,6 +293,7 @@ PerlValue *perl_array_get_ref(PerlArray *a, long long idx); /* borrow: no clone,
 void       perl_array_set(PerlArray *a, long long idx, PerlValue *v);
 void       perl_array_set_loc(PerlArray *a, long long idx, PerlValue *v,
                               const char *file, int line);
+void       perl_array_fill_undef(PerlArray *a, long long n);
 /* Die before a store when idx is still negative after counting from the
    end. A read of that index is undef; a write is a catchable die. */
 void       perl_array_check_store(PerlArray *a, long long idx,
@@ -613,6 +614,28 @@ void perl_set_dollar0(const char *path);         /* $0 = script path (byte-parit
    way, since every chunk computes independent elements. */
 typedef void (*perlc_autopar_fn)(void **rows, long long lo, long long hi);
 void perl_autopar_run(perlc_autopar_fn fn, void **rows, long long bound);
+
+/* Stage 46 (mappar): grep match mask + ordered gather. */
+unsigned char *perl_mappar_mask_new(long long n);
+void perl_mappar_mask_free(unsigned char *m);
+void perl_mappar_mask_set(unsigned char *m, long long i);
+void perl_mappar_grep_gather(PerlArray *out, PerlArray *in,
+                             unsigned char *m, long long n);
+
+/* Stage 46: variable-length map concat — one result array per chunk,
+   keyed at the chunk's lo index; gather concatenates in order. */
+void **perl_mappar_slots_new(long long n);
+void perl_mappar_chunk_put(void **slots, long long lo, PerlArray *a);
+void perl_mappar_concat_gather(PerlArray *out, void **slots, long long n);
+void perl_mappar_slots_free(void **slots);
+
+/* Stage 46: per-chunk die. Workers setjmp, record TLS $@ at the lowest
+   dying index; the caller rethrows after the pool joins. */
+void *perl_mappar_die_new(void);
+void perl_mappar_die_record(void *slot, long long i);
+int  perl_mappar_die_pending(void *slot);
+void perl_mappar_die_raise(void *slot);
+void perl_mappar_die_free(void *slot);
 
 /* Stage 45 debug: per-row FK prelude certification inputs */
 void perl_fk_cert_dbg(long long tag, long long flags, long long len,
