@@ -129,6 +129,17 @@ now fan out with Stage 46. `join(",", @outer)` still refuses (named
 array reads stay sequential). Knob: `mappar`. Tests:
 `tests/joinpar_{smoke,deep}.pl`.
 
+### 11. Closed `split` / `pack` in mappar — closed this session
+
+`split` is a list-yield (map-concat) or a scalar field-count (grep).
+`pack` is scalar. Both were default-false in `mapParBodyPurity`.
+`map { split /:/ }` / `map { split ',', $_ }` / `map { pack("C", length($_)) }`
+now fan out with Stage 46. The interp/split pcre2 LRU is already
+per-thread; regex split skips `%+`/`$1` install unless the unit reads
+those slots. A `$1` anywhere, `/g`, and `pack("C*", @outer)` stay
+sequential. Knob: `mappar`. Tests: `tests/splitpar_{smoke,deep}.pl`
+— those files must not mention `$1`/`$&`.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -152,7 +163,7 @@ array reads stay sequential). Knob: `mappar`. Tests:
 
 ## Practical order
 
-(1)–(7) and (9)–(10) landed this session. (8) is the pcre2 leftover of
+(1)–(7) and (9)–(11) landed this session. (8) is the pcre2 leftover of
 (4): a C concatenation scanner was measured slower than JIT and was
 not landed. Remaining of (4) is a different match engine. Parallelism
 will not move it.

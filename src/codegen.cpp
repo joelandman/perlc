@@ -9534,6 +9534,7 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
      - workers setjmp; `/` `%` / die record per-chunk and rethrow after join
      - no calls, I/O, last/next/redo, local, eval, hashes, pop
      - boolean literal /pat/ (no /g) when the unit does not read $1/$&
+     - closed split (string or regex) and pack; regex split refuses $1/$& /g
      - append-only `push @b` (dest != iterated array) reuses concat slots
      - ordered i64 `$s +=` / `$s -=` uses per-chunk partials; die in an
        append/reduce body stays sequential (prefix side effects)
@@ -9584,8 +9585,10 @@ bool CodeGen::mapParScalarYield(const Node &n) const {
     case NK::Range: case NK::MapFunc: case NK::GrepFunc: case NK::SortFunc:
     case NK::RepeatArray:
     case NK::RegexMatch: case NK::RegexMatchExpr: case NK::RegexMatchInterp:
+    case NK::SplitFunc:
         /* List-context match yields the capture list (empty on failure),
-           not a 1:1 boolean. Grep uses scalar /pat/ via perl_is_true. */
+           not a 1:1 boolean. Grep uses scalar /pat/ via perl_is_true.
+           split yields fields (concat). */
         return false;
     case NK::PostfixDeref:
         if (e->sval == "all_array" || e->sval == "slice_array" ||
@@ -9763,10 +9766,17 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
         case NK::IndexFunc: case NK::RindexFunc: case NK::SubstrFunc:
         case NK::JoinFunc: case NK::SprintfFunc:
         case NK::HexFunc: case NK::OctFunc:
+        case NK::PackFunc: case NK::SplitFunc:
             /* 4-arg substr($s,off,len,$repl) writes $s in place; lvalue
                substr(...) = is asWrite. Both stay sequential. */
             if (asWrite) return false;
             if (e.kind == NK::SubstrFunc && e.args.size() >= 4) return false;
+            /* Regex split uses the per-thread pcre2 LRU. Capture
+               globals and /g stay sequential (last-match $1 / %+). */
+            if (e.kind == NK::SplitFunc && e.ival) {
+                if (matchAmpNeeded_ || matchCapsNeeded_) return false;
+                if (e.name.find('g') != std::string::npos) return false;
+            }
             if (e.left && !exprOk(*e.left, false)) return false;
             if (e.right && !exprOk(*e.right, false)) return false;
             for (auto &a : e.args)
@@ -9990,6 +10000,7 @@ bool CodeGen::mapParListYield(const Node &n) const {
     if (e->kind == NK::PostfixDeref &&
         (e->sval == "all_array" || e->sval == "slice_array"))
         return true;
+    if (e->kind == NK::SplitFunc) return true;
     return false;
 }
 

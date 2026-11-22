@@ -127,6 +127,11 @@ read-only 2/3-arg `substr` in closed map/grep (`PERLC_OPT_DISABLE=mappar`).
 **Closed 2026-11-22 — opt_strat 10 (joinpar):** `join` / `sprintf` /
 `hex` / `oct` in closed map/grep. Named-array `join(",", @outer)`
 stays sequential. Tests: `tests/joinpar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 11 (splitpar):** `split` (string or
+regex) and `pack` in closed map/grep. Regex split uses the per-thread
+pcre2 LRU and skips `$1`/`%+` install unless the unit reads them.
+`pack("C*", @outer)` stays sequential. Tests:
+`tests/splitpar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

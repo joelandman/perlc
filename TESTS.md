@@ -4138,7 +4138,8 @@ arbitrary blocks.
   `tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`,
   `tests/greppar_{smoke,deep}.pl`,
   `tests/idxpar_{smoke,deep}.pl`,
-  `tests/joinpar_{smoke,deep}.pl`.
+  `tests/joinpar_{smoke,deep}.pl`,
+  `tests/splitpar_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
@@ -4181,6 +4182,13 @@ arbitrary blocks.
   `oct` in a closed map/grep body fan out with mappar. `join(",", @outer)`
   stays sequential (named array read). Knob `mappar`. Tests:
   `tests/joinpar_{smoke,deep}.pl`.
+- **split / pack (opt_strat 11):** `split` (string or regex) and `pack`
+  in a closed map/grep body fan out with mappar. `split` is list-concat
+  in map and a field-count boolean in grep. Regex split uses the
+  per-thread pcre2 LRU; `$1`/`$&`/`%+` install is skipped unless the
+  unit reads those slots. A `$1` anywhere, `/g`, and
+  `pack("C*", @outer)` stay sequential. Knob `mappar`. Tests:
+  `tests/splitpar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
 - **Still sequential:** live-length foreach that `push`es the iterated
   array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
   reductions; arbitrary blocks; impure / named-sub sort; C-style

@@ -12421,7 +12421,10 @@ PerlArray *perl_split_regex(const char *pattern, const char *flags, PerlValue *s
             break;
         }
         int rc = pcre2_match(re, (PCRE2_SPTR)s, slen, pos, 0, md, NULL);
-        if (rc > 0) populate_named_captures(md, s, re);
+        /* %+ / $1 install is process-global. Skip it unless the unit
+           reads those slots, so regex split can run in mappar workers. */
+        if (rc > 0 && (s_match_amp_needed || s_match_caps_needed))
+            populate_named_captures(md, s, re);
         if (rc <= 0) {
             SPLIT_PUSH_FIELD(fstart);
             break;
