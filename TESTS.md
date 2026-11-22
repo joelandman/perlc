@@ -4141,7 +4141,8 @@ arbitrary blocks.
   `tests/joinpar_{smoke,deep}.pl`,
   `tests/splitpar_{smoke,deep}.pl`,
   `tests/unpackpar_{smoke,deep}.pl`,
-  `tests/revpar_{smoke,deep}.pl`.
+  `tests/revpar_{smoke,deep}.pl`,
+  `tests/interppar_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
@@ -4173,8 +4174,9 @@ arbitrary blocks.
   closed grep body fans out when the compilation unit does not read
   capture globals (pcre2 match_data is TLS; `$1`/`$&` install is skipped).
   A `$1` anywhere in the unit keeps every regex sequential. `/g`, subst,
-  interp, `$s =~ EXPR`, and `map { /pat/ }` (list-context capture list,
-  empty on failure) stay sequential. Knob `mappar`. Tests:
+  and `map { /pat/ }` (list-context capture list, empty on failure) stay
+  sequential. Closed interp `/$p/` and `$_ =~ qr/pat/` landed in
+  opt_strat 14. Knob `mappar`. Tests:
   `tests/greppar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
 - **index / substr (opt_strat 9):** `index`, `rindex`, and read-only
   2/3-arg `substr` in a closed map/grep body fan out with mappar.
@@ -4201,11 +4203,16 @@ arbitrary blocks.
   a 1:1 string (`emitArrayPtr` skips `scalar_ctx`, same stamp as D142
   localtime). `reverse @outer` stays sequential. Knob `mappar`. Tests:
   `tests/revpar_{smoke,deep}.pl`.
+- **interp / qr (opt_strat 14):** closed `/$p/`, `$_ =~ /$p/`, and
+  `$_ =~ qr/pat/` in a grep body fan out with mappar when the pattern is
+  `$_` or a body-`my` (interp LRU is per-thread). An outer `$pat`, `/g`,
+  subst, and `map { /$p/ }` stay sequential. Knob `mappar`. Tests:
+  `tests/interppar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
 - **Still sequential:** live-length foreach that `push`es the iterated
   array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
   reductions; arbitrary blocks; impure / named-sub sort; C-style
   `for ($i = LO; …)` without `my` (post-loop `$i`); regex that needs
-  capture globals, `/g`, subst, or interp. Regex residual perlc leftovers
+  capture globals, `/g`, subst, or an outer interpolated `$pat`. Regex residual perlc leftovers
   (subject promote skip, void `$count++`) landed. A C `/lit\d+_lit/`
   scanner lost to pcre2 JIT (opt_strat 8, not landed). Remaining: a
   different match engine. Next candidates: `docs/opt_strat.md`.

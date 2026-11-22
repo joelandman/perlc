@@ -159,6 +159,16 @@ does not flatten as list reverse (same stamp as D142 localtime).
 `reverse @outer` stays sequential. Knob: `mappar`. Tests:
 `tests/revpar_{smoke,deep}.pl`.
 
+### 14. Closed interpolated match / `qr` in mappar — closed this session
+
+Item 7 allowed literal `/pat/` only. The interp LRU is already
+per-thread (item 11) and capture install is skipped unless the unit
+reads `$1`/`$&`. Closed `/$p/`, `$_ =~ /$p/`, and `$_ =~ qr/pat/` now
+fan out when `$p`/`$re` is `$_` or a body-`my`. An outer `$pat`, `/g`,
+subst, and `map { /$p/ }` (list-context capture list) stay sequential.
+Knob: `mappar`. Tests: `tests/interppar_{smoke,deep}.pl` — those files
+must not mention `$1`/`$&`.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -182,7 +192,7 @@ does not flatten as list reverse (same stamp as D142 localtime).
 
 ## Practical order
 
-(1)–(7) and (9)–(13) landed this session. (8) is the pcre2 leftover of
+(1)–(7) and (9)–(14) landed this session. (8) is the pcre2 leftover of
 (4): a C concatenation scanner was measured slower than JIT and was
 not landed. Remaining of (4) is a different match engine. Parallelism
 will not move it.

@@ -2472,6 +2472,30 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
        with a QR operand also lands here (`my @m = ($str =~ $re);`).
        NOTE: !~ is excluded — real perl's !~ returns a plain boolean even
        in list context (never a capture list). */
+    if (n.kind == NK::RegexMatchInterp &&
+        n.name.find('g') == std::string::npos && !n.ival) {
+        /* List-context /$p/: capture list (empty on failure), same as
+           a literal /pat/. Boolean emitExpr would push "" on miss. */
+        Value *str = emitExpr(*n.left);
+        Value *patPv = emitExpr(*n.right);
+        if (!rtFuncs_.count("perl_to_string_dup"))
+            rtFuncs_["perl_to_string_dup"] = Function::Create(
+                makeRT(ctx_, PointerType::getUnqual(ctx_), {perlPtrTy_}),
+                Function::ExternalLinkage, "perl_to_string_dup", mod_.get());
+        Function *freeFnRmi = rtFuncs_.count("free")
+            ? rtFuncs_["free"]
+            : (rtFuncs_["free"] = Function::Create(
+                   makeRT(ctx_, Type::getVoidTy(ctx_),
+                          {PointerType::getUnqual(ctx_)}),
+                   Function::ExternalLinkage, "free", mod_.get()));
+        Value *patC = builder_.CreateCall(getRTFunc("perl_to_string_dup"), {patPv});
+        Value *flg = builder_.CreateGlobalStringPtr(n.name, "rmi_lst_flg");
+        Value *av = callRT("perl_regex_match_captures_list", {str, patC, flg});
+        builder_.CreateCall(freeFnRmi, {patC});
+        freeIfOwned(str);
+        freeIfOwned(patPv);
+        return av;
+    }
     if (((n.kind == NK::RegexMatch && n.name.find('g') == std::string::npos) ||
          n.kind == NK::RegexMatchExpr) && !n.ival) {
         Value *str = emitExpr(*n.left);
@@ -9537,6 +9561,7 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
      - workers setjmp; `/` `%` / die record per-chunk and rethrow after join
      - no calls, I/O, last/next/redo, local, eval, hashes, pop
      - boolean literal /pat/ (no /g) when the unit does not read $1/$&
+     - closed interp / $s =~ EXPR / qr (no /g); outer $pat stays sequential
      - closed split (string or regex) and pack; regex split refuses $1/$& /g
      - closed unpack (list-concat in map; scalar first field in grep)
      - closed reverse (list-concat) and scalar reverse (1:1 string)
@@ -9807,15 +9832,29 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
         case NK::DieStmt:
             if (asWrite) return false;
             return !e.left || exprOk(*e.left, false);
-        case NK::RegexMatch: {
-            /* Boolean literal /pat/ (no /g). Capture slots $1/$& are
-               process-global, so a unit that reads them stays sequential
-               (last successful match is ordered). Interp / $s =~ EXPR /
-               subst remain refused. pcre2 match_data is already TLS. */
+        case NK::RegexMatch:
+        case NK::RegexMatchInterp:
+        case NK::RegexMatchExpr: {
+            /* Boolean /pat/, /$p/, and $s =~ EXPR (no /g). Capture slots
+               $1/$& are process-global, so a unit that reads them stays
+               sequential. The interp LRU is per-thread; pcre2 match_data
+               is TLS. Outer $pat fails readableScalar. subst stays off. */
             if (asWrite) return false;
             if (matchAmpNeeded_ || matchCapsNeeded_) return false;
             if (e.name.find('g') != std::string::npos) return false;
-            return e.left && exprOk(*e.left, false);
+            if (e.kind == NK::RegexMatchExpr && e.right &&
+                e.right->kind == NK::QrRegex &&
+                e.right->name.find('g') != std::string::npos)
+                return false;
+            if (e.left && !exprOk(*e.left, false)) return false;
+            if (e.right && !exprOk(*e.right, false)) return false;
+            if (e.kind == NK::RegexMatch) return (bool)e.left;
+            return true;
+        }
+        case NK::QrRegex: {
+            if (asWrite) return false;
+            if (e.name.find('g') != std::string::npos) return false;
+            return !e.right || exprOk(*e.right, false);
         }
         default:
             return false;
@@ -9847,7 +9886,7 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
             st.kind == NK::ShiftExpr || st.kind == NK::UnshiftStmt || st.kind == NK::UnshiftStmt2 ||
             st.kind == NK::SpliceFunc || st.kind == NK::KeysFunc || st.kind == NK::ValuesFunc ||
             st.kind == NK::EachFunc || st.kind == NK::MapFunc || st.kind == NK::GrepFunc ||
-            st.kind == NK::SortFunc || st.kind == NK::RegexMatchExpr ||
+            st.kind == NK::SortFunc ||
             st.kind == NK::RegexSubst || st.kind == NK::CaptureVar || st.kind == NK::DollarAt)
             return false;
         if (st.kind == NK::DieStmt)

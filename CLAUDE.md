@@ -140,6 +140,10 @@ map/grep. Map unpack is list-concat; grep unpack is the first field.
 map/grep. List reverse concatenates; `scalar reverse` is 1:1 string
 reverse (`emitArrayPtr` skips `scalar_ctx`). `reverse @outer` stays
 sequential. Tests: `tests/revpar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 14 (interppar):** closed `/$p/`,
+`$_ =~ /$p/`, and `$_ =~ qr/pat/` in map/grep when the pattern is `$_`
+or a body-`my`. Outer `$pat`, `/g`, and `map { /$p/ }` stay sequential.
+Tests: `tests/interppar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.
