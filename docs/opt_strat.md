@@ -146,7 +146,8 @@ sequential. Knob: `mappar`. Tests: `tests/splitpar_{smoke,deep}.pl`
 (grep). It was still default-false after pack landed in (11).
 `map { unpack("C*", $_) }` and `map { unpack("C", pack("C", length($_))) }`
 now fan out with Stage 46. An outer format scalar (`unpack($fmt, $_)`)
-stays sequential. Knob: `mappar`. Tests:
+fans out when `$fmt` is a file-scope `my`/`our` (item 15). Knob:
+`mappar`. Tests:
 `tests/unpackpar_{smoke,deep}.pl` — print numeric fields, not packed
 binary.
 
@@ -164,9 +165,21 @@ does not flatten as list reverse (same stamp as D142 localtime).
 Item 7 allowed literal `/pat/` only. The interp LRU is already
 per-thread (item 11) and capture install is skipped unless the unit
 reads `$1`/`$&`. Closed `/$p/`, `$_ =~ /$p/`, and `$_ =~ qr/pat/` now
-fan out when `$p`/`$re` is `$_` or a body-`my`. An outer `$pat`, `/g`,
-subst, and `map { /$p/ }` (list-context capture list) stay sequential.
+fan out when `$p`/`$re` is `$_` or a body-`my`. A file-scope outer
+`$pat` fans out (item 15). `/g`, subst, a nested-lexical `$pat`, and
+`map { /$p/ }` (list-context capture list) stay sequential.
 Knob: `mappar`. Tests: `tests/interppar_{smoke,deep}.pl` — those files
+must not mention `$1`/`$&`.
+
+### 15. Read-only file-scope scalars in mappar — closed this session
+
+Workers only had `$_` / body-`my` in scope, so an outer `$pat` / `$fmt`
+/ `$k` stayed sequential even when the body only read it. File-scope
+`my`/`our` scalars live in GVs `lookupVar` can load from a worker.
+`grep { /$pat/ }`, `map { length($_) + $k }`, and `map { unpack($fmt, $_) }`
+now fan out. A nested lexical (`sub { my $p; grep { /$p/ } }`) and any
+write of an outer scalar stay sequential. Named arrays stay sequential.
+Knob: `mappar`. Tests: `tests/roscpar_{smoke,deep}.pl` — those files
 must not mention `$1`/`$&`.
 
 ## Non-goals (do not review next)
@@ -192,7 +205,7 @@ must not mention `$1`/`$&`.
 
 ## Practical order
 
-(1)–(7) and (9)–(14) landed this session. (8) is the pcre2 leftover of
+(1)–(7) and (9)–(15) landed this session. (8) is the pcre2 leftover of
 (4): a C concatenation scanner was measured slower than JIT and was
 not landed. Remaining of (4) is a different match engine. Parallelism
 will not move it.

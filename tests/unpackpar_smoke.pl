@@ -1,8 +1,7 @@
 #!/usr/bin/env perl
 # Closed unpack (unpackpar) smoke: small N stays sequential (below
-# PERLC_AUTOPAR_MIN) and matches real perl. An outer format scalar stays
-# on the sequential fallback. Print numeric unpack fields, not packed
-# binary (NULs make the harness treat output as binary).
+# PERLC_AUTOPAR_MIN) and matches real perl. Print numeric unpack fields,
+# not packed binary (NULs make the harness treat output as binary).
 use strict;
 use warnings;
 
@@ -20,7 +19,7 @@ print "grep-A: @g\n";
 my @rt = map { unpack("C", pack("C", length($_))) } @w;
 print "roundtrip: @rt\n";
 
-# refused (outer scalar read) — sequential fallback must still match
+# file-scope outer $fmt is now eligible (opt_strat 15); keep as a match
 my $fmt = "C*";
 my @bad = map { unpack($fmt, $_) } ("AB", "C");
 print "unpack-outer: @bad\n";

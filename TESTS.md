@@ -4142,7 +4142,8 @@ arbitrary blocks.
   `tests/splitpar_{smoke,deep}.pl`,
   `tests/unpackpar_{smoke,deep}.pl`,
   `tests/revpar_{smoke,deep}.pl`,
-  `tests/interppar_{smoke,deep}.pl`.
+  `tests/interppar_{smoke,deep}.pl`,
+  `tests/roscpar_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
@@ -4195,8 +4196,8 @@ arbitrary blocks.
   `tests/splitpar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
 - **unpack (opt_strat 12):** `unpack` in a closed map/grep body fans out
   with mappar. Map unpack is list-concat of fields; grep unpack is the
-  first field as a boolean. `unpack($fmt, $_)` with an outer format
-  stays sequential. Knob `mappar`. Tests:
+  first field as a boolean. File-scope `unpack($fmt, $_)` fans out
+  (opt_strat 15). Knob `mappar`. Tests:
   `tests/unpackpar_{smoke,deep}.pl`.
 - **reverse (opt_strat 13):** `reverse` in a closed map/grep body fans
   out with mappar. Map list reverse concatenates; `scalar reverse` is
@@ -4205,14 +4206,20 @@ arbitrary blocks.
   `tests/revpar_{smoke,deep}.pl`.
 - **interp / qr (opt_strat 14):** closed `/$p/`, `$_ =~ /$p/`, and
   `$_ =~ qr/pat/` in a grep body fan out with mappar when the pattern is
-  `$_` or a body-`my` (interp LRU is per-thread). An outer `$pat`, `/g`,
-  subst, and `map { /$p/ }` stay sequential. Knob `mappar`. Tests:
+  `$_` or a body-`my` (interp LRU is per-thread). A file-scope outer
+  `$pat` fans out (opt_strat 15). `/g`, subst, a nested-lexical `$pat`,
+  and `map { /$p/ }` stay sequential. Knob `mappar`. Tests:
   `tests/interppar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
+- **read-only file-scope scalars (opt_strat 15):** file-scope `my`/`our`
+  scalars that a closed map/grep body only reads fan out with mappar
+  (workers load the GV). A nested lexical and any outer write stay
+  sequential. Named arrays stay sequential. Knob `mappar`. Tests:
+  `tests/roscpar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
 - **Still sequential:** live-length foreach that `push`es the iterated
   array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
   reductions; arbitrary blocks; impure / named-sub sort; C-style
   `for ($i = LO; …)` without `my` (post-loop `$i`); regex that needs
-  capture globals, `/g`, subst, or an outer interpolated `$pat`. Regex residual perlc leftovers
+  capture globals, `/g`, subst, or a nested-lexical interpolated `$pat`. Regex residual perlc leftovers
   (subject promote skip, void `$count++`) landed. A C `/lit\d+_lit/`
   scanner lost to pcre2 JIT (opt_strat 8, not landed). Remaining: a
   different match engine. Next candidates: `docs/opt_strat.md`.

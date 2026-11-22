@@ -9561,7 +9561,8 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
      - workers setjmp; `/` `%` / die record per-chunk and rethrow after join
      - no calls, I/O, last/next/redo, local, eval, hashes, pop
      - boolean literal /pat/ (no /g) when the unit does not read $1/$&
-     - closed interp / $s =~ EXPR / qr (no /g); outer $pat stays sequential
+     - closed interp / $s =~ EXPR / qr (no /g); nested-lexical $pat stays sequential
+     - read-only file-scope / our scalars (workers load the GV; nested lexicals no)
      - closed split (string or regex) and pack; regex split refuses $1/$& /g
      - closed unpack (list-concat in map; scalar first field in grep)
      - closed reverse (list-concat) and scalar reverse (1:1 string)
@@ -9656,7 +9657,17 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
     auto readableScalar = [&](const Node &t) -> bool {
         if (t.kind != NK::ScalarVar) return false;
         std::string b = bareVarName(t.name);
-        return locals.count(b) || mapParIsAliasName(t.name, aliasBare);
+        if (locals.count(b) || mapParIsAliasName(t.name, aliasBare))
+            return true;
+        /* File-scope my/our live in GVs workers can load. A nested
+           lexical is an alloca in the parent function and is not in
+           the worker's scope. Writes of outer scalars stay off via
+           writableScalar. */
+        if (fileScalarGlobals_.count(b)) return true;
+        if (!currentPackage_.empty() &&
+            fileScalarGlobals_.count(currentPackage_ + "::" + b))
+            return true;
+        return false;
     };
     auto isLoopIndex = [&](const Node *idx) -> bool {
         if (!idx) return false;
@@ -9838,7 +9849,8 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
             /* Boolean /pat/, /$p/, and $s =~ EXPR (no /g). Capture slots
                $1/$& are process-global, so a unit that reads them stays
                sequential. The interp LRU is per-thread; pcre2 match_data
-               is TLS. Outer $pat fails readableScalar. subst stays off. */
+               is TLS. Nested-lexical $pat fails readableScalar. subst
+               stays off. */
             if (asWrite) return false;
             if (matchAmpNeeded_ || matchCapsNeeded_) return false;
             if (e.name.find('g') != std::string::npos) return false;

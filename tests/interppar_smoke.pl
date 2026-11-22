@@ -1,8 +1,8 @@
 #!/usr/bin/env perl
 # Closed interp/qr match (interppar) smoke: small N stays sequential
 # (below PERLC_AUTOPAR_MIN) and matches real perl. A body-local /$p/
-# and $_ =~ $re are eligible; an outer $pat and /g stay on the
-# sequential fallback. Do not mention $1 / $& in this file.
+# and $_ =~ $re are eligible; /g stays on the sequential fallback.
+# Do not mention $1 / $& in this file.
 use strict;
 use warnings;
 
@@ -27,7 +27,7 @@ print "grep-sub: @from\n";
 my @m = map { my $p = "a"; /$p/ } @w;
 print "map-interp: @m\n";
 
-# refused (outer scalar read)
+# file-scope outer $pat is now eligible (opt_strat 15); keep as a match
 my $pat = "an";
 my @bad = grep { /$pat/ } @w;
 print "grep-outer: @bad\n";

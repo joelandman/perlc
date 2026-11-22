@@ -134,7 +134,7 @@ pcre2 LRU and skips `$1`/`%+` install unless the unit reads them.
 `tests/splitpar_{smoke,deep}.pl`.
 **Closed 2026-11-22 — opt_strat 12 (unpackpar):** `unpack` in closed
 map/grep. Map unpack is list-concat; grep unpack is the first field.
-`unpack($fmt, $_)` with an outer format stays sequential. Tests:
+File-scope `unpack($fmt, $_)` fans out (opt_strat 15). Tests:
 `tests/unpackpar_{smoke,deep}.pl`.
 **Closed 2026-11-22 — opt_strat 13 (revpar):** `reverse` in closed
 map/grep. List reverse concatenates; `scalar reverse` is 1:1 string
@@ -142,8 +142,13 @@ reverse (`emitArrayPtr` skips `scalar_ctx`). `reverse @outer` stays
 sequential. Tests: `tests/revpar_{smoke,deep}.pl`.
 **Closed 2026-11-22 — opt_strat 14 (interppar):** closed `/$p/`,
 `$_ =~ /$p/`, and `$_ =~ qr/pat/` in map/grep when the pattern is `$_`
-or a body-`my`. Outer `$pat`, `/g`, and `map { /$p/ }` stay sequential.
+or a body-`my`. File-scope outer `$pat` fans out (opt_strat 15). `/g`,
+a nested-lexical `$pat`, and `map { /$p/ }` stay sequential.
 Tests: `tests/interppar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 15 (roscpar):** read-only file-scope
+`my`/`our` scalars in closed map/grep (workers load the GV). Nested
+lexicals and outer writes stay sequential. Tests:
+`tests/roscpar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.
