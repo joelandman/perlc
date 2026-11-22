@@ -150,6 +150,15 @@ stays sequential. Knob: `mappar`. Tests:
 `tests/unpackpar_{smoke,deep}.pl` — print numeric fields, not packed
 binary.
 
+### 13. Closed `reverse` in mappar — closed this session
+
+`reverse` is list-context in a map block (`map { reverse $_ }` is a
+1-element identity) and string-reverse under `scalar` or grep.
+`emitArrayPtr` now skips `sval=="scalar_ctx"` so `map { scalar reverse $_ }`
+does not flatten as list reverse (same stamp as D142 localtime).
+`reverse @outer` stays sequential. Knob: `mappar`. Tests:
+`tests/revpar_{smoke,deep}.pl`.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -173,7 +182,7 @@ binary.
 
 ## Practical order
 
-(1)–(7) and (9)–(12) landed this session. (8) is the pcre2 leftover of
+(1)–(7) and (9)–(13) landed this session. (8) is the pcre2 leftover of
 (4): a C concatenation scanner was measured slower than JIT and was
 not landed. Remaining of (4) is a different match engine. Parallelism
 will not move it.

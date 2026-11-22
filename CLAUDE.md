@@ -136,6 +136,10 @@ pcre2 LRU and skips `$1`/`%+` install unless the unit reads them.
 map/grep. Map unpack is list-concat; grep unpack is the first field.
 `unpack($fmt, $_)` with an outer format stays sequential. Tests:
 `tests/unpackpar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 13 (revpar):** `reverse` in closed
+map/grep. List reverse concatenates; `scalar reverse` is 1:1 string
+reverse (`emitArrayPtr` skips `scalar_ctx`). `reverse @outer` stays
+sequential. Tests: `tests/revpar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

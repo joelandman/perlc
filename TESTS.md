@@ -4140,7 +4140,8 @@ arbitrary blocks.
   `tests/idxpar_{smoke,deep}.pl`,
   `tests/joinpar_{smoke,deep}.pl`,
   `tests/splitpar_{smoke,deep}.pl`,
-  `tests/unpackpar_{smoke,deep}.pl`.
+  `tests/unpackpar_{smoke,deep}.pl`,
+  `tests/revpar_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
@@ -4195,6 +4196,11 @@ arbitrary blocks.
   first field as a boolean. `unpack($fmt, $_)` with an outer format
   stays sequential. Knob `mappar`. Tests:
   `tests/unpackpar_{smoke,deep}.pl`.
+- **reverse (opt_strat 13):** `reverse` in a closed map/grep body fans
+  out with mappar. Map list reverse concatenates; `scalar reverse` is
+  a 1:1 string (`emitArrayPtr` skips `scalar_ctx`, same stamp as D142
+  localtime). `reverse @outer` stays sequential. Knob `mappar`. Tests:
+  `tests/revpar_{smoke,deep}.pl`.
 - **Still sequential:** live-length foreach that `push`es the iterated
   array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
   reductions; arbitrary blocks; impure / named-sub sort; C-style

@@ -2272,8 +2272,11 @@ Value *CodeGen::emitArrayPtr(const Node &n) {
         freeIfOwned(hi);
         return arr;
     }
-    if (n.kind == NK::ReverseFunc) {
-        /* reverse @arr or reverse LIST — return new reversed array */
+    if (n.kind == NK::ReverseFunc && n.sval != "scalar_ctx") {
+        /* reverse @arr or reverse LIST — return new reversed array.
+           Explicit `scalar reverse` (parser stamps sval="scalar_ctx")
+           must fall through to emitExpr: map { scalar reverse $_ }
+           yields the reversed string, not a 1-element list reverse. */
         Value *av = nullptr;
         if (n.args.size() == 1) av = emitArrayPtr(*n.args[0]);
         if (!av) {
@@ -9536,6 +9539,7 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
      - boolean literal /pat/ (no /g) when the unit does not read $1/$&
      - closed split (string or regex) and pack; regex split refuses $1/$& /g
      - closed unpack (list-concat in map; scalar first field in grep)
+     - closed reverse (list-concat) and scalar reverse (1:1 string)
      - append-only `push @b` (dest != iterated array) reuses concat slots
      - ordered i64 `$s +=` / `$s -=` uses per-chunk partials; die in an
        append/reduce body stays sequential (prefix side effects)
@@ -9591,6 +9595,9 @@ bool CodeGen::mapParScalarYield(const Node &n) const {
            not a 1:1 boolean. Grep uses scalar /pat/ via perl_is_true.
            split/unpack yield fields (concat). */
         return false;
+    case NK::ReverseFunc:
+        /* List reverse concatenates; `scalar reverse` is a 1:1 string. */
+        return e->sval == "scalar_ctx";
     case NK::PostfixDeref:
         if (e->sval == "all_array" || e->sval == "slice_array" ||
             e->sval == "all_hash"  || e->sval == "slice_hash")
@@ -9768,6 +9775,7 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
         case NK::JoinFunc: case NK::SprintfFunc:
         case NK::HexFunc: case NK::OctFunc:
         case NK::PackFunc: case NK::SplitFunc: case NK::UnpackFunc:
+        case NK::ReverseFunc:
             /* 4-arg substr($s,off,len,$repl) writes $s in place; lvalue
                substr(...) = is asWrite. Both stay sequential. */
             if (asWrite) return false;
@@ -10002,6 +10010,7 @@ bool CodeGen::mapParListYield(const Node &n) const {
         (e->sval == "all_array" || e->sval == "slice_array"))
         return true;
     if (e->kind == NK::SplitFunc || e->kind == NK::UnpackFunc) return true;
+    if (e->kind == NK::ReverseFunc && e->sval != "scalar_ctx") return true;
     return false;
 }
 
