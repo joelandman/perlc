@@ -316,6 +316,10 @@ private:
        array-ref alias, so D105 promote (FLAT/FLOAT_PAIR → REF_ARRAY) is
        a no-op for the match and only adds a CFG diamond per element. */
     bool skipPromoteOnRead_ = false;
+    /* scanMatchGlobalUse: this unit reads $&/`/' (amp) or $1/%+ (caps).
+       Forces capture install and refuses regex in mappar. */
+    bool matchAmpNeeded_ = false;
+    bool matchCapsNeeded_ = false;
     /* D10: per-compilation counters (reset in compile()) */
     int sortCmpCounter_ = 0;
     int substEvalCounter_ = 0; /* D38c: unique names for s///e eval fns */

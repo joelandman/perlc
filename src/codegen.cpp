@@ -7131,6 +7131,8 @@ void CodeGen::compile(const Node &program, const std::string &modName,
     globIterSeq_ = 0;
     regexMemoSeq_ = 0;
     skipPromoteOnRead_ = false;
+    matchAmpNeeded_ = false;
+    matchCapsNeeded_ = false;
     lastSqrtInput_ = nullptr;
     floatSqrtOf_.clear();
 
@@ -7323,6 +7325,8 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             bool amp = false, caps = false, dynEval = false;
             scanMatchGlobalUse(program, amp, caps, dynEval);
             if (asEvalPad_ || dynEval) { amp = true; caps = true; }
+            matchAmpNeeded_ = amp;
+            matchCapsNeeded_ = caps;
             if (amp || caps) {
                 auto *i32g = Type::getInt32Ty(ctx_);
                 callRT("perl_set_match_globals_needed", {
@@ -7609,6 +7613,8 @@ void CodeGen::compile(const Node &program, const std::string &modName,
             bool amp = false, caps = false, dynEval = false;
             scanMatchGlobalUse(program, amp, caps, dynEval);
             if (asEvalPad_ || dynEval) { amp = true; caps = true; }
+            matchAmpNeeded_ = amp;
+            matchCapsNeeded_ = caps;
             if (amp || caps) {
                 auto *i32g = Type::getInt32Ty(ctx_);
                 callRT("perl_set_match_globals_needed", {
@@ -9526,7 +9532,8 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
        loop var (disjoint slots)
      - list-yielding map uses per-chunk arrays + ordered concat
      - workers setjmp; `/` `%` / die record per-chunk and rethrow after join
-     - no calls, I/O, last/next/redo, local, eval, regex, hashes, pop
+     - no calls, I/O, last/next/redo, local, eval, hashes, pop
+     - boolean literal /pat/ (no /g) when the unit does not read $1/$&
      - append-only `push @b` (dest != iterated array) reuses concat slots
      - ordered i64 `$s +=` / `$s -=` uses per-chunk partials; die in an
        append/reduce body stays sequential (prefix side effects)
@@ -9576,6 +9583,9 @@ bool CodeGen::mapParScalarYield(const Node &n) const {
     case NK::ArrayVar: case NK::DerefArray: case NK::ArrayLit:
     case NK::Range: case NK::MapFunc: case NK::GrepFunc: case NK::SortFunc:
     case NK::RepeatArray:
+    case NK::RegexMatch: case NK::RegexMatchExpr: case NK::RegexMatchInterp:
+        /* List-context match yields the capture list (empty on failure),
+           not a 1:1 boolean. Grep uses scalar /pat/ via perl_is_true. */
         return false;
     case NK::PostfixDeref:
         if (e->sval == "all_array" || e->sval == "slice_array" ||
@@ -9772,6 +9782,16 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
         case NK::DieStmt:
             if (asWrite) return false;
             return !e.left || exprOk(*e.left, false);
+        case NK::RegexMatch: {
+            /* Boolean literal /pat/ (no /g). Capture slots $1/$& are
+               process-global, so a unit that reads them stays sequential
+               (last successful match is ordered). Interp / $s =~ EXPR /
+               subst remain refused. pcre2 match_data is already TLS. */
+            if (asWrite) return false;
+            if (matchAmpNeeded_ || matchCapsNeeded_) return false;
+            if (e.name.find('g') != std::string::npos) return false;
+            return e.left && exprOk(*e.left, false);
+        }
         default:
             return false;
         }
@@ -9802,7 +9822,7 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
             st.kind == NK::ShiftExpr || st.kind == NK::UnshiftStmt || st.kind == NK::UnshiftStmt2 ||
             st.kind == NK::SpliceFunc || st.kind == NK::KeysFunc || st.kind == NK::ValuesFunc ||
             st.kind == NK::EachFunc || st.kind == NK::MapFunc || st.kind == NK::GrepFunc ||
-            st.kind == NK::SortFunc || st.kind == NK::RegexMatch || st.kind == NK::RegexMatchExpr ||
+            st.kind == NK::SortFunc || st.kind == NK::RegexMatchExpr ||
             st.kind == NK::RegexSubst || st.kind == NK::CaptureVar || st.kind == NK::DollarAt)
             return false;
         if (st.kind == NK::DieStmt)

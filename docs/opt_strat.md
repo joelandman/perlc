@@ -55,8 +55,7 @@ File-scope `my $count = 0` is not int-promoted, which is the regex3m
 shape. Tests: `tests/regex_residual_{smoke,deep}.pl`.
 
 Still open: a different match strategy (the pcre2 cliff). Parallel
-`grep { /pat/ }` is a separate, smaller slice: capture globals (`$1`,
-`$&`) are why regex is refused in `mapParBodyPurity` today.
+boolean `grep { /pat/ }` closed as item 7.
 
 ### 5. Closed `sort` with a pure comparator — closed this session
 
@@ -81,6 +80,24 @@ C-style semantics). Live bounds (`$i < foo()`, `$i < $n` while `$n +=`)
 stay sequential. Knob: `PERLC_OPT_DISABLE=mappar` (also off with
 `autopar`). Tests: `tests/cforpar_{smoke,deep}.pl`.
 
+### 7. Parallel boolean `grep { /pat/ }` — closed this session
+
+`mapParBodyPurity` refused every regex because `$1`/`$&`/`$``/`$'`/`%+`
+are process-global capture slots. Sequential grep leaves the last
+successful match in those slots; parallel workers would race them.
+Boolean literal `NK::RegexMatch` (no `/g`, no subst, no interp, no
+`$s =~ EXPR`) is now allowed in map/grep/foreach-par bodies when this
+compilation unit does not read those globals (`scanMatchGlobalUse` sets
+`matchAmpNeeded_` / `matchCapsNeeded_`; string `eval` forces both on).
+pcre2 `match_data` is already TLS; capture install is skipped when the
+flags are off. A `$1` anywhere in the unit keeps every regex sequential.
+`grep { /pat/ }`, `grep /pat/, LIST`, `!/pat/`, and `/i`/`m`/`s`/`x`
+share the same purity. `map { /pat/ }` stays sequential: list-context
+match yields the capture list (empty on failure), not a 1:1 boolean.
+Knob: `mappar` (also off with `autopar`). Tests:
+`tests/greppar_{smoke,deep}.pl` — those files must not mention `$1`/`$&`
+or the eligible greps stay sequential.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -104,5 +121,5 @@ stay sequential. Knob: `PERLC_OPT_DISABLE=mappar` (also off with
 
 ## Practical order
 
-(1)–(6) and the perlc-side of (4) landed this session. Remaining of
+(1)–(7) and the perlc-side of (4) landed this session. Remaining of
 (4) is the pcre2 match strategy (parallelism will not move it).

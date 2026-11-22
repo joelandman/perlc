@@ -4103,8 +4103,10 @@ arbitrary blocks.
   alias, body-`my` scalars, and literals; it may write the alias cell
   (map/grep/foreach-@arr) and those locals; `/` `%` and `die` are allowed
   (worker setjmp). Nested `$x->[i] =` is refused (shared referents).
-  Calls, I/O, last/next/redo, `local`, eval, regex, hashes, and push/pop
-  stay sequential. Bare `{ k => v }` pairs stay sequential. A 1-element
+  Calls, I/O, last/next/redo, `local`, eval, hashes, and push/pop
+  stay sequential. Boolean literal `/pat/` (no `/g`) is allowed when
+  the unit does not read `$1`/`$&`/`$``/`$'`/`%+`. Interp, `$s =~ EXPR`,
+  subst, and `/g` stay sequential. Bare `{ k => v }` pairs stay sequential. A 1-element
   `ArrayLit` is a paren group `(expr)`, same as Stage 41 `fkNoRowTouch`.
 - **Emission:** snapshot `perl_array_len` (foreach: `perl_array_len_i64`)
   once. Bound `>= PERLC_AUTOPAR_MIN` (default 8192) fans out through
@@ -4133,7 +4135,8 @@ arbitrary blocks.
 - **Tests:** `tests/mappar_{smoke,deep}.pl`,
   `tests/foreachpar_{smoke,deep}.pl`, `tests/rangepar_{smoke,deep}.pl`,
   `tests/mapconcat_{smoke,deep}.pl`, `tests/mapdie_{smoke,deep}.pl`,
-  `tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`.
+  `tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`,
+  `tests/greppar_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
@@ -4161,13 +4164,20 @@ arbitrary blocks.
   rangepar worker. The index is read-only in the par body. Live bounds
   and `$i++` then `$a[$i]` stay sequential. Knob `mappar`. Tests:
   `tests/cforpar_{smoke,deep}.pl`.
+- **Boolean grep /pat/ (opt_strat 7):** literal `NK::RegexMatch` in a
+  closed grep body fans out when the compilation unit does not read
+  capture globals (pcre2 match_data is TLS; `$1`/`$&` install is skipped).
+  A `$1` anywhere in the unit keeps every regex sequential. `/g`, subst,
+  interp, `$s =~ EXPR`, and `map { /pat/ }` (list-context capture list,
+  empty on failure) stay sequential. Knob `mappar`. Tests:
+  `tests/greppar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
 - **Still sequential:** live-length foreach that `push`es the iterated
   array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
   reductions; arbitrary blocks; impure / named-sub sort; C-style
-  `for ($i = LO; …)` without `my` (post-loop `$i`). Regex residual
-  perlc leftovers (subject promote skip, void `$count++`) landed; the
-  pcre2 match strategy and parallel `grep { /pat/ }` remain. Next
-  candidates: `docs/opt_strat.md`.
+  `for ($i = LO; …)` without `my` (post-loop `$i`); regex that needs
+  capture globals, `/g`, subst, or interp. Regex residual perlc leftovers
+  (subject promote skip, void `$count++`) landed; the pcre2 match
+  strategy remains. Next candidates: `docs/opt_strat.md`.
 
 ### Native stdlib waves 1–3 (2026-09-22)
 
