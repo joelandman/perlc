@@ -101,7 +101,8 @@ on an unboxed int; float stays sequential). Tests:
 `tests/feappend_{smoke,deep}.pl`, `tests/fereduce_{smoke,deep}.pl`.
 **Closed 2026-11-22 — opt_strat 4 perlc leftovers:** match-subject
 D105 promote skip and void boxed `$count++` (`tests/regex_residual_{smoke,deep}.pl`).
-pcre2 match strategy stays open.
+pcre2 match strategy stays open (a C concatenation scanner lost to
+JIT; see opt_strat 8).
 **Closed 2026-11-22 — opt_strat 5 (sortpar):** stable mergesort (perl
 contract; qsort was not stable). Closed `$a`/`$b` comparators and
 builtin num/str sorts parallel-merge on the Stage-45 pool; impure
@@ -117,6 +118,8 @@ in closed grep (no `/g`, no subst, no interp) parallelizes when the
 compilation unit does not read `$1`/`$&`. `map { /pat/ }` stays
 sequential (list-context capture list). Tests:
 `tests/greppar_{smoke,deep}.pl`.
+**Measured 2026-11-22 — opt_strat 8:** a C `/lit\d+_lit/` scanner
+matched perl but was slower than pcre2 JIT on regex_heavy; not landed.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

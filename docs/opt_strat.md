@@ -54,8 +54,11 @@ alias) and statement-context `$count++` / `$count--` on a boxed PV
 File-scope `my $count = 0` is not int-promoted, which is the regex3m
 shape. Tests: `tests/regex_residual_{smoke,deep}.pl`.
 
-Still open: a different match strategy (the pcre2 cliff). Parallel
-boolean `grep { /pat/ }` closed as item 7.
+**Item 8 (pcre2 leftover) measured this session, not landed:** a C
+concatenation scanner for `/item_\d+_match/` matched perl but lost to
+pcre2 JIT (~33% slower on `regex_heavy` 1e6×40 at `-O2` LTO). The
+cliff is a different engine (SIMD/batch/hyperscan), not a hand-rolled
+boolean NFA. Parallel boolean `grep { /pat/ }` closed as item 7.
 
 ### 5. Closed `sort` with a pure comparator — closed this session
 
@@ -98,6 +101,17 @@ Knob: `mappar` (also off with `autopar`). Tests:
 `tests/greppar_{smoke,deep}.pl` — those files must not mention `$1`/`$&`
 or the eligible greps stay sequential.
 
+### 8. Simple boolean match vs pcre2 JIT — measured, not taken
+
+After memo slots, promote skip, and void `$count++`, regex3m is ~90%
+libpcre2. A boolean concatenation matcher (`^? (lit | \d | \d+ | \d* )* $?`,
+empty flags, ASCII `\d`, `$` before a final newline) was written on the
+memo path and gated vs perl. It is **not landed**: at `-O2` LTO,
+`bench/regex_heavy.pl 1000000 40` was ~1.08s with the scanner vs
+~0.81s with pcre2 JIT (same match count). A C byte-scan of short
+subjects does not beat JIT. Remaining of (4): a different engine
+(SIMD/batch/hyperscan), not another per-call NFA.
+
 ## Non-goals (do not review next)
 
 - Arbitrary-block parallel
@@ -121,5 +135,7 @@ or the eligible greps stay sequential.
 
 ## Practical order
 
-(1)–(7) and the perlc-side of (4) landed this session. Remaining of
-(4) is the pcre2 match strategy (parallelism will not move it).
+(1)–(7) landed this session. (8) is the pcre2 leftover of (4): a C
+concatenation scanner was measured slower than JIT and was not landed.
+Remaining of (4) is a different match engine. Parallelism will not
+move it.
