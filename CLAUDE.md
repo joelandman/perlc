@@ -149,6 +149,10 @@ Tests: `tests/interppar_{smoke,deep}.pl`.
 `my`/`our` scalars in closed map/grep (workers load the GV). Nested
 lexicals and outer writes stay sequential. Tests:
 `tests/roscpar_{smoke,deep}.pl`.
+**Closed 2026-11-22 — opt_strat 16 (nlcapar):** read-only nested
+lexicals (`sub { my $p; grep { /$p/ } }`) are passed into mappar
+workers via extra ctx slots. Outer writes stay sequential. Tests:
+`tests/nlcapar_{smoke,deep}.pl`.
 Review list: `docs/opt_strat.md`. Outer-loop batch dispatch for the mbs
 shape landed as `outerpar` (2026-11-07). Do not auto-parallel arbitrary
 blocks.

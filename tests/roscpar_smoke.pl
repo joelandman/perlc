@@ -1,8 +1,8 @@
 #!/usr/bin/env perl
 # Read-only file-scope scalars (roscpar) smoke: small N stays sequential
 # (below PERLC_AUTOPAR_MIN) and matches real perl. File-scope $pat/$k/$fmt
-# are eligible; a nested lexical and an outer write stay on the sequential
-# fallback. Do not mention $1 / $& in this file.
+# are eligible; an outer write stays on the sequential fallback. Nested
+# lexicals are item 16. Do not mention $1 / $& in this file.
 use strict;
 use warnings;
 
@@ -20,7 +20,7 @@ my $fmt = "A*";
 my @u = map { unpack($fmt, $_) } @w;
 print "map-fmt: @u\n";
 
-# refused (nested lexical is a parent alloca, not a GV)
+# file-scope test keeps a nested lexical as a match (opt_strat 16)
 sub inner {
     my $p = "a";
     return grep { /$p/ } @_;

@@ -4143,7 +4143,8 @@ arbitrary blocks.
   `tests/unpackpar_{smoke,deep}.pl`,
   `tests/revpar_{smoke,deep}.pl`,
   `tests/interppar_{smoke,deep}.pl`,
-  `tests/roscpar_{smoke,deep}.pl`.
+  `tests/roscpar_{smoke,deep}.pl`,
+  `tests/nlcapar_{smoke,deep}.pl`.
   Deep uses bound 13005 so the pool path runs. Smoke covers refused
   outer-accumulator, nested-store, `$a[$i+1]`, and `$i++` then store
   shapes on the sequential fallback.
@@ -4213,13 +4214,19 @@ arbitrary blocks.
 - **read-only file-scope scalars (opt_strat 15):** file-scope `my`/`our`
   scalars that a closed map/grep body only reads fan out with mappar
   (workers load the GV). A nested lexical and any outer write stay
-  sequential. Named arrays stay sequential. Knob `mappar`. Tests:
+  sequential until item 16. Named arrays stay sequential. Knob `mappar`. Tests:
   `tests/roscpar_{smoke,deep}.pl` (must not mention `$1`/`$&`).
+- **nested-lexical capture (opt_strat 16):** a sub- or block-scoped
+  `my $p` that a closed map/grep body only reads is passed into the
+  worker as an extra ctx slot (parent alloca; same idea as sort D61).
+  Outer writes stay sequential. Named arrays stay sequential. Knob
+  `mappar`. Tests: `tests/nlcapar_{smoke,deep}.pl` (must not mention
+  `$1`/`$&`).
 - **Still sequential:** live-length foreach that `push`es the iterated
   array; `$a[$i+1]` / `$i++` then `$a[$i]` range or C-style bodies; float
   reductions; arbitrary blocks; impure / named-sub sort; C-style
   `for ($i = LO; …)` without `my` (post-loop `$i`); regex that needs
-  capture globals, `/g`, subst, or a nested-lexical interpolated `$pat`. Regex residual perlc leftovers
+  capture globals, `/g`, subst, or a write of an outer interpolated `$pat`. Regex residual perlc leftovers
   (subject promote skip, void `$count++`) landed. A C `/lit\d+_lit/`
   scanner lost to pcre2 JIT (opt_strat 8, not landed). Remaining: a
   different match engine. Next candidates: `docs/opt_strat.md`.

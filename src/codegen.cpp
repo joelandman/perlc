@@ -9561,8 +9561,9 @@ static bool packFlatScanOk(const Node &n, const std::string &anm, bool &foundMy,
      - workers setjmp; `/` `%` / die record per-chunk and rethrow after join
      - no calls, I/O, last/next/redo, local, eval, hashes, pop
      - boolean literal /pat/ (no /g) when the unit does not read $1/$&
-     - closed interp / $s =~ EXPR / qr (no /g); nested-lexical $pat stays sequential
-     - read-only file-scope / our scalars (workers load the GV; nested lexicals no)
+     - closed interp / $s =~ EXPR / qr (no /g)
+     - read-only file-scope / our scalars (workers load the GV)
+     - read-only nested lexicals (parent allocas passed in extra ctx slots)
      - closed split (string or regex) and pack; regex split refuses $1/$& /g
      - closed unpack (list-concat in map; scalar first field in grep)
      - closed reverse (list-concat) and scalar reverse (1:1 string)
@@ -9659,14 +9660,15 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
         std::string b = bareVarName(t.name);
         if (locals.count(b) || mapParIsAliasName(t.name, aliasBare))
             return true;
-        /* File-scope my/our live in GVs workers can load. A nested
-           lexical is an alloca in the parent function and is not in
-           the worker's scope. Writes of outer scalars stay off via
-           writableScalar. */
+        /* File-scope my/our live in GVs workers can load. Nested
+           lexicals are parent allocas; workers rematerialize them
+           from extra ctx slots (opt_strat 16). Writes of outer
+           scalars stay off via writableScalar. */
         if (fileScalarGlobals_.count(b)) return true;
         if (!currentPackage_.empty() &&
             fileScalarGlobals_.count(currentPackage_ + "::" + b))
             return true;
+        if (mapParHasLexical(b)) return true;
         return false;
     };
     auto isLoopIndex = [&](const Node *idx) -> bool {
@@ -9849,8 +9851,7 @@ bool CodeGen::mapParBodyPurity(const Node &s, const std::string &aliasBare,
             /* Boolean /pat/, /$p/, and $s =~ EXPR (no /g). Capture slots
                $1/$& are process-global, so a unit that reads them stays
                sequential. The interp LRU is per-thread; pcre2 match_data
-               is TLS. Nested-lexical $pat fails readableScalar. subst
-               stays off. */
+               is TLS. subst stays off. */
             if (asWrite) return false;
             if (matchAmpNeeded_ || matchCapsNeeded_) return false;
             if (e.name.find('g') != std::string::npos) return false;
@@ -10148,9 +10149,65 @@ void CodeGen::emitMapGrepParIter(const Node &n, bool isMap, bool concat,
     }
 }
 
+bool CodeGen::mapParHasLexical(const std::string &bare) const {
+    for (int i = (int)scopes_.size() - 1; i >= 0; i--)
+        if (scopes_[i].count(bare)) return true;
+    for (int i = (int)intScopes_.size() - 1; i >= 0; i--)
+        if (intScopes_[i].count(bare)) return true;
+    for (int i = (int)floatScopes_.size() - 1; i >= 0; i--)
+        if (floatScopes_[i].count(bare)) return true;
+    return false;
+}
+
+std::vector<std::string> CodeGen::mapParOuterCapNames(const Node &body,
+                                                      const std::string &aliasBare) {
+    std::set<std::string> used;
+    collectAllScalarNames(body, used);
+    std::vector<std::string> names;
+    for (auto &nm : used) {
+        if (nm.empty() || nm == "_" || mapParIsAliasName(nm, aliasBare))
+            continue;
+        if (mapParHasLexical(nm))
+            names.push_back(nm);
+    }
+    return names;
+}
+
+Value *CodeGen::mapParLoadOuterCap(const std::string &bare) {
+    for (int i = (int)scopes_.size() - 1; i >= 0; i--) {
+        auto it = scopes_[i].find(bare);
+        if (it != scopes_[i].end())
+            return builder_.CreateLoad(perlPtrTy_, it->second, bare + ".capv");
+    }
+    if (Value *ia = lookupIntVar(bare)) {
+        Value *iv = builder_.CreateLoad(Type::getInt64Ty(ctx_), ia);
+        return boxI64(iv);
+    }
+    if (Value *fa = lookupFloatVar(bare)) {
+        Value *fv = builder_.CreateLoad(Type::getDoubleTy(ctx_), fa);
+        return boxF64(fv);
+    }
+    return nullptr;
+}
+
+void CodeGen::mapParBindOuterCaps(Value *ctxArg, int baseOff,
+                                 const std::vector<std::string> &names) {
+    auto *i64 = Type::getInt64Ty(ctx_);
+    for (size_t i = 0; i < names.size(); i++) {
+        Value *cell = builder_.CreateGEP(perlPtrTy_, ctxArg,
+            ConstantInt::get(i64, (int64_t)baseOff + (int64_t)i),
+            names[i] + ".capp");
+        Value *pv = builder_.CreateLoad(perlPtrTy_, cell, names[i] + ".cap");
+        auto *slot = createEntryAlloca(perlPtrTy_, nullptr, names[i]);
+        builder_.CreateStore(pv, slot);
+        declareVar(names[i], slot);
+    }
+}
+
 llvm::Function *CodeGen::emitMapGrepParWorker(const Node &n, bool isMap,
                                               const std::string &aliasBare,
-                                              bool concat) {
+                                              bool concat,
+                                              const std::vector<std::string> &outerCaps) {
     auto *i64 = Type::getInt64Ty(ctx_);
     FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
         {perlPtrTy_, i64, i64}, false);
@@ -10212,6 +10269,7 @@ llvm::Function *CodeGen::emitMapGrepParWorker(const Node &n, bool isMap,
     Value *inputArr = builder_.CreateLoad(perlPtrTy_, inCell, "mappar.in");
     Value *outOrMask = builder_.CreateLoad(perlPtrTy_, outCell, "mappar.out");
     Value *dieSlot = builder_.CreateLoad(perlPtrTy_, dieCell, "mappar.die");
+    mapParBindOuterCaps(ctxArg, 3, outerCaps);
     auto *iSlot = createEntryAlloca(i64, nullptr, "mappar.i");
     auto *udAlloca = createEntryAlloca(perlPtrTy_, nullptr, "$_");
     builder_.CreateStore(lo, iSlot);
@@ -10265,8 +10323,11 @@ void CodeGen::emitMapGrepParDispatch(const Node &n, bool isMap, bool concat,
                                     Value *inputArr, Value *resultArr,
                                     Value *len) {
     auto *i64 = Type::getInt64Ty(ctx_);
+    const Node *bodyN = n.body ? n.body.get() : n.left.get();
+    std::vector<std::string> outerCaps;
+    if (bodyN) outerCaps = mapParOuterCapNames(*bodyN, "_");
     auto *ctxArr = builder_.CreateAlloca(perlPtrTy_,
-        ConstantInt::get(i64, 3), "mappar.ctx");
+        ConstantInt::get(i64, (int64_t)(3 + outerCaps.size())), "mappar.ctx");
     builder_.CreateStore(inputArr,
         builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 0)));
     Value *outOrMask = resultArr;
@@ -10281,7 +10342,14 @@ void CodeGen::emitMapGrepParDispatch(const Node &n, bool isMap, bool concat,
     Value *dieSlot = callRT("perl_mappar_die_new", {});
     builder_.CreateStore(dieSlot,
         builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, 2)));
-    Function *wfn = emitMapGrepParWorker(n, isMap, "_", concat);
+    for (size_t i = 0; i < outerCaps.size(); i++) {
+        Value *pv = mapParLoadOuterCap(outerCaps[i]);
+        if (!pv) pv = perlUndef();
+        builder_.CreateStore(pv,
+            builder_.CreateGEP(perlPtrTy_, ctxArr,
+                ConstantInt::get(i64, (int64_t)(3 + i))));
+    }
+    Function *wfn = emitMapGrepParWorker(n, isMap, "_", concat, outerCaps);
     callRT("perl_autopar_run", {wfn, ctxArr, len});
     callRT("perl_mappar_die_raise", {dieSlot});
     callRT("perl_mappar_die_free", {dieSlot});
@@ -10297,7 +10365,8 @@ void CodeGen::emitMapGrepParDispatch(const Node &n, bool isMap, bool concat,
 llvm::Function *CodeGen::emitForeachParWorker(const Node &n,
                                               const std::string &aliasBare,
                                               const std::string &appendDest,
-                                              const std::string &reduceName) {
+                                              const std::string &reduceName,
+                                              const std::vector<std::string> &outerCaps) {
     auto *i64 = Type::getInt64Ty(ctx_);
     FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
         {perlPtrTy_, i64, i64}, false);
@@ -10374,6 +10443,7 @@ llvm::Function *CodeGen::emitForeachParWorker(const Node &n,
         builder_.CreateStore(ConstantInt::get(i64, 0), accAlloca);
         declareIntVar(reduceName, accAlloca);
     }
+    mapParBindOuterCaps(ctxArg, ctxOff, outerCaps);
     auto *iSlot = createEntryAlloca(i64, nullptr, "fepar.i");
     auto *loopVar = createEntryAlloca(perlPtrTy_, nullptr, aliasBare);
     builder_.CreateStore(lo, iSlot);
@@ -10480,7 +10550,10 @@ bool CodeGen::tryEmitForeachArrPar(const Node &n, Value *tmpArr,
     builder_.CreateCondBr(enough, parBB, seqBB);
 
     builder_.SetInsertPoint(parBB);
-    int nctx = 2 + (appendDest.empty() ? 0 : 1) + (reduceName.empty() ? 0 : 1);
+    std::vector<std::string> outerCaps;
+    if (n.body) outerCaps = mapParOuterCapNames(*n.body, alias);
+    int nctx = 2 + (appendDest.empty() ? 0 : 1) + (reduceName.empty() ? 0 : 1)
+        + (int)outerCaps.size();
     auto *ctxArr = builder_.CreateAlloca(perlPtrTy_,
         ConstantInt::get(i64, nctx), "fepar.ctx");
     builder_.CreateStore(tmpArr,
@@ -10501,7 +10574,14 @@ bool CodeGen::tryEmitForeachArrPar(const Node &n, Value *tmpArr,
         builder_.CreateStore(redSlots,
             builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, off++)));
     }
-    Function *wfn = emitForeachParWorker(n, alias, appendDest, reduceName);
+    for (size_t i = 0; i < outerCaps.size(); i++) {
+        Value *pv = mapParLoadOuterCap(outerCaps[i]);
+        if (!pv) pv = perlUndef();
+        builder_.CreateStore(pv,
+            builder_.CreateGEP(perlPtrTy_, ctxArr,
+                ConstantInt::get(i64, (int64_t)(off + (int)i))));
+    }
+    Function *wfn = emitForeachParWorker(n, alias, appendDest, reduceName, outerCaps);
     callRT("perl_autopar_run", {wfn, ctxArr, len});
     callRT("perl_mappar_die_raise", {dieSlot});
     callRT("perl_mappar_die_free", {dieSlot});
@@ -10529,7 +10609,8 @@ bool CodeGen::tryEmitForeachArrPar(const Node &n, Value *tmpArr,
 
 llvm::Function *CodeGen::emitForeachRangeParWorker(const Node &n,
         const std::string &idxBare, const std::vector<std::string> &arrNames,
-        const std::string &appendDest, const std::string &reduceName) {
+        const std::string &appendDest, const std::string &reduceName,
+        const std::vector<std::string> &outerCaps) {
     auto *i64 = Type::getInt64Ty(ctx_);
     FunctionType *fty = FunctionType::get(Type::getVoidTy(ctx_),
         {perlPtrTy_, i64, i64}, false);
@@ -10614,6 +10695,7 @@ llvm::Function *CodeGen::emitForeachRangeParWorker(const Node &n,
         builder_.CreateStore(ConstantInt::get(i64, 0), accAlloca);
         declareIntVar(reduceName, accAlloca);
     }
+    mapParBindOuterCaps(ctxArg, extraOff, outerCaps);
     auto *offSlot = createEntryAlloca(i64, nullptr, "rangepar.off");
     auto *iterAlloca = createEntryAlloca(i64, nullptr, idxBare + ".i");
     builder_.CreateStore(lo, offSlot);
@@ -10738,8 +10820,11 @@ bool CodeGen::tryEmitForeachRangePar(const Node &n, const std::string &idxBare,
         for (Value *av : arrPtrs)
             callRT("perl_array_fill_undef", {av, need});
     }
+    std::vector<std::string> outerCaps;
+    if (n.body) outerCaps = mapParOuterCapNames(*n.body, idxBare);
     int nctx = (int)arrNames.size() + 2
-        + (appendDest.empty() ? 0 : 1) + (reduceName.empty() ? 0 : 1);
+        + (appendDest.empty() ? 0 : 1) + (reduceName.empty() ? 0 : 1)
+        + (int)outerCaps.size();
     auto *ctxArr = builder_.CreateAlloca(perlPtrTy_,
         ConstantInt::get(i64, nctx), "rangepar.ctx");
     builder_.CreateStore(builder_.CreateIntToPtr(lo, perlPtrTy_),
@@ -10764,8 +10849,15 @@ bool CodeGen::tryEmitForeachRangePar(const Node &n, const std::string &idxBare,
         builder_.CreateStore(redSlots,
             builder_.CreateGEP(perlPtrTy_, ctxArr, ConstantInt::get(i64, extra++)));
     }
+    for (size_t i = 0; i < outerCaps.size(); i++) {
+        Value *pv = mapParLoadOuterCap(outerCaps[i]);
+        if (!pv) pv = perlUndef();
+        builder_.CreateStore(pv,
+            builder_.CreateGEP(perlPtrTy_, ctxArr,
+                ConstantInt::get(i64, (int64_t)(extra + (int)i))));
+    }
     Function *wfn = emitForeachRangeParWorker(n, idxBare, arrNames,
-                                              appendDest, reduceName);
+                                              appendDest, reduceName, outerCaps);
     callRT("perl_autopar_run", {wfn, ctxArr, bound});
     callRT("perl_mappar_die_raise", {dieSlot});
     callRT("perl_mappar_die_free", {dieSlot});

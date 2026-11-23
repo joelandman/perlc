@@ -180,7 +180,45 @@ Workers only had `$_` / body-`my` in scope, so an outer `$pat` / `$fmt`
 now fan out. A nested lexical (`sub { my $p; grep { /$p/ } }`) and any
 write of an outer scalar stay sequential. Named arrays stay sequential.
 Knob: `mappar`. Tests: `tests/roscpar_{smoke,deep}.pl` — those files
-must not mention `$1`/`$&`.
+must not mention `$1`/`$&`. Nested-lexical capture is item 16.
+
+### 16. Nested-lexical capture into mappar workers — closed this session
+
+Item 15 loads file-scope GVs from a worker; a sub- or block-scoped
+`my $p` is an alloca in the parent function and is not in the worker's
+`scopes_`. Collect those read-only outer scalars, pass their PVs in
+extra ctx slots, and rematerialize them in the worker (same idea as
+sort's D61 captures). Writes of an outer scalar stay sequential.
+Named arrays stay sequential. Knob: `mappar`. Tests:
+`tests/nlcapar_{smoke,deep}.pl` — those files must not mention `$1`/`$&`.
+
+### 17. `map { /pat/ }` list-concat of captures
+
+Item 7 left `map { /pat/ }` sequential: list-context match yields the
+capture list (empty on failure), not a 1:1 boolean. Same concat slots
+as split/unpack. A `$1` anywhere in the unit, `/g`, and subst stay
+sequential. Knob: `mappar`. Tests: `tests/mapcap_{smoke,deep}.pl` —
+those files must not mention `$1`/`$&`.
+
+### 18. Closed non-mutating `tr///r` / `s///r`
+
+`tr///r` and `s///r` return a new string and do not write `$_`. Closed
+bodies that only read `$_` / body-`my` / captured outer scalars can fan
+out. In-place `tr///` and `s///` (no `/r`) stay sequential. Knob:
+`mappar`. Tests: `tests/trrpar_{smoke,deep}.pl`.
+
+### 19. Closed List::Util-shaped i64 folds
+
+`sum` / `min` / `max` over an int list is the same ordered i64 join as
+item 2 (`$s +=`). Float folds stay sequential (IEEE add is not
+associative). Knob: `mappar`. Tests: `tests/lutilpar_{smoke,deep}.pl`.
+
+### 20. Regex match engine (leftover of 4 / 8)
+
+regex3m is ~90% libpcre2. A C concatenation scanner lost to pcre2 JIT
+(item 8). Remaining work is a different engine (SIMD / batch /
+hyperscan-class), not another per-call NFA and not more mappar.
+Parallelism will not move it.
 
 ## Non-goals (do not review next)
 
@@ -205,7 +243,8 @@ must not mention `$1`/`$&`.
 
 ## Practical order
 
-(1)–(7) and (9)–(15) landed this session. (8) is the pcre2 leftover of
-(4): a C concatenation scanner was measured slower than JIT and was
-not landed. Remaining of (4) is a different match engine. Parallelism
-will not move it.
+(1)–(7) and (9)–(16) landed this session. (17)–(19) are further
+closed-body mappar slices. (8)/(20) is
+the pcre2 leftover of (4): a C concatenation scanner was measured
+slower than JIT and was not landed. Remaining of (4) is a different
+match engine. Parallelism will not move it.

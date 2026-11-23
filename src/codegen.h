@@ -186,9 +186,16 @@ public:
     bool mapParListYield(const Node &n) const;
     void emitParDiePrologue(llvm::Value *dieSlot, llvm::Value *iSlot);
     void emitParDieEpilogue();
+    bool mapParHasLexical(const std::string &bare) const;
+    std::vector<std::string> mapParOuterCapNames(const Node &body,
+                                                 const std::string &aliasBare);
+    llvm::Value *mapParLoadOuterCap(const std::string &bare);
+    void mapParBindOuterCaps(llvm::Value *ctxArg, int baseOff,
+                             const std::vector<std::string> &names);
     llvm::Function *emitMapGrepParWorker(const Node &n, bool isMap,
                                          const std::string &aliasBare,
-                                         bool concat);
+                                         bool concat,
+                                         const std::vector<std::string> &outerCaps);
     void emitMapGrepParIter(const Node &n, bool isMap, bool concat,
                             llvm::Value *elem, llvm::Value *udAlloca,
                             llvm::Value *outOrMask, llvm::Value *i);
@@ -198,7 +205,8 @@ public:
     llvm::Function *emitForeachParWorker(const Node &n,
                                          const std::string &aliasBare,
                                          const std::string &appendDest,
-                                         const std::string &reduceName);
+                                         const std::string &reduceName,
+                                         const std::vector<std::string> &outerCaps);
     bool tryEmitForeachArrPar(const Node &n, llvm::Value *tmpArr,
                               bool ownsTmpArr, bool ncTmp,
                               llvm::Value *ownedForeach,
@@ -209,7 +217,8 @@ public:
                                               const std::string &idxBare,
                                               const std::vector<std::string> &arrNames,
                                               const std::string &appendDest,
-                                              const std::string &reduceName);
+                                              const std::string &reduceName,
+                                              const std::vector<std::string> &outerCaps);
     bool tryEmitForeachRangePar(const Node &n, const std::string &idxBare,
                                 llvm::Value *lo, llvm::Value *hi,
                                 llvm::Function *fn, llvm::BasicBlock *exit,
