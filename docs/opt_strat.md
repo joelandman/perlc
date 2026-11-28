@@ -192,7 +192,7 @@ sort's D61 captures). Writes of an outer scalar stay sequential.
 Named arrays stay sequential. Knob: `mappar`. Tests:
 `tests/nlcapar_{smoke,deep}.pl` — those files must not mention `$1`/`$&`.
 
-### 17. `map { /pat/ }` list-concat of captures
+### 17. `map { /pat/ }` list-concat of captures — closed this session
 
 Item 7 left `map { /pat/ }` sequential: list-context match yields the
 capture list (empty on failure), not a 1:1 boolean. Same concat slots
@@ -207,7 +207,7 @@ bodies that only read `$_` / body-`my` / captured outer scalars can fan
 out. In-place `tr///` and `s///` (no `/r`) stay sequential. Knob:
 `mappar`. Tests: `tests/trrpar_{smoke,deep}.pl`.
 
-### 19. Closed List::Util-shaped i64 folds
+### 19. List::Util-shaped i64 folds — closed this session
 
 `sum` / `min` / `max` over an int list is the same ordered i64 join as
 item 2 (`$s +=`). Float folds stay sequential (IEEE add is not

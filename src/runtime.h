@@ -1022,6 +1022,12 @@ PerlValue *perl_hires_tv_interval(PerlValue *t0ref, PerlValue *t1ref); /* elapse
 PerlValue *perl_sum_list(PerlArray *a);         /* sum LIST — undef if empty */
 PerlValue *perl_min_list(PerlArray *a);         /* min LIST — undef if empty */
 PerlValue *perl_max_list(PerlArray *a);         /* max LIST — undef if empty */
+/* opt_strat 19: parallel sum/min/max over an all-int list. The runtime reads
+   the array length itself and branches on PERLC_AUTOPAR_MIN before fanning
+   out. Same result type as the sequential fold (sum→int, min/max→float). */
+PerlValue *perl_sum_list_par(PerlArray *a);
+PerlValue *perl_min_list_par(PerlArray *a);
+PerlValue *perl_max_list_par(PerlArray *a);
 PerlArray *perl_uniq_list(PerlArray *a);        /* uniq LIST — keeps first occurrence of each distinct value, anywhere in the list (D69: NOT consecutive-only, that was the bug) */
 
 /* ── sort with custom comparator ─────────────────────────────────────────── */

@@ -164,6 +164,29 @@ static bool hasInterpTrigger(const std::string &s) {
     return false;
 }
 
+/* opt_strat 19: true only when the input to a List::Util sum/min/max is
+   provably all-integers at compile time, so a parallel i64 fold is sound
+   (it won't silently lose a float that the sequential perl_sum_list /
+   perl_min_list / perl_max_list would otherwise produce). An int literal, a
+   unary-minus of an int literal, an ArrayLit of all such (a nested Range of
+   int-literal bounds counts too), and nothing else. */
+static bool nodeIsAllIntLiteral(const Node &n) {
+    switch (n.kind) {
+    case NK::IntLit:
+        return true;
+    case NK::UnaryOp:
+        return n.sval == "-" && n.left && nodeIsAllIntLiteral(*n.left);
+    case NK::ArrayLit:
+        for (const auto &e : n.args)
+            if (!e || !nodeIsAllIntLiteral(*e)) return false;
+        return true;
+    case NK::Range:
+        return n.left && n.right &&
+               nodeIsAllIntLiteral(*n.left) && nodeIsAllIntLiteral(*n.right);
+    default:
+        return false;
+    }
+}
 /* D64/D53: collect every scalar name referenced anywhere inside ANY
    closure (AnonSub, or sort{}'s custom comparator) nested within `n`, OR
    that ever has \$name (RefScalar) taken anywhere in `n` — used to decide
@@ -1030,6 +1053,12 @@ RT("perl_clear_named_captures", voidTy);
     RT("perl_sum_list",     pv,  av);
     RT("perl_min_list",     pv,  av);
     RT("perl_max_list",     pv,  av);
+    /* opt_strat 19: parallel sum/min/max over an all-int list. The runtime
+        reads the array length itself and branches on PERLC_AUTOPAR_MIN;
+        same result type as the sequential fold (sum→int, min/max→float). */
+    RT("perl_sum_list_par", pv,  av);
+    RT("perl_min_list_par", pv,  av);
+    RT("perl_max_list_par", pv,  av);
     RT("perl_uniq_list",    av,  av);
     /* sort with custom comparator — fn ptr passed as i8p (opaque pointer);
        third arg is the comparator's closure captures array (D61), may be
@@ -10063,6 +10092,16 @@ bool CodeGen::mapParListYield(const Node &n) const {
         return true;
     if (e->kind == NK::SplitFunc || e->kind == NK::UnpackFunc) return true;
     if (e->kind == NK::ReverseFunc && e->sval != "scalar_ctx") return true;
+    /* opt_strat 17: a bare `/pat/` / `/$p/` / `$s =~ EXPR` in a map BODY
+       yields the LIST-CONTEXT capture list (one "1" on a groupless match,
+       the captures when there are groups, empty on a miss) — exactly like
+       `my @m = ($str =~ /pat/). Same concat gather as split/unpack. The
+       unit reading $1/$& is refused by the purity walk, so $&/$1 here can't
+       race. `scalar /pat/` stays a scalar yield (its outer `scalar` node
+       isn't a regex, so mapParScalarYield handles it). */
+    if (e->kind == NK::RegexMatch || e->kind == NK::RegexMatchInterp ||
+        e->kind == NK::RegexMatchExpr)
+        return true;
     return false;
 }
 
@@ -17127,11 +17166,27 @@ Value *CodeGen::emitExpr(const Node &n) {
                 else     callRT("perl_array_push",   {av, emitExpr(*a)});
             }
         }
+        /* opt_strat 19: provably-all-int fold — single Range with
+           int-literal bounds, or an all-int literal list (possibly with a
+           nested Range), with no other args — takes the parallel i64 fold.
+           sum->int and min/max->float, matching the sequential runtime's
+           result types. Everything else falls through below. */
+        if ((n.kind == NK::SumFunc || n.kind == NK::MinFunc ||
+             n.kind == NK::MaxFunc) && !n.args.empty() &&
+            [&n] {
+                for (const auto &a : n.args)
+                    if (!nodeIsAllIntLiteral(*a)) return false;
+                return true;
+            }()) {
+            if (n.kind == NK::SumFunc)  return callRT("perl_sum_list_par", {av});
+            if (n.kind == NK::MinFunc)  return callRT("perl_min_list_par", {av});
+            return callRT("perl_max_list_par", {av});
+        }
         if (n.kind == NK::SumFunc)  return callRT("perl_sum_list", {av});
         if (n.kind == NK::MinFunc)  return callRT("perl_min_list", {av});
         if (n.kind == NK::MaxFunc)  return callRT("perl_max_list", {av});
-        /* D69: uniq in scalar context returns the COUNT of unique
-           elements (real List::Util's documented behavior) — this
+           /* D69: uniq in scalar context returns the COUNT of unique
+            elements (real List::Util's documented behavior) — this
            previously returned the *first* unique element's value instead,
            a second, separate bug from the consecutive-only dedup fixed in
            perl_uniq_list() itself (runtime.c). */

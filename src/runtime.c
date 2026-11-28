@@ -683,8 +683,11 @@ static PerlValue s_dollar_dot   = { .tag = PERL_INT,   .ival = 0 };
 static PerlValue s_dollar_comma = { .tag = PERL_UNDEF };
 /* $\ — output record separator (undef = no separator) */
 static PerlValue s_dollar_bsl   = { .tag = PERL_UNDEF };
-/* $& — last successful regex match string */
-static PerlValue s_dollar_amp   = { .tag = PERL_UNDEF };
+/* $& — last successful regex match string.  __thread: match globals are
+   per-match state, so concurrent worker threads (the Stage-45/46 auto-parallel
+   pool that fans out regex map/grep) must not share them — a data race here was
+   corrupting the heap (opt_strat 17).  Per-thread, matching real Perl. */
+static __thread PerlValue s_dollar_amp   = { .tag = PERL_UNDEF };
 /* $? — last wait(2)/system status word */
 static PerlValue s_dollar_question = { .tag = PERL_INT, .ival = 0 };
 
@@ -11695,8 +11698,12 @@ PerlArray *perl_range(PerlValue *from, PerlValue *to) {
 /* ── regex (PCRE2) ───────────────────────────────────────────────────────── */
 
 #define PERL_MAX_CAPTURES 10
-static PerlValue *perl_captures_[PERL_MAX_CAPTURES + 1];  /* $1..$10 */
-static PerlHash *perl_plus_hash = NULL;
+/* $1..$10 — per-match capture text.  __thread so the auto-parallel pool's
+   concurrent regex map/grep workers don't race on shared capture slots
+   (opt_strat 17); matches real Perl's per-thread match state. */
+static __thread PerlValue *perl_captures_[PERL_MAX_CAPTURES + 1];
+/* %+ named-capture hash — same per-thread rationale as above. */
+static __thread PerlHash *perl_plus_hash = NULL;
 static int s_match_amp_needed = 0;   /* $& / $` / $' appear in this process */
 static int s_match_caps_needed = 0;  /* $1..$n or %+ appear in this process */
 
@@ -14630,6 +14637,112 @@ PerlValue *perl_max_list(PerlArray *a) {
         if (v > m) m = v;
     }
     return perl_alloc_float(m);
+}
+
+/* ── List::Util parallel folds (opt_strat 19) ──────────────────────────── */
+
+/* opt_strat 19: fold [lo,hi) of arr into one i64 partial. op: 0=sum,
+   1=min, 2=max. All elements are provably integer (checked at codegen), so
+   perl_to_int is exact. *out is left 0 for an empty chunk. */
+static void parfold_chunk(PerlArray *arr, long long lo, long long hi,
+                          int op, long long *out) {
+    long long acc = 0;
+    int have = 0;
+    for (long long i = lo; i < hi; i++) {
+        PerlValue *v = arr->elems[i];
+        long long x = v ? perl_to_int(v) : 0;
+        if (!have) { acc = x; have = 1; }
+        else if (op == 1 && x < acc) acc = x;
+        else if (op == 2 && x > acc) acc = x;
+        else if (op == 0) acc += x;
+    }
+    *out = have ? acc : 0;
+}
+
+typedef struct {
+    PerlArray *arr;
+    long long  lo, hi;
+    int        op;
+    long long *partial;
+    long long  id;
+} parfold_arg;
+
+static void *parfold_worker(void *argp) {
+    parfold_arg *a = (parfold_arg *)argp;
+    parfold_chunk(a->arr, a->lo, a->hi, a->op, &a->partial[a->id]);
+    return NULL;
+}
+
+static long long parfold_reduce(long long *partial, long long nw, int op) {
+    long long acc = 0;
+    int have = 0;
+    for (long long c = 0; c < nw; c++) {
+        long long x = partial[c];
+        if (!have) { acc = x; have = 1; }
+        else if (op == 1 && x < acc) acc = x;
+        else if (op == 2 && x > acc) acc = x;
+        else if (op == 0) acc += x;
+    }
+    return have ? acc : 0;
+}
+
+static int parfold_workers(void) {
+    long long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+    if (ncpu > PERLC_AUTOPAR_MAX_THREADS) ncpu = PERLC_AUTOPAR_MAX_THREADS;
+    return (int)ncpu;
+}
+
+/* opt_strat 19: parallel sum / min / max over an all-int list of len
+   elements. len < PERLC_AUTOPAR_MIN (default 8192) or a 1-CPU host runs the
+   whole list inline (byte-identical to perl_sum_list / perl_min_list /
+   perl_max_list); otherwise each chunk folds to one i64 partial on the
+   Stage-45 pool and the main thread joins. The result type matches the
+   sequential runtime: sum returns an int (perl_sum_list is int for an
+   all-int list), min/max return a float (perl_min_list / perl_max_list are
+   always float). No empty chunk occurs above the threshold. */
+static PerlValue *parfold_run(PerlArray *a, long long len, int op) {
+    long long minb = 8192;
+    const char *e = getenv("PERLC_AUTOPAR_MIN");
+    if (e) {
+        long long v = atoll(e);
+        if (v > 0) minb = v;
+    }
+    if (!a || len <= 0 || len < minb)
+        return op == 0 ? perl_sum_list(a) : op == 1 ? perl_min_list(a)
+                                                    : perl_max_list(a);
+    int nw = parfold_workers();
+    if (nw < 2)
+        return op == 0 ? perl_sum_list(a) : op == 1 ? perl_min_list(a)
+                                                    : perl_max_list(a);
+    long long sz = (len + nw - 1) / nw;
+    pthread_t  th[PERLC_AUTOPAR_MAX_THREADS];
+    parfold_arg ar[PERLC_AUTOPAR_MAX_THREADS];
+    long long   partials[PERLC_AUTOPAR_MAX_THREADS];
+    /* chunk 0 on the calling thread, chunks 1..nw-1 on workers */
+    parfold_arg a0;
+    a0.arr = a; a0.lo = 0; a0.hi = (sz < len) ? sz : len; a0.op = op;
+    a0.partial = partials; a0.id = 0;
+    parfold_worker(&a0);
+    for (long long c = 1; c < nw; c++) {
+        long long lo = c * sz, hi = lo + sz < len ? lo + sz : len;
+        ar[c].arr = a; ar[c].lo = lo; ar[c].hi = hi; ar[c].op = op;
+        ar[c].partial = partials; ar[c].id = c;
+        pthread_create(&th[c], NULL, parfold_worker, &ar[c]);
+    }
+    for (long long c = 1; c < nw; c++) pthread_join(th[c], NULL);
+    long long r = parfold_reduce(partials, nw, op);
+    return op == 0 ? perl_alloc_int(r) : perl_alloc_float((double)r);
+}
+
+PerlValue *perl_sum_list_par(PerlArray *a) {
+    return parfold_run(a, a ? a->len : 0, 0);
+}
+PerlValue *perl_min_list_par(PerlArray *a) {
+    return parfold_run(a, a ? a->len : 0, 1);
+}
+PerlValue *perl_max_list_par(PerlArray *a) {
+    return parfold_run(a, a ? a->len : 0, 2);
 }
 
 PerlArray *perl_uniq_list(PerlArray *a) {
